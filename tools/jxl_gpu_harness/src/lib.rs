@@ -8,6 +8,7 @@ pub mod capture;
 pub mod codec;
 pub mod compare;
 pub mod config;
+pub mod conformance;
 pub mod cpu_baseline;
 pub mod error;
 pub mod reference;

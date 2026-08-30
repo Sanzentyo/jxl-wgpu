@@ -13,6 +13,11 @@ use jxl_gpu_harness::codec::{
     run_codec_case,
 };
 use jxl_gpu_harness::config::{CorpusConfig, SyntheticCaseConfig, ThresholdConfig};
+use jxl_gpu_harness::conformance::{
+    ConformanceAction, ConformanceCaseReport, ConformanceCorpus, ConformanceReport,
+    DEFAULT_MAX_ROW_BYTES, ExternalFixtureOptions, LazyImage, external_fixture,
+    run_stock_gpu_round_trip,
+};
 use jxl_gpu_harness::cpu_baseline::{DjxlBaselineOptions, run_djxl_baseline};
 use jxl_gpu_harness::error::{Error, Result};
 use jxl_gpu_harness::replay::{BackendKind, create_backend, verify_capture};
@@ -22,6 +27,7 @@ use jxl_gpu_harness::tune::TuningProfile;
 
 const DEFAULT_CORPUS: &str = "tools/jxl_gpu_harness/corpus.toml";
 const DEFAULT_THRESHOLDS: &str = "tools/jxl_gpu_harness/thresholds.toml";
+const DEFAULT_CONFORMANCE_CORPUS: &str = "tools/jxl_gpu_harness/conformance-corpus.toml";
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -40,6 +46,8 @@ enum Command {
     Bench(BenchArgs),
     /// Run GPU-required decode, encode, or round-trip workloads without a CPU codec fallback.
     Codec(CodecArgs),
+    /// Inventory or execute the deterministic multi-resolution codec conformance corpus.
+    Conformance(ConformanceArgs),
     /// Generate one deterministic capture file.
     Capture(CaptureArgs),
     /// Replay and compare one capture file.
@@ -121,6 +129,39 @@ struct CodecArgs {
     /// Per-process comparator timeout; defaults to 30000 ms.
     #[arg(long, requires = "cpu_baseline_djxl")]
     cpu_baseline_timeout_ms: Option<u64>,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+struct ConformanceArgs {
+    /// Versioned deterministic image manifest.
+    #[arg(long, default_value = DEFAULT_CONFORMANCE_CORPUS)]
+    corpus: PathBuf,
+    /// Inventory only, run stock-profile GPU round trips, or create external reference fixtures.
+    #[arg(long, value_enum, default_value = "inventory")]
+    action: ConformanceAction,
+    /// Restrict execution to named cases. May be repeated or comma separated.
+    #[arg(long = "case", value_delimiter = ',')]
+    cases: Vec<String>,
+    /// Maximum allocation allowed for one lazily generated row.
+    #[arg(long, default_value_t = DEFAULT_MAX_ROW_BYTES)]
+    max_row_bytes: u64,
+    /// Development-only cjxl path for external fixture creation.
+    #[arg(long, default_value = "/opt/homebrew/bin/cjxl")]
+    cjxl: PathBuf,
+    /// Development-only djxl path for external fixture verification.
+    #[arg(long, default_value = "/opt/homebrew/bin/djxl")]
+    djxl: PathBuf,
+    /// Destination for development-only generated PNM/JXL fixtures.
+    #[arg(long, default_value = "fixtures/conformance-generated")]
+    fixture_dir: PathBuf,
+    /// Actually write and execute external reference fixtures; otherwise external mode is dry-run.
+    #[arg(long)]
+    apply: bool,
+    /// Replace existing external fixture files.
+    #[arg(long, requires = "apply")]
+    force: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -213,6 +254,7 @@ fn run(cli: Cli) -> Result<bool> {
             }),
         ),
         Command::Codec(args) => run_codec(args),
+        Command::Conformance(args) => run_conformance(args),
         Command::Capture(args) => {
             refuse_overwrite(&args.output, args.force)?;
             let parameters = args.parameters.into_iter().collect::<BTreeMap<_, _>>();
@@ -271,6 +313,73 @@ fn run(cli: Cli) -> Result<bool> {
             Ok(passed)
         }
     }
+}
+
+fn run_conformance(args: ConformanceArgs) -> Result<bool> {
+    if args.max_row_bytes == 0 {
+        return Err(Error::InvalidConfig(
+            "--max-row-bytes must be nonzero".into(),
+        ));
+    }
+    if args.action != ConformanceAction::ExternalFixtures && (args.apply || args.force) {
+        return Err(Error::InvalidConfig(
+            "--apply and --force are only valid with --action external-fixtures".into(),
+        ));
+    }
+    let corpus = ConformanceCorpus::load(&args.corpus)?;
+    let cases = corpus.select(&args.cases)?;
+    let backend = if args.action == ConformanceAction::GpuRoundTrip {
+        request_backend()?
+    } else {
+        None
+    };
+    let external_options = ExternalFixtureOptions {
+        apply: args.apply,
+        force: args.force,
+        output_dir: args.fixture_dir,
+        cjxl: args.cjxl,
+        djxl: args.djxl,
+    };
+    let mut reports = Vec::with_capacity(cases.len());
+    for case in cases {
+        let inventory = LazyImage::new(case, args.max_row_bytes)?.inventory()?;
+        let gpu_round_trip = if args.action == ConformanceAction::GpuRoundTrip
+            && case.expectation
+                == jxl_gpu_harness::conformance::ConformanceExpectation::StockGpuRoundTrip
+        {
+            Some(run_stock_gpu_round_trip(
+                case,
+                backend.as_ref(),
+                args.max_row_bytes,
+            )?)
+        } else {
+            None
+        };
+        let external_fixture = if args.action == ConformanceAction::ExternalFixtures {
+            Some(external_fixture(
+                case,
+                args.max_row_bytes,
+                &external_options,
+            )?)
+        } else {
+            None
+        };
+        reports.push(ConformanceCaseReport {
+            inventory,
+            gpu_round_trip,
+            external_fixture,
+        });
+    }
+    let report = ConformanceReport {
+        schema_version: jxl_gpu_harness::conformance::CONFORMANCE_SCHEMA_VERSION,
+        action: args.action,
+        manifest: args.corpus.display().to_string(),
+        dry_run: args.action == ConformanceAction::ExternalFixtures && !args.apply,
+        cases: reports,
+    };
+    let passed = report.passed();
+    write_json(&report, args.output.output.as_deref())?;
+    Ok(passed)
 }
 
 fn run_corpus(args: CorpusRunArgs, benchmark: Option<BenchmarkOptions>) -> Result<bool> {

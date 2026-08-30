@@ -21,6 +21,10 @@ cargo run -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl --format u
   --cpu-baseline-iterations 20 --cpu-baseline-timeout-ms 30000
 cargo run -p jxl_gpu_harness -- codec input.gray --operation encode --format u8 --extent 256x256
 cargo run -p jxl_gpu_harness -- codec input.gray --operation round-trip --format u8 --extent 256x256 --output-target cpu-readback
+cargo run -p jxl_gpu_harness -- conformance --action inventory
+cargo run -p jxl_gpu_harness -- conformance --action gpu-round-trip
+cargo run -p jxl_gpu_harness -- conformance --action external-fixtures \
+  --case tiny-gray8-2x2 --fixture-dir /tmp/jxl-reference-fixtures --apply
 cargo run -p jxl_gpu_harness -- capture --name gaborish_edge_17x19 --operation gaborish -o case.jxlcap
 cargo run -p jxl_gpu_harness -- replay --input case.jxlcap --backend wgpu
 cargo run -p jxl_gpu_harness -- tune --output tuning.json --candidates reference,wgpu
@@ -109,6 +113,28 @@ the selected executable's `--version` output. `verified=true` requires both the 
 count and pixel hash to match GPU decode + CPU readback. Comparator status is reported separately
 and does not silently change the production path or assert that either implementation is faster.
 
+## Multi-resolution conformance corpus
+
+`conformance-corpus.toml` is a typed inventory of deterministic Gray, RGB, and RGBA inputs. It
+includes tiny, odd, square, portrait, landscape, panorama, tall, 255/256/257 boundary, HD, FHD,
+and UHD 4K extents. Each case records sample depth, alpha pattern, active bytes, row alignment,
+extra padding, and padding byte. Generation is row-lazy: validation, BLAKE3 hashing, raw output,
+and PGM/PPM/PAM output never allocate a complete large image.
+
+`--action inventory` emits both a padded-storage `input_hash` and an active-pixel `pixel_hash`.
+`--action gpu-round-trip` executes only cases labelled `stock_gpu_round_trip`; currently that is
+the honest Gray U8 2..=256 profile. Its source is uploaded with the manifest's actual padded row
+stride before GPU encoding. RGB, RGBA, higher bit depth, 257+, HD, FHD, and 4K cases remain visible
+as `future_gpu_profile` and are not counted as successful codec execution.
+
+`--action external-fixtures` is development-only and a dry run unless `--apply` is present. With
+`--apply`, it streams a PGM/PPM source to the chosen `cjxl`, decodes the standard JXL through the
+chosen `djxl`, and requires exact extent, channel count, sample maximum, and canonical pixel hash.
+No external executable or CPU codec dependency enters a production crate. Existing files are
+refused unless `--force` is explicit. See
+[`docs/CONFORMANCE_CORPUS.md`](../../docs/CONFORMANCE_CORPUS.md) for the format and support inventory
+contract.
+
 ## Synthetic capture/replay
 
 Synthetic capture/replay remains independent from the production codec frontend. Corpus cases and
@@ -122,4 +148,6 @@ Synthetic `chroma_upsample` cases use `axis=0` for horizontal and `axis=1` for v
 `2n` extent. Synthetic `epf` cases use `pass=0`, `1`, or `2`; `variable_sigma=1` stores one finite
 F32 sigma sample per 8x8 block.
 
-All commands can write the versioned JSON report validated by `schemas/run.schema.json`.
+Capture, replay, benchmark, and codec commands can write the versioned JSON report validated by
+`schemas/run.schema.json`. The conformance command emits its own `schema_version = 1` inventory
+report so future-profile metadata is not confused with executable codec-case success.
