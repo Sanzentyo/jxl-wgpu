@@ -75,10 +75,11 @@ pub use acceleration::{
     ACCELERATION_INDEX_BOX_TYPE, AccelerationIndexError, Gray8AccelerationIndex, PrefixCodeEntry,
 };
 pub use inventory::{
-    AnimationInventory, BitRange, ByteRange, CodestreamInventory, EmbeddedIccInventory,
-    FrameBlendInfo, FrameBlendMode, FrameEncoding, FrameInventory, FramePassesInventory,
-    FrameSection, FrameSectionKind, FrameType, ImageHeaderInventory, InventoryError,
-    InventoryLimits, SampleBitDepth,
+    AnimationInventory, BitRange, ByteRange, CodestreamInventory, EdgePreservingFilterInventory,
+    EmbeddedIccInventory, EpfSigmaInventory, EpfWeightsInventory, FiniteF16, FrameBlendInfo,
+    FrameBlendMode, FrameEncoding, FrameInventory, FramePassesInventory, FrameSection,
+    FrameSectionKind, FrameType, GaborishInventory, ImageHeaderInventory, InventoryError,
+    InventoryLimits, RestorationFilterInventory, SampleBitDepth,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).

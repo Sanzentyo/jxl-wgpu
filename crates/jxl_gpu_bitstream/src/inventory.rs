@@ -195,6 +195,119 @@ pub struct FramePassesInventory {
     pub last_pass: Vec<u32>,
 }
 
+/// Finite IEEE 754 binary16 value retained exactly as serialized in a JPEG XL header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FiniteF16(u16);
+
+impl FiniteF16 {
+    /// Construct a finite binary16 value. Infinity and NaN encodings are rejected.
+    #[must_use]
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & 0x7c00 == 0x7c00 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    #[must_use]
+    pub const fn to_bits(self) -> u16 {
+        self.0
+    }
+
+    /// Convert this value exactly to `f32`.
+    #[must_use]
+    pub fn to_f32(self) -> f32 {
+        let bits = u32::from(self.0);
+        let sign = (bits & 0x8000) << 16;
+        let exponent = (bits >> 10) & 0x1f;
+        let fraction = bits & 0x03ff;
+        let expanded = if exponent == 0 {
+            if fraction == 0 {
+                sign
+            } else {
+                let top_bit = 31 - fraction.leading_zeros();
+                let biased_exponent = top_bit + 103;
+                let mantissa = (fraction - (1 << top_bit)) << (23 - top_bit);
+                sign | (biased_exponent << 23) | mantissa
+            }
+        } else {
+            sign | ((exponent + 112) << 23) | (fraction << 13)
+        };
+        f32::from_bits(expanded)
+    }
+}
+
+/// Gaborish filter declaration from a frame header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GaborishInventory {
+    Disabled,
+    #[default]
+    Default,
+    Custom {
+        weights: [[FiniteF16; 2]; 3],
+    },
+}
+
+/// Custom EPF channel weights and the two serialized zero-flush thresholds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpfWeightsInventory {
+    pub channel_scale: [FiniteF16; 3],
+    pub pass1_zeroflush: FiniteF16,
+    pub pass2_zeroflush: FiniteF16,
+}
+
+/// Custom EPF sigma values. `quant_mul` is serialized only for VarDCT frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpfSigmaInventory {
+    pub quant_mul: Option<FiniteF16>,
+    pub pass0_sigma_scale: FiniteF16,
+    pub pass2_sigma_scale: FiniteF16,
+    pub border_sad_mul: FiniteF16,
+}
+
+/// Edge-preserving filter declaration from a frame header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgePreservingFilterInventory {
+    Disabled,
+    Enabled {
+        iterations: u32,
+        /// `None` selects the standard eight-entry sharpness LUT.
+        sharp_lut: Option<[FiniteF16; 8]>,
+        /// `None` selects the standard channel scales and zero-flush thresholds.
+        weights: Option<EpfWeightsInventory>,
+        /// `None` selects the standard EPF sigma values.
+        sigma: Option<EpfSigmaInventory>,
+        /// Serialized for Modular frames; VarDCT frames leave this as `None`.
+        sigma_for_modular: Option<FiniteF16>,
+    },
+}
+
+impl Default for EdgePreservingFilterInventory {
+    fn default() -> Self {
+        Self::Enabled {
+            iterations: 2,
+            sharp_lut: None,
+            weights: None,
+            sigma: None,
+            sigma_for_modular: None,
+        }
+    }
+}
+
+/// Restoration-filter contract retained from a standard frame header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RestorationFilterInventory {
+    /// The complete standard default selected by the filter bundle's `all_default` bit.
+    #[default]
+    Default,
+    Custom {
+        gaborish: GaborishInventory,
+        epf: EdgePreservingFilterInventory,
+    },
+}
+
 /// Logical meaning of a physical TOC entry when the TOC is not permuted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSectionKind {
@@ -258,6 +371,7 @@ pub struct FrameInventory {
     pub save_as_reference: u32,
     pub save_before_color_transform: bool,
     pub name_bytes: Vec<u8>,
+    pub restoration_filter: RestorationFilterInventory,
     pub group_count: u64,
     pub low_frequency_group_count: u64,
     pub sections: Vec<FrameSection>,
@@ -469,6 +583,7 @@ pub(crate) fn parse_codestream_inventory(
             save_as_reference: header.save_as_reference,
             save_before_color_transform: header.save_before_color_transform,
             name_bytes: header.name_bytes,
+            restoration_filter: header.restoration_filter,
             group_count: counts.groups,
             low_frequency_group_count: counts.low_frequency_groups,
             sections,
@@ -739,6 +854,7 @@ struct ParsedFrameHeader {
     save_as_reference: u32,
     save_before_color_transform: bool,
     name_bytes: Vec<u8>,
+    restoration_filter: RestorationFilterInventory,
     max_horizontal_shift: u32,
     max_vertical_shift: u32,
 }
@@ -781,6 +897,7 @@ fn parse_frame_header(
             save_as_reference: 0,
             save_before_color_transform: false,
             name_bytes: Vec::new(),
+            restoration_filter: RestorationFilterInventory::default(),
             max_horizontal_shift: 0,
             max_vertical_shift: 0,
         });
@@ -952,7 +1069,7 @@ fn parse_frame_header(
         ));
     }
     let name_bytes = read_name(reader, limits.max_frame_name_bytes)?;
-    parse_restoration_filter(reader, encoding, limits.max_extension_bits)?;
+    let restoration_filter = parse_restoration_filter(reader, encoding, limits.max_extension_bits)?;
     parse_extensions(reader, limits.max_extension_bits)?;
 
     const H_SHIFT: [u32; 4] = [0, 1, 1, 0];
@@ -995,6 +1112,7 @@ fn parse_frame_header(
         save_as_reference,
         save_before_color_transform,
         name_bytes,
+        restoration_filter,
         max_horizontal_shift,
         max_vertical_shift,
     })
@@ -1098,43 +1216,84 @@ fn parse_restoration_filter(
     reader: &mut BitReader<'_>,
     encoding: FrameEncoding,
     max_extension_bits: u64,
-) -> Result<(), InventoryError> {
+) -> Result<RestorationFilterInventory, InventoryError> {
     if read_bool(reader)? {
-        return Ok(());
+        return Ok(RestorationFilterInventory::Default);
     }
     let gab = read_bool(reader)?;
     let gab_custom = gab && read_bool(reader)?;
-    if gab_custom {
-        for _ in 0..6 {
-            read_f16(reader)?;
+    let gaborish = if !gab {
+        GaborishInventory::Disabled
+    } else if !gab_custom {
+        GaborishInventory::Default
+    } else {
+        let mut weights = [[FiniteF16::default(); 2]; 3];
+        for channel in &mut weights {
+            for weight in channel.iter_mut() {
+                *weight = read_f16(reader)?;
+            }
+            if (1.0 + (channel[0].to_f32() + channel[1].to_f32()) * 4.0).abs() < f32::EPSILON {
+                return Err(InventoryError::InvalidFrame(
+                    "Gaborish weights produce a near-zero kernel",
+                ));
+            }
         }
-    }
+        GaborishInventory::Custom { weights }
+    };
     let epf_iters = read_bits(reader, 2)? as u32;
     let sharp_custom = epf_iters > 0 && encoding == FrameEncoding::VarDct && read_bool(reader)?;
-    if sharp_custom {
-        for _ in 0..8 {
-            read_f16(reader)?;
+    let sharp_lut = if sharp_custom {
+        let mut values = [FiniteF16::default(); 8];
+        for value in &mut values {
+            *value = read_f16(reader)?;
         }
-    }
+        Some(values)
+    } else {
+        None
+    };
     let weight_custom = epf_iters > 0 && read_bool(reader)?;
-    if weight_custom {
-        for _ in 0..5 {
-            read_f16(reader)?;
-        }
-    }
+    let weights = if weight_custom {
+        Some(EpfWeightsInventory {
+            channel_scale: [read_f16(reader)?, read_f16(reader)?, read_f16(reader)?],
+            pass1_zeroflush: read_f16(reader)?,
+            pass2_zeroflush: read_f16(reader)?,
+        })
+    } else {
+        None
+    };
     let sigma_custom = epf_iters > 0 && read_bool(reader)?;
-    if sigma_custom && encoding == FrameEncoding::VarDct {
-        read_f16(reader)?;
-    }
-    if sigma_custom {
-        for _ in 0..3 {
-            read_f16(reader)?;
+    let sigma = if sigma_custom {
+        Some(EpfSigmaInventory {
+            quant_mul: if encoding == FrameEncoding::VarDct {
+                Some(read_f16(reader)?)
+            } else {
+                None
+            },
+            pass0_sigma_scale: read_f16(reader)?,
+            pass2_sigma_scale: read_f16(reader)?,
+            border_sad_mul: read_f16(reader)?,
+        })
+    } else {
+        None
+    };
+    let sigma_for_modular = if epf_iters > 0 && encoding == FrameEncoding::Modular {
+        Some(read_f16(reader)?)
+    } else {
+        None
+    };
+    let epf = if epf_iters == 0 {
+        EdgePreservingFilterInventory::Disabled
+    } else {
+        EdgePreservingFilterInventory::Enabled {
+            iterations: epf_iters,
+            sharp_lut,
+            weights,
+            sigma,
+            sigma_for_modular,
         }
-    }
-    if epf_iters > 0 && encoding == FrameEncoding::Modular {
-        read_f16(reader)?;
-    }
-    parse_extensions(reader, max_extension_bits)
+    };
+    parse_extensions(reader, max_extension_bits)?;
+    Ok(RestorationFilterInventory::Custom { gaborish, epf })
 }
 
 fn parse_extensions(
@@ -1387,12 +1546,9 @@ fn read_name(reader: &mut BitReader<'_>, max_name_bytes: usize) -> Result<Vec<u8
     Ok(name)
 }
 
-fn read_f16(reader: &mut BitReader<'_>) -> Result<(), InventoryError> {
+fn read_f16(reader: &mut BitReader<'_>) -> Result<FiniteF16, InventoryError> {
     let bits = read_bits(reader, 16)? as u16;
-    if bits & 0x7c00 == 0x7c00 {
-        return Err(InventoryError::InvalidFrame("non-finite F16 header value"));
-    }
-    Ok(())
+    FiniteF16::from_bits(bits).ok_or(InventoryError::InvalidFrame("non-finite F16 header value"))
 }
 
 #[derive(Clone, Copy)]
@@ -1820,6 +1976,107 @@ mod tests {
             }
         );
         assert_eq!(reader.bit_offset(), 28);
+    }
+
+    #[test]
+    fn finite_f16_expands_normals_subnormals_and_signed_zero_exactly() {
+        assert_eq!(FiniteF16::from_bits(0x0000).unwrap().to_f32().to_bits(), 0);
+        assert_eq!(
+            FiniteF16::from_bits(0x8000).unwrap().to_f32().to_bits(),
+            0x8000_0000
+        );
+        assert_eq!(
+            FiniteF16::from_bits(0x0001).unwrap().to_f32().to_bits(),
+            0x3380_0000
+        );
+        assert_eq!(
+            FiniteF16::from_bits(0x3c00).unwrap().to_f32().to_bits(),
+            1.0_f32.to_bits()
+        );
+        assert_eq!(
+            FiniteF16::from_bits(0x7bff).unwrap().to_f32().to_bits(),
+            0x477f_e000
+        );
+        assert!(FiniteF16::from_bits(0x7c00).is_none());
+        assert!(FiniteF16::from_bits(0x7e00).is_none());
+    }
+
+    #[test]
+    fn restoration_inventory_retains_custom_vardct_and_modular_values() {
+        let one = 0x3c00_u64;
+        let half = 0x3800_u64;
+        let quarter = 0x3400_u64;
+        let two = 0x4000_u64;
+
+        let mut vardct_bits = BitWriter::new();
+        vardct_bits.write_bits(0, 1).unwrap(); // Non-default restoration bundle.
+        vardct_bits.write_bits(1, 1).unwrap(); // Gaborish enabled.
+        vardct_bits.write_bits(1, 1).unwrap(); // Custom Gaborish weights.
+        for value in [one, half, one, half, one, half] {
+            vardct_bits.write_bits(value, 16).unwrap();
+        }
+        vardct_bits.write_bits(3, 2).unwrap(); // Three EPF iterations.
+        vardct_bits.write_bits(1, 1).unwrap(); // Custom sharpness LUT.
+        for value in [0, quarter, half, one, 0, quarter, half, one] {
+            vardct_bits.write_bits(value, 16).unwrap();
+        }
+        vardct_bits.write_bits(1, 1).unwrap(); // Custom channel weights.
+        for value in [one, half, quarter, half, quarter] {
+            vardct_bits.write_bits(value, 16).unwrap();
+        }
+        vardct_bits.write_bits(1, 1).unwrap(); // Custom sigma values.
+        for value in [one, half, quarter, two] {
+            vardct_bits.write_bits(value, 16).unwrap();
+        }
+        vardct_bits.write_bits(0, 2).unwrap(); // No restoration extensions.
+
+        let mut vardct_reader = BitReader::new(vardct_bits.as_bytes());
+        let vardct =
+            parse_restoration_filter(&mut vardct_reader, FrameEncoding::VarDct, u64::MAX).unwrap();
+        let RestorationFilterInventory::Custom { gaborish, epf } = vardct else {
+            panic!("custom restoration bundle was not retained");
+        };
+        assert!(matches!(gaborish, GaborishInventory::Custom { .. }));
+        let EdgePreservingFilterInventory::Enabled {
+            iterations,
+            sharp_lut,
+            weights,
+            sigma,
+            sigma_for_modular,
+        } = epf
+        else {
+            panic!("custom EPF bundle was not retained");
+        };
+        assert_eq!(iterations, 3);
+        assert_eq!(sharp_lut.unwrap()[3].to_bits(), one as u16);
+        assert_eq!(weights.unwrap().channel_scale[2].to_bits(), quarter as u16);
+        assert_eq!(sigma.unwrap().border_sad_mul.to_bits(), two as u16);
+        assert_eq!(sigma_for_modular, None);
+
+        let mut modular_bits = BitWriter::new();
+        modular_bits.write_bits(0, 1).unwrap(); // Non-default restoration bundle.
+        modular_bits.write_bits(0, 1).unwrap(); // Gaborish disabled.
+        modular_bits.write_bits(1, 2).unwrap(); // One EPF iteration.
+        modular_bits.write_bits(0, 1).unwrap(); // Default channel weights.
+        modular_bits.write_bits(0, 1).unwrap(); // Default sigma values.
+        modular_bits.write_bits(one, 16).unwrap(); // Modular sigma.
+        modular_bits.write_bits(0, 2).unwrap(); // No restoration extensions.
+        let mut modular_reader = BitReader::new(modular_bits.as_bytes());
+        let RestorationFilterInventory::Custom { gaborish, epf } =
+            parse_restoration_filter(&mut modular_reader, FrameEncoding::Modular, u64::MAX)
+                .unwrap()
+        else {
+            panic!("custom Modular restoration bundle was not retained");
+        };
+        assert_eq!(gaborish, GaborishInventory::Disabled);
+        assert!(matches!(
+            epf,
+            EdgePreservingFilterInventory::Enabled {
+                iterations: 1,
+                sigma_for_modular: Some(value),
+                ..
+            } if value.to_bits() == one as u16
+        ));
     }
 
     #[test]
