@@ -82,6 +82,12 @@ must fit both `max_storage_buffer_binding_size` and `max_buffer_size`. The publi
 owned, and total addressed bytes per job. `for_in_flight(n)` reports checked aggregate bytes for a
 caller-selected concurrency ceiling, while `memory_limits` exposes the relevant device limits.
 
+The uniform, artifact, and mapped-readback allocations form one exclusive reusable buffer set.
+Sets match the exact artifact size, remain leased through map completion and consumption, and are
+returned safely even when a Future is abandoned. Idle retention defaults to 32 MiB with a
+256-set object cap; `buffer_pool_stats`, `set_buffer_pool_limit`, and `clear_buffer_pool` expose
+reuse and control. Caller-owned source bindings are neither copied into nor retained by this pool.
+
 The predictor is computed in signed integer arithmetic:
 
 ```text
@@ -124,10 +130,11 @@ LosslessGray8Encoder::encode / encode_container
     -> the same submission through its blocking wait path
 ```
 
-On native `wgpu`, a small poll helper wakes the runtime-neutral future when mapping completes. A
-browser cannot block `Device::poll`; its synchronous wait returns an error and callers must await.
-This is API-correct but the per-submission native poll helper is an implementation cost to replace
-with a shared device completion pump.
+On native `wgpu`, each context owns a bounded `SubmissionPoller`, and every context clone shares its
+single completion worker. `WgpuContext::from_backend` reuses the backend's worker and byte budget,
+so encode, decode, and readback do not create per-submission polling threads. Poll capacity is
+reserved before queue submission and saturation is a typed retryable error. A browser cannot block
+`Device::poll`; its synchronous wait returns an error and callers must await.
 
 `EncoderCapabilities::negotiate` is authoritative. A backend must only list profiles and stages it
 executes. The generic API models animation and progressive plans so these can be implemented without
@@ -221,9 +228,10 @@ GPU input normalization / color transform
 ```
 
 AC groups can run independently only after global metadata, quant fields, progressive layout, and
-entropy clustering policy have been selected. A future implementation should batch many small images
-or animation frames in one submission and maintain persistent GPU scratch/pipeline caches; one image
-stage per dispatch would reproduce CPU structure rather than exploit the GPU.
+entropy clustering policy have been selected. A future implementation should batch many small
+images or animation frames in one submission and reuse the existing pipeline and bounded artifact
+pool; future multi-stage kernels will also need persistent scratch planning. One image stage per
+dispatch would reproduce CPU structure rather than exploit the GPU.
 
 ## Other encoder crates reviewed
 
@@ -283,10 +291,9 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
    group packets.
 6. Add animation frame headers, reference slots, blending, and persistent reference surfaces to the
    existing session API. Only then advertise animation capability.
-7. Add a capture/replay harness with GPU timestamps, wall time, queue latency, transfer/readback
-   bytes, peak allocations, encoded size, `djxl` conformance, exact lossless comparison, and lossy
-   quality metrics. CPU readback, continuous decode/encode, and concurrent jobs are distinct benchmark
-   scenarios.
+7. Extend the existing capture/replay and codec harness with GPU timestamps, queue latency, peak
+   driver allocations, and lossy quality metrics. It already separates CPU readback, continuous
+   decode/encode, concurrent host fan-out, encoded size, and exact `djxl` conformance.
 
 Until a slice is implemented and validated, capability negotiation must reject it. Benchmarks,
 wrappers, and CPU oracles do not expand the advertised production capability.

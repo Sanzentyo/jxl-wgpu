@@ -86,6 +86,12 @@ Every layout calculation is checked for overflow, overlapping planes, undersized
 subsampling constraints. Odd extents use explicit ceil division where the format permits them;
 formats such as packed 4:2:2 can require an even width.
 
+F64 output from the stock Gray8 decoder is an explicit precision contract, not an inferred format
+upgrade. `F64OutputPolicy` selects native shader arithmetic, native-or-exact-F32-widening, or the
+portable exact-widening path. `NativeRequired` rejects a logical device without enabled
+`SHADER_F64`; the compatibility path produces valid binary64 storage but does not claim that its
+normalization was evaluated with F64 arithmetic.
+
 ## GPU output and display
 
 There are three distinct terminal paths:
@@ -97,8 +103,28 @@ There are three distinct terminal paths:
    return an RGBA texture suitable for sampling, rendering, or copying to a surface texture.
 
 Queue ordering is the synchronization primitive for path 2 and 3. No host wait is required before
-encoding a dependent command. Resource handles keep allocations alive; explicit completion is
-needed only for CPU access or slot reuse across unrelated queues/devices.
+encoding a dependent command. Wgpu command ownership keeps referenced allocations physically
+alive. The crate's byte accounting is narrower: it is retained by `GpuBufferLease` and
+engine-owned release guards, not by raw `wgpu::Buffer` clones made by callers. Explicit completion
+is needed for CPU access and for application-defined reuse across unrelated queues/devices.
+
+The stock decoder exposes this early path through a deliberately separate
+`UnvalidatedGpuImageFrame`. Its queue token, requested layout, and permit-bearing buffers can feed
+`DisplayPipeline`, `ImageReadbackPipeline`, or a custom same-queue command, but authoritative frame
+metadata and changed regions are withheld until status validation succeeds. Transport completion
+does not imply codec validation. If validation later fails, queued consumers cannot be rolled back
+and every derived texture or byte buffer must be discarded.
+
+For already-produced authoritative frames, `ImageReadbackPipeline::submit_frames` combines all
+outputs into one bounded staging allocation, command buffer, queue submission, map callback, and
+runtime-neutral completion object. This aggregates only transport; it does not merge the codec
+submissions that produced those frames or claim true codec batching.
+
+Generic color packing has an explicit two-sided source contract: `OutputDesc::color_encoding`
+declares the render-plan signal and `ImageOutputRequest::source_encoding` must match it. The
+portable shader converts BT.709 primaries between Linear, sRGB, and BT.709 transfer functions via
+linear light before applying RGB or YCbCr output packing. Undefined metadata, unsupported transfer
+functions, and wide/HDR primaries fail before the output dispatch instead of relabelling samples.
 
 `DisplayPipeline` caches pipelines and bind-group layouts by source format and color conversion.
 Direct RGBA copies are used when storage and texture layouts agree. Planar, semi-planar, and packed
@@ -108,23 +134,40 @@ native multi-plane texture object.
 
 ## Animation and concurrency
 
-Sync and async animation frontends drive one GPU codec state machine. A frame contains its index,
-duration/tick metadata, presentation timestamp, loop metadata, and composed output. Reference-frame
-and blend dependencies are explicit session state; a frame slot is not reusable while a later GPU
-submission or caller lease still depends on it.
+Sync and async animation frontends drive one GPU codec state machine. Stream metadata carries the
+timebase, loop count, and whether frame timecodes exist. A frame carries its index, exact duration,
+cumulative presentation-start ticks, optional bitstream timecode, and composed output.
+Reference-frame and blend dependencies are explicit session state. The session's count slot is
+occupied from submission through its ordered pending value and then by the returned
+`GpuFrameLease`; dropping that lease releases the slot. This slot count is an admission bound, not
+proof that arbitrary downstream wgpu commands have completed. Engine-owned release guards and
+tracked buffer leases separately retain byte reservations.
+
+Decode submission and completion are separate contracts. `GpuSubmissionSession::submit_next`
+records queue work and returns an owned `GpuPendingFrame`; native `wait` and runtime-neutral
+`poll_complete` validate that exact submission later. `GpuDecodeSession` retains pending frames in
+submission order and can prefetch several frames before waiting for the front. Its progress value
+distinguishes target depth, explicit stream end, frame-slot pressure, shared memory pressure, and
+bounded poll-worker pressure. Completion order cannot reorder presentation metadata or outputs.
 
 The synchronous API advances and, when requested, waits for one GPU frame at a time. The
 runtime-neutral async API is expressed with `Future`, `Poll`, `Context`, and `Waker`; it does not
 depend on Tokio, async-std, or a particular reactor. Completion callbacks wake the task.
 
-GPU animation output uses a bounded in-flight budget. A slot cannot be reused until its consumer
-lease is released or its submission is complete. This gives explicit backpressure and prevents an
-animation, a sequential batch, or concurrent decoders from growing GPU memory without limit.
+GPU animation output uses a bounded frame-slot count plus a separate byte-weighted memory budget.
+A queued submission or returned `GpuFrameLease` occupies one slot. Engine work holds its own
+release guards, and output allocations hold tracked `GpuBufferLease` permits; only the latter two
+participate in byte accounting. Raw wgpu handle clones cannot be observed by that budget.
 
-Repeated decodes share immutable shader modules, pipeline caches, and a bounded buffer pool.
-Concurrent decoders may share a device and queue while retaining separate frame state. The harness
-reports both per-image latency and aggregate throughput for small, large, sequential, concurrent,
-and animation workloads.
+Clones of one stock decoder engine share its compiled pipelines. Decoders built from one backend
+share the device, queue, bounded poll worker, and byte-weighted transient memory admission while
+retaining separate frame state. Its bounded exact-match pool reuses lookup, reconstruction,
+status/readback, and POD-parameter buffers only after the completion lifetime is safe; raw
+codestream and caller-owned output buffers are never pooled. Encoder contexts created with
+`WgpuContext::from_backend` share the same bounded poll worker and memory budget, while standalone
+contexts own one bounded worker. The harness reports measured still-image latency and throughput
+for isolated, sequential, burst, and persistent-worker workloads; stock-codec animation remains a
+typed unsupported result.
 
 ## Safety invariants
 

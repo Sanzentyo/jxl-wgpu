@@ -3,8 +3,8 @@
 Portable, GPU-required JPEG XL encode/decode building blocks for Rust.
 
 This is an independent Cargo workspace. Production codec execution requires a compatible GPU.
-Published `jxl` and the reference `cjxl`/`djxl` tools are used only by development oracles and the
-comparison harness.
+Published `jxl` and the reference `djxl` tool are development-only interoperability oracles and are
+not production dependencies or fallback paths.
 
 ## Crates
 
@@ -21,8 +21,10 @@ comparison harness.
   runtime-neutral async APIs.
 - `jxl_wgpu_encode`: GPU-required encode jobs, group packet assembly, and runtime-neutral
   animation-session contracts.
-- `jxl_gpu_harness`: correctness, capture/replay, latency, throughput, concurrency, animation, and
-  CPU-readback measurements.
+- `jxl_gpu_harness`: correctness, capture/replay, sequential/concurrent timing, output-path, and
+  CPU-readback evidence with explicit submission, wait, logical-byte, and staging-byte counters.
+  Host-thread fan-out is labelled separately from unimplemented coalesced GPU batching; the stock
+  codec's animation boundary remains a typed unsupported result.
 
 ## Execution contract
 
@@ -35,6 +37,12 @@ processing, and supported entropy work belong to GPU jobs. The exact initially s
 is capability-negotiated; broader JPEG XL features remain typed rejections until their kernels and
 conformance tests exist.
 
+Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
+admission. The same completion values work with native blocking calls or any async executor.
+Decoder output buffers carry cloneable memory leases, so dropping a session cannot free its budget
+while a tracked lease is still retained. GPU frame/output containers are intentionally not
+cloneable; raw wgpu handles cloned through the explicit interop borrow are outside that accounting.
+
 ## Implemented codec slice
 
 The checked-in interoperable slice is intentionally narrow and is not presented as a complete
@@ -44,8 +52,8 @@ JPEG XL implementation:
 |---|---|---|
 | Encode | Standard lossless Modular Gray8 codestream/container | one 2..=256 pixel-wide/high still, one group/pass, fixed Gradient predictor |
 | Decode | GPU entropy/LZ77/residual/Gradient reconstruction from the actual `jxlc` payload | the same Gray8 profile in a container carrying a SHA-bound and prefix-verified `jwgp` acceleration index |
-| Output | GPU-resident gray/luma and supported 8-bit planar/semi-planar YCbCr, including NV12 | unsupported color/bit-depth combinations return typed errors |
-| Presentation | Same-queue buffer-to-RGBA display pipeline | no host synchronization before dependent queue work |
+| Output | GPU-resident Gray8 written into all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts | numeric normalization is mandatory; F64 requires an explicit native-or-compatibility precision policy |
+| Presentation | Same-queue buffer-to-linear-BT.709 RGBA display pipeline | explicit unvalidated handoff can enqueue display/readback/custom GPU work before the 16-byte validation map completes; derived results are discarded if validation later fails |
 | CPU transport | Explicit mapped readback after GPU completion | transport only; it never selects a host codec |
 
 The encoder's output is independently accepted and reproduced exactly by the published Rust `jxl`
@@ -54,10 +62,11 @@ box; conforming decoders ignore it and decode the standard `jxlc`. The stock dec
 requires that validated index instead of duplicating the generic JPEG XL prefix-tree parser on the
 host. Raw or unrelated JPEG XL inputs therefore reject rather than silently taking another path.
 
-The public session traits already model blocking and runtime-neutral asynchronous animation,
-bounded frame leases, timing, loop metadata, and reference slots. The stock codec backend still
-rejects animation, RGB encode, multi-group/progressive Modular, VarDCT, ICC, patches, splines, and
-other profiles until each has a GPU implementation and conformance coverage.
+The public decode session traits separate queue submission from completion, prefetch an ordered
+bounded frame window, and expose native blocking plus runtime-neutral asynchronous completion.
+Frame leases, timing, timecodes, loop metadata, and reference slots remain explicit. The stock
+codec backend still rejects animation, RGB encode, multi-group/progressive Modular, VarDCT, ICC,
+patches, splines, and other profiles until each has a GPU implementation and conformance coverage.
 
 ## Formats and display
 
@@ -66,13 +75,23 @@ chroma siting, color matrix, and range. CUDA-specific block-linear memory is out
 it is not portable through WebGPU; pitch-linear formats are supported.
 
 GPU outputs may be read back explicitly or passed directly to later work on the same `wgpu::Queue`.
-`DisplayPipeline` converts supported buffers into an RGBA texture that can be sampled, rendered, or
-copied to a surface without a host wait. Pipelines and buffers are reused across frames and decoder
-instances within configured memory bounds.
+The stock pending frame can expose a distinct `UnvalidatedGpuImageFrame`; its permit-bearing buffer
+leases can be consumed immediately while frame metadata and changed regions remain withheld until
+validation. `DisplayPipeline` converts supported buffers into an explicit linear-light BT.709 RGBA
+texture that can be sampled, rendered, or copied to a surface without an additional host wait.
+Unsupported primaries and HDR transfer functions are rejected instead of being mislabeled.
 
-Animation encode/decode exposes frame timing and loop metadata through both blocking and
-runtime-neutral `Future`/poll APIs. GPU callbacks wake the future without depending on Tokio,
-async-std, or a particular reactor. Bounded in-flight permits provide backpressure.
+The ten non-color numeric VPI layouts remain GPU-buffer/readback outputs rather than implicitly
+colorized display images. They carry no color meaning, so `DisplayPipeline` returns a typed error
+instead of inventing a range, component selection, or transfer function. Applications can enqueue
+an explicit visualization shader on the same queue through `GpuBufferLease::as_wgpu_buffer()` and
+the checked `ImageLayout`.
+
+The animation session contracts expose frame timing and loop metadata through both blocking and
+runtime-neutral `Future`/poll APIs. Prefetch submits multiple frames without a host wait; the
+ordered pending queue then completes its front through a native wait or a task waker, without
+depending on Tokio, async-std, or a particular reactor. The stock codec slice is still-only and
+returns a typed unsupported error for animation codestreams.
 
 ## Build and validate
 
@@ -81,5 +100,6 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo run -p jxl_gpu_harness -- verify --backend reference
-cargo run -p jxl_gpu_harness -- codec --corpus tools/jxl_gpu_harness/codec-corpus.toml
+cargo run -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl \
+  --format u8 --output-target cpu-readback
 ```

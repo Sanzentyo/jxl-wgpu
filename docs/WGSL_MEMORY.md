@@ -44,16 +44,16 @@ name shown in parentheses.
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
-| `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation`, 3 pads | 128 | 4 | uniform |
+| `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad | 128 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
-| `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, _padding0` | 96 | 4 | uniform |
+| `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer` | 96 | 4 | uniform |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuTask` / `Task` | `coefficient_offset, destination_x, destination_y, quant_index, matrix_index, correlation_index, lf_index` | 28 | 4 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuResourceVector` / `vec4<f32>` | four `f32` lanes | 16 | 16 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8ArtifactHeader` / `output_words[0..53]` | `event_count, raw_counts[19], lz77_counts[33]` | 212 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Event` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
-| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | token range, dimensions/sample count, output mode/transfer/range, 3 plane offset/stride pairs, chroma dimensions | 64 | 4 | uniform |
+| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | token range, dimensions/sample count, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma dimensions, logical size, numeric mapping | 96 | 4 | uniform |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 
 ### Values that intentionally are not `Pod`
@@ -69,8 +69,10 @@ name shown in parentheses.
   row strides, and lengths. `ImageLayout` validates their byte ranges; there is no single fixed
   Rust record that could safely represent their contents.
 - Codestream storage and the decoder prefix lookup are variable arrays, not fixed records. The
-  lookup remains `Vec<u32>` and is uploaded with `cast_slice`; the raw codestream remains bytes so
-  its bit/byte offsets and explicit four-byte sentinel are preserved.
+  lookup is retained session-locally as `Arc<[u32]>` and uploaded with `cast_slice`; the raw
+  codestream remains bytes so its bit/byte offsets and explicit four-byte sentinel are preserved.
+  Aligned codestream spans are uploaded directly from shared input storage, without constructing
+  a second full-size host `Vec`.
 
 Manual endian-aware serialization is therefore retained only for bitstream/container/file
 formats. Fixed GPU records do not use hand-written byte flattening.
@@ -100,7 +102,7 @@ the device and checks every dispatched dimension against `max_compute_workgroups
 | `display_image` | source RO, destination T, U | 16x16 | source must have `STORAGE`; each pitch-linear plane and its final address is bounded |
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
 | encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | profile dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
-| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, U | 1x1 | bounded `jwgp` index, aligned token words plus sentinel, prefix table, sample/output ranges and status allocation are prevalidated |
+| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, U | 1x1 | bounded `jwgp` index, aligned token words plus sentinel, prefix table, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated |
 
 Display source buffers are now also checked for the usage needed by the operation: `STORAGE` for
 shader conversion and `COPY_SRC` for direct RGBA8 buffer-to-texture copies. A multi-row direct
@@ -126,13 +128,21 @@ WebGPU's portable baseline; VarDCT additionally checks its workgroup storage lim
   returned as image data.
 - Core packed output and CPU staging copies use the same padded byte count. VarDCT upload element
   sizes (4, 16, and 28) are already multiples of 4.
-- Generic `ImageReadbackPipeline` independently pads each source copy and each aggregate staging
-  offset to 4 bytes, validates `COPY_SRC`, validates the source allocation, and maps one bounded
-  aggregate staging buffer.
-- Encoder artifact storage and mapped readback have identical checked, 4-byte-aligned sizes.
+- Generic `ImageReadbackPipeline::submit_frames` independently pads every source copy and aggregate
+  staging offset across all supplied frames to 4 bytes, validates `COPY_SRC` and each source
+  allocation, records one command buffer/queue submission, and maps one bounded aggregate staging
+  buffer. Returned frames retain their original output ranges and exclude all copy padding.
+- Encoder artifact storage and mapped readback have identical checked, 4-byte-aligned sizes. The
+  16-byte `Gray8Params` uniform and both artifact buffers are leased as one exact-size set, so a
+  buffer cannot be reused by another submission until the mapped artifacts have been consumed and
+  the readback buffer has been unmapped. If the future is abandoned, its callback-owned lifetime
+  performs that unmap and return only after mapping resolves.
   Its 212-byte header and 16-byte events are parsed as checked `Pod` records. Decoder codestream
   storage is padded to a word and includes a four-byte sentinel; its 16-byte status is parsed as a
   checked `DecodeStatus` record.
+- Gray8 decoder output allocation is rounded to four bytes while `logical_size` remains explicit.
+  RGBA/BGRA pixels and odd-width YUYV/UYVY pairs use aligned whole-word stores; byte and 16-bit
+  plane writers bounds-check each addressed byte against `logical_size`.
 - Buffer-to-texture paths apply WebGPU's separate 256-byte multi-row pitch rule. Texture-to-buffer
   tests likewise use 256-byte row padding.
 
@@ -143,9 +153,9 @@ WebGPU's portable baseline; VarDCT additionally checks its workgroup storage lim
 | Core render session | `WgpuSubmissionStats` reports physical resident-plane bytes and exact explicit transient bytes: uniforms, uploads, packed outputs and staging. `max_transient_bytes` is enforced per submission. | `WgpuFrameSession::pending_transient_bytes()` checked-adds submitted jobs and checked-subtracts them on all wait paths. | The aggregate is observable, not a second admission limit. Queue-ordered reusable resident allocations make it conservative. Caller-owned GPU outputs can outlive `wait`, so the session cannot track them afterward. |
 | Core resident arena | Planner accounts physical slots once, respects simultaneous lifetimes, validates every slot against `max_buffer_size` and every bound plane against `max_storage_buffer_binding_size`. | Buffer pool has a configured hard byte limit and never leases one buffer concurrently. | Pipeline/driver memory excluded. |
 | VarDCT DCT8 | Exact coefficient, task, resource, and uniform upload bytes are included in the core transient total. Every upload is checked against `min(max_buffer_size, max_storage_buffer_binding_size)`. | Included in core pending total. | Non-DCT8 transform buckets return a typed rejection. There is no extra global scratch buffer; 1,536-byte workgroup storage is not global buffer memory. |
-| Gray8 encoder | `LosslessGray8MemoryPlan` reports source binding, 16-byte uniform, artifact storage, mapped readback, owned bytes/job and addressed bytes/job. | `for_in_flight(max_jobs)` checked-multiplies both totals and exposes the caller-selected ceiling. | API reports but does not internally semaphore caller concurrency; the application must enforce its selected ceiling. |
-| Gray8 decoder | `WgpuDecodeMemoryStats` reports complete per-frame explicit allocation and `reserved_bytes = per_frame_bytes * max_in_flight`. | A session holds a checked reservation (default 64 MiB/session) in an engine-wide checked budget (default 256 MiB); the in-flight limiter enforces its count. | Driver-private allocations excluded. |
-| Generic image readback | `ImageReadbackStats` reports logical bytes and exact aggregate staging bytes; `ImageReadbackLimits::max_transient_bytes` and device `max_buffer_size` are enforced per submission. | No aggregate admission counter across several independently live `ImageReadbackSubmission` values. | Applications requiring a global cap must limit live submissions; adding a shared reservation is future work. |
+| Gray8 encoder | `LosslessGray8MemoryPlan` reports source binding, 16-byte uniform, artifact storage, mapped readback, owned bytes/job and addressed bytes/job. `EncoderBufferPoolStats` separately reports exact idle bytes, three-buffer set counts, hits, misses and evictions. | Every submit non-blockingly reserves `owned_bytes_per_job` from the context's shared `MemoryBudget`. The exclusive buffer lease and permit survive until mapped artifacts are consumed. If the future is abandoned, its callback-owned lifetime unmaps and returns the set only after mapping resolves; the mapped artifact buffer is parsed in place instead of being duplicated into a host `Vec`. A bounded poll slot is reserved before `Queue::submit`, so poll saturation returns both memory and buffers without orphaning GPU work. The idle pool uses exact artifact-size matching and has an independent 32 MiB default hard limit, configurable down to zero, plus a 256-set object-count cap for tiny workloads. | Caller-owned source bindings are sampled directly: they are reported as addressed, are neither copied nor pooled, and are not charged as encoder-owned. Queue/driver-private command metadata excluded. Physical caller-visible allocation is bounded by live admitted bytes plus the separately reported idle-pool bytes. |
+| Gray8 decoder | `WgpuDecodeMemoryStats` splits complete `per_frame_bytes` into `output_lease_bytes + transient_bytes`, then reports `max_frame_slots` and `max_frame_window_bytes`. `WgpuDecodeBufferPoolStats` separately reports exact idle/leased bytes and objects, hits, misses, recycling, evictions, limits, and clear generation. | Output and transient portions use the backend-wide transient `MemoryBudget` by default, shared with encode and generic readback; an explicit cloneable budget can define another intentional sharing group. Prefetch keeps each permit from queue submission through the ordered pending frame and then the returned frame lease. Lookup, reconstruction, status, mapped status staging, and the 96-byte POD uniform (plus a native-F64 dummy when used) have exclusive exact-size/usage/alignment leases. The map callback owns those leases through completion; abandonment still unmaps staging before return. Output leases retain their reservation beyond session drop. Memory and bounded-poller saturation are explicit prefetch backpressure, with poll capacity reserved before source consumption and queue submission; the count limiter remains independent. | Requested window exposure above 64 MiB is rejected. Idle decoder retention is bounded independently at 32 MiB, 256 buffers total, and 32 per exact key by default; all limits can be reduced to zero. Clear invalidates outstanding generations without disrupting submitted work. Raw codestream and caller-owned output buffers are never pooled. Active logical bytes and idle physical bytes are reported separately rather than double-counted. Driver-private allocations excluded. |
+| Generic image readback | `ImageReadbackStats` reports frame/output counts, logical bytes, exact aggregate staging bytes, and padding bytes. One `submit_frames` call uses one staging allocation, command buffer, queue submission, map callback, and completion future/wait across all supplied frames; `ImageReadbackLimits::max_transient_bytes` and device `max_buffer_size` are enforced on that aggregate. | `max_in_flight_bytes` is a hard byte-weighted budget shared by pipeline clones (or backend clones when created from a backend). The complete staging allocation is admitted atomically. A permit and every source lease remain attached through mapping/consumption; an abandoned future leaves them owned by the callback until GPU completion, and exhaustion is a typed non-blocking error. | Codec dispatches are not coalesced by this transport API. Driver-private mapping/command metadata excluded. |
 | Display textures | Pitch-linear source buffers are fully range/usage bounded. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing and display-pipeline objects are intentionally excluded. |
 | Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
 
@@ -163,6 +173,17 @@ a valid large host buffer cannot wrap a WGSL `u32` byte index. VarDCT uploads ar
 both relevant device limits, and DCT8 rejects insufficient workgroup storage before encoding the
 pass.
 
+The Gray8 decoder classifies output storage through `classify_pixel_format`, checks all four plane
+offset/stride/end values and the complete logical allocation against WGSL's `u32` address space,
+and separately enforces four-byte row alignment for whole-word RGBA, packed-4:2:2, 32-bit numeric,
+and 64-bit numeric writes. Numeric U8/S8/U16/S16 use bounds-checked byte stores; 2S16, U32/S32,
+F32/2F32, and F64 use aligned whole words. The F64 template is validated in both portable
+exact-F32-widening and `FLOAT64`-capable native forms; the native pipeline is compiled lazily only
+for a resolved native-F64 request. `ShaderF64Policy::Auto` requests `SHADER_F64` when the adapter
+advertises it, `Disabled` omits it, and `Require` returns a typed error when unavailable. The Naga
+regression test also proves that the native WGSL is rejected without the `FLOAT64` validator
+capability, so a source containing `array<f64>` cannot leak into the portable pipeline.
+
 ## Regression coverage
 
 The ABI tests pin every Rust size, natural alignment, and field order, including the 16-byte
@@ -175,6 +196,13 @@ deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
 - pending transient accumulation and release for multiple submissions;
 - 4-byte and 256-byte copy-pitch rules;
 - display final-address rejection above WGSL's `u32` space;
+- host negotiation and exact GPU readback for all 30 VPI pitch-linear formats (20 color-bearing
+  and 10 explicitly normalized numeric formats),
+  including odd extents, Y16, four-plane alpha, and packed-4:2:2 tail duplication;
+- byte-checked BT.709-primary conversion between Linear, sRGB, and BT.709 source/target transfer
+  functions, plus pre-dispatch rejection of mismatched, undefined, wide-gamut, and HDR contracts;
+- typed rejection of missing/mismatched numeric mappings and native-required F64 on devices without
+  enabled `SHADER_F64`, plus an explicitly skipped native-F64 GPU test on unsupported adapters;
 - the 1,536-byte VarDCT workgroup-storage requirement; and
 - the encoder's worst-case event capacity.
 
