@@ -372,7 +372,11 @@ pub struct LosslessModularMemoryPlan {
     /// primary storage buffer directly.
     pub readback_bytes: u64,
     pub direct_readback: bool,
+    /// Artifact batches needed to cover the frame.
     pub batch_count: u32,
+    /// Actual `wgpu::Queue::submit` calls made by this job. Resident jobs submit once; streamed
+    /// jobs submit every batch once for histogram aggregation and once for serialization.
+    pub gpu_submission_count: u32,
     pub streaming: bool,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
@@ -874,6 +878,14 @@ impl LosslessModularBackend {
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let batch_count = u32::try_from(batches.len())
             .map_err(|_| EncodeError::InvalidSource("artifact batch count overflow"))?;
+        let streaming = batch_count > 1;
+        let gpu_submission_count = if streaming {
+            batch_count
+                .checked_mul(2)
+                .ok_or(EncodeError::InvalidSource("GPU submission count overflow"))?
+        } else {
+            1
+        };
         let memory = LosslessModularMemoryPlan {
             group_grid,
             format,
@@ -888,7 +900,8 @@ impl LosslessModularBackend {
             readback_bytes,
             direct_readback: self.direct_mapping,
             batch_count,
-            streaming: batch_count > 1,
+            gpu_submission_count,
+            streaming,
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
@@ -5091,6 +5104,7 @@ mod tests {
         let memory = encoder.memory_plan(&source).unwrap();
         assert!(memory.streaming);
         assert!(memory.batch_count > 1);
+        assert_eq!(memory.gpu_submission_count, memory.batch_count * 2);
         assert!(memory.artifact_storage_bytes < memory.total_artifact_bytes);
         assert!(memory.peak_source_binding_bytes < memory.source_binding_bytes);
 
@@ -5520,6 +5534,8 @@ mod tests {
         let expected_output_bytes =
             u64::try_from(expected_output_words * 4).expect("test artifact size fits u64");
         assert_eq!(memory.group_grid.groups, 1);
+        assert_eq!(memory.batch_count, 1);
+        assert_eq!(memory.gpu_submission_count, 1);
         let parameter_bytes = std::mem::size_of::<ModularParams>() as u64;
         assert_eq!(memory.parameter_storage_bytes, parameter_bytes);
         assert_eq!(memory.artifact_storage_bytes, expected_output_bytes);

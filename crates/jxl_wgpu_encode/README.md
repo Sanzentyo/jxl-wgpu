@@ -23,8 +23,12 @@ Modular codestream or `jxlc` container.
   image or source pixels are read by the CPU.
 - The frame is split into standard 256x256 PassGroups. Edge groups may be one pixel wide or high.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
-  group-major, channel-major order. All artifacts are copied to one staging buffer and completed by
-  one runtime-neutral future, one map callback, and one bounded poll slot.
+  group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
+  complete-channel-group batches bounded by storage-binding and dispatch limits.
+- Native multi-batch jobs run through a runtime-neutral worker. A histogram pass first derives one
+  stream-wide prefix code; a second pass validates and serializes each batch immediately, then
+  releases its mapped artifact storage. Peak GPU memory is therefore bounded independently of the
+  total image area even though the final standard codestream remains contiguous.
 - Every group/channel produces independent Gradient-predictor residuals, LZ77/raw token events, and
   histograms. The host validates every artifact, combines histograms per channel, creates the four
   JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
@@ -32,11 +36,11 @@ Modular codestream or `jxlc` container.
   each PassGroup carries its own group header and token stream.
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, component storage bytes,
-exact source binding range, parameter-storage bytes, artifact-storage bytes, mapped readback bytes,
-total encoder-owned live bytes, and the group grid before submission. A single shared
-`MemoryBudget` reservation covers the whole frame. The exclusive three-buffer pool lease and
-reservation survive until the map callback and mapped-range consumer are both finished, including
-when the returned future is abandoned.
+full and peak source binding ranges, peak parameter/artifact/readback bytes, diagnostic total
+artifact bytes, batch count, streaming mode, total encoder-owned live bytes, and the group grid
+before submission. Every live batch uses the same shared `MemoryBudget`. Its exclusive buffer-pool
+lease and reservation survive until the map callback and mapped-range consumer are both finished,
+including when the returned future is abandoned.
 
 The returned `LosslessModularSubmission` implements `Future` without depending on an async runtime;
 native callers may instead use `wait`. `group_grid` and `ordered_groups` expose the exact dispatch
@@ -70,12 +74,27 @@ let jxl_container = submission.wait()?;
 # }
 ```
 
-Single-group Gray8 containers additionally carry the private `jwgp` acceleration index understood
-by the stock GPU decoder. Its current schema represents one contiguous 8-bit single-channel token
-span, so other depths, RGB(A), and multi-group containers intentionally omit that private box; they
-remain ordinary interoperable JPEG XL containers. Conformance tests cover every depth `1..=16`,
-the 1/255/256/257 group boundaries, and extreme aspect ratios with exact logical-sample comparison
-using both the published Rust `jxl` decoder and reference `djxl`.
+Single-group Gray8 containers additionally carry the optional private `jwgp` acceleration index.
+Its current schema represents one contiguous 8-bit single-channel token span, so other depths,
+RGB(A), and multi-group containers intentionally omit that private box; all remain ordinary
+interoperable JPEG XL containers. Conformance tests cover every depth `1..=16`, the
+1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
+through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and
+runtime-neutral Future codestreams.
+
+## Experimental VarDCT profile
+
+`VarDctEncoder` accepts padded, interleaved sRGB8 and executes sRGB linearization, XYB conversion,
+forward DCT8, quantization, token generation, and histogram artifact generation on the GPU. The
+host validates those bounded artifacts and assembles a standard VarDCT still codestream. The
+current capability intentionally advertises only DCT8 at its fixed distance-25 control plane;
+the typed strategy inventory already describes all 27 standard strategies but does not pretend
+that unimplemented strategies are executable.
+
+The VarDCT submission owns 3,512 budgeted bytes, supports blocking completion and a runtime-neutral
+`Future`, and is deterministic on one device. Rust `jxl`, `djxl`, and a development-only `cjxl`
+fixture agree on its dimensions and RGB8 output. Black is exact; red and gradient fixtures carry
+explicit quality guards. There is no CPU transform, quantization, or pixel fallback.
 
 ## Animation sessions
 

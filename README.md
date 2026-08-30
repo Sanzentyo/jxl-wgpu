@@ -20,11 +20,10 @@ not production dependencies or fallback paths.
 - `jxl_wgpu_decode`: GPU-required codestream and animation sessions with synchronous and
   runtime-neutral async APIs.
 - `jxl_wgpu_encode`: GPU-required encode jobs, group packet assembly, and runtime-neutral
-  animation-session contracts.
+  animation-session contracts for lossless Modular plus an experimental GPU VarDCT profile.
 - `jxl_gpu_harness`: correctness, capture/replay, sequential/concurrent timing, output-path, and
   CPU-readback evidence with explicit submission, wait, logical-byte, and staging-byte counters.
-  Host-thread fan-out is labelled separately from unimplemented coalesced GPU batching; the stock
-  codec's animation boundary remains a typed unsupported result.
+  Host-thread fan-out is labelled separately from coalesced GPU batching.
 
 ## Execution contract
 
@@ -45,28 +44,28 @@ cloneable; raw wgpu handles cloned through the explicit interop borrow are outsi
 
 ## Implemented codec slice
 
-The checked-in interoperable slice is intentionally narrow and is not presented as a complete
-JPEG XL implementation:
+The checked-in paths are interoperable but are not yet a complete JPEG XL implementation:
 
 | Direction | Stock `wgpu` implementation | Current limits |
 |---|---|---|
-| Encode | Standard lossless Modular Gray8 codestream/container | one 2..=256 pixel-wide/high still, one group/pass, fixed Gradient predictor |
-| Decode | GPU entropy/LZ77/residual/Gradient reconstruction from the actual `jxlc` payload | the same Gray8 profile in a container carrying a SHA-bound and prefix-verified `jwgp` acceleration index |
-| Output | GPU-resident Gray8 written into all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts | numeric normalization is mandatory; F64 requires an explicit native-or-compatibility precision policy |
+| Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills, crops/references/blending animation, plus an experimental DCT8 VarDCT RGB8 still profile | Modular uses one pass and the implemented predictor/entropy set; VarDCT currently uses the documented fixed quality profile |
+| Decode | GPU prefix/hybrid entropy, LZ77, MA prediction, residual reconstruction, reversible color transform, and requested output conversion from ordinary raw/`jxlc`/`jxlp` streams | the executable path is one-pass lossless Modular still; VarDCT parsing/LF kernels are being integrated but are not yet an authoritative output path |
+| Output | GPU-resident native integer Gray/RGB/RGBA plus all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts | numeric normalization is explicit; F64 requires a native-or-exact-widening precision policy |
 | Presentation | Same-queue buffer-to-linear-BT.709 RGBA display pipeline | explicit unvalidated handoff can enqueue display/readback/custom GPU work before the 16-byte validation map completes; derived results are discarded if validation later fails |
 | CPU transport | Explicit mapped readback after GPU completion | transport only; it never selects a host codec |
 
-The encoder's output is independently accepted and reproduced exactly by the published Rust `jxl`
-decoder and by `djxl` when it is available in the test environment. `jwgp` is an auxiliary private
-box; conforming decoders ignore it and decode the standard `jxlc`. The stock decoder currently
-requires that validated index instead of duplicating the generic JPEG XL prefix-tree parser on the
-host. Raw or unrelated JPEG XL inputs therefore reject rather than silently taking another path.
+Lossless encoder output is independently accepted and reproduced exactly by the published Rust
+`jxl` decoder and by `djxl` when it is available in the test environment. `jwgp` is an optional
+single-group acceleration box; conforming decoders, including this workspace's generic standard
+path, ignore it and decode the standard `jxlc`. The VarDCT encoder is likewise checked with both
+oracles, with exact black and bounded-quality color fixtures.
 
 The public decode session traits separate queue submission from completion, prefetch an ordered
 bounded frame window, and expose native blocking plus runtime-neutral asynchronous completion.
-Frame leases, timing, timecodes, loop metadata, and reference slots remain explicit. The stock
-codec backend still rejects animation, RGB encode, multi-group/progressive Modular, VarDCT, ICC,
-patches, splines, and other profiles until each has a GPU implementation and conformance coverage.
+Frame leases, timing, timecodes, loop metadata, and reference slots remain explicit. The encoder
+implements standard Modular animation. Decoder animation, progressive Modular, non-alpha extra
+channels, complete VarDCT reconstruction, arbitrary ICC transforms, patches, splines, and noise
+remain typed rejections until their GPU paths and conformance coverage land.
 
 ## Formats and display
 
