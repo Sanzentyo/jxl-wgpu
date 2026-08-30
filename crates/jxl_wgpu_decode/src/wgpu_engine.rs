@@ -38,6 +38,7 @@ const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
+const WORKGROUP_SIZE_MARKER: &str = "/*__JXL_WORKGROUP_SIZE__*/";
 const F64_EXACT_F32_WIDENING: &str = r#"
                 if params.numeric_mapping != 1u {
                     decode_error = ERROR_OUTPUT_MAPPING;
@@ -64,8 +65,10 @@ const F64_NATIVE_BINDING: &str =
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
-const TARGET_STREAM_BATCH_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_PARALLEL_GROUP_LANES: usize = 64;
+const MODULAR_GROUP_WORKGROUP_SIZE: u32 = 64;
+// Each lane is one serial reconstruction invocation which may process a full 256x256 group. Keep
+// a finite watchdog-oriented ceiling even when the adapter and shared byte budget allow more.
+const WATCHDOG_PARALLEL_GROUP_LANE_CAP: usize = 512;
 
 /// Conservative GPU allocation accounting for the stock decoder's bounded frame window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,12 +81,24 @@ pub struct WgpuDecodeMemoryStats {
     pub max_frame_slots: usize,
     /// Maximum exposure implied by `per_frame_bytes * max_frame_slots`.
     pub max_frame_window_bytes: u64,
+    /// Peak reusable codestream window selected from the byte budget and device binding limit.
+    pub stream_window_bytes: u64,
+    /// All parallel reconstruction lanes in the reusable scratch allocation.
+    pub reconstruction_scratch_bytes: u64,
+    /// Byte stride of one reconstruction lane.
+    pub reconstruction_lane_stride_bytes: u64,
+    /// Largest descriptor-derived LZ history ring used by one group lane.
+    pub max_lz77_window_words: u32,
     /// Bounded stream uploads required for one frame. Each batch is one ordered queue submission.
     pub stream_batch_count: usize,
     /// Actual codec queue submissions per decoded frame.
     pub submissions_per_frame: usize,
     /// Scratch-isolated Modular groups decoded concurrently by one compute dispatch.
     pub parallel_group_lanes: usize,
+    /// Logical group invocations packed into one portable compute workgroup.
+    pub group_workgroup_size: u32,
+    /// Largest compute-workgroup count submitted by one bounded stream batch.
+    pub max_dispatch_workgroups: u32,
 }
 
 /// F64 production path resolved for one output request.
@@ -118,6 +133,7 @@ struct ShaderParams {
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
+    lz77_window_mask: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -175,7 +191,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 176);
+    assert!(std::mem::size_of::<ShaderParams>() == 180);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
@@ -302,11 +318,16 @@ fn shader_source(path: F64OutputPath) -> String {
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
         .replace(MODULAR_RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT_SHADER)
         .replace(F64_OUTPUT_MARKER, implementation)
-        .replace(F64_BINDING_MARKER, binding);
+        .replace(F64_BINDING_MARKER, binding)
+        .replace(
+            WORKGROUP_SIZE_MARKER,
+            &MODULAR_GROUP_WORKGROUP_SIZE.to_string(),
+        );
     debug_assert!(!source.contains(MODULAR_ENTROPY_MARKER));
     debug_assert!(!source.contains(MODULAR_RECONSTRUCT_MARKER));
     debug_assert!(!source.contains(F64_OUTPUT_MARKER));
     debug_assert!(!source.contains(F64_BINDING_MARKER));
+    debug_assert!(!source.contains(WORKGROUP_SIZE_MARKER));
     source
 }
 
@@ -786,6 +807,7 @@ struct DecodeMemoryPermits {
 #[derive(Clone, Debug)]
 struct GroupDispatchLayout {
     reconstruction_lane_stride: u64,
+    max_lz77_window_words: u32,
     parallel_group_lanes: usize,
     reconstructed_bytes: u64,
     stream_windows: Arc<[GroupStreamWindow]>,
@@ -817,8 +839,22 @@ impl GroupDispatchLayout {
         memory_limit_bytes: u64,
     ) -> Result<Self> {
         let limits = device.limits();
+        if limits.max_compute_invocations_per_workgroup < MODULAR_GROUP_WORKGROUP_SIZE
+            || limits.max_compute_workgroup_size_x < MODULAR_GROUP_WORKGROUP_SIZE
+        {
+            return Err(Error::backend(format!(
+                "device cannot run the portable {MODULAR_GROUP_WORKGROUP_SIZE}-invocation Modular workgroup"
+            )));
+        }
         let mut reconstruction_lane_stride = 0u64;
+        let mut max_lz77_window_words = 0u32;
         for group in &profile.groups {
+            let decoded_symbol_count = group_decoded_symbol_count(profile, *group)?;
+            max_lz77_window_words = max_lz77_window_words.max(group_lz77_window_words(
+                profile,
+                *group,
+                decoded_symbol_count,
+            )?);
             reconstruction_lane_stride = reconstruction_lane_stride
                 .max(align4(group_reconstructed_bytes(profile, *group)?)?);
         }
@@ -827,8 +863,7 @@ impl GroupDispatchLayout {
         }
         let stream_limit = limits
             .max_storage_buffer_binding_size
-            .min(limits.max_buffer_size)
-            .min(TARGET_STREAM_BATCH_BYTES);
+            .min(limits.max_buffer_size);
         let group_count = u64::try_from(profile.groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
         let status_stride = STATUS_BYTES;
@@ -860,9 +895,11 @@ impl GroupDispatchLayout {
             .min(limits.max_buffer_size)
             / reconstruction_lane_stride;
         let device_lane_cap = usize::try_from(device_lane_cap).unwrap_or(usize::MAX);
-        let workgroup_cap =
-            usize::try_from(limits.max_compute_workgroups_per_dimension).unwrap_or(usize::MAX);
-        let lane_cap = MAX_PARALLEL_GROUP_LANES
+        let workgroup_cap = u64::from(limits.max_compute_workgroups_per_dimension)
+            .checked_mul(u64::from(MODULAR_GROUP_WORKGROUP_SIZE))
+            .and_then(|lanes| usize::try_from(lanes).ok())
+            .unwrap_or(usize::MAX);
+        let lane_cap = WATCHDOG_PARALLEL_GROUP_LANE_CAP
             .min(profile.groups.len())
             .min(device_lane_cap)
             .min(workgroup_cap);
@@ -908,6 +945,7 @@ impl GroupDispatchLayout {
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
         Ok(Self {
             reconstruction_lane_stride,
+            max_lz77_window_words,
             parallel_group_lanes,
             reconstructed_bytes,
             stream_windows: stream_windows.into(),
@@ -1063,10 +1101,7 @@ fn select_parallel_group_layout(
 }
 
 fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGroup) -> Result<u64> {
-    const LZ77_WINDOW_WORDS: u64 = 1 << 20;
-    let sample_words = u64::from(group.sample_count()?)
-        .checked_mul(u64::from(profile.channels.count()))
-        .ok_or_else(|| Error::backend("group reconstruction sample count overflow"))?;
+    let sample_words = group_decoded_symbol_count(profile, group)?;
     let predictor_words = if profile.ma_config.needs_self_correcting() {
         u64::from(group.width)
             .checked_mul(5)
@@ -1074,16 +1109,33 @@ fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGro
     } else {
         0
     };
-    let entropy_words = if profile.ma_config.entropy.lz77.is_some() {
-        sample_words.min(LZ77_WINDOW_WORDS)
-    } else {
-        0
-    };
-    sample_words
+    let entropy_words = u64::from(group_lz77_window_words(profile, group, sample_words)?);
+    u64::from(sample_words)
         .checked_add(predictor_words)
         .and_then(|words| words.checked_add(entropy_words))
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))
+}
+
+fn group_decoded_symbol_count(
+    profile: &StandardModularProfile,
+    group: ModularGroup,
+) -> Result<u32> {
+    group
+        .sample_count()?
+        .checked_mul(profile.channels.count())
+        .ok_or_else(|| Error::backend("group reconstruction sample count overflow"))
+}
+
+fn group_lz77_window_words(
+    profile: &StandardModularProfile,
+    group: ModularGroup,
+    decoded_symbol_count: u32,
+) -> Result<u32> {
+    profile
+        .ma_config
+        .entropy
+        .lz77_window_words(group.width, decoded_symbol_count)
 }
 
 fn modular_metadata_bytes(metadata: &[u32]) -> Result<u64> {
@@ -1541,15 +1593,33 @@ fn validate_device_limits(
     let transient_bytes = per_frame
         .checked_sub(output_bytes)
         .ok_or_else(|| Error::backend("Modular transient memory accounting underflow"))?;
+    let max_dispatch_workgroups =
+        dispatch
+            .stream_batches
+            .iter()
+            .try_fold(0u32, |maximum, batch| {
+                u32::try_from(batch.len())
+                    .map(|groups| maximum.max(groups.div_ceil(MODULAR_GROUP_WORKGROUP_SIZE)))
+                    .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
+            })?;
+    if max_dispatch_workgroups == 0 {
+        return Err(Error::backend("Modular stream batch layout is empty"));
+    }
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
         output_lease_bytes: output_bytes,
         transient_bytes,
         max_frame_slots,
         max_frame_window_bytes,
+        stream_window_bytes: dispatch.stream_bytes,
+        reconstruction_scratch_bytes: dispatch.reconstructed_bytes,
+        reconstruction_lane_stride_bytes: dispatch.reconstruction_lane_stride,
+        max_lz77_window_words: dispatch.max_lz77_window_words,
         stream_batch_count: dispatch.stream_batches.len(),
         submissions_per_frame: dispatch.stream_batches.len(),
         parallel_group_lanes: dispatch.parallel_group_lanes,
+        group_workgroup_size: MODULAR_GROUP_WORKGROUP_SIZE,
+        max_dispatch_workgroups,
     })
 }
 
@@ -1809,7 +1879,11 @@ fn submit_decode(
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &binding, &[]);
-            pass.dispatch_workgroups(control.group_count, 1, 1);
+            pass.dispatch_workgroups(
+                control.group_count.div_ceil(MODULAR_GROUP_WORKGROUP_SIZE),
+                1,
+                1,
+            );
         }
         let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
         if final_batch {
@@ -1919,6 +1993,12 @@ fn build_params(
         source_bits: u32::from(profile.bits_per_sample),
         source_mask: (1u32 << profile.bits_per_sample) - 1,
         needs_self_correcting: u32::from(profile.ma_config.needs_self_correcting()),
+        lz77_window_mask: group_lz77_window_words(
+            profile,
+            group,
+            group_decoded_symbol_count(profile, group)?,
+        )?
+        .saturating_sub(1),
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -2104,6 +2184,38 @@ mod tests {
         assert_eq!(windows[0].upload_offset, 0);
         assert_eq!(windows[2].upload_offset, 0);
         assert_eq!(windows[4].upload_offset, 0);
+    }
+
+    #[test]
+    fn adaptive_stream_layout_coalesces_or_trades_lanes_for_the_byte_budget() {
+        let codestream = vec![0u8; 8 * 1024];
+        let groups = (0..8)
+            .map(|index| ModularGroup {
+                token_bit_offset: index * 8 * 1024,
+                token_bit_end: (index + 1) * 8 * 1024,
+                x: index as u32,
+                y: 0,
+                width: 1,
+                height: 1,
+                stream_index: index as u32,
+            })
+            .collect::<Vec<_>>();
+        let (lanes, _, batches, peak) =
+            select_parallel_group_layout(&codestream, &groups, 64 * 1024, 8, 4096, 1024, 64 * 1024)
+                .unwrap()
+                .unwrap();
+        assert_eq!(lanes, 8);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0], 0..8);
+        assert_eq!(peak, 8 * 1024 + STREAM_SENTINEL_BYTES);
+
+        let (lanes, _, batches, peak) =
+            select_parallel_group_layout(&codestream, &groups, 64 * 1024, 8, 4096, 1024, 20 * 1024)
+                .unwrap()
+                .unwrap();
+        assert_eq!(lanes, 3);
+        assert_eq!(batches, [0..3, 3..6, 6..8]);
+        assert_eq!(peak, 3 * 1024 + STREAM_SENTINEL_BYTES);
     }
 
     #[test]
@@ -2351,7 +2463,7 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 176);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 180);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -2366,50 +2478,57 @@ mod tests {
             source_bits: 10,
             source_mask: 11,
             needs_self_correcting: 12,
-            output_kind: 13,
-            transfer: 14,
-            limited_range: 15,
-            channels: 16,
-            order: 17,
-            bits: 18,
-            storage_bits: 19,
-            plane0_offset: 20,
-            plane0_stride: 21,
-            plane1_offset: 22,
-            plane1_stride: 23,
-            plane2_offset: 24,
-            plane2_stride: 25,
-            plane3_offset: 26,
-            plane3_stride: 27,
-            chroma_width: 28,
-            chroma_height: 29,
-            logical_size: 30,
-            numeric_mapping: 31,
-            status_index: 32,
-            stream_index: 33,
-            wp_p1: 34,
-            wp_p2: 35,
-            wp_p3a: 36,
-            wp_p3b: 37,
-            wp_p3c: 38,
-            wp_p3d: 39,
-            wp_p3e: 40,
-            wp_w0: 41,
-            wp_w1: 42,
-            wp_w2: 43,
-            wp_w3: 44,
+            lz77_window_mask: 13,
+            output_kind: 14,
+            transfer: 15,
+            limited_range: 16,
+            channels: 17,
+            order: 18,
+            bits: 19,
+            storage_bits: 20,
+            plane0_offset: 21,
+            plane0_stride: 22,
+            plane1_offset: 23,
+            plane1_stride: 24,
+            plane2_offset: 25,
+            plane2_stride: 26,
+            plane3_offset: 27,
+            plane3_stride: 28,
+            chroma_width: 29,
+            chroma_height: 30,
+            logical_size: 31,
+            numeric_mapping: 32,
+            status_index: 33,
+            stream_index: 34,
+            wp_p1: 35,
+            wp_p2: 36,
+            wp_p3a: 37,
+            wp_p3b: 38,
+            wp_p3c: 39,
+            wp_p3d: 40,
+            wp_p3e: 41,
+            wp_w0: 42,
+            wp_w1: 43,
+            wp_w2: 44,
+            wp_w3: 45,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 44]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 45]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+                45,
             ]
         );
         assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));
+        assert!(SHADER_TEMPLATE.contains("lz77_window_mask: u32,"));
         assert!(SHADER_TEMPLATE.contains("stream_index: u32,"));
         assert!(SHADER_TEMPLATE.contains("wp_w3: u32,"));
         assert!(SHADER_TEMPLATE.contains("params_table: array<Params>"));
+        let portable = shader_source(F64OutputPath::ExactF32Widening);
+        assert!(portable.contains("@compute @workgroup_size(64)"));
+        assert!(portable.contains("@builtin(global_invocation_id)"));
+        assert!(portable.contains("let lane_index = global_invocation_id.x;"));
 
         assert_eq!(std::mem::size_of::<DispatchControl>(), 16);
         assert_eq!(std::mem::align_of::<DispatchControl>(), 4);

@@ -1,7 +1,8 @@
 //! Reusable packed JPEG XL entropy descriptor decoder.
 //!
 //! Required caller ABI: `modular_metadata`, `reconstructed`, `Params` fields `token_end`,
-//! `sample_count`, `source_channels`, `needs_self_correcting`, and `width`; private
+//! `sample_count`, `source_channels`, `needs_self_correcting`, `width`, and
+//! `lz77_window_mask`; private
 //! `bit_cursor`/`decode_error`; `read_bits`/`peek_bits`; and the shared `ERROR_*` constants.
 //! The LZ window begins after raw sample words and the optional five-words-per-column weighted
 //! predictor state. Call `entropy_begin`, `entropy_read_varint`, then `entropy_finalize` once per
@@ -190,14 +191,19 @@ fn entropy_window_base() -> u32 {
 }
 
 fn entropy_copy_value() -> u32 {
-    let value = reconstruction_load(entropy_window_base() + (entropy_copy_position & 0xfffffu));
+    let value = reconstruction_load(
+        entropy_window_base() + (entropy_copy_position & params.lz77_window_mask)
+    );
     entropy_copy_position += 1u;
     entropy_copy_remaining -= 1u;
     return value;
 }
 
 fn entropy_record_value(value: u32) {
-    reconstruction_store(entropy_window_base() + (entropy_decoded & 0xfffffu), value);
+    reconstruction_store(
+        entropy_window_base() + (entropy_decoded & params.lz77_window_mask),
+        value,
+    );
     entropy_decoded += 1u;
 }
 

@@ -711,6 +711,14 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             let stats = session.submission_session().memory_stats();
             assert!(stats.parallel_group_lanes > 1);
             assert!(stats.parallel_group_lanes <= 64);
+            assert_eq!(stats.max_lz77_window_words, 1);
+            assert_eq!(stats.group_workgroup_size, 64);
+            assert_eq!(stats.max_dispatch_workgroups, 1);
+            assert_eq!(
+                stats.reconstruction_scratch_bytes,
+                stats.reconstruction_lane_stride_bytes * stats.parallel_group_lanes as u64
+            );
+            assert!(stats.stream_window_bytes < stats.transient_bytes);
             assert_eq!(stats.stream_batch_count, 1);
             assert_eq!(stats.submissions_per_frame, 1);
         }

@@ -89,6 +89,34 @@ impl HybridIntegerConfigIr {
     fn split(self) -> u32 {
         1u32 << self.split_exponent
     }
+
+    /// Inclusive bounds for every integer represented by one entropy token.
+    ///
+    /// The extra bits form a monotonic range before the JPEG XL `u32` result. If a malformed or
+    /// future descriptor could make that range exceed `u32`, using the full upper bound keeps GPU
+    /// LZ history sizing conservative without consuming any image entropy on the host.
+    fn value_bounds(self, token: u32) -> (u32, u32) {
+        if token < self.split() {
+            return (token, token);
+        }
+        let embedded = self.msb_in_token + self.lsb_in_token;
+        let bit_count =
+            (self.split_exponent - embedded + ((token - self.split()) >> embedded)) & 31;
+        let low_mask = (1u32 << self.lsb_in_token).wrapping_sub(1);
+        let low = token & low_mask;
+        let shifted = token >> self.lsb_in_token;
+        let high_mask = (1u32 << self.msb_in_token).wrapping_sub(1);
+        let high = (shifted & high_mask) | (1 << self.msb_in_token);
+        let assemble = |extra: u64| {
+            (((u64::from(high) << bit_count) | extra) << self.lsb_in_token) | u64::from(low)
+        };
+        let minimum = assemble(0);
+        let maximum = assemble((1u64 << bit_count) - 1);
+        (
+            u32::try_from(minimum).unwrap_or(0),
+            u32::try_from(maximum).unwrap_or(u32::MAX),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -597,6 +625,72 @@ impl EntropyCoderIr {
             Self::Ans { histograms, .. } => histograms.get(cluster)?.single_symbol,
         }
     }
+
+    fn supported_tokens(&self, cluster: usize) -> Result<Vec<u32>> {
+        let tokens = match self {
+            Self::Prefix(histograms) => {
+                let histogram = histograms
+                    .get(cluster)
+                    .ok_or_else(|| invalid_entropy_error("prefix cluster is missing"))?;
+                if let Some(symbol) = histogram.single_symbol {
+                    vec![symbol]
+                } else {
+                    histogram
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.bit_len != 0)
+                        .map(|(symbol, _)| {
+                            u32::try_from(symbol)
+                                .map_err(|_| invalid_entropy_error("prefix symbol exceeds u32"))
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                }
+            }
+            Self::Ans { histograms, .. } => {
+                let histogram = histograms
+                    .get(cluster)
+                    .ok_or_else(|| invalid_entropy_error("ANS cluster is missing"))?;
+                if let Some(symbol) = histogram.single_symbol {
+                    vec![symbol]
+                } else {
+                    let bucket_size = 1u32 << histogram.log_bucket_size;
+                    let mut present = vec![false; histogram.buckets.len()];
+                    for (index, bucket) in histogram.buckets.iter().copied().enumerate() {
+                        let (alias_symbol, cutoff, _, _, _) = bucket.fields();
+                        if cutoff > bucket_size {
+                            return invalid_entropy("ANS alias cutoff exceeds its bucket");
+                        }
+                        if cutoff != 0 {
+                            present[index] = true;
+                        }
+                        if cutoff < bucket_size {
+                            let alias = usize::try_from(alias_symbol).map_err(|_| {
+                                invalid_entropy_error("ANS alias exceeds host address space")
+                            })?;
+                            let slot = present.get_mut(alias).ok_or_else(|| {
+                                invalid_entropy_error("ANS alias exceeds its alphabet")
+                            })?;
+                            *slot = true;
+                        }
+                    }
+                    present
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, present)| *present)
+                        .map(|(symbol, _)| {
+                            u32::try_from(symbol)
+                                .map_err(|_| invalid_entropy_error("ANS symbol exceeds u32"))
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                }
+            }
+        };
+        if tokens.is_empty() {
+            return invalid_entropy("entropy histogram has no reachable symbol");
+        }
+        Ok(tokens)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -757,6 +851,60 @@ impl EntropyDecoderIr {
         let token = self.coder.single_symbol(cluster)?;
         let config = *self.configs.get(cluster)?;
         (token < config.split()).then_some(token)
+    }
+
+    /// Power-of-two LZ history required by a bounded logical stream.
+    ///
+    /// This examines only the already-parsed distance histogram and hybrid-integer descriptor.
+    /// It deliberately does not consume entropy symbols. The returned ring is a conservative
+    /// upper bound for every reachable back-reference after the JPEG XL special-distance mapping.
+    pub(crate) fn lz77_window_words(
+        &self,
+        distance_multiplier: u32,
+        decoded_symbol_limit: u32,
+    ) -> Result<u32> {
+        if self.lz77.is_none() || decoded_symbol_limit == 0 {
+            return Ok(0);
+        }
+        let distance_cluster = usize::from(
+            *self
+                .context_to_cluster
+                .last()
+                .ok_or_else(|| invalid_entropy_error("LZ77 distance context is missing"))?,
+        );
+        let config = *self
+            .configs
+            .get(distance_cluster)
+            .ok_or_else(|| invalid_entropy_error("LZ77 distance config is missing"))?;
+        let mut maximum_distance = 0u32;
+        for token in self.coder.supported_tokens(distance_cluster)? {
+            let (minimum, maximum) = config.value_bounds(token);
+            if distance_multiplier == 0 {
+                maximum_distance =
+                    maximum_distance.max(resolve_lz77_distance(maximum, 0, decoded_symbol_limit));
+                continue;
+            }
+            let special_end = maximum.min(119);
+            if minimum <= special_end {
+                for value in minimum..=special_end {
+                    maximum_distance = maximum_distance.max(resolve_lz77_distance(
+                        value,
+                        distance_multiplier,
+                        decoded_symbol_limit,
+                    ));
+                }
+            }
+            if maximum >= 120 {
+                maximum_distance = maximum_distance.max(resolve_lz77_distance(
+                    maximum,
+                    distance_multiplier,
+                    decoded_symbol_limit,
+                ));
+            }
+        }
+        maximum_distance
+            .checked_next_power_of_two()
+            .ok_or_else(|| invalid_entropy_error("LZ77 history ring size overflow").into())
     }
 
     /// Packs a descriptor-only GPU ABI for non-Modular consumers such as VarDCT metadata.
@@ -1883,6 +2031,112 @@ mod tests {
         assert_eq!(unpack_signed(2), 1);
         assert_eq!(unpack_signed(3), -2);
         assert_eq!(add_log2_ceil(15), 4);
+    }
+
+    #[test]
+    fn hybrid_value_bounds_include_every_extra_bit_pattern() {
+        let config = HybridIntegerConfigIr {
+            split_exponent: 0,
+            msb_in_token: 0,
+            lsb_in_token: 0,
+        };
+        assert_eq!(config.value_bounds(0), (0, 0));
+        assert_eq!(config.value_bounds(1), (1, 1));
+        assert_eq!(config.value_bounds(2), (2, 3));
+    }
+
+    #[test]
+    fn prefix_distance_histogram_sizes_exact_power_of_two_lz_ring() {
+        let descriptor = EntropyDecoderIr {
+            lz77: Some(super::Lz77Ir {
+                min_symbol: 224,
+                min_length: 3,
+                length_config: HybridIntegerConfigIr {
+                    split_exponent: 0,
+                    msb_in_token: 0,
+                    lsb_in_token: 0,
+                },
+            }),
+            context_to_cluster: vec![0, 0],
+            configs: vec![HybridIntegerConfigIr {
+                split_exponent: 8,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            }],
+            coder: EntropyCoderIr::Prefix(vec![PrefixHistogramIr::single(0).unwrap()]),
+        };
+        assert_eq!(descriptor.lz77_window_words(256, 65_536).unwrap(), 256);
+
+        let mut distance_one = descriptor;
+        distance_one.coder = EntropyCoderIr::Prefix(vec![PrefixHistogramIr::single(1).unwrap()]);
+        assert_eq!(distance_one.lz77_window_words(256, 65_536).unwrap(), 1);
+    }
+
+    #[test]
+    fn ans_alias_support_bounds_lz_ring_without_decoding_symbols() {
+        let alias_distance_one = AnsBucketIr::new(1, 0, 4096, 0, 0);
+        let descriptor = EntropyDecoderIr {
+            lz77: Some(super::Lz77Ir {
+                min_symbol: 224,
+                min_length: 3,
+                length_config: HybridIntegerConfigIr {
+                    split_exponent: 0,
+                    msb_in_token: 0,
+                    lsb_in_token: 0,
+                },
+            }),
+            context_to_cluster: vec![0, 0],
+            configs: vec![HybridIntegerConfigIr {
+                split_exponent: 8,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            }],
+            coder: EntropyCoderIr::Ans {
+                log_alphabet_size: 5,
+                histograms: vec![super::AnsHistogramIr {
+                    buckets: vec![alias_distance_one, alias_distance_one],
+                    log_bucket_size: 7,
+                    single_symbol: None,
+                }],
+            },
+        };
+        assert_eq!(descriptor.lz77_window_words(256, 65_536).unwrap(), 1);
+    }
+
+    #[test]
+    fn malformed_ans_alias_table_cannot_underallocate_lz_history() {
+        let descriptor = EntropyDecoderIr {
+            lz77: Some(super::Lz77Ir {
+                min_symbol: 224,
+                min_length: 3,
+                length_config: HybridIntegerConfigIr {
+                    split_exponent: 0,
+                    msb_in_token: 0,
+                    lsb_in_token: 0,
+                },
+            }),
+            context_to_cluster: vec![0, 0],
+            configs: vec![HybridIntegerConfigIr {
+                split_exponent: 8,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            }],
+            coder: EntropyCoderIr::Ans {
+                log_alphabet_size: 5,
+                histograms: vec![super::AnsHistogramIr {
+                    buckets: vec![AnsBucketIr::new(7, 0, 4096, 0, 0)],
+                    log_bucket_size: 7,
+                    single_symbol: None,
+                }],
+            },
+        };
+        let error = descriptor.lz77_window_words(256, 65_536).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::ModularTree(crate::ModularTreeError::InvalidEntropy {
+                reason: "ANS alias exceeds its alphabet"
+            })
+        ));
     }
 
     #[test]

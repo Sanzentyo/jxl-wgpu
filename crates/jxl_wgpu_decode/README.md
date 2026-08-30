@@ -25,9 +25,10 @@ decode a pass-group entropy token, residual, predictor, color transform, or pixe
 
 The compute shader reads Prefix or ANS symbols and hybrid integers from bounded codestream windows,
 validates every bit and output bound, applies LZ77, walks the MA tree, reconstructs all predictors,
-and reverses YCoCg for RGB(A). Up to 64 budget- and device-resolved scratch lanes decode independent
-groups in one `dispatch_workgroups` wave; their canvas rectangles do not overlap. Large frames use
-ordered batches backed by one reusable stream window instead of binding the full codestream. One
+and reverses YCoCg for RGB(A). Up to 512 budget- and device-resolved scratch lanes decode independent
+groups in one `dispatch_workgroups` wave; 64 logical group invocations are packed into each portable
+compute workgroup and their canvas rectangles do not overlap. Large frames use ordered batches backed
+by one reusable stream window instead of binding the full codestream. One
 aggregate status staging buffer is mapped once after the last batch, and every four-word group
 status is checked before the frame is reported. No reconstructed sample is produced on the CPU.
 `DecodeProfile::ModularLossless` reports this as `ModularPredictionProfile::MetaAdaptive` with
@@ -36,6 +37,22 @@ engines use the distinct `Fixed` variant.
 
 VarDCT, multiple passes, palette/squeeze and non-YCoCg transforms, non-alpha extra channels,
 patches, splines, noise, and reference-frame animation remain typed unsupported profiles.
+
+### Measured lossless Modular checkpoint
+
+On an Apple M5, the 36,643,474-byte 7680x4320 Gray8 conformance codestream decoded to the exact
+33,177,600-byte source hash in one codec submission. Warm sequential decode plus staged UMA
+readback (`warmup=1`, `iterations=7`) selected 64 invocations per workgroup: 32/64/128/256 produced
+median latencies of 280.151/280.387/292.455/303.263 ms respectively, while 64 had the best mean
+and p95 (280.878/282.067 ms). The chosen pipeline is 5.20x faster than the earlier 64-lane,
+8-MiB-window, one-invocation-workgroup checkpoint (1.457 s). These are one-device engineering
+measurements, not cross-adapter performance guarantees; `memory_stats` exposes the resolved
+window, lanes, workgroups, and submissions for each device and request.
+
+The same selected pipeline decoded the exact 15360x8640 Gray8 hash from a 146,573,715-byte
+codestream in six bounded submissions: warm median 1.502 s (`warmup=1`, `iterations=3`), down from
+5.861 s and 32 submissions at the earlier checkpoint. The 132,710,400-byte output remains
+persistent while the stream window and descriptor-sized parallel scratch are reused across waves.
 
 ## GPU output formats
 
@@ -115,24 +132,30 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 176-byte `repr(C)` POD. It carries the token
+The CPU/WGSL per-group parameter ABI is a checked 180-byte `repr(C)` POD. It carries the token
 range, local extent, canvas origin, source channel/depth/mask, chroma-initialization ownership,
 four plane offset/stride pairs, exact output channel/order/depth/range/transfer codes, the resolved
-numeric mapping, global status index, MA stream index, weighted-predictor header, and
+numeric mapping, descriptor-derived LZ ring mask, global status index, MA stream index,
+weighted-predictor header, and
 shader-visible logical size. Records are a tightly packed read-only storage array; a separate
 16-byte uniform selects the global group range and local scratch-lane stride for each wave.
 Codestream segments are rounded to four bytes and include a zero sentinel word for bounded
-cross-word peeks. The peak stream allocation is capped at 8 MiB, and token offsets are rebased to
-their window rather than requiring a full-codestream storage binding.
+cross-word peeks. Token offsets are rebased to their window rather than requiring a
+full-codestream storage binding. The peak window grows only when a larger batch fits the actual
+per-slot shared byte budget and device storage-binding limit, allowing a large still image to
+coalesce submissions without compromising concurrent small-frame admission.
 
 Entropy metadata, bounded lane scratch, aggregate status/readback, parameters, dispatch control,
 output, and peak stream-window sizes are overflow-checked against storage, uniform, and device
-buffer limits. Lane count is the minimum of the 64-lane cap, group count, device workgroup/storage
-limits, and the scratch space affordable per requested frame slot. If the requested slot count is
+buffer limits. Lane count is the minimum of the 512-lane watchdog cap, group count, device workgroup/storage
+limits, and the scratch plus actual peak stream space affordable per requested frame slot. The LZ
+ring itself is the next power of two above the largest reachable back-reference derived from the
+distance histogram, hybrid-integer configuration, and group width; it is never sized by decoding
+residuals on the host. If the requested slot count is
 not affordable but one complete frame is, the prepared backend narrows it and propagates the
 resolved bound into the actual session limiter and prefetch validation. `WgpuDecodeSession::memory_stats`
-reports complete per-frame, output-lease, transient, peak-window, resolved-slot, lane-count,
-stream-batch, and actual submission counts. Concurrent jobs opened through an engine or its
+reports complete per-frame, output-lease, transient, peak-window, resolved-slot, stream/scratch/LZ
+sizes, lane/workgroup counts, stream batches, and actual submission counts. Concurrent jobs opened through an engine or its
 clones use the `WgpuBackend`'s shared
 transient memory budget by default, so decode, encode, and generic readback apply one aggregate
 admission bound. `WgpuSubmissionEngine::with_memory_budget` instead accepts an explicit cloneable
@@ -152,7 +175,7 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for e
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while metadata and packed 176-byte
+aligned spans directly from the shared input storage, while metadata and packed 180-byte
 `ShaderParams` records use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.

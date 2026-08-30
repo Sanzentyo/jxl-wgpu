@@ -11,6 +11,7 @@ struct Params {
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
+    lz77_window_mask: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -504,14 +505,15 @@ fn finalize_output() {
 
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
-@compute @workgroup_size(1)
-fn decode(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
-    if workgroup_id.x >= dispatch_control.group_count {
+@compute @workgroup_size(/*__JXL_WORKGROUP_SIZE__*/)
+fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+    let lane_index = global_invocation_id.x;
+    if lane_index >= dispatch_control.group_count {
         return;
     }
-    let group_index = dispatch_control.first_group + workgroup_id.x;
+    let group_index = dispatch_control.first_group + lane_index;
     params = params_table[group_index];
-    reconstruction_base = workgroup_id.x * dispatch_control.lane_stride_words;
+    reconstruction_base = lane_index * dispatch_control.lane_stride_words;
     bit_cursor = params.token_start;
     decode_error = 0u;
     current_channel = 0u;
