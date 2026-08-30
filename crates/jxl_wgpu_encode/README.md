@@ -93,17 +93,40 @@ provided by the application.
 
 ## Experimental VarDCT profile
 
-`VarDctEncoder` accepts padded, interleaved sRGB8 and executes sRGB linearization, XYB conversion,
-forward DCT8, quantization, token generation, and histogram artifact generation on the GPU. The
-host validates those bounded artifacts and assembles a standard VarDCT still codestream. The
-current capability intentionally advertises only DCT8 at its fixed distance-25 control plane;
-the typed strategy inventory already describes all 27 standard strategies but does not pretend
-that unimplemented strategies are executable.
+`VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
+image whose extent equals that transform. Seven regular strategies are executable end to end:
+`Dct8`, `Dct16x8` (8×16 pixels), `Dct8x16` (16×8), `Dct16x16`, `Dct32x32`, `Dct32x16` (16×32),
+and `Dct16x32` (32×16). `VarDctStrategy::EXECUTABLE` is the authoritative inventory; the other
+standard identifiers remain typed but are rejected rather than silently lowered to DCT8.
 
-The VarDCT submission owns 3,512 budgeted bytes, supports blocking completion and a runtime-neutral
-`Future`, and is deterministic on one device. Rust `jxl`, `djxl`, and a development-only `cjxl`
-fixture agree on its dimensions and RGB8 output. Black is exact; red and gradient fixtures carry
-explicit quality guards. There is no CPU transform, quantization, or pixel fallback.
+The GPU executes sRGB linearization, XYB conversion, the selected full regular forward transform,
+LF quantization, the per-8×8 clamped-gradient DC predictor, signed tokenization, prefix packing,
+histogramming, and construction of the standard strategy map. The host validates the complete
+typed artifact before serializing control metadata. This LF-first distance-25 profile deliberately
+quantizes every AC coefficient to zero, so it is interoperable but is not yet a general quality
+or rate-control implementation.
+
+Each VarDCT submission reserves exactly 51,456 encoder-owned bytes: one 256-byte parameter record,
+one 25,600-byte GPU artifact, and one equal-size readback. The WGSL parameter ABI is explicitly
+padded to 256 bytes; the artifact bounds one 32×32 transform, 16 DC blocks, and a 2,048-bit GPU
+entropy fragment, and both records are `bytemuck::Pod`. Completion supports blocking native use
+and a runtime-neutral `Future`, and is deterministic on one device. Actual-GPU tests run every
+executable strategy through the published Rust `jxl` decoder; black is exact and solid-red and
+gradient fixtures carry explicit quality guards. `djxl` verifies emitted streams, while `cjxl`
+serves as a development quality oracle. There is no CPU transform, quantization, residual,
+entropy, pixel-codec fallback, or compatibility alias.
+
+```rust,no_run
+# use jxl_wgpu_encode::{BufferImageSource, VarDctEncoder, VarDctStrategy, WgpuContext};
+# fn encode(
+#     context: WgpuContext,
+#     source_16_by_8: BufferImageSource,
+# ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
+let encoder = VarDctEncoder::new(context, VarDctStrategy::Dct8x16)?;
+assert_eq!(encoder.strategy().block_extent(), (16, 8));
+encoder.encode(source_16_by_8)
+# }
+```
 
 ## Animation sessions
 

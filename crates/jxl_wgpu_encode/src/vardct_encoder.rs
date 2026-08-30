@@ -1,9 +1,9 @@
 //! Standard VarDCT still-image encoder frontend.
 //!
-//! This module deliberately starts with one complete, independently decodable
-//! DCT8 profile.  Its fixed control-plane syntax is kept separate from the
-//! lossless Modular encoder so neither profile becomes a compatibility layer
-//! for the other.
+//! The bounded frontend encodes one regular transform whose extent is also the
+//! image extent. Its control-plane syntax is kept separate from the lossless
+//! Modular encoder so neither profile becomes a compatibility layer for the
+//! other.
 
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -32,7 +32,10 @@ use crate::{
 const GLOBAL_SCALE: u32 = 8_813;
 const QUANT_LF: u32 = 10;
 const HF_MUL: i32 = 6;
-const MAX_DC_FRAGMENT_WORDS: usize = 5;
+const MAX_BLOCKS: usize = 16;
+const MAX_COEFFICIENTS: usize = 32 * 32;
+const MAX_DC_SAMPLES: usize = 3 * MAX_BLOCKS;
+const MAX_DC_FRAGMENT_WORDS: usize = 64;
 const SHADER: &str = include_str!("vardct_encoder.wgsl");
 const PROFILE_DISTANCE: f32 = 25.0;
 
@@ -73,9 +76,9 @@ impl VarDctColorEncoding {
 
 /// Typed JPEG XL VarDCT strategy identifier.
 ///
-/// The enum covers the complete standard strategy alphabet so the dispatch IR
-/// does not need another representation when larger transforms are added.
-/// The current frontend admits only [`Self::Dct8`].
+/// The enum covers the complete standard strategy alphabet. Use
+/// [`Self::EXECUTABLE`] to enumerate the regular transforms implemented by the
+/// current GPU kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum VarDctStrategy {
@@ -141,6 +144,17 @@ impl VarDctStrategy {
         Self::Dct128x256,
     ];
 
+    /// Regular strategies implemented end-to-end by this encoder.
+    pub const EXECUTABLE: [Self; 7] = [
+        Self::Dct8,
+        Self::Dct16x8,
+        Self::Dct8x16,
+        Self::Dct16x16,
+        Self::Dct32x32,
+        Self::Dct32x16,
+        Self::Dct16x32,
+    ];
+
     #[must_use]
     pub const fn codestream_id(self) -> u8 {
         self as u8
@@ -171,6 +185,27 @@ impl VarDctStrategy {
             Dct256x128 => (128, 256),
             Dct128x256 => (256, 128),
         }
+    }
+
+    /// Whether this strategy has a GPU transform and standard emitter in this
+    /// frontend.
+    #[must_use]
+    pub const fn is_executable(self) -> bool {
+        matches!(
+            self,
+            Self::Dct8
+                | Self::Dct16x8
+                | Self::Dct8x16
+                | Self::Dct16x16
+                | Self::Dct32x32
+                | Self::Dct32x16
+                | Self::Dct16x32
+        )
+    }
+
+    const fn block_grid(self) -> (u32, u32) {
+        let (width, height) = self.block_extent();
+        (width as u32 / 8, height as u32 / 8)
     }
 }
 
@@ -209,9 +244,15 @@ impl VarDctMemoryPlan {
 struct VarDctKernelParams {
     row_stride: u32,
     byte_offset: u32,
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    strategy: u32,
     global_scale: u32,
     quant_lf: u32,
     raw_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    padding: [u32; 17],
 }
 
 #[repr(C)]
@@ -224,22 +265,27 @@ struct GpuPrefixEntry {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct VarDctKernelArtifact {
-    quantized_dc_yxb: [i32; 3],
-    dc_raw_tokens: [u32; 3],
-    dc_extra_bits: [u32; 3],
+    strategy_map: [u32; MAX_BLOCKS],
+    quantized_dc_yxb: [i32; MAX_DC_SAMPLES],
+    dc_raw_tokens: [u32; MAX_DC_SAMPLES],
+    dc_extra_bits: [u32; MAX_DC_SAMPLES],
     dc_fragment_words: [u32; MAX_DC_FRAGMENT_WORDS],
     dc_fragment_bit_len: u32,
+    dc_sample_count: u32,
+    block_count: u32,
+    strategy: u32,
     raw_histogram: [u32; RAW_SYMBOLS],
-    forward_xyb_bits: [u32; 3 * 64],
-    quantized_xyb: [i32; 3 * 64],
+    padding: [u32; 9],
+    forward_xyb_bits: [u32; 3 * MAX_COEFFICIENTS],
+    quantized_xyb: [i32; 3 * MAX_COEFFICIENTS],
 }
 
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 168);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 256);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelArtifact>() == 1_672);
+    assert!(std::mem::size_of::<VarDctKernelArtifact>() == 25_600);
     assert!(std::mem::align_of::<VarDctKernelArtifact>() == 4);
 };
 
@@ -433,6 +479,14 @@ fn write_unsigned_token(
     code.write_raw(output, token, nbits, value - (1 << nbits))
 }
 
+fn pack_signed_control(value: i32) -> u32 {
+    if value < 0 {
+        value.unsigned_abs() * 2 - 1
+    } else {
+        value as u32 * 2
+    }
+}
+
 fn append_gpu_dc_fragment(
     output: &mut BitWriter,
     artifact: &VarDctKernelArtifact,
@@ -460,20 +514,33 @@ fn write_lf_group(
     write_local_modular_header(output)?;
     append_gpu_dc_fragment(output, artifact)?;
 
-    // One DCT8 block, no chroma-from-luma correction, fixed HF multiplier,
-    // and zero EPF sharpness. These are control metadata, never source pixels.
+    // One GPU-selected regular transform, no chroma-from-luma correction,
+    // fixed HF multiplier, and zero EPF sharpness. Source-dependent DC entropy
+    // was already packed by the GPU; these values describe its control map.
+    // HfMetadata first stores `number of first blocks - 1`; this profile has
+    // exactly one first block, while the field width grows with the DC grid.
+    let first_block_bits = artifact.block_count.next_power_of_two().trailing_zeros() as u8;
+    output.write_bits(0, first_block_bits)?;
     write_local_modular_header(output)?;
-    for value in [0, 0, 0, (HF_MUL - 1) * 2, 0] {
-        write_unsigned_token(output, code, value as u32)?;
+    write_unsigned_token(output, code, 0)?;
+    write_unsigned_token(output, code, 0)?;
+    write_unsigned_token(output, code, pack_signed_control(artifact.strategy as i32))?;
+    write_unsigned_token(
+        output,
+        code,
+        pack_signed_control((HF_MUL - 1) - artifact.strategy as i32),
+    )?;
+    for _ in 0..artifact.block_count {
+        write_unsigned_token(output, code, 0)?;
     }
     Ok(())
 }
 
 fn write_hf_global(output: &mut BitWriter) -> Result<(), EncodeError> {
     // Default dequant matrices, natural coefficient order, and a single-token
-    // HF decoder whose only symbol is zero. All 189 AC coefficients are zero
-    // in this initial DC-only DCT8 quantization profile, so the pass group has
-    // no payload bits. This is the 18-bit normative bundle encoding of those
+    // HF decoder whose only symbol is zero. All AC coefficients are zero in
+    // this LF-first regular-transform profile, so the pass group has no
+    // payload bits. This is the 18-bit normative bundle encoding of those
     // fields, written LSB-first by BitWriter.
     output.write_bits(0x2495, 18)?;
     Ok(())
@@ -506,27 +573,33 @@ struct VarDctDispatchPlan {
     memory: VarDctMemoryPlan,
 }
 
-/// GPU backend for the bounded standard DCT8 still-image profile.
+/// GPU backend for one bounded standard regular-transform still-image profile.
 ///
-/// The initial profile accepts exactly one 8x8 interleaved sRGB8 block. This
-/// intentionally small surface is complete: it emits a standards-compliant
-/// VarDCT frame and does not route pixels or coefficients through a CPU codec.
+/// The source extent must equal the selected transform extent. The backend
+/// emits a standards-compliant VarDCT frame and does not route pixels or
+/// coefficients through a CPU codec.
 pub struct VarDctBackend {
     pipeline: Arc<wgpu::ComputePipeline>,
     code: PrefixCode,
+    strategy: VarDctStrategy,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     storage_offset_alignment: u64,
 }
 
 impl VarDctBackend {
-    /// Creates the standard DCT8 backend and its compute pipeline.
+    /// Creates a standard regular-transform backend and its compute pipeline.
     ///
     /// # Errors
     ///
     /// Returns an encoder error if the fixed standard entropy tree cannot be
     /// represented by the JPEG XL prefix-code writer.
-    pub fn new(context: &WgpuContext) -> Result<Self, EncodeError> {
+    pub fn new(context: &WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
+        if !strategy.is_executable() {
+            return Err(EncodeError::InvalidConfiguration(
+                "the selected VarDCT strategy is not implemented by the GPU kernel",
+            ));
+        }
         let code = fixed_prefix_code()?;
         let module = context
             .device()
@@ -536,7 +609,7 @@ impl VarDctBackend {
             });
         let pipeline = Arc::new(context.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu VarDCT DCT8 pipeline"),
+                label: Some("jxl-wgpu VarDCT regular-transform pipeline"),
                 layout: None,
                 module: &module,
                 entry_point: Some("encode"),
@@ -549,6 +622,7 @@ impl VarDctBackend {
         Ok(Self {
             pipeline,
             code,
+            strategy,
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
                     min_distance: distance,
@@ -579,9 +653,11 @@ impl VarDctBackend {
 
     fn dispatch_plan(&self, source: &BufferImageSource) -> Result<VarDctDispatchPlan, EncodeError> {
         let extent = source.layout.extent;
-        if extent.width != 8 || extent.height != 8 {
+        let (expected_width, expected_height) = self.strategy.block_extent();
+        if extent.width != u32::from(expected_width) || extent.height != u32::from(expected_height)
+        {
             return Err(EncodeError::InvalidSource(
-                "the initial VarDCT profile requires an 8x8 source",
+                "the VarDCT source extent must equal the selected transform extent",
             ));
         }
         if source.layout.format != VarDctColorEncoding::SrgbD65.pixel_format()
@@ -594,8 +670,8 @@ impl VarDctBackend {
             .layout
             .plane(0)
             .ok_or(EncodeError::InvalidSource("missing VarDCT RGB plane"))?;
-        const ROW_BYTES: u64 = 8 * 3;
-        if plane.row_bytes != ROW_BYTES || plane.row_stride < ROW_BYTES {
+        let row_bytes = u64::from(extent.width) * 3;
+        if plane.row_bytes != row_bytes || plane.row_stride < row_bytes {
             return Err(EncodeError::InvalidSource(
                 "the VarDCT RGB plane has an invalid row layout",
             ));
@@ -604,9 +680,9 @@ impl VarDctBackend {
             .map_err(|_| EncodeError::InvalidSource("VarDCT row stride exceeds WGSL u32"))?;
         let sample_end = plane
             .row_stride
-            .checked_mul(7)
+            .checked_mul(u64::from(extent.height - 1))
             .and_then(|rows| plane.offset.checked_add(rows))
-            .and_then(|offset| offset.checked_add(ROW_BYTES))
+            .and_then(|offset| offset.checked_add(row_bytes))
             .ok_or(EncodeError::InvalidSource(
                 "VarDCT source address arithmetic overflow",
             ))?;
@@ -658,9 +734,15 @@ impl VarDctBackend {
             byte_offset: u32::try_from(relative_offset).map_err(|_| {
                 EncodeError::InvalidSource("VarDCT source offset exceeds the WGSL u32 space")
             })?,
+            width: extent.width,
+            height: extent.height,
+            blocks_x: extent.width / 8,
+            blocks_y: extent.height / 8,
+            strategy: u32::from(self.strategy.codestream_id()),
             global_scale: GLOBAL_SCALE,
             quant_lf: QUANT_LF,
             raw_prefix: prefix_entries(&self.code),
+            padding: [0; 17],
         };
         Ok(VarDctDispatchPlan {
             source_binding_offset,
@@ -684,17 +766,21 @@ fn profile_distance() -> PerceptualDistance {
         .expect("the fixed VarDCT distance is within the public validated range")
 }
 
-fn validate_vardct_request(request: &FrameEncodeRequest) -> Result<(), EncodeError> {
+fn validate_vardct_request(
+    request: &FrameEncodeRequest,
+    strategy: VarDctStrategy,
+) -> Result<(), EncodeError> {
+    let (width, height) = strategy.block_extent();
     if request.frame_index != FrameIndex::new(0)
         || !request.is_last
         || request.animation != AnimationHeader::Still
-        || request.canvas_width != 8
-        || request.canvas_height != 8
+        || request.canvas_width != u32::from(width)
+        || request.canvas_height != u32::from(height)
         || request.options != FrameOptions::default()
         || request.progressive != ProgressivePlan::single()
     {
         return Err(EncodeError::InvalidConfiguration(
-            "the initial VarDCT profile requires one full-canvas final 8x8 still frame",
+            "the VarDCT profile requires one full-canvas final transform-sized still frame",
         ));
     }
     if request.profile
@@ -703,7 +789,7 @@ fn validate_vardct_request(request: &FrameEncodeRequest) -> Result<(), EncodeErr
         })
     {
         return Err(EncodeError::InvalidConfiguration(
-            "the requested VarDCT distance does not match the fixed DCT8 profile",
+            "the requested VarDCT distance does not match the fixed LF-first profile",
         ));
     }
     Ok(())
@@ -733,7 +819,7 @@ impl GpuEncodeBackend for VarDctBackend {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
-        validate_vardct_request(request)?;
+        validate_vardct_request(request, self.strategy)?;
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -859,6 +945,7 @@ impl GpuEncodeBackend for VarDctBackend {
             lifetime: Some(lifetime),
             completion,
             code: self.code.clone(),
+            strategy: self.strategy,
             frame_index: request.frame_index,
             is_last: request.is_last,
         })
@@ -947,6 +1034,7 @@ pub struct VarDctJob {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
     code: PrefixCode,
+    strategy: VarDctStrategy,
     frame_index: FrameIndex,
     is_last: bool,
 }
@@ -971,7 +1059,7 @@ impl VarDctJob {
         let result = (|| {
             let artifact = bytemuck::try_from_bytes::<VarDctKernelArtifact>(&mapped)
                 .map_err(|_| BackendError::InvalidArtifact("VarDCT ABI size or alignment"))?;
-            validate_artifact(artifact, &self.code)?;
+            validate_artifact(artifact, &self.code, self.strategy)?;
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
                 is_last: self.is_last,
@@ -1018,29 +1106,65 @@ impl GpuEncodeJob for VarDctJob {
 fn validate_artifact(
     artifact: &VarDctKernelArtifact,
     code: &PrefixCode,
+    strategy: VarDctStrategy,
 ) -> Result<(), BackendError> {
-    if artifact.quantized_dc_yxb[0] != artifact.quantized_xyb[64]
-        || artifact.quantized_dc_yxb[1] != artifact.quantized_xyb[0]
-        || artifact.quantized_dc_yxb[2] != artifact.quantized_xyb[128]
+    let (blocks_x, blocks_y) = strategy.block_grid();
+    let block_count = usize::try_from(blocks_x * blocks_y)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT block count does not fit usize"))?;
+    let expected_strategy = u32::from(strategy.codestream_id());
+    if artifact.strategy != expected_strategy
+        || artifact.block_count != block_count as u32
+        || artifact.dc_sample_count != (3 * block_count) as u32
     {
         return Err(BackendError::InvalidArtifact(
-            "VarDCT DC channel ordering mismatch",
+            "VarDCT strategy or live-count header mismatch",
         ));
     }
-    for channel in 0..3 {
-        let base = channel * 64;
-        if artifact.quantized_xyb[base + 1..base + 64]
+    for block in 0..MAX_BLOCKS {
+        let expected = if block < block_count {
+            expected_strategy | u32::from(block == 0) << 8
+        } else {
+            0
+        };
+        if artifact.strategy_map[block] != expected {
+            return Err(BackendError::InvalidArtifact(
+                "VarDCT GPU strategy map is malformed",
+            ));
+        }
+    }
+
+    let coefficient_count =
+        usize::from(strategy.block_extent().0) * usize::from(strategy.block_extent().1);
+    let xyb_channels = [1usize, 0, 2];
+    for (dc_channel, &xyb_channel) in xyb_channels.iter().enumerate() {
+        let dc_base = dc_channel * MAX_BLOCKS;
+        let coefficient_base = xyb_channel * MAX_COEFFICIENTS;
+        for block in 0..block_count {
+            if artifact.quantized_dc_yxb[dc_base + block]
+                != artifact.quantized_xyb[coefficient_base + block]
+            {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT DC channel ordering mismatch",
+                ));
+            }
+        }
+        if artifact.quantized_dc_yxb[dc_base + block_count..dc_base + MAX_BLOCKS]
             .iter()
             .any(|&value| value != 0)
+            || artifact.quantized_xyb
+                [coefficient_base + block_count..coefficient_base + MAX_COEFFICIENTS]
+                .iter()
+                .any(|&value| value != 0)
         {
             return Err(BackendError::InvalidArtifact(
-                "the fixed VarDCT profile produced a nonzero AC token",
+                "the VarDCT profile produced a nonzero AC or padding token",
             ));
         }
     }
     if artifact
         .forward_xyb_bits
-        .iter()
+        .chunks_exact(MAX_COEFFICIENTS)
+        .flat_map(|channel| &channel[..coefficient_count])
         .any(|&bits| !f32::from_bits(bits).is_finite())
     {
         return Err(BackendError::InvalidArtifact(
@@ -1051,36 +1175,70 @@ fn validate_artifact(
     let entries = code.raw_entries();
     let mut expected_histogram = [0u32; RAW_SYMBOLS];
     let mut bit_offset = 0u32;
-    for (slot, &value) in artifact.quantized_dc_yxb.iter().enumerate() {
-        let (token, extra_bit_count, extra) = signed_token(value)?;
-        if artifact.dc_raw_tokens[slot] != token || artifact.dc_extra_bits[slot] != extra {
-            return Err(BackendError::InvalidArtifact(
-                "VarDCT DC token does not match its quantized coefficient",
-            ));
+    for channel in 0..3 {
+        let base = channel * MAX_BLOCKS;
+        for block in 0..block_count {
+            let block_x = block % blocks_x as usize;
+            let block_y = block / blocks_x as usize;
+            let left = if block_x > 0 {
+                artifact.quantized_dc_yxb[base + block - 1]
+            } else if block_y > 0 {
+                artifact.quantized_dc_yxb[base + block - blocks_x as usize]
+            } else {
+                0
+            };
+            let top = if block_y > 0 {
+                artifact.quantized_dc_yxb[base + block - blocks_x as usize]
+            } else {
+                left
+            };
+            let top_left = if block_x > 0 && block_y > 0 {
+                artifact.quantized_dc_yxb[base + block - blocks_x as usize - 1]
+            } else {
+                left
+            };
+            let residual =
+                artifact.quantized_dc_yxb[base + block] - clamped_gradient_i32(top, left, top_left);
+            let (token, extra_bit_count, extra) = signed_token(residual)?;
+            let slot = base + block;
+            if artifact.dc_raw_tokens[slot] != token || artifact.dc_extra_bits[slot] != extra {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT DC token does not match its predicted residual",
+                ));
+            }
+            let token_index = usize::try_from(token).map_err(|_| {
+                BackendError::InvalidArtifact("VarDCT DC token index does not fit usize")
+            })?;
+            let entry = entries
+                .get(token_index)
+                .ok_or(BackendError::InvalidArtifact(
+                    "VarDCT DC token exceeds the fixed entropy alphabet",
+                ))?;
+            if read_fragment_bits(artifact, bit_offset, u32::from(entry.bit_len))?
+                != u32::from(entry.bits)
+            {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT GPU prefix fragment does not match its token",
+                ));
+            }
+            bit_offset += u32::from(entry.bit_len);
+            if read_fragment_bits(artifact, bit_offset, extra_bit_count)? != extra {
+                return Err(BackendError::InvalidArtifact(
+                    "VarDCT GPU extra-bit fragment does not match its token",
+                ));
+            }
+            bit_offset += extra_bit_count;
+            expected_histogram[token_index] += 1;
         }
-        let token_index = usize::try_from(token).map_err(|_| {
-            BackendError::InvalidArtifact("VarDCT DC token index does not fit usize")
-        })?;
-        let entry = entries
-            .get(token_index)
-            .ok_or(BackendError::InvalidArtifact(
-                "VarDCT DC token exceeds the fixed entropy alphabet",
-            ))?;
-        if read_fragment_bits(artifact, bit_offset, u32::from(entry.bit_len))?
-            != u32::from(entry.bits)
+        if artifact.dc_raw_tokens[base + block_count..base + MAX_BLOCKS]
+            .iter()
+            .chain(&artifact.dc_extra_bits[base + block_count..base + MAX_BLOCKS])
+            .any(|&value| value != 0)
         {
             return Err(BackendError::InvalidArtifact(
-                "VarDCT GPU prefix fragment does not match its token",
+                "VarDCT DC token padding is nonzero",
             ));
         }
-        bit_offset += u32::from(entry.bit_len);
-        if read_fragment_bits(artifact, bit_offset, extra_bit_count)? != extra {
-            return Err(BackendError::InvalidArtifact(
-                "VarDCT GPU extra-bit fragment does not match its token",
-            ));
-        }
-        bit_offset += extra_bit_count;
-        expected_histogram[token_index] += 1;
     }
     if bit_offset != artifact.dc_fragment_bit_len || artifact.raw_histogram != expected_histogram {
         return Err(BackendError::InvalidArtifact(
@@ -1088,6 +1246,10 @@ fn validate_artifact(
         ));
     }
     Ok(())
+}
+
+fn clamped_gradient_i32(top: i32, left: i32, top_left: i32) -> i32 {
+    (top + left - top_left).clamp(top.min(left), top.max(left))
 }
 
 fn signed_token(value: i32) -> Result<(u32, u32, u32), BackendError> {
@@ -1138,9 +1300,11 @@ fn read_fragment_bits(
     Ok(value)
 }
 
-/// GPU-only convenience encoder for the bounded standard DCT8 still profile.
+/// GPU-only convenience encoder for one bounded standard regular VarDCT
+/// transform.
 pub struct VarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
+    strategy: VarDctStrategy,
 }
 
 impl VarDctEncoder {
@@ -1148,12 +1312,14 @@ impl VarDctEncoder {
     ///
     /// # Errors
     ///
-    /// Returns an encoder error if its fixed standard entropy tree cannot be
-    /// constructed.
-    pub fn new(context: WgpuContext) -> Result<Self, EncodeError> {
-        let backend = VarDctBackend::new(&context)?;
+    /// Returns an encoder error if `strategy` is not in
+    /// [`VarDctStrategy::EXECUTABLE`] or the fixed standard entropy tree cannot
+    /// be constructed.
+    pub fn new(context: WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
+        let backend = VarDctBackend::new(&context, strategy)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
+            strategy,
         })
     }
 
@@ -1164,7 +1330,7 @@ impl VarDctEncoder {
 
     #[must_use]
     pub const fn strategy(&self) -> VarDctStrategy {
-        VarDctStrategy::Dct8
+        self.strategy
     }
 
     #[must_use]
@@ -1211,6 +1377,9 @@ impl VarDctEncoder {
         container: bool,
     ) -> Result<VarDctSubmission, EncodeError> {
         self.memory_plan(&source)?;
+        let (width, height) = self.strategy.block_extent();
+        let width = u32::from(width);
+        let height = u32::from(height);
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
@@ -1220,8 +1389,8 @@ impl VarDctEncoder {
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::SameDevice,
             animation: AnimationHeader::Still,
-            canvas_width: 8,
-            canvas_height: 8,
+            canvas_width: width,
+            canvas_height: height,
             options: FrameOptions::default(),
         };
         let frame = self
@@ -1229,7 +1398,7 @@ impl VarDctEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(VarDctSubmission {
             frame: Some(frame),
-            codestream_header: image_header(8, 8)?,
+            codestream_header: image_header(width, height)?,
             container,
         })
     }
@@ -1287,9 +1456,12 @@ impl Future for VarDctSubmission {
 fn cpu_test_artifact(q_yxb: [i32; 3], code: &PrefixCode) -> VarDctKernelArtifact {
     let mut fragment = BitWriter::new();
     let mut histogram = [0u32; RAW_SYMBOLS];
-    let mut raw_tokens = [0u32; 3];
-    let mut extra_bits = [0u32; 3];
-    for (index, value) in q_yxb.into_iter().enumerate() {
+    let mut quantized_dc_yxb = [0i32; MAX_DC_SAMPLES];
+    let mut raw_tokens = [0u32; MAX_DC_SAMPLES];
+    let mut extra_bits = [0u32; MAX_DC_SAMPLES];
+    for (channel, value) in q_yxb.into_iter().enumerate() {
+        let index = channel * MAX_BLOCKS;
+        quantized_dc_yxb[index] = value;
         let packed = if value >= 0 {
             (value as u32) << 1
         } else {
@@ -1313,15 +1485,26 @@ fn cpu_test_artifact(q_yxb: [i32; 3], code: &PrefixCode) -> VarDctKernelArtifact
     for (index, byte) in bytes.into_iter().enumerate() {
         words[index / 4] |= u32::from(byte) << ((index % 4) * 8);
     }
+    let mut strategy_map = [0u32; MAX_BLOCKS];
+    strategy_map[0] = 1 << 8;
+    let mut quantized_xyb = [0; 3 * MAX_COEFFICIENTS];
+    quantized_xyb[MAX_COEFFICIENTS] = q_yxb[0];
+    quantized_xyb[0] = q_yxb[1];
+    quantized_xyb[2 * MAX_COEFFICIENTS] = q_yxb[2];
     VarDctKernelArtifact {
-        quantized_dc_yxb: q_yxb,
+        strategy_map,
+        quantized_dc_yxb,
         dc_raw_tokens: raw_tokens,
         dc_extra_bits: extra_bits,
         dc_fragment_words: words,
         dc_fragment_bit_len: bit_len,
+        dc_sample_count: 3,
+        block_count: 1,
+        strategy: 0,
         raw_histogram: histogram,
-        forward_xyb_bits: [0; 3 * 64],
-        quantized_xyb: [0; 3 * 64],
+        padding: [0; 9],
+        forward_xyb_bits: [0; 3 * MAX_COEFFICIENTS],
+        quantized_xyb,
     }
 }
 
@@ -1343,7 +1526,7 @@ mod tests {
     use super::*;
     use crate::assemble_frame;
 
-    fn decode_rgb8(codestream: &[u8]) -> Vec<u8> {
+    fn decode_rgb8_sized(codestream: &[u8], width: usize, height: usize) -> Vec<u8> {
         let mut input = codestream;
         let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
         let mut decoder = loop {
@@ -1352,7 +1535,7 @@ mod tests {
                 ProcessingResult::NeedsMoreInput { fallback, .. } => decoder = fallback,
             }
         };
-        assert_eq!(decoder.basic_info().size, (8, 8));
+        assert_eq!(decoder.basic_info().size, (width, height));
         decoder.set_pixel_format(JxlPixelFormat::rgb8(0));
         let mut frame = loop {
             match decoder.process(&mut input, None).unwrap() {
@@ -1360,8 +1543,8 @@ mod tests {
                 ProcessingResult::NeedsMoreInput { fallback, .. } => decoder = fallback,
             }
         };
-        let mut pixels = vec![0u8; 8 * 8 * 3];
-        let mut buffers = [JxlOutputBuffer::new(&mut pixels, 8, 8 * 3)];
+        let mut pixels = vec![0u8; width * height * 3];
+        let mut buffers = [JxlOutputBuffer::new(&mut pixels, height, width * 3)];
         loop {
             match frame.process(&mut input, &mut buffers, None).unwrap() {
                 ProcessingResult::Complete { .. } => break,
@@ -1369,6 +1552,10 @@ mod tests {
             }
         }
         pixels
+    }
+
+    fn decode_rgb8(codestream: &[u8]) -> Vec<u8> {
+        decode_rgb8_sized(codestream, 8, 8)
     }
 
     fn test_context() -> Option<WgpuContext> {
@@ -1393,16 +1580,27 @@ mod tests {
     }
 
     fn padded_rgb_source(context: &WgpuContext, pixels: &[[u8; 3]; 64]) -> BufferImageSource {
+        padded_rgb_source_sized(context, 8, 8, pixels)
+    }
+
+    fn padded_rgb_source_sized(
+        context: &WgpuContext,
+        width: usize,
+        height: usize,
+        pixels: &[[u8; 3]],
+    ) -> BufferImageSource {
         const OFFSET: u64 = 5;
-        const ROW_STRIDE: u64 = 29;
-        const ROW_BYTES: u64 = 24;
-        let extent = Extent2d::new(8, 8);
-        let allocation_size = align_up(OFFSET + ROW_STRIDE * 7 + ROW_BYTES, 4).unwrap();
+        let row_bytes = (width * 3) as u64;
+        let row_stride = row_bytes + 5;
+        let extent = Extent2d::new(width as u32, height as u32);
+        let allocation_size =
+            align_up(OFFSET + row_stride * (height as u64 - 1) + row_bytes, 4).unwrap();
         let mut allocation = vec![0xa5; allocation_size as usize];
-        for y in 0..8usize {
-            let start = usize::try_from(OFFSET + ROW_STRIDE * y as u64).unwrap();
-            for x in 0..8usize {
-                allocation[start + x * 3..start + x * 3 + 3].copy_from_slice(&pixels[y * 8 + x]);
+        for y in 0..height {
+            let start = usize::try_from(OFFSET + row_stride * y as u64).unwrap();
+            for x in 0..width {
+                allocation[start + x * 3..start + x * 3 + 3]
+                    .copy_from_slice(&pixels[y * width + x]);
             }
         }
         let layout = ImageLayout::from_planes(
@@ -1411,9 +1609,9 @@ mod tests {
             vec![PitchLinearPlaneLayout {
                 plane_index: 0,
                 offset: OFFSET,
-                row_stride: ROW_STRIDE,
+                row_stride,
                 sample_extent: extent,
-                row_bytes: ROW_BYTES,
+                row_bytes,
             }],
         )
         .unwrap();
@@ -1427,7 +1625,7 @@ mod tests {
         BufferImageSource::new(buffer, layout).unwrap()
     }
 
-    fn psnr(reference: &[[u8; 3]; 64], actual: &[u8]) -> f64 {
+    fn psnr(reference: &[[u8; 3]], actual: &[u8]) -> f64 {
         let squared_error = reference
             .iter()
             .flatten()
@@ -1444,6 +1642,14 @@ mod tests {
         10.0 * (255.0 * 255.0 / mse).log10()
     }
 
+    fn max_abs_error(left: &[u8], right: &[u8]) -> u8 {
+        left.iter()
+            .zip(right)
+            .map(|(&left, &right)| left.abs_diff(right))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn oracle_directory() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1455,8 +1661,8 @@ mod tests {
         ))
     }
 
-    fn ppm_bytes(pixels: &[[u8; 3]; 64]) -> Vec<u8> {
-        let mut output = b"P6\n8 8\n255\n".to_vec();
+    fn ppm_bytes(pixels: &[[u8; 3]], width: usize, height: usize) -> Vec<u8> {
+        let mut output = format!("P6\n{width} {height}\n255\n").into_bytes();
         output.extend(pixels.iter().flatten().copied());
         output
     }
@@ -1483,12 +1689,18 @@ mod tests {
         &bytes[start..*cursor]
     }
 
-    fn read_ppm_rgb8(path: &Path) -> Vec<u8> {
+    fn read_ppm_rgb8(path: &Path, width: usize, height: usize) -> Vec<u8> {
         let bytes = fs::read(path).unwrap();
         let mut cursor = 0usize;
         assert_eq!(next_ppm_token(&bytes, &mut cursor), b"P6");
-        assert_eq!(next_ppm_token(&bytes, &mut cursor), b"8");
-        assert_eq!(next_ppm_token(&bytes, &mut cursor), b"8");
+        assert_eq!(
+            next_ppm_token(&bytes, &mut cursor),
+            width.to_string().as_bytes(),
+        );
+        assert_eq!(
+            next_ppm_token(&bytes, &mut cursor),
+            height.to_string().as_bytes(),
+        );
         assert_eq!(next_ppm_token(&bytes, &mut cursor), b"255");
         assert!(bytes[cursor].is_ascii_whitespace());
         if bytes[cursor] == b'\r' && bytes.get(cursor + 1) == Some(&b'\n') {
@@ -1496,7 +1708,7 @@ mod tests {
         } else {
             cursor += 1;
         }
-        assert_eq!(bytes.len() - cursor, 8 * 8 * 3);
+        assert_eq!(bytes.len() - cursor, width * height * 3);
         bytes[cursor..].to_vec()
     }
 
@@ -1535,7 +1747,24 @@ mod tests {
         assert_pod::<GpuPrefixEntry>();
         assert_pod::<VarDctKernelParams>();
         assert_pod::<VarDctKernelArtifact>();
+        assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 256);
+        assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 25_600);
         assert_eq!(std::mem::align_of::<VarDctKernelArtifact>(), 4);
+    }
+
+    #[test]
+    fn naga_validates_regular_transform_shader_and_bounded_abi() {
+        let module = naga::front::wgsl::parse_str(SHADER).expect("VarDCT WGSL parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("VarDCT WGSL validates");
+        assert!(SHADER.contains("@compute @workgroup_size(256)"));
+        assert!(SHADER.contains("strategy_map: array<u32, 16>"));
+        assert!(SHADER.contains("padding: array<u32, 17>"));
+        assert!(SHADER.contains("forward_xyb_bits: array<u32, 3072>"));
     }
 
     #[test]
@@ -1546,6 +1775,22 @@ mod tests {
         assert_eq!(VarDctStrategy::Dct16x8.block_extent(), (8, 16));
         assert_eq!(VarDctStrategy::Dct8x16.block_extent(), (16, 8));
         assert_eq!(VarDctStrategy::Dct256x128.block_extent(), (128, 256));
+        assert!(
+            VarDctStrategy::EXECUTABLE
+                .into_iter()
+                .all(VarDctStrategy::is_executable)
+        );
+        assert!(!VarDctStrategy::Hornuss.is_executable());
+        assert!(!VarDctStrategy::Dct64x64.is_executable());
+    }
+
+    #[test]
+    fn unsupported_strategy_is_rejected_without_a_dct8_fallback() {
+        let Some(context) = test_context() else {
+            return;
+        };
+        let result = VarDctEncoder::new(context, VarDctStrategy::Hornuss);
+        assert!(matches!(result, Err(EncodeError::InvalidConfiguration(_))));
     }
 
     #[test]
@@ -1553,14 +1798,14 @@ mod tests {
         let Some(context) = test_context() else {
             return;
         };
-        let encoder = VarDctEncoder::new(context.clone()).unwrap();
+        let encoder = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
         let source = padded_rgb_source(&context, &[[0, 0, 0]; 64]);
         let plan = encoder.memory_plan(&source).unwrap();
         assert_eq!(plan.source_binding_bytes, 232);
-        assert_eq!(plan.parameter_storage_bytes, 168);
-        assert_eq!(plan.artifact_storage_bytes, 1_672);
-        assert_eq!(plan.readback_bytes, 1_672);
-        assert_eq!(plan.owned_bytes_per_job, 3_512);
+        assert_eq!(plan.parameter_storage_bytes, 256);
+        assert_eq!(plan.artifact_storage_bytes, 25_600);
+        assert_eq!(plan.readback_bytes, 25_600);
+        assert_eq!(plan.owned_bytes_per_job, 51_456);
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
         let codestream = encoder.encode(source).unwrap();
@@ -1569,11 +1814,78 @@ mod tests {
     }
 
     #[test]
+    fn every_executable_regular_strategy_emits_a_standard_black_codestream() {
+        let Some(context) = test_context() else {
+            return;
+        };
+        for strategy in VarDctStrategy::EXECUTABLE {
+            let (width, height) = strategy.block_extent();
+            let width = usize::from(width);
+            let height = usize::from(height);
+            let pixels = vec![[0, 0, 0]; width * height];
+            let encoder = VarDctEncoder::new(context.clone(), strategy).unwrap();
+            let codestream = encoder
+                .encode(padded_rgb_source_sized(&context, width, height, &pixels))
+                .unwrap();
+            assert_eq!(
+                decode_rgb8_sized(&codestream, width, height),
+                vec![0; width * height * 3],
+                "strategy={strategy:?}",
+            );
+            assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn every_executable_regular_strategy_preserves_solid_color_and_lf_gradient() {
+        let Some(context) = test_context() else {
+            return;
+        };
+        for strategy in VarDctStrategy::EXECUTABLE {
+            let (width, height) = strategy.block_extent();
+            let width = usize::from(width);
+            let height = usize::from(height);
+            let encoder = VarDctEncoder::new(context.clone(), strategy).unwrap();
+
+            let red = vec![[255, 0, 0]; width * height];
+            let red_stream = encoder
+                .encode(padded_rgb_source_sized(&context, width, height, &red))
+                .unwrap();
+            let decoded_red = decode_rgb8_sized(&red_stream, width, height);
+            let red_quality = psnr(&red, &decoded_red);
+            assert!(
+                red_quality > 30.0,
+                "strategy={strategy:?}, PSNR={red_quality}"
+            );
+
+            let mut gradient = vec![[0u8; 3]; width * height];
+            for y in 0..height {
+                for x in 0..width {
+                    gradient[y * width + x] = [
+                        (x * 255 / (width - 1)) as u8,
+                        (y * 255 / (height - 1)) as u8,
+                        ((x + y) * 255 / (width + height - 2)) as u8,
+                    ];
+                }
+            }
+            let gradient_stream = encoder
+                .encode(padded_rgb_source_sized(&context, width, height, &gradient))
+                .unwrap();
+            let decoded_gradient = decode_rgb8_sized(&gradient_stream, width, height);
+            let gradient_quality = psnr(&gradient, &decoded_gradient);
+            assert!(
+                gradient_quality > 9.0,
+                "strategy={strategy:?}, PSNR={gradient_quality}",
+            );
+        }
+    }
+
+    #[test]
     fn gpu_profile_is_same_device_deterministic_and_bounded_quality() {
         let Some(context) = test_context() else {
             return;
         };
-        let encoder = VarDctEncoder::new(context.clone()).unwrap();
+        let encoder = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
         let mut fixture = [[0u8; 3]; 64];
         for y in 0..8usize {
             for x in 0..8usize {
@@ -1615,74 +1927,88 @@ mod tests {
         let Some(context) = test_context() else {
             return;
         };
-        let encoder = VarDctEncoder::new(context.clone()).unwrap();
-        let mut fixture = [[0u8; 3]; 64];
-        for y in 0..8usize {
-            for x in 0..8usize {
-                fixture[y * 8 + x] = [
-                    (x * 31 + y * 3) as u8,
-                    (y * 31 + x * 3) as u8,
-                    ((x + y) * 16) as u8,
-                ];
-            }
-        }
-        let codestream = encoder
-            .encode(padded_rgb_source(&context, &fixture))
-            .unwrap();
-        let rust_pixels = decode_rgb8(&codestream);
-
         let directory = oracle_directory();
         fs::create_dir_all(&directory).unwrap();
-        let gpu_path = directory.join("gpu.jxl");
-        let gpu_ppm_path = directory.join("gpu.ppm");
-        let source_path = directory.join("source.ppm");
-        let reference_path = directory.join("reference.jxl");
-        let reference_ppm_path = directory.join("reference.ppm");
-        fs::write(&gpu_path, &codestream).unwrap();
-        fs::write(&source_path, ppm_bytes(&fixture)).unwrap();
+        for strategy in VarDctStrategy::EXECUTABLE {
+            let (width, height) = strategy.block_extent();
+            let width = usize::from(width);
+            let height = usize::from(height);
+            let mut fixture = vec![[0u8; 3]; width * height];
+            for y in 0..height {
+                for x in 0..width {
+                    fixture[y * width + x] = [
+                        (x * 255 / (width - 1)) as u8,
+                        (y * 255 / (height - 1)) as u8,
+                        ((x + y) * 255 / (width + height - 2)) as u8,
+                    ];
+                }
+            }
+            let encoder = VarDctEncoder::new(context.clone(), strategy).unwrap();
+            let codestream = encoder
+                .encode(padded_rgb_source_sized(&context, width, height, &fixture))
+                .unwrap();
+            let rust_pixels = decode_rgb8_sized(&codestream, width, height);
 
-        let gpu_decode = Command::new(DJXL)
-            .arg(&gpu_path)
-            .arg(&gpu_ppm_path)
-            .args(["--num_threads=0", "--quiet"])
-            .status()
-            .unwrap();
-        assert!(gpu_decode.success());
-        assert_eq!(read_ppm_rgb8(&gpu_ppm_path), rust_pixels);
+            let stem = strategy.codestream_id().to_string();
+            let gpu_path = directory.join(format!("gpu-{stem}.jxl"));
+            let gpu_ppm_path = directory.join(format!("gpu-{stem}.ppm"));
+            let source_path = directory.join(format!("source-{stem}.ppm"));
+            let reference_path = directory.join(format!("reference-{stem}.jxl"));
+            let reference_ppm_path = directory.join(format!("reference-{stem}.ppm"));
+            fs::write(&gpu_path, &codestream).unwrap();
+            fs::write(&source_path, ppm_bytes(&fixture, width, height)).unwrap();
 
-        let reference_encode = Command::new(CJXL)
-            .arg(&source_path)
-            .arg(&reference_path)
-            .args([
-                "-d",
-                "25",
-                "-e",
-                "1",
-                "-m",
-                "0",
-                "--progressive_dc=0",
-                "--resampling=1",
-                "--epf=0",
-                "--gaborish=0",
-                "--container=0",
-                "--num_threads=0",
-                "--quiet",
-            ])
-            .status()
-            .unwrap();
-        assert!(reference_encode.success());
-        let reference_codestream = fs::read(&reference_path).unwrap();
-        let rust_reference = decode_rgb8(&reference_codestream);
-        let reference_decode = Command::new(DJXL)
-            .arg(&reference_path)
-            .arg(&reference_ppm_path)
-            .args(["--num_threads=0", "--quiet"])
-            .status()
-            .unwrap();
-        assert!(reference_decode.success());
-        assert_eq!(read_ppm_rgb8(&reference_ppm_path), rust_reference);
-        assert!(psnr(&fixture, &rust_pixels) > 9.0);
-        assert!(psnr(&fixture, &rust_reference) > 9.0);
+            let gpu_decode = Command::new(DJXL)
+                .arg(&gpu_path)
+                .arg(&gpu_ppm_path)
+                .args(["--num_threads=0", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(gpu_decode.success(), "strategy={strategy:?}");
+            let libjxl_pixels = read_ppm_rgb8(&gpu_ppm_path, width, height);
+            assert!(
+                max_abs_error(&libjxl_pixels, &rust_pixels) <= 1,
+                "strategy={strategy:?}",
+            );
+
+            let reference_encode = Command::new(CJXL)
+                .arg(&source_path)
+                .arg(&reference_path)
+                .args([
+                    "-d",
+                    "25",
+                    "-e",
+                    "1",
+                    "-m",
+                    "0",
+                    "--progressive_dc=0",
+                    "--resampling=1",
+                    "--epf=0",
+                    "--gaborish=0",
+                    "--container=0",
+                    "--num_threads=0",
+                    "--quiet",
+                ])
+                .status()
+                .unwrap();
+            assert!(reference_encode.success(), "strategy={strategy:?}");
+            let reference_codestream = fs::read(&reference_path).unwrap();
+            let rust_reference = decode_rgb8_sized(&reference_codestream, width, height);
+            let reference_decode = Command::new(DJXL)
+                .arg(&reference_path)
+                .arg(&reference_ppm_path)
+                .args(["--num_threads=0", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(reference_decode.success(), "strategy={strategy:?}");
+            let libjxl_reference = read_ppm_rgb8(&reference_ppm_path, width, height);
+            assert!(
+                max_abs_error(&libjxl_reference, &rust_reference) <= 1,
+                "strategy={strategy:?}",
+            );
+            assert!(psnr(&fixture, &rust_pixels) > 9.0);
+            assert!(psnr(&fixture, &rust_reference) > 9.0);
+        }
 
         fs::remove_dir_all(directory).unwrap();
     }
