@@ -1,4 +1,4 @@
-// One regular VarDCT transform, up to 32x32 pixels. The shader owns every
+// One VarDCT strategy, up to a 32x32-pixel footprint. The shader owns every
 // data-dependent operation: input normalization, transfer function, XYB,
 // forward transform, per-8x8 DC quantization/prediction, strategy-map
 // generation, signed tokenization, histogramming, and prefix bit packing.
@@ -193,7 +193,7 @@ fn encode(@builtin(local_invocation_index) local_index: u32) {
     }
     workgroupBarrier();
 
-    // Full regular forward transform. Coefficients are diagnostic GPU output;
+    // Full diagnostic DCT forward transform. Coefficients are GPU output;
     // this LF-first profile deliberately quantizes every AC coefficient to zero.
     for (var coefficient_index = local_index;
          coefficient_index < pixel_count;

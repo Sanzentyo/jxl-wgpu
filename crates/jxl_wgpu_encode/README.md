@@ -94,18 +94,19 @@ provided by the application.
 ## Experimental VarDCT profile
 
 `VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
-image whose extent equals that transform. Nine regular strategies are executable end to end:
-`Dct8`, `Dct16x8` (8×16 pixels), `Dct8x16` (16×8), `Dct16x16`, `Dct32x8` (8×32), `Dct8x32`
-(32×8), `Dct32x32`, `Dct32x16` (16×32), and `Dct16x32` (32×16).
-`VarDctStrategy::EXECUTABLE` is the authoritative inventory; the other
-standard identifiers remain typed but are rejected rather than silently lowered to DCT8.
+image whose extent equals that transform. Eighteen strategies are executable end to end: all
+standard 8×8-footprint strategies (`Dct8`, Hornuss, `Dct2x2`, `Dct4x4`, `Dct4x8`, `Dct8x4`, and
+AFV0–3), plus `Dct16x8`, `Dct8x16`, `Dct16x16`, `Dct32x8`, `Dct8x32`, `Dct32x32`, `Dct32x16`,
+and `Dct16x32`. `VarDctStrategy::EXECUTABLE` is the authoritative inventory; the larger standard
+identifiers remain typed but are rejected rather than silently lowered to DCT8.
 
-The GPU executes sRGB linearization, XYB conversion, the selected full regular forward transform,
+The GPU executes sRGB linearization, XYB conversion, a full diagnostic forward transform,
 LF quantization, the per-8×8 clamped-gradient DC predictor, signed tokenization, prefix packing,
 histogramming, and construction of the standard strategy map. The host validates the complete
 typed artifact before serializing control metadata. This LF-first distance-25 profile deliberately
 quantizes every AC coefficient to zero, so it is interoperable but is not yet a general quality
-or rate-control implementation.
+or rate-control implementation. Special 8×8 strategies emit their own exact strategy identifiers
+and a standard DC-only coefficient payload; they are never relabeled DCT8.
 
 Each VarDCT submission reserves exactly 51,456 encoder-owned bytes: one 256-byte parameter record,
 one 25,600-byte GPU artifact, and one equal-size readback. The WGSL parameter ABI is explicitly

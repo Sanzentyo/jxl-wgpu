@@ -1,6 +1,6 @@
 //! Standard VarDCT still-image encoder frontend.
 //!
-//! The bounded frontend encodes one regular transform whose extent is also the
+//! The bounded frontend encodes one strategy whose footprint is also the
 //! image extent. Its control-plane syntax is kept separate from the lossless
 //! Modular encoder so neither profile becomes a compatibility layer for the
 //! other.
@@ -77,7 +77,7 @@ impl VarDctColorEncoding {
 /// Typed JPEG XL VarDCT strategy identifier.
 ///
 /// The enum covers the complete standard strategy alphabet. Use
-/// [`Self::EXECUTABLE`] to enumerate the regular transforms implemented by the
+/// [`Self::EXECUTABLE`] to enumerate the strategies implemented by the
 /// current GPU kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -144,9 +144,12 @@ impl VarDctStrategy {
         Self::Dct128x256,
     ];
 
-    /// Regular strategies implemented end-to-end by this encoder.
-    pub const EXECUTABLE: [Self; 9] = [
+    /// Strategies implemented end-to-end by this encoder.
+    pub const EXECUTABLE: [Self; 18] = [
         Self::Dct8,
+        Self::Hornuss,
+        Self::Dct2x2,
+        Self::Dct4x4,
         Self::Dct16x8,
         Self::Dct8x16,
         Self::Dct16x16,
@@ -155,6 +158,12 @@ impl VarDctStrategy {
         Self::Dct32x32,
         Self::Dct32x16,
         Self::Dct16x32,
+        Self::Dct4x8,
+        Self::Dct8x4,
+        Self::Afv0,
+        Self::Afv1,
+        Self::Afv2,
+        Self::Afv3,
     ];
 
     #[must_use]
@@ -196,6 +205,9 @@ impl VarDctStrategy {
         matches!(
             self,
             Self::Dct8
+                | Self::Hornuss
+                | Self::Dct2x2
+                | Self::Dct4x4
                 | Self::Dct16x8
                 | Self::Dct8x16
                 | Self::Dct16x16
@@ -204,6 +216,12 @@ impl VarDctStrategy {
                 | Self::Dct32x32
                 | Self::Dct32x16
                 | Self::Dct16x32
+                | Self::Dct4x8
+                | Self::Dct8x4
+                | Self::Afv0
+                | Self::Afv1
+                | Self::Afv2
+                | Self::Afv3
         )
     }
 
@@ -518,7 +536,7 @@ fn write_lf_group(
     write_local_modular_header(output)?;
     append_gpu_dc_fragment(output, artifact)?;
 
-    // One GPU-selected regular transform, no chroma-from-luma correction,
+    // One GPU-selected strategy, no chroma-from-luma correction,
     // fixed HF multiplier, and zero EPF sharpness. Source-dependent DC entropy
     // was already packed by the GPU; these values describe its control map.
     // HfMetadata first stores `number of first blocks - 1`; this profile has
@@ -543,7 +561,7 @@ fn write_lf_group(
 fn write_hf_global(output: &mut BitWriter) -> Result<(), EncodeError> {
     // Default dequant matrices, natural coefficient order, and a single-token
     // HF decoder whose only symbol is zero. All AC coefficients are zero in
-    // this LF-first regular-transform profile, so the pass group has no
+    // this LF-first strategy profile, so the pass group has no
     // payload bits. This is the 18-bit normative bundle encoding of those
     // fields, written LSB-first by BitWriter.
     output.write_bits(0x2495, 18)?;
@@ -577,7 +595,7 @@ struct VarDctDispatchPlan {
     memory: VarDctMemoryPlan,
 }
 
-/// GPU backend for one bounded standard regular-transform still-image profile.
+/// GPU backend for one bounded standard VarDCT still-image strategy.
 ///
 /// The source extent must equal the selected transform extent. The backend
 /// emits a standards-compliant VarDCT frame and does not route pixels or
@@ -592,7 +610,7 @@ pub struct VarDctBackend {
 }
 
 impl VarDctBackend {
-    /// Creates a standard regular-transform backend and its compute pipeline.
+    /// Creates a standard VarDCT strategy backend and its compute pipeline.
     ///
     /// # Errors
     ///
@@ -613,7 +631,7 @@ impl VarDctBackend {
             });
         let pipeline = Arc::new(context.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu VarDCT regular-transform pipeline"),
+                label: Some("jxl-wgpu VarDCT strategy pipeline"),
                 layout: None,
                 module: &module,
                 entry_point: Some("encode"),
@@ -1304,7 +1322,7 @@ fn read_fragment_bits(
     Ok(value)
 }
 
-/// GPU-only convenience encoder for one bounded standard regular VarDCT
+/// GPU-only convenience encoder for one bounded standard VarDCT
 /// transform.
 pub struct VarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
@@ -1757,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn naga_validates_regular_transform_shader_and_bounded_abi() {
+    fn naga_validates_strategy_shader_and_bounded_abi() {
         let module = naga::front::wgsl::parse_str(SHADER).expect("VarDCT WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -1784,16 +1802,16 @@ mod tests {
                 .into_iter()
                 .all(VarDctStrategy::is_executable)
         );
-        assert!(!VarDctStrategy::Hornuss.is_executable());
+        assert!(VarDctStrategy::Hornuss.is_executable());
         assert!(!VarDctStrategy::Dct64x64.is_executable());
     }
 
     #[test]
-    fn unsupported_strategy_is_rejected_without_a_dct8_fallback() {
+    fn oversized_strategy_is_rejected_without_a_dct8_fallback() {
         let Some(context) = test_context() else {
             return;
         };
-        let result = VarDctEncoder::new(context, VarDctStrategy::Hornuss);
+        let result = VarDctEncoder::new(context, VarDctStrategy::Dct64x64);
         assert!(matches!(result, Err(EncodeError::InvalidConfiguration(_))));
     }
 
@@ -1818,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn every_executable_regular_strategy_emits_a_standard_black_codestream() {
+    fn every_executable_strategy_emits_a_standard_black_codestream() {
         let Some(context) = test_context() else {
             return;
         };
@@ -1841,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn every_executable_regular_strategy_preserves_solid_color_and_lf_gradient() {
+    fn every_executable_strategy_preserves_solid_color_and_lf_gradient() {
         let Some(context) = test_context() else {
             return;
         };
