@@ -15,10 +15,10 @@
 //! runtime-neutral [`Future`], so a caller can keep multiple frames in flight. Multi-batch browser
 //! jobs advance one bounded map callback at a time from that same future and do not require a
 //! specific executor or Web Worker.
-//! [`VarDctEncoder`] is the first bounded lossy frontend: one 8x8 pitch-linear sRGB8 block is
-//! normalized, transformed to XYB, forward-DCT8 transformed, quantized, tokenized, and histogrammed
-//! on the GPU. Its fixed distance-25 profile retains DC and quantizes AC to zero; this narrow but
-//! complete standard profile keeps all 27 strategy identifiers in a typed expansion-ready IR.
+//! [`VarDctEncoder`] executes all 27 standard strategy identifiers. Strategies through 32x32 use a
+//! fixed diagnostic transform artifact; the 64x64 through 256x256 families use a scalable
+//! per-8x8-block GPU DC reduction followed by a bounded GPU control/entropy pass. Its fixed
+//! distance-25 profile retains DC and quantizes AC to zero.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -73,6 +73,6 @@ pub use session::{
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{
-    VarDctBackend, VarDctColorEncoding, VarDctEncoder, VarDctJob, VarDctMemoryPlan, VarDctStrategy,
-    VarDctSubmission,
+    VarDctBackend, VarDctColorEncoding, VarDctEncoder, VarDctJob, VarDctKernelLayout,
+    VarDctMemoryPlan, VarDctStrategy, VarDctSubmission,
 };

@@ -1,6 +1,6 @@
 //! Standard VarDCT still-image encoder frontend.
 //!
-//! The bounded frontend encodes one strategy whose footprint is also the
+//! The frontend encodes one strategy whose footprint is also the
 //! image extent. Its control-plane syntax is kept separate from the lossless
 //! Modular encoder so neither profile becomes a compatibility layer for the
 //! other.
@@ -37,7 +37,13 @@ const MAX_COEFFICIENTS: usize = 32 * 32;
 const MAX_DC_SAMPLES: usize = 3 * MAX_BLOCKS;
 const MAX_DC_FRAGMENT_WORDS: usize = 64;
 const SHADER: &str = include_str!("vardct_encoder.wgsl");
+const LARGE_SHADER: &str = include_str!("vardct_large_encoder.wgsl");
 const PROFILE_DISTANCE: f32 = 25.0;
+const LARGE_WORKGROUP_INVOCATIONS: u32 = 64;
+const LARGE_WORKGROUP_STORAGE_BYTES: u32 = 64 * 16;
+const SCALABLE_HEADER_WORDS: u32 = 64;
+const SCALABLE_SECTION_ALIGNMENT_WORDS: u32 = 64;
+const SCALABLE_ARTIFACT_READY: u32 = 0x5644_4354;
 
 /// Presentation/source color contract of the standard VarDCT frontend.
 ///
@@ -145,26 +151,7 @@ impl VarDctStrategy {
     ];
 
     /// Strategies implemented end-to-end by this encoder.
-    pub const EXECUTABLE: [Self; 18] = [
-        Self::Dct8,
-        Self::Hornuss,
-        Self::Dct2x2,
-        Self::Dct4x4,
-        Self::Dct16x8,
-        Self::Dct8x16,
-        Self::Dct16x16,
-        Self::Dct32x8,
-        Self::Dct8x32,
-        Self::Dct32x32,
-        Self::Dct32x16,
-        Self::Dct16x32,
-        Self::Dct4x8,
-        Self::Dct8x4,
-        Self::Afv0,
-        Self::Afv1,
-        Self::Afv2,
-        Self::Afv3,
-    ];
+    pub const EXECUTABLE: [Self; 27] = Self::ALL;
 
     #[must_use]
     pub const fn codestream_id(self) -> u8 {
@@ -202,7 +189,11 @@ impl VarDctStrategy {
     /// frontend.
     #[must_use]
     pub const fn is_executable(self) -> bool {
-        matches!(
+        true
+    }
+
+    const fn uses_scalable_kernel(self) -> bool {
+        !matches!(
             self,
             Self::Dct8
                 | Self::Hornuss
@@ -231,9 +222,19 @@ impl VarDctStrategy {
     }
 }
 
-/// Explicit bounded allocations retained by one in-flight VarDCT submission.
+/// GPU artifact implementation selected for a VarDCT memory plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VarDctKernelLayout {
+    /// Fixed 25 KiB diagnostic artifact used through 32x32.
+    Bounded,
+    /// Runtime-sized artifact and 8x8-block reduction used above 32x32.
+    Scalable,
+}
+
+/// Explicit allocations retained by one in-flight VarDCT submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctMemoryPlan {
+    pub kernel_layout: VarDctKernelLayout,
     /// Source bytes made addressable by the storage binding. The caller owns
     /// this allocation, so it is not charged to `owned_bytes_per_job`.
     pub source_binding_bytes: u64,
@@ -251,6 +252,22 @@ impl VarDctMemoryPlan {
         let readback_bytes = artifact_storage_bytes;
         let owned_bytes_per_job = parameter_storage_bytes + artifact_storage_bytes + readback_bytes;
         Self {
+            kernel_layout: VarDctKernelLayout::Bounded,
+            source_binding_bytes,
+            parameter_storage_bytes,
+            artifact_storage_bytes,
+            readback_bytes,
+            owned_bytes_per_job,
+            addressed_bytes_per_job: source_binding_bytes + owned_bytes_per_job,
+        }
+    }
+
+    const fn scalable(source_binding_bytes: u64, artifact_storage_bytes: u64) -> Self {
+        let parameter_storage_bytes = std::mem::size_of::<ScalableVarDctKernelParams>() as u64;
+        let readback_bytes = artifact_storage_bytes;
+        let owned_bytes_per_job = parameter_storage_bytes + artifact_storage_bytes + readback_bytes;
+        Self {
+            kernel_layout: VarDctKernelLayout::Scalable,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes,
@@ -302,6 +319,57 @@ struct VarDctKernelArtifact {
     quantized_xyb: [i32; 3 * MAX_COEFFICIENTS],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScalableVarDctKernelParams {
+    row_stride: u32,
+    byte_offset: u32,
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    strategy: u32,
+    global_scale: u32,
+    quant_lf: u32,
+    raw_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    strategy_offset: u32,
+    dc_offset: u32,
+    token_offset: u32,
+    extra_offset: u32,
+    fragment_offset: u32,
+    fragment_word_capacity: u32,
+    artifact_words: u32,
+    padding: [u32; 10],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScalableVarDctArtifactHeader {
+    status: u32,
+    block_count: u32,
+    dc_sample_count: u32,
+    strategy: u32,
+    ac_all_zero: u32,
+    strategy_offset: u32,
+    strategy_len: u32,
+    dc_offset: u32,
+    dc_len: u32,
+    token_offset: u32,
+    token_len: u32,
+    extra_offset: u32,
+    extra_len: u32,
+    fragment_offset: u32,
+    fragment_word_capacity: u32,
+    dc_fragment_bit_len: u32,
+    artifact_words: u32,
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    raw_histogram: [u32; RAW_SYMBOLS],
+    padding: [u32; 24],
+}
+
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
@@ -309,6 +377,10 @@ const _: () = {
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<VarDctKernelArtifact>() == 25_600);
     assert!(std::mem::align_of::<VarDctKernelArtifact>() == 4);
+    assert!(std::mem::size_of::<ScalableVarDctKernelParams>() == 256);
+    assert!(std::mem::align_of::<ScalableVarDctKernelParams>() == 4);
+    assert!(std::mem::size_of::<ScalableVarDctArtifactHeader>() == 256);
+    assert!(std::mem::align_of::<ScalableVarDctArtifactHeader>() == 4);
 };
 
 fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
@@ -321,6 +393,111 @@ fn prefix_entries(code: &PrefixCode) -> [GpuPrefixEntry; RAW_SYMBOLS] {
             bits: u32::from(bits),
             bit_len: u32::from(bit_len),
         })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScalableArtifactLayout {
+    strategy_offset: u32,
+    strategy_len: u32,
+    dc_offset: u32,
+    dc_len: u32,
+    token_offset: u32,
+    token_len: u32,
+    extra_offset: u32,
+    extra_len: u32,
+    fragment_offset: u32,
+    fragment_word_capacity: u32,
+    fragment_max_bits: u32,
+    artifact_words: u32,
+}
+
+impl ScalableArtifactLayout {
+    fn new(strategy: VarDctStrategy, code: &PrefixCode) -> Result<Self, EncodeError> {
+        let (blocks_x, blocks_y) = strategy.block_grid();
+        let strategy_len =
+            blocks_x
+                .checked_mul(blocks_y)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT block count overflow",
+                ))?;
+        let dc_len = strategy_len
+            .checked_mul(3)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT DC sample count overflow",
+            ))?;
+        let max_bits_per_sample = code
+            .raw_entries()
+            .into_iter()
+            .enumerate()
+            .map(|(token, entry)| {
+                let extra_bits = u32::try_from(token.saturating_sub(1))
+                    .expect("the fixed entropy alphabet fits u32");
+                u32::from(entry.bit_len) + extra_bits
+            })
+            .max()
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT entropy alphabet must not be empty",
+            ))?;
+        let fragment_max_bits =
+            dc_len
+                .checked_mul(max_bits_per_sample)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT entropy fragment capacity overflow",
+                ))?;
+        let fragment_word_capacity =
+            fragment_max_bits
+                .checked_add(31)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT entropy fragment word count overflow",
+                ))?
+                / 32;
+
+        let strategy_offset = SCALABLE_HEADER_WORDS;
+        let dc_offset = align_words(strategy_offset.checked_add(strategy_len).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT strategy section overflow"),
+        )?)?;
+        let token_offset = align_words(dc_offset.checked_add(dc_len).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT DC section overflow"),
+        )?)?;
+        let extra_offset = align_words(token_offset.checked_add(dc_len).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT token section overflow"),
+        )?)?;
+        let fragment_offset = align_words(extra_offset.checked_add(dc_len).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT extra-bit section overflow"),
+        )?)?;
+        let artifact_words =
+            align_words(fragment_offset.checked_add(fragment_word_capacity).ok_or(
+                EncodeError::InvalidConfiguration("VarDCT artifact size overflow"),
+            )?)?;
+        Ok(Self {
+            strategy_offset,
+            strategy_len,
+            dc_offset,
+            dc_len,
+            token_offset,
+            token_len: dc_len,
+            extra_offset,
+            extra_len: dc_len,
+            fragment_offset,
+            fragment_word_capacity,
+            fragment_max_bits,
+            artifact_words,
+        })
+    }
+
+    const fn artifact_bytes(self) -> u64 {
+        self.artifact_words as u64 * std::mem::size_of::<u32>() as u64
+    }
+}
+
+fn align_words(words: u32) -> Result<u32, EncodeError> {
+    let adjustment = SCALABLE_SECTION_ALIGNMENT_WORDS - 1;
+    words
+        .checked_add(adjustment)
+        .map(|value| value / SCALABLE_SECTION_ALIGNMENT_WORDS * SCALABLE_SECTION_ALIGNMENT_WORDS)
+        .ok_or(EncodeError::InvalidConfiguration(
+            "VarDCT artifact alignment overflow",
+        ))
 }
 
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
@@ -509,13 +686,21 @@ fn pack_signed_control(value: i32) -> u32 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct VarDctArtifactData<'a> {
+    block_count: u32,
+    strategy: u32,
+    dc_fragment_words: &'a [u32],
+    dc_fragment_bit_len: u32,
+}
+
 fn append_gpu_dc_fragment(
     output: &mut BitWriter,
-    artifact: &VarDctKernelArtifact,
+    artifact: VarDctArtifactData<'_>,
 ) -> Result<(), EncodeError> {
     let bit_len = usize::try_from(artifact.dc_fragment_bit_len)
         .map_err(|_| EncodeError::Backend("GPU DC fragment length overflow".into()))?;
-    if bit_len > MAX_DC_FRAGMENT_WORDS * 32 {
+    if bit_len > artifact.dc_fragment_words.len() * 32 {
         return Err(EncodeError::Backend(
             "GPU DC fragment exceeds its fixed artifact allocation".into(),
         ));
@@ -530,7 +715,7 @@ fn append_gpu_dc_fragment(
 fn write_lf_group(
     output: &mut BitWriter,
     code: &PrefixCode,
-    artifact: &VarDctKernelArtifact,
+    artifact: VarDctArtifactData<'_>,
 ) -> Result<(), EncodeError> {
     output.write_bits(0, 2)?; // no extra LF precision
     write_local_modular_header(output)?;
@@ -544,8 +729,18 @@ fn write_lf_group(
     let first_block_bits = artifact.block_count.next_power_of_two().trailing_zeros() as u8;
     output.write_bits(0, first_block_bits)?;
     write_local_modular_header(output)?;
-    write_unsigned_token(output, code, 0)?;
-    write_unsigned_token(output, code, 0)?;
+    let strategy = VarDctStrategy::ALL
+        .get(artifact.strategy as usize)
+        .copied()
+        .ok_or_else(|| EncodeError::Backend("GPU VarDCT strategy ID is out of range".into()))?;
+    let (blocks_x, blocks_y) = strategy.block_grid();
+    let correlation_samples = blocks_x.div_ceil(8) * blocks_y.div_ceil(8);
+    // The two chroma-from-luma maps are tiled on the 8x8-block grid. They are
+    // one sample each through DCT64, then scale to 2x2 and 4x4 for the
+    // DCT128/DCT256 families.
+    for _ in 0..2 * correlation_samples {
+        write_unsigned_token(output, code, 0)?;
+    }
     write_unsigned_token(output, code, pack_signed_control(artifact.strategy as i32))?;
     write_unsigned_token(
         output,
@@ -569,7 +764,7 @@ fn write_hf_global(output: &mut BitWriter) -> Result<(), EncodeError> {
 }
 
 fn build_frame_packet(
-    artifact: &VarDctKernelArtifact,
+    artifact: VarDctArtifactData<'_>,
     code: &PrefixCode,
 ) -> Result<FramePacketSet, EncodeError> {
     let mut group = BitWriter::new();
@@ -591,21 +786,40 @@ fn build_frame_packet(
 struct VarDctDispatchPlan {
     source_binding_offset: u64,
     source_binding_size: NonZeroU64,
-    params: VarDctKernelParams,
+    kernel: VarDctKernelPlan,
     memory: VarDctMemoryPlan,
 }
 
-/// GPU backend for one bounded standard VarDCT still-image strategy.
+#[derive(Clone, Copy, Debug)]
+enum VarDctKernelPlan {
+    Bounded(VarDctKernelParams),
+    Scalable {
+        params: ScalableVarDctKernelParams,
+        layout: ScalableArtifactLayout,
+    },
+}
+
+enum VarDctPipelines {
+    Bounded(Arc<wgpu::ComputePipeline>),
+    Scalable {
+        quantize: Arc<wgpu::ComputePipeline>,
+        serialize: Arc<wgpu::ComputePipeline>,
+    },
+}
+
+/// GPU backend for one standard VarDCT still-image strategy.
 ///
 /// The source extent must equal the selected transform extent. The backend
 /// emits a standards-compliant VarDCT frame and does not route pixels or
 /// coefficients through a CPU codec.
 pub struct VarDctBackend {
-    pipeline: Arc<wgpu::ComputePipeline>,
+    pipelines: VarDctPipelines,
     code: PrefixCode,
     strategy: VarDctStrategy,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
+    max_buffer_size: u64,
+    max_compute_workgroups_per_dimension: u32,
     storage_offset_alignment: u64,
 }
 
@@ -617,32 +831,55 @@ impl VarDctBackend {
     /// Returns an encoder error if the fixed standard entropy tree cannot be
     /// represented by the JPEG XL prefix-code writer.
     pub fn new(context: &WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
-        if !strategy.is_executable() {
-            return Err(EncodeError::InvalidConfiguration(
-                "the selected VarDCT strategy is not implemented by the GPU kernel",
-            ));
-        }
         let code = fixed_prefix_code()?;
-        let module = context
-            .device()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("jxl-wgpu VarDCT forward-transform kernel"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-            });
-        let pipeline = Arc::new(context.device().create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu VarDCT strategy pipeline"),
+        let limits = context.device().limits();
+        let pipelines = if strategy.uses_scalable_kernel() {
+            validate_scalable_device_limits(&limits, strategy)?;
+            let module = context
+                .device()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("jxl-wgpu scalable VarDCT kernel"),
+                    source: wgpu::ShaderSource::Wgsl(LARGE_SHADER.into()),
+                });
+            let descriptor = |label, entry_point| wgpu::ComputePipelineDescriptor {
+                label: Some(label),
                 layout: None,
                 module: &module,
-                entry_point: Some("encode"),
+                entry_point: Some(entry_point),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
-            },
-        ));
+            };
+            VarDctPipelines::Scalable {
+                quantize: Arc::new(context.device().create_compute_pipeline(&descriptor(
+                    "jxl-wgpu scalable VarDCT block quantization",
+                    "quantize_blocks",
+                ))),
+                serialize: Arc::new(context.device().create_compute_pipeline(&descriptor(
+                    "jxl-wgpu scalable VarDCT control serialization",
+                    "serialize_control",
+                ))),
+            }
+        } else {
+            let module = context
+                .device()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("jxl-wgpu VarDCT forward-transform kernel"),
+                    source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                });
+            VarDctPipelines::Bounded(Arc::new(context.device().create_compute_pipeline(
+                &wgpu::ComputePipelineDescriptor {
+                    label: Some("jxl-wgpu VarDCT strategy pipeline"),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("encode"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                },
+            )))
+        };
         let distance = profile_distance();
-        let limits = context.device().limits();
         Ok(Self {
-            pipeline,
+            pipelines,
             code,
             strategy,
             capabilities: EncoderCapabilities {
@@ -663,6 +900,8 @@ impl VarDctBackend {
                 ],
             },
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
+            max_buffer_size: limits.max_buffer_size,
+            max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
         })
     }
@@ -751,26 +990,94 @@ impl VarDctBackend {
         u32::try_from(shader_last_byte).map_err(|_| {
             EncodeError::InvalidSource("VarDCT source address exceeds the WGSL u32 space")
         })?;
-        let params = VarDctKernelParams {
-            row_stride,
-            byte_offset: u32::try_from(relative_offset).map_err(|_| {
-                EncodeError::InvalidSource("VarDCT source offset exceeds the WGSL u32 space")
-            })?,
-            width: extent.width,
-            height: extent.height,
-            blocks_x: extent.width / 8,
-            blocks_y: extent.height / 8,
-            strategy: u32::from(self.strategy.codestream_id()),
-            global_scale: GLOBAL_SCALE,
-            quant_lf: QUANT_LF,
-            raw_prefix: prefix_entries(&self.code),
-            padding: [0; 17],
+        let byte_offset = u32::try_from(relative_offset).map_err(|_| {
+            EncodeError::InvalidSource("VarDCT source offset exceeds the WGSL u32 space")
+        })?;
+        let blocks_x = extent.width / 8;
+        let blocks_y = extent.height / 8;
+        let common_strategy = u32::from(self.strategy.codestream_id());
+        let (kernel, memory) = if self.strategy.uses_scalable_kernel() {
+            let layout = ScalableArtifactLayout::new(self.strategy, &self.code)?;
+            let block_count =
+                blocks_x
+                    .checked_mul(blocks_y)
+                    .ok_or(EncodeError::InvalidConfiguration(
+                        "VarDCT block dispatch count overflow",
+                    ))?;
+            if block_count > self.max_compute_workgroups_per_dimension {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_compute_workgroups_per_dimension",
+                    required: u64::from(block_count),
+                    available: u64::from(self.max_compute_workgroups_per_dimension),
+                }
+                .into());
+            }
+            let artifact_bytes = layout.artifact_bytes();
+            if artifact_bytes > self.max_storage_binding_size {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_storage_buffer_binding_size",
+                    required: artifact_bytes,
+                    available: self.max_storage_binding_size,
+                }
+                .into());
+            }
+            if artifact_bytes > self.max_buffer_size {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_buffer_size",
+                    required: artifact_bytes,
+                    available: self.max_buffer_size,
+                }
+                .into());
+            }
+            (
+                VarDctKernelPlan::Scalable {
+                    params: ScalableVarDctKernelParams {
+                        row_stride,
+                        byte_offset,
+                        width: extent.width,
+                        height: extent.height,
+                        blocks_x,
+                        blocks_y,
+                        strategy: common_strategy,
+                        global_scale: GLOBAL_SCALE,
+                        quant_lf: QUANT_LF,
+                        raw_prefix: prefix_entries(&self.code),
+                        strategy_offset: layout.strategy_offset,
+                        dc_offset: layout.dc_offset,
+                        token_offset: layout.token_offset,
+                        extra_offset: layout.extra_offset,
+                        fragment_offset: layout.fragment_offset,
+                        fragment_word_capacity: layout.fragment_word_capacity,
+                        artifact_words: layout.artifact_words,
+                        padding: [0; 10],
+                    },
+                    layout,
+                },
+                VarDctMemoryPlan::scalable(source_binding_bytes, artifact_bytes),
+            )
+        } else {
+            (
+                VarDctKernelPlan::Bounded(VarDctKernelParams {
+                    row_stride,
+                    byte_offset,
+                    width: extent.width,
+                    height: extent.height,
+                    blocks_x,
+                    blocks_y,
+                    strategy: common_strategy,
+                    global_scale: GLOBAL_SCALE,
+                    quant_lf: QUANT_LF,
+                    raw_prefix: prefix_entries(&self.code),
+                    padding: [0; 17],
+                }),
+                VarDctMemoryPlan::fixed(source_binding_bytes),
+            )
         };
         Ok(VarDctDispatchPlan {
             source_binding_offset,
             source_binding_size,
-            params,
-            memory: VarDctMemoryPlan::fixed(source_binding_bytes),
+            kernel,
+            memory,
         })
     }
 }
@@ -781,6 +1088,60 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .checked_add(adjustment)?
         .checked_div(alignment)?
         .checked_mul(alignment)
+}
+
+fn validate_scalable_device_limits(
+    limits: &wgpu::Limits,
+    strategy: VarDctStrategy,
+) -> Result<(), EncodeError> {
+    let checks = [
+        (
+            "max_compute_invocations_per_workgroup",
+            u64::from(LARGE_WORKGROUP_INVOCATIONS),
+            u64::from(limits.max_compute_invocations_per_workgroup),
+        ),
+        (
+            "max_compute_workgroup_size_x",
+            u64::from(LARGE_WORKGROUP_INVOCATIONS),
+            u64::from(limits.max_compute_workgroup_size_x),
+        ),
+        (
+            "max_compute_workgroup_storage_size",
+            u64::from(LARGE_WORKGROUP_STORAGE_BYTES),
+            u64::from(limits.max_compute_workgroup_storage_size),
+        ),
+        (
+            "max_storage_buffers_per_shader_stage",
+            3,
+            u64::from(limits.max_storage_buffers_per_shader_stage),
+        ),
+    ];
+    if let Some((name, required, available)) = checks
+        .into_iter()
+        .find(|(_, required, available)| required > available)
+    {
+        return Err(UnsupportedFeature::DeviceLimit {
+            name,
+            required,
+            available,
+        }
+        .into());
+    }
+    let (blocks_x, blocks_y) = strategy.block_grid();
+    let dispatches = blocks_x
+        .checked_mul(blocks_y)
+        .ok_or(EncodeError::InvalidConfiguration(
+            "VarDCT block dispatch count overflow",
+        ))?;
+    if dispatches > limits.max_compute_workgroups_per_dimension {
+        return Err(UnsupportedFeature::DeviceLimit {
+            name: "max_compute_workgroups_per_dimension",
+            required: u64::from(dispatches),
+            available: u64::from(limits.max_compute_workgroups_per_dimension),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn profile_distance() -> PerceptualDistance {
@@ -866,9 +1227,14 @@ impl GpuEncodeBackend for VarDctBackend {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
-        context
-            .queue()
-            .write_buffer(&parameters, 0, bytemuck::bytes_of(&plan.params));
+        context.queue().write_buffer(
+            &parameters,
+            0,
+            match &plan.kernel {
+                VarDctKernelPlan::Bounded(params) => bytemuck::bytes_of(params),
+                VarDctKernelPlan::Scalable { params, .. } => bytemuck::bytes_of(params),
+            },
+        );
 
         let source_binding = wgpu::BufferBinding {
             buffer: &source.buffer,
@@ -879,34 +1245,36 @@ impl GpuEncodeBackend for VarDctBackend {
             .expect("the VarDCT parameter ABI is non-empty");
         let artifact_binding_size = NonZeroU64::new(plan.memory.artifact_storage_bytes)
             .expect("the VarDCT artifact ABI is non-empty");
-        let bind_group = context
-            .device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jxl-wgpu VarDCT bindings"),
-                layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(source_binding),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &parameters,
-                            offset: 0,
-                            size: Some(params_binding_size),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &artifact,
-                            offset: 0,
-                            size: Some(artifact_binding_size),
-                        }),
-                    },
-                ],
-            });
+        let create_bind_group = |pipeline: &wgpu::ComputePipeline, label| {
+            context
+                .device()
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(source_binding.clone()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &parameters,
+                                offset: 0,
+                                size: Some(params_binding_size),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &artifact,
+                                offset: 0,
+                                size: Some(artifact_binding_size),
+                            }),
+                        },
+                    ],
+                })
+        };
         let mut commands =
             context
                 .device()
@@ -914,15 +1282,85 @@ impl GpuEncodeBackend for VarDctBackend {
                     label: Some("jxl-wgpu VarDCT encode"),
                 });
         commands.clear_buffer(&artifact, 0, None);
-        {
-            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jxl-wgpu VarDCT forward transform and tokenization"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        let job_layout = match (&self.pipelines, plan.kernel) {
+            (VarDctPipelines::Bounded(pipeline), VarDctKernelPlan::Bounded(_)) => {
+                let bind_group = create_bind_group(pipeline, "jxl-wgpu VarDCT bindings");
+                let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("jxl-wgpu VarDCT forward transform and tokenization"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                VarDctJobLayout::Bounded
+            }
+            (
+                VarDctPipelines::Scalable {
+                    quantize,
+                    serialize,
+                },
+                VarDctKernelPlan::Scalable { params, layout },
+            ) => {
+                let quantize_bind_group =
+                    create_bind_group(quantize, "jxl-wgpu scalable VarDCT quantization bindings");
+                {
+                    let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("jxl-wgpu scalable VarDCT 8x8 DC quantization"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(quantize);
+                    pass.set_bind_group(0, &quantize_bind_group, &[]);
+                    pass.dispatch_workgroups(params.blocks_x * params.blocks_y, 1, 1);
+                }
+                // A separate WebGPU pass is the explicit global storage
+                // visibility boundary for all block workgroups before the
+                // single deterministic prediction/serialization invocation.
+                // The control entry point intentionally has no source binding;
+                // automatic pipeline layouts therefore retain only bindings
+                // 1 and 2 for this pass.
+                let serialize_bind_group =
+                    context
+                        .device()
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("jxl-wgpu scalable VarDCT serialization bindings"),
+                            layout: &serialize.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &parameters,
+                                        offset: 0,
+                                        size: Some(params_binding_size),
+                                    }),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &artifact,
+                                        offset: 0,
+                                        size: Some(artifact_binding_size),
+                                    }),
+                                },
+                            ],
+                        });
+                {
+                    let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("jxl-wgpu scalable VarDCT control and entropy serialization"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(serialize);
+                    pass.set_bind_group(0, &serialize_bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+                VarDctJobLayout::Scalable(layout)
+            }
+            _ => {
+                return Err(BackendError::Invariant(
+                    "VarDCT strategy selected incompatible GPU pipelines",
+                )
+                .into());
+            }
+        };
         commands.copy_buffer_to_buffer(
             &artifact,
             0,
@@ -968,6 +1406,7 @@ impl GpuEncodeBackend for VarDctBackend {
             completion,
             code: self.code.clone(),
             strategy: self.strategy,
+            artifact_layout: job_layout,
             frame_index: request.frame_index,
             is_last: request.is_last,
         })
@@ -1052,11 +1491,18 @@ impl Drop for VarDctJobLifetime {
 }
 
 /// Runtime-neutral completion for one standard VarDCT GPU submission.
+#[derive(Clone, Copy, Debug)]
+enum VarDctJobLayout {
+    Bounded,
+    Scalable(ScalableArtifactLayout),
+}
+
 pub struct VarDctJob {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
     code: PrefixCode,
     strategy: VarDctStrategy,
+    artifact_layout: VarDctJobLayout,
     frame_index: FrameIndex,
     is_last: bool,
 }
@@ -1079,9 +1525,18 @@ impl VarDctJob {
             }
         };
         let result = (|| {
-            let artifact = bytemuck::try_from_bytes::<VarDctKernelArtifact>(&mapped)
-                .map_err(|_| BackendError::InvalidArtifact("VarDCT ABI size or alignment"))?;
-            validate_artifact(artifact, &self.code, self.strategy)?;
+            let artifact = match self.artifact_layout {
+                VarDctJobLayout::Bounded => {
+                    let artifact = bytemuck::try_from_bytes::<VarDctKernelArtifact>(&mapped)
+                        .map_err(|_| {
+                            BackendError::InvalidArtifact("VarDCT ABI size or alignment")
+                        })?;
+                    validate_artifact(artifact, &self.code, self.strategy)?
+                }
+                VarDctJobLayout::Scalable(layout) => {
+                    validate_scalable_artifact(&mapped, layout, &self.code, self.strategy)?
+                }
+            };
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
                 is_last: self.is_last,
@@ -1125,11 +1580,11 @@ impl GpuEncodeJob for VarDctJob {
     }
 }
 
-fn validate_artifact(
-    artifact: &VarDctKernelArtifact,
+fn validate_artifact<'a>(
+    artifact: &'a VarDctKernelArtifact,
     code: &PrefixCode,
     strategy: VarDctStrategy,
-) -> Result<(), BackendError> {
+) -> Result<VarDctArtifactData<'a>, BackendError> {
     let (blocks_x, blocks_y) = strategy.block_grid();
     let block_count = usize::try_from(blocks_x * blocks_y)
         .map_err(|_| BackendError::InvalidArtifact("VarDCT block count does not fit usize"))?;
@@ -1267,7 +1722,313 @@ fn validate_artifact(
             "VarDCT GPU entropy fragment length or histogram mismatch",
         ));
     }
+    Ok(fixed_artifact_data(artifact))
+}
+
+fn fixed_artifact_data(artifact: &VarDctKernelArtifact) -> VarDctArtifactData<'_> {
+    VarDctArtifactData {
+        block_count: artifact.block_count,
+        strategy: artifact.strategy,
+        dc_fragment_words: &artifact.dc_fragment_words,
+        dc_fragment_bit_len: artifact.dc_fragment_bit_len,
+    }
+}
+
+fn validate_scalable_artifact<'a>(
+    mapped: &'a [u8],
+    layout: ScalableArtifactLayout,
+    code: &PrefixCode,
+    strategy: VarDctStrategy,
+) -> Result<VarDctArtifactData<'a>, BackendError> {
+    let expected_bytes = usize::try_from(layout.artifact_bytes()).map_err(|_| {
+        BackendError::InvalidArtifact("scalable VarDCT artifact size does not fit usize")
+    })?;
+    if mapped.len() != expected_bytes {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT mapped artifact has the wrong byte length",
+        ));
+    }
+    let words = bytemuck::try_cast_slice::<u8, u32>(mapped).map_err(|_| {
+        BackendError::InvalidArtifact("scalable VarDCT artifact word ABI alignment")
+    })?;
+    let header_bytes = mapped
+        .get(..std::mem::size_of::<ScalableVarDctArtifactHeader>())
+        .ok_or(BackendError::InvalidArtifact(
+            "scalable VarDCT artifact header is truncated",
+        ))?;
+    let header = bytemuck::try_from_bytes::<ScalableVarDctArtifactHeader>(header_bytes)
+        .map_err(|_| BackendError::InvalidArtifact("scalable VarDCT header ABI alignment"))?;
+    let (blocks_x, blocks_y) = strategy.block_grid();
+    let block_count = blocks_x
+        .checked_mul(blocks_y)
+        .ok_or(BackendError::InvalidArtifact(
+            "scalable VarDCT block count overflow",
+        ))?;
+    let dc_sample_count = block_count
+        .checked_mul(3)
+        .ok_or(BackendError::InvalidArtifact(
+            "scalable VarDCT sample count overflow",
+        ))?;
+    let (width, height) = strategy.block_extent();
+    if header.status != SCALABLE_ARTIFACT_READY
+        || header.block_count != block_count
+        || header.dc_sample_count != dc_sample_count
+        || header.strategy != u32::from(strategy.codestream_id())
+        || header.ac_all_zero != 1
+        || header.strategy_offset != layout.strategy_offset
+        || header.strategy_len != layout.strategy_len
+        || header.dc_offset != layout.dc_offset
+        || header.dc_len != layout.dc_len
+        || header.token_offset != layout.token_offset
+        || header.token_len != layout.token_len
+        || header.extra_offset != layout.extra_offset
+        || header.extra_len != layout.extra_len
+        || header.fragment_offset != layout.fragment_offset
+        || header.fragment_word_capacity != layout.fragment_word_capacity
+        || header.artifact_words != layout.artifact_words
+        || header.width != u32::from(width)
+        || header.height != u32::from(height)
+        || header.blocks_x != blocks_x
+        || header.blocks_y != blocks_y
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT status, live counts, orientation, or layout metadata mismatch",
+        ));
+    }
+    if header.padding.iter().any(|&word| word != 0) {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT header padding is nonzero",
+        ));
+    }
+    if header.dc_fragment_bit_len > layout.fragment_max_bits
+        || header.dc_fragment_bit_len
+            > layout
+                .fragment_word_capacity
+                .checked_mul(32)
+                .ok_or(BackendError::InvalidArtifact(
+                    "scalable VarDCT fragment capacity overflow",
+                ))?
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT entropy fragment exceeds its checked capacity",
+        ));
+    }
+
+    let strategy_map = artifact_words(words, layout.strategy_offset, layout.strategy_len)?;
+    let quantized_dc = artifact_words(words, layout.dc_offset, layout.dc_len)?;
+    let raw_tokens = artifact_words(words, layout.token_offset, layout.token_len)?;
+    let extra_bits = artifact_words(words, layout.extra_offset, layout.extra_len)?;
+    let fragment_words =
+        artifact_words(words, layout.fragment_offset, layout.fragment_word_capacity)?;
+    validate_zero_gap(words, SCALABLE_HEADER_WORDS, layout.strategy_offset)?;
+    validate_zero_gap(
+        words,
+        layout.strategy_offset + layout.strategy_len,
+        layout.dc_offset,
+    )?;
+    validate_zero_gap(words, layout.dc_offset + layout.dc_len, layout.token_offset)?;
+    validate_zero_gap(
+        words,
+        layout.token_offset + layout.token_len,
+        layout.extra_offset,
+    )?;
+    validate_zero_gap(
+        words,
+        layout.extra_offset + layout.extra_len,
+        layout.fragment_offset,
+    )?;
+    validate_zero_gap(
+        words,
+        layout.fragment_offset + layout.fragment_word_capacity,
+        layout.artifact_words,
+    )?;
+
+    let expected_strategy = u32::from(strategy.codestream_id());
+    for (block, &value) in strategy_map.iter().enumerate() {
+        let expected = expected_strategy | u32::from(block == 0) << 8;
+        if value != expected {
+            return Err(BackendError::InvalidArtifact(
+                "scalable VarDCT GPU strategy map is malformed",
+            ));
+        }
+    }
+
+    let block_count_usize = usize::try_from(block_count)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT block count does not fit usize"))?;
+    let entries = code.raw_entries();
+    let mut expected_histogram = [0u32; RAW_SYMBOLS];
+    let mut bit_offset = 0u32;
+    for channel in 0..3usize {
+        let base = channel * block_count_usize;
+        for block in 0..block_count_usize {
+            let block_x = block % blocks_x as usize;
+            let block_y = block / blocks_x as usize;
+            let left = if block_x > 0 {
+                quantized_dc[base + block - 1] as i32
+            } else if block_y > 0 {
+                quantized_dc[base + block - blocks_x as usize] as i32
+            } else {
+                0
+            };
+            let top = if block_y > 0 {
+                quantized_dc[base + block - blocks_x as usize] as i32
+            } else {
+                left
+            };
+            let top_left = if block_x > 0 && block_y > 0 {
+                quantized_dc[base + block - blocks_x as usize - 1] as i32
+            } else {
+                left
+            };
+            let actual = quantized_dc[base + block] as i32;
+            let residual = actual - clamped_gradient_i32(top, left, top_left);
+            let (token, extra_bit_count, extra) = signed_token(residual)?;
+            let slot = base + block;
+            if raw_tokens[slot] != token || extra_bits[slot] != extra {
+                return Err(BackendError::InvalidArtifact(
+                    "scalable VarDCT DC token does not match its predicted residual",
+                ));
+            }
+            let token_index = usize::try_from(token).map_err(|_| {
+                BackendError::InvalidArtifact("VarDCT DC token index does not fit usize")
+            })?;
+            let entry = entries
+                .get(token_index)
+                .ok_or(BackendError::InvalidArtifact(
+                    "VarDCT DC token exceeds the fixed entropy alphabet",
+                ))?;
+            if read_fragment_slice(
+                fragment_words,
+                header.dc_fragment_bit_len,
+                bit_offset,
+                u32::from(entry.bit_len),
+            )? != u32::from(entry.bits)
+            {
+                return Err(BackendError::InvalidArtifact(
+                    "scalable VarDCT GPU prefix fragment does not match its token",
+                ));
+            }
+            bit_offset += u32::from(entry.bit_len);
+            if read_fragment_slice(
+                fragment_words,
+                header.dc_fragment_bit_len,
+                bit_offset,
+                extra_bit_count,
+            )? != extra
+            {
+                return Err(BackendError::InvalidArtifact(
+                    "scalable VarDCT GPU extra-bit fragment does not match its token",
+                ));
+            }
+            bit_offset += extra_bit_count;
+            expected_histogram[token_index] += 1;
+        }
+    }
+    if bit_offset != header.dc_fragment_bit_len || header.raw_histogram != expected_histogram {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT entropy fragment length or histogram mismatch",
+        ));
+    }
+    validate_fragment_padding(fragment_words, header.dc_fragment_bit_len)?;
+    Ok(VarDctArtifactData {
+        block_count,
+        strategy: expected_strategy,
+        dc_fragment_words: fragment_words,
+        dc_fragment_bit_len: header.dc_fragment_bit_len,
+    })
+}
+
+fn artifact_words(words: &[u32], offset: u32, len: u32) -> Result<&[u32], BackendError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT artifact offset does not fit usize"))?;
+    let len = usize::try_from(len)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT artifact length does not fit usize"))?;
+    let end = start.checked_add(len).ok_or(BackendError::InvalidArtifact(
+        "VarDCT artifact range overflow",
+    ))?;
+    words.get(start..end).ok_or(BackendError::InvalidArtifact(
+        "VarDCT artifact range is out of bounds",
+    ))
+}
+
+fn validate_zero_gap(words: &[u32], start: u32, end: u32) -> Result<(), BackendError> {
+    if artifact_words(
+        words,
+        start,
+        end.checked_sub(start).ok_or(BackendError::InvalidArtifact(
+            "VarDCT artifact section order is invalid",
+        ))?,
+    )?
+    .iter()
+    .any(|&word| word != 0)
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT artifact alignment padding is nonzero",
+        ));
+    }
     Ok(())
+}
+
+fn validate_fragment_padding(words: &[u32], bit_len: u32) -> Result<(), BackendError> {
+    let used_words = bit_len
+        .checked_add(31)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT fragment word count overflow",
+        ))?
+        / 32;
+    let used_words = usize::try_from(used_words)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT fragment size does not fit usize"))?;
+    if let Some(&last_word) = used_words.checked_sub(1).and_then(|index| words.get(index)) {
+        let live_bits = bit_len % 32;
+        if live_bits != 0 && last_word & !((1u32 << live_bits) - 1) != 0 {
+            return Err(BackendError::InvalidArtifact(
+                "scalable VarDCT fragment has nonzero high padding bits",
+            ));
+        }
+    }
+    if words
+        .get(used_words..)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT fragment used-word count is out of bounds",
+        ))?
+        .iter()
+        .any(|&word| word != 0)
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT fragment word padding is nonzero",
+        ));
+    }
+    Ok(())
+}
+
+fn read_fragment_slice(
+    words: &[u32],
+    bit_len: u32,
+    start: u32,
+    count: u32,
+) -> Result<u32, BackendError> {
+    let end = start
+        .checked_add(count)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment address overflow",
+        ))?;
+    let capacity = u32::try_from(words.len())
+        .ok()
+        .and_then(|len| len.checked_mul(32))
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment capacity overflow",
+        ))?;
+    if end > bit_len || end > capacity {
+        return Err(BackendError::InvalidArtifact(
+            "VarDCT GPU fragment is truncated",
+        ));
+    }
+    let mut value = 0u32;
+    for index in 0..count {
+        let bit = start + index;
+        value |= ((words[(bit / 32) as usize] >> (bit % 32)) & 1) << index;
+    }
+    Ok(value)
 }
 
 fn clamped_gradient_i32(top: i32, left: i32, top_left: i32) -> i32 {
@@ -1322,8 +2083,7 @@ fn read_fragment_bits(
     Ok(value)
 }
 
-/// GPU-only convenience encoder for one bounded standard VarDCT
-/// transform.
+/// GPU-only convenience encoder for one standard VarDCT transform.
 pub struct VarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
     strategy: VarDctStrategy,
@@ -1334,9 +2094,9 @@ impl VarDctEncoder {
     ///
     /// # Errors
     ///
-    /// Returns an encoder error if `strategy` is not in
-    /// [`VarDctStrategy::EXECUTABLE`] or the fixed standard entropy tree cannot
-    /// be constructed.
+    /// Returns an encoder error if the fixed standard entropy tree cannot be
+    /// constructed or the selected device cannot execute the strategy's
+    /// checked storage/workgroup/dispatch requirements.
     pub fn new(context: WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
         let backend = VarDctBackend::new(&context, strategy)?;
         Ok(Self {
@@ -1739,7 +2499,9 @@ mod tests {
         let code = fixed_prefix_code().unwrap();
         assert!(prefix_entries(&code).iter().all(|entry| entry.bit_len > 0));
         let artifact = cpu_test_artifact([0, 0, 0], &code);
-        let frame = assemble_frame(build_frame_packet(&artifact, &code).unwrap()).unwrap();
+        let frame =
+            assemble_frame(build_frame_packet(fixed_artifact_data(&artifact), &code).unwrap())
+                .unwrap();
         let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
         codestream.extend_from_slice(frame.bytes());
         let decoded = decode_rgb8(&codestream);
@@ -1752,7 +2514,9 @@ mod tests {
         // libjxl's DCT8 oracle quantizes a solid red block close to these
         // Y/X/(B-Y) values with this profile's global DC scale.
         let artifact = cpu_test_artifact([332, 153, -6], &code);
-        let frame = assemble_frame(build_frame_packet(&artifact, &code).unwrap()).unwrap();
+        let frame =
+            assemble_frame(build_frame_packet(fixed_artifact_data(&artifact), &code).unwrap())
+                .unwrap();
         let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
         codestream.extend_from_slice(frame.bytes());
         let decoded = decode_rgb8(&codestream);
@@ -1769,9 +2533,13 @@ mod tests {
         assert_pod::<GpuPrefixEntry>();
         assert_pod::<VarDctKernelParams>();
         assert_pod::<VarDctKernelArtifact>();
+        assert_pod::<ScalableVarDctKernelParams>();
+        assert_pod::<ScalableVarDctArtifactHeader>();
         assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 256);
         assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 25_600);
         assert_eq!(std::mem::align_of::<VarDctKernelArtifact>(), 4);
+        assert_eq!(std::mem::size_of::<ScalableVarDctKernelParams>(), 256);
+        assert_eq!(std::mem::size_of::<ScalableVarDctArtifactHeader>(), 256);
     }
 
     #[test]
@@ -1787,6 +2555,19 @@ mod tests {
         assert!(SHADER.contains("strategy_map: array<u32, 16>"));
         assert!(SHADER.contains("padding: array<u32, 17>"));
         assert!(SHADER.contains("forward_xyb_bits: array<u32, 3072>"));
+
+        let module =
+            naga::front::wgsl::parse_str(LARGE_SHADER).expect("scalable VarDCT WGSL parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("scalable VarDCT WGSL validates");
+        assert!(LARGE_SHADER.contains("@compute @workgroup_size(64)"));
+        assert!(LARGE_SHADER.contains("@compute @workgroup_size(1)"));
+        assert!(LARGE_SHADER.contains("block_xyb: array<vec3<f32>, 64>"));
+        assert!(LARGE_SHADER.contains("var<storage, read_write> artifact_words: array<u32>"));
     }
 
     #[test]
@@ -1797,22 +2578,51 @@ mod tests {
         assert_eq!(VarDctStrategy::Dct16x8.block_extent(), (8, 16));
         assert_eq!(VarDctStrategy::Dct8x16.block_extent(), (16, 8));
         assert_eq!(VarDctStrategy::Dct256x128.block_extent(), (128, 256));
+        assert_eq!(VarDctStrategy::Dct256x128.block_grid(), (16, 32));
+        assert_eq!(VarDctStrategy::Dct128x256.block_extent(), (256, 128));
+        assert_eq!(VarDctStrategy::Dct128x256.block_grid(), (32, 16));
+        assert_eq!(VarDctStrategy::EXECUTABLE, VarDctStrategy::ALL);
         assert!(
             VarDctStrategy::EXECUTABLE
                 .into_iter()
                 .all(VarDctStrategy::is_executable)
         );
         assert!(VarDctStrategy::Hornuss.is_executable());
-        assert!(!VarDctStrategy::Dct64x64.is_executable());
+        assert!(VarDctStrategy::Dct64x64.is_executable());
     }
 
     #[test]
-    fn oversized_strategy_is_rejected_without_a_dct8_fallback() {
-        let Some(context) = test_context() else {
-            return;
-        };
-        let result = VarDctEncoder::new(context, VarDctStrategy::Dct64x64);
-        assert!(matches!(result, Err(EncodeError::InvalidConfiguration(_))));
+    fn scalable_layout_is_checked_and_preserves_large_orientation() {
+        let code = fixed_prefix_code().unwrap();
+        let portrait = ScalableArtifactLayout::new(VarDctStrategy::Dct256x128, &code).unwrap();
+        let landscape = ScalableArtifactLayout::new(VarDctStrategy::Dct128x256, &code).unwrap();
+        let largest = ScalableArtifactLayout::new(VarDctStrategy::Dct256x256, &code).unwrap();
+        assert_eq!(portrait.strategy_len, 16 * 32);
+        assert_eq!(landscape.strategy_len, 32 * 16);
+        assert_eq!(portrait.dc_len, 3 * 16 * 32);
+        assert_eq!(portrait, landscape);
+        assert_eq!(portrait.strategy_offset, SCALABLE_HEADER_WORDS);
+        assert_eq!(
+            portrait.strategy_offset % SCALABLE_SECTION_ALIGNMENT_WORDS,
+            0
+        );
+        assert_eq!(portrait.dc_offset % SCALABLE_SECTION_ALIGNMENT_WORDS, 0);
+        assert_eq!(portrait.token_offset % SCALABLE_SECTION_ALIGNMENT_WORDS, 0);
+        assert_eq!(portrait.extra_offset % SCALABLE_SECTION_ALIGNMENT_WORDS, 0);
+        assert_eq!(
+            portrait.fragment_offset % SCALABLE_SECTION_ALIGNMENT_WORDS,
+            0
+        );
+        assert_eq!(
+            portrait.artifact_words % SCALABLE_SECTION_ALIGNMENT_WORDS,
+            0
+        );
+        assert!(portrait.fragment_max_bits > 0);
+        assert_eq!(portrait.artifact_bytes(), 25_600);
+        assert_eq!(largest.strategy_len, 1_024);
+        assert_eq!(largest.dc_len, 3_072);
+        assert_eq!(largest.fragment_max_bits, 76_800);
+        assert_eq!(largest.artifact_bytes(), 50_944);
     }
 
     #[test]
@@ -1823,6 +2633,7 @@ mod tests {
         let encoder = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
         let source = padded_rgb_source(&context, &[[0, 0, 0]; 64]);
         let plan = encoder.memory_plan(&source).unwrap();
+        assert_eq!(plan.kernel_layout, VarDctKernelLayout::Bounded);
         assert_eq!(plan.source_binding_bytes, 232);
         assert_eq!(plan.parameter_storage_bytes, 256);
         assert_eq!(plan.artifact_storage_bytes, 25_600);
@@ -1846,9 +2657,20 @@ mod tests {
             let height = usize::from(height);
             let pixels = vec![[0, 0, 0]; width * height];
             let encoder = VarDctEncoder::new(context.clone(), strategy).unwrap();
-            let codestream = encoder
-                .encode(padded_rgb_source_sized(&context, width, height, &pixels))
-                .unwrap();
+            let source = padded_rgb_source_sized(&context, width, height, &pixels);
+            let plan = encoder.memory_plan(&source).unwrap();
+            if strategy.uses_scalable_kernel() {
+                let layout =
+                    ScalableArtifactLayout::new(strategy, &fixed_prefix_code().unwrap()).unwrap();
+                assert_eq!(plan.kernel_layout, VarDctKernelLayout::Scalable);
+                assert_eq!(plan.parameter_storage_bytes, 256);
+                assert_eq!(plan.artifact_storage_bytes, layout.artifact_bytes());
+                assert_eq!(plan.readback_bytes, layout.artifact_bytes());
+                assert_eq!(plan.owned_bytes_per_job, 256 + 2 * layout.artifact_bytes());
+            } else {
+                assert_eq!(plan.kernel_layout, VarDctKernelLayout::Bounded);
+            }
+            let codestream = encoder.encode(source).unwrap();
             assert_eq!(
                 decode_rgb8_sized(&codestream, width, height),
                 vec![0; width * height * 3],
