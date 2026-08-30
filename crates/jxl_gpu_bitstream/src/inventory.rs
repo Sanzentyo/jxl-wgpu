@@ -184,6 +184,17 @@ pub struct FrameBlendInfo {
     pub source: u32,
 }
 
+/// Progressive-pass schedule declared by a frame header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FramePassesInventory {
+    /// Per-pass coefficient shift, with one entry for every pass except the final pass.
+    pub shifts: Vec<u32>,
+    /// Resolution divisor for each progressive downsampling boundary.
+    pub downsampling: Vec<u32>,
+    /// Inclusive pass index at which the corresponding downsampling boundary ends.
+    pub last_pass: Vec<u32>,
+}
+
 /// Logical meaning of a physical TOC entry when the TOC is not permuted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSectionKind {
@@ -226,7 +237,11 @@ pub struct FrameInventory {
     pub do_ycbcr: bool,
     pub jpeg_upsampling: [u32; 3],
     pub upsampling: u32,
+    /// One upsampling factor per image-header extra channel, in channel order.
+    pub extra_channel_upsampling: Vec<u32>,
     pub group_size_shift: u32,
+    pub x_qm_scale: u32,
+    pub b_qm_scale: u32,
     pub width: u32,
     pub height: u32,
     pub x0: i32,
@@ -236,6 +251,7 @@ pub struct FrameInventory {
     /// One blending contract per image-header extra channel, in channel order.
     pub extra_channel_blends: Vec<FrameBlendInfo>,
     pub num_passes: u32,
+    pub progressive_passes: FramePassesInventory,
     pub duration_ticks: u32,
     pub timecode: Option<u32>,
     pub is_last: bool,
@@ -434,7 +450,10 @@ pub(crate) fn parse_codestream_inventory(
             do_ycbcr: header.do_ycbcr,
             jpeg_upsampling: header.jpeg_upsampling,
             upsampling: header.upsampling,
+            extra_channel_upsampling: header.extra_channel_upsampling,
             group_size_shift: header.group_size_shift,
+            x_qm_scale: header.x_qm_scale,
+            b_qm_scale: header.b_qm_scale,
             width: header.width,
             height: header.height,
             x0: header.x0,
@@ -443,6 +462,7 @@ pub(crate) fn parse_codestream_inventory(
             color_blend: header.color_blend,
             extra_channel_blends: header.extra_channel_blends,
             num_passes: header.num_passes,
+            progressive_passes: header.progressive_passes,
             duration_ticks: header.duration,
             timecode: header.timecode,
             is_last,
@@ -699,8 +719,12 @@ struct ParsedFrameHeader {
     do_ycbcr: bool,
     jpeg_upsampling: [u32; 3],
     upsampling: u32,
+    extra_channel_upsampling: Vec<u32>,
     group_size_shift: u32,
+    x_qm_scale: u32,
+    b_qm_scale: u32,
     num_passes: u32,
+    progressive_passes: FramePassesInventory,
     lf_level: u32,
     have_crop: bool,
     color_blend: FrameBlendInfo,
@@ -737,8 +761,12 @@ fn parse_frame_header(
             do_ycbcr: false,
             jpeg_upsampling: [0; 3],
             upsampling: 1,
+            extra_channel_upsampling: vec![1; extra_channel_count],
             group_size_shift: 1,
+            x_qm_scale: if context.xyb_encoded { 3 } else { 2 },
+            b_qm_scale: 2,
             num_passes: 1,
+            progressive_passes: FramePassesInventory::default(),
             lf_level: 0,
             have_crop: false,
             color_blend: FrameBlendInfo::default(),
@@ -794,9 +822,10 @@ fn parse_frame_header(
     } else {
         read_u32(reader, [c(1), c(2), c(4), c(8)])?
     };
+    let mut extra_channel_upsampling = vec![1; extra_channel_count];
     if !has_lf_frame {
-        for _ in 0..context.num_extra_channels {
-            let _ = read_u32(reader, [c(1), c(2), c(4), c(8)])?;
+        for value in &mut extra_channel_upsampling {
+            *value = read_u32(reader, [c(1), c(2), c(4), c(8)])?;
         }
     }
     let group_size_shift = if encoding == FrameEncoding::Modular {
@@ -804,15 +833,20 @@ fn parse_frame_header(
     } else {
         1
     };
-    if encoding == FrameEncoding::VarDct && context.xyb_encoded {
-        let _ = read_bits(reader, 3)?;
-        let _ = read_bits(reader, 3)?;
-    }
-    let num_passes = if frame_type == FrameType::ReferenceOnly {
-        1
+    let (x_qm_scale, b_qm_scale) = if encoding == FrameEncoding::VarDct && context.xyb_encoded {
+        (read_bits(reader, 3)? as u32, read_bits(reader, 3)? as u32)
+    } else {
+        (2, 2)
+    };
+    let progressive_passes = if frame_type == FrameType::ReferenceOnly {
+        FramePassesInventory::default()
     } else {
         parse_passes(reader)?
     };
+    let num_passes = u32::try_from(progressive_passes.shifts.len())
+        .map_err(|_| InventoryError::ResourceLimit("frame passes"))?
+        .checked_add(1)
+        .ok_or(InventoryError::SizeOverflow)?;
     let lf_level = if frame_type == FrameType::LowFrequency {
         read_u32(reader, [c(1), c(2), c(3), c(4)])?
     } else {
@@ -941,8 +975,12 @@ fn parse_frame_header(
         do_ycbcr,
         jpeg_upsampling,
         upsampling,
+        extra_channel_upsampling,
         group_size_shift,
+        x_qm_scale,
+        b_qm_scale,
         num_passes,
+        progressive_passes,
         lf_level,
         have_crop,
         color_blend,
@@ -962,14 +1000,20 @@ fn parse_frame_header(
     })
 }
 
-fn parse_passes(reader: &mut BitReader<'_>) -> Result<u32, InventoryError> {
+fn parse_passes(reader: &mut BitReader<'_>) -> Result<FramePassesInventory, InventoryError> {
     let num_passes = read_u32(reader, [c(1), c(2), c(3), b(4, 3)])?;
     if num_passes == 1 {
-        return Ok(1);
+        return Ok(FramePassesInventory::default());
     }
     let num_downsampling = read_u32(reader, [c(0), c(1), c(2), b(3, 1)])?;
-    for _ in 0..num_passes - 1 {
-        let _ = read_bits(reader, 2)?;
+    let shift_count = usize::try_from(num_passes - 1)
+        .map_err(|_| InventoryError::ResourceLimit("frame passes"))?;
+    let mut shifts = Vec::new();
+    shifts
+        .try_reserve_exact(shift_count)
+        .map_err(|_| InventoryError::AllocationFailed("frame passes"))?;
+    for _ in 0..shift_count {
+        shifts.push(read_bits(reader, 2)? as u32);
     }
     let mut downsampling = Vec::new();
     downsampling
@@ -992,7 +1036,11 @@ fn parse_passes(reader: &mut BitReader<'_>) -> Result<u32, InventoryError> {
     {
         return Err(InventoryError::InvalidFrame("invalid progressive passes"));
     }
-    Ok(num_passes)
+    Ok(FramePassesInventory {
+        shifts,
+        downsampling,
+        last_pass,
+    })
 }
 
 fn parse_blending_info(
@@ -1494,6 +1542,10 @@ mod tests {
         );
         assert_eq!(frame.frame_type, FrameType::Regular);
         assert_eq!(frame.encoding, FrameEncoding::VarDct);
+        assert_eq!((frame.x_qm_scale, frame.b_qm_scale), (2, 2));
+        assert_eq!(frame.extra_channel_upsampling, Vec::<u32>::new());
+        assert_eq!(frame.num_passes, 1);
+        assert_eq!(frame.progressive_passes, FramePassesInventory::default());
         assert_eq!((frame.width, frame.height), (1, 1));
         assert_eq!((frame.group_count, frame.low_frequency_group_count), (1, 1));
         assert_eq!(
@@ -1741,6 +1793,33 @@ mod tests {
             2
         );
         assert_eq!(sourced_extra_reader.bit_offset(), 4);
+    }
+
+    #[test]
+    fn progressive_pass_inventory_preserves_the_complete_schedule() {
+        let mut bits = BitWriter::new();
+        bits.write_bits(3, 2).unwrap(); // Extended num_passes selector.
+        bits.write_bits(2, 3).unwrap(); // 4 + 2 = 6 passes.
+        bits.write_bits(2, 2).unwrap(); // Two downsampling boundaries.
+        for shift in [3, 2, 2, 1, 0] {
+            bits.write_bits(shift, 2).unwrap();
+        }
+        bits.write_bits(3, 2).unwrap(); // Downsampling 8.
+        bits.write_bits(1, 2).unwrap(); // Downsampling 2.
+        bits.write_bits(1, 2).unwrap(); // Last pass 1.
+        bits.write_bits(3, 2).unwrap(); // Extended last-pass selector.
+        bits.write_bits(4, 3).unwrap(); // Last pass 4.
+
+        let mut reader = BitReader::new(bits.as_bytes());
+        assert_eq!(
+            parse_passes(&mut reader).unwrap(),
+            FramePassesInventory {
+                shifts: vec![3, 2, 2, 1, 0],
+                downsampling: vec![8, 2],
+                last_pass: vec![1, 4],
+            }
+        );
+        assert_eq!(reader.bit_offset(), 28);
     }
 
     #[test]
