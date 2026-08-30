@@ -75,11 +75,14 @@ pub use acceleration::{
     ACCELERATION_INDEX_BOX_TYPE, AccelerationIndexError, Gray8AccelerationIndex, PrefixCodeEntry,
 };
 pub use inventory::{
-    AnimationInventory, BitRange, ByteRange, CodestreamInventory, EdgePreservingFilterInventory,
-    EmbeddedIccInventory, EpfSigmaInventory, EpfWeightsInventory, FiniteF16, FrameBlendInfo,
-    FrameBlendMode, FrameEncoding, FrameInventory, FramePassesInventory, FrameSection,
-    FrameSectionKind, FrameType, GaborishInventory, ImageHeaderInventory, InventoryError,
-    InventoryLimits, RestorationFilterInventory, SampleBitDepth,
+    AnimationInventory, BitRange, ByteRange, ChromaticityInventory, CodestreamInventory,
+    ColourEncodingInventory, ColourSpaceInventory, EdgePreservingFilterInventory,
+    EmbeddedIccInventory, EpfSigmaInventory, EpfWeightsInventory, ExtraChannelInventory,
+    ExtraChannelTypeInventory, FiniteF16, FiniteF32, FrameBlendInfo, FrameBlendMode, FrameEncoding,
+    FrameInventory, FramePassesInventory, FrameSection, FrameSectionKind, FrameType,
+    GaborishInventory, ImageHeaderInventory, InventoryError, InventoryLimits, PrimariesInventory,
+    RenderingIntentInventory, RestorationFilterInventory, SampleBitDepth, ToneMappingInventory,
+    TransferFunctionInventory, WhitePointInventory,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).

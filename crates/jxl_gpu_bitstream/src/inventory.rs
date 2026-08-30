@@ -5,7 +5,14 @@
 //! entropy-coded TOC permutation. No image sample, Modular, or VarDCT data is decoded here.
 
 use jxl_bitstream::Bitstream as ImageBitstream;
-use jxl_image::{BitDepth as JxlBitDepth, ImageHeader};
+use jxl_image::{
+    BitDepth as JxlBitDepth, ExtraChannelType as JxlExtraChannelType, ImageHeader,
+    color::{
+        ColourEncoding as JxlColourEncoding, ColourSpace as JxlColourSpace,
+        Primaries as JxlPrimaries, RenderingIntent as JxlRenderingIntent,
+        TransferFunction as JxlTransferFunction, WhitePoint as JxlWhitePoint,
+    },
+};
 use jxl_oxide_common::Bundle;
 use thiserror::Error;
 
@@ -105,6 +112,159 @@ pub enum SampleBitDepth {
     },
 }
 
+/// Finite `f32` value stored by exact IEEE 754 bits so inventories remain equality-comparable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FiniteF32(u32);
+
+impl FiniteF32 {
+    #[must_use]
+    pub fn from_f32(value: f32) -> Option<Self> {
+        value.is_finite().then_some(Self(value.to_bits()))
+    }
+
+    #[must_use]
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        Self::from_f32(f32::from_bits(bits))
+    }
+
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn to_f32(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+/// JPEG XL color-space declaration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ColourSpaceInventory {
+    #[default]
+    Rgb = 0,
+    Grey = 1,
+    Xyb = 2,
+    Unknown = 3,
+}
+
+/// Integer-scaled custom xy chromaticity coordinate (`1_000_000` units per 1.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromaticityInventory {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// JPEG XL white-point declaration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WhitePointInventory {
+    #[default]
+    D65,
+    Custom(ChromaticityInventory),
+    E,
+    Dci,
+}
+
+/// JPEG XL RGB-primary declaration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrimariesInventory {
+    #[default]
+    Srgb,
+    Custom {
+        red: ChromaticityInventory,
+        green: ChromaticityInventory,
+        blue: ChromaticityInventory,
+    },
+    Bt2100,
+    P3,
+}
+
+/// JPEG XL transfer-function declaration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransferFunctionInventory {
+    Gamma {
+        scaled_gamma: u32,
+        inverted: bool,
+    },
+    Bt709,
+    Unknown,
+    Linear,
+    #[default]
+    Srgb,
+    Pq,
+    Dci,
+    Hlg,
+}
+
+/// ICC rendering intent declared by an enumerated JPEG XL color encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RenderingIntentInventory {
+    Perceptual = 0,
+    #[default]
+    Relative = 1,
+    Saturation = 2,
+    Absolute = 3,
+}
+
+/// Standard JPEG XL color encoding, either enumerated or supplied by an embedded ICC profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColourEncodingInventory {
+    Enumerated {
+        colour_space: ColourSpaceInventory,
+        white_point: WhitePointInventory,
+        primaries: PrimariesInventory,
+        transfer_function: TransferFunctionInventory,
+        rendering_intent: RenderingIntentInventory,
+    },
+    IccProfile {
+        colour_space: ColourSpaceInventory,
+    },
+}
+
+/// Semantic type and parameters of one JPEG XL extra channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraChannelTypeInventory {
+    Alpha {
+        associated: bool,
+    },
+    Depth,
+    SpotColour {
+        red: FiniteF32,
+        green: FiniteF32,
+        blue: FiniteF32,
+        solidity: FiniteF32,
+    },
+    SelectionMask,
+    Black,
+    Cfa {
+        channel: u32,
+    },
+    Thermal,
+    NonOptional,
+    Optional,
+}
+
+/// Complete image-header declaration for one extra channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtraChannelInventory {
+    pub channel_type: ExtraChannelTypeInventory,
+    pub bit_depth: SampleBitDepth,
+    pub dimension_shift: u32,
+    pub name_bytes: Vec<u8>,
+}
+
+/// HDR tone-mapping metadata from the JPEG XL image header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToneMappingInventory {
+    pub intensity_target: FiniteF32,
+    pub min_nits: FiniteF32,
+    pub relative_to_max_display: bool,
+    pub linear_below: FiniteF32,
+}
+
 /// Animation timing metadata from the JPEG XL image header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnimationInventory {
@@ -137,8 +297,11 @@ pub struct ImageHeaderInventory {
     pub bit_depth: SampleBitDepth,
     pub modular_16bit_buffers: bool,
     pub extra_channel_count: u32,
+    pub extra_channels: Vec<ExtraChannelInventory>,
     pub xyb_encoded: bool,
     pub grayscale: bool,
+    pub colour_encoding: ColourEncodingInventory,
+    pub tone_mapping: ToneMappingInventory,
     pub embedded_icc: Option<EmbeddedIccInventory>,
     pub animation: Option<AnimationInventory>,
 }
@@ -639,17 +802,20 @@ fn parse_image_header(
     if extra_channel_count > MAX_EXTRA_CHANNELS {
         return Err(InventoryError::ResourceLimit("extra channels"));
     }
-    let bit_depth = match metadata.bit_depth {
-        JxlBitDepth::IntegerSample { bits_per_sample } => {
-            SampleBitDepth::Integer { bits_per_sample }
-        }
-        JxlBitDepth::FloatSample {
-            bits_per_sample,
-            exp_bits,
-        } => SampleBitDepth::Float {
-            bits_per_sample,
-            exponent_bits_per_sample: exp_bits,
-        },
+    let bit_depth = sample_bit_depth(metadata.bit_depth);
+    let mut extra_channels = Vec::new();
+    extra_channels
+        .try_reserve_exact(metadata.ec_info.len())
+        .map_err(|_| InventoryError::AllocationFailed("extra-channel inventory"))?;
+    for info in &metadata.ec_info {
+        extra_channels.push(extra_channel_inventory(info)?);
+    }
+    let colour_encoding = colour_encoding_inventory(&metadata.colour_encoding);
+    let tone_mapping = ToneMappingInventory {
+        intensity_target: finite_header_f32(metadata.tone_mapping.intensity_target)?,
+        min_nits: finite_header_f32(metadata.tone_mapping.min_nits)?,
+        relative_to_max_display: metadata.tone_mapping.relative_to_max_display,
+        linear_below: finite_header_f32(metadata.tone_mapping.linear_below)?,
     };
     let animation = metadata
         .animation
@@ -691,8 +857,11 @@ fn parse_image_header(
         bit_depth,
         modular_16bit_buffers: metadata.modular_16bit_buffers,
         extra_channel_count,
+        extra_channels,
         xyb_encoded: metadata.xyb_encoded,
         grayscale: metadata.grayscale(),
+        colour_encoding,
+        tone_mapping,
         embedded_icc,
         animation,
     };
@@ -709,6 +878,134 @@ fn parse_image_header(
             have_timecodes: animation.is_some_and(|animation| animation.have_timecodes),
         },
     })
+}
+
+fn sample_bit_depth(bit_depth: JxlBitDepth) -> SampleBitDepth {
+    match bit_depth {
+        JxlBitDepth::IntegerSample { bits_per_sample } => {
+            SampleBitDepth::Integer { bits_per_sample }
+        }
+        JxlBitDepth::FloatSample {
+            bits_per_sample,
+            exp_bits,
+        } => SampleBitDepth::Float {
+            bits_per_sample,
+            exponent_bits_per_sample: exp_bits,
+        },
+    }
+}
+
+fn finite_header_f32(value: f32) -> Result<FiniteF32, InventoryError> {
+    FiniteF32::from_f32(value)
+        .ok_or_else(|| InventoryError::ImageHeader("non-finite image-header value".into()))
+}
+
+fn extra_channel_inventory(
+    info: &jxl_image::ExtraChannelInfo,
+) -> Result<ExtraChannelInventory, InventoryError> {
+    let channel_type = match info.ty {
+        JxlExtraChannelType::Alpha { alpha_associated } => ExtraChannelTypeInventory::Alpha {
+            associated: alpha_associated,
+        },
+        JxlExtraChannelType::Depth => ExtraChannelTypeInventory::Depth,
+        JxlExtraChannelType::SpotColour {
+            red,
+            green,
+            blue,
+            solidity,
+        } => ExtraChannelTypeInventory::SpotColour {
+            red: finite_header_f32(red)?,
+            green: finite_header_f32(green)?,
+            blue: finite_header_f32(blue)?,
+            solidity: finite_header_f32(solidity)?,
+        },
+        JxlExtraChannelType::SelectionMask => ExtraChannelTypeInventory::SelectionMask,
+        JxlExtraChannelType::Black => ExtraChannelTypeInventory::Black,
+        JxlExtraChannelType::Cfa { cfa_channel } => ExtraChannelTypeInventory::Cfa {
+            channel: cfa_channel,
+        },
+        JxlExtraChannelType::Thermal => ExtraChannelTypeInventory::Thermal,
+        JxlExtraChannelType::NonOptional => ExtraChannelTypeInventory::NonOptional,
+        JxlExtraChannelType::Optional => ExtraChannelTypeInventory::Optional,
+    };
+    let source_name = info.name.as_bytes();
+    let mut name_bytes = Vec::new();
+    name_bytes
+        .try_reserve_exact(source_name.len())
+        .map_err(|_| InventoryError::AllocationFailed("extra-channel name"))?;
+    name_bytes.extend_from_slice(source_name);
+    Ok(ExtraChannelInventory {
+        channel_type,
+        bit_depth: sample_bit_depth(info.bit_depth),
+        dimension_shift: info.dim_shift,
+        name_bytes,
+    })
+}
+
+fn colour_encoding_inventory(encoding: &JxlColourEncoding) -> ColourEncodingInventory {
+    match encoding {
+        JxlColourEncoding::Enum(enumerated) => ColourEncodingInventory::Enumerated {
+            colour_space: colour_space_inventory(enumerated.colour_space),
+            white_point: match enumerated.white_point {
+                JxlWhitePoint::D65 => WhitePointInventory::D65,
+                JxlWhitePoint::Custom(point) => {
+                    WhitePointInventory::Custom(ChromaticityInventory {
+                        x: point.x,
+                        y: point.y,
+                    })
+                }
+                JxlWhitePoint::E => WhitePointInventory::E,
+                JxlWhitePoint::Dci => WhitePointInventory::Dci,
+            },
+            primaries: match enumerated.primaries {
+                JxlPrimaries::Srgb => PrimariesInventory::Srgb,
+                JxlPrimaries::Custom { red, green, blue } => PrimariesInventory::Custom {
+                    red: ChromaticityInventory { x: red.x, y: red.y },
+                    green: ChromaticityInventory {
+                        x: green.x,
+                        y: green.y,
+                    },
+                    blue: ChromaticityInventory {
+                        x: blue.x,
+                        y: blue.y,
+                    },
+                },
+                JxlPrimaries::Bt2100 => PrimariesInventory::Bt2100,
+                JxlPrimaries::P3 => PrimariesInventory::P3,
+            },
+            transfer_function: match enumerated.tf {
+                JxlTransferFunction::Gamma { g, inverted } => TransferFunctionInventory::Gamma {
+                    scaled_gamma: g,
+                    inverted,
+                },
+                JxlTransferFunction::Bt709 => TransferFunctionInventory::Bt709,
+                JxlTransferFunction::Unknown => TransferFunctionInventory::Unknown,
+                JxlTransferFunction::Linear => TransferFunctionInventory::Linear,
+                JxlTransferFunction::Srgb => TransferFunctionInventory::Srgb,
+                JxlTransferFunction::Pq => TransferFunctionInventory::Pq,
+                JxlTransferFunction::Dci => TransferFunctionInventory::Dci,
+                JxlTransferFunction::Hlg => TransferFunctionInventory::Hlg,
+            },
+            rendering_intent: match enumerated.rendering_intent {
+                JxlRenderingIntent::Perceptual => RenderingIntentInventory::Perceptual,
+                JxlRenderingIntent::Relative => RenderingIntentInventory::Relative,
+                JxlRenderingIntent::Saturation => RenderingIntentInventory::Saturation,
+                JxlRenderingIntent::Absolute => RenderingIntentInventory::Absolute,
+            },
+        },
+        JxlColourEncoding::IccProfile(colour_space) => ColourEncodingInventory::IccProfile {
+            colour_space: colour_space_inventory(*colour_space),
+        },
+    }
+}
+
+const fn colour_space_inventory(colour_space: JxlColourSpace) -> ColourSpaceInventory {
+    match colour_space {
+        JxlColourSpace::Rgb => ColourSpaceInventory::Rgb,
+        JxlColourSpace::Grey => ColourSpaceInventory::Grey,
+        JxlColourSpace::Xyb => ColourSpaceInventory::Xyb,
+        JxlColourSpace::Unknown => ColourSpaceInventory::Unknown,
+    }
 }
 
 fn parse_embedded_icc(
@@ -1679,6 +1976,22 @@ mod tests {
             basic.image_header.bit_depth,
             SampleBitDepth::Integer { bits_per_sample: 8 }
         );
+        assert_eq!(
+            basic.image_header.colour_encoding,
+            ColourEncodingInventory::Enumerated {
+                colour_space: ColourSpaceInventory::Rgb,
+                white_point: WhitePointInventory::D65,
+                primaries: PrimariesInventory::Srgb,
+                transfer_function: TransferFunctionInventory::Srgb,
+                rendering_intent: RenderingIntentInventory::Relative,
+            }
+        );
+        assert_eq!(
+            basic.image_header.tone_mapping.intensity_target.to_f32(),
+            255.0
+        );
+        assert_eq!(basic.image_header.tone_mapping.min_nits.to_f32(), 0.0);
+        assert!(basic.image_header.extra_channels.is_empty());
         assert!(basic.image_header.xyb_encoded);
         assert_eq!(basic.frames.len(), 1);
         let frame = &basic.frames[0];
@@ -1848,6 +2161,12 @@ mod tests {
         let bytes = crate::test_fixtures::with_icc();
         let inventory = inventory(&bytes);
         assert_eq!(inventory.codestream_bytes, 358);
+        assert_eq!(
+            inventory.image_header.colour_encoding,
+            ColourEncodingInventory::IccProfile {
+                colour_space: ColourSpaceInventory::Grey,
+            }
+        );
         let icc = inventory
             .image_header
             .embedded_icc
@@ -2149,6 +2468,16 @@ mod tests {
         );
         assert_eq!(fragmented.image_header.bit_range.length, 69);
         assert_eq!(fragmented.image_header.extra_channel_count, 1);
+        assert_eq!(fragmented.image_header.extra_channels.len(), 1);
+        assert_eq!(
+            fragmented.image_header.extra_channels[0],
+            ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::Alpha { associated: false },
+                bit_depth: SampleBitDepth::Integer { bits_per_sample: 8 },
+                dimension_shift: 0,
+                name_bytes: Vec::new(),
+            }
+        );
         assert!(!fragmented.image_header.xyb_encoded);
         assert_eq!(
             fragmented.image_header.animation,
