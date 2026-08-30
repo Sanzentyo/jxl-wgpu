@@ -238,7 +238,7 @@
         "readback_staging_bytes": { "type": "integer", "minimum": 0 },
         "readback_source_frames": { "type": "integer", "minimum": 0 },
         "readback_max_frames_per_submission": { "type": "integer", "minimum": 0 },
-        "readback_mode": { "oneOf": [{ "type": "null" }, { "enum": ["staged_copy", "aggregate_staged_copy"] }] },
+        "readback_mode": { "oneOf": [{ "type": "null" }, { "enum": ["staged_copy", "direct_map", "aggregate_staged_copy"] }] },
         "coalesced_gpu_batching": { "const": false },
         "output_hash": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }] },
         "timing": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/codec_timing" }] },

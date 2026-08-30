@@ -86,6 +86,8 @@ pub enum WorkloadExecutionModel {
 #[serde(rename_all = "snake_case")]
 pub enum CpuReadbackMode {
     StagedCopy,
+    /// One producer-marked output allocation was mapped in place without a staging copy.
+    DirectMap,
     /// Several already-produced GPU frames share one staging buffer, queue submission, and map.
     AggregateStagedCopy,
 }
@@ -616,6 +618,7 @@ fn run_encode(
             readback_completion_waits: 0,
             readback_logical_bytes: 0,
             readback_staging_bytes: 0,
+            readback_direct_submissions: 0,
             readback_source_frames: 0,
             readback_max_frames_per_submission: 0,
             output_hash: Some(blake3::hash(&encoded).to_hex().to_string()),
@@ -873,6 +876,10 @@ fn decode_once_inner(
             observation.readback_staging_bytes = observation
                 .readback_staging_bytes
                 .saturating_add(result.stats.staging_bytes);
+            if result.stats.direct_mapped {
+                observation.readback_direct_submissions =
+                    observation.readback_direct_submissions.saturating_add(1);
+            }
             for output in result.frame.outputs {
                 readback_hash.update(&output.bytes);
                 readback_outputs = readback_outputs.saturating_add(1);
@@ -1330,8 +1337,12 @@ fn complete_workload(
         readback_staging_bytes: aggregate.readback_staging_bytes,
         readback_source_frames: aggregate.readback_source_frames,
         readback_max_frames_per_submission: aggregate.readback_max_frames_per_submission,
-        readback_mode: readback_mode.or_else(|| {
-            (aggregate.readback_submissions != 0).then_some(CpuReadbackMode::StagedCopy)
+        readback_mode: readback_mode.or(match aggregate.readback_submissions {
+            0 => None,
+            submissions if submissions == aggregate.readback_direct_submissions => {
+                Some(CpuReadbackMode::DirectMap)
+            }
+            _ => Some(CpuReadbackMode::StagedCopy),
         }),
         output_hash: aggregate.output_hash,
         timing: CodecTiming {
@@ -1688,6 +1699,7 @@ struct DecodeObservation {
     readback_completion_waits: u64,
     readback_logical_bytes: u64,
     readback_staging_bytes: u64,
+    readback_direct_submissions: u64,
     readback_source_frames: u64,
     readback_max_frames_per_submission: u64,
     output_hash: Option<String>,
@@ -1731,6 +1743,9 @@ impl DecodeObservation {
         self.readback_staging_bytes = self
             .readback_staging_bytes
             .saturating_add(other.readback_staging_bytes);
+        self.readback_direct_submissions = self
+            .readback_direct_submissions
+            .saturating_add(other.readback_direct_submissions);
         self.readback_source_frames = self
             .readback_source_frames
             .saturating_add(other.readback_source_frames);
@@ -1855,6 +1870,7 @@ mod tests {
                 readback_completion_waits: 0,
                 readback_logical_bytes: 0,
                 readback_staging_bytes: 0,
+                readback_direct_submissions: 0,
                 readback_source_frames: 0,
                 readback_max_frames_per_submission: 0,
                 output_hash: None,
@@ -2099,7 +2115,12 @@ mod tests {
             },
         );
         assert_eq!(single.status, CaseStatus::Passed, "{:?}", single.issue);
-        assert_eq!(single.readback_mode, Some(CpuReadbackMode::StagedCopy));
+        let expected_single_mode = if backend.direct_readback_enabled() {
+            CpuReadbackMode::DirectMap
+        } else {
+            CpuReadbackMode::StagedCopy
+        };
+        assert_eq!(single.readback_mode, Some(expected_single_mode));
         assert_eq!(single.readback_source_frames, 1);
         assert_eq!(single.readback_max_frames_per_submission, 1);
         assert_eq!(aggregate.output_hash, single.output_hash);
@@ -2112,10 +2133,15 @@ mod tests {
             aggregate.readback_logical_bytes,
             single.readback_logical_bytes * 6
         );
-        assert_eq!(
-            aggregate.readback_staging_bytes,
-            single.readback_staging_bytes * 6
-        );
+        if backend.direct_readback_enabled() {
+            assert_eq!(single.readback_staging_bytes, 0);
+            assert!(aggregate.readback_staging_bytes > 0);
+        } else {
+            assert_eq!(
+                aggregate.readback_staging_bytes,
+                single.readback_staging_bytes * 6
+            );
+        }
         assert_eq!(aggregate.codec_submissions, single.codec_submissions * 6);
         assert_eq!(
             aggregate.codec_completion_waits,
@@ -2268,8 +2294,13 @@ mod tests {
         assert_eq!(report.readback_completion_waits, 1);
         assert_eq!(report.gpu_output_logical_bytes, 65);
         assert_eq!(report.readback_logical_bytes, 65);
-        assert_eq!(report.readback_staging_bytes, 68);
-        assert_eq!(report.readback_mode, Some(CpuReadbackMode::StagedCopy));
+        if backend.direct_readback_enabled() {
+            assert_eq!(report.readback_staging_bytes, 0);
+            assert_eq!(report.readback_mode, Some(CpuReadbackMode::DirectMap));
+        } else {
+            assert_eq!(report.readback_staging_bytes, 68);
+            assert_eq!(report.readback_mode, Some(CpuReadbackMode::StagedCopy));
+        }
         assert!(!report.coalesced_gpu_batching);
         assert_eq!(report.output_bytes, 65);
         assert!(report.output_hash.is_some());

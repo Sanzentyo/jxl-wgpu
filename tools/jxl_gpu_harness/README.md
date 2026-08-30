@@ -97,8 +97,9 @@ completion paths, not the queue-submit count. Warmup activity is excluded from t
 `readback_logical_bytes` and `readback_staging_bytes` come from the aggregate readback plan; staging
 bytes include independently applied four-byte copy padding for every output.
 `readback_source_frames` and `readback_max_frames_per_submission` make frame coalescing auditable.
-`readback_mode` is `aggregate_staged_copy` for a CPU-readback concurrent burst larger than one and
-`staged_copy` for the per-frame path, including `burst-size = 1`. A
+`readback_mode` is `aggregate_staged_copy` for a CPU-readback concurrent burst larger than one,
+`direct_map` for a sole producer-marked output on an eligible native UMA backend, and
+`staged_copy` for the remaining per-frame path. Direct maps report zero staging bytes. A
 `display_texture` run enqueues conversion on the same queue but does not wait for display conversion
 completion, so it reports display submissions and zero display waits rather than pretending to be
 end-to-end presentation latency. `gpu_resident` performs no image readback. `output_bytes` is the

@@ -495,6 +495,7 @@ mod tests {
                 .as_array()
                 .unwrap();
         assert!(modes.iter().any(|mode| mode == "staged_copy"));
+        assert!(modes.iter().any(|mode| mode == "direct_map"));
         assert!(modes.iter().any(|mode| mode == "aggregate_staged_copy"));
         for field in [
             "readback_source_frames",
