@@ -59,6 +59,8 @@ pub enum UnsupportedVarDctFeature {
 pub enum VarDctFrontendError {
     #[error("standard GPU VarDCT profile does not support {feature:?}")]
     Unsupported { feature: UnsupportedVarDctFeature },
+    #[error("the JPEG XL VarDCT frame name is not valid UTF-8")]
+    InvalidFrameName,
     #[error("frame section bit range overflows the codestream address space")]
     SectionRangeOverflow,
     #[error("frame section {range:?} exceeds the {codestream_bits}-bit contiguous codestream")]
@@ -579,6 +581,8 @@ pub struct StandardVarDctProfile {
     /// Whether section F.2's adaptive smoothing pass is required after LF dequantization and
     /// chroma-from-luma reconstruction.
     pub adaptive_lf_smoothing: bool,
+    /// Validated UTF-8 frame name preserved in authoritative [`crate::FrameMetadata`].
+    pub frame_name: String,
     pub sections: VarDctSectionLayout,
 }
 
@@ -597,6 +601,8 @@ impl StandardVarDctProfile {
         validate_image(inventory)?;
         let frame = validate_frame(inventory)?;
         let sections = collect_sections(inventory, frame)?;
+        let frame_name = String::from_utf8(frame.name_bytes.clone())
+            .map_err(|_| VarDctFrontendError::InvalidFrameName)?;
         let bits_per_sample = match inventory.image_header.bit_depth {
             SampleBitDepth::Integer { bits_per_sample } => bits_per_sample,
             SampleBitDepth::Float { .. } => {
@@ -612,6 +618,7 @@ impl StandardVarDctProfile {
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
             adaptive_lf_smoothing: frame.flags & 0x80 == 0,
+            frame_name,
             sections,
         })
     }
@@ -979,4 +986,57 @@ fn metadata_at<T>(
     operation: impl FnOnce(&mut MetadataBitstream<'_>) -> Result<T, jxl_bitstream::Error>,
 ) -> Result<T, VarDctPacketError> {
     operation(reader).map_err(|source| VarDctPacketError::MetadataBitstream { stage, source })
+}
+
+#[cfg(test)]
+mod tests {
+    use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
+
+    use super::*;
+
+    fn fixture(input: &str) -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid checked-in fixture hex digit"),
+            }
+        }
+
+        let digits = input
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
+        digits
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    #[test]
+    fn strict_profile_preserves_utf8_frame_names_and_rejects_invalid_bytes() {
+        let encoded = fixture(include_str!("../test-data/basic.jxl.hex"));
+        let parsed = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default()).unwrap();
+        let mut inventory = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        assert!(inventory.frames[0].name_bytes.is_empty());
+
+        inventory.frames[0]
+            .name_bytes
+            .extend_from_slice(b"named frame");
+        assert_eq!(
+            StandardVarDctProfile::negotiate(&inventory)
+                .unwrap()
+                .frame_name,
+            "named frame"
+        );
+        inventory.frames[0].name_bytes = vec![0xff];
+        assert_eq!(
+            StandardVarDctProfile::negotiate(&inventory).unwrap_err(),
+            VarDctFrontendError::InvalidFrameName
+        );
+    }
 }

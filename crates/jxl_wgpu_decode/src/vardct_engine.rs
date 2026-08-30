@@ -15,10 +15,13 @@ use std::task::{Context, Poll, Waker};
 
 use jxl_gpu_bitstream::{
     ColourEncodingInventory, ColourSpaceInventory, EdgePreservingFilterInventory,
-    GaborishInventory, InventoryLimits, PrimariesInventory, RenderingIntentInventory,
+    GaborishInventory, InventoryLimits, ParseLimits, PrimariesInventory, RenderingIntentInventory,
     RestorationFilterInventory, TransferFunctionInventory, WhitePointInventory,
 };
-use jxl_gpu_formats::{ColorSpecification, ImageLayout, LayoutError, PixelFormat, RgbChannelOrder};
+use jxl_gpu_formats::{
+    ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, ImageLayout,
+    LayoutError, PixelFormat, RgbChannelOrder, TransferFunction, YcbcrEncoding,
+};
 use jxl_gpu_protocol::{
     ChangedRegions, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
 };
@@ -61,6 +64,7 @@ const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as
 const ARTIFACT_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctArtifactStatus>() as u64;
 const VALIDATION_STAGING_BYTES: u64 = PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES;
 const ADAPTIVE_LF_WORKGROUP_BYTES: u64 = 18 * 18 * 16;
+const VAR_DCT_PARSE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
@@ -118,7 +122,17 @@ pub enum VarDctDecodeError {
 /// Exact canonical output supported by [`VarDctSubmissionEngine`].
 #[must_use]
 pub fn vardct_rgb8_format() -> PixelFormat {
-    PixelFormat::rgb8(RgbChannelOrder::Rgb, false, ColorSpecification::Default)
+    PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
 }
 
 /// Exact GPU buffer accounting for one bounded VarDCT frame.
@@ -358,12 +372,22 @@ struct VarDctSource {
     layout: ImageLayout,
     inverse_opsin: VarDctInverseOpsin,
     quant_biases: [f32; 4],
+    frame_name: String,
     transform_index: usize,
     memory: VarDctDecodeMemoryStats,
 }
 
 impl GpuSubmissionEngine for VarDctSubmissionEngine {
     type Session = VarDctDecodeSession;
+
+    fn parse_limits(&self) -> ParseLimits {
+        ParseLimits {
+            max_input_bytes: VAR_DCT_PARSE_LIMIT_BYTES,
+            max_boxes: 32,
+            max_box_bytes: VAR_DCT_PARSE_LIMIT_BYTES,
+            max_codestream_bytes: VAR_DCT_PARSE_LIMIT_BYTES,
+        }
+    }
 
     fn open(
         &self,
@@ -526,6 +550,7 @@ fn prepare_source(
         output_plan,
     )?;
     validate_device_limits(backend.device(), memory)?;
+    let frame_name = packet.profile.frame_name.clone();
     Ok(VarDctSource {
         codestream_storage: codestream.shared_storage(),
         codestream_range: codestream.storage_range(),
@@ -539,6 +564,7 @@ fn prepare_source(
         layout,
         inverse_opsin,
         quant_biases,
+        frame_name,
         transform_index,
         memory,
     })
@@ -719,6 +745,7 @@ pub struct VarDctPendingFrame {
     token: SubmissionToken,
     layout: ImageLayout,
     transform: TransformKind,
+    frame_name: String,
     expected_lf_samples: u32,
     expected_hf_samples: u32,
     expected_coefficients: u32,
@@ -842,7 +869,7 @@ impl VarDctPendingFrame {
                 timecode: None,
                 is_last: true,
                 is_keyframe: true,
-                name: String::new(),
+                name: std::mem::take(&mut self.frame_name),
             },
             GpuImageFrame {
                 token: self.token,
@@ -1256,6 +1283,7 @@ fn submit_vardct(
         token: SubmissionToken(1),
         layout: source.layout.clone(),
         transform: source.packet.transform,
+        frame_name: source.frame_name.clone(),
         expected_lf_samples: blocks * 3,
         expected_hf_samples: blocks + 4,
         expected_coefficients: source.packet.coefficient_words(),

@@ -67,6 +67,10 @@ default dequantization metadata, disabled Gaborish/EPF, zero chroma correlation 
 the standard zero-AC HF-global bundle. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
+A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
+typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
+payload can be reassembled; this is an engine limit, not a late profile check after the generic
+1-GiB parser ceiling.
 
 The host inventories bounded scalar headers and packs the MA-tree descriptor, but does not decode
 an image entropy symbol. One GPU submission decodes and validates LF/HF metadata, dequantizes and
@@ -76,19 +80,26 @@ and artifact status share one 128-byte staging map; cleared downstream buffers a
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
-The only output descriptor is `vardct_rgb8_format()`. `VarDctDecodeMemoryStats` accounts every
-upload, metadata, status, uniform, artifact, coefficient, XYB, transform-scratch, and output byte.
-By default those bytes use the backend budget shared by decode, encode, and readback;
-`VarDctSubmissionEngine::with_memory_budget` can instead select an explicit sharing group.
-Transient reservations survive until the aggregate status map completes. The packed output
-reservation survives through the final tracked `GpuBufferLease` clone, including an early
-`UnvalidatedGpuImageFrame`; only the validated frame carries authoritative metadata and changed
-regions. Native blocking and runtime-neutral poll/future completion use the common decoder session
-API, and the engine compiles for browser WebGPU without a Tokio or async-std dependency.
+The only output descriptor is `vardct_rgb8_format()`: interleaved RGB8 with explicit BT.709/sRGB
+primaries, IEC sRGB transfer, full range, and no YCbCr encoding. It is accepted directly by
+`DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
+intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
+uniform, artifact, coefficient, XYB, transform-scratch, and output byte. By default those bytes use
+the backend budget shared by decode, encode, and readback; `VarDctSubmissionEngine::with_memory_budget`
+can instead select an explicit sharing group. Transient reservations survive until the aggregate
+status map completes. The packed output reservation survives through the final tracked
+`GpuBufferLease` clone, including an early `UnvalidatedGpuImageFrame`; only the validated frame
+carries authoritative metadata and changed regions. Native blocking and runtime-neutral
+poll/future completion use the common decoder session API, and the engine compiles for browser
+WebGPU without a Tokio or async-std dependency.
 
-The actual-adapter oracle encodes a standard packet, executes this complete GPU path, reads the
-resident result back explicitly, and, when `djxl` is installed, compares it with that independent
-decoder (at most one RGB8 code of rounding difference for the covered solid-image case). It also
+The actual-adapter matrix covers all nine accepted regular transform extents. It GPU-encodes each
+standard packet, executes the complete resident decode, reads the result back explicitly, and,
+when `djxl` is installed, compares it with that independent decoder (at most one RGB8 code of
+rounding difference for the covered solid-image cases). The Dct8 case also exercises the
+runtime-neutral async completion and GPU display conversion. A deterministic entropy-bit
+corruption remains host-parseable, is exposed only through the explicitly unvalidated type, and
+then fails packet-status validation before authoritative metadata is returned. The matrix also
 verifies that readback releases its shared reservation while the last decode-output buffer clone
 continues to own the exact output bytes.
 
