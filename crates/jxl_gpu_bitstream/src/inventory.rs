@@ -265,6 +265,23 @@ pub struct ToneMappingInventory {
     pub linear_below: FiniteF32,
 }
 
+/// Resolved XYB opsin inverse parameters from the image header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpsinInverseMatrixInventory {
+    pub inverse_matrix: [[FiniteF32; 3]; 3],
+    pub opsin_bias: [FiniteF32; 3],
+    pub quant_bias: [FiniteF32; 3],
+    pub quant_bias_numerator: FiniteF32,
+}
+
+/// Resolved standard or custom image upsampling weights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpsamplingWeightsInventory {
+    pub up2: [FiniteF32; 15],
+    pub up4: [FiniteF32; 55],
+    pub up8: [FiniteF32; 210],
+}
+
 /// Animation timing metadata from the JPEG XL image header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnimationInventory {
@@ -302,6 +319,9 @@ pub struct ImageHeaderInventory {
     pub grayscale: bool,
     pub colour_encoding: ColourEncodingInventory,
     pub tone_mapping: ToneMappingInventory,
+    /// Present only when the codestream encodes color in XYB.
+    pub opsin_inverse_matrix: Option<OpsinInverseMatrixInventory>,
+    pub upsampling_weights: UpsamplingWeightsInventory,
     pub embedded_icc: Option<EmbeddedIccInventory>,
     pub animation: Option<AnimationInventory>,
 }
@@ -817,6 +837,22 @@ fn parse_image_header(
         relative_to_max_display: metadata.tone_mapping.relative_to_max_display,
         linear_below: finite_header_f32(metadata.tone_mapping.linear_below)?,
     };
+    let opsin_inverse_matrix = if metadata.xyb_encoded {
+        let matrix = &metadata.opsin_inverse_matrix;
+        Some(OpsinInverseMatrixInventory {
+            inverse_matrix: finite_header_matrix(matrix.inv_mat)?,
+            opsin_bias: finite_header_array(matrix.opsin_bias)?,
+            quant_bias: finite_header_array(matrix.quant_bias)?,
+            quant_bias_numerator: finite_header_f32(matrix.quant_bias_numerator)?,
+        })
+    } else {
+        None
+    };
+    let upsampling_weights = UpsamplingWeightsInventory {
+        up2: finite_header_array(metadata.up2_weight)?,
+        up4: finite_header_array(metadata.up4_weight)?,
+        up8: finite_header_array(metadata.up8_weight)?,
+    };
     let animation = metadata
         .animation
         .as_ref()
@@ -862,6 +898,8 @@ fn parse_image_header(
         grayscale: metadata.grayscale(),
         colour_encoding,
         tone_mapping,
+        opsin_inverse_matrix,
+        upsampling_weights,
         embedded_icc,
         animation,
     };
@@ -898,6 +936,22 @@ fn sample_bit_depth(bit_depth: JxlBitDepth) -> SampleBitDepth {
 fn finite_header_f32(value: f32) -> Result<FiniteF32, InventoryError> {
     FiniteF32::from_f32(value)
         .ok_or_else(|| InventoryError::ImageHeader("non-finite image-header value".into()))
+}
+
+fn finite_header_array<const N: usize>(values: [f32; N]) -> Result<[FiniteF32; N], InventoryError> {
+    let mut output = [FiniteF32::default(); N];
+    for (output, value) in output.iter_mut().zip(values) {
+        *output = finite_header_f32(value)?;
+    }
+    Ok(output)
+}
+
+fn finite_header_matrix(values: [[f32; 3]; 3]) -> Result<[[FiniteF32; 3]; 3], InventoryError> {
+    Ok([
+        finite_header_array(values[0])?,
+        finite_header_array(values[1])?,
+        finite_header_array(values[2])?,
+    ])
 }
 
 fn extra_channel_inventory(
@@ -1993,6 +2047,14 @@ mod tests {
         assert_eq!(basic.image_header.tone_mapping.min_nits.to_f32(), 0.0);
         assert!(basic.image_header.extra_channels.is_empty());
         assert!(basic.image_header.xyb_encoded);
+        let opsin = basic
+            .image_header
+            .opsin_inverse_matrix
+            .expect("XYB fixture retains its resolved opsin matrix");
+        assert!((11.0..12.0).contains(&opsin.inverse_matrix[0][0].to_f32()));
+        assert_eq!(basic.image_header.upsampling_weights.up2.len(), 15);
+        assert_eq!(basic.image_header.upsampling_weights.up4.len(), 55);
+        assert_eq!(basic.image_header.upsampling_weights.up8.len(), 210);
         assert_eq!(basic.frames.len(), 1);
         let frame = &basic.frames[0];
         assert_eq!(
@@ -2479,6 +2541,7 @@ mod tests {
             }
         );
         assert!(!fragmented.image_header.xyb_encoded);
+        assert_eq!(fragmented.image_header.opsin_inverse_matrix, None);
         assert_eq!(
             fragmented.image_header.animation,
             Some(AnimationInventory {

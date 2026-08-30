@@ -80,9 +80,10 @@ pub use inventory::{
     EmbeddedIccInventory, EpfSigmaInventory, EpfWeightsInventory, ExtraChannelInventory,
     ExtraChannelTypeInventory, FiniteF16, FiniteF32, FrameBlendInfo, FrameBlendMode, FrameEncoding,
     FrameInventory, FramePassesInventory, FrameSection, FrameSectionKind, FrameType,
-    GaborishInventory, ImageHeaderInventory, InventoryError, InventoryLimits, PrimariesInventory,
-    RenderingIntentInventory, RestorationFilterInventory, SampleBitDepth, ToneMappingInventory,
-    TransferFunctionInventory, WhitePointInventory,
+    GaborishInventory, ImageHeaderInventory, InventoryError, InventoryLimits,
+    OpsinInverseMatrixInventory, PrimariesInventory, RenderingIntentInventory,
+    RestorationFilterInventory, SampleBitDepth, ToneMappingInventory, TransferFunctionInventory,
+    UpsamplingWeightsInventory, WhitePointInventory,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).
