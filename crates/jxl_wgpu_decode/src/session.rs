@@ -849,10 +849,29 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
     match profile {
         DecodeProfile::ModularLossless {
             bits_per_sample: 1..=16,
+            prediction,
             ..
-        } => Ok(()),
+        } => match prediction {
+            crate::ModularPredictionProfile::Fixed { .. } => Ok(()),
+            crate::ModularPredictionProfile::MetaAdaptive {
+                node_count,
+                decision_node_count,
+                leaf_context_count,
+                max_depth,
+                ..
+            } if node_count != 0
+                && leaf_context_count != 0
+                && max_depth != 0
+                && decision_node_count.checked_add(leaf_context_count) == Some(node_count) =>
+            {
+                Ok(())
+            }
+            crate::ModularPredictionProfile::MetaAdaptive { .. } => Err(Error::EngineContract(
+                "MA prediction profile has inconsistent node/context/depth metadata",
+            )),
+        },
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
-            "fixed-predictor Modular profile must use 1 through 16 bits per sample",
+            "lossless Modular profile must use 1 through 16 bits per sample",
         )),
     }
 }

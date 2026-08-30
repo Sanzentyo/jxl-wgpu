@@ -30,6 +30,9 @@ groups in one `dispatch_workgroups` wave; their canvas rectangles do not overlap
 ordered batches backed by one reusable stream window instead of binding the full codestream. One
 aggregate status staging buffer is mapped once after the last batch, and every four-word group
 status is checked before the frame is reported. No reconstructed sample is produced on the CPU.
+`DecodeProfile::ModularLossless` reports this as `ModularPredictionProfile::MetaAdaptive` with
+exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
+engines use the distinct `Fixed` variant.
 
 VarDCT, multiple passes, palette/squeeze and non-YCoCg transforms, non-alpha extra channels,
 patches, splines, noise, and reference-frame animation remain typed unsupported profiles.

@@ -22,12 +22,13 @@ use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
 use crate::model::native_modular_format;
+use crate::modular_tree::MaTreeNodeIr;
 use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
 use crate::{
-    AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FixedModularPredictor, FrameDuration,
-    FrameMetadata, GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
-    GpuSubmissionEngine, GpuSubmissionSession, NumericSampleMapping, PreparedGpuSession, Result,
-    SubmittedGpuFrame,
+    AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
+    GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
+    GpuSubmissionEngine, GpuSubmissionSession, ModularPredictionProfile, NumericSampleMapping,
+    PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
@@ -413,13 +414,34 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         )?;
         let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
             .expect("device admission always resolves at least one frame slot");
-        let predictor = FixedModularPredictor::new(5)
-            .expect("the standard Modular profile uses the valid Gradient predictor index");
+        let node_count = u32::try_from(profile.ma_config.nodes.len())
+            .map_err(|_| Error::backend("MA tree node count exceeds public profile bounds"))?;
+        let decision_node_count = u32::try_from(
+            profile
+                .ma_config
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, MaTreeNodeIr::Decision { .. }))
+                .count(),
+        )
+        .map_err(|_| Error::backend("MA decision node count exceeds public profile bounds"))?;
+        let leaf_context_count = node_count
+            .checked_sub(decision_node_count)
+            .ok_or_else(|| Error::backend("MA leaf context count underflow"))?;
+        let max_depth = u32::try_from(profile.ma_config.max_depth)
+            .map_err(|_| Error::backend("MA tree depth exceeds public profile bounds"))?;
+        let prediction = ModularPredictionProfile::MetaAdaptive {
+            node_count,
+            decision_node_count,
+            leaf_context_count,
+            max_depth,
+            uses_self_correcting: profile.ma_config.needs_self_correcting(),
+        };
         Ok(PreparedGpuSession::new(
             DecodeProfile::ModularLossless {
                 bits_per_sample: profile.bits_per_sample,
                 channels: profile.channels,
-                predictor,
+                prediction,
                 grouping: if profile.groups.len() == 1 {
                     crate::ModularGrouping::SingleGroup
                 } else {

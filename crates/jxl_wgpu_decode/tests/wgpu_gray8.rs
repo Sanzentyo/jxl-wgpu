@@ -694,9 +694,18 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
         assert!(matches!(
             session.profile(),
             jxl_wgpu_decode::DecodeProfile::ModularLossless {
+                prediction: jxl_wgpu_decode::ModularPredictionProfile::MetaAdaptive {
+                    node_count,
+                    decision_node_count,
+                    leaf_context_count,
+                    max_depth,
+                    ..
+                },
                 grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
                 ..
-            }
+            } if decision_node_count.checked_add(leaf_context_count) == Some(node_count)
+                && leaf_context_count != 0
+                && max_depth != 0
         ));
         if (width, height, container) == (513, 257, false) {
             let stats = session.submission_session().memory_stats();

@@ -9,11 +9,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use jxl_gpu_formats::{ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, PixelFormat};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu_decode::{
-    AnimationMetadata, DecodeProfile, Error, FixedModularPredictor, FrameDuration, FrameMetadata,
-    FrameTimebase, FrontendIncomplete, FrontendStage, GpuCodestream, GpuDecoder, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, PrefetchBackpressure,
-    PreparedGpuSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
-    UnsupportedProfile,
+    AnimationMetadata, DecodeProfile, Error, FrameDuration, FrameMetadata, FrameTimebase,
+    FrontendIncomplete, FrontendStage, GpuCodestream, GpuDecoder, GpuOutputRequest,
+    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, ModularChannels, ModularGrouping,
+    ModularPredictionProfile, ModularPredictor, PrefetchBackpressure, PreparedGpuSession, Result,
+    SubmittedGpuFrame, UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 
 mod common;
@@ -33,6 +33,15 @@ fn output_request(limit: usize) -> GpuOutputRequest {
     GpuOutputRequest::color(PixelFormat::nv12(color))
         .unwrap()
         .with_max_frame_slots(NonZeroUsize::new(limit).unwrap())
+}
+
+fn fixed_profile(bits_per_sample: u8, predictor: ModularPredictor) -> DecodeProfile {
+    DecodeProfile::ModularLossless {
+        bits_per_sample,
+        channels: ModularChannels::Gray,
+        prediction: ModularPredictionProfile::Fixed { predictor },
+        grouping: ModularGrouping::SingleGroup,
+    }
 }
 
 fn timebase() -> FrameTimebase {
@@ -103,7 +112,7 @@ impl GpuSubmissionEngine for ReadyEngine {
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert!(codestream.bytes().starts_with(&[0xff, 0x0a]));
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            fixed_profile(8, ModularPredictor::Zero),
             AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
             ReadySession {
                 frames: VecDeque::from([frame(0, false), frame(1, true)]),
@@ -128,10 +137,7 @@ impl GpuSubmissionSession for ReadySession {
 fn sync_gpu_frames_are_bounded_and_keep_exact_timing() {
     let decoder = GpuDecoder::new(ReadyEngine);
     let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
-    assert_eq!(
-        session.profile(),
-        DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap())
-    );
+    assert_eq!(session.profile(), fixed_profile(8, ModularPredictor::Zero));
     assert_eq!(session.metadata().extent, Extent2d::new(8, 6));
 
     let first = session.next_frame().unwrap().unwrap();
@@ -178,7 +184,7 @@ impl GpuSubmissionEngine for TimecodeEngine {
         _request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            fixed_profile(8, ModularPredictor::Zero),
             AnimationMetadata::animation(Extent2d::new(4, 3), timebase(), 1, true, Some(1)),
             TimecodeSession {
                 frame_timecode: self.frame_timecode,
@@ -336,7 +342,7 @@ impl GpuSubmissionEngine for PendingEngine {
         _request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_16bit(FixedModularPredictor::new(1).unwrap()),
+            fixed_profile(16, ModularPredictor::West),
             AnimationMetadata::still(Extent2d::new(2, 2)),
             PendingSession {
                 control: Arc::clone(&self.control),
@@ -465,7 +471,7 @@ impl GpuSubmissionEngine for PrefetchAnimationEngine {
         _request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            fixed_profile(8, ModularPredictor::Zero),
             AnimationMetadata::animation(
                 Extent2d::new(8, 6),
                 timebase(),
@@ -669,7 +675,7 @@ impl GpuSubmissionEngine for ResolvedSlotEngine {
         _request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            fixed_profile(8, ModularPredictor::Zero),
             AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
             ReadySession {
                 frames: VecDeque::from([frame(0, false), frame(1, true)]),

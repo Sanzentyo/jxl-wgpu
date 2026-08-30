@@ -14,35 +14,13 @@ use crate::{Error, Result};
 /// A GPU decode profile negotiated before any frame is submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeProfile {
-    /// Lossless Modular data reconstructed by a fixed-predictor GPU kernel.
+    /// Lossless Modular data reconstructed by a GPU entropy/MA pipeline.
     ModularLossless {
         bits_per_sample: u8,
         channels: ModularChannels,
-        predictor: FixedModularPredictor,
+        prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
     },
-}
-
-impl DecodeProfile {
-    #[must_use]
-    pub const fn modular_lossless_8bit(predictor: FixedModularPredictor) -> Self {
-        Self::ModularLossless {
-            bits_per_sample: 8,
-            channels: ModularChannels::Gray,
-            predictor,
-            grouping: ModularGrouping::SingleGroup,
-        }
-    }
-
-    #[must_use]
-    pub const fn modular_lossless_16bit(predictor: FixedModularPredictor) -> Self {
-        Self::ModularLossless {
-            bits_per_sample: 16,
-            channels: ModularChannels::Gray,
-            predictor,
-            grouping: ModularGrouping::SingleGroup,
-        }
-    }
 }
 
 /// Logical channels reconstructed by a lossless Modular profile.
@@ -64,24 +42,50 @@ impl ModularChannels {
     }
 }
 
-/// Fixed JPEG XL Modular predictor selected for every sample in the negotiated profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FixedModularPredictor(u8);
+/// JPEG XL Modular predictor selected by a fixed synthetic frontend or an MA-tree leaf.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ModularPredictor {
+    #[default]
+    Zero = 0,
+    West,
+    North,
+    AvgWestAndNorth,
+    Select,
+    Gradient,
+    SelfCorrecting,
+    NorthEast,
+    NorthWest,
+    WestWest,
+    AvgWestAndNorthWest,
+    AvgNorthAndNorthWest,
+    AvgNorthAndNorthEast,
+    AvgAll,
+}
 
-impl FixedModularPredictor {
-    /// Creates a fixed predictor from the JPEG XL predictor index (0..=13).
-    #[must_use]
-    pub const fn new(index: u8) -> Option<Self> {
-        if index <= 13 { Some(Self(index)) } else { None }
-    }
-
+impl ModularPredictor {
     #[must_use]
     pub const fn index(self) -> u8 {
-        self.0
+        self as u8
     }
 }
 
-/// Grouping supported by the fixed-predictor GPU entropy/group frontend.
+/// Predictor metadata represented by a negotiated lossless Modular profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularPredictionProfile {
+    /// A synthetic/custom engine applies one predictor without a standard MA-tree descriptor.
+    Fixed { predictor: ModularPredictor },
+    /// A standards-compliant MA tree and its entropy contexts were lowered to GPU metadata.
+    MetaAdaptive {
+        node_count: u32,
+        decision_node_count: u32,
+        leaf_context_count: u32,
+        max_depth: u32,
+        uses_self_correcting: bool,
+    },
+}
+
+/// Pass-group layout represented by the GPU entropy/group frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModularGrouping {
     SingleGroup,

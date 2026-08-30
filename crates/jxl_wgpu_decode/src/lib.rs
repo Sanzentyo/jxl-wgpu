@@ -45,9 +45,9 @@ pub use jxl_gpu_bitstream::ParseLimits;
 pub use jxl_gpu_formats::{ImageLayout, PixelFormat};
 pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
-    AnimationMetadata, DecodeProfile, F64OutputPolicy, FixedModularPredictor, FrameDuration,
-    FrameMetadata, FrameTimebase, GpuCodestream, GpuOutputMapping, GpuOutputRequest,
-    ModularChannels, ModularGrouping, NumericSampleMapping,
+    AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration, FrameMetadata, FrameTimebase,
+    GpuCodestream, GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping,
+    ModularPredictionProfile, ModularPredictor, NumericSampleMapping,
 };
 pub use session::{
     GpuDecodeSession, GpuDecoder, GpuFrameLease, GpuPendingFrame, GpuSubmissionEngine,
