@@ -9,6 +9,8 @@
 //!
 //! See the crate README and [`vpi`] for the NVIDIA VPI 4.1.3 inventory.
 
+#![deny(unsafe_code)]
+
 mod classify;
 mod format;
 mod layout;

@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+#![deny(unsafe_code)]
+
 //! Backend-neutral protocol for accelerating JPEG XL rendering.
 //!
 //! The decoder deliberately exposes no `wgpu` types here. A backend can
@@ -230,7 +232,7 @@ pub enum EpfPass {
     Pass2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransferFunction {
     Linear,
     Srgb,
@@ -238,6 +240,49 @@ pub enum TransferFunction {
     Pq,
     Hlg,
     Gamma,
+}
+
+/// RGB primary chromaticities attached to an output signal.
+///
+/// The portable backend currently converts only BT.709 primaries. The other variants make an
+/// unsupported wide-gamut or undefined source an explicit, rejectable contract instead of
+/// allowing the same samples to be relabelled silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RgbPrimaries {
+    Bt709,
+    Bt2020,
+    DciP3,
+    Undefined,
+}
+
+/// Primaries and transfer function of three floating-point RGB channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RgbColorEncoding {
+    pub primaries: RgbPrimaries,
+    pub transfer: TransferFunction,
+}
+
+impl RgbColorEncoding {
+    pub const LINEAR_BT709: Self = Self {
+        primaries: RgbPrimaries::Bt709,
+        transfer: TransferFunction::Linear,
+    };
+    pub const SRGB_BT709: Self = Self {
+        primaries: RgbPrimaries::Bt709,
+        transfer: TransferFunction::Srgb,
+    };
+    pub const BT709: Self = Self {
+        primaries: RgbPrimaries::Bt709,
+        transfer: TransferFunction::Bt709,
+    };
+}
+
+/// Color interpretation of a render-plan output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutputColorEncoding {
+    /// The output is not a three-channel RGB color signal.
+    NonColor,
+    Rgb(RgbColorEncoding),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,6 +536,8 @@ pub struct OutputDesc {
     pub sample_type: SampleType,
     pub channels: u8,
     pub layout: OutputLayout,
+    /// Encoding of the values presented to a generic color-output conversion.
+    pub color_encoding: OutputColorEncoding,
 }
 
 /// A validated, backend-neutral rendering graph.
@@ -526,6 +573,20 @@ impl RenderPlan {
         for (node_index, node) in self.nodes.iter().enumerate() {
             if node.scale.x == 0 || node.scale.y == 0 {
                 return Err(PlanError::ZeroScale(node_index));
+            }
+            if let RenderOp::PremultiplyAlpha { alpha_plane } = node.op
+                && node
+                    .inputs
+                    .iter()
+                    .filter(|&&input| input == alpha_plane)
+                    .count()
+                    != 1
+            {
+                return Err(PlanError::OperationInput {
+                    node: node_index,
+                    operation: RenderOpKind::PremultiplyAlpha,
+                    plane: alpha_plane,
+                });
             }
             for input in &node.inputs {
                 if !planes.contains_key(input) {
@@ -663,6 +724,12 @@ pub enum PlanError {
     MultipleWriters(PlaneId),
     #[error("node {0} has a zero scale")]
     ZeroScale(usize),
+    #[error("node {node} {operation:?} must declare plane {plane:?} exactly once as an input")]
+    OperationInput {
+        node: usize,
+        operation: RenderOpKind,
+        plane: PlaneId,
+    },
     #[error("render plan declares the same output more than once")]
     DuplicateOutput,
     #[error("save node refers to unknown output {0:?}")]
@@ -1079,6 +1146,44 @@ mod tests {
                 plane: PlaneId(1)
             })
         ));
+    }
+
+    #[test]
+    fn premultiply_alpha_dependency_must_be_an_explicit_available_input() {
+        let alpha = PlaneId(3);
+        let mut missing = test_plan();
+        missing.nodes[1].op = RenderOp::PremultiplyAlpha { alpha_plane: alpha };
+        assert_eq!(
+            missing.validate(),
+            Err(PlanError::OperationInput {
+                node: 1,
+                operation: RenderOpKind::PremultiplyAlpha,
+                plane: alpha,
+            })
+        );
+
+        let mut unknown = test_plan();
+        unknown.nodes[1].op = RenderOp::PremultiplyAlpha { alpha_plane: alpha };
+        unknown.nodes[1].inputs.push(alpha);
+        assert_eq!(unknown.validate(), Err(PlanError::UnknownPlane(alpha)));
+
+        let mut read_before_write = test_plan();
+        read_before_write.planes.push(PlaneDesc {
+            id: alpha,
+            extent: Extent2d::new(32, 32),
+            stride: 32,
+            sample_type: SampleType::F32,
+            role: PlaneRole::Intermediate,
+        });
+        read_before_write.nodes[1].op = RenderOp::PremultiplyAlpha { alpha_plane: alpha };
+        read_before_write.nodes[1].inputs.push(alpha);
+        assert_eq!(
+            read_before_write.validate(),
+            Err(PlanError::ReadBeforeWrite {
+                node: 1,
+                plane: alpha,
+            })
+        );
     }
 
     #[test]

@@ -844,7 +844,7 @@ mod tests {
         [PrefixCodeEntry; LZ77_SYMBOLS],
     ) {
         // Complete 6-bit canonical alphabet, with the first twelve raw symbols and all LZ77
-        // symbols present. Symbols unused by the prototype remain zero.
+        // symbols present. Symbols unused by the fixed Gray8 profile remain zero.
         let mut raw = [PrefixCodeEntry::default(); RAW_SYMBOLS];
         let mut lz77 = [PrefixCodeEntry::default(); LZ77_SYMBOLS];
         for (code, entry) in raw.iter_mut().take(12).chain(&mut lz77).enumerate() {

@@ -36,6 +36,8 @@ const FTYP: [u8; 4] = *b"ftyp";
 /// Resource limits applied before allocating or concatenating container payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseLimits {
+    /// Maximum total input bytes inspected by one parse operation.
+    pub max_input_bytes: u64,
     pub max_boxes: usize,
     pub max_box_bytes: u64,
     pub max_codestream_bytes: u64,
@@ -44,6 +46,7 @@ pub struct ParseLimits {
 impl Default for ParseLimits {
     fn default() -> Self {
         Self {
+            max_input_bytes: 1 << 30,
             max_boxes: 16_384,
             max_box_bytes: 1 << 30,
             max_codestream_bytes: 1 << 30,
@@ -112,6 +115,9 @@ pub struct ContainerBox<'payload> {
 
 /// Validates a raw codestream or JPEG XL container and returns contiguous codestream bytes.
 pub fn parse(input: &[u8], limits: ParseLimits) -> Result<ParsedJxl<'_>, Error> {
+    if u64::try_from(input.len()).map_err(|_| Error::SizeOverflow)? > limits.max_input_bytes {
+        return Err(Error::ResourceLimit("input size"));
+    }
     if input.starts_with(&CODESTREAM_SIGNATURE) {
         validate_codestream_len(input.len(), limits)?;
         return Ok(ParsedJxl {
@@ -296,7 +302,11 @@ fn join_fragments(
     if total > limits.max_codestream_bytes {
         return Err(Error::ResourceLimit("codestream size"));
     }
-    let mut joined = Vec::with_capacity(usize::try_from(total).map_err(|_| Error::SizeOverflow)?);
+    let total = usize::try_from(total).map_err(|_| Error::SizeOverflow)?;
+    let mut joined = Vec::new();
+    joined
+        .try_reserve_exact(total)
+        .map_err(|_| Error::AllocationFailed("fragmented codestream"))?;
     for index in 0..expected_count {
         joined.extend_from_slice(fragments.get(&index).ok_or(Error::MissingFragment)?);
     }
@@ -363,7 +373,7 @@ fn parse_box_header(input: &[u8], cursor: usize) -> Result<BoxHeader, Error> {
 #[derive(Clone, Debug)]
 pub struct BitReader<'input> {
     bytes: &'input [u8],
-    bit_offset: usize,
+    bit_offset: u64,
 }
 
 impl<'input> BitReader<'input> {
@@ -376,14 +386,14 @@ impl<'input> BitReader<'input> {
     }
 
     #[must_use]
-    pub const fn bit_offset(&self) -> usize {
+    pub const fn bit_offset(&self) -> u64 {
         self.bit_offset
     }
 
     #[must_use]
-    pub fn remaining_bits(&self) -> usize {
-        self.bytes
-            .len()
+    pub fn remaining_bits(&self) -> u64 {
+        u64::try_from(self.bytes.len())
+            .unwrap_or(u64::MAX)
             .saturating_mul(8)
             .saturating_sub(self.bit_offset)
     }
@@ -392,12 +402,14 @@ impl<'input> BitReader<'input> {
         if count > 56 {
             return Err(Error::InvalidBitCount(count));
         }
-        if self.remaining_bits() < usize::from(count) {
+        if self.remaining_bits() < u64::from(count) {
             return Err(Error::UnexpectedEndOfBits);
         }
         let mut value = 0u64;
         for shift in 0..count {
-            let byte = self.bytes[self.bit_offset / 8];
+            let byte_index =
+                usize::try_from(self.bit_offset / 8).map_err(|_| Error::SizeOverflow)?;
+            let byte = self.bytes[byte_index];
             let bit = (byte >> (self.bit_offset % 8)) & 1;
             value |= u64::from(bit) << shift;
             self.bit_offset += 1;
@@ -407,7 +419,11 @@ impl<'input> BitReader<'input> {
 
     pub fn align_to_byte(&mut self) -> Result<(), Error> {
         let aligned = self.bit_offset.checked_add(7).ok_or(Error::SizeOverflow)? & !7;
-        if aligned > self.bytes.len().saturating_mul(8) {
+        let available = u64::try_from(self.bytes.len())
+            .map_err(|_| Error::SizeOverflow)?
+            .checked_mul(8)
+            .ok_or(Error::SizeOverflow)?;
+        if aligned > available {
             return Err(Error::UnexpectedEndOfBits);
         }
         self.bit_offset = aligned;
@@ -530,6 +546,8 @@ pub struct FragmentedContainerWriter {
     bytes: Vec<u8>,
     next_index: u32,
     finished: bool,
+    codestream_signature: [u8; 2],
+    codestream_signature_len: u8,
 }
 
 impl FragmentedContainerWriter {
@@ -541,6 +559,8 @@ impl FragmentedContainerWriter {
             bytes,
             next_index: 0,
             finished: false,
+            codestream_signature: [0; 2],
+            codestream_signature_len: 0,
         }
     }
 
@@ -566,6 +586,17 @@ impl FragmentedContainerWriter {
         if self.next_index >= 1 << 31 {
             return Err(Error::TooManyFragments);
         }
+        let mut signature = self.codestream_signature;
+        let mut signature_len = usize::from(self.codestream_signature_len);
+        let needed = signature.len().saturating_sub(signature_len);
+        let copied = needed.min(payload.len());
+        signature[signature_len..signature_len + copied].copy_from_slice(&payload[..copied]);
+        signature_len += copied;
+        if (signature_len == signature.len() && signature != CODESTREAM_SIGNATURE)
+            || (is_last && signature_len != signature.len())
+        {
+            return Err(Error::InvalidCodestreamSignature);
+        }
         let index = self.next_index | if is_last { 1 << 31 } else { 0 };
         let payload_size = u64::try_from(payload.len()).map_err(|_| Error::SizeOverflow)?;
         let compact_size = 12u64.checked_add(payload_size).ok_or(Error::SizeOverflow)?;
@@ -582,6 +613,8 @@ impl FragmentedContainerWriter {
         self.bytes.extend_from_slice(payload);
         self.next_index = self.next_index.checked_add(1).ok_or(Error::SizeOverflow)?;
         self.finished = is_last;
+        self.codestream_signature = signature;
+        self.codestream_signature_len = signature_len as u8;
         Ok(())
     }
 
@@ -640,6 +673,8 @@ pub enum Error {
     FragmentAfterLast(u32),
     #[error("resource limit exceeded for {0}")]
     ResourceLimit(&'static str),
+    #[error("allocation failed while building {0}")]
+    AllocationFailed(&'static str),
     #[error("size arithmetic overflow")]
     SizeOverflow,
     #[error("bit count {0} exceeds the supported 56-bit operation")]
@@ -820,6 +855,34 @@ mod tests {
         let mut writer = FragmentedContainerWriter::new();
         writer.push_fragment(&[0xff, 0x0a], false).unwrap();
         assert_eq!(writer.finish().unwrap_err(), Error::MissingFinalFragment);
+    }
+
+    #[test]
+    fn fragmented_writer_validates_a_signature_split_across_fragments() {
+        let mut writer = FragmentedContainerWriter::new();
+        writer.push_fragment(&[0xff], false).unwrap();
+        writer.push_fragment(&[0x0a, 7], true).unwrap();
+        let bytes = writer.finish().unwrap();
+        assert_eq!(
+            parse(&bytes, ParseLimits::default()).unwrap().codestream(),
+            [0xff, 0x0a, 7]
+        );
+    }
+
+    #[test]
+    fn fragmented_writer_rejects_an_invalid_or_truncated_signature() {
+        let mut invalid = FragmentedContainerWriter::new();
+        invalid.push_fragment(&[0xff], false).unwrap();
+        assert_eq!(
+            invalid.push_fragment(&[0x09], true).unwrap_err(),
+            Error::InvalidCodestreamSignature
+        );
+
+        let mut truncated = FragmentedContainerWriter::new();
+        assert_eq!(
+            truncated.push_fragment(&[0xff], true).unwrap_err(),
+            Error::InvalidCodestreamSignature
+        );
     }
 
     #[test]
