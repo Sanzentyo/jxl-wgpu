@@ -110,7 +110,7 @@ struct CodecArgs {
     warmup: u32,
     #[arg(long, default_value_t = 1)]
     iterations: u32,
-    /// Host threads released as one barrier-synchronized burst; this is not GPU batching.
+    /// Barrier-synchronized codec workers; CPU readback coalesces only their finished transport.
     #[arg(long, default_value_t = 1)]
     burst_size: u32,
     #[arg(long, default_value_t = 1)]

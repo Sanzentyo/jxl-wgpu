@@ -838,6 +838,8 @@ pub fn run_stock_gpu_round_trip(
             report.readback_completion_waits = 1;
             report.readback_logical_bytes = execution.readback_logical_bytes;
             report.readback_staging_bytes = execution.readback_staging_bytes;
+            report.readback_source_frames = 1;
+            report.readback_max_frames_per_submission = 1;
             report.readback_mode = Some(crate::codec::CpuReadbackMode::StagedCopy);
             report.output_hash = Some(execution.output_hash.clone());
             if execution.output_hash == execution.expected_hash {

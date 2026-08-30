@@ -807,7 +807,10 @@ const fn nanos(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{DeclaredExtent, SizeClass, WorkloadExecutionModel};
+    #[cfg(unix)]
+    use crate::codec::WorkloadExecutionModel;
+    use crate::codec::{DeclaredExtent, SizeClass};
+    #[cfg(unix)]
     use crate::report::{CodecTiming, TimingStatistics, WorkloadTiming};
 
     #[test]

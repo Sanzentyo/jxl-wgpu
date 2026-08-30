@@ -10,7 +10,7 @@ use crate::codec::{
 use crate::compare::{AccuracyMetrics, ThresholdEvaluation};
 use crate::error::{Error, Result};
 
-pub const RUN_REPORT_SCHEMA_VERSION: u16 = 3;
+pub const RUN_REPORT_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +142,10 @@ pub struct CodecCaseReport {
     pub readback_completion_waits: u64,
     pub readback_logical_bytes: u64,
     pub readback_staging_bytes: u64,
+    /// Number of decoded GPU frames transported by measured readback submissions.
+    pub readback_source_frames: u64,
+    /// Largest number of decoded GPU frames represented by one measured readback submission.
+    pub readback_max_frames_per_submission: u64,
     pub readback_mode: Option<CpuReadbackMode>,
     /// `false` until several images or frames are encoded into one GPU submission.
     pub coalesced_gpu_batching: bool,
@@ -189,6 +193,8 @@ impl CodecCaseReport {
             readback_completion_waits: 0,
             readback_logical_bytes: 0,
             readback_staging_bytes: 0,
+            readback_source_frames: 0,
+            readback_max_frames_per_submission: 0,
             readback_mode: None,
             coalesced_gpu_batching: false,
             output_hash: None,
@@ -470,6 +476,37 @@ mod tests {
         assert_eq!(value["coalesced_gpu_batching"], false);
         assert_eq!(value["codec_completion_waits"], 0);
         assert_eq!(value["readback_staging_bytes"], 0);
+        assert_eq!(value["readback_source_frames"], 0);
+        assert_eq!(value["readback_max_frames_per_submission"], 0);
         assert!(value["cpu_baseline"].is_null());
+    }
+
+    #[test]
+    fn schema_v4_distinguishes_aggregate_readback_from_codec_batching() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/run.schema.json")).unwrap();
+        assert_eq!(schema["properties"]["schema_version"]["const"], 4);
+        assert_eq!(
+            schema["$defs"]["codec_case"]["properties"]["coalesced_gpu_batching"]["const"],
+            false
+        );
+        let modes =
+            schema["$defs"]["codec_case"]["properties"]["readback_mode"]["oneOf"][1]["enum"]
+                .as_array()
+                .unwrap();
+        assert!(modes.iter().any(|mode| mode == "staged_copy"));
+        assert!(modes.iter().any(|mode| mode == "aggregate_staged_copy"));
+        for field in [
+            "readback_source_frames",
+            "readback_max_frames_per_submission",
+        ] {
+            assert!(
+                schema["$defs"]["codec_case"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == field)
+            );
+        }
     }
 }

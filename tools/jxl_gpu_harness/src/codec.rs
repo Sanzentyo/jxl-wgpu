@@ -17,8 +17,8 @@ use jxl_gpu_formats::{
 };
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
-    DisplayPipeline, DisplayTextureDescriptor, ImageReadbackPipeline, WgpuBackend,
-    WgpuBackendConfig,
+    DisplayPipeline, DisplayTextureDescriptor, GpuImageFrame, GpuImageOutput,
+    ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::{
     Error as DecodeError, F64OutputPolicy, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
@@ -86,6 +86,8 @@ pub enum WorkloadExecutionModel {
 #[serde(rename_all = "snake_case")]
 pub enum CpuReadbackMode {
     StagedCopy,
+    /// Several already-produced GPU frames share one staging buffer, queue submission, and map.
+    AggregateStagedCopy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -468,6 +470,19 @@ pub fn run_codec_case(
     let mut effective_options = options.clone();
     effective_options.extent = extent;
 
+    #[cfg(target_arch = "wasm32")]
+    if effective_options.workload.parallelism() > 1 {
+        report.status = CaseStatus::Unsupported;
+        report.issue = Some(CodecIssue::new(
+            CodecIssueKind::Unsupported,
+            "harness",
+            "host_threads",
+            "browser WebAssembly does not provide the native host-thread workload executors",
+        ));
+        report.adapter = backend.map(|value| value.adapter_info().name.clone());
+        return report;
+    }
+
     let execution = match effective_options.operation {
         CodecOperation::Decode => run_decode(&case.path, backend, &effective_options),
         CodecOperation::Encode => run_encode(&case.path, backend, &effective_options),
@@ -488,8 +503,10 @@ pub fn run_codec_case(
             report.readback_completion_waits = execution.readback_completion_waits;
             report.readback_logical_bytes = execution.readback_logical_bytes;
             report.readback_staging_bytes = execution.readback_staging_bytes;
-            report.readback_mode =
-                (execution.readback_submissions != 0).then_some(CpuReadbackMode::StagedCopy);
+            report.readback_source_frames = execution.readback_source_frames;
+            report.readback_max_frames_per_submission =
+                execution.readback_max_frames_per_submission;
+            report.readback_mode = execution.readback_mode;
             report.output_hash = execution.output_hash;
             report.timing = Some(execution.timing);
         }
@@ -539,6 +556,23 @@ fn run_decode(
         .with_max_frame_slots(max_frame_slots);
     let require_animation = options.workload.kind == WorkloadKind::Animation;
 
+    if options.output_target == OutputTarget::CpuReadback
+        && options.workload.kind == WorkloadKind::ConcurrentBurst
+        && options.workload.burst_size > 1
+    {
+        let readback = readback
+            .as_ref()
+            .expect("CPU-readback output created an aggregate readback pipeline");
+        return execute_aggregate_readback_workload(options.workload, readback, |_| {
+            decode_once_retained(
+                &decoder,
+                Arc::clone(&encoded),
+                request.clone(),
+                require_animation,
+            )
+        });
+    }
+
     execute_workload(options.workload, || {
         decode_once(
             &decoder,
@@ -582,6 +616,8 @@ fn run_encode(
             readback_completion_waits: 0,
             readback_logical_bytes: 0,
             readback_staging_bytes: 0,
+            readback_source_frames: 0,
+            readback_max_frames_per_submission: 0,
             output_hash: Some(blake3::hash(&encoded).to_hex().to_string()),
             hash_mismatch: false,
         })
@@ -751,6 +787,44 @@ fn decode_once(
     readback: Option<&ImageReadbackPipeline>,
     require_animation: bool,
 ) -> std::result::Result<DecodeObservation, CodecIssue> {
+    decode_once_inner(
+        decoder,
+        encoded,
+        request,
+        display,
+        readback,
+        require_animation,
+        false,
+    )
+    .map(|decoded| decoded.observation)
+}
+
+fn decode_once_retained(
+    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuSubmissionEngine>,
+    encoded: Arc<[u8]>,
+    request: GpuOutputRequest,
+    require_animation: bool,
+) -> std::result::Result<RetainedDecode, CodecIssue> {
+    decode_once_inner(
+        decoder,
+        encoded,
+        request,
+        None,
+        None,
+        require_animation,
+        true,
+    )
+}
+
+fn decode_once_inner(
+    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuSubmissionEngine>,
+    encoded: Arc<[u8]>,
+    request: GpuOutputRequest,
+    display: Option<&DisplayPipeline>,
+    readback: Option<&ImageReadbackPipeline>,
+    require_animation: bool,
+    retain_for_aggregate_readback: bool,
+) -> std::result::Result<RetainedDecode, CodecIssue> {
     let mut session = decoder
         .open_shared(encoded, request)
         .map_err(decode_issue)?;
@@ -778,6 +852,7 @@ fn decode_once(
     })?;
 
     let mut observation = DecodeObservation::default();
+    let mut retained_frames = Vec::new();
     let mut readback_hash = blake3::Hasher::new();
     let mut readback_outputs = 0_u32;
     while let Some(frame) = session.next_frame().map_err(decode_issue)? {
@@ -805,6 +880,9 @@ fn decode_once(
             observation.readback_submissions = observation.readback_submissions.saturating_add(1);
             observation.readback_completion_waits =
                 observation.readback_completion_waits.saturating_add(1);
+            observation.readback_source_frames =
+                observation.readback_source_frames.saturating_add(1);
+            observation.readback_max_frames_per_submission = 1;
         }
         for output in &frame.output().outputs {
             observation.output_bytes = observation
@@ -820,11 +898,72 @@ fn decode_once(
                 observation.display_submissions = observation.display_submissions.saturating_add(1);
             }
         }
+        if retain_for_aggregate_readback {
+            retained_frames.push(GpuImageFrame {
+                token: frame.output().token,
+                outputs: frame
+                    .output()
+                    .outputs
+                    .iter()
+                    .map(|output| GpuImageOutput {
+                        id: output.id,
+                        layout: output.layout.clone(),
+                        buffer: output.buffer.clone(),
+                    })
+                    .collect(),
+                changed: frame.output().changed.clone(),
+            });
+        }
     }
     if readback_outputs != 0 {
         observation.output_hash = Some(readback_hash.finalize().to_hex().to_string());
     }
-    Ok(observation)
+    Ok(RetainedDecode {
+        observation,
+        frames: retained_frames,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+trait DecodeWorkloadOperation:
+    Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync
+{
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T> DecodeWorkloadOperation for T where
+    T: Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync
+{
+}
+
+#[cfg(target_arch = "wasm32")]
+trait DecodeWorkloadOperation: Fn() -> std::result::Result<DecodeObservation, CodecIssue> {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> DecodeWorkloadOperation for T where
+    T: Fn() -> std::result::Result<DecodeObservation, CodecIssue>
+{
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+trait RetainedWorkloadOperation:
+    Fn(u32) -> std::result::Result<RetainedDecode, CodecIssue> + Sync
+{
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T> RetainedWorkloadOperation for T where
+    T: Fn(u32) -> std::result::Result<RetainedDecode, CodecIssue> + Sync
+{
+}
+
+#[cfg(target_arch = "wasm32")]
+trait RetainedWorkloadOperation: Fn(u32) -> std::result::Result<RetainedDecode, CodecIssue> {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> RetainedWorkloadOperation for T where
+    T: Fn(u32) -> std::result::Result<RetainedDecode, CodecIssue>
+{
 }
 
 fn execute_workload<F>(
@@ -832,7 +971,7 @@ fn execute_workload<F>(
     operation: F,
 ) -> std::result::Result<WorkloadExecution, CodecIssue>
 where
-    F: Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync,
+    F: DecodeWorkloadOperation,
 {
     let parallelism = workload.parallelism();
     for _ in 0..workload.warmup {
@@ -850,6 +989,305 @@ where
         measured
     };
     let wall_ns = nanos(wall_start.elapsed().as_nanos());
+    complete_workload(workload, measured, wall_ns, None)
+}
+
+fn execute_aggregate_readback_workload<F>(
+    workload: WorkloadSpec,
+    readback: &ImageReadbackPipeline,
+    operation: F,
+) -> std::result::Result<WorkloadExecution, CodecIssue>
+where
+    F: RetainedWorkloadOperation,
+{
+    debug_assert_eq!(workload.kind, WorkloadKind::ConcurrentBurst);
+    debug_assert!(workload.burst_size > 1);
+    let parallelism = workload.parallelism();
+    for _ in 0..workload.warmup {
+        execute_aggregate_readback_group(parallelism, readback, &operation)?;
+    }
+
+    let wall_start = Instant::now();
+    let mut measured = Vec::new();
+    for _ in 0..workload.measured_groups() {
+        measured.extend(execute_aggregate_readback_group(
+            parallelism,
+            readback,
+            &operation,
+        )?);
+    }
+    let wall_ns = nanos(wall_start.elapsed().as_nanos());
+    complete_workload(
+        workload,
+        measured,
+        wall_ns,
+        Some(CpuReadbackMode::AggregateStagedCopy),
+    )
+}
+
+fn execute_aggregate_readback_group<F>(
+    parallelism: u32,
+    readback: &ImageReadbackPipeline,
+    operation: &F,
+) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
+where
+    F: RetainedWorkloadOperation,
+{
+    let decoded = execute_retained_group(parallelism, operation)?;
+    let mut starts = Vec::with_capacity(decoded.len());
+    let mut observations = Vec::with_capacity(decoded.len());
+    let mut frame_counts = Vec::with_capacity(decoded.len());
+    let mut frames = Vec::new();
+    for (started, decoded) in decoded {
+        starts.push(started);
+        observations.push(decoded.observation);
+        frame_counts.push(decoded.frames.len());
+        frames.extend(decoded.frames);
+    }
+
+    let submitted_frame_count = frames.len();
+    let expected_boundaries = frames
+        .iter()
+        .map(|frame| {
+            (
+                frame.token,
+                frame
+                    .outputs
+                    .iter()
+                    .map(|output| (output.id, output.layout.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let pending = readback.submit_frames(&frames).map_err(readback_issue)?;
+    let stats = pending.stats();
+    drop(frames);
+    let result = pending.wait().map_err(readback_issue)?;
+    if stats.frame_count != submitted_frame_count
+        || result.frames.len() != submitted_frame_count
+        || result.stats != stats
+    {
+        return Err(CodecIssue::new(
+            CodecIssueKind::Backend,
+            "cpu_readback",
+            "batch_frame_boundary",
+            "aggregate readback did not preserve the submitted GPU-frame count",
+        ));
+    }
+    for ((expected_token, expected_outputs), actual) in
+        expected_boundaries.iter().zip(&result.frames)
+    {
+        let boundaries_match = actual.token == *expected_token
+            && actual.outputs.len() == expected_outputs.len()
+            && actual
+                .outputs
+                .iter()
+                .zip(expected_outputs)
+                .all(|(output, (id, layout))| output.id == *id && output.layout == *layout);
+        if !boundaries_match {
+            return Err(CodecIssue::new(
+                CodecIssueKind::Backend,
+                "cpu_readback",
+                "batch_output_boundary",
+                "aggregate readback changed a frame token, output order, id, or image layout",
+            ));
+        }
+    }
+
+    let mut result_frames = result.frames.iter();
+    let mut batch_logical_bytes = 0_u64;
+    let mut batch_staging_bytes = 0_u64;
+    for (observation, &frame_count) in observations.iter_mut().zip(&frame_counts) {
+        let mut hasher = blake3::Hasher::new();
+        let mut logical_bytes = 0_u64;
+        let mut staging_bytes = 0_u64;
+        for _ in 0..frame_count {
+            let frame = result_frames.next().ok_or_else(|| {
+                CodecIssue::new(
+                    CodecIssueKind::Backend,
+                    "cpu_readback",
+                    "batch_frame_boundary",
+                    "aggregate readback ended inside one worker's frame range",
+                )
+            })?;
+            for output in &frame.outputs {
+                let byte_len = u64::try_from(output.bytes.len()).map_err(|_| {
+                    CodecIssue::new(
+                        CodecIssueKind::Backend,
+                        "cpu_readback",
+                        "byte_length_overflow",
+                        "readback byte length does not fit report storage",
+                    )
+                })?;
+                if byte_len != output.layout.logical_size {
+                    return Err(CodecIssue::new(
+                        CodecIssueKind::Backend,
+                        "cpu_readback",
+                        "output_boundary",
+                        format!(
+                            "readback output contains {byte_len} bytes but its layout declares {}",
+                            output.layout.logical_size
+                        ),
+                    ));
+                }
+                logical_bytes = logical_bytes.checked_add(byte_len).ok_or_else(|| {
+                    CodecIssue::new(
+                        CodecIssueKind::Backend,
+                        "cpu_readback",
+                        "byte_length_overflow",
+                        "aggregate logical byte count overflowed report storage",
+                    )
+                })?;
+                staging_bytes = staging_bytes
+                    .checked_add(aligned_copy_size(byte_len)?)
+                    .ok_or_else(|| {
+                        CodecIssue::new(
+                            CodecIssueKind::Backend,
+                            "cpu_readback",
+                            "byte_length_overflow",
+                            "aggregate staging byte count overflowed report storage",
+                        )
+                    })?;
+                hasher.update(&output.bytes);
+            }
+        }
+        observation.readback_source_frames = u64::try_from(frame_count).unwrap_or(u64::MAX);
+        observation.readback_max_frames_per_submission =
+            u64::try_from(submitted_frame_count).unwrap_or(u64::MAX);
+        observation.readback_logical_bytes = logical_bytes;
+        observation.readback_staging_bytes = staging_bytes;
+        observation.output_hash = Some(hasher.finalize().to_hex().to_string());
+        batch_logical_bytes = batch_logical_bytes
+            .checked_add(logical_bytes)
+            .ok_or_else(|| {
+                CodecIssue::new(
+                    CodecIssueKind::Backend,
+                    "cpu_readback",
+                    "byte_length_overflow",
+                    "aggregate logical byte count overflowed report storage",
+                )
+            })?;
+        batch_staging_bytes = batch_staging_bytes
+            .checked_add(staging_bytes)
+            .ok_or_else(|| {
+                CodecIssue::new(
+                    CodecIssueKind::Backend,
+                    "cpu_readback",
+                    "byte_length_overflow",
+                    "aggregate staging byte count overflowed report storage",
+                )
+            })?;
+    }
+    if result_frames.next().is_some()
+        || batch_logical_bytes != stats.logical_bytes
+        || batch_staging_bytes != stats.staging_bytes
+    {
+        return Err(CodecIssue::new(
+            CodecIssueKind::Backend,
+            "cpu_readback",
+            "batch_output_boundary",
+            "aggregate readback did not preserve logical output byte boundaries",
+        ));
+    }
+    let Some(first) = observations.first_mut() else {
+        return Err(CodecIssue::new(
+            CodecIssueKind::Backend,
+            "harness",
+            "empty_burst",
+            "validated aggregate readback burst produced no worker observations",
+        ));
+    };
+    first.readback_submissions = 1;
+    first.readback_completion_waits = 1;
+
+    let completed = Instant::now();
+    Ok(observations
+        .into_iter()
+        .zip(starts)
+        .map(|(observation, started)| {
+            (
+                observation,
+                nanos(completed.duration_since(started).as_nanos()),
+            )
+        })
+        .collect())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn execute_retained_group<F>(
+    parallelism: u32,
+    operation: &F,
+) -> std::result::Result<Vec<(Instant, RetainedDecode)>, CodecIssue>
+where
+    F: RetainedWorkloadOperation,
+{
+    std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(
+            usize::try_from(parallelism).expect("validated parallelism fits usize"),
+        ));
+        let handles = (0..parallelism)
+            .map(|worker_index| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let started = Instant::now();
+                    operation(worker_index).map(|decoded| (started, decoded))
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    CodecIssue::new(
+                        CodecIssueKind::Backend,
+                        "harness",
+                        "worker_panic",
+                        "an aggregate readback workload worker panicked",
+                    )
+                })?
+            })
+            .collect()
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_retained_group<F>(
+    parallelism: u32,
+    operation: &F,
+) -> std::result::Result<Vec<(Instant, RetainedDecode)>, CodecIssue>
+where
+    F: RetainedWorkloadOperation,
+{
+    (0..parallelism)
+        .map(|worker_index| {
+            let started = Instant::now();
+            operation(worker_index).map(|decoded| (started, decoded))
+        })
+        .collect()
+}
+
+fn aligned_copy_size(logical_size: u64) -> std::result::Result<u64, CodecIssue> {
+    logical_size
+        .checked_add(3)
+        .map(|size| size & !3)
+        .ok_or_else(|| {
+            CodecIssue::new(
+                CodecIssueKind::Backend,
+                "cpu_readback",
+                "byte_length_overflow",
+                "readback copy-alignment size overflowed report storage",
+            )
+        })
+}
+
+fn complete_workload(
+    workload: WorkloadSpec,
+    measured: Vec<(DecodeObservation, u64)>,
+    wall_ns: u64,
+    readback_mode: Option<CpuReadbackMode>,
+) -> std::result::Result<WorkloadExecution, CodecIssue> {
+    let parallelism = workload.parallelism();
     let mut samples = Vec::with_capacity(measured.len());
     let mut aggregate = DecodeObservation::default();
     for (observation, duration) in measured {
@@ -873,9 +1311,9 @@ where
     if aggregate.hash_mismatch {
         return Err(CodecIssue::new(
             CodecIssueKind::Backend,
-            "gpu_encode",
+            "harness",
             "nondeterministic_output",
-            "identical measured inputs produced different encoded byte hashes",
+            "identical measured operations produced different output byte hashes",
         ));
     }
     Ok(WorkloadExecution {
@@ -890,6 +1328,11 @@ where
         readback_completion_waits: aggregate.readback_completion_waits,
         readback_logical_bytes: aggregate.readback_logical_bytes,
         readback_staging_bytes: aggregate.readback_staging_bytes,
+        readback_source_frames: aggregate.readback_source_frames,
+        readback_max_frames_per_submission: aggregate.readback_max_frames_per_submission,
+        readback_mode: readback_mode.or_else(|| {
+            (aggregate.readback_submissions != 0).then_some(CpuReadbackMode::StagedCopy)
+        }),
         output_hash: aggregate.output_hash,
         timing: CodecTiming {
             operation_latency: timing,
@@ -904,12 +1347,13 @@ where
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn execute_group<F>(
     parallelism: u32,
     operation: &F,
 ) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
 where
-    F: Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync,
+    F: DecodeWorkloadOperation,
 {
     if parallelism == 1 {
         let started = Instant::now();
@@ -947,13 +1391,30 @@ where
     })
 }
 
+#[cfg(target_arch = "wasm32")]
+fn execute_group<F>(
+    parallelism: u32,
+    operation: &F,
+) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
+where
+    F: DecodeWorkloadOperation,
+{
+    (0..parallelism)
+        .map(|_| {
+            let started = Instant::now();
+            operation().map(|observation| (observation, nanos(started.elapsed().as_nanos())))
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn execute_worker_stream<F>(
     workers: u32,
     operations_per_worker: u32,
     operation: &F,
 ) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
 where
-    F: Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync,
+    F: DecodeWorkloadOperation,
 {
     std::thread::scope(|scope| {
         let barrier = Arc::new(std::sync::Barrier::new(
@@ -990,6 +1451,25 @@ where
             .collect::<std::result::Result<Vec<_>, _>>()
             .map(|per_worker| per_worker.into_iter().flatten().collect())
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_worker_stream<F>(
+    workers: u32,
+    operations_per_worker: u32,
+    operation: &F,
+) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
+where
+    F: DecodeWorkloadOperation,
+{
+    (0..workers)
+        .flat_map(|_| {
+            (0..operations_per_worker).map(|_| {
+                let started = Instant::now();
+                operation().map(|observation| (observation, nanos(started.elapsed().as_nanos())))
+            })
+        })
+        .collect()
 }
 
 fn encode_issue(error: EncodeError) -> CodecIssue {
@@ -1060,6 +1540,18 @@ fn readback_issue(error: jxl_wgpu::Error) -> CodecIssue {
             "cpu_readback",
             "device_limit",
             format!("readback requires {required} staging bytes, device limit is {limit}"),
+        ),
+        jxl_wgpu::Error::MemoryBackpressure(error) => CodecIssue::new(
+            CodecIssueKind::Backend,
+            "cpu_readback",
+            "memory_backpressure",
+            error.to_string(),
+        ),
+        jxl_wgpu::Error::PollAdmission(error) => CodecIssue::new(
+            CodecIssueKind::Backend,
+            "cpu_readback",
+            "poll_admission",
+            error.to_string(),
         ),
         jxl_wgpu::Error::Unsupported(detail) => CodecIssue::new(
             CodecIssueKind::Unsupported,
@@ -1196,8 +1688,16 @@ struct DecodeObservation {
     readback_completion_waits: u64,
     readback_logical_bytes: u64,
     readback_staging_bytes: u64,
+    readback_source_frames: u64,
+    readback_max_frames_per_submission: u64,
     output_hash: Option<String>,
     hash_mismatch: bool,
+}
+
+#[derive(Debug)]
+struct RetainedDecode {
+    observation: DecodeObservation,
+    frames: Vec<GpuImageFrame>,
 }
 
 impl DecodeObservation {
@@ -1231,6 +1731,12 @@ impl DecodeObservation {
         self.readback_staging_bytes = self
             .readback_staging_bytes
             .saturating_add(other.readback_staging_bytes);
+        self.readback_source_frames = self
+            .readback_source_frames
+            .saturating_add(other.readback_source_frames);
+        self.readback_max_frames_per_submission = self
+            .readback_max_frames_per_submission
+            .max(other.readback_max_frames_per_submission);
         self.hash_mismatch |= other.hash_mismatch;
         match (&self.output_hash, other.output_hash) {
             (Some(left), Some(right)) if left != &right => self.hash_mismatch = true,
@@ -1252,6 +1758,9 @@ struct WorkloadExecution {
     readback_completion_waits: u64,
     readback_logical_bytes: u64,
     readback_staging_bytes: u64,
+    readback_source_frames: u64,
+    readback_max_frames_per_submission: u64,
+    readback_mode: Option<CpuReadbackMode>,
     output_hash: Option<String>,
     timing: CodecTiming,
 }
@@ -1346,6 +1855,8 @@ mod tests {
                 readback_completion_waits: 0,
                 readback_logical_bytes: 0,
                 readback_staging_bytes: 0,
+                readback_source_frames: 0,
+                readback_max_frames_per_submission: 0,
                 output_hash: None,
                 hash_mismatch: false,
             })
@@ -1362,6 +1873,31 @@ mod tests {
             execution.timing.workload.execution_model,
             WorkloadExecutionModel::PersistentHostWorkers
         );
+    }
+
+    #[test]
+    fn nondeterministic_output_hash_is_operation_neutral() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let issue = match execute_workload(
+            WorkloadSpec {
+                kind: WorkloadKind::WarmSequential,
+                iterations: 2,
+                ..WorkloadSpec::default()
+            },
+            || {
+                let index = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(DecodeObservation {
+                    output_hash: Some(format!("hash-{index}")),
+                    ..DecodeObservation::default()
+                })
+            },
+        ) {
+            Err(issue) => issue,
+            Ok(_) => panic!("different output hashes must fail the workload"),
+        };
+        assert_eq!(issue.component, "harness");
+        assert_eq!(issue.code, "nondeterministic_output");
+        assert!(issue.detail.contains("output byte hashes"));
     }
 
     #[test]
@@ -1393,12 +1929,82 @@ mod tests {
     }
 
     #[test]
+    fn retained_burst_results_are_returned_in_worker_index_order() {
+        let results = execute_retained_group(4, &|worker_index| {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                3 - worker_index,
+            )));
+            Ok(RetainedDecode {
+                observation: DecodeObservation {
+                    output_bytes: u64::from(worker_index),
+                    ..DecodeObservation::default()
+                },
+                frames: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|(_, decoded)| decoded.observation.output_bytes)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn readback_admission_failures_keep_distinct_typed_codes() {
+        let issue = readback_issue(jxl_wgpu::Error::MemoryBackpressure(
+            jxl_wgpu::MemoryBudgetError::Exhausted {
+                requested_bytes: 12,
+                reserved_bytes: 12,
+                limit_bytes: 12,
+            },
+        ));
+        assert_eq!(issue.kind, CodecIssueKind::Backend);
+        assert_eq!(issue.component, "cpu_readback");
+        assert_eq!(issue.code, "memory_backpressure");
+
+        let issue = readback_issue(jxl_wgpu::Error::PollAdmission(
+            jxl_wgpu::SubmissionPollerError::Full { capacity: 256 },
+        ));
+        assert_eq!(issue.kind, CodecIssueKind::Backend);
+        assert_eq!(issue.component, "cpu_readback");
+        assert_eq!(issue.code, "poll_admission");
+    }
+
+    #[test]
     fn explicit_cpu_readback_is_a_separate_output_target() {
         assert_ne!(OutputTarget::CpuReadback, OutputTarget::GpuResident);
         assert_eq!(
             serde_json::to_string(&OutputTarget::CpuReadback).unwrap(),
             "\"cpu_readback\""
         );
+    }
+
+    fn aggregate_test_frame(
+        backend: &WgpuBackend,
+        layout: &ImageLayout,
+        token: u32,
+        fill: u8,
+    ) -> GpuImageFrame {
+        GpuImageFrame {
+            token: jxl_gpu_protocol::SubmissionToken(u64::from(token)),
+            outputs: vec![GpuImageOutput {
+                id: jxl_gpu_protocol::OutputId(token),
+                layout: layout.clone(),
+                buffer: jxl_wgpu::GpuBufferLease::new(Arc::new(
+                    backend
+                        .device()
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("jxl-gpu-harness aggregate test source"),
+                            contents: &[fill; 12],
+                            usage: wgpu::BufferUsages::COPY_SRC,
+                        }),
+                )),
+            }],
+            changed: jxl_gpu_protocol::ChangedRegions::default(),
+        }
     }
 
     #[test]
@@ -1432,6 +2038,203 @@ mod tests {
         assert!(!report.coalesced_gpu_batching);
         assert!(report.output_bytes > 0);
         assert!(report.output_hash.is_some());
+    }
+
+    #[test]
+    fn actual_concurrent_burst_coalesces_only_readback_transport() {
+        let Some(backend) = request_backend().unwrap() else {
+            return;
+        };
+        let case = CodecCorpusCase {
+            name: "gray8_aggregate_readback".into(),
+            path: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/gpu_gray8_lossless.jxl"),
+            size_class: SizeClass::Small,
+            extent: None,
+        };
+        let aggregate_options = CodecRunOptions {
+            operation: CodecOperation::Decode,
+            workload: WorkloadSpec {
+                kind: WorkloadKind::ConcurrentBurst,
+                warmup: 1,
+                iterations: 2,
+                burst_size: 3,
+                ..WorkloadSpec::default()
+            },
+            output_target: OutputTarget::CpuReadback,
+            format: GpuPixelFormat::U8,
+            size_class: SizeClass::Auto,
+            extent: None,
+        };
+        let aggregate = run_codec_case(&case, Some(&backend), &aggregate_options);
+        assert_eq!(
+            aggregate.status,
+            CaseStatus::Passed,
+            "{:?}",
+            aggregate.issue
+        );
+        assert_eq!(aggregate.frame_count, 6);
+        assert_eq!(aggregate.readback_submissions, 2);
+        assert_eq!(aggregate.readback_completion_waits, 2);
+        assert_eq!(aggregate.readback_source_frames, 6);
+        assert_eq!(aggregate.readback_max_frames_per_submission, 3);
+        assert_eq!(
+            aggregate.readback_mode,
+            Some(CpuReadbackMode::AggregateStagedCopy)
+        );
+        assert!(!aggregate.coalesced_gpu_batching);
+        assert_eq!(aggregate.timing.as_ref().unwrap().workload.operations, 6);
+
+        let single = run_codec_case(
+            &case,
+            Some(&backend),
+            &CodecRunOptions {
+                workload: WorkloadSpec {
+                    kind: WorkloadKind::ConcurrentBurst,
+                    iterations: 1,
+                    burst_size: 1,
+                    ..WorkloadSpec::default()
+                },
+                ..aggregate_options
+            },
+        );
+        assert_eq!(single.status, CaseStatus::Passed, "{:?}", single.issue);
+        assert_eq!(single.readback_mode, Some(CpuReadbackMode::StagedCopy));
+        assert_eq!(single.readback_source_frames, 1);
+        assert_eq!(single.readback_max_frames_per_submission, 1);
+        assert_eq!(aggregate.output_hash, single.output_hash);
+        assert_eq!(aggregate.output_bytes, single.output_bytes * 6);
+        assert_eq!(
+            aggregate.gpu_output_logical_bytes,
+            single.gpu_output_logical_bytes * 6
+        );
+        assert_eq!(
+            aggregate.readback_logical_bytes,
+            single.readback_logical_bytes * 6
+        );
+        assert_eq!(
+            aggregate.readback_staging_bytes,
+            single.readback_staging_bytes * 6
+        );
+        assert_eq!(aggregate.codec_submissions, single.codec_submissions * 6);
+        assert_eq!(
+            aggregate.codec_completion_waits,
+            single.codec_completion_waits * 6
+        );
+    }
+
+    #[test]
+    fn actual_aggregate_readback_hashes_worker_segments_in_index_order() {
+        let Some(backend) = request_backend().unwrap() else {
+            return;
+        };
+        let layout = ImageLayout::packed(
+            Extent2d::new(3, 3),
+            PixelFormat::non_color(
+                jxl_gpu_formats::SampleKind::Unsigned,
+                8,
+                &[jxl_gpu_formats::Channel::X],
+            ),
+        )
+        .unwrap();
+        let pipeline = ImageReadbackPipeline::new(&backend);
+        let observations = execute_aggregate_readback_group(3, &pipeline, &|worker_index| {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                2 - worker_index,
+            )));
+            Ok(RetainedDecode {
+                observation: DecodeObservation {
+                    frame_count: 1,
+                    output_bytes: 9,
+                    gpu_output_logical_bytes: 9,
+                    codec_submissions: 1,
+                    codec_completion_waits: 1,
+                    ..DecodeObservation::default()
+                },
+                frames: vec![aggregate_test_frame(
+                    &backend,
+                    &layout,
+                    worker_index + 1,
+                    u8::try_from(worker_index + 11).unwrap(),
+                )],
+            })
+        })
+        .unwrap();
+        assert_eq!(observations.len(), 3);
+        for (worker_index, (observation, duration)) in observations.iter().enumerate() {
+            let fill = u8::try_from(worker_index).unwrap() + 11;
+            let expected_hash = blake3::hash(&[fill; 9]).to_hex().to_string();
+            assert_eq!(
+                observation.output_hash.as_deref(),
+                Some(expected_hash.as_str())
+            );
+            assert_eq!(observation.readback_logical_bytes, 9);
+            assert_eq!(observation.readback_staging_bytes, 12);
+            assert_eq!(observation.readback_source_frames, 1);
+            assert_eq!(observation.readback_max_frames_per_submission, 3);
+            assert!(*duration > 0);
+        }
+        assert_eq!(observations[0].0.readback_submissions, 1);
+        assert_eq!(observations[0].0.readback_completion_waits, 1);
+        assert_eq!(observations[1].0.readback_submissions, 0);
+        assert_eq!(observations[2].0.readback_completion_waits, 0);
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn actual_aggregate_readback_budget_survives_abandonment() {
+        let Some(backend) = request_backend().unwrap() else {
+            return;
+        };
+        let layout = ImageLayout::packed(
+            Extent2d::new(3, 3),
+            PixelFormat::non_color(
+                jxl_gpu_formats::SampleKind::Unsigned,
+                8,
+                &[jxl_gpu_formats::Channel::X],
+            ),
+        )
+        .unwrap();
+        let frames = [
+            aggregate_test_frame(&backend, &layout, 1, 11),
+            aggregate_test_frame(&backend, &layout, 2, 22),
+        ];
+        let pipeline = ImageReadbackPipeline::from_device_queue(
+            backend.device().clone(),
+            backend.queue().clone(),
+            jxl_wgpu::ImageReadbackLimits {
+                max_transient_bytes: 24,
+                max_in_flight_bytes: 24,
+            },
+        )
+        .unwrap();
+        let pending = pipeline.submit_frames(&frames).unwrap();
+        assert_eq!(pending.stats().frame_count, 2);
+        assert_eq!(pending.stats().staging_bytes, 24);
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 24);
+        let issue = readback_issue(pipeline.submit_frames(&frames).unwrap_err());
+        assert_eq!(issue.code, "memory_backpressure");
+
+        let submission = pending.submission().clone();
+        drop(pending);
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while pipeline.memory_stats().reserved_bytes != 0 && Instant::now() < deadline {
+            backend.device().poll(wgpu::PollType::Poll).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+        let result = pipeline.submit_frames(&frames).unwrap().wait().unwrap();
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(result.frames[0].outputs[0].bytes, [11; 9]);
+        assert_eq!(result.frames[1].outputs[0].bytes, [22; 9]);
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
     }
 
     #[test]

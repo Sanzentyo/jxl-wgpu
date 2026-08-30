@@ -72,16 +72,21 @@ The workload names describe what this implementation actually schedules:
   the measured sample.
 - `warm-sequential` repeats an operation on one host thread while reusing the backend objects.
 - `concurrent-burst` releases `burst-size` independent host threads at a barrier for each iteration.
-  Every worker still makes its own codec operation and completion wait.
+  Every worker still makes its own codec operation and codec-validation wait. With
+  `--output-target cpu-readback` and `burst-size > 1`, the already-produced GPU frames are retained
+  in worker-index order and transported together by one aggregate staging allocation, one queue
+  submission, one mapping callback, and one completion wait per burst.
 - `concurrent` starts `concurrency` persistent host workers. Each worker performs `iterations`
   operations sequentially; workers overlap one another without a barrier between operations.
 - `animation` opens and advances an actual animated codestream session. A still input is rejected,
   and the current stock Gray8 profile reports animation as unsupported. Repeating a still with
   `warm-sequential` is only a repeated-still proxy, not an animation result.
 
-Neither host fan-out workload is GPU batching. The current runner does not encode several images or
-frames into one command buffer. Reports therefore set `coalesced_gpu_batching` to `false` and expose
-the measured-operation counts `codec_submissions`, `codec_completion_waits`,
+Neither host fan-out workload is codec GPU batching. The runner does not encode or decode several
+images or frames in one codec command buffer. Reports therefore keep `coalesced_gpu_batching` at
+`false`. Aggregate concurrent-burst readback coalesces only buffer-to-host transport after every
+independent decode has completed. Reports expose the measured-operation counts
+`codec_submissions`, `codec_completion_waits`,
 `display_submissions`, `display_completion_waits`, `readback_submissions`, and
 `readback_completion_waits`. `codec_submissions` is the actual queue-submit count: a streamed
 Modular encode counts both histogram and serialization passes for every batch, and decode counts
@@ -90,13 +95,25 @@ completion paths, not the queue-submit count. Warmup activity is excluded from t
 
 `gpu_output_logical_bytes` sums the addressable decoded GPU layouts. For `cpu_readback`,
 `readback_logical_bytes` and `readback_staging_bytes` come from the aggregate readback plan; staging
-bytes include four-byte copy padding. `readback_mode` is currently `staged_copy`. A
+bytes include independently applied four-byte copy padding for every output.
+`readback_source_frames` and `readback_max_frames_per_submission` make frame coalescing auditable.
+`readback_mode` is `aggregate_staged_copy` for a CPU-readback concurrent burst larger than one and
+`staged_copy` for the per-frame path, including `burst-size = 1`. A
 `display_texture` run enqueues conversion on the same queue but does not wait for display conversion
 completion, so it reports display submissions and zero display waits rather than pretending to be
 end-to-end presentation latency. `gpu_resident` performs no image readback. `output_bytes` is the
 encoded container size for encode and the decoded logical-image total for decode/round-trip.
 Per-operation latency starts after a burst/worker start barrier; workload wall time includes thread
 creation, synchronization, all operations, and joins. Throughput is derived from that wall time.
+
+One concurrent burst is an all-or-nothing transport batch: the backend's shared transient budget
+must admit the retained decoded-output leases and the aggregate staging allocation at the same
+time. Shared-budget admission failure is reported as typed `memory_backpressure`; per-submission
+and device caps remain typed `transient_limit` or `device_limit`. The harness does not silently
+split a requested burst into several maps because that would change the measured batching contract.
+Reduce `--burst-size` or increase the configured backend budget for large images.
+Animation keeps its frame-by-frame `staged_copy` path; this aggregate workload measures independent
+still decodes and does not claim animation-frame coalescing.
 
 ## Opt-in external CPU comparator
 

@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "command", "generated_unix_ms", "package_version", "target_os", "target_arch", "adapters", "cases"],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "command": { "type": "string", "minLength": 1 },
     "generated_unix_ms": { "type": "integer", "minimum": 0 },
     "package_version": { "type": "string", "minLength": 1 },
@@ -210,7 +210,7 @@
     "codec_case": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["case_id", "path", "operation", "workload", "output_target", "status", "adapter", "pixel_format", "size_class", "declared_extent", "input_bytes", "output_bytes", "gpu_output_logical_bytes", "frame_count", "codec_submissions", "codec_completion_waits", "display_submissions", "display_completion_waits", "readback_submissions", "readback_completion_waits", "readback_logical_bytes", "readback_staging_bytes", "readback_mode", "coalesced_gpu_batching", "output_hash", "timing", "issue", "cpu_baseline"],
+      "required": ["case_id", "path", "operation", "workload", "output_target", "status", "adapter", "pixel_format", "size_class", "declared_extent", "input_bytes", "output_bytes", "gpu_output_logical_bytes", "frame_count", "codec_submissions", "codec_completion_waits", "display_submissions", "display_completion_waits", "readback_submissions", "readback_completion_waits", "readback_logical_bytes", "readback_staging_bytes", "readback_source_frames", "readback_max_frames_per_submission", "readback_mode", "coalesced_gpu_batching", "output_hash", "timing", "issue", "cpu_baseline"],
       "properties": {
         "case_id": { "type": "string", "minLength": 1 },
         "path": { "type": "string", "minLength": 1 },
@@ -236,7 +236,9 @@
         "readback_completion_waits": { "type": "integer", "minimum": 0 },
         "readback_logical_bytes": { "type": "integer", "minimum": 0 },
         "readback_staging_bytes": { "type": "integer", "minimum": 0 },
-        "readback_mode": { "oneOf": [{ "type": "null" }, { "const": "staged_copy" }] },
+        "readback_source_frames": { "type": "integer", "minimum": 0 },
+        "readback_max_frames_per_submission": { "type": "integer", "minimum": 0 },
+        "readback_mode": { "oneOf": [{ "type": "null" }, { "enum": ["staged_copy", "aggregate_staged_copy"] }] },
         "coalesced_gpu_batching": { "const": false },
         "output_hash": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }] },
         "timing": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/codec_timing" }] },
