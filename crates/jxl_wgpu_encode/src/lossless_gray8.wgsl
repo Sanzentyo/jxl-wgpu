@@ -3,6 +3,7 @@ struct Params {
     height: u32,
     row_stride: u32,
     byte_offset: u32,
+    output_word_offset: u32,
 }
 
 @group(0) @binding(0)
@@ -15,37 +16,38 @@ var<storage, read> source_words: array<u32>;
 var<storage, read_write> output_words: array<u32>;
 
 @group(0) @binding(2)
-var<uniform> params: Params;
+var<storage, read> group_params: array<Params>;
 
 const OUTPUT_HEADER_WORDS: u32 = 53u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
-fn sample_at(x: u32, y: u32) -> i32 {
+fn sample_at(params: Params, x: u32, y: u32) -> i32 {
     let byte_index = params.byte_offset + y * params.row_stride + x;
     let word = source_words[byte_index >> 2u];
     let shift = (byte_index & 3u) * 8u;
     return i32((word >> shift) & 255u);
 }
 
-fn append_event(kind: u32, token: u32, nbits: u32, bits: u32) {
-    let event = output_words[0];
-    let word_count = arrayLength(&output_words);
-    let capacity = (word_count - OUTPUT_HEADER_WORDS) / EVENT_WORDS;
+fn append_event(params: Params, kind: u32, token: u32, nbits: u32, bits: u32) {
+    let output_base = params.output_word_offset;
+    let event = output_words[output_base];
+    let pixel_count = params.width * params.height;
+    let capacity = pixel_count + (pixel_count + 7u) / 8u + 1u;
     if event >= capacity {
         // Host validation treats this sentinel as a bounded backend failure.
-        output_words[0] = EVENT_OVERFLOW;
+        output_words[output_base] = EVENT_OVERFLOW;
         return;
     }
-    let base = OUTPUT_HEADER_WORDS + event * EVENT_WORDS;
+    let base = output_base + OUTPUT_HEADER_WORDS + event * EVENT_WORDS;
     output_words[base] = kind;
     output_words[base + 1u] = token;
     output_words[base + 2u] = nbits;
     output_words[base + 3u] = bits;
-    output_words[0] = event + 1u;
+    output_words[output_base] = event + 1u;
 }
 
-fn emit_raw(value: u32) {
+fn emit_raw(params: Params, value: u32) {
     var token = 0u;
     var nbits = 0u;
     var bits = 0u;
@@ -55,17 +57,19 @@ fn emit_raw(value: u32) {
         nbits = n;
         bits = value - (1u << n);
     }
-    output_words[1u + token] = output_words[1u + token] + 1u;
-    append_event(0u, token, nbits, bits);
+    let count_index = params.output_word_offset + 1u + token;
+    output_words[count_index] = output_words[count_index] + 1u;
+    append_event(params, 0u, token, nbits, bits);
 }
 
-fn emit_run(count: u32) {
+fn emit_run(params: Params, count: u32) {
     if count == 0u {
         return;
     }
     // The prefix stream's raw symbol zero is the LZ77 escape. JPEG XL's
     // configured minimum length is seven, hence the encoded value is count-8.
-    output_words[1] = output_words[1] + 1u;
+    let output_base = params.output_word_offset;
+    output_words[output_base + 1u] = output_words[output_base + 1u] + 1u;
     let value = count - 8u;
     var token = value;
     var nbits = 0u;
@@ -76,29 +80,29 @@ fn emit_run(count: u32) {
         nbits = n;
         bits = value - (1u << n);
     }
-    output_words[20u + token] = output_words[20u + token] + 1u;
-    append_event(1u, token, nbits, bits);
+    output_words[output_base + 20u + token] = output_words[output_base + 20u + token] + 1u;
+    append_event(params, 1u, token, nbits, bits);
 }
 
-fn packed_residual(x: u32, y: u32) -> u32 {
-    let pixel = sample_at(x, y);
+fn packed_residual(params: Params, x: u32, y: u32) -> u32 {
+    let pixel = sample_at(params, x, y);
     var left = 0i;
     var top = 0i;
     var top_left = 0i;
     if y == 0u {
         if x != 0u {
-            left = sample_at(x - 1u, y);
+            left = sample_at(params, x - 1u, y);
         }
         top = left;
         top_left = left;
     } else {
-        top = sample_at(x, y - 1u);
+        top = sample_at(params, x, y - 1u);
         if x == 0u {
             left = top;
             top_left = top;
         } else {
-            left = sample_at(x - 1u, y);
-            top_left = sample_at(x - 1u, y - 1u);
+            left = sample_at(params, x - 1u, y);
+            top_left = sample_at(params, x - 1u, y - 1u);
         }
     }
 
@@ -117,9 +121,10 @@ fn packed_residual(x: u32, y: u32) -> u32 {
 
 @compute @workgroup_size(1)
 fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    if any(global_id != vec3<u32>(0u)) {
+    if global_id.y != 0u || global_id.z != 0u || global_id.x >= arrayLength(&group_params) {
         return;
     }
+    let params = group_params[global_id.x];
 
     var run = 0u;
     for (var y = 0u; y < params.height; y += 1u) {
@@ -129,7 +134,7 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
             var prefix = 0u;
             var prefix_open = true;
             for (var index = 0u; index < count; index += 1u) {
-                let residual = packed_residual(chunk_x + index, y);
+                let residual = packed_residual(params, chunk_x + index, y);
                 residuals[index] = residual;
                 if prefix_open && residual == 0u {
                     prefix += 1u;
@@ -141,17 +146,17 @@ fn encode(@builtin(global_invocation_id) global_id: vec3<u32>) {
             if prefix == count && (run > 0u || prefix > 7u) {
                 run += prefix;
             } else if prefix + run > 7u {
-                emit_run(run + prefix);
+                emit_run(params, run + prefix);
                 for (var index = prefix; index < count; index += 1u) {
-                    emit_raw(residuals[index]);
+                    emit_raw(params, residuals[index]);
                 }
                 run = 0u;
             } else {
                 for (var index = 0u; index < count; index += 1u) {
-                    emit_raw(residuals[index]);
+                    emit_raw(params, residuals[index]);
                 }
             }
         }
     }
-    emit_run(run);
+    emit_run(params, run);
 }

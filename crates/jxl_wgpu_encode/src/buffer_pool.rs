@@ -14,7 +14,7 @@ pub struct EncoderBufferPoolStats {
     pub limit_bytes: u64,
     /// Bytes held by all currently idle buffer sets.
     pub idle_bytes: u64,
-    /// Complete uniform/artifact/readback sets ready for reuse.
+    /// Complete parameter/artifact/readback sets ready for reuse.
     pub idle_buffer_sets: u64,
     /// Hard object-count bound applied in addition to `limit_bytes`.
     pub max_idle_buffer_sets: u64,
@@ -36,16 +36,17 @@ pub struct EncoderBufferPoolStats {
 
 #[derive(Debug)]
 pub(crate) struct EncoderBufferSet {
-    pub(crate) uniform: Arc<wgpu::Buffer>,
+    pub(crate) parameters: Arc<wgpu::Buffer>,
     pub(crate) artifact: Arc<wgpu::Buffer>,
     pub(crate) readback: Arc<wgpu::Buffer>,
+    parameter_bytes: u64,
     artifact_bytes: u64,
     allocation_bytes: u64,
 }
 
 impl EncoderBufferSet {
-    fn new(device: &wgpu::Device, uniform_bytes: u64, artifact_bytes: u64) -> Self {
-        let allocation_bytes = uniform_bytes
+    fn new(device: &wgpu::Device, parameter_bytes: u64, artifact_bytes: u64) -> Self {
+        let allocation_bytes = parameter_bytes
             .checked_add(
                 artifact_bytes
                     .checked_mul(2)
@@ -53,10 +54,10 @@ impl EncoderBufferSet {
             )
             .expect("checked dispatch plan bounds total pooled bytes");
         Self {
-            uniform: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless gray8 pooled parameters"),
-                size: uniform_bytes,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            parameters: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("jxl-wgpu lossless gray8 pooled group parameters"),
+                size: parameter_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })),
             artifact: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
@@ -73,6 +74,7 @@ impl EncoderBufferSet {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })),
+            parameter_bytes,
             artifact_bytes,
             allocation_bytes,
         }
@@ -152,14 +154,16 @@ impl EncoderBufferPool {
     pub(crate) fn checkout(
         self: &Arc<Self>,
         device: &wgpu::Device,
-        uniform_bytes: u64,
+        parameter_bytes: u64,
         artifact_bytes: u64,
     ) -> EncoderBufferLease {
         let generation = {
             let mut state = self.lock_state();
             let generation = state.generation;
             let exact_match = state.idle.iter().position(|idle| {
-                idle.generation == generation && idle.buffers.artifact_bytes == artifact_bytes
+                idle.generation == generation
+                    && idle.buffers.parameter_bytes == parameter_bytes
+                    && idle.buffers.artifact_bytes == artifact_bytes
             });
             if let Some(idle) = exact_match.and_then(|index| state.idle.remove(index)) {
                 state.idle_bytes = state
@@ -178,7 +182,7 @@ impl EncoderBufferPool {
         };
         // Creating driver objects can be expensive. Keep cold concurrent submissions independent
         // by never holding the pool mutex across `Device::create_buffer`.
-        let buffers = EncoderBufferSet::new(device, uniform_bytes, artifact_bytes);
+        let buffers = EncoderBufferSet::new(device, parameter_bytes, artifact_bytes);
         {
             let mut state = self.lock_state();
             state.leased_buffer_sets = state.leased_buffer_sets.saturating_add(1);

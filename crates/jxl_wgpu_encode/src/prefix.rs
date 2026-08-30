@@ -33,9 +33,9 @@ pub(crate) struct PrefixCode {
 }
 
 impl PrefixCode {
-    pub(crate) fn from_gpu_counts(
-        raw_gpu: &[u32; RAW_SYMBOLS],
-        lz77_gpu: &[u32; LZ77_SYMBOLS],
+    pub(crate) fn from_aggregated_counts(
+        raw_gpu: &[u64; RAW_SYMBOLS],
+        lz77_gpu: &[u64; LZ77_SYMBOLS],
     ) -> Result<Self, EncodeError> {
         if raw_gpu[10..].iter().any(|&count| count != 0)
             || lz77_gpu[28..].iter().any(|&count| count != 0)
@@ -47,10 +47,20 @@ impl PrefixCode {
         let mut raw_counts = [0u64; RAW_SYMBOLS];
         let mut lz77_counts = [0u64; LZ77_SYMBOLS];
         for (index, count) in raw_counts.iter_mut().enumerate() {
-            *count = (u64::from(raw_gpu[index]) << 8) + BASE_RAW_COUNTS[index];
+            *count = raw_gpu[index]
+                .checked_shl(8)
+                .and_then(|value| value.checked_add(BASE_RAW_COUNTS[index]))
+                .ok_or_else(|| {
+                    EncodeError::Backend("aggregate raw histogram scaling overflow".into())
+                })?;
         }
         for (index, count) in lz77_counts.iter_mut().enumerate() {
-            *count = (u64::from(lz77_gpu[index]) << 8) + BASE_LZ77_COUNTS[index];
+            *count = lz77_gpu[index]
+                .checked_shl(8)
+                .and_then(|value| value.checked_add(BASE_LZ77_COUNTS[index]))
+                .ok_or_else(|| {
+                    EncodeError::Backend("aggregate LZ77 histogram scaling overflow".into())
+                })?;
         }
         Ok(Self::new(&raw_counts, &lz77_counts))
     }

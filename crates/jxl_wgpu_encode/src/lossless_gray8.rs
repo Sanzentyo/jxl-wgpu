@@ -29,7 +29,9 @@ use crate::{
     UnsupportedFeature, WgpuContext, assemble_frame,
 };
 
-const MAX_DIMENSION: u32 = 256;
+/// JPEG XL's default Modular pass-group edge length.
+pub const LOSSLESS_GRAY8_GROUP_DIMENSION: u32 = 256;
+const LOSSLESS_GRAY8_LF_GROUP_DIMENSION: u32 = LOSSLESS_GRAY8_GROUP_DIMENSION * 8;
 const SHADER: &str = include_str!("lossless_gray8.wgsl");
 
 #[repr(C)]
@@ -39,6 +41,7 @@ struct Gray8Params {
     height: u32,
     row_stride: u32,
     byte_offset: u32,
+    output_word_offset: u32,
 }
 
 /// Fixed storage-buffer header written by `lossless_gray8.wgsl`.
@@ -64,7 +67,7 @@ const OUTPUT_HEADER_WORDS: usize = std::mem::size_of::<Gray8ArtifactHeader>() / 
 const EVENT_WORDS: usize = std::mem::size_of::<Gray8Event>() / 4;
 
 const _: () = {
-    assert!(std::mem::size_of::<Gray8Params>() == 16);
+    assert!(std::mem::size_of::<Gray8Params>() == 20);
     assert!(std::mem::align_of::<Gray8Params>() == 4);
     assert!(std::mem::size_of::<Gray8ArtifactHeader>() == 53 * 4);
     assert!(std::mem::align_of::<Gray8ArtifactHeader>() == 4);
@@ -72,11 +75,99 @@ const _: () = {
     assert!(std::mem::align_of::<Gray8Event>() == 4);
 };
 
+/// Row-major JPEG XL pass-group grid used by one Gray8 frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LosslessGray8GroupGrid {
+    pub width: u32,
+    pub height: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub groups: u32,
+    pub lf_columns: u32,
+    pub lf_rows: u32,
+    pub lf_groups: u32,
+}
+
+impl LosslessGray8GroupGrid {
+    fn for_extent(width: u32, height: u32) -> Result<Self, EncodeError> {
+        if width == 0 || height == 0 || width >= (1 << 30) || height >= (1 << 30) {
+            return Err(EncodeError::InvalidConfiguration(
+                "gray8 dimensions must be in 1..2^30",
+            ));
+        }
+        let columns = width.div_ceil(LOSSLESS_GRAY8_GROUP_DIMENSION);
+        let rows = height.div_ceil(LOSSLESS_GRAY8_GROUP_DIMENSION);
+        let groups = columns
+            .checked_mul(rows)
+            .ok_or(EncodeError::InvalidSource("Gray8 group count overflow"))?;
+        let lf_columns = width.div_ceil(LOSSLESS_GRAY8_LF_GROUP_DIMENSION);
+        let lf_rows = height.div_ceil(LOSSLESS_GRAY8_LF_GROUP_DIMENSION);
+        let lf_groups = lf_columns
+            .checked_mul(lf_rows)
+            .ok_or(EncodeError::InvalidSource("Gray8 LF group count overflow"))?;
+        // FrameGroupLayout performs the normative TOC-entry bound as well. Do it here so an
+        // impossible grid is rejected before any driver allocation or queue interaction.
+        FrameGroupLayout::new(lf_groups, groups, 1)?;
+        Ok(Self {
+            width,
+            height,
+            columns,
+            rows,
+            groups,
+            lf_columns,
+            lf_rows,
+            lf_groups,
+        })
+    }
+
+    /// Resolves a canonical row-major pass-group index to its exact pixel rectangle.
+    #[must_use]
+    pub fn group(self, index: u32) -> Option<LosslessGray8Group> {
+        if index >= self.groups {
+            return None;
+        }
+        let column = index % self.columns;
+        let row = index / self.columns;
+        let x = column.checked_mul(LOSSLESS_GRAY8_GROUP_DIMENSION)?;
+        let y = row.checked_mul(LOSSLESS_GRAY8_GROUP_DIMENSION)?;
+        Some(LosslessGray8Group {
+            index,
+            column,
+            row,
+            x,
+            y,
+            width: (self.width - x).min(LOSSLESS_GRAY8_GROUP_DIMENSION),
+            height: (self.height - y).min(LOSSLESS_GRAY8_GROUP_DIMENSION),
+        })
+    }
+
+    /// Iterates the standard JPEG XL TOC PassGroup order.
+    pub fn ordered_groups(self) -> impl ExactSizeIterator<Item = LosslessGray8Group> {
+        (0..self.groups).map(move |index| {
+            self.group(index)
+                .expect("an index from the checked group range is valid")
+        })
+    }
+}
+
+/// One GPU workgroup and its standard row-major JPEG XL PassGroup destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LosslessGray8Group {
+    pub index: u32,
+    pub column: u32,
+    pub row: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Checked memory accounting for one concrete Gray8 submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LosslessGray8MemoryPlan {
+    pub group_grid: LosslessGray8GroupGrid,
     pub source_binding_bytes: u64,
-    pub uniform_bytes: u64,
+    pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
     pub readback_bytes: u64,
     pub owned_bytes_per_job: u64,
@@ -97,6 +188,7 @@ pub struct LosslessGray8MemoryLimits {
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
+    pub max_compute_workgroups_per_dimension: u32,
 }
 
 impl LosslessGray8MemoryPlan {
@@ -128,19 +220,28 @@ impl LosslessGray8MemoryPlan {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct Gray8GroupPlan {
+    width: u32,
+    height: u32,
+    artifact_byte_offset: u64,
+    output_size: u64,
+    max_events: usize,
+}
+
+#[derive(Clone, Debug)]
 struct Gray8DispatchPlan {
     width: u32,
     height: u32,
-    row_stride: u32,
-    shader_byte_offset: u32,
+    group_grid: LosslessGray8GroupGrid,
+    parameters: Vec<Gray8Params>,
+    groups: Vec<Gray8GroupPlan>,
     source_binding_offset: u64,
     source_binding_size: NonZeroU64,
     output_size: u64,
-    max_events: usize,
     memory: LosslessGray8MemoryPlan,
 }
 
-/// The first executable encoder profile: one 8-bit grayscale Modular group.
+/// GPU lossless 8-bit grayscale Modular encoding with row-major 256x256 pass groups.
 ///
 /// It never reads source pixels on the CPU. The source buffer must contain one
 /// `PixelFormat::non_color(Unsigned, 8, &[X])` plane. The GPU emits predictor
@@ -152,6 +253,7 @@ pub struct LosslessGray8Backend {
     max_storage_binding_size: u64,
     max_buffer_size: u64,
     storage_offset_alignment: u64,
+    max_compute_workgroups_per_dimension: u32,
 }
 
 impl LosslessGray8Backend {
@@ -194,6 +296,7 @@ impl LosslessGray8Backend {
             max_storage_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
+            max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
         }
     }
 
@@ -210,10 +313,11 @@ impl LosslessGray8Backend {
             max_storage_buffer_binding_size: self.max_storage_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.storage_offset_alignment,
+            max_compute_workgroups_per_dimension: self.max_compute_workgroups_per_dimension,
         }
     }
 
-    /// Reports encoder-owned uniform, artifact, and readback buffers retained for reuse.
+    /// Reports encoder-owned parameter, artifact, and readback buffers retained for reuse.
     #[must_use]
     pub fn buffer_pool_stats(&self) -> EncoderBufferPoolStats {
         self.buffer_pool.stats()
@@ -240,12 +344,14 @@ impl LosslessGray8Backend {
         source: &crate::BufferImageSource,
     ) -> Result<Gray8DispatchPlan, EncodeError> {
         let extent = source.layout.extent;
-        if extent.width < 2
-            || extent.height < 2
-            || extent.width > MAX_DIMENSION
-            || extent.height > MAX_DIMENSION
-        {
-            return Err(UnsupportedFeature::InputFormat.into());
+        let group_grid = LosslessGray8GroupGrid::for_extent(extent.width, extent.height)?;
+        if group_grid.groups > self.max_compute_workgroups_per_dimension {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "max_compute_workgroups_per_dimension",
+                required: u64::from(group_grid.groups),
+                available: u64::from(self.max_compute_workgroups_per_dimension),
+            }
+            .into());
         }
         if source.layout.format != PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X])
             || source.layout.planes.len() != 1
@@ -320,8 +426,6 @@ impl LosslessGray8Backend {
         }
         let source_binding_size = NonZeroU64::new(source_binding_bytes)
             .ok_or(EncodeError::InvalidSource("source binding is empty"))?;
-        let shader_byte_offset = u32::try_from(plane.offset - source_binding_offset)
-            .map_err(|_| EncodeError::InvalidSource("relative plane offset exceeds u32"))?;
         let shader_last_byte = sample_end
             .checked_sub(source_binding_offset)
             .and_then(|value| value.checked_sub(1))
@@ -332,23 +436,68 @@ impl LosslessGray8Backend {
             EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
         })?;
 
-        let pixel_count = usize::try_from(u64::from(extent.width) * u64::from(extent.height))
-            .map_err(|_| EncodeError::InvalidSource("image dimensions overflow"))?;
-        let max_events = event_capacity(pixel_count)?;
-        let output_words = OUTPUT_HEADER_WORDS
-            .checked_add(
-                max_events
-                    .checked_mul(EVENT_WORDS)
-                    .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?,
-            )
-            .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
-        let output_size = u64::try_from(output_words)
-            .ok()
-            .and_then(|words| words.checked_mul(4))
-            .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
-        if !output_size.is_multiple_of(4) {
+        let group_count = usize::try_from(group_grid.groups)
+            .map_err(|_| EncodeError::InvalidSource("Gray8 group count overflow"))?;
+        let mut parameters = Vec::with_capacity(group_count);
+        let mut groups = Vec::with_capacity(group_count);
+        let mut output_size = 0u64;
+        for group in group_grid.ordered_groups() {
+            let x = group.x;
+            let y = group.y;
+            let width = group.width;
+            let height = group.height;
+            let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
+                .map_err(|_| EncodeError::InvalidSource("group dimensions overflow"))?;
+            let max_events = event_capacity(pixel_count)?;
+            let output_words = OUTPUT_HEADER_WORDS
+                .checked_add(
+                    max_events
+                        .checked_mul(EVENT_WORDS)
+                        .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?,
+                )
+                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            let group_output_size = u64::try_from(output_words)
+                .ok()
+                .and_then(|words| words.checked_mul(4))
+                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            let output_word_offset = u32::try_from(output_size / 4).map_err(|_| {
+                EncodeError::InvalidSource("artifact buffer exceeds WGSL u32 indexing")
+            })?;
+            let tile_byte_offset = plane
+                .offset
+                .checked_add(plane.row_stride.checked_mul(u64::from(y)).ok_or(
+                    EncodeError::InvalidSource("source address arithmetic overflow"),
+                )?)
+                .and_then(|value| value.checked_add(u64::from(x)))
+                .and_then(|value| value.checked_sub(source_binding_offset))
+                .ok_or(EncodeError::InvalidSource(
+                    "source address arithmetic overflow",
+                ))?;
+            let byte_offset = u32::try_from(tile_byte_offset).map_err(|_| {
+                EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
+            })?;
+            parameters.push(Gray8Params {
+                width,
+                height,
+                row_stride,
+                byte_offset,
+                output_word_offset,
+            });
+            groups.push(Gray8GroupPlan {
+                width,
+                height,
+                artifact_byte_offset: output_size,
+                output_size: group_output_size,
+                max_events,
+            });
+            output_size = output_size
+                .checked_add(group_output_size)
+                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+        }
+        let output_words = output_size / 4;
+        if output_words > u64::from(u32::MAX) + 1 {
             return Err(EncodeError::InvalidSource(
-                "artifact buffer is not copy/map aligned",
+                "artifact buffer exceeds WGSL u32 indexing",
             ));
         }
         if output_size > self.max_storage_binding_size {
@@ -367,18 +516,41 @@ impl LosslessGray8Backend {
             }
             .into());
         }
-        let uniform_bytes = u64::try_from(std::mem::size_of::<Gray8Params>())
-            .map_err(|_| EncodeError::InvalidSource("uniform size overflow"))?;
+        let parameter_storage_bytes = u64::try_from(parameters.len())
+            .ok()
+            .and_then(|count| {
+                count.checked_mul(u64::try_from(std::mem::size_of::<Gray8Params>()).ok()?)
+            })
+            .ok_or(EncodeError::InvalidSource(
+                "group parameter storage size overflow",
+            ))?;
+        if parameter_storage_bytes > self.max_storage_binding_size {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "max_storage_buffer_binding_size",
+                required: parameter_storage_bytes,
+                available: self.max_storage_binding_size,
+            }
+            .into());
+        }
+        if parameter_storage_bytes > self.max_buffer_size {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "max_buffer_size",
+                required: parameter_storage_bytes,
+                available: self.max_buffer_size,
+            }
+            .into());
+        }
         let owned_bytes_per_job = output_size
             .checked_mul(2)
-            .and_then(|value| value.checked_add(uniform_bytes))
+            .and_then(|value| value.checked_add(parameter_storage_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let addressed_bytes_per_job = owned_bytes_per_job
             .checked_add(source_binding_bytes)
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let memory = LosslessGray8MemoryPlan {
+            group_grid,
             source_binding_bytes,
-            uniform_bytes,
+            parameter_storage_bytes,
             artifact_storage_bytes: output_size,
             readback_bytes: output_size,
             owned_bytes_per_job,
@@ -387,12 +559,12 @@ impl LosslessGray8Backend {
         Ok(Gray8DispatchPlan {
             width: extent.width,
             height: extent.height,
-            row_stride,
-            shader_byte_offset,
+            group_grid,
+            parameters,
+            groups,
             source_binding_offset,
             source_binding_size,
             output_size,
-            max_events,
             memory,
         })
     }
@@ -452,21 +624,17 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
 
-        let params = Gray8Params {
-            width: plan.width,
-            height: plan.height,
-            row_stride: plan.row_stride,
-            byte_offset: plan.shader_byte_offset,
-        };
         let buffer_lease = self.buffer_pool.checkout(
             context.device(),
-            plan.memory.uniform_bytes,
+            plan.memory.parameter_storage_bytes,
             plan.output_size,
         );
         let buffers = buffer_lease.buffers();
-        context
-            .queue()
-            .write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&params));
+        context.queue().write_buffer(
+            &buffers.parameters,
+            0,
+            bytemuck::cast_slice(&plan.parameters),
+        );
         let bind_group = context
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -487,7 +655,7 @@ impl GpuEncodeBackend for LosslessGray8Backend {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: buffers.uniform.as_entire_binding(),
+                        resource: buffers.parameters.as_entire_binding(),
                     },
                 ],
             });
@@ -505,7 +673,7 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.dispatch_workgroups(plan.group_grid.groups, 1, 1);
         }
         commands.copy_buffer_to_buffer(
             &buffers.artifact,
@@ -551,7 +719,8 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             lifetime: Some(lifetime),
             completion,
             output_size: plan.output_size,
-            max_events: plan.max_events,
+            group_grid: plan.group_grid,
+            groups: plan.groups,
             width: plan.width,
             height: plan.height,
             frame_index: request.frame_index,
@@ -626,7 +795,8 @@ pub struct LosslessGray8Job {
     lifetime: Option<Arc<EncodeJobLifetime>>,
     completion: Arc<MapCompletion>,
     output_size: u64,
-    max_events: usize,
+    group_grid: LosslessGray8GroupGrid,
+    groups: Vec<Gray8GroupPlan>,
     width: u32,
     height: u32,
     frame_index: FrameIndex,
@@ -666,7 +836,13 @@ impl LosslessGray8Job {
         let bytes = mapped
             .get(..expected)
             .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?;
-        let result = build_packets(self.width, self.height, self.max_events, bytes);
+        let result = build_packets(
+            self.width,
+            self.height,
+            self.group_grid,
+            &self.groups,
+            bytes,
+        );
         drop(mapped);
         readback.unmap();
         lifetime.mapped.store(false, Ordering::Release);
@@ -676,7 +852,7 @@ impl LosslessGray8Job {
             frame_index: self.frame_index,
             is_last: self.is_last,
             packets,
-            acceleration: Some(acceleration),
+            acceleration,
         })
     }
 }
@@ -811,6 +987,7 @@ impl LosslessGray8Encoder {
         self.memory_plan(&source)?;
         let width = source.layout.extent.width;
         let height = source.layout.extent.height;
+        let group_grid = LosslessGray8GroupGrid::for_extent(width, height)?;
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
@@ -827,6 +1004,7 @@ impl LosslessGray8Encoder {
             frame: Some(frame),
             codestream_header: image_header(width, height)?,
             container,
+            group_grid,
         })
     }
 }
@@ -836,9 +1014,21 @@ pub struct LosslessGray8Submission {
     frame: Option<FrameSubmission<LosslessGray8Job>>,
     codestream_header: BitFragment,
     container: bool,
+    group_grid: LosslessGray8GroupGrid,
 }
 
 impl LosslessGray8Submission {
+    /// Exact row-major group grid dispatched by this submission.
+    #[must_use]
+    pub const fn group_grid(&self) -> LosslessGray8GroupGrid {
+        self.group_grid
+    }
+
+    /// Canonical descriptors for the independently executed GPU workgroups.
+    pub fn ordered_groups(&self) -> impl ExactSizeIterator<Item = LosslessGray8Group> {
+        self.group_grid.ordered_groups()
+    }
+
     pub fn wait(mut self) -> Result<Vec<u8>, EncodeError> {
         let frame = self
             .frame
@@ -849,17 +1039,34 @@ impl LosslessGray8Submission {
     }
 
     fn assemble(&self, frame: GpuFrameArtifacts) -> Result<Vec<u8>, EncodeError> {
-        let group_size = frame
-            .packets
-            .packets()
-            .first()
-            .ok_or_else(|| EncodeError::Backend("gray8 frame has no group packet".into()))?
-            .payload
-            .len();
-        let acceleration = frame
-            .acceleration
-            .ok_or_else(|| EncodeError::Backend("gray8 acceleration artifact is missing".into()))?;
+        let acceleration = frame.acceleration;
+        let fused_group_size = acceleration
+            .as_ref()
+            .map(|_| {
+                frame
+                    .packets
+                    .packets()
+                    .first()
+                    .ok_or_else(|| EncodeError::Backend("gray8 frame has no group packet".into()))
+                    .map(|packet| packet.payload.len())
+            })
+            .transpose()?;
         let encoded_frame = assemble_frame(frame.packets)?;
+        let mut codestream = self.codestream_header.bytes().to_vec();
+        codestream.extend_from_slice(encoded_frame.bytes());
+        if !self.container {
+            return Ok(codestream);
+        }
+
+        let Some(acceleration) = acceleration else {
+            // The current private acceleration-index schema describes one contiguous token span.
+            // Multi-group output remains a fully standard deterministic `jxlc` container, without
+            // inventing an incompatible extension record.
+            return Ok(write_container_with_boxes(&codestream, &[])?);
+        };
+        let group_size = fused_group_size.ok_or_else(|| {
+            EncodeError::Backend("gray8 acceleration metadata requires a fused group".into())
+        })?;
         let bytes_before_group = encoded_frame
             .bytes()
             .len()
@@ -871,11 +1078,6 @@ impl LosslessGray8Submission {
             .len()
             .checked_add(bytes_before_group)
             .ok_or_else(|| EncodeError::Backend("gray8 codestream size overflow".into()))?;
-        let mut codestream = self.codestream_header.bytes().to_vec();
-        codestream.extend_from_slice(encoded_frame.bytes());
-        if !self.container {
-            return Ok(codestream);
-        }
 
         let GpuAccelerationArtifact::Gray8Prefix {
             width,
@@ -934,9 +1136,127 @@ impl Future for LosslessGray8Submission {
 fn build_packets(
     width: u32,
     height: u32,
-    max_events: usize,
+    group_grid: LosslessGray8GroupGrid,
+    group_plans: &[Gray8GroupPlan],
     bytes: &[u8],
-) -> Result<(FramePacketSet, GpuAccelerationArtifact), EncodeError> {
+) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
+    if group_plans.len() != group_grid.groups as usize {
+        return Err(EncodeError::Backend(
+            "GPU group plan does not match the frame grid".into(),
+        ));
+    }
+    let mut artifacts = Vec::with_capacity(group_plans.len());
+    let mut aggregate_raw = [0u64; RAW_SYMBOLS];
+    let mut aggregate_lz77 = [0u64; LZ77_SYMBOLS];
+    for plan in group_plans {
+        let start = usize::try_from(plan.artifact_byte_offset)
+            .map_err(|_| EncodeError::Backend("GPU artifact offset overflow".into()))?;
+        let end = plan
+            .artifact_byte_offset
+            .checked_add(plan.output_size)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| EncodeError::Backend("GPU artifact range overflow".into()))?;
+        let artifact_bytes = bytes
+            .get(start..end)
+            .ok_or_else(|| EncodeError::Backend("GPU group artifact is truncated".into()))?;
+        let artifact =
+            parse_group_artifact(plan.width, plan.height, plan.max_events, artifact_bytes)?;
+        for (total, count) in aggregate_raw.iter_mut().zip(artifact.header.raw_counts) {
+            *total = total
+                .checked_add(u64::from(count))
+                .ok_or_else(|| invalid_gpu_artifact("aggregate raw histogram overflow"))?;
+        }
+        for (total, count) in aggregate_lz77.iter_mut().zip(artifact.header.lz77_counts) {
+            *total = total
+                .checked_add(u64::from(count))
+                .ok_or_else(|| invalid_gpu_artifact("aggregate LZ77 histogram overflow"))?;
+        }
+        artifacts.push(artifact);
+    }
+
+    let primary = PrefixCode::from_aggregated_counts(&aggregate_raw, &aggregate_lz77)?;
+    let unused = PrefixCode::fixed_unused_channel();
+    let codes = [primary.clone(), unused.clone(), unused.clone(), unused];
+    if group_grid.groups == 1 {
+        let mut group = BitWriter::new();
+        write_dc_global(&mut group, &codes)?;
+        let token_bit_offset_in_group = u64::try_from(group.bit_len())
+            .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
+        write_events(&mut group, &codes[0], artifacts[0].events)?;
+        let token_bit_end = u64::try_from(group.bit_len())
+            .map_err(|_| EncodeError::Backend("gray8 token length overflow".into()))?;
+        let token_bit_len = token_bit_end
+            .checked_sub(token_bit_offset_in_group)
+            .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
+        group.align_to_byte()?;
+        let packets = FramePacketSet::new(
+            frame_header()?,
+            FrameGroupLayout::new(1, 1, 1)?,
+            [GroupPacket::new(
+                GroupPacketKind::Single,
+                group.into_bytes(),
+            )],
+        )?;
+        let acceleration = GpuAccelerationArtifact::Gray8Prefix {
+            width,
+            height,
+            token_bit_offset_in_group,
+            token_bit_len,
+            raw_prefix: codes[0].raw_entries(),
+            lz77_prefix: codes[0].lz77_entries(),
+        };
+        return Ok((packets, Some(acceleration)));
+    }
+
+    let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
+    let mut packets = Vec::with_capacity(layout.toc_entries());
+    let mut dc_global = BitWriter::new();
+    write_dc_global(&mut dc_global, &codes)?;
+    dc_global.align_to_byte()?;
+    packets.push(GroupPacket::new(
+        GroupPacketKind::DcGlobal,
+        dc_global.into_bytes(),
+    ));
+    for group in 0..group_grid.lf_groups {
+        packets.push(GroupPacket::new(
+            GroupPacketKind::DcGroup(group),
+            Vec::new(),
+        ));
+    }
+    // Lossless Modular has no VarDCT HF-global payload.
+    packets.push(GroupPacket::new(GroupPacketKind::AcGlobal, Vec::new()));
+    for (group, artifact) in artifacts.iter().enumerate() {
+        let mut pass_group = BitWriter::new();
+        // GroupHeader: use the LF-global tree, default weighted predictor, no transforms.
+        pass_group.write_bits(1, 1)?;
+        pass_group.write_bits(1, 1)?;
+        pass_group.write_bits(0, 2)?;
+        write_events(&mut pass_group, &codes[0], artifact.events)?;
+        pass_group.align_to_byte()?;
+        packets.push(GroupPacket::new(
+            GroupPacketKind::AcGroup {
+                pass: 0,
+                group: u32::try_from(group)
+                    .map_err(|_| EncodeError::Backend("Gray8 group index overflow".into()))?,
+            },
+            pass_group.into_bytes(),
+        ));
+    }
+    Ok((FramePacketSet::new(frame_header()?, layout, packets)?, None))
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedGray8Artifact<'a> {
+    header: Gray8ArtifactHeader,
+    events: &'a [Gray8Event],
+}
+
+fn parse_group_artifact<'a>(
+    width: u32,
+    height: u32,
+    max_events: usize,
+    bytes: &'a [u8],
+) -> Result<ValidatedGray8Artifact<'a>, EncodeError> {
     let header_bytes = bytes
         .get(..std::mem::size_of::<Gray8ArtifactHeader>())
         .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
@@ -965,27 +1285,18 @@ fn build_packets(
         .map_err(|_| EncodeError::Backend("GPU event stream has an invalid ABI layout".into()))?;
 
     validate_gpu_artifacts(width, height, &header, events)?;
-    let primary = PrefixCode::from_gpu_counts(&header.raw_counts, &header.lz77_counts)?;
-    let unused = PrefixCode::fixed_unused_channel();
-    let codes = [primary.clone(), unused.clone(), unused.clone(), unused];
-    let mut group = BitWriter::new();
-    write_dc_global(&mut group, &codes)?;
-    let token_bit_offset_in_group = u64::try_from(group.bit_len())
-        .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
+    Ok(ValidatedGray8Artifact { header, events })
+}
+
+fn write_events(
+    output: &mut BitWriter,
+    code: &PrefixCode,
+    events: &[Gray8Event],
+) -> Result<(), EncodeError> {
     for event in events {
         match event.kind {
-            0 => codes[0].write_raw(
-                &mut group,
-                event.token,
-                event.extra_bit_count,
-                event.extra_bits,
-            )?,
-            1 => codes[0].write_run(
-                &mut group,
-                event.token,
-                event.extra_bit_count,
-                event.extra_bits,
-            )?,
+            0 => code.write_raw(output, event.token, event.extra_bit_count, event.extra_bits)?,
+            1 => code.write_run(output, event.token, event.extra_bit_count, event.extra_bits)?,
             _ => {
                 return Err(EncodeError::Backend(
                     "GPU emitted an unknown token kind".into(),
@@ -993,30 +1304,7 @@ fn build_packets(
             }
         }
     }
-    let token_bit_end = u64::try_from(group.bit_len())
-        .map_err(|_| EncodeError::Backend("gray8 token length overflow".into()))?;
-    let token_bit_len = token_bit_end
-        .checked_sub(token_bit_offset_in_group)
-        .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
-    group.align_to_byte()?;
-
-    let packets = FramePacketSet::new(
-        frame_header()?,
-        FrameGroupLayout::new(1, 1, 1)?,
-        [GroupPacket::new(
-            GroupPacketKind::Single,
-            group.into_bytes(),
-        )],
-    )?;
-    let acceleration = GpuAccelerationArtifact::Gray8Prefix {
-        width,
-        height,
-        token_bit_offset_in_group,
-        token_bit_len,
-        raw_prefix: codes[0].raw_entries(),
-        lz77_prefix: codes[0].lz77_entries(),
-    };
-    Ok((packets, acceleration))
+    Ok(())
 }
 
 fn validate_gpu_artifacts(
@@ -1203,9 +1491,9 @@ fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
 }
 
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
-    if !(2..(1 << 30)).contains(&size) {
+    if !(1..(1 << 30)).contains(&size) {
         return Err(EncodeError::InvalidConfiguration(
-            "gray8 dimensions must be in 2..2^30",
+            "gray8 dimensions must be in 1..2^30",
         ));
     }
     let value = size - 1;
@@ -1251,7 +1539,7 @@ fn frame_header() -> Result<BitFragment, EncodeError> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
     use jxl::api::{
@@ -1314,22 +1602,24 @@ mod tests {
     }
 
     #[test]
-    fn gray8_params_abi_matches_wgsl_uniform() {
-        assert_eq!(std::mem::size_of::<Gray8Params>(), 16);
+    fn gray8_params_abi_matches_wgsl_storage_array() {
+        assert_eq!(std::mem::size_of::<Gray8Params>(), 20);
         assert_eq!(std::mem::align_of::<Gray8Params>(), 4);
         let params = Gray8Params {
             width: 1,
             height: 2,
             row_stride: 3,
             byte_offset: 4,
+            output_word_offset: 5,
         };
         assert_eq!(
-            bytemuck::cast::<Gray8Params, [u32; 4]>(params),
-            [1, 2, 3, 4]
+            bytemuck::cast::<Gray8Params, [u32; 5]>(params),
+            [1, 2, 3, 4, 5]
         );
         assert!(SHADER.contains(
-            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n}"
+            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n    output_word_offset: u32,\n}"
         ));
+        assert!(SHADER.contains("var<storage, read> group_params: array<Params>;"));
     }
 
     #[test]
@@ -1362,6 +1652,48 @@ mod tests {
         assert!(SHADER.contains("const EVENT_WORDS: u32 = 4u;"));
     }
 
+    #[test]
+    fn group_grid_is_row_major_and_covers_edge_tiles_exactly() {
+        let grid = LosslessGray8GroupGrid::for_extent(513, 257).unwrap();
+        assert_eq!(
+            grid,
+            LosslessGray8GroupGrid {
+                width: 513,
+                height: 257,
+                columns: 3,
+                rows: 2,
+                groups: 6,
+                lf_columns: 1,
+                lf_rows: 1,
+                lf_groups: 1,
+            }
+        );
+        let groups = grid.ordered_groups().collect::<Vec<_>>();
+        assert_eq!(groups.len(), 6);
+        assert_eq!(
+            groups[0],
+            LosslessGray8Group {
+                index: 0,
+                column: 0,
+                row: 0,
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 256,
+            }
+        );
+        assert_eq!(groups[2].x, 512);
+        assert_eq!(groups[2].width, 1);
+        assert_eq!(groups[3].y, 256);
+        assert_eq!(groups[3].height, 1);
+        assert_eq!((groups[5].x, groups[5].y), (512, 256));
+        assert!(grid.group(6).is_none());
+
+        assert_eq!(LosslessGray8GroupGrid::for_extent(1, 1).unwrap().groups, 1);
+        assert!(LosslessGray8GroupGrid::for_extent(0, 1).is_err());
+        assert!(LosslessGray8GroupGrid::for_extent(1, 0).is_err());
+    }
+
     fn artifact_bytes(header: Gray8ArtifactHeader, events: &[Gray8Event]) -> Vec<u8> {
         let mut bytes = bytemuck::bytes_of(&header).to_vec();
         bytes.extend_from_slice(bytemuck::cast_slice(events));
@@ -1386,7 +1718,7 @@ mod tests {
                 extra_bits: 0,
             }],
         );
-        assert!(build_packets(1, 1, 1, &bytes).is_err());
+        assert!(parse_group_artifact(1, 1, 1, &bytes).is_err());
     }
 
     #[test]
@@ -1406,7 +1738,7 @@ mod tests {
                 extra_bits: 0,
             }],
         );
-        assert!(build_packets(1, 1, 1, &malformed).is_err());
+        assert!(parse_group_artifact(1, 1, 1, &malformed).is_err());
 
         header.raw_counts = [0; RAW_SYMBOLS];
         header.raw_counts[1] = 1;
@@ -1419,7 +1751,7 @@ mod tests {
                 extra_bits: 0,
             }],
         );
-        assert!(build_packets(1, 1, 1, &mismatched).is_err());
+        assert!(parse_group_artifact(1, 1, 1, &mismatched).is_err());
     }
 
     #[test]
@@ -1439,7 +1771,7 @@ mod tests {
                 extra_bits: 0,
             }],
         );
-        assert!(build_packets(2, 1, 1, &bytes).is_err());
+        assert!(parse_group_artifact(2, 1, 1, &bytes).is_err());
     }
 
     /// Mirrors only the event-admission control flow in `encode` WGSL. A
@@ -1490,8 +1822,10 @@ mod tests {
             }
         }
 
-        let pixels = usize::try_from(u64::from(MAX_DIMENSION) * u64::from(MAX_DIMENSION))
-            .expect("maximum Gray8 profile dimensions fit usize");
+        let pixels = usize::try_from(
+            u64::from(LOSSLESS_GRAY8_GROUP_DIMENSION) * u64::from(LOSSLESS_GRAY8_GROUP_DIMENSION),
+        )
+        .expect("maximum Gray8 profile dimensions fit usize");
         let capacity = event_capacity(pixels).expect("maximum event capacity fits usize");
         for events in [
             simulated_shader_event_count(pixels, 1, |_| false),
@@ -1540,11 +1874,7 @@ mod tests {
             PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         )
         .unwrap();
-        let byte_count = usize::try_from(u64::from(width) * u64::from(height))
-            .expect("test source size fits usize");
-        let pixels = (0..byte_count)
-            .map(|index| ((index * 29 + index / 7) & 255) as u8)
-            .collect::<Vec<_>>();
+        let pixels = packed_test_pixels(width, height);
         let buffer = Arc::new(context.device().create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("jxl-wgpu encoder pool test source"),
@@ -1553,6 +1883,27 @@ mod tests {
             },
         ));
         crate::BufferImageSource::new(buffer, layout).unwrap()
+    }
+
+    fn packed_test_pixels(width: u32, height: u32) -> Vec<u8> {
+        let byte_count = usize::try_from(u64::from(width) * u64::from(height))
+            .expect("test source size fits usize");
+        (0..byte_count)
+            .map(|index| ((index * 29 + index / 7) & 255) as u8)
+            .collect()
+    }
+
+    fn expected_artifact_storage_bytes(width: u32, height: u32) -> u64 {
+        LosslessGray8GroupGrid::for_extent(width, height)
+            .unwrap()
+            .ordered_groups()
+            .map(|group| {
+                let pixels =
+                    usize::try_from(u64::from(group.width) * u64::from(group.height)).unwrap();
+                let words = OUTPUT_HEADER_WORDS + event_capacity(pixels).unwrap() * EVENT_WORDS;
+                u64::try_from(words).unwrap() * 4
+            })
+            .sum()
     }
 
     #[test]
@@ -1837,10 +2188,13 @@ mod tests {
     }
 
     fn decode_with_djxl_if_available(encoded: &[u8]) -> Option<Result<Vec<u8>, String>> {
+        static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
         if Command::new("djxl").arg("-V").output().is_err() {
             return None;
         }
-        let directory = std::env::temp_dir().join(format!("jxl-wgpu-gray8-{}", std::process::id()));
+        let id = DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("jxl-wgpu-gray8-{}-{id}", std::process::id()));
         if let Err(error) = std::fs::create_dir(&directory) {
             return Some(Err(format!(
                 "could not create djxl test directory: {error}"
@@ -1931,6 +2285,112 @@ mod tests {
     }
 
     #[test]
+    fn gpu_groups_cover_safe_boundary_extents_and_decode_exactly() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU multi-group lossless encode test: no wgpu adapter");
+            return;
+        };
+        let encoder = LosslessGray8Encoder::new(context.clone());
+        let extents = [
+            (1, 1),
+            (17, 13),
+            (257, 1),
+            (1, 257),
+            (257, 257),
+            (513, 3),
+            (3, 513),
+            (513, 513),
+            (4_097, 1),
+            (1, 4_097),
+        ];
+        for (width, height) in extents {
+            let expected = packed_test_pixels(width, height);
+            let source = packed_test_source(&context, width, height);
+            let memory = encoder.memory_plan(&source).unwrap();
+            assert_eq!(
+                memory.parameter_storage_bytes,
+                u64::from(memory.group_grid.groups) * 20
+            );
+            assert_eq!(
+                memory.artifact_storage_bytes,
+                expected_artifact_storage_bytes(width, height)
+            );
+            assert_eq!(memory.readback_bytes, memory.artifact_storage_bytes);
+            assert_eq!(
+                memory.owned_bytes_per_job,
+                memory.parameter_storage_bytes + memory.artifact_storage_bytes * 2
+            );
+            assert_eq!(
+                memory.addressed_bytes_per_job,
+                memory.owned_bytes_per_job + memory.source_binding_bytes
+            );
+
+            let submission = encoder.submit(source.clone()).unwrap();
+            assert_eq!(
+                submission.ordered_groups().collect::<Vec<_>>(),
+                memory.group_grid.ordered_groups().collect::<Vec<_>>()
+            );
+            let encoded = submission.wait().unwrap();
+            let (size, decoded) = decode_gray8(&encoded)
+                .unwrap_or_else(|error| panic!("Rust jxl rejected {width}x{height}: {error}"));
+            assert_eq!(size, (width as usize, height as usize));
+            assert_eq!(decoded, expected, "Rust jxl mismatch for {width}x{height}");
+            let container = encoder.encode_container(source).unwrap();
+            let parsed =
+                jxl_gpu_bitstream::parse(&container, jxl_gpu_bitstream::ParseLimits::default())
+                    .unwrap();
+            assert_eq!(parsed.codestream(), encoded);
+            let (_, container_decoded) = decode_gray8(&container).unwrap_or_else(|error| {
+                panic!("Rust jxl rejected {width}x{height} container: {error}")
+            });
+            assert_eq!(container_decoded, expected);
+            if let Some(decoded) = decode_with_djxl_if_available(&container) {
+                assert_eq!(
+                    decoded.unwrap_or_else(|error| {
+                        panic!("djxl rejected {width}x{height} container: {error}")
+                    }),
+                    expected,
+                    "djxl mismatch for {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_group_container_and_runtime_neutral_future_are_deterministic() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU multi-group container test: no wgpu adapter");
+            return;
+        };
+        let width = 257;
+        let height = 257;
+        let expected = packed_test_pixels(width, height);
+        let source = packed_test_source(&context, width, height);
+        let encoder = LosslessGray8Encoder::new(context);
+        let raw = encoder.encode(source.clone()).unwrap();
+        let async_raw = pollster::block_on(encoder.submit(source.clone()).unwrap()).unwrap();
+        assert_eq!(async_raw, raw);
+
+        let container = encoder.encode_container(source.clone()).unwrap();
+        let parsed =
+            jxl_gpu_bitstream::parse(&container, jxl_gpu_bitstream::ParseLimits::default())
+                .unwrap();
+        assert_eq!(parsed.codestream(), raw);
+        assert_eq!(
+            parsed.boxes_of_type(ACCELERATION_INDEX_BOX_TYPE).count(),
+            0,
+            "the current private acceleration index is intentionally single-group"
+        );
+        let (size, decoded) = decode_gray8(&container).unwrap();
+        assert_eq!(size, (width as usize, height as usize));
+        assert_eq!(decoded, expected);
+        if let Some(decoded) = decode_with_djxl_if_available(&container) {
+            assert_eq!(decoded.unwrap(), expected);
+        }
+        assert_eq!(encoder.encode_container(source).unwrap(), container);
+    }
+
+    #[test]
     fn gpu_tokens_form_a_reference_decodable_lossless_codestream() {
         let Some(context) = test_context() else {
             eprintln!("skipping GPU lossless encode test: no wgpu adapter");
@@ -1993,10 +2453,11 @@ mod tests {
             + event_capacity(pixel_count).expect("test event capacity") * EVENT_WORDS;
         let expected_output_bytes =
             u64::try_from(expected_output_words * 4).expect("test artifact size fits u64");
-        assert_eq!(memory.uniform_bytes, 16);
+        assert_eq!(memory.group_grid.groups, 1);
+        assert_eq!(memory.parameter_storage_bytes, 20);
         assert_eq!(memory.artifact_storage_bytes, expected_output_bytes);
         assert_eq!(memory.readback_bytes, expected_output_bytes);
-        assert_eq!(memory.owned_bytes_per_job, 16 + expected_output_bytes * 2);
+        assert_eq!(memory.owned_bytes_per_job, 20 + expected_output_bytes * 2);
         assert_eq!(
             memory.addressed_bytes_per_job,
             memory.owned_bytes_per_job + memory.source_binding_bytes

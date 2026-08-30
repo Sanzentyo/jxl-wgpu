@@ -5,9 +5,8 @@
 //! through `wgpu`. The CPU side is limited to job coordination and deterministic
 //! JPEG XL bitstream/container assembly.
 //!
-//! The first revision intentionally exposes the backend boundary and the exact
-//! group-packet assembly primitive before claiming complete JPEG XL encoding.
-//! [`GpuEncoder`] can only advertise profiles implemented by its backend.
+//! [`LosslessGray8Encoder`] implements standard multi-group lossless Modular Gray8 while the
+//! generic [`GpuEncoder`] advertises only profiles implemented by its selected backend.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -45,7 +44,8 @@ pub use gpu::{
     TextureImageSource, WgpuContext,
 };
 pub use lossless_gray8::{
-    LosslessGray8Backend, LosslessGray8Encoder, LosslessGray8InFlightMemory, LosslessGray8Job,
+    LOSSLESS_GRAY8_GROUP_DIMENSION, LosslessGray8Backend, LosslessGray8Encoder, LosslessGray8Group,
+    LosslessGray8GroupGrid, LosslessGray8InFlightMemory, LosslessGray8Job,
     LosslessGray8MemoryLimits, LosslessGray8MemoryPlan, LosslessGray8Submission,
 };
 pub use packet::{
