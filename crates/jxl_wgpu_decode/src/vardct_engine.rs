@@ -1038,12 +1038,15 @@ fn submit_vardct(
         "jxl-wgpu VarDCT B plane",
     ]
     .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::COPY_DST));
+    let mut output_usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    if backend.direct_readback_enabled() {
+        output_usage |= wgpu::BufferUsages::MAP_READ;
+    }
     let output = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT packed RGB8 output"),
         size: source.memory.output_lease_bytes,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
+        usage: output_usage,
         mapped_at_creation: false,
     }));
     let status_staging = device.create_buffer(&wgpu::BufferDescriptor {
