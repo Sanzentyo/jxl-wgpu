@@ -3086,6 +3086,35 @@ mod tests {
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
         let codestream = encoder.encode(source).unwrap();
+        let inventory =
+            jxl_gpu_bitstream::parse(&codestream, jxl_gpu_bitstream::ParseLimits::default())
+                .unwrap()
+                .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+                .unwrap();
+        let frame = &inventory.frames[0];
+        assert_eq!(frame.group_count, 2);
+        assert_eq!(frame.low_frequency_group_count, 1);
+        assert_eq!(frame.sections.len(), 5);
+        assert_eq!(
+            frame
+                .sections
+                .iter()
+                .map(|section| section.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal,
+                jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGroup { group_index: 0 },
+                jxl_gpu_bitstream::FrameSectionKind::HighFrequencyGlobal,
+                jxl_gpu_bitstream::FrameSectionKind::PassGroup {
+                    pass_index: 0,
+                    group_index: 0,
+                },
+                jxl_gpu_bitstream::FrameSectionKind::PassGroup {
+                    pass_index: 0,
+                    group_index: 1,
+                },
+            ]
+        );
         assert_eq!(
             decode_rgb8_sized(&codestream, width, height),
             vec![0; width * height * 3]
