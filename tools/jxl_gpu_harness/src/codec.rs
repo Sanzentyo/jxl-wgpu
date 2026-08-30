@@ -574,7 +574,7 @@ fn run_encode(
             frame_count: 1,
             output_bytes: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
             gpu_output_logical_bytes: 0,
-            codec_submissions: 1,
+            codec_submissions: prepared.gpu_submission_count,
             codec_completion_waits: 1,
             display_submissions: 0,
             display_completion_waits: 0,
@@ -592,6 +592,7 @@ struct PreparedGray8Encode {
     encoder: LosslessModularEncoder,
     source: BufferImageSource,
     source_hash: String,
+    gpu_submission_count: u64,
 }
 
 fn prepare_gray8_encode(
@@ -672,10 +673,18 @@ fn prepare_gray8_encode(
     );
     let source = BufferImageSource::new(buffer, layout).map_err(encode_issue)?;
     let context = WgpuContext::from_backend(backend);
+    let encoder = LosslessModularEncoder::new(context);
+    let gpu_submission_count = u64::from(
+        encoder
+            .memory_plan(&source)
+            .map_err(encode_issue)?
+            .gpu_submission_count,
+    );
     Ok(PreparedGray8Encode {
-        encoder: LosslessModularEncoder::new(context),
+        encoder,
         source,
         source_hash,
+        gpu_submission_count,
     })
 }
 
@@ -726,7 +735,9 @@ fn run_round_trip(
                 "GPU decoded Gray8 bytes do not exactly match the encoder input",
             ));
         }
-        observation.codec_submissions = observation.codec_submissions.saturating_add(1);
+        observation.codec_submissions = observation
+            .codec_submissions
+            .saturating_add(prepared.gpu_submission_count);
         observation.codec_completion_waits = observation.codec_completion_waits.saturating_add(1);
         Ok(observation)
     })
@@ -751,13 +762,29 @@ fn decode_once(
             "the animation workload requires an animated JPEG XL codestream",
         ));
     }
+    let submissions_per_frame = u64::try_from(
+        session
+            .submission_session()
+            .memory_stats()
+            .submissions_per_frame,
+    )
+    .map_err(|_| {
+        CodecIssue::new(
+            CodecIssueKind::Backend,
+            "gpu_decode",
+            "submission_count_overflow",
+            "the decoder GPU submission count does not fit report storage",
+        )
+    })?;
 
     let mut observation = DecodeObservation::default();
     let mut readback_hash = blake3::Hasher::new();
     let mut readback_outputs = 0_u32;
     while let Some(frame) = session.next_frame().map_err(decode_issue)? {
         observation.frame_count = observation.frame_count.saturating_add(1);
-        observation.codec_submissions = observation.codec_submissions.saturating_add(1);
+        observation.codec_submissions = observation
+            .codec_submissions
+            .saturating_add(submissions_per_frame);
         observation.codec_completion_waits = observation.codec_completion_waits.saturating_add(1);
         if let Some(readback) = readback {
             let result = readback

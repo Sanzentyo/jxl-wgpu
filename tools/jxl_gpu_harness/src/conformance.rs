@@ -707,6 +707,9 @@ pub struct ConformanceCaseReport {
 pub struct StockGpuRoundTripResult {
     pub inventory: ConformanceInventory,
     pub report: CodecCaseReport,
+    /// Standard JPEG XL container bytes produced by the GPU encoder. The decoder consumes a
+    /// shallow clone of this same allocation; callers may save it without rebuilding the frame.
+    pub encoded: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -793,6 +796,7 @@ pub fn run_stock_gpu_round_trip(
         return Ok(StockGpuRoundTripResult {
             inventory: image.inventory()?,
             report,
+            encoded: None,
         });
     };
     report.adapter = Some(backend.adapter_info().name.clone());
@@ -809,6 +813,7 @@ pub fn run_stock_gpu_round_trip(
             return Ok(StockGpuRoundTripResult {
                 inventory: image.inventory()?,
                 report,
+                encoded: None,
             });
         }
     };
@@ -817,7 +822,7 @@ pub fn run_stock_gpu_round_trip(
         layout: source.generated.layout,
         hashes: source.generated.hashes.clone(),
     };
-    match execute_stock_gpu_round_trip(case, source, backend) {
+    let encoded = match execute_stock_gpu_round_trip(case, source, backend) {
         Ok(execution) => {
             report.frame_count = 1;
             report.output_bytes = image.layout().active_bytes;
@@ -844,6 +849,7 @@ pub fn run_stock_gpu_round_trip(
                     ),
                 ));
             }
+            Some(execution.encoded)
         }
         Err(error) => {
             report.status = CaseStatus::Error;
@@ -853,9 +859,20 @@ pub fn run_stock_gpu_round_trip(
                 "gpu_round_trip",
                 format_error_chain(&error),
             ));
+            None
         }
-    }
-    Ok(StockGpuRoundTripResult { inventory, report })
+    };
+    Ok(StockGpuRoundTripResult {
+        inventory,
+        report,
+        encoded,
+    })
+}
+
+/// Saves an already-produced standard JPEG XL container without rebuilding or cloning it.
+pub fn write_encoded_output(path: impl AsRef<Path>, encoded: &[u8]) -> Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, encoded).map_err(|source| Error::io(path, source))
 }
 
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -875,6 +892,7 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 struct StockGpuExecution {
     expected_hash: String,
     output_hash: String,
+    encoded: Arc<[u8]>,
     output_logical_bytes: u64,
     codec_submissions: u64,
     readback_logical_bytes: u64,
@@ -1161,9 +1179,10 @@ fn execute_stock_gpu_round_trip(
             .map_err(|source| StockGpuRoundTripError::Encode { source })?
             .gpu_submission_count,
     );
-    let encoded = encoder
+    let encoded: Arc<[u8]> = encoder
         .encode_container(source)
-        .map_err(|source| StockGpuRoundTripError::Encode { source })?;
+        .map_err(|source| StockGpuRoundTripError::Encode { source })?
+        .into();
 
     let request = match case.source.model {
         PixelModel::Gray => {
@@ -1179,7 +1198,7 @@ fn execute_stock_gpu_round_trip(
     };
     let decoder = GpuDecoder::wgpu(backend.clone());
     let mut session = decoder
-        .open_shared(Arc::<[u8]>::from(encoded), request)
+        .open_shared(Arc::clone(&encoded), request)
         .map_err(|source| StockGpuRoundTripError::Decode {
             stage: "session creation",
             source,
@@ -1252,6 +1271,7 @@ fn execute_stock_gpu_round_trip(
     Ok(StockGpuExecution {
         expected_hash: generated.hashes.pixel_hash,
         output_hash,
+        encoded,
         output_logical_bytes,
         codec_submissions,
         readback_logical_bytes: readback_stats.logical_bytes,
@@ -1836,6 +1856,13 @@ mod tests {
         assert_eq!(&mapped[expected.len()..], &[0_u8; 3]);
         assert_eq!(generated, expected_summary);
         assert!(aligned_stock_source_buffer_size(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn encoded_output_write_preserves_the_io_error_source() {
+        let error = write_encoded_output(std::env::temp_dir(), b"not-written").unwrap_err();
+        assert!(matches!(error, Error::Io { .. }));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

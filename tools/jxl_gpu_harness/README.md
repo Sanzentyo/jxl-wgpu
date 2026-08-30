@@ -23,6 +23,10 @@ cargo run -p jxl_gpu_harness -- codec input.gray --operation encode --format u8 
 cargo run -p jxl_gpu_harness -- codec input.gray --operation round-trip --format u8 --extent 256x256 --output-target cpu-readback
 cargo run -p jxl_gpu_harness -- conformance --action inventory
 cargo run -p jxl_gpu_harness -- conformance --action gpu-round-trip
+cargo run -p jxl_gpu_harness -- conformance --action gpu-round-trip \
+  --case tiny-gray8-2x2 --encoded-output /tmp/tiny-gray8.jxl
+cargo run -p jxl_gpu_harness -- codec /tmp/tiny-gray8.jxl --format u8 \
+  --output-target cpu-readback --cpu-baseline-djxl /opt/homebrew/bin/djxl
 cargo run -p jxl_gpu_harness -- conformance --action external-fixtures \
   --case tiny-gray8-2x2 --fixture-dir /tmp/jxl-reference-fixtures --apply
 cargo run -p jxl_gpu_harness -- capture --name gaborish_edge_17x19 --operation gaborish -o case.jxlcap
@@ -68,7 +72,7 @@ The workload names describe what this implementation actually schedules:
   the measured sample.
 - `warm-sequential` repeats an operation on one host thread while reusing the backend objects.
 - `concurrent-burst` releases `burst-size` independent host threads at a barrier for each iteration.
-  Every worker still makes its own codec submission and completion wait.
+  Every worker still makes its own codec operation and completion wait.
 - `concurrent` starts `concurrency` persistent host workers. Each worker performs `iterations`
   operations sequentially; workers overlap one another without a barrier between operations.
 - `animation` opens and advances an actual animated codestream session. A still input is rejected,
@@ -79,7 +83,10 @@ Neither host fan-out workload is GPU batching. The current runner does not encod
 frames into one command buffer. Reports therefore set `coalesced_gpu_batching` to `false` and expose
 the measured-operation counts `codec_submissions`, `codec_completion_waits`,
 `display_submissions`, `display_completion_waits`, `readback_submissions`, and
-`readback_completion_waits`. Warmup activity is excluded from these counters.
+`readback_completion_waits`. `codec_submissions` is the actual queue-submit count: a streamed
+Modular encode counts both histogram and serialization passes for every batch, and decode counts
+every bounded codestream batch. `codec_completion_waits` remains the number of public blocking
+completion paths, not the queue-submit count. Warmup activity is excluded from these counters.
 
 `gpu_output_logical_bytes` sums the addressable decoded GPU layouts. For `cpu_readback`,
 `readback_logical_bytes` and `readback_staging_bytes` come from the aggregate readback plan; staging
@@ -133,11 +140,18 @@ frame twice. The single-frame full 16K case explicitly uses one decoder frame sl
 cases retain the normal two-slot concurrency contract. Reported codec submissions include the
 encoder's streamed histogram/serialization batches and the decoder's bounded stream batches.
 
+`--encoded-output PATH` is valid only for `gpu-round-trip` with exactly one explicitly named
+`--case`. Encoding converts the container `Vec` to `Arc<[u8]>` once, gives the decoder a shallow
+`Arc` clone, and writes that same allocation after verification. This makes even a large generated
+container reusable as a `codec` input (including `--cpu-baseline-djxl`) without another encode or
+an additional codestream-sized clone. Invalid action/case-count combinations and filesystem write
+failures remain typed errors with their source chains.
+
 Local validation evidence from 2026-08-31 on the Apple M5 Metal adapter is deliberately recorded
 as machine-specific data, not a portable performance guarantee. The targeted 7680x4320 Gray8 case
 round-tripped exactly with 21 actual codec queue submissions. The complete
-`conformance_corpus` integration target passed all three tests in 398.39 seconds, including exact
-readback for all 24 stock cases and the 15360x8640 full-frame Gray8 case. The stock integration
+stock-profile integration run completed in 398.39 seconds, including exact readback for all 24
+stock cases and the 15360x8640 full-frame Gray8 case. The stock integration
 test prints each case name, codec submission count, and readback staging bytes so later runs retain
 their own progress and batching evidence.
 

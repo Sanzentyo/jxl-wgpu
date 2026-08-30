@@ -16,7 +16,7 @@ use jxl_gpu_harness::config::{CorpusConfig, SyntheticCaseConfig, ThresholdConfig
 use jxl_gpu_harness::conformance::{
     ConformanceAction, ConformanceCaseReport, ConformanceCorpus, ConformanceReport,
     DEFAULT_MAX_ROW_BYTES, ExternalFixtureOptions, LazyImage, external_fixture,
-    run_stock_gpu_round_trip,
+    run_stock_gpu_round_trip, write_encoded_output,
 };
 use jxl_gpu_harness::cpu_baseline::{DjxlBaselineOptions, run_djxl_baseline};
 use jxl_gpu_harness::error::{Error, Result};
@@ -147,6 +147,9 @@ struct ConformanceArgs {
     /// Maximum allocation allowed for one lazily generated row.
     #[arg(long, default_value_t = DEFAULT_MAX_ROW_BYTES)]
     max_row_bytes: u64,
+    /// Save the selected GPU encoder's standard JPEG XL container for reuse by `codec`.
+    #[arg(long, value_name = "PATH")]
+    encoded_output: Option<PathBuf>,
     /// Development-only cjxl path for external fixture creation.
     #[arg(long, default_value = "/opt/homebrew/bin/cjxl")]
     cjxl: PathBuf,
@@ -316,6 +319,12 @@ fn run(cli: Cli) -> Result<bool> {
 }
 
 fn run_conformance(args: ConformanceArgs) -> Result<bool> {
+    validate_conformance_encoded_output(
+        args.action,
+        &args.cases,
+        args.encoded_output.as_deref(),
+        args.output.output.as_deref(),
+    )?;
     if args.max_row_bytes == 0 {
         return Err(Error::InvalidConfig(
             "--max-row-bytes must be nonzero".into(),
@@ -341,12 +350,14 @@ fn run_conformance(args: ConformanceArgs) -> Result<bool> {
         djxl: args.djxl,
     };
     let mut reports = Vec::with_capacity(cases.len());
+    let mut encoded = None;
     for case in cases {
         let (inventory, gpu_round_trip) = if args.action == ConformanceAction::GpuRoundTrip
             && case.expectation
                 == jxl_gpu_harness::conformance::ConformanceExpectation::StockGpuRoundTrip
         {
             let result = run_stock_gpu_round_trip(case, backend.as_ref(), args.max_row_bytes)?;
+            encoded = result.encoded;
             (result.inventory, Some(result.report))
         } else {
             (LazyImage::new(case, args.max_row_bytes)?.inventory()?, None)
@@ -366,6 +377,15 @@ fn run_conformance(args: ConformanceArgs) -> Result<bool> {
             external_fixture,
         });
     }
+    if let Some(path) = args.encoded_output.as_deref() {
+        let encoded = encoded.as_deref().ok_or_else(|| {
+            Error::InvalidConfig(
+                "--encoded-output requested a case that did not produce GPU-encoded JPEG XL bytes"
+                    .into(),
+            )
+        })?;
+        write_encoded_output(path, encoded)?;
+    }
     let report = ConformanceReport {
         schema_version: jxl_gpu_harness::conformance::CONFORMANCE_SCHEMA_VERSION,
         action: args.action,
@@ -376,6 +396,33 @@ fn run_conformance(args: ConformanceArgs) -> Result<bool> {
     let passed = report.passed();
     write_json(&report, args.output.output.as_deref())?;
     Ok(passed)
+}
+
+fn validate_conformance_encoded_output(
+    action: ConformanceAction,
+    cases: &[String],
+    encoded_output: Option<&Path>,
+    report_output: Option<&Path>,
+) -> Result<()> {
+    if encoded_output.is_none() {
+        return Ok(());
+    }
+    if action != ConformanceAction::GpuRoundTrip {
+        return Err(Error::InvalidConfig(
+            "--encoded-output is only valid with --action gpu-round-trip".into(),
+        ));
+    }
+    if cases.len() != 1 {
+        return Err(Error::InvalidConfig(
+            "--encoded-output requires exactly one explicitly named --case".into(),
+        ));
+    }
+    if encoded_output == report_output {
+        return Err(Error::InvalidConfig(
+            "--encoded-output and JSON --output must name different paths".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn run_corpus(args: CorpusRunArgs, benchmark: Option<BenchmarkOptions>) -> Result<bool> {
@@ -572,4 +619,93 @@ fn parse_extent(value: &str) -> std::result::Result<DeclaredExtent, String> {
             .map_err(|error| format!("invalid extent height: {error}"))?,
     };
     extent.validate().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_output_requires_one_named_gpu_round_trip_case() {
+        let output = Path::new("saved.jxl");
+        let one_case = vec!["tiny-gray8-2x2".to_string()];
+        validate_conformance_encoded_output(
+            ConformanceAction::GpuRoundTrip,
+            &one_case,
+            Some(output),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_conformance_encoded_output(
+                ConformanceAction::Inventory,
+                &one_case,
+                Some(output),
+                None,
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_conformance_encoded_output(
+                ConformanceAction::ExternalFixtures,
+                &one_case,
+                Some(output),
+                None,
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_conformance_encoded_output(
+                ConformanceAction::GpuRoundTrip,
+                &[],
+                Some(output),
+                None,
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_conformance_encoded_output(
+                ConformanceAction::GpuRoundTrip,
+                &["one".into(), "two".into()],
+                Some(output),
+                None,
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_conformance_encoded_output(
+                ConformanceAction::GpuRoundTrip,
+                &one_case,
+                Some(output),
+                Some(output),
+            ),
+            Err(Error::InvalidConfig(_))
+        ));
+        validate_conformance_encoded_output(ConformanceAction::Inventory, &[], None, None).unwrap();
+    }
+
+    #[test]
+    fn clap_accepts_encoded_output_for_later_typed_validation() {
+        let cli = Cli::try_parse_from([
+            "jxl_gpu_harness",
+            "conformance",
+            "--action",
+            "gpu-round-trip",
+            "--case",
+            "tiny-gray8-2x2",
+            "--encoded-output",
+            "saved.jxl",
+        ])
+        .unwrap();
+        let Command::Conformance(args) = cli.command else {
+            panic!("expected conformance command");
+        };
+        validate_conformance_encoded_output(
+            args.action,
+            &args.cases,
+            args.encoded_output.as_deref(),
+            args.output.output.as_deref(),
+        )
+        .unwrap();
+    }
 }

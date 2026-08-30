@@ -5,7 +5,7 @@ use jxl_gpu_harness::codec::request_backend;
 use jxl_gpu_harness::conformance::{
     AlphaPattern, ConformanceCorpus, ConformanceExpectation, DEFAULT_MAX_ROW_BYTES,
     ExternalFixtureOptions, ExternalFixtureStatus, LazyImage, PixelModel, ResolutionClass,
-    SampleDepth, external_fixture, run_stock_gpu_round_trip,
+    SampleDepth, external_fixture, run_stock_gpu_round_trip, write_encoded_output,
 };
 use jxl_gpu_harness::report::CaseStatus;
 
@@ -140,6 +140,7 @@ fn stock_profile_cases_round_trip_exactly_on_an_available_gpu() {
         let result = run_stock_gpu_round_trip(case, Some(&backend), DEFAULT_MAX_ROW_BYTES).unwrap();
         let expected = result.inventory.hashes.pixel_hash;
         let report = result.report;
+        assert!(result.encoded.is_some());
         eprintln!(
             "conformance case {}: status={:?}, codec_submissions={}, readback_staging_bytes={}",
             case.name, report.status, report.codec_submissions, report.readback_staging_bytes
@@ -147,6 +148,35 @@ fn stock_profile_cases_round_trip_exactly_on_an_available_gpu() {
         assert_eq!(report.status, CaseStatus::Passed, "{report:#?}");
         assert_eq!(report.output_hash.as_deref(), Some(expected.as_str()));
     }
+}
+
+#[test]
+fn stock_small_case_container_can_be_saved_without_reencoding() {
+    let corpus = ConformanceCorpus::load(manifest_path()).unwrap();
+    let Some(backend) = request_backend().unwrap() else {
+        eprintln!("skipping encoded save test because no adapter is available");
+        return;
+    };
+    let case = corpus
+        .cases
+        .iter()
+        .find(|case| case.name == "tiny-gray8-2x2")
+        .unwrap();
+    let result = run_stock_gpu_round_trip(case, Some(&backend), DEFAULT_MAX_ROW_BYTES).unwrap();
+    assert_eq!(result.report.status, CaseStatus::Passed);
+    let encoded = result
+        .encoded
+        .expect("a completed GPU encode returns its container");
+    assert_eq!(std::sync::Arc::strong_count(&encoded), 1);
+    let path = std::env::temp_dir().join(format!(
+        "jxl-wgpu-conformance-encoded-save-{}.jxl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    write_encoded_output(&path, encoded.as_ref()).unwrap();
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(saved.as_slice(), encoded.as_ref());
 }
 
 #[test]
