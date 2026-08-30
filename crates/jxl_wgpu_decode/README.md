@@ -52,8 +52,51 @@ the complete logical reconstruction workspace and finalize through the generic o
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
 
-VarDCT, multiple passes, palette/squeeze and non-YCoCg transforms, non-alpha extra channels,
-patches, splines, noise, and reference-frame animation remain typed unsupported profiles.
+For the stock `WgpuSubmissionEngine`, VarDCT, multiple passes, palette/squeeze and non-YCoCg
+transforms, non-alpha extra channels, patches, splines, noise, and reference-frame animation
+remain typed unsupported profiles.
+
+### Bounded standard VarDCT engine
+
+`GpuDecoder::vardct_wgpu` selects a separate production engine for one deliberately narrow,
+standard VarDCT profile. It accepts exactly one final 8-bit XYB still frame, one LF group, one pass
+group, and a one-entry TOC. The complete image must be one regular 8x8, 16x16, 32x32, 16x8,
+8x16, 32x8, 8x32, 32x16, or 16x32 transform. The current packet contract additionally requires
+adaptive LF smoothing, `global_scale=8813`, `quant_lf=10`, frame quant-matrix scales X=3/B=2,
+default dequantization metadata, disabled Gaborish/EPF, zero chroma correlation and sharpness, and
+the standard zero-AC HF-global bundle. The image header must declare the standard sRGB/D65
+presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
+reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
+
+The host inventories bounded scalar headers and packs the MA-tree descriptor, but does not decode
+an image entropy symbol. One GPU submission decodes and validates LF/HF metadata, dequantizes and
+smooths LF, lowers one typed HF artifact and coefficient sink, runs the existing resident regular
+VarDCT renderer, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8. Packet
+and artifact status share one 128-byte staging map; cleared downstream buffers and zeroed indirect
+dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
+is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
+
+The only output descriptor is `vardct_rgb8_format()`. `VarDctDecodeMemoryStats` accounts every
+upload, metadata, status, uniform, artifact, coefficient, XYB, transform-scratch, and output byte.
+By default those bytes use the backend budget shared by decode, encode, and readback;
+`VarDctSubmissionEngine::with_memory_budget` can instead select an explicit sharing group.
+Transient reservations survive until the aggregate status map completes. The packed output
+reservation survives through the final tracked `GpuBufferLease` clone, including an early
+`UnvalidatedGpuImageFrame`; only the validated frame carries authoritative metadata and changed
+regions. Native blocking and runtime-neutral poll/future completion use the common decoder session
+API, and the engine compiles for browser WebGPU without a Tokio or async-std dependency.
+
+The actual-adapter oracle encodes a standard packet, executes this complete GPU path, reads the
+resident result back explicitly, and, when `djxl` is installed, compares it with that independent
+decoder (at most one RGB8 code of rounding difference for the covered solid-image case). It also
+verifies that readback releases its shared reservation while the last decode-output buffer clone
+continues to own the exact output bytes.
+
+This is not full VarDCT coverage. Nonzero AC/HF coefficient entropy, multiple transforms or
+groups, special transform strategies, custom quantization matrices and HF orders/presets,
+Gaborish/EPF, alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
+extra channels, progressive passes, animation, and reference frames return typed unsupported
+errors. They are not substituted with dummy coefficients or a CPU implementation.
 
 ### Measured lossless Modular checkpoint
 
