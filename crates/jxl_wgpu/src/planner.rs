@@ -557,14 +557,10 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             }
             Ok(())
         }
-        RenderOp::VarDct { transform } => {
-            if *transform != 8
-                || !node.inputs.is_empty()
-                || node.outputs.len() != 3
-                || node.resources.len() != 1
-            {
-                return Err(Error::Unsupported(format!(
-                    "node {index} has a VarDCT contract outside the bounded DCT8 backend"
+        RenderOp::VarDct => {
+            if !node.inputs.is_empty() || node.outputs.len() != 3 || node.resources.len() != 1 {
+                return Err(Error::InvalidPayload(format!(
+                    "node {index} has an invalid VarDCT plane or resource contract"
                 )));
             }
             Ok(())
@@ -1044,7 +1040,7 @@ fn streaming_extents(
     }
 
     for node in &plan.nodes {
-        let input_extent = if matches!(node.op, RenderOp::VarDct { .. }) {
+        let input_extent = if matches!(node.op, RenderOp::VarDct) {
             let output = node.outputs.first().ok_or_else(|| {
                 Error::InvalidPayload(format!("node '{}' has no spatial output", node.name))
             })?;

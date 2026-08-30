@@ -38,6 +38,7 @@ mod scheduler;
 mod session;
 mod upload;
 mod vardct;
+mod vardct_general;
 mod video;
 
 pub use arena::{ArenaAllocation, ArenaPlan, ArenaPlanner};

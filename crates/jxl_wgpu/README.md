@@ -246,8 +246,10 @@ token is consumed or dropped, and the final caller-visible buffer lease is dropp
 All copy sizes are four-byte aligned, all offsets/strides/allocation sums use checked arithmetic,
 and values consumed as WGSL indices must fit `u32`. Rust uniform/storage records use `#[repr(C)]`
 plus `bytemuck::Pod`; tests pin their field order, size, alignment, and structured-array stride.
-VarDCT DCT8 additionally checks its 1,536-byte workgroup-memory requirement. The complete table is
-in [`docs/WGSL_MEMORY.md`](../../docs/WGSL_MEMORY.md).
+The optimized DCT8 kernel uses 1,536 bytes of workgroup memory and the special-transform kernel
+uses 2,304 bytes. Large rectangular DCTs use two globally accounted scratch buffers instead of
+transform-sized workgroup arrays. The complete table is in
+[`docs/WGSL_MEMORY.md`](../../docs/WGSL_MEMORY.md).
 
 ## Implemented render operations
 
@@ -258,7 +260,9 @@ The current planner and scheduler execute these protocol stages:
 - per-plane and fused three-plane Gaborish;
 - EPF passes 0, 1, and 2 with constant or supplied sigma;
 - 2x, 4x, and 8x image upsampling with validated weights;
-- DCT8 VarDCT dequantization, color correlation, inverse transform, and LF composition;
+- all 27 JPEG XL VarDCT strategies: square and rectangular DCTs through 256x256, Hornuss,
+  hierarchical DCT2, DCT4 variants, and all four AFV orientations, with GPU dequantization, color
+  correlation, LF-grid reinterpretation, and inverse transform;
 - stream-defined inverse XYB-to-linear-RGB and Linear, sRGB, BT.709, Gamma, PQ, and HLG transfer
   functions;
 - all JPEG XL frame and patch blend modes for straight or associated alpha, including alpha-channel
@@ -270,8 +274,8 @@ The current planner and scheduler execute these protocol stages:
 
 The backend validates precision contracts, node arity, plane types/extents/strides, resource
 revisions, transform coverage, dispatch dimensions, shader-visible addresses, and device limits
-before submission. Unsupported render operations, unsupported VarDCT transform buckets, explicit
-streaming execution, invalid color semantics, and unavailable device features return
+before submission. Unsupported render operations, explicit streaming execution, invalid color
+semantics, and unavailable device features return
 `Error::Unsupported` or another specific resource/payload error.
 
 ## Platform notes

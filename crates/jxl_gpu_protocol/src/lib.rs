@@ -477,11 +477,12 @@ pub enum RenderOp {
     Gaborish(GaborishParams),
     Epf(EpfParams),
     Upsample(UpsampleParams),
-    /// VarDCT packet stage. `transform` is the maximum square DCT edge handled natively by the
-    /// backend. A backend must return a typed unsupported error for transforms it cannot execute.
-    VarDct {
-        transform: u16,
-    },
+    /// Dequantize and inverse-transform the strategy buckets in [`VarDctPacket`].
+    ///
+    /// Transform coverage is carried by each packet bucket rather than summarized as a maximum
+    /// edge. This prevents capability negotiation from silently treating rectangular and special
+    /// JPEG XL transforms as equivalent to a square DCT with the same largest dimension.
+    VarDct,
     AddNoise {
         seed0: u32,
         seed1: u32,
@@ -517,7 +518,7 @@ impl RenderOp {
             Self::Gaborish(_) => RenderOpKind::Gaborish,
             Self::Epf(_) => RenderOpKind::Epf,
             Self::Upsample(_) => RenderOpKind::Upsample,
-            Self::VarDct { .. } => RenderOpKind::VarDct,
+            Self::VarDct => RenderOpKind::VarDct,
             Self::AddNoise { .. } => RenderOpKind::AddNoise,
             Self::XybToRgb(_) => RenderOpKind::XybToRgb,
             Self::YcbcrToRgb => RenderOpKind::YcbcrToRgb,
@@ -919,27 +920,124 @@ pub struct GroupPayload {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransformKind {
-    Dct2,
-    Dct4,
+    Dct8,
+    Hornuss,
+    Dct2x2,
+    Dct4x4,
+    Dct16x16,
+    Dct32x32,
+    Dct16x8,
+    Dct8x16,
+    Dct32x8,
+    Dct8x32,
+    Dct32x16,
+    Dct16x32,
     Dct4x8,
     Dct8x4,
-    Dct8,
-    Dct8x16,
-    Dct16x8,
-    Dct16,
-    Dct16x32,
-    Dct32x16,
-    Dct32,
-    Dct32x64,
-    Dct64x32,
-    Dct64,
-    Dct128,
-    Dct256,
     Afv0,
     Afv1,
     Afv2,
     Afv3,
-    Hornuss,
+    Dct64x64,
+    Dct64x32,
+    Dct32x64,
+    Dct128x128,
+    Dct128x64,
+    Dct64x128,
+    Dct256x256,
+    Dct256x128,
+    Dct128x256,
+}
+
+impl TransformKind {
+    /// Every transform strategy defined by the JPEG XL codestream, in codestream order.
+    pub const ALL: [Self; 27] = [
+        Self::Dct8,
+        Self::Hornuss,
+        Self::Dct2x2,
+        Self::Dct4x4,
+        Self::Dct16x16,
+        Self::Dct32x32,
+        Self::Dct16x8,
+        Self::Dct8x16,
+        Self::Dct32x8,
+        Self::Dct8x32,
+        Self::Dct32x16,
+        Self::Dct16x32,
+        Self::Dct4x8,
+        Self::Dct8x4,
+        Self::Afv0,
+        Self::Afv1,
+        Self::Afv2,
+        Self::Afv3,
+        Self::Dct64x64,
+        Self::Dct64x32,
+        Self::Dct32x64,
+        Self::Dct128x128,
+        Self::Dct128x64,
+        Self::Dct64x128,
+        Self::Dct256x256,
+        Self::Dct256x128,
+        Self::Dct128x256,
+    ];
+
+    /// Spatial output extent `(width, height)` for one transform task.
+    ///
+    /// JPEG XL names rectangular transforms as rows-by-columns, so `Dct16x8` covers an 8-pixel
+    /// wide by 16-pixel high rectangle.
+    pub const fn pixel_extent(self) -> Extent2d {
+        match self {
+            Self::Dct8
+            | Self::Hornuss
+            | Self::Dct2x2
+            | Self::Dct4x4
+            | Self::Dct4x8
+            | Self::Dct8x4
+            | Self::Afv0
+            | Self::Afv1
+            | Self::Afv2
+            | Self::Afv3 => Extent2d::new(8, 8),
+            Self::Dct16x16 => Extent2d::new(16, 16),
+            Self::Dct32x32 => Extent2d::new(32, 32),
+            Self::Dct16x8 => Extent2d::new(8, 16),
+            Self::Dct8x16 => Extent2d::new(16, 8),
+            Self::Dct32x8 => Extent2d::new(8, 32),
+            Self::Dct8x32 => Extent2d::new(32, 8),
+            Self::Dct32x16 => Extent2d::new(16, 32),
+            Self::Dct16x32 => Extent2d::new(32, 16),
+            Self::Dct64x64 => Extent2d::new(64, 64),
+            Self::Dct64x32 => Extent2d::new(32, 64),
+            Self::Dct32x64 => Extent2d::new(64, 32),
+            Self::Dct128x128 => Extent2d::new(128, 128),
+            Self::Dct128x64 => Extent2d::new(64, 128),
+            Self::Dct64x128 => Extent2d::new(128, 64),
+            Self::Dct256x256 => Extent2d::new(256, 256),
+            Self::Dct256x128 => Extent2d::new(128, 256),
+            Self::Dct128x256 => Extent2d::new(256, 128),
+        }
+    }
+
+    /// Low-frequency sample rectangle consumed before the inverse transform.
+    pub const fn lf_extent(self) -> Extent2d {
+        let pixels = self.pixel_extent();
+        Extent2d::new(pixels.width / 8, pixels.height / 8)
+    }
+
+    /// Whether this strategy uses JPEG XL's special 8x8 inverse rather than a regular 2D DCT.
+    pub const fn is_special(self) -> bool {
+        matches!(
+            self,
+            Self::Hornuss
+                | Self::Dct2x2
+                | Self::Dct4x4
+                | Self::Dct4x8
+                | Self::Dct8x4
+                | Self::Afv0
+                | Self::Afv1
+                | Self::Afv2
+                | Self::Afv3
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -960,25 +1058,19 @@ pub struct CoefficientOverflow {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransformTask {
-    /// Scalar offset into [`VarDctPacket::coefficients`]. DCT8 data is channel-major X/Y/B,
-    /// followed by 64 coefficients per channel in the exact linear transform-buffer order
-    /// consumed by `jxl_transforms::transform::transform_to_pixels`.
+    /// Scalar offset into [`VarDctPacket::coefficients`]. Data is channel-major X/Y/B, followed
+    /// by `TransformKind::pixel_extent().area()` coefficients per channel in JPEG XL's linear
+    /// transform-buffer order. This is the order consumed by the selected strategy, not a generic
+    /// row-major frequency matrix.
     pub coefficient_offset: u32,
-    pub coefficient_count: u32,
-    /// Absolute destination coordinates in the three output planes.
-    pub destination_x: u32,
-    pub destination_y: u32,
-    pub block_width: u16,
-    pub block_height: u16,
+    /// Per-channel destination origins. `None` skips a chroma-subsampled channel for this task.
+    /// The transform extent itself is unchanged; frontends supply downsampled coordinates.
+    pub destinations: [Option<(u32, u32)>; 3],
     pub quant_index: u16,
     pub dequant_matrix_index: u16,
     pub correlation_index: u16,
-    /// Index of the dequantized X/Y/B LF coefficient that replaces coefficient zero before IDCT.
-    pub lf_index: u32,
-    pub lf_x: u16,
-    pub lf_y: u16,
-    pub hshift: u8,
-    pub vshift: u8,
+    /// First tightly packed X/Y/B LF tuple in [`VarDctResource::lf_coefficients`].
+    pub lf_offset: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -996,38 +1088,39 @@ pub struct VarDctPacket {
     pub buckets: Vec<TransformBucket>,
 }
 
-/// Per-frequency dequantization multipliers for one DCT8 matrix.
+/// Per-frequency dequantization multipliers for one transform strategy.
 ///
-/// `scales` contains exactly 64 entries in the same linear order as the DCT8 coefficients passed
-/// to `jxl_transforms::transform::transform_to_pixels`. Each entry stores the X/Y/B channel
+/// `scales` contains exactly `transform.pixel_extent().area()` entries in the same JPEG XL
+/// transform-buffer order as the task coefficients. Each entry stores the X/Y/B channel
 /// multipliers applied after quantization-bias adjustment.
 #[derive(Clone, Debug)]
-pub struct VarDctDct8DequantMatrix {
+pub struct VarDctDequantMatrix {
+    pub transform: TransformKind,
     pub scales: Vec<[f32; 3]>,
 }
 
-/// Typed late-bound parameters for the bounded DCT8 GPU path.
+/// Typed late-bound parameters for GPU VarDCT rendering.
 ///
 /// A [`TransformTask`] selects one `quant_scales` entry with `quant_index`, one
 /// `dequant_matrices` entry with `dequant_matrix_index`, and one `correlations` entry with
-/// `correlation_index`. Its `lf_index` selects the separately decoded coefficient zero.
-/// HF coefficients are bias-adjusted using `quant_biases`, multiplied by both selected
-/// dequantization factors, then Y is correlated into X/B using `[y_to_x, y_to_b]` before the LF
-/// replacement and inverse transform. Producers can therefore represent global scale, raw
-/// quantization, channel multipliers, quantization matrices, color correlation, and the LF image
-/// without an untyped positional `Vec<f32>` contract.
+/// `correlation_index`. Its `lf_offset` selects the separately decoded LF rectangle. HF
+/// coefficients are bias-adjusted using `quant_biases`, multiplied by both selected dequantization
+/// factors, then Y is correlated into X/B using `[y_to_x, y_to_b]` before LF reinterpretation and
+/// inverse transform. Producers can therefore represent global scale, raw quantization, channel
+/// multipliers, quantization matrices, color correlation, and the LF image without an untyped
+/// positional `Vec<f32>` contract.
 #[derive(Clone, Debug)]
-pub struct VarDctDct8Resource {
+pub struct VarDctResource {
     /// Biases for X/Y/B small coefficients followed by the large-coefficient numerator.
     pub quant_biases: [f32; 4],
     /// Per-quantization-index X/Y/B multipliers.
     pub quant_scales: Vec<[f32; 3]>,
-    pub dequant_matrices: Vec<VarDctDct8DequantMatrix>,
+    pub dequant_matrices: Vec<VarDctDequantMatrix>,
     /// Per-correlation-index `[y_to_x, y_to_b]` multipliers.
     pub correlations: Vec<[f32; 2]>,
-    /// Per-task dequantized LF coefficients in X/Y/B order. JPEG XL transmits these separately
-    /// from the HF coefficient stream; `transform_to_pixels` replaces coefficient zero with this
-    /// value immediately before DCT8.
+    /// Tightly packed LF tuples in X/Y/B order. Regular large transforms reinterpret an `N/8` by
+    /// `M/8` rectangle into their lowest frequencies before inverse DCT; special 8x8 transforms
+    /// consume one tuple.
     pub lf_coefficients: Vec<[f32; 3]>,
 }
 
@@ -1037,7 +1130,7 @@ pub enum ResourceData {
     F32(Vec<f32>),
     I32(Vec<i32>),
     Bytes(Vec<u8>),
-    VarDctDct8(VarDctDct8Resource),
+    VarDct(VarDctResource),
 }
 
 #[derive(Clone, Debug)]
@@ -1294,5 +1387,52 @@ mod tests {
         let mut unsupported = test_plan();
         unsupported.nodes[0].op = RenderOp::AddNoise { seed0: 1, seed1: 2 };
         assert!(!capabilities.supports_plan(&unsupported));
+    }
+
+    #[test]
+    fn vardct_strategy_table_has_all_codestream_extents() {
+        let expected = [
+            (TransformKind::Dct8, (8, 8)),
+            (TransformKind::Hornuss, (8, 8)),
+            (TransformKind::Dct2x2, (8, 8)),
+            (TransformKind::Dct4x4, (8, 8)),
+            (TransformKind::Dct16x16, (16, 16)),
+            (TransformKind::Dct32x32, (32, 32)),
+            (TransformKind::Dct16x8, (8, 16)),
+            (TransformKind::Dct8x16, (16, 8)),
+            (TransformKind::Dct32x8, (8, 32)),
+            (TransformKind::Dct8x32, (32, 8)),
+            (TransformKind::Dct32x16, (16, 32)),
+            (TransformKind::Dct16x32, (32, 16)),
+            (TransformKind::Dct4x8, (8, 8)),
+            (TransformKind::Dct8x4, (8, 8)),
+            (TransformKind::Afv0, (8, 8)),
+            (TransformKind::Afv1, (8, 8)),
+            (TransformKind::Afv2, (8, 8)),
+            (TransformKind::Afv3, (8, 8)),
+            (TransformKind::Dct64x64, (64, 64)),
+            (TransformKind::Dct64x32, (32, 64)),
+            (TransformKind::Dct32x64, (64, 32)),
+            (TransformKind::Dct128x128, (128, 128)),
+            (TransformKind::Dct128x64, (64, 128)),
+            (TransformKind::Dct64x128, (128, 64)),
+            (TransformKind::Dct256x256, (256, 256)),
+            (TransformKind::Dct256x128, (128, 256)),
+            (TransformKind::Dct128x256, (256, 128)),
+        ];
+
+        assert_eq!(TransformKind::ALL.len(), expected.len());
+        for (actual, (strategy, (width, height))) in TransformKind::ALL.into_iter().zip(expected) {
+            assert_eq!(actual, strategy);
+            assert_eq!(actual.pixel_extent(), Extent2d::new(width, height));
+            assert_eq!(actual.lf_extent(), Extent2d::new(width / 8, height / 8));
+        }
+        assert_eq!(
+            TransformKind::ALL
+                .into_iter()
+                .filter(|strategy| strategy.is_special())
+                .count(),
+            9
+        );
     }
 }

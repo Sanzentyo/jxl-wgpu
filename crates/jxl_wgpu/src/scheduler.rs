@@ -120,7 +120,7 @@ impl Scheduler {
                 | RenderOp::ChromaUpsample { .. }
                 | RenderOp::Gaborish(_)
                 | RenderOp::Epf(_)
-                | RenderOp::VarDct { .. }
+                | RenderOp::VarDct
                 | RenderOp::XybToRgb(_)
                 | RenderOp::YcbcrToRgb
                 | RenderOp::TransferFunction(_)
@@ -490,7 +490,7 @@ impl Scheduler {
                             encode_epf(&factory, &mut encoder, node, &planes, resources, params)?;
                             1
                         }
-                        RenderOp::VarDct { .. } => vardct::encode(
+                        RenderOp::VarDct => vardct::encode(
                             backend,
                             &mut encoder,
                             plan,
@@ -734,7 +734,7 @@ fn validate_resources(
         }
         match &node.op {
             RenderOp::Epf(params) => validate_epf_resource(plan, node, params, resources)?,
-            RenderOp::VarDct { .. } => {}
+            RenderOp::VarDct => {}
             _ if node.resources.is_empty() => {}
             _ => {
                 return Err(Error::Unsupported(format!(
@@ -790,7 +790,7 @@ fn transient_bytes(
                     add_slice::<f32>(&mut bytes, 1)?;
                 }
             }
-            RenderOp::VarDct { .. } => {
+            RenderOp::VarDct => {
                 add_bytes(
                     &mut bytes,
                     vardct::transient_bytes(plan, node, groups, resources)?,
@@ -1164,7 +1164,7 @@ fn zero_required_slot_offsets(
     for output in plan
         .nodes
         .iter()
-        .filter(|node| matches!(node.op, RenderOp::VarDct { .. }))
+        .filter(|node| matches!(node.op, RenderOp::VarDct))
         .flat_map(|node| &node.outputs)
     {
         let allocation = execution.arena.allocation(*output).ok_or_else(|| {

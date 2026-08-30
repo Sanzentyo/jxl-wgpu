@@ -12,7 +12,7 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::{
     GroupId, GroupPayload, PackedCoefficients, PlaneId, RenderNode, RenderOp, RenderPlan,
-    ResourceData, ResourceId, ResourceUpdate, TransformKind, VarDctDct8Resource, VarDctPacket,
+    ResourceData, ResourceId, ResourceUpdate, TransformKind, VarDctPacket, VarDctResource,
 };
 use wgpu::util::DeviceExt;
 
@@ -30,25 +30,34 @@ const DCT8_WORKGROUP_STORAGE_BYTES: u32 = 2 * 192 * 4;
 type FlattenedResource = (Vec<GpuResourceVector>, u32, u32, u32, u32);
 
 #[derive(Clone, Copy, Debug)]
-struct Rect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+pub(super) struct Rect {
+    pub(super) x: u32,
+    pub(super) y: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
 }
 
 impl Rect {
     fn from_task(task: &jxl_gpu_protocol::TransformTask) -> Result<Self> {
-        if task.block_width == 0 || task.block_height == 0 {
+        let Some((x, y)) = task.destinations[0] else {
             return Err(Error::InvalidPayload(
-                "VarDCT task has an empty destination".into(),
+                "optimized DCT8 path requires an X-channel destination".into(),
+            ));
+        };
+        if task
+            .destinations
+            .iter()
+            .any(|&destination| destination != Some((x, y)))
+        {
+            return Err(Error::InvalidPayload(
+                "optimized DCT8 path requires equal enabled channel destinations".into(),
             ));
         }
         Ok(Self {
-            x: task.destination_x,
-            y: task.destination_y,
-            width: u32::from(task.block_width),
-            height: u32::from(task.block_height),
+            x,
+            y,
+            width: 8,
+            height: 8,
         })
     }
 
@@ -60,7 +69,7 @@ impl Rect {
         self.y.checked_add(self.height)
     }
 
-    fn is_within(self, width: u32, height: u32) -> bool {
+    pub(super) fn is_within(self, width: u32, height: u32) -> bool {
         self.right().is_some_and(|right| right <= width)
             && self.bottom().is_some_and(|bottom| bottom <= height)
     }
@@ -72,7 +81,7 @@ impl Rect {
 /// collision is found. That invariant makes the immediate y predecessor and successor sufficient
 /// for each insertion, while a min-heap expires rectangles whose right edge only touches the next
 /// left edge.
-fn find_rect_overlap(rects: &[Rect]) -> Result<Option<(usize, usize)>> {
+pub(super) fn find_rect_overlap(rects: &[Rect]) -> Result<Option<(usize, usize)>> {
     let mut starts = rects
         .iter()
         .enumerate()
@@ -172,18 +181,18 @@ struct PreparedVarDct {
 pub(crate) fn has_node(plan: &RenderPlan) -> bool {
     plan.nodes
         .iter()
-        .any(|node| matches!(node.op, RenderOp::VarDct { .. }))
+        .any(|node| matches!(node.op, RenderOp::VarDct))
 }
 
 pub(crate) fn validate_plan(plan: &RenderPlan) -> Result<()> {
     let nodes = plan
         .nodes
         .iter()
-        .filter(|node| matches!(node.op, RenderOp::VarDct { .. }))
+        .filter(|node| matches!(node.op, RenderOp::VarDct))
         .collect::<Vec<_>>();
     if nodes.len() > 1 {
         return Err(Error::Unsupported(
-            "the bounded backend accepts at most one VarDCT node per render plan".into(),
+            "the portable backend accepts at most one VarDCT node per render plan".into(),
         ));
     }
     if let Some(node) = nodes.first() {
@@ -193,15 +202,9 @@ pub(crate) fn validate_plan(plan: &RenderPlan) -> Result<()> {
 }
 
 fn validate_node(plan: &RenderPlan, node: &RenderNode) -> Result<()> {
-    let RenderOp::VarDct { transform } = node.op else {
+    let RenderOp::VarDct = node.op else {
         return Ok(());
     };
-    if transform != 8 {
-        return Err(Error::Unsupported(format!(
-            "VarDCT node '{}' declares native transform edge {transform}; only DCT8 is available",
-            node.name
-        )));
-    }
     if !node.inputs.is_empty() || node.outputs.len() != DCT8_CHANNELS || node.resources.len() != 1 {
         return Err(Error::InvalidPayload(format!(
             "VarDCT node '{}' requires no plane inputs, three F32 outputs, and one typed resource",
@@ -218,59 +221,19 @@ fn validate_node(plan: &RenderPlan, node: &RenderNode) -> Result<()> {
                 .ok_or(Error::MissingPlane(*id))
         })
         .collect::<Result<Vec<_>>>()?;
-    let extent = outputs[0].extent;
-    if outputs.iter().any(|plane| {
-        plane.sample_type != jxl_gpu_protocol::SampleType::F32 || plane.extent != extent
-    }) {
-        return Err(Error::Unsupported(
-            "VarDCT requires three equal-sized F32 destination planes".into(),
+    if outputs
+        .iter()
+        .any(|plane| plane.sample_type != jxl_gpu_protocol::SampleType::F32)
+    {
+        return Err(Error::InvalidPayload(
+            "VarDCT requires three F32 destination planes".into(),
         ));
     }
     Ok(())
 }
 
 pub(crate) fn validate_packet(packet: &VarDctPacket) -> Result<()> {
-    for bucket in &packet.buckets {
-        if bucket.transform != TransformKind::Dct8 {
-            return Err(Error::Unsupported(format!(
-                "VarDCT transform {:?} is unsupported; the portable backend executes only DCT8",
-                bucket.transform
-            )));
-        }
-        for task in &bucket.tasks {
-            if task.hshift != 0 || task.vshift != 0 {
-                return Err(Error::Unsupported(format!(
-                    "shifted DCT8 task ({}, {}) is unsupported by the portable backend",
-                    task.hshift, task.vshift
-                )));
-            }
-        }
-    }
-
-    let coefficient_len = coefficient_len(&packet.coefficients)?;
-    validate_packed_overflow(&packet.coefficients, coefficient_len)?;
-    for bucket in &packet.buckets {
-        for task in &bucket.tasks {
-            let _ = Rect::from_task(task)?;
-            if task.block_width != 8 || task.block_height != 8 {
-                return Err(Error::InvalidPayload(format!(
-                    "DCT8 task declares {}x{} pixels instead of 8x8",
-                    task.block_width, task.block_height
-                )));
-            }
-            let start =
-                usize::try_from(task.coefficient_offset).map_err(|_| Error::BufferSizeOverflow)?;
-            let count =
-                usize::try_from(task.coefficient_count).map_err(|_| Error::BufferSizeOverflow)?;
-            let end = start.checked_add(count).ok_or(Error::BufferSizeOverflow)?;
-            if end > coefficient_len {
-                return Err(Error::InvalidPayload(format!(
-                    "VarDCT coefficient range {start}..{end} exceeds packet length {coefficient_len}"
-                )));
-            }
-        }
-    }
-    Ok(())
+    crate::vardct_general::validate_packet(packet)
 }
 
 fn coefficient_len(coefficients: &PackedCoefficients) -> Result<usize> {
@@ -331,7 +294,7 @@ fn decode_coefficients(coefficients: &PackedCoefficients) -> Result<Vec<i32>> {
     }
 }
 
-fn validate_resource(resource: &VarDctDct8Resource) -> Result<()> {
+fn validate_resource(resource: &VarDctResource) -> Result<()> {
     if resource
         .quant_biases
         .iter()
@@ -351,17 +314,20 @@ fn validate_resource(resource: &VarDctDct8Resource) -> Result<()> {
         ));
     }
     for (index, matrix) in resource.dequant_matrices.iter().enumerate() {
-        if matrix.scales.len() != DCT8_COEFFICIENTS_PER_CHANNEL {
+        if matrix.transform != TransformKind::Dct8
+            || matrix.scales.len() != DCT8_COEFFICIENTS_PER_CHANNEL
+        {
             return Err(Error::InvalidPayload(format!(
-                "DCT8 dequant matrix {index} has {} entries, expected 64",
-                matrix.scales.len()
+                "DCT8 dequant matrix {index} has transform {:?} and {} entries, expected Dct8/64",
+                matrix.transform,
+                matrix.scales.len(),
             )));
         }
     }
     Ok(())
 }
 
-fn flatten_resource(resource: &VarDctDct8Resource) -> Result<FlattenedResource> {
+fn flatten_resource(resource: &VarDctResource) -> Result<FlattenedResource> {
     validate_resource(resource)?;
     let mut vectors = Vec::new();
     let quant_offset = 0;
@@ -414,9 +380,9 @@ fn prepare(
             "VarDCT resource {resource_id:?} has not been supplied"
         ))
     })?;
-    let ResourceData::VarDctDct8(resource) = &resource.data else {
-        return Err(Error::Unsupported(format!(
-            "VarDCT resource {resource_id:?} is not typed DCT8 dequantization data"
+    let ResourceData::VarDct(resource) = &resource.data else {
+        return Err(Error::InvalidPayload(format!(
+            "VarDCT resource {resource_id:?} does not contain typed VarDCT parameters"
         )));
     };
     validate_resource(resource)?;
@@ -447,17 +413,10 @@ fn prepare(
                     )));
                 }
                 task_rects.push(rect);
-                if usize::try_from(task.coefficient_count).ok() != Some(DCT8_COEFFICIENTS_PER_TASK)
-                {
-                    return Err(Error::InvalidPayload(format!(
-                        "DCT8 task has {} coefficients, expected {DCT8_COEFFICIENTS_PER_TASK}",
-                        task.coefficient_count
-                    )));
-                }
                 if usize::from(task.quant_index) >= resource.quant_scales.len()
                     || usize::from(task.dequant_matrix_index) >= resource.dequant_matrices.len()
                     || usize::from(task.correlation_index) >= resource.correlations.len()
-                    || usize::try_from(task.lf_index)
+                    || usize::try_from(task.lf_offset)
                         .ok()
                         .is_none_or(|index| index >= resource.lf_coefficients.len())
                 {
@@ -474,12 +433,12 @@ fn prepare(
                 coefficients.extend_from_slice(&decoded[source_start..source_end]);
                 tasks.push(GpuTask {
                     coefficient_offset,
-                    destination_x: task.destination_x,
-                    destination_y: task.destination_y,
+                    destination_x: rect.x,
+                    destination_y: rect.y,
                     quant_index: u32::from(task.quant_index),
                     matrix_index: u32::from(task.dequant_matrix_index),
                     correlation_index: u32::from(task.correlation_index),
-                    lf_index: task.lf_index,
+                    lf_index: task.lf_offset,
                 });
             }
         }
@@ -512,6 +471,9 @@ pub(crate) fn transient_bytes(
     groups: &BTreeMap<GroupId, GroupPayload>,
     resources: &BTreeMap<ResourceId, ResourceUpdate>,
 ) -> Result<u64> {
+    if crate::vardct_general::is_required(groups, resources, node.resources[0]) {
+        return crate::vardct_general::transient_bytes(plan, node, groups, resources);
+    }
     prepared_transient_bytes(&prepare(plan, node, groups, resources)?)
 }
 
@@ -542,6 +504,11 @@ pub(crate) fn encode(
     groups: &BTreeMap<GroupId, GroupPayload>,
     resources: &BTreeMap<ResourceId, ResourceUpdate>,
 ) -> Result<u32> {
+    if crate::vardct_general::is_required(groups, resources, node.resources[0]) {
+        return crate::vardct_general::encode(
+            backend, encoder, plan, node, planes, groups, resources,
+        );
+    }
     let prepared = prepare(plan, node, groups, resources)?;
     let outputs = node
         .outputs
@@ -748,7 +715,7 @@ fn dequantized_reference_block(
     matrix_index: usize,
     correlation_index: usize,
     lf_index: usize,
-    resource: &VarDctDct8Resource,
+    resource: &VarDctResource,
 ) -> [[f32; 64]; 3] {
     let quant_scale = resource.quant_scales[quant_index];
     let matrix = &resource.dequant_matrices[matrix_index].scales;
@@ -782,7 +749,7 @@ fn scalar_reference_block(
     matrix_index: usize,
     correlation_index: usize,
     lf_index: usize,
-    resource: &VarDctDct8Resource,
+    resource: &VarDctResource,
 ) -> [[f32; 64]; 3] {
     let dequantized = dequantized_reference_block(
         coefficients,
@@ -936,17 +903,18 @@ mod tests {
         Border2d, CoefficientOverflow, Extent2d, FrameSessionDesc, GroupPayload, MemoryMode,
         OutputDesc, OutputId, OutputLayout, PackedCoefficients, PlaneData, PlaneDesc, PlaneRole,
         PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan,
-        ResourceUpdate, SaveParams, Scale2d, TransformBucket, TransformTask,
-        VarDctDct8DequantMatrix, VarDctPacket,
+        ResourceUpdate, SaveParams, Scale2d, TransformBucket, TransformTask, VarDctDequantMatrix,
+        VarDctPacket,
     };
 
     use crate::{WgpuBackend, WgpuBackendConfig};
 
-    fn resource() -> VarDctDct8Resource {
-        VarDctDct8Resource {
+    fn resource() -> VarDctResource {
+        VarDctResource {
             quant_biases: [1.0, 1.0, 1.0, 0.0],
             quant_scales: vec![[1.0, 0.5, 2.0]],
-            dequant_matrices: vec![VarDctDct8DequantMatrix {
+            dequant_matrices: vec![VarDctDequantMatrix {
+                transform: TransformKind::Dct8,
                 scales: vec![[1.0, 1.0, 1.0]; 64],
             }],
             correlations: vec![[0.25, -0.5]],
@@ -957,19 +925,11 @@ mod tests {
     fn dct8_task(coefficient_offset: u32, destination_x: u32, destination_y: u32) -> TransformTask {
         TransformTask {
             coefficient_offset,
-            coefficient_count: 192,
-            destination_x,
-            destination_y,
-            block_width: 8,
-            block_height: 8,
+            destinations: [Some((destination_x, destination_y)); 3],
             quant_index: 0,
             dequant_matrix_index: 0,
             correlation_index: 0,
-            lf_index: coefficient_offset / 192,
-            lf_x: 0,
-            lf_y: 0,
-            hshift: 0,
-            vshift: 0,
+            lf_offset: coefficient_offset / 192,
         }
     }
 
@@ -989,7 +949,7 @@ mod tests {
             nodes: vec![
                 RenderNode {
                     name: "vardct".into(),
-                    op: RenderOp::VarDct { transform: 8 },
+                    op: RenderOp::VarDct,
                     inputs: Vec::new(),
                     outputs: channels.to_vec(),
                     resources: vec![ResourceId(0)],
@@ -1078,7 +1038,7 @@ mod tests {
         matrix_index: usize,
         correlation_index: usize,
         lf_index: usize,
-        resource: &VarDctDct8Resource,
+        resource: &VarDctResource,
     ) -> [[f32; 64]; 3] {
         let mut output = dequantized_reference_block(
             coefficients,
@@ -1107,22 +1067,22 @@ mod tests {
         output_width: usize,
         task: &TransformTask,
         coefficients: &[i32],
-        resource: &VarDctDct8Resource,
+        resource: &VarDctResource,
     ) {
         let block = codec_reference_block(
             coefficients,
             usize::from(task.quant_index),
             usize::from(task.dequant_matrix_index),
             usize::from(task.correlation_index),
-            task.lf_index as usize,
+            task.lf_offset as usize,
             resource,
         );
         for channel in 0..3 {
             for y in 0..8 {
                 for x in 0..8 {
-                    let destination_index = (task.destination_y as usize + y) * output_width
-                        + task.destination_x as usize
-                        + x;
+                    let (destination_x, destination_y) = task.destinations[channel].unwrap();
+                    let destination_index =
+                        (destination_y as usize + y) * output_width + destination_x as usize + x;
                     destination[channel][destination_index] = block[channel][y * 8 + x];
                 }
             }
@@ -1326,60 +1286,54 @@ mod tests {
     }
 
     #[test]
-    fn non_dct8_buckets_and_shifted_dct8_are_typed_unsupported() {
+    fn non_dct8_buckets_and_split_destinations_are_structurally_valid() {
         let non_dct8 = |tasks| VarDctPacket {
             revision: 0,
             last_pass: 0,
             coefficients: PackedCoefficients::DenseI32(Vec::new()),
             buckets: vec![TransformBucket {
-                transform: TransformKind::Dct4,
+                transform: TransformKind::Dct4x4,
                 tasks,
             }],
         };
 
-        assert!(matches!(
-            validate_packet(&non_dct8(Vec::new())),
-            Err(Error::Unsupported(message)) if message.contains("Dct4")
-        ));
-        assert!(matches!(
-            validate_packet(&non_dct8(vec![TransformTask {
-                coefficient_offset: 0,
-                coefficient_count: 0,
-                destination_x: 0,
-                destination_y: 0,
-                block_width: 4,
-                block_height: 4,
-                quant_index: 0,
-                dequant_matrix_index: 0,
-                correlation_index: 0,
-                lf_index: 0,
-                lf_x: 0,
-                lf_y: 0,
-                hshift: 0,
-                vshift: 0,
-            }])),
-            Err(Error::Unsupported(message)) if message.contains("Dct4")
-        ));
+        assert!(validate_packet(&non_dct8(Vec::new())).is_ok());
+        assert!(
+            validate_packet(&VarDctPacket {
+                revision: 0,
+                last_pass: 0,
+                coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
+                buckets: vec![TransformBucket {
+                    transform: TransformKind::Dct4x4,
+                    tasks: vec![TransformTask {
+                        coefficient_offset: 0,
+                        destinations: [Some((0, 0)); 3],
+                        quant_index: 0,
+                        dequant_matrix_index: 0,
+                        correlation_index: 0,
+                        lf_offset: 0,
+                    }],
+                }],
+            })
+            .is_ok()
+        );
 
-        let mut shifted = dct8_task(0, 0, 0);
-        shifted.hshift = 1;
-        let shifted_packet = VarDctPacket {
+        let mut split = dct8_task(0, 0, 0);
+        split.destinations[2] = Some((4, 0));
+        let split_packet = VarDctPacket {
             revision: 0,
             last_pass: 0,
             coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
             buckets: vec![TransformBucket {
                 transform: TransformKind::Dct8,
-                tasks: vec![shifted],
+                tasks: vec![split],
             }],
         };
-        assert!(matches!(
-            validate_packet(&shifted_packet),
-            Err(Error::Unsupported(message)) if message.contains("shifted DCT8")
-        ));
+        assert!(validate_packet(&split_packet).is_ok());
     }
 
     #[test]
-    fn enqueue_rejects_all_non_dct8_buckets_and_shifted_tasks() {
+    fn enqueue_accepts_non_dct8_bucket_and_split_destinations() {
         let Some(backend) = test_backend() else {
             return;
         };
@@ -1394,38 +1348,26 @@ mod tests {
             planes: Vec::new(),
             vardct: Some(packet),
         };
-        let non_dct8 = |tasks| VarDctPacket {
+        let mut split = dct8_task(0, 0, 0);
+        split.destinations[1] = None;
+        let packet = VarDctPacket {
             revision: 0,
             last_pass: 0,
             coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
-            buckets: vec![TransformBucket {
-                transform: TransformKind::Dct4,
-                tasks,
-            }],
+            buckets: vec![
+                TransformBucket {
+                    transform: TransformKind::Dct4x4,
+                    tasks: Vec::new(),
+                },
+                TransformBucket {
+                    transform: TransformKind::Dct8,
+                    tasks: vec![split],
+                },
+            ],
         };
-
-        for packet in [non_dct8(Vec::new()), non_dct8(vec![dct8_task(0, 0, 0)])] {
-            assert!(matches!(
-                session.enqueue(payload(packet)),
-                Err(Error::Unsupported(message)) if message.contains("Dct4")
-            ));
-        }
-
-        let mut shifted = dct8_task(0, 0, 0);
-        shifted.vshift = 1;
-        let shifted = VarDctPacket {
-            revision: 0,
-            last_pass: 0,
-            coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
-            buckets: vec![TransformBucket {
-                transform: TransformKind::Dct8,
-                tasks: vec![shifted],
-            }],
-        };
-        assert!(matches!(
-            session.enqueue(payload(shifted)),
-            Err(Error::Unsupported(message)) if message.contains("shifted DCT8")
-        ));
+        session
+            .enqueue(payload(packet))
+            .expect("full transform descriptors are accepted before GPU submission");
     }
 
     #[test]
@@ -1438,7 +1380,7 @@ mod tests {
             ResourceUpdate {
                 id: ResourceId(0),
                 revision: 0,
-                data: ResourceData::VarDctDct8(resource()),
+                data: ResourceData::VarDct(resource()),
             },
         )]);
         let payload = |packet| {
@@ -1520,7 +1462,7 @@ mod tests {
             .update_resource(ResourceUpdate {
                 id: ResourceId(0),
                 revision: 0,
-                data: ResourceData::VarDctDct8(resource),
+                data: ResourceData::VarDct(resource),
             })
             .expect("supply VarDCT dequantization resource");
         session
