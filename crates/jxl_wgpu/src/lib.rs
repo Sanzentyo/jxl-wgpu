@@ -34,6 +34,7 @@ mod pipeline_cache;
 mod planner;
 mod poller;
 mod readback;
+mod resident_vardct;
 mod scheduler;
 mod session;
 mod upload;
@@ -72,6 +73,11 @@ pub use readback::{
     ImageReadbackBatchResult, ImageReadbackBatchSubmission, ImageReadbackLimits,
     ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats, ImageReadbackSubmission,
     UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
+};
+pub use resident_vardct::{
+    ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs, ResidentVarDctMemoryPlan,
+    ResidentVarDctOutputPlane, ResidentVarDctRenderConfig, ResidentVarDctRenderer,
+    ResidentVarDctScratch,
 };
 pub use session::{
     GpuFrame, GpuOutputBuffer, SubmissionMode, WgpuFrameSession, WgpuSubmissionStats,
