@@ -12,12 +12,14 @@ other driver-private allocations cannot be measured portably and are not include
 ## ABI rules
 
 - Every Rust value copied into a uniform or structured storage buffer is `#[repr(C)]`, derives
-  `bytemuck::Pod` and `Zeroable`, and has a size test. Scalar-only WGSL records have natural
-  alignment 4; their total sizes are deliberately multiples of 16 for uniform bindings.
+  `bytemuck::Pod` and `Zeroable`, and has compile-time size/alignment assertions plus a field-order
+  test. Uploads use `bytemuck::bytes_of` or `cast_slice`; fixed readback records use
+  `try_cast_slice`. Scalar-only WGSL records have natural alignment 4; their total sizes are
+  deliberately multiples of 16 for uniform bindings.
 - `Dct8Uniform` ends in `vec4<f32>`. Its WGSL natural alignment is therefore 16 and Rust uses
   `#[repr(C, align(16))]`.
 - Storage arrays use the same element stride on both sides: `GpuTask`/`Task` is 28 bytes and
-  `[f32; 4]`/`vec4<f32>` is 16 bytes.
+  `GpuResourceVector`/`vec4<f32>` is 16 bytes with 16-byte alignment.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size
@@ -46,9 +48,32 @@ name shown in parentheses.
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
 | `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, _padding0` | 96 | 4 | uniform |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuTask` / `Task` | `coefficient_offset, destination_x, destination_y, quant_index, matrix_index, correlation_index, lf_index` | 28 | 4 | storage element |
+| `jxl_wgpu/vardct_dct8.wgsl` | `GpuResourceVector` / `vec4<f32>` | four `f32` lanes | 16 | 16 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
+| `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8ArtifactHeader` / `output_words[0..53]` | `event_count, raw_counts[19], lz77_counts[33]` | 212 | 4 | storage/readback record |
+| `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Event` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | token range, dimensions/sample count, output mode/transfer/range, 3 plane offset/stride pairs, chroma dimensions | 64 | 4 | uniform |
+| `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
+
+### Values that intentionally are not `Pod`
+
+`Pod` describes an in-memory Rust/WGSL ABI, not every sequence of bytes handled by the workspace:
+
+- JPEG XL codestreams, container boxes, and the `jwgp` acceleration index are wire formats. Their
+  serializers use explicit little-endian fields and packed offsets. In particular, a serialized
+  prefix entry is three bytes (`u8` plus `u16`), while Rust's naturally aligned
+  `PrefixCodeEntry` occupies four bytes. Deriving `Pod` would serialize host padding and produce a
+  different, invalid wire format.
+- Raw image planes and mapped packed-image byte ranges have runtime-selected formats, plane counts,
+  row strides, and lengths. `ImageLayout` validates their byte ranges; there is no single fixed
+  Rust record that could safely represent their contents.
+- Codestream storage and the decoder prefix lookup are variable arrays, not fixed records. The
+  lookup remains `Vec<u32>` and is uploaded with `cast_slice`; the raw codestream remains bytes so
+  its bit/byte offsets and explicit four-byte sentinel are preserved.
+
+Manual endian-aware serialization is therefore retained only for bitstream/container/file
+formats. Fixed GPU records do not use hand-written byte flattening.
 
 ## Bindings and dispatch bounds
 
@@ -105,8 +130,9 @@ WebGPU's portable baseline; VarDCT additionally checks its workgroup storage lim
   offset to 4 bytes, validates `COPY_SRC`, validates the source allocation, and maps one bounded
   aggregate staging buffer.
 - Encoder artifact storage and mapped readback have identical checked, 4-byte-aligned sizes.
-  Decoder codestream storage is padded to a word and includes a four-byte sentinel; status copies
-  are 16 bytes.
+  Its 212-byte header and 16-byte events are parsed as checked `Pod` records. Decoder codestream
+  storage is padded to a word and includes a four-byte sentinel; its 16-byte status is parsed as a
+  checked `DecodeStatus` record.
 - Buffer-to-texture paths apply WebGPU's separate 256-byte multi-row pitch rule. Texture-to-buffer
   tests likewise use 256-byte row padding.
 
@@ -139,7 +165,8 @@ pass.
 
 ## Regression coverage
 
-The ABI tests pin every Rust size and natural alignment, including the 16-byte VarDCT alignment.
+The ABI tests pin every Rust size, natural alignment, and field order, including the 16-byte
+VarDCT alignment and both Gray8 readback schemas.
 GPU tests compile and execute every portable core shader, all display formats, VarDCT DCT8, the
 deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
 

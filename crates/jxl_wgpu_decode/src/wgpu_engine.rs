@@ -23,7 +23,6 @@ use crate::{
 const SHADER: &str = include_str!("lossless_gray8.wgsl");
 const LOOKUP_BITS: u8 = 15;
 const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
-const STATUS_BYTES: u64 = 16;
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const MAX_SESSION_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
@@ -62,7 +61,24 @@ struct ShaderParams {
     chroma_height: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<ShaderParams>() == 64);
+/// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DecodeStatus {
+    code: u32,
+    decoded_samples: u32,
+    cursor: u32,
+    expected_cursor: u32,
+}
+
+const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
+
+const _: () = {
+    assert!(std::mem::size_of::<ShaderParams>() == 64);
+    assert!(std::mem::align_of::<ShaderParams>() == 4);
+    assert!(std::mem::size_of::<DecodeStatus>() == 16);
+    assert!(std::mem::align_of::<DecodeStatus>() == 4);
+};
 
 struct EngineMemoryBudget {
     limit: u64,
@@ -352,16 +368,28 @@ impl WgpuDecodeSession {
         let status_bytes = mapped
             .get(..STATUS_BYTES as usize)
             .ok_or_else(|| Error::backend("GPU status buffer was truncated"))?;
-        let words: Vec<u32> = status_bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte status word")))
-            .collect();
+        let status = bytemuck::try_cast_slice::<u8, DecodeStatus>(status_bytes)
+            .map_err(|_| Error::backend("GPU status buffer has an invalid ABI layout"))
+            .and_then(|statuses| {
+                statuses
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Error::backend("GPU status buffer was truncated"))
+            });
         drop(mapped);
         pending.status_staging.unmap();
-        if words[0] != STATUS_OK || words[1] != pending.sample_count || words[2] != words[3] {
+        let status = status?;
+        if status.code != STATUS_OK
+            || status.decoded_samples != pending.sample_count
+            || status.cursor != status.expected_cursor
+        {
             return Err(Error::backend(format!(
                 "Gray8 GPU decode rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
-                words[0], words[1], pending.sample_count, words[2], words[3]
+                status.code,
+                status.decoded_samples,
+                pending.sample_count,
+                status.cursor,
+                status.expected_cursor
             )));
         }
 
@@ -578,13 +606,9 @@ fn submit_decode(
     });
 
     let lookup = build_prefix_lookup(&source.index)?;
-    let lookup_bytes = lookup
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect::<Vec<_>>();
     let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu decode prefix lookup"),
-        contents: &lookup_bytes,
+        contents: bytemuck::cast_slice(&lookup),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -917,6 +941,49 @@ mod tests {
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
         assert_eq!(std::mem::size_of::<ShaderParams>(), 64);
+        assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
+        let params = ShaderParams {
+            token_start: 1,
+            token_end: 2,
+            width: 3,
+            height: 4,
+            sample_count: 5,
+            output_mode: 6,
+            transfer: 7,
+            limited_range: 8,
+            plane0_offset: 9,
+            plane0_stride: 10,
+            plane1_offset: 11,
+            plane1_stride: 12,
+            plane2_offset: 13,
+            plane2_stride: 14,
+            chroma_width: 15,
+            chroma_height: 16,
+        };
+        assert_eq!(
+            bytemuck::cast::<ShaderParams, [u32; 16]>(params),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert!(SHADER.contains(
+            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,"
+        ));
+
+        assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);
+        assert_eq!(std::mem::align_of::<DecodeStatus>(), 4);
+        let status = DecodeStatus {
+            code: 1,
+            decoded_samples: 2,
+            cursor: 3,
+            expected_cursor: 4,
+        };
+        assert_eq!(
+            bytemuck::cast::<DecodeStatus, [u32; 4]>(status),
+            [1, 2, 3, 4]
+        );
+        assert!(SHADER.contains("status[0] = STATUS_OK;"));
+        assert!(SHADER.contains("status[1] = decoded;"));
+        assert!(SHADER.contains("status[2] = bit_cursor;"));
+        assert!(SHADER.contains("status[3] = params.token_end;"));
         assert_eq!(stream_allocation_size(4).unwrap(), 8);
         assert_eq!(stream_allocation_size(5).unwrap(), 12);
     }

@@ -22,8 +22,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaLocation, ColorModel, ColorRange, ColorSpecification, ImageLayout,
-    PackingFieldKind, SampleKind, Swizzle, YcbcrEncoding,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
+    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
+    WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputLayout, SampleType};
 use wgpu::util::DeviceExt;
@@ -618,24 +619,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             "image layout logical size is not canonical for its planes".into(),
         ));
     }
-    if layout.format.sample_kind != SampleKind::Unsigned
-        || layout.format.byte_order == ByteOrder::Big
-    {
-        return Err(Error::Unsupported(
-            "display conversion requires unsigned native/little-endian pitch-linear storage".into(),
-        ));
-    }
-    let storage = layout
-        .format
-        .planes
-        .iter()
-        .map(stored_plane_channels)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            Error::Unsupported(
-                "display conversion requires uniform byte-aligned channel words".into(),
-            )
-        })?;
+    let class = classify_display_format(&layout.format)?;
     let (subsample_x, subsample_y) = layout
         .format
         .chroma_subsampling
@@ -645,142 +629,104 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         layout.extent.width.div_ceil(u32::from(subsample_x)),
         layout.extent.height.div_ceil(u32::from(subsample_y)),
     );
-    let (kind, channels, order, bits, storage_bits, matrix, range, siting_x, siting_y) =
-        match layout.format.model {
-            ColorModel::Rgb => {
-                let (kind, channels) = match storage.as_slice() {
-                    [(channels, 8, 8)] if matches!(channels.len(), 3 | 4) => {
-                        (0, channels.len() as u8)
-                    }
-                    planar
-                        if matches!(planar.len(), 3 | 4)
-                            && planar.iter().all(|(channels, bits, storage_bits)| {
-                                channels.len() == 1 && *bits == 8 && *storage_bits == 8
-                            }) =>
-                    {
-                        (1, planar.len() as u8)
-                    }
-                    _ => {
-                        return Err(Error::Unsupported(
-                            "display RGB image requires planar or interleaved RGB(A)/BGR(A)8"
-                                .into(),
-                        ));
-                    }
-                };
-                let order = if layout.format.swizzle == Swizzle::XYZ1 {
-                    0
-                } else if layout.format.swizzle == Swizzle::ZYX1 {
-                    1
-                } else if layout.format.swizzle == Swizzle::XYZW {
-                    2
-                } else if layout.format.swizzle == Swizzle::ZYXW {
-                    3
-                } else {
+    let (kind, channels, order, bits, storage_bits, matrix, range, siting_x, siting_y) = match class
+    {
+        ColorFormatClass::Rgb8 { storage, order } => {
+            let kind = match storage {
+                RgbStorage::Interleaved => 0,
+                RgbStorage::Planar => 1,
+            };
+            let (channels, order) = match order {
+                RgbChannelOrder::Rgb => (3, 0),
+                RgbChannelOrder::Bgr => (3, 1),
+                RgbChannelOrder::Rgba => (4, 2),
+                RgbChannelOrder::Bgra => (4, 3),
+            };
+            (kind, channels, order, 8, 8, 1, 0, 1, 1)
+        }
+        color_class => {
+            let color = match layout.format.color_spec {
+                ColorSpecification::Defined(color) => color,
+                ColorSpecification::Default | ColorSpecification::Undefined => {
+                    return Err(Error::Unsupported(
+                        "display YCbCr conversion requires an explicit matrix and range".into(),
+                    ));
+                }
+            };
+            let matrix = match color.encoding {
+                YcbcrEncoding::Bt601 => 0,
+                YcbcrEncoding::Bt709 => 1,
+                YcbcrEncoding::Bt2020 => 2,
+                unsupported => {
                     return Err(Error::Unsupported(format!(
-                        "display RGB swizzle {:?} is unsupported",
-                        layout.format.swizzle
+                        "display YCbCr matrix {unsupported:?} is unsupported"
                     )));
-                };
-                (kind, channels, order, 8, 8, 1, 0, 1, 1)
-            }
-            ColorModel::Ycbcr => {
-                let color = match layout.format.color_spec {
-                    ColorSpecification::Defined(color) => color,
-                    ColorSpecification::Default | ColorSpecification::Undefined => {
-                        return Err(Error::Unsupported(
-                            "display YCbCr conversion requires an explicit matrix and range".into(),
-                        ));
-                    }
-                };
-                let matrix = match color.encoding {
-                    YcbcrEncoding::Bt601 => 0,
-                    YcbcrEncoding::Bt709 => 1,
-                    YcbcrEncoding::Bt2020 => 2,
-                    unsupported => {
-                        return Err(Error::Unsupported(format!(
-                            "display YCbCr matrix {unsupported:?} is unsupported"
-                        )));
-                    }
-                };
-                let range = u8::from(color.range == ColorRange::Limited);
-                let siting_x =
-                    display_chroma_siting(color.chroma_location.horizontal, subsample_x)?;
-                let siting_y = display_chroma_siting(color.chroma_location.vertical, subsample_y)?;
-                match storage.as_slice() {
-                    [(y, bits, storage_bits)] if y.as_slice() == [Channel::X] => {
-                        if !matches!((*bits, *storage_bits), (8, 8) | (16, 16)) {
-                            return Err(Error::Unsupported(
-                                "display luma supports only Y8 and Y16".into(),
-                            ));
-                        }
-                        (
-                            if *bits == 8 { 2 } else { 3 },
-                            1,
-                            0,
-                            *bits,
-                            *storage_bits,
-                            matrix,
-                            range,
-                            siting_x,
-                            siting_y,
-                        )
-                    }
-                    [(packed, 8, 8)]
-                        if packed.as_slice()
-                            == [Channel::X, Channel::Y, Channel::X, Channel::Z] =>
-                    {
-                        (6, 3, 0, 8, 8, matrix, range, siting_x, siting_y)
-                    }
-                    [(packed, 8, 8)]
-                        if packed.as_slice()
-                            == [Channel::Y, Channel::X, Channel::Z, Channel::X] =>
-                    {
-                        (6, 3, 1, 8, 8, matrix, range, siting_x, siting_y)
-                    }
-                    [
-                        (y, bits, stored),
-                        (cb, cb_bits, cb_stored),
-                        (cr, cr_bits, cr_stored),
-                    ] if y.as_slice() == [Channel::X]
-                        && cb.as_slice() == [Channel::Y]
-                        && cr.as_slice() == [Channel::Z]
-                        && bits == cb_bits
-                        && bits == cr_bits
-                        && stored == cb_stored
-                        && stored == cr_stored =>
-                    {
-                        validate_display_yuv_depth(*bits, *stored)?;
-                        (4, 3, 0, *bits, *stored, matrix, range, siting_x, siting_y)
-                    }
-                    [(y, bits, stored), (uv, uv_bits, uv_stored)]
-                        if y.as_slice() == [Channel::X]
-                            && matches!(
-                                uv.as_slice(),
-                                [Channel::Y, Channel::Z] | [Channel::Z, Channel::Y]
-                            )
-                            && bits == uv_bits
-                            && stored == uv_stored =>
-                    {
-                        validate_display_yuv_depth(*bits, *stored)?;
-                        let order = u8::from(uv.as_slice() == [Channel::Z, Channel::Y]);
-                        (
-                            5, 3, order, *bits, *stored, matrix, range, siting_x, siting_y,
-                        )
-                    }
-                    _ => {
-                        return Err(Error::Unsupported(
-                            "display YCbCr format is not a supported luma, planar/semi-planar, or packed 4:2:2 layout"
-                                .into(),
-                        ));
-                    }
+                }
+            };
+            let range = u8::from(color.range == ColorRange::Limited);
+            let siting_x = display_chroma_siting(color.chroma_location.horizontal, subsample_x)?;
+            let siting_y = display_chroma_siting(color.chroma_location.vertical, subsample_y)?;
+            match color_class {
+                ColorFormatClass::Luma { bits, storage_bits } => (
+                    if bits == 8 { 2 } else { 3 },
+                    1,
+                    0,
+                    bits,
+                    storage_bits,
+                    matrix,
+                    range,
+                    siting_x,
+                    siting_y,
+                ),
+                ColorFormatClass::YuvPlanar {
+                    bits, storage_bits, ..
+                } => (
+                    4,
+                    3,
+                    0,
+                    bits,
+                    storage_bits,
+                    matrix,
+                    range,
+                    siting_x,
+                    siting_y,
+                ),
+                ColorFormatClass::YuvSemiplanar {
+                    bits,
+                    storage_bits,
+                    chroma_order,
+                    ..
+                } => {
+                    let order = u8::from(chroma_order == ChromaOrder::CrCb);
+                    (
+                        5,
+                        3,
+                        order,
+                        bits,
+                        storage_bits,
+                        matrix,
+                        range,
+                        siting_x,
+                        siting_y,
+                    )
+                }
+                ColorFormatClass::Yuv422Packed { order } => (
+                    6,
+                    3,
+                    u8::from(order == Packed422Order::Uyvy),
+                    8,
+                    8,
+                    matrix,
+                    range,
+                    siting_x,
+                    siting_y,
+                ),
+                ColorFormatClass::Rgb8 { .. } => {
+                    unreachable!("RGB color classes were handled before YCbCr lowering")
                 }
             }
-            unsupported => {
-                return Err(Error::Unsupported(format!(
-                    "display semantics for color model {unsupported:?} are undefined"
-                )));
-            }
-        };
+        }
+    };
     let display_format = DisplayImageFormat {
         kind,
         channels,
@@ -853,13 +799,26 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
     })
 }
 
-fn validate_display_yuv_depth(bits: u8, storage_bits: u8) -> Result<()> {
-    if matches!((bits, storage_bits), (8, 8) | (10 | 12 | 16, 16)) {
-        Ok(())
+fn classify_display_format(format: &PixelFormat) -> Result<ColorFormatClass> {
+    match classify_pixel_format(format) {
+        Ok(PixelFormatClass::Color(color)) => Ok(color),
+        Ok(PixelFormatClass::Numeric(numeric)) => Err(numeric_display_error(numeric)),
+        Err(error) => Err(Error::Unsupported(format!(
+            "display image format is unsupported: {error}"
+        ))),
+    }
+}
+
+fn numeric_display_error(numeric: NumericFormatClass) -> Error {
+    if numeric.wgsl == WgslNumericCapability::UnavailableFloat64 {
+        Error::Unsupported(
+            "display conversion has no implicit color semantics for numeric F64; portable WGSL also has no native F64 arithmetic"
+                .into(),
+        )
     } else {
-        Err(Error::Unsupported(format!(
-            "display YCbCr depth {bits} in {storage_bits}-bit storage is unsupported"
-        )))
+        Error::Unsupported(format!(
+            "display conversion has no implicit color semantics for numeric format {numeric:?}"
+        ))
     }
 }
 
@@ -919,38 +878,6 @@ fn display_chroma_siting(location: ChromaLocation, divisor: u8) -> Result<u8> {
             "display chroma location {unsupported:?} is not supported for {divisor}:1 subsampling"
         ))),
     }
-}
-
-fn stored_plane_channels(plane: &jxl_gpu_formats::PlaneFormat) -> Option<(Vec<Channel>, u8, u8)> {
-    let mut channels = Vec::with_capacity(plane.words.len());
-    let mut channel_bits = None;
-    let mut storage_bits = None;
-    for word in &plane.words {
-        let field = word.fields.first()?;
-        let PackingFieldKind::Channel(channel) = field.kind else {
-            return None;
-        };
-        if word
-            .fields
-            .iter()
-            .skip(1)
-            .any(|field| !matches!(field.kind, PackingFieldKind::Padding) || field.bits == 0)
-        {
-            return None;
-        }
-        let word_bits = u8::try_from(word.bits()).ok()?;
-        if channel_bits
-            .replace(field.bits)
-            .is_some_and(|bits| bits != field.bits)
-            || storage_bits
-                .replace(word_bits)
-                .is_some_and(|bits| bits != word_bits)
-        {
-            return None;
-        }
-        channels.push(channel);
-    }
-    Some((channels, channel_bits?, storage_bits?))
 }
 
 fn validate_display_descriptor(descriptor: DisplayTextureDescriptor) -> Result<()> {
@@ -1073,11 +1000,68 @@ struct DisplayImageParams {
     _padding: u32,
 }
 
+const _: () = {
+    assert!(std::mem::size_of::<DisplayRgbParams>() == 32);
+    assert!(std::mem::align_of::<DisplayRgbParams>() == 4);
+    assert!(std::mem::size_of::<DisplayImageParams>() == 96);
+    assert!(std::mem::align_of::<DisplayImageParams>() == 4);
+};
+
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
 
     use super::*;
+
+    fn abi_words<T: Pod>(value: &T) -> &[u32] {
+        bytemuck::cast_slice(std::slice::from_ref(value))
+    }
+
+    fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
+        let marker = format!("struct {name} {{");
+        let (_, after_marker) = shader
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
+        let (body, _) = after_marker
+            .split_once("};")
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
+        let actual = body
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "WGSL field-order drift for {name}");
+    }
+
+    #[test]
+    fn canonical_classifier_drives_vpi_display_support() {
+        let mut color_count = 0;
+        let mut numeric_count = 0;
+        for predefined in jxl_gpu_formats::vpi::VpiPitchLinearFormat::ALL {
+            let format = predefined.pixel_format();
+            let layout = ImageLayout::packed(Extent2d::new(3, 3), format.clone()).unwrap();
+            let buffer_size = align_to_word(layout.logical_size).unwrap();
+            match classify_pixel_format(&format).unwrap() {
+                PixelFormatClass::Color(_) => {
+                    color_count += 1;
+                    validate_image(&layout, buffer_size)
+                        .unwrap_or_else(|error| panic!("{}: {error}", predefined.name()));
+                }
+                PixelFormatClass::Numeric(numeric) => {
+                    numeric_count += 1;
+                    let Err(Error::Unsupported(message)) = validate_image(&layout, buffer_size)
+                    else {
+                        panic!("{} did not return typed Unsupported", predefined.name());
+                    };
+                    assert!(message.contains("no implicit color semantics"));
+                    if numeric.wgsl == WgslNumericCapability::UnavailableFloat64 {
+                        assert!(message.contains("no native F64 arithmetic"));
+                    }
+                }
+            }
+        }
+        assert_eq!(color_count, 20);
+        assert_eq!(numeric_count, 10);
+    }
 
     #[test]
     fn display_uniform_abi_sizes_are_explicit_and_aligned() {
@@ -1087,6 +1071,93 @@ mod tests {
         assert_eq!(std::mem::align_of::<DisplayImageParams>(), 4);
         assert_eq!(size_of::<DisplayRgbParams>() % 16, 0);
         assert_eq!(size_of::<DisplayImageParams>() % 16, 0);
+    }
+
+    #[test]
+    fn display_uniform_rust_word_order_matches_wgsl_field_order() {
+        let rgb = DisplayRgbParams {
+            width: 1,
+            height: 2,
+            channels: 3,
+            sample_type: 4,
+            layout: 5,
+            logical_samples: 6,
+            _padding: [7, 8],
+        };
+        assert_eq!(abi_words(&rgb), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_wgsl_fields(
+            include_str!("../shaders/display_rgb.wgsl"),
+            "DisplayRgbParams",
+            &[
+                "width",
+                "height",
+                "channels",
+                "sample_type",
+                "storage_layout",
+                "logical_samples",
+                "_padding0",
+                "_padding1",
+            ],
+        );
+
+        let image = DisplayImageParams {
+            width: 1,
+            height: 2,
+            kind: 3,
+            channels: 4,
+            order: 5,
+            matrix: 6,
+            range: 7,
+            siting_x: 8,
+            siting_y: 9,
+            subsample_x: 10,
+            subsample_y: 11,
+            bits: 12,
+            storage_bits: 13,
+            plane0_offset: 14,
+            plane0_stride: 15,
+            plane1_offset: 16,
+            plane1_stride: 17,
+            plane2_offset: 18,
+            plane2_stride: 19,
+            plane3_offset: 20,
+            plane3_stride: 21,
+            chroma_width: 22,
+            chroma_height: 23,
+            _padding: 24,
+        };
+        let expected = (1..=24).collect::<Vec<_>>();
+        assert_eq!(abi_words(&image), expected);
+        assert_wgsl_fields(
+            include_str!("../shaders/display_image.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "kind",
+                "channels",
+                "order",
+                "matrix",
+                "range",
+                "siting_x",
+                "siting_y",
+                "subsample_x",
+                "subsample_y",
+                "bits",
+                "storage_bits",
+                "plane0_offset",
+                "plane0_stride",
+                "plane1_offset",
+                "plane1_stride",
+                "plane2_offset",
+                "plane2_stride",
+                "plane3_offset",
+                "plane3_stride",
+                "chroma_width",
+                "chroma_height",
+                "_padding0",
+            ],
+        );
     }
 
     #[test]

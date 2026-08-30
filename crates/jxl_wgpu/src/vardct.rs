@@ -27,7 +27,7 @@ const DCT8_CHANNELS: usize = 3;
 const DCT8_COEFFICIENTS_PER_TASK: usize = DCT8_COEFFICIENTS_PER_CHANNEL * DCT8_CHANNELS;
 const DCT8_WORKGROUP_STORAGE_BYTES: u32 = 2 * 192 * 4;
 
-type FlattenedResource = (Vec<[f32; 4]>, u32, u32, u32, u32);
+type FlattenedResource = (Vec<GpuResourceVector>, u32, u32, u32, u32);
 
 #[derive(Clone, Copy, Debug)]
 struct Rect {
@@ -130,6 +130,10 @@ struct GpuTask {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GpuResourceVector([f32; 4]);
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct Dct8Uniform {
     task_count: u32,
     output_width: u32,
@@ -145,10 +149,19 @@ struct Dct8Uniform {
     quant_biases: [f32; 4],
 }
 
+const _: () = {
+    assert!(std::mem::size_of::<GpuTask>() == 28);
+    assert!(std::mem::align_of::<GpuTask>() == 4);
+    assert!(std::mem::size_of::<GpuResourceVector>() == 16);
+    assert!(std::mem::align_of::<GpuResourceVector>() == 16);
+    assert!(std::mem::size_of::<Dct8Uniform>() == 64);
+    assert!(std::mem::align_of::<Dct8Uniform>() == 16);
+};
+
 struct PreparedVarDct {
     coefficients: Vec<i32>,
     tasks: Vec<GpuTask>,
-    resource_vectors: Vec<[f32; 4]>,
+    resource_vectors: Vec<GpuResourceVector>,
     quant_offset: u32,
     matrix_offset: u32,
     correlation_offset: u32,
@@ -356,28 +369,28 @@ fn flatten_resource(resource: &VarDctDct8Resource) -> Result<FlattenedResource> 
         resource
             .quant_scales
             .iter()
-            .map(|scale| [scale[0], scale[1], scale[2], 0.0]),
+            .map(|scale| GpuResourceVector([scale[0], scale[1], scale[2], 0.0])),
     );
     let matrix_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(resource.dequant_matrices.iter().flat_map(|matrix| {
         matrix
             .scales
             .iter()
-            .map(|scale| [scale[0], scale[1], scale[2], 0.0])
+            .map(|scale| GpuResourceVector([scale[0], scale[1], scale[2], 0.0]))
     }));
     let correlation_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
         resource
             .correlations
             .iter()
-            .map(|correlation| [correlation[0], correlation[1], 0.0, 0.0]),
+            .map(|correlation| GpuResourceVector([correlation[0], correlation[1], 0.0, 0.0])),
     );
     let lf_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
         resource
             .lf_coefficients
             .iter()
-            .map(|lf| [lf[0], lf[1], lf[2], 0.0]),
+            .map(|lf| GpuResourceVector([lf[0], lf[1], lf[2], 0.0])),
     );
     Ok((
         vectors,
@@ -809,13 +822,115 @@ mod tests {
 
     use super::*;
 
+    fn abi_words<T: Pod>(value: &T) -> &[u32] {
+        bytemuck::cast_slice(std::slice::from_ref(value))
+    }
+
+    fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
+        let marker = format!("struct {name} {{");
+        let (_, after_marker) = shader
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
+        let (body, _) = after_marker
+            .split_once("};")
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
+        let actual = body
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "WGSL field-order drift for {name}");
+    }
+
     #[test]
     fn vardct_gpu_abi_sizes_are_explicit_and_aligned() {
         assert_eq!(size_of::<GpuTask>(), 28);
+        assert_eq!(size_of::<GpuResourceVector>(), 16);
+        assert_eq!(std::mem::align_of::<GpuResourceVector>(), 16);
         assert_eq!(size_of::<Dct8Uniform>(), 64);
         assert_eq!(size_of::<Dct8Uniform>() % 16, 0);
         assert_eq!(std::mem::align_of::<Dct8Uniform>(), 16);
         assert_eq!(DCT8_WORKGROUP_STORAGE_BYTES, 1536);
+    }
+
+    #[test]
+    fn vardct_rust_word_order_matches_wgsl_field_order() {
+        let task = GpuTask {
+            coefficient_offset: 1,
+            destination_x: 2,
+            destination_y: 3,
+            quant_index: 4,
+            matrix_index: 5,
+            correlation_index: 6,
+            lf_index: 7,
+        };
+        assert_eq!(abi_words(&task), &[1, 2, 3, 4, 5, 6, 7]);
+
+        let resource = GpuResourceVector([
+            f32::from_bits(1),
+            f32::from_bits(2),
+            f32::from_bits(3),
+            f32::from_bits(4),
+        ]);
+        assert_eq!(abi_words(&resource), &[1, 2, 3, 4]);
+
+        let params = Dct8Uniform {
+            task_count: 1,
+            output_width: 2,
+            output_height: 3,
+            output_stride_x: 4,
+            output_stride_y: 5,
+            output_stride_b: 6,
+            quant_offset: 7,
+            matrix_offset: 8,
+            correlation_offset: 9,
+            lf_offset: 10,
+            _padding: [11, 12],
+            quant_biases: [
+                f32::from_bits(13),
+                f32::from_bits(14),
+                f32::from_bits(15),
+                f32::from_bits(16),
+            ],
+        };
+        assert_eq!(abi_words(&params), &(1..=16).collect::<Vec<_>>());
+
+        let shader = include_str!("../shaders/vardct_dct8.wgsl");
+        assert!(
+            shader.contains("var<storage, read> resources: array<vec4<f32>>;"),
+            "WGSL resource element ABI drifted from a 16-byte vec4"
+        );
+        assert_wgsl_fields(
+            shader,
+            "Task",
+            &[
+                "coefficient_offset",
+                "destination_x",
+                "destination_y",
+                "quant_index",
+                "matrix_index",
+                "correlation_index",
+                "lf_index",
+            ],
+        );
+        assert_wgsl_fields(
+            shader,
+            "Params",
+            &[
+                "task_count",
+                "output_width",
+                "output_height",
+                "output_stride_x",
+                "output_stride_y",
+                "output_stride_b",
+                "quant_offset",
+                "matrix_offset",
+                "correlation_offset",
+                "lf_offset",
+                "_pad0",
+                "_pad1",
+                "quant_biases",
+            ],
+        );
     }
     use jxl_gpu_protocol::{
         Border2d, CoefficientOverflow, Extent2d, FrameSessionDesc, GroupPayload, MemoryMode,
@@ -1140,7 +1255,7 @@ mod tests {
         let prepared = PreparedVarDct {
             coefficients: vec![0; 192],
             tasks: vec![GpuTask::zeroed()],
-            resource_vectors: vec![[0.0; 4]; 3],
+            resource_vectors: vec![GpuResourceVector::zeroed(); 3],
             quant_offset: 0,
             matrix_offset: 0,
             correlation_offset: 0,
@@ -1149,7 +1264,7 @@ mod tests {
         };
         let expected = 192 * std::mem::size_of::<i32>()
             + std::mem::size_of::<GpuTask>()
-            + 3 * std::mem::size_of::<[f32; 4]>()
+            + 3 * std::mem::size_of::<GpuResourceVector>()
             + std::mem::size_of::<Dct8Uniform>();
         assert_eq!(
             prepared_transient_bytes(&prepared).unwrap(),

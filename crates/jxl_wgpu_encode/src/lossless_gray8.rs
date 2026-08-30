@@ -20,8 +20,6 @@ use crate::{
     ProfileCapability, ProgressivePlan, UnsupportedFeature, WgpuContext, assemble_frame,
 };
 
-const OUTPUT_HEADER_WORDS: usize = 53;
-const EVENT_WORDS: usize = 4;
 const MAX_DIMENSION: u32 = 256;
 const SHADER: &str = include_str!("lossless_gray8.wgsl");
 
@@ -34,7 +32,36 @@ struct Gray8Params {
     byte_offset: u32,
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<Gray8Params>()];
+/// Fixed storage-buffer header written by `lossless_gray8.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Gray8ArtifactHeader {
+    event_count: u32,
+    raw_counts: [u32; RAW_SYMBOLS],
+    lz77_counts: [u32; LZ77_SYMBOLS],
+}
+
+/// Fixed storage-buffer event written after [`Gray8ArtifactHeader`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Gray8Event {
+    kind: u32,
+    token: u32,
+    extra_bit_count: u32,
+    extra_bits: u32,
+}
+
+const OUTPUT_HEADER_WORDS: usize = std::mem::size_of::<Gray8ArtifactHeader>() / 4;
+const EVENT_WORDS: usize = std::mem::size_of::<Gray8Event>() / 4;
+
+const _: () = {
+    assert!(std::mem::size_of::<Gray8Params>() == 16);
+    assert!(std::mem::align_of::<Gray8Params>() == 4);
+    assert!(std::mem::size_of::<Gray8ArtifactHeader>() == 53 * 4);
+    assert!(std::mem::align_of::<Gray8ArtifactHeader>() == 4);
+    assert!(std::mem::size_of::<Gray8Event>() == 16);
+    assert!(std::mem::align_of::<Gray8Event>() == 4);
+};
 
 /// Checked memory accounting for one concrete Gray8 submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -567,12 +594,11 @@ impl LosslessGray8Job {
             .map_err(|_| EncodeError::Backend("mapped artifact size overflow".into()))?;
         let bytes = mapped
             .get(..expected)
-            .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?
-            .to_vec();
+            .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?;
+        let result = build_packets(self.width, self.height, self.max_events, bytes);
         drop(mapped);
         staging.unmap();
-        let (packets, acceleration) =
-            build_packets(self.width, self.height, self.max_events, &bytes)?;
+        let (packets, acceleration) = result?;
         Ok(GpuFrameArtifacts {
             frame_index: self.frame_index,
             is_last: self.is_last,
@@ -803,50 +829,54 @@ fn build_packets(
     max_events: usize,
     bytes: &[u8],
 ) -> Result<(FramePacketSet, GpuAccelerationArtifact), EncodeError> {
-    let words = bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
-        .collect::<Vec<_>>();
-    if words.len() < OUTPUT_HEADER_WORDS {
-        return Err(EncodeError::Backend(
-            "GPU artifact header is truncated".into(),
-        ));
-    }
-    let event_count = usize::try_from(words[0])
+    let header_bytes = bytes
+        .get(..std::mem::size_of::<Gray8ArtifactHeader>())
+        .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
+    let header = bytemuck::try_cast_slice::<u8, Gray8ArtifactHeader>(header_bytes)
+        .map_err(|_| EncodeError::Backend("GPU artifact header has an invalid ABI layout".into()))?
+        .first()
+        .copied()
+        .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
+    let event_count = usize::try_from(header.event_count)
         .map_err(|_| EncodeError::Backend("GPU event count overflow".into()))?;
     if event_count > max_events {
         return Err(EncodeError::Backend(
             "GPU emitted more token events than the output allocation".into(),
         ));
     }
-    let raw_counts: [u32; RAW_SYMBOLS] = words[1..1 + RAW_SYMBOLS]
-        .try_into()
-        .expect("artifact header has all raw counts");
-    let lz77_counts: [u32; LZ77_SYMBOLS] = words[20..20 + LZ77_SYMBOLS]
-        .try_into()
-        .expect("artifact header has all LZ77 counts");
-    let required_words = OUTPUT_HEADER_WORDS
-        .checked_add(
-            event_count
-                .checked_mul(EVENT_WORDS)
-                .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?,
-        )
+    let event_bytes = event_count
+        .checked_mul(std::mem::size_of::<Gray8Event>())
         .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
-    if words.len() < required_words {
-        return Err(EncodeError::Backend("GPU event stream is truncated".into()));
-    }
+    let required_bytes = std::mem::size_of::<Gray8ArtifactHeader>()
+        .checked_add(event_bytes)
+        .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
+    let events = bytes
+        .get(std::mem::size_of::<Gray8ArtifactHeader>()..required_bytes)
+        .ok_or_else(|| EncodeError::Backend("GPU event stream is truncated".into()))?;
+    let events = bytemuck::try_cast_slice::<u8, Gray8Event>(events)
+        .map_err(|_| EncodeError::Backend("GPU event stream has an invalid ABI layout".into()))?;
 
-    let primary = PrefixCode::from_gpu_counts(&raw_counts, &lz77_counts);
+    let primary = PrefixCode::from_gpu_counts(&header.raw_counts, &header.lz77_counts);
     let unused = PrefixCode::fixed_unused_channel();
     let codes = [primary.clone(), unused.clone(), unused.clone(), unused];
     let mut group = BitWriter::new();
     write_dc_global(&mut group, &codes)?;
     let token_bit_offset_in_group = u64::try_from(group.bit_len())
         .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
-    for event in words[OUTPUT_HEADER_WORDS..required_words].chunks_exact(EVENT_WORDS) {
-        match event[0] {
-            0 => codes[0].write_raw(&mut group, event[1], event[2], event[3])?,
-            1 => codes[0].write_run(&mut group, event[1], event[2], event[3])?,
+    for event in events {
+        match event.kind {
+            0 => codes[0].write_raw(
+                &mut group,
+                event.token,
+                event.extra_bit_count,
+                event.extra_bits,
+            )?,
+            1 => codes[0].write_run(
+                &mut group,
+                event.token,
+                event.extra_bit_count,
+                event.extra_bits,
+            )?,
             _ => {
                 return Err(EncodeError::Backend(
                     "GPU emitted an unknown token kind".into(),
@@ -1032,18 +1062,48 @@ mod tests {
         assert_eq!(std::mem::size_of::<Gray8Params>(), 16);
         assert_eq!(std::mem::align_of::<Gray8Params>(), 4);
         let params = Gray8Params {
-            width: 0x0403_0201,
-            height: 0x0807_0605,
-            row_stride: 0x0c0b_0a09,
-            byte_offset: 0x100f_0e0d,
+            width: 1,
+            height: 2,
+            row_stride: 3,
+            byte_offset: 4,
         };
         assert_eq!(
-            bytemuck::bytes_of(&params),
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            bytemuck::cast::<Gray8Params, [u32; 4]>(params),
+            [1, 2, 3, 4]
         );
         assert!(SHADER.contains(
             "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n}"
         ));
+    }
+
+    #[test]
+    fn gray8_artifact_abi_matches_wgsl_word_schema() {
+        assert_eq!(std::mem::size_of::<Gray8ArtifactHeader>(), 53 * 4);
+        assert_eq!(std::mem::align_of::<Gray8ArtifactHeader>(), 4);
+        assert_eq!(std::mem::size_of::<Gray8Event>(), 4 * 4);
+        assert_eq!(std::mem::align_of::<Gray8Event>(), 4);
+
+        let header = Gray8ArtifactHeader {
+            event_count: 7,
+            raw_counts: std::array::from_fn(|index| 100 + index as u32),
+            lz77_counts: std::array::from_fn(|index| 200 + index as u32),
+        };
+        let words = bytemuck::cast::<Gray8ArtifactHeader, [u32; 53]>(header);
+        assert_eq!(words[0], 7);
+        assert_eq!(words[1..20], header.raw_counts);
+        assert_eq!(words[20..53], header.lz77_counts);
+
+        let event = Gray8Event {
+            kind: 1,
+            token: 2,
+            extra_bit_count: 3,
+            extra_bits: 4,
+        };
+        assert_eq!(bytemuck::cast::<Gray8Event, [u32; 4]>(event), [1, 2, 3, 4]);
+        assert!(SHADER.contains("Word 0 is the event count, words 1..20 are raw-token counts"));
+        assert!(SHADER.contains("// (kind, token, extra-bit count, extra bits)."));
+        assert!(SHADER.contains("const OUTPUT_HEADER_WORDS: u32 = 53u;"));
+        assert!(SHADER.contains("const EVENT_WORDS: u32 = 4u;"));
     }
 
     /// Mirrors only the event-admission control flow in `encode` WGSL. A

@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaLocation, ColorModel, ColorRange, ColorSpecification, ImageLayout,
-    PackingFieldKind, SampleKind, Swizzle, YcbcrEncoding,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
+    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
+    WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{
     ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId, GroupPayload, MemoryMode, OutputDesc,
@@ -2204,16 +2205,6 @@ fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImageOutput> {
             layout.planes.len()
         )));
     }
-    if layout.format.sample_kind != SampleKind::Unsigned {
-        return Err(Error::Unsupported(
-            "generic GPU output currently requires unsigned integer storage".into(),
-        ));
-    }
-    if layout.format.byte_order == ByteOrder::Big {
-        return Err(Error::Unsupported(
-            "big-endian generic GPU output is not supported by portable WGSL".into(),
-        ));
-    }
     let mut plane_offsets = [0; 4];
     let mut plane_strides = [0; 4];
     for (index, plane) in layout.planes.iter().enumerate() {
@@ -2221,48 +2212,18 @@ fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImageOutput> {
         plane_strides[index] = to_shader_u32(plane.row_stride)?;
     }
 
-    match layout.format.model {
-        ColorModel::Rgb => {
-            let stored = layout
-                .format
-                .planes
-                .iter()
-                .map(image_byte_word_channels)
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    Error::Unsupported(
-                        "RGB GPU output currently supports only unsigned 8-bit channels".into(),
-                    )
-                })?;
-            let (kind, channels) = match stored.as_slice() {
-                [interleaved] if matches!(interleaved.len(), 3 | 4) => {
-                    (0, interleaved.len() as u32)
-                }
-                planar
-                    if matches!(planar.len(), 3 | 4)
-                        && planar.iter().all(|channels| channels.len() == 1) =>
-                {
-                    (1, planar.len() as u32)
-                }
-                _ => {
-                    return Err(Error::Unsupported(
-                        "RGB GPU output requires interleaved or planar RGB(A)/BGR(A)8".into(),
-                    ));
-                }
+    let class = classify_image_output_format(&layout.format)?;
+    match class {
+        ColorFormatClass::Rgb8 { storage, order } => {
+            let kind = match storage {
+                RgbStorage::Interleaved => 0,
+                RgbStorage::Planar => 1,
             };
-            let order = if layout.format.swizzle == Swizzle::XYZ1 {
-                0
-            } else if layout.format.swizzle == Swizzle::ZYX1 {
-                1
-            } else if layout.format.swizzle == Swizzle::XYZW {
-                2
-            } else if layout.format.swizzle == Swizzle::ZYXW {
-                3
-            } else {
-                return Err(Error::Unsupported(format!(
-                    "RGB GPU output swizzle {:?} is unsupported",
-                    layout.format.swizzle
-                )));
+            let (channels, order) = match order {
+                RgbChannelOrder::Rgb => (3, 0),
+                RgbChannelOrder::Bgr => (3, 1),
+                RgbChannelOrder::Rgba => (4, 2),
+                RgbChannelOrder::Bgra => (4, 3),
             };
             Ok(PreparedImageOutput {
                 kind,
@@ -2280,86 +2241,38 @@ fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImageOutput> {
                 plane_strides,
             })
         }
-        ColorModel::Ycbcr => {
+        color => {
             let (matrix, range, siting_x, siting_y) = image_color_params(layout)?;
             let (subsample_x, subsample_y) = layout
                 .format
                 .chroma_subsampling
                 .chroma_divisors()
                 .unwrap_or((1, 1));
-            let stored_planes = layout
-                .format
-                .planes
-                .iter()
-                .map(image_stored_plane_channels)
-                .collect::<Option<Vec<_>>>();
-            let (kind, channels, order, bits, storage_bits) = if let Some(stored) = stored_planes {
-                match stored.as_slice() {
-                    [(y, bits, storage)] if y.as_slice() == [Channel::X] => {
-                        if !matches!((*bits, *storage), (8, 8) | (16, 16)) {
-                            return Err(Error::Unsupported(
-                                "generic luma output supports Y8 and Y16".into(),
-                            ));
-                        }
-                        (if *bits == 8 { 2 } else { 3 }, 1, 0, *bits, *storage)
-                    }
-                    [(packed, 8, 8)]
-                        if packed.as_slice()
-                            == [Channel::X, Channel::Y, Channel::X, Channel::Z] =>
-                    {
-                        (6, 3, 0, 8, 8)
-                    }
-                    [(packed, 8, 8)]
-                        if packed.as_slice()
-                            == [Channel::Y, Channel::X, Channel::Z, Channel::X] =>
-                    {
-                        (6, 3, 1, 8, 8)
-                    }
-                    [
-                        (y, bits, storage),
-                        (cb, cb_bits, cb_storage),
-                        (cr, cr_bits, cr_storage),
-                    ] if y.as_slice() == [Channel::X]
-                        && cb.as_slice() == [Channel::Y]
-                        && cr.as_slice() == [Channel::Z]
-                        && bits == cb_bits
-                        && bits == cr_bits
-                        && storage == cb_storage
-                        && storage == cr_storage =>
-                    {
-                        validate_image_yuv_depth(*bits, *storage)?;
-                        (4, 3, 0, *bits, *storage)
-                    }
-                    [(y, bits, storage), (chroma, chroma_bits, chroma_storage)]
-                        if y.as_slice() == [Channel::X]
-                            && chroma.as_slice() == [Channel::Y, Channel::Z]
-                            && bits == chroma_bits
-                            && storage == chroma_storage =>
-                    {
-                        validate_image_yuv_depth(*bits, *storage)?;
-                        (5, 3, 0, *bits, *storage)
-                    }
-                    [(y, bits, storage), (chroma, chroma_bits, chroma_storage)]
-                        if y.as_slice() == [Channel::X]
-                            && chroma.as_slice() == [Channel::Z, Channel::Y]
-                            && bits == chroma_bits
-                            && storage == chroma_storage =>
-                    {
-                        validate_image_yuv_depth(*bits, *storage)?;
-                        (5, 3, 1, *bits, *storage)
-                    }
-                    _ => {
-                        return Err(Error::Unsupported(
-                            "YCbCr GPU output requires Y8, planar/semi-planar YUV8, NV12/NV21/NV24/NV42, YUYV, or UYVY"
-                                .into(),
-                        ));
-                    }
+            let (kind, channels, order, bits, storage_bits) = match color {
+                ColorFormatClass::Luma { bits, storage_bits } => {
+                    (if bits == 8 { 2 } else { 3 }, 1, 0, bits, storage_bits)
                 }
-            } else {
-                return Err(Error::Unsupported(
-                    "generic YCbCr numeric packing is not representable by the portable output shader"
-                        .into(),
-                ));
+                ColorFormatClass::YuvPlanar {
+                    bits, storage_bits, ..
+                } => (4, 3, 0, bits, storage_bits),
+                ColorFormatClass::YuvSemiplanar {
+                    bits,
+                    storage_bits,
+                    chroma_order,
+                    ..
+                } => (
+                    5,
+                    3,
+                    u32::from(chroma_order == ChromaOrder::CrCb),
+                    bits,
+                    storage_bits,
+                ),
+                ColorFormatClass::Yuv422Packed { order } => {
+                    (6, 3, u32::from(order == Packed422Order::Uyvy), 8, 8)
+                }
+                ColorFormatClass::Rgb8 { .. } => {
+                    unreachable!("RGB color classes were handled before YCbCr lowering")
+                }
             };
             Ok(PreparedImageOutput {
                 kind,
@@ -2377,69 +2290,29 @@ fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImageOutput> {
                 plane_strides,
             })
         }
-        unsupported => Err(Error::Unsupported(format!(
-            "generic GPU output color model {unsupported:?} is not a display encoding"
+    }
+}
+
+fn classify_image_output_format(format: &PixelFormat) -> Result<ColorFormatClass> {
+    match classify_pixel_format(format) {
+        Ok(PixelFormatClass::Color(color)) => Ok(color),
+        Ok(PixelFormatClass::Numeric(numeric)) => Err(numeric_image_output_error(numeric)),
+        Err(error) => Err(Error::Unsupported(format!(
+            "generic GPU output format is unsupported: {error}"
         ))),
     }
 }
 
-fn image_byte_word_channels(plane: &jxl_gpu_formats::PlaneFormat) -> Option<Vec<Channel>> {
-    plane
-        .words
-        .iter()
-        .map(|word| match word.fields.as_slice() {
-            [field] if field.bits == 8 && matches!(field.kind, PackingFieldKind::Channel(_)) => {
-                let PackingFieldKind::Channel(channel) = field.kind else {
-                    unreachable!("packing kind was checked")
-                };
-                Some(channel)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn image_stored_plane_channels(
-    plane: &jxl_gpu_formats::PlaneFormat,
-) -> Option<(Vec<Channel>, u8, u8)> {
-    let mut channels = Vec::with_capacity(plane.words.len());
-    let mut channel_bits = None;
-    let mut storage_bits = None;
-    for word in &plane.words {
-        let field = word.fields.first()?;
-        let PackingFieldKind::Channel(channel) = field.kind else {
-            return None;
-        };
-        if word
-            .fields
-            .iter()
-            .skip(1)
-            .any(|field| !matches!(field.kind, PackingFieldKind::Padding) || field.bits == 0)
-        {
-            return None;
-        }
-        let word_bits = u8::try_from(word.bits()).ok()?;
-        if channel_bits
-            .replace(field.bits)
-            .is_some_and(|bits| bits != field.bits)
-            || storage_bits
-                .replace(word_bits)
-                .is_some_and(|bits| bits != word_bits)
-        {
-            return None;
-        }
-        channels.push(channel);
-    }
-    Some((channels, channel_bits?, storage_bits?))
-}
-
-fn validate_image_yuv_depth(bits: u8, storage_bits: u8) -> Result<()> {
-    if matches!((bits, storage_bits), (8, 8) | (10 | 12 | 16, 16)) {
-        Ok(())
+fn numeric_image_output_error(numeric: NumericFormatClass) -> Error {
+    if numeric.wgsl == WgslNumericCapability::UnavailableFloat64 {
+        Error::Unsupported(
+            "generic GPU output does not assign color semantics to numeric F64; portable WGSL also has no native F64 arithmetic"
+                .into(),
+        )
     } else {
-        Err(Error::Unsupported(format!(
-            "YCbCr output depth {bits} in {storage_bits}-bit storage is unsupported"
-        )))
+        Error::Unsupported(format!(
+            "generic GPU output does not assign color semantics to numeric format {numeric:?}"
+        ))
     }
 }
 
@@ -2936,6 +2809,33 @@ struct ImageOutputUniform {
     _padding: [u32; 3],
 }
 
+const _: () = {
+    assert!(std::mem::size_of::<CopyParams>() == 16);
+    assert!(std::mem::align_of::<CopyParams>() == 4);
+    assert!(std::mem::size_of::<ModularParams>() == 32);
+    assert!(std::mem::align_of::<ModularParams>() == 4);
+    assert!(std::mem::size_of::<ChromaUpsampleUniform>() == 32);
+    assert!(std::mem::align_of::<ChromaUpsampleUniform>() == 4);
+    assert!(std::mem::size_of::<Chroma2dUniform>() == 32);
+    assert!(std::mem::align_of::<Chroma2dUniform>() == 4);
+    assert!(std::mem::size_of::<GaborishUniform>() == 32);
+    assert!(std::mem::align_of::<GaborishUniform>() == 4);
+    assert!(std::mem::size_of::<GaborishRgbUniform>() == 80);
+    assert!(std::mem::align_of::<GaborishRgbUniform>() == 4);
+    assert!(std::mem::size_of::<EpfUniform>() == 80);
+    assert!(std::mem::align_of::<EpfUniform>() == 4);
+    assert!(std::mem::size_of::<UpsampleUniform>() == 32);
+    assert!(std::mem::align_of::<UpsampleUniform>() == 4);
+    assert!(std::mem::size_of::<YcbcrUniform>() == 32);
+    assert!(std::mem::align_of::<YcbcrUniform>() == 4);
+    assert!(std::mem::size_of::<PremultiplyUniform>() == 32);
+    assert!(std::mem::align_of::<PremultiplyUniform>() == 4);
+    assert!(std::mem::size_of::<SaveUniform>() == 32);
+    assert!(std::mem::align_of::<SaveUniform>() == 4);
+    assert!(std::mem::size_of::<ImageOutputUniform>() == 128);
+    assert!(std::mem::align_of::<ImageOutputUniform>() == 4);
+};
+
 #[cfg(test)]
 mod tests {
     use std::mem::{align_of, size_of};
@@ -2948,6 +2848,61 @@ mod tests {
     use crate::arena::{ArenaAllocation, ArenaPlan};
 
     use super::*;
+
+    fn abi_words<T: Pod>(value: &T) -> &[u32] {
+        bytemuck::cast_slice(std::slice::from_ref(value))
+    }
+
+    fn assert_sequential_words<T: Pod>(value: &T) {
+        let expected =
+            (1..=u32::try_from(size_of::<T>() / size_of::<u32>()).unwrap()).collect::<Vec<_>>();
+        assert_eq!(abi_words(value), expected);
+    }
+
+    fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
+        let marker = format!("struct {name} {{");
+        let (_, after_marker) = shader
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
+        let (body, _) = after_marker
+            .split_once("};")
+            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
+        let actual = body
+            .lines()
+            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "WGSL field-order drift for {name}");
+    }
+
+    #[test]
+    fn canonical_classifier_drives_vpi_image_output_support() {
+        let mut color_count = 0;
+        let mut numeric_count = 0;
+        for predefined in jxl_gpu_formats::vpi::VpiPitchLinearFormat::ALL {
+            let format = predefined.pixel_format();
+            let layout = ImageLayout::packed(Extent2d::new(3, 3), format.clone()).unwrap();
+            match classify_pixel_format(&format).unwrap() {
+                PixelFormatClass::Color(_) => {
+                    color_count += 1;
+                    prepare_image_output(&layout)
+                        .unwrap_or_else(|error| panic!("{}: {error}", predefined.name()));
+                }
+                PixelFormatClass::Numeric(numeric) => {
+                    numeric_count += 1;
+                    let Error::Unsupported(message) = prepare_image_output(&layout).unwrap_err()
+                    else {
+                        panic!("{} did not return typed Unsupported", predefined.name());
+                    };
+                    assert!(message.contains("does not assign color semantics"));
+                    if numeric.wgsl == WgslNumericCapability::UnavailableFloat64 {
+                        assert!(message.contains("no native F64 arithmetic"));
+                    }
+                }
+            }
+        }
+        assert_eq!(color_count, 20);
+        assert_eq!(numeric_count, 10);
+    }
 
     #[test]
     fn uniform_abi_sizes_are_explicit_and_naturally_aligned() {
@@ -2992,6 +2947,391 @@ mod tests {
                 "Rust/WGSL natural ABI alignment drift for {name}"
             );
         }
+    }
+
+    #[test]
+    fn uniform_rust_word_order_matches_wgsl_field_order() {
+        assert_sequential_words(&CopyParams {
+            width: 1,
+            height: 2,
+            input_stride: 3,
+            output_stride: 4,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/copy.wgsl"),
+            "Params",
+            &["width", "height", "input_stride", "output_stride"],
+        );
+
+        assert_sequential_words(&ModularParams {
+            width: 1,
+            height: 2,
+            input_stride: 3,
+            output_stride: 4,
+            multiplier: f32::from_bits(5),
+            bias: f32::from_bits(6),
+            _padding: [7, 8],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/modular_to_f32.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride",
+                "output_stride",
+                "multiplier",
+                "bias",
+                "_pad0",
+                "_pad1",
+            ],
+        );
+
+        assert_sequential_words(&ChromaUpsampleUniform {
+            input_width: 1,
+            input_height: 2,
+            output_width: 3,
+            output_height: 4,
+            input_stride: 5,
+            output_stride: 6,
+            axis: 7,
+            _padding: 8,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/chroma_upsample.wgsl"),
+            "Params",
+            &[
+                "input_width",
+                "input_height",
+                "output_width",
+                "output_height",
+                "input_stride",
+                "output_stride",
+                "axis",
+                "_pad0",
+            ],
+        );
+
+        assert_sequential_words(&Chroma2dUniform {
+            input_width: 1,
+            input_height: 2,
+            output_width: 3,
+            output_height: 4,
+            input_stride: 5,
+            output_stride: 6,
+            _padding: [7, 8],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/chroma_2d.wgsl"),
+            "Params",
+            &[
+                "input_width",
+                "input_height",
+                "output_width",
+                "output_height",
+                "input_stride",
+                "output_stride",
+                "_pad0",
+                "_pad1",
+            ],
+        );
+
+        assert_sequential_words(&GaborishUniform {
+            width: 1,
+            height: 2,
+            input_stride: 3,
+            output_stride: 4,
+            weight0: f32::from_bits(5),
+            weight1: f32::from_bits(6),
+            weight2: f32::from_bits(7),
+            _padding: 8,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/gaborish.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride",
+                "output_stride",
+                "weight0",
+                "weight1",
+                "weight2",
+                "_pad0",
+            ],
+        );
+
+        assert_sequential_words(&GaborishRgbUniform {
+            width: 1,
+            height: 2,
+            input_stride_x: 3,
+            input_stride_y: 4,
+            input_stride_b: 5,
+            output_stride_x: 6,
+            output_stride_y: 7,
+            output_stride_b: 8,
+            weights_x: [
+                f32::from_bits(9),
+                f32::from_bits(10),
+                f32::from_bits(11),
+                f32::from_bits(12),
+            ],
+            weights_y: [
+                f32::from_bits(13),
+                f32::from_bits(14),
+                f32::from_bits(15),
+                f32::from_bits(16),
+            ],
+            weights_b: [
+                f32::from_bits(17),
+                f32::from_bits(18),
+                f32::from_bits(19),
+                f32::from_bits(20),
+            ],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/gaborish_rgb.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride_x",
+                "input_stride_y",
+                "input_stride_b",
+                "output_stride_x",
+                "output_stride_y",
+                "output_stride_b",
+                "weight0_x",
+                "weight1_x",
+                "weight2_x",
+                "_pad_x",
+                "weight0_y",
+                "weight1_y",
+                "weight2_y",
+                "_pad_y",
+                "weight0_b",
+                "weight1_b",
+                "weight2_b",
+                "_pad_b",
+            ],
+        );
+
+        assert_sequential_words(&EpfUniform {
+            width: 1,
+            height: 2,
+            input_stride_x: 3,
+            input_stride_y: 4,
+            input_stride_b: 5,
+            output_stride_x: 6,
+            output_stride_y: 7,
+            output_stride_b: 8,
+            sigma_width: 9,
+            sigma_height: 10,
+            sigma_stride: 11,
+            sigma_is_plane: 12,
+            sigma_scale: f32::from_bits(13),
+            border_sad_mul: f32::from_bits(14),
+            channel_scale_x: f32::from_bits(15),
+            channel_scale_y: f32::from_bits(16),
+            channel_scale_b: f32::from_bits(17),
+            min_sigma: f32::from_bits(18),
+            _padding: [19, 20],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/epf.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride_x",
+                "input_stride_y",
+                "input_stride_b",
+                "output_stride_x",
+                "output_stride_y",
+                "output_stride_b",
+                "sigma_width",
+                "sigma_height",
+                "sigma_stride",
+                "sigma_is_plane",
+                "sigma_scale",
+                "border_sad_mul",
+                "channel_scale_x",
+                "channel_scale_y",
+                "channel_scale_b",
+                "min_sigma",
+                "_pad0",
+                "_pad1",
+            ],
+        );
+
+        assert_sequential_words(&UpsampleUniform {
+            input_width: 1,
+            input_height: 2,
+            output_width: 3,
+            output_height: 4,
+            input_stride: 5,
+            output_stride: 6,
+            factor: 7,
+            _padding: 8,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/upsample.wgsl"),
+            "Params",
+            &[
+                "input_width",
+                "input_height",
+                "output_width",
+                "output_height",
+                "input_stride",
+                "output_stride",
+                "factor",
+                "_pad0",
+            ],
+        );
+
+        assert_sequential_words(&YcbcrUniform {
+            width: 1,
+            height: 2,
+            cb_stride: 3,
+            y_stride: 4,
+            cr_stride: 5,
+            output_stride: 6,
+            component: 7,
+            _padding: 8,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/ycbcr_to_rgb.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "cb_stride",
+                "y_stride",
+                "cr_stride",
+                "output_stride",
+                "component",
+                "_pad0",
+            ],
+        );
+
+        assert_sequential_words(&PremultiplyUniform {
+            width: 1,
+            height: 2,
+            color_stride: 3,
+            alpha_stride: 4,
+            output_stride: 5,
+            _padding: [6, 7, 8],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/premultiply_alpha.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "color_stride",
+                "alpha_stride",
+                "output_stride",
+                "_pad0",
+                "_pad1",
+                "_pad2",
+            ],
+        );
+
+        assert_sequential_words(&SaveUniform {
+            width: 1,
+            height: 2,
+            source_stride: 3,
+            channels: 4,
+            channel: 5,
+            layout: 6,
+            orientation: 7,
+            _padding: 8,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/save.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "source_stride",
+                "channels",
+                "channel",
+                "output_layout",
+                "orientation",
+                "_pad0",
+            ],
+        );
+
+        assert_sequential_words(&ImageOutputUniform {
+            width: 1,
+            height: 2,
+            source_width: 3,
+            source_height: 4,
+            r_stride: 5,
+            g_stride: 6,
+            b_stride: 7,
+            kind: 8,
+            channels: 9,
+            order: 10,
+            matrix: 11,
+            range: 12,
+            siting_x: 13,
+            siting_y: 14,
+            subsample_x: 15,
+            subsample_y: 16,
+            bits: 17,
+            storage_bits: 18,
+            plane0_offset: 19,
+            plane0_stride: 20,
+            plane1_offset: 21,
+            plane1_stride: 22,
+            plane2_offset: 23,
+            plane2_stride: 24,
+            plane3_offset: 25,
+            plane3_stride: 26,
+            logical_size: 27,
+            dispatch_width: 28,
+            orientation: 29,
+            _padding: [30, 31, 32],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/rgb_to_image.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "source_width",
+                "source_height",
+                "r_stride",
+                "g_stride",
+                "b_stride",
+                "kind",
+                "channels",
+                "order",
+                "matrix",
+                "range",
+                "siting_x",
+                "siting_y",
+                "subsample_x",
+                "subsample_y",
+                "bits",
+                "storage_bits",
+                "plane0_offset",
+                "plane0_stride",
+                "plane1_offset",
+                "plane1_stride",
+                "plane2_offset",
+                "plane2_stride",
+                "plane3_offset",
+                "plane3_stride",
+                "logical_size",
+                "dispatch_width",
+                "orientation",
+                "_padding0",
+                "_padding1",
+                "_padding2",
+            ],
+        );
     }
 
     fn execution(allocations: Vec<ArenaAllocation>, size_bytes: u64) -> ExecutionPlan {
