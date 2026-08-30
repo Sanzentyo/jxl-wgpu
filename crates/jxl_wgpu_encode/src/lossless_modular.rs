@@ -39,6 +39,7 @@ use crate::{
 pub const LOSSLESS_MODULAR_GROUP_DIMENSION: u32 = 256;
 const LOSSLESS_MODULAR_LF_GROUP_DIMENSION: u32 = LOSSLESS_MODULAR_GROUP_DIMENSION * 8;
 const SHADER: &str = include_str!("lossless_modular.wgsl");
+const MAX_DISPATCHES_PER_ARTIFACT_BINDING: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -52,6 +53,9 @@ struct ModularParams {
     channels: u32,
     bytes_per_sample: u32,
     sample_mask: u32,
+    // An explicit 256-byte array stride keeps every batch boundary valid for the portable
+    // storage-buffer offset alignment without hidden Rust padding.
+    _padding: [u32; 55],
 }
 
 /// Fixed storage-buffer header written by `lossless_modular.wgsl`.
@@ -77,7 +81,7 @@ const OUTPUT_HEADER_WORDS: usize = std::mem::size_of::<ModularArtifactHeader>() 
 const EVENT_WORDS: usize = std::mem::size_of::<ModularEvent>() / 4;
 
 const _: () = {
-    assert!(std::mem::size_of::<ModularParams>() == 36);
+    assert!(std::mem::size_of::<ModularParams>() == 256);
     assert!(std::mem::align_of::<ModularParams>() == 4);
     assert!(std::mem::size_of::<ModularArtifactHeader>() == 53 * 4);
     assert!(std::mem::align_of::<ModularArtifactHeader>() == 4);
@@ -356,7 +360,10 @@ pub struct LosslessModularMemoryPlan {
     pub source_binding_bytes: u64,
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
+    /// Separate copy destination required before mapping. Zero when the device can map the
+    /// primary storage buffer directly.
     pub readback_bytes: u64,
+    pub direct_readback: bool,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
 }
@@ -416,6 +423,14 @@ struct ModularGroupPlan {
     max_events: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModularDispatchBatch {
+    first_dispatch: usize,
+    dispatch_count: usize,
+    artifact_byte_offset: u64,
+    artifact_binding_size: NonZeroU64,
+}
+
 #[derive(Clone, Debug)]
 struct ModularDispatchPlan {
     width: u32,
@@ -425,6 +440,7 @@ struct ModularDispatchPlan {
     bits_per_sample: u8,
     parameters: Vec<ModularParams>,
     groups: Vec<ModularGroupPlan>,
+    batches: Vec<ModularDispatchBatch>,
     source_binding_offset: u64,
     source_binding_size: NonZeroU64,
     output_size: u64,
@@ -445,6 +461,7 @@ pub struct LosslessModularBackend {
     max_buffer_size: u64,
     storage_offset_alignment: u64,
     max_compute_workgroups_per_dimension: u32,
+    direct_mapping: bool,
 }
 
 impl LosslessModularBackend {
@@ -490,6 +507,7 @@ impl LosslessModularBackend {
             max_buffer_size: limits.max_buffer_size,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+            direct_mapping: context.direct_mapping_enabled(),
         }
     }
 
@@ -644,9 +662,22 @@ impl LosslessModularBackend {
 
         let dispatch_count = usize::try_from(dispatches)
             .map_err(|_| EncodeError::InvalidSource("Modular dispatch count overflow"))?;
+        if !256_u64.is_multiple_of(self.storage_offset_alignment.max(1)) {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "min_storage_buffer_offset_alignment",
+                required: self.storage_offset_alignment,
+                available: 256,
+            }
+            .into());
+        }
+        let artifact_alignment = self.storage_offset_alignment.max(4);
         let mut parameters = Vec::with_capacity(dispatch_count);
         let mut groups = Vec::with_capacity(dispatch_count);
+        let mut batches =
+            Vec::with_capacity(dispatch_count.div_ceil(MAX_DISPATCHES_PER_ARTIFACT_BINDING));
         let mut output_size = 0u64;
+        let mut batch_first_dispatch = 0usize;
+        let mut batch_artifact_offset = 0u64;
         for group in group_grid.ordered_groups() {
             let x = group.x;
             let y = group.y;
@@ -687,8 +718,28 @@ impl LosslessModularBackend {
                 EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
             })?;
             for channel in 0..channels {
-                let output_word_offset = u32::try_from(output_size / 4).map_err(|_| {
-                    EncodeError::InvalidSource("artifact buffer exceeds WGSL u32 indexing")
+                if parameters.len() - batch_first_dispatch == MAX_DISPATCHES_PER_ARTIFACT_BINDING {
+                    batches.push(modular_dispatch_batch(
+                        batch_first_dispatch,
+                        parameters.len(),
+                        batch_artifact_offset,
+                        output_size,
+                        self.max_storage_binding_size,
+                    )?);
+                    batch_first_dispatch = parameters.len();
+                    output_size = align_up(output_size, artifact_alignment).ok_or(
+                        EncodeError::InvalidSource("artifact batch alignment overflow"),
+                    )?;
+                    batch_artifact_offset = output_size;
+                }
+                output_size = align_up(output_size, artifact_alignment).ok_or(
+                    EncodeError::InvalidSource("artifact group alignment overflow"),
+                )?;
+                let batch_word_offset = output_size.checked_sub(batch_artifact_offset).ok_or(
+                    EncodeError::InvalidSource("artifact batch offset underflow"),
+                )? / 4;
+                let output_word_offset = u32::try_from(batch_word_offset).map_err(|_| {
+                    EncodeError::InvalidSource("artifact binding exceeds WGSL u32 indexing")
                 })?;
                 parameters.push(ModularParams {
                     width,
@@ -700,6 +751,7 @@ impl LosslessModularBackend {
                     channels,
                     bytes_per_sample: u32::from(source_spec.bytes_per_sample),
                     sample_mask: (1u32 << source_spec.bits_per_sample) - 1,
+                    _padding: [0; 55],
                 });
                 groups.push(ModularGroupPlan {
                     width,
@@ -714,19 +766,14 @@ impl LosslessModularBackend {
                     .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             }
         }
-        let output_words = output_size / 4;
-        if output_words > u64::from(u32::MAX) + 1 {
-            return Err(EncodeError::InvalidSource(
-                "artifact buffer exceeds WGSL u32 indexing",
-            ));
-        }
-        if output_size > self.max_storage_binding_size {
-            return Err(UnsupportedFeature::DeviceLimit {
-                name: "max_storage_buffer_binding_size",
-                required: output_size,
-                available: self.max_storage_binding_size,
-            }
-            .into());
+        if parameters.len() > batch_first_dispatch {
+            batches.push(modular_dispatch_batch(
+                batch_first_dispatch,
+                parameters.len(),
+                batch_artifact_offset,
+                output_size,
+                self.max_storage_binding_size,
+            )?);
         }
         if output_size > self.max_buffer_size {
             return Err(UnsupportedFeature::DeviceLimit {
@@ -760,8 +807,9 @@ impl LosslessModularBackend {
             }
             .into());
         }
+        let readback_bytes = if self.direct_mapping { 0 } else { output_size };
         let owned_bytes_per_job = output_size
-            .checked_mul(2)
+            .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let addressed_bytes_per_job = owned_bytes_per_job
@@ -776,7 +824,8 @@ impl LosslessModularBackend {
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes: output_size,
-            readback_bytes: output_size,
+            readback_bytes,
+            direct_readback: self.direct_mapping,
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
@@ -788,6 +837,7 @@ impl LosslessModularBackend {
             bits_per_sample: source_spec.bits_per_sample,
             parameters,
             groups,
+            batches,
             source_binding_offset,
             source_binding_size,
             output_size,
@@ -802,6 +852,49 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .checked_add(adjustment)?
         .checked_div(alignment)?
         .checked_mul(alignment)
+}
+
+fn modular_dispatch_batch(
+    first_dispatch: usize,
+    end_dispatch: usize,
+    artifact_byte_offset: u64,
+    artifact_end: u64,
+    max_storage_binding_size: u64,
+) -> Result<ModularDispatchBatch, EncodeError> {
+    let dispatch_count =
+        end_dispatch
+            .checked_sub(first_dispatch)
+            .ok_or(EncodeError::InvalidSource(
+                "artifact batch dispatch range underflow",
+            ))?;
+    if dispatch_count == 0 {
+        return Err(EncodeError::InvalidSource(
+            "artifact batch must contain at least one dispatch",
+        ));
+    }
+    let artifact_binding_bytes =
+        artifact_end
+            .checked_sub(artifact_byte_offset)
+            .ok_or(EncodeError::InvalidSource(
+                "artifact batch byte range underflow",
+            ))?;
+    if artifact_binding_bytes > max_storage_binding_size {
+        return Err(UnsupportedFeature::DeviceLimit {
+            name: "max_storage_buffer_binding_size",
+            required: artifact_binding_bytes,
+            available: max_storage_binding_size,
+        }
+        .into());
+    }
+    let artifact_binding_size = NonZeroU64::new(artifact_binding_bytes).ok_or(
+        EncodeError::InvalidSource("artifact batch binding must not be empty"),
+    )?;
+    Ok(ModularDispatchBatch {
+        first_dispatch,
+        dispatch_count,
+        artifact_byte_offset,
+        artifact_binding_size,
+    })
 }
 
 fn event_capacity(pixel_count: usize) -> Result<usize, EncodeError> {
@@ -989,6 +1082,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
             context.device(),
             plan.memory.parameter_storage_bytes,
             plan.output_size,
+            self.direct_mapping,
         );
         let buffers = buffer_lease.buffers();
         context.queue().write_buffer(
@@ -996,30 +1090,67 @@ impl GpuEncodeBackend for LosslessModularBackend {
             0,
             bytemuck::cast_slice(&plan.parameters),
         );
-        let bind_group = context
-            .device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jxl-wgpu lossless modular bindings"),
-                layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &source.buffer,
-                            offset: plan.source_binding_offset,
-                            size: Some(plan.source_binding_size),
+        let bind_group_layout = self.pipeline.get_bind_group_layout(0);
+        let bind_groups = plan
+            .batches
+            .iter()
+            .map(|batch| {
+                let parameter_offset = u64::try_from(batch.first_dispatch)
+                    .ok()
+                    .and_then(|index| {
+                        index.checked_mul(std::mem::size_of::<ModularParams>() as u64)
+                    })
+                    .ok_or(EncodeError::InvalidSource(
+                        "artifact batch parameter offset overflow",
+                    ))?;
+                let parameter_size = u64::try_from(batch.dispatch_count)
+                    .ok()
+                    .and_then(|count| {
+                        count.checked_mul(std::mem::size_of::<ModularParams>() as u64)
+                    })
+                    .and_then(NonZeroU64::new)
+                    .ok_or(EncodeError::InvalidSource(
+                        "artifact batch parameter size overflow",
+                    ))?;
+                Ok((
+                    context
+                        .device()
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("jxl-wgpu lossless modular batch bindings"),
+                            layout: &bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &source.buffer,
+                                        offset: plan.source_binding_offset,
+                                        size: Some(plan.source_binding_size),
+                                    }),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &buffers.artifact,
+                                        offset: batch.artifact_byte_offset,
+                                        size: Some(batch.artifact_binding_size),
+                                    }),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &buffers.parameters,
+                                        offset: parameter_offset,
+                                        size: Some(parameter_size),
+                                    }),
+                                },
+                            ],
                         }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: buffers.artifact.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: buffers.parameters.as_entire_binding(),
-                    },
-                ],
-            });
+                    u32::try_from(batch.dispatch_count).map_err(|_| {
+                        EncodeError::InvalidSource("artifact batch dispatch count overflow")
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, EncodeError>>()?;
         let mut commands =
             context
                 .device()
@@ -1033,16 +1164,20 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(plan.group_grid.groups * plan.format.channel_count(), 1, 1);
+            for (bind_group, dispatch_count) in &bind_groups {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(*dispatch_count, 1, 1);
+            }
         }
-        commands.copy_buffer_to_buffer(
-            &buffers.artifact,
-            0,
-            &buffers.readback,
-            0,
-            plan.output_size,
-        );
+        if !self.direct_mapping {
+            commands.copy_buffer_to_buffer(
+                &buffers.artifact,
+                0,
+                &buffers.readback,
+                0,
+                plan.output_size,
+            );
+        }
 
         let completion = Arc::new(MapCompletion::default());
         let callback_completion = Arc::clone(&completion);
@@ -2525,7 +2660,7 @@ mod tests {
 
     #[test]
     fn modular_params_abi_matches_wgsl_storage_array() {
-        assert_eq!(std::mem::size_of::<ModularParams>(), 36);
+        assert_eq!(std::mem::size_of::<ModularParams>(), 256);
         assert_eq!(std::mem::align_of::<ModularParams>(), 4);
         let params = ModularParams {
             width: 1,
@@ -2537,13 +2672,13 @@ mod tests {
             channels: 7,
             bytes_per_sample: 8,
             sample_mask: 9,
+            _padding: [0; 55],
         };
-        assert_eq!(
-            bytemuck::cast::<ModularParams, [u32; 9]>(params),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        );
+        let words = bytemuck::cast::<ModularParams, [u32; 64]>(params);
+        assert_eq!(&words[..9], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(words[9..].iter().all(|&word| word == 0));
         assert!(SHADER.contains(
-            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n    output_word_offset: u32,\n    channel: u32,\n    channels: u32,\n    bytes_per_sample: u32,\n    sample_mask: u32,\n}"
+            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n    output_word_offset: u32,\n    channel: u32,\n    channels: u32,\n    bytes_per_sample: u32,\n    sample_mask: u32,\n    _padding: array<u32, 55>,\n}"
         ));
         assert!(SHADER.contains("var<storage, read> group_params: array<Params>;"));
     }
@@ -3134,17 +3269,16 @@ mod tests {
         )
     }
 
-    fn expected_artifact_storage_bytes(width: u32, height: u32) -> u64 {
+    fn expected_artifact_storage_bytes(width: u32, height: u32, alignment: u64) -> u64 {
         LosslessModularGroupGrid::for_extent(width, height)
             .unwrap()
             .ordered_groups()
-            .map(|group| {
+            .fold(0, |offset, group| {
                 let pixels =
                     usize::try_from(u64::from(group.width) * u64::from(group.height)).unwrap();
                 let words = OUTPUT_HEADER_WORDS + event_capacity(pixels).unwrap() * EVENT_WORDS;
-                u64::try_from(words).unwrap() * 4
+                align_up(offset, alignment).unwrap() + u64::try_from(words).unwrap() * 4
             })
-            .sum()
     }
 
     #[test]
@@ -3154,15 +3288,15 @@ mod tests {
             return;
         };
         let pool = EncoderBufferPool::new(64 * 1024);
-        let first = pool.checkout(context.device(), 16, 1024);
+        let first = pool.checkout(context.device(), 16, 1024, false);
         let first_artifact = Arc::clone(&first.buffers().artifact);
-        let second = pool.checkout(context.device(), 16, 1024);
+        let second = pool.checkout(context.device(), 16, 1024, false);
         assert!(!Arc::ptr_eq(&first_artifact, &second.buffers().artifact));
         assert_eq!(pool.stats().leased_buffer_sets, 2);
         assert_eq!(pool.stats().allocation_misses, 2);
 
         drop(first);
-        let third = pool.checkout(context.device(), 16, 1024);
+        let third = pool.checkout(context.device(), 16, 1024, false);
         assert!(Arc::ptr_eq(&first_artifact, &third.buffers().artifact));
         assert_eq!(pool.stats().reuse_hits, 1);
         assert_eq!(pool.stats().leased_buffer_sets, 2);
@@ -4072,12 +4206,31 @@ mod tests {
             );
             assert_eq!(
                 memory.artifact_storage_bytes,
-                expected_artifact_storage_bytes(width, height)
+                expected_artifact_storage_bytes(
+                    width,
+                    height,
+                    u64::from(
+                        context
+                            .device()
+                            .limits()
+                            .min_storage_buffer_offset_alignment
+                    )
+                    .max(4),
+                )
             );
-            assert_eq!(memory.readback_bytes, memory.artifact_storage_bytes);
+            assert_eq!(
+                memory.readback_bytes,
+                if memory.direct_readback {
+                    0
+                } else {
+                    memory.artifact_storage_bytes
+                }
+            );
             assert_eq!(
                 memory.owned_bytes_per_job,
-                memory.parameter_storage_bytes + memory.artifact_storage_bytes * 2
+                memory.parameter_storage_bytes
+                    + memory.artifact_storage_bytes
+                    + memory.readback_bytes
             );
             assert_eq!(
                 memory.addressed_bytes_per_job,
@@ -4580,10 +4733,17 @@ mod tests {
         let parameter_bytes = std::mem::size_of::<ModularParams>() as u64;
         assert_eq!(memory.parameter_storage_bytes, parameter_bytes);
         assert_eq!(memory.artifact_storage_bytes, expected_output_bytes);
-        assert_eq!(memory.readback_bytes, expected_output_bytes);
+        assert_eq!(
+            memory.readback_bytes,
+            if memory.direct_readback {
+                0
+            } else {
+                expected_output_bytes
+            }
+        );
         assert_eq!(
             memory.owned_bytes_per_job,
-            parameter_bytes + expected_output_bytes * 2
+            parameter_bytes + expected_output_bytes + memory.readback_bytes
         );
         assert_eq!(
             memory.addressed_bytes_per_job,

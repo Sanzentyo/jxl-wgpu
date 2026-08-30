@@ -42,17 +42,49 @@ pub(crate) struct EncoderBufferSet {
     parameter_bytes: u64,
     artifact_bytes: u64,
     allocation_bytes: u64,
+    direct_mapping: bool,
 }
 
 impl EncoderBufferSet {
-    fn new(device: &wgpu::Device, parameter_bytes: u64, artifact_bytes: u64) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        parameter_bytes: u64,
+        artifact_bytes: u64,
+        direct_mapping: bool,
+    ) -> Self {
         let allocation_bytes = parameter_bytes
-            .checked_add(
+            .checked_add(if direct_mapping {
+                artifact_bytes
+            } else {
                 artifact_bytes
                     .checked_mul(2)
-                    .expect("checked dispatch plan bounds two artifact buffers"),
-            )
+                    .expect("checked dispatch plan bounds two artifact buffers")
+            })
             .expect("checked dispatch plan bounds total pooled bytes");
+        let artifact = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jxl-wgpu lossless modular pooled GPU artifacts"),
+            size: artifact_bytes,
+            usage: if direct_mapping {
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::MAP_READ
+                    | wgpu::BufferUsages::COPY_DST
+            } else {
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST
+            },
+            mapped_at_creation: false,
+        }));
+        let readback = if direct_mapping {
+            Arc::clone(&artifact)
+        } else {
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("jxl-wgpu lossless modular pooled artifact readback"),
+                size: artifact_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }))
+        };
         Self {
             parameters: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("jxl-wgpu lossless modular pooled group parameters"),
@@ -60,23 +92,12 @@ impl EncoderBufferSet {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })),
-            artifact: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless modular pooled GPU artifacts"),
-                size: artifact_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })),
-            readback: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless modular pooled artifact readback"),
-                size: artifact_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            })),
+            artifact,
+            readback,
             parameter_bytes,
             artifact_bytes,
             allocation_bytes,
+            direct_mapping,
         }
     }
 }
@@ -156,6 +177,7 @@ impl EncoderBufferPool {
         device: &wgpu::Device,
         parameter_bytes: u64,
         artifact_bytes: u64,
+        direct_mapping: bool,
     ) -> EncoderBufferLease {
         let generation = {
             let mut state = self.lock_state();
@@ -164,6 +186,7 @@ impl EncoderBufferPool {
                 idle.generation == generation
                     && idle.buffers.parameter_bytes == parameter_bytes
                     && idle.buffers.artifact_bytes == artifact_bytes
+                    && idle.buffers.direct_mapping == direct_mapping
             });
             if let Some(idle) = exact_match.and_then(|index| state.idle.remove(index)) {
                 state.idle_bytes = state
@@ -182,7 +205,8 @@ impl EncoderBufferPool {
         };
         // Creating driver objects can be expensive. Keep cold concurrent submissions independent
         // by never holding the pool mutex across `Device::create_buffer`.
-        let buffers = EncoderBufferSet::new(device, parameter_bytes, artifact_bytes);
+        let buffers =
+            EncoderBufferSet::new(device, parameter_bytes, artifact_bytes, direct_mapping);
         {
             let mut state = self.lock_state();
             state.leased_buffer_sets = state.leased_buffer_sets.saturating_add(1);

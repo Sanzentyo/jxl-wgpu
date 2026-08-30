@@ -8,6 +8,7 @@ struct Params {
     channels: u32,
     bytes_per_sample: u32,
     sample_mask: u32,
+    _padding: array<u32, 55>,
 }
 
 @group(0) @binding(0)

@@ -16,6 +16,7 @@ pub struct WgpuContext {
     queue: Arc<wgpu::Queue>,
     poller: SubmissionPoller,
     memory_budget: MemoryBudget,
+    direct_mapping: bool,
 }
 
 const DEFAULT_ENCODER_IN_FLIGHT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
@@ -44,6 +45,9 @@ impl WgpuContext {
         let poller = SubmissionPoller::new(device.as_ref().clone())
             .map_err(BackendError::PollWorkerStart)?;
         Ok(Self {
+            direct_mapping: device
+                .features()
+                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             device,
             queue,
             poller,
@@ -59,6 +63,7 @@ impl WgpuContext {
             queue: Arc::new(backend.queue().clone()),
             poller: backend.submission_poller().clone(),
             memory_budget: backend.transient_memory_budget().clone(),
+            direct_mapping: backend.direct_readback_enabled(),
         }
     }
 
@@ -78,6 +83,10 @@ impl WgpuContext {
 
     pub(crate) const fn memory_budget(&self) -> &MemoryBudget {
         &self.memory_budget
+    }
+
+    pub(crate) const fn direct_mapping_enabled(&self) -> bool {
+        self.direct_mapping
     }
 
     /// Reports bytes reserved by all live encoder jobs sharing this context.
