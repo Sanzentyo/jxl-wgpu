@@ -18,6 +18,11 @@ pub mod artifact {
     pub use crate::vardct_artifact::*;
 }
 
+/// Runtime-neutral decoder session for the bounded standard resident path.
+pub mod engine {
+    pub use crate::vardct_engine::*;
+}
+
 /// Bounded standard-codestream inventory and metadata-prefix IR.
 pub mod frontend {
     pub use crate::vardct_frontend::*;

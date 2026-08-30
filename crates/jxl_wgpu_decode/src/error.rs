@@ -125,6 +125,8 @@ pub enum Error {
     FrontendIncomplete(#[from] FrontendIncomplete),
     #[error(transparent)]
     ModularTree(#[from] ModularTreeError),
+    #[error(transparent)]
+    VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
     #[error("GPU decode memory backpressure: {0}")]

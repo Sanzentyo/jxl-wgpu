@@ -873,6 +873,13 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
             "lossless Modular profile must use 1 through 16 bits per sample",
         )),
+        DecodeProfile::VarDctRegular {
+            bits_per_sample: 8,
+            transform,
+        } if !transform.is_special() => Ok(()),
+        DecodeProfile::VarDctRegular { .. } => Err(Error::EngineContract(
+            "the bounded VarDCT profile requires 8-bit samples and one regular transform",
+        )),
     }
 }
 

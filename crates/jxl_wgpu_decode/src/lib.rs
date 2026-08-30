@@ -31,6 +31,7 @@ mod modular_tree;
 mod profile;
 mod session;
 mod vardct_artifact;
+mod vardct_engine;
 mod vardct_frontend;
 mod vardct_lf;
 mod vardct_output;
@@ -62,7 +63,12 @@ pub use session::{
     GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure, PrefetchGpuFrames, PrefetchProgress,
     PreparedGpuSession, SubmittedGpuFrame,
 };
+pub use vardct_engine::{
+    VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctPendingFrame,
+    VarDctSubmissionEngine, vardct_rgb8_format,
+};
 pub use wgpu_engine::{
-    F64OutputPath, ModularReconstructionSpecialization, OutputWritePath, WgpuDecodeCapabilities,
-    WgpuDecodeMemoryStats, WgpuDecodeSession, WgpuPendingFrame, WgpuSubmissionEngine,
+    F64OutputPath, ModularOutputSpecialization, ModularReconstructionSpecialization,
+    OutputWritePath, WgpuDecodeCapabilities, WgpuDecodeMemoryStats, WgpuDecodeSession,
+    WgpuPendingFrame, WgpuSubmissionEngine,
 };

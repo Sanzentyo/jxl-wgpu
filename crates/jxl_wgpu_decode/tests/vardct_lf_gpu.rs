@@ -1,12 +1,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-#[path = "../src/vardct_lf.rs"]
-mod vardct_lf;
-
 use std::sync::mpsc;
 
 use jxl_wgpu::{DirectReadbackPolicy, WgpuBackend, WgpuBackendConfig};
-use vardct_lf::{ADAPTIVE_LF_SHADER, AdaptiveLfParams};
+use jxl_wgpu_decode::vardct::lf::{ADAPTIVE_LF_SHADER, AdaptiveLfParams};
 use wgpu::util::DeviceExt;
 
 fn backend() -> Option<WgpuBackend> {

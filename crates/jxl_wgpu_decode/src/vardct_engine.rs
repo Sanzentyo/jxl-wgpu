@@ -1,0 +1,1339 @@
+//! Runtime-neutral GPU submission engine for the bounded standard VarDCT profile.
+//!
+//! The accepted codestream profile is intentionally small and authoritative: one still XYB
+//! frame, one regular transform covering the complete image, fixed quantization, GPU-decoded LF
+//! and HF metadata, and a GPU-validated zero-AC HF bundle. No pixel, coefficient, transform,
+//! quantization, residual, or entropy fallback runs on the CPU.
+
+use std::collections::BTreeMap;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
+
+use jxl_gpu_bitstream::{
+    ColourEncodingInventory, ColourSpaceInventory, EdgePreservingFilterInventory,
+    GaborishInventory, InventoryLimits, PrimariesInventory, RenderingIntentInventory,
+    RestorationFilterInventory, TransferFunctionInventory, WhitePointInventory,
+};
+use jxl_gpu_formats::{ColorSpecification, ImageLayout, LayoutError, PixelFormat, RgbChannelOrder};
+use jxl_gpu_protocol::{
+    ChangedRegions, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
+};
+use jxl_wgpu::{
+    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
+    MemoryPermit, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
+    ResidentVarDctMemoryPlan, ResidentVarDctOutputPlane, ResidentVarDctRenderConfig,
+    ResidentVarDctRenderer, ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
+    UnvalidatedGpuImageOutput, WgpuBackend,
+};
+use thiserror::Error;
+use wgpu::util::DeviceExt;
+
+use crate::vardct_artifact::{
+    GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfDispatchStage, HfMetadataArtifactConfig,
+    HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
+    VAR_DCT_STRATEGY_COUNT, VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
+};
+use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams, AdaptiveLfPipeline};
+use crate::vardct_output::{
+    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputError, VarDctOutputInputs,
+    VarDctOutputPacker, VarDctOutputPlan, VarDctOutputPlane, VarDctOutputScratch,
+};
+use crate::vardct_packet::{
+    FixedVarDctPacketError, FixedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
+    VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline,
+};
+use crate::vardct_resource::{
+    VarDctResourceBuffers, VarDctResourceError, VarDctResourceLayout, VarDctResourceParams,
+    VarDctResourcePipeline,
+};
+use crate::{
+    AnimationMetadata, DecodeProfile, Error as DecodeError, FrameDuration, FrameMetadata,
+    GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
+    GpuSubmissionEngine, GpuSubmissionSession, PreparedGpuSession, Result as DecodeResult,
+    SubmittedGpuFrame,
+};
+
+const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
+const ARTIFACT_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctArtifactStatus>() as u64;
+const VALIDATION_STAGING_BYTES: u64 = PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES;
+const ADAPTIVE_LF_WORKGROUP_BYTES: u64 = 18 * 18 * 16;
+
+/// Typed production-path failure for GPU-resident VarDCT decode.
+#[derive(Debug, Error)]
+pub enum VarDctDecodeError {
+    #[error("the bounded VarDCT engine only produces tightly packed sRGB D65 RGB8 output")]
+    UnsupportedOutput,
+    #[error("the bounded VarDCT engine does not implement image orientation {orientation}")]
+    UnsupportedOrientation { orientation: u32 },
+    #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
+    UnsupportedColorEncoding,
+    #[error("the bounded VarDCT engine requires disabled Gaborish and EPF restoration")]
+    UnsupportedRestoration,
+    #[error("the bounded VarDCT engine requires frame quant-matrix scales X=3 and B=2")]
+    UnsupportedQuantMatrixScale,
+    #[error("the XYB image header does not contain an inverse opsin matrix")]
+    MissingInverseOpsin,
+    #[error("the bounded VarDCT engine requires exactly one image frame")]
+    MissingFrame,
+    #[error(transparent)]
+    Packet(#[from] FixedVarDctPacketError),
+    #[error(transparent)]
+    PacketGpu(#[from] GpuVarDctPacketError),
+    #[error(transparent)]
+    Artifact(#[from] VarDctArtifactError),
+    #[error(transparent)]
+    ArtifactGpu(#[from] GpuVarDctLoweringError),
+    #[error(transparent)]
+    Resource(#[from] VarDctResourceError),
+    #[error(transparent)]
+    Resident(#[from] ResidentVarDctError),
+    #[error(transparent)]
+    Output(#[from] VarDctOutputError),
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error("VarDCT GPU memory arithmetic overflow while computing {field}")]
+    ArithmeticOverflow { field: &'static str },
+    #[error("VarDCT {resource} needs {required} bytes, device permits {available}")]
+    DeviceLimit {
+        resource: &'static str,
+        required: u64,
+        available: u64,
+    },
+    #[error("VarDCT artifact status {field} is {actual}, expected {expected}")]
+    ArtifactStatus {
+        field: &'static str,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("mapped VarDCT validation status has an invalid {status} ABI")]
+    StatusAbi { status: &'static str },
+    #[error("VarDCT GPU completion was consumed more than once")]
+    CompletionConsumed,
+}
+
+/// Exact canonical output supported by [`VarDctSubmissionEngine`].
+#[must_use]
+pub fn vardct_rgb8_format() -> PixelFormat {
+    PixelFormat::rgb8(RgbChannelOrder::Rgb, false, ColorSpecification::Default)
+}
+
+/// Exact GPU buffer accounting for one bounded VarDCT frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarDctDecodeMemoryStats {
+    pub codestream_bytes: u64,
+    pub modular_metadata_bytes: u64,
+    pub reconstructed_bytes: u64,
+    pub raw_metadata_bytes: u64,
+    pub coefficient_bytes: u64,
+    pub packet_status_bytes: u64,
+    pub validation_staging_bytes: u64,
+    pub packet_control_bytes: u64,
+    pub modular_params_bytes: u64,
+    pub lf_temporary_bytes: u64,
+    pub resource_bytes: u64,
+    pub resource_uniform_bytes: u64,
+    pub adaptive_lf_uniform_bytes: u64,
+    pub artifact_bytes: u64,
+    pub occupancy_bytes: u64,
+    pub artifact_uniform_bytes: u64,
+    pub xyb_plane_bytes: u64,
+    pub resident_transient_bytes: u64,
+    pub output_uniform_bytes: u64,
+    /// Packed RGB8 storage retained until the final [`GpuBufferLease`] clone is dropped.
+    pub output_lease_bytes: u64,
+    /// All non-output GPU buffers retained through status validation.
+    pub transient_bytes: u64,
+    pub total_frame_bytes: u64,
+}
+
+impl VarDctDecodeMemoryStats {
+    fn plan(
+        codestream_len: usize,
+        packet: &FixedVarDctPacketPlan,
+        control: VarDctPacketControl,
+        resource: VarDctResourceLayout,
+        artifact: VarDctArtifactLayout,
+        resident: ResidentVarDctMemoryPlan,
+        output: VarDctOutputPlan,
+    ) -> Result<Self, VarDctDecodeError> {
+        let checked_words = |words: u64, field: &'static str| {
+            words
+                .checked_mul(4)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow { field })
+        };
+        let codestream_bytes = align4(u64::try_from(codestream_len).map_err(|_| {
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "codestream upload length",
+            }
+        })?)?;
+        let modular_metadata_bytes = checked_words(
+            u64::try_from(packet.modular_metadata.len()).map_err(|_| {
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "Modular metadata length",
+                }
+            })?,
+            "Modular metadata bytes",
+        )?;
+        let reconstructed_bytes = checked_words(
+            u64::from(packet.reconstructed_words()?),
+            "LF reconstruction bytes",
+        )?;
+        let raw_metadata_bytes =
+            checked_words(u64::from(control.capacities[1]), "raw HF metadata bytes")?;
+        let coefficient_bytes =
+            checked_words(u64::from(packet.coefficient_words()), "coefficient bytes")?;
+        let packet_status_bytes = PACKET_STATUS_BYTES;
+        let validation_staging_bytes = VALIDATION_STAGING_BYTES;
+        let packet_control_bytes = std::mem::size_of::<VarDctPacketControl>() as u64;
+        let modular_params_bytes = std::mem::size_of::<VarDctModularParams>() as u64;
+        let lf_temporary_bytes = u64::from(resource.block_count).checked_mul(16).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "LF temporary bytes",
+            },
+        )?;
+        let resource_bytes = resource.bytes();
+        let resource_uniform_bytes = std::mem::size_of::<VarDctResourceParams>() as u64;
+        let adaptive_lf_uniform_bytes = std::mem::size_of::<AdaptiveLfParams>() as u64;
+        let artifact_bytes = artifact.artifact_bytes;
+        let occupancy_bytes = artifact.occupancy_bytes;
+        let artifact_uniform_bytes = std::mem::size_of::<HfMetadataLoweringParams>() as u64;
+        let pixels = u64::from(packet.profile.width)
+            .checked_mul(u64::from(packet.profile.height))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "XYB pixel count",
+            })?;
+        let xyb_plane_bytes =
+            pixels
+                .checked_mul(12)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "XYB plane bytes",
+                })?;
+        let resident_transient_bytes = resident.total_bytes;
+        let output_uniform_bytes = output.memory.uniform_bytes;
+        let output_lease_bytes = output.memory.output_storage_bytes;
+        let transient_bytes = [
+            codestream_bytes,
+            modular_metadata_bytes,
+            reconstructed_bytes,
+            raw_metadata_bytes,
+            coefficient_bytes,
+            packet_status_bytes,
+            validation_staging_bytes,
+            packet_control_bytes,
+            modular_params_bytes,
+            lf_temporary_bytes,
+            resource_bytes,
+            resource_uniform_bytes,
+            adaptive_lf_uniform_bytes,
+            artifact_bytes,
+            occupancy_bytes,
+            artifact_uniform_bytes,
+            xyb_plane_bytes,
+            resident_transient_bytes,
+            output_uniform_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "VarDCT transient byte total",
+                })
+        })?;
+        let total_frame_bytes = transient_bytes.checked_add(output_lease_bytes).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "VarDCT frame byte total",
+            },
+        )?;
+        Ok(Self {
+            codestream_bytes,
+            modular_metadata_bytes,
+            reconstructed_bytes,
+            raw_metadata_bytes,
+            coefficient_bytes,
+            packet_status_bytes,
+            validation_staging_bytes,
+            packet_control_bytes,
+            modular_params_bytes,
+            lf_temporary_bytes,
+            resource_bytes,
+            resource_uniform_bytes,
+            adaptive_lf_uniform_bytes,
+            artifact_bytes,
+            occupancy_bytes,
+            artifact_uniform_bytes,
+            xyb_plane_bytes,
+            resident_transient_bytes,
+            output_uniform_bytes,
+            output_lease_bytes,
+            transient_bytes,
+            total_frame_bytes,
+        })
+    }
+}
+
+struct VarDctPipelines {
+    packet: VarDctPacketPipeline,
+    resource: VarDctResourcePipeline,
+    adaptive_lf: AdaptiveLfPipeline,
+    artifact: HfMetadataLoweringPipeline,
+    renderer: ResidentVarDctRenderer,
+    output: VarDctOutputPacker,
+}
+
+impl VarDctPipelines {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            packet: VarDctPacketPipeline::new(device),
+            resource: VarDctResourcePipeline::new(device),
+            adaptive_lf: AdaptiveLfPipeline::new(device),
+            artifact: HfMetadataLoweringPipeline::new(device),
+            renderer: ResidentVarDctRenderer::new(device),
+            output: VarDctOutputPacker::new(device),
+        }
+    }
+}
+
+/// GPU-only submission engine for the strict standard zero-AC regular-VarDCT profile.
+#[derive(Clone)]
+pub struct VarDctSubmissionEngine {
+    backend: WgpuBackend,
+    pipelines: Arc<VarDctPipelines>,
+    memory: MemoryBudget,
+}
+
+impl VarDctSubmissionEngine {
+    #[must_use]
+    pub fn new(backend: WgpuBackend) -> Self {
+        let memory = backend.transient_memory_budget().clone();
+        Self::with_memory_budget(backend, memory)
+    }
+
+    /// Uses an explicitly shared byte budget for output, entropy, render, and validation buffers.
+    #[must_use]
+    pub fn with_memory_budget(backend: WgpuBackend, memory: MemoryBudget) -> Self {
+        let pipelines = Arc::new(VarDctPipelines::new(backend.device()));
+        Self {
+            backend,
+            pipelines,
+            memory,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> &WgpuBackend {
+        &self.backend
+    }
+
+    #[must_use]
+    pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.memory.snapshot()
+    }
+}
+
+impl std::fmt::Debug for VarDctSubmissionEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VarDctSubmissionEngine")
+            .field("backend", &self.backend)
+            .field("memory", &self.memory.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+struct VarDctSource {
+    codestream_storage: Arc<[u8]>,
+    codestream_range: Range<usize>,
+    packet: FixedVarDctPacketPlan,
+    control: VarDctPacketControl,
+    resource_layout: VarDctResourceLayout,
+    resource_params: VarDctResourceParams,
+    artifact_layout: VarDctArtifactLayout,
+    artifact_params: HfMetadataLoweringParams,
+    output_plan: VarDctOutputPlan,
+    layout: ImageLayout,
+    inverse_opsin: VarDctInverseOpsin,
+    quant_biases: [f32; 4],
+    transform_index: usize,
+    memory: VarDctDecodeMemoryStats,
+}
+
+impl GpuSubmissionEngine for VarDctSubmissionEngine {
+    type Session = VarDctDecodeSession;
+
+    fn open(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+    ) -> DecodeResult<PreparedGpuSession<Self::Session>> {
+        let parsed = jxl_gpu_bitstream::parse(codestream.bytes(), self.parse_limits())?;
+        let inventory = parsed.codestream_inventory(InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: u64::try_from(codestream.bytes().len())
+                .map_err(|_| DecodeError::backend("VarDCT codestream size exceeds u64"))?,
+            ..InventoryLimits::default()
+        })?;
+        let source = prepare_source(&self.backend, codestream, request, &inventory)?;
+        let extent = source.layout.extent;
+        let profile = DecodeProfile::VarDctRegular {
+            bits_per_sample: 8,
+            transform: source.packet.transform,
+        };
+        Ok(PreparedGpuSession::new(
+            profile,
+            AnimationMetadata::still(extent),
+            VarDctDecodeSession {
+                backend: self.backend.clone(),
+                pipelines: Arc::clone(&self.pipelines),
+                memory_stats: source.memory,
+                source: Some(source),
+                memory: self.memory.clone(),
+            },
+        )
+        .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
+    }
+}
+
+fn prepare_source(
+    backend: &WgpuBackend,
+    codestream: GpuCodestream,
+    request: &GpuOutputRequest,
+    inventory: &jxl_gpu_bitstream::CodestreamInventory,
+) -> Result<VarDctSource, VarDctDecodeError> {
+    if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
+        return Err(VarDctDecodeError::UnsupportedOutput);
+    }
+    if inventory.image_header.orientation != 1 {
+        return Err(VarDctDecodeError::UnsupportedOrientation {
+            orientation: inventory.image_header.orientation,
+        });
+    }
+    if !matches!(
+        inventory.image_header.colour_encoding,
+        ColourEncodingInventory::Enumerated {
+            colour_space: ColourSpaceInventory::Rgb,
+            white_point: WhitePointInventory::D65,
+            primaries: PrimariesInventory::Srgb,
+            transfer_function: TransferFunctionInventory::Srgb,
+            rendering_intent: RenderingIntentInventory::Relative,
+        }
+    ) {
+        return Err(VarDctDecodeError::UnsupportedColorEncoding);
+    }
+    let frame = inventory
+        .frames
+        .first()
+        .ok_or(VarDctDecodeError::MissingFrame)?;
+    if !matches!(
+        frame.restoration_filter,
+        RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Disabled,
+            epf: EdgePreservingFilterInventory::Disabled,
+        }
+    ) {
+        return Err(VarDctDecodeError::UnsupportedRestoration);
+    }
+    if frame.x_qm_scale != 3 || frame.b_qm_scale != 2 {
+        return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
+    }
+    let packet = FixedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
+    let control = packet.packet_control()?;
+    let [blocks_x, blocks_y] = packet.block_extent();
+    let transform_extent = packet.transform.pixel_extent();
+    let transform_area = transform_extent
+        .width
+        .checked_mul(transform_extent.height)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "transform area",
+        })?;
+    let resource_layout = VarDctResourceLayout::new(blocks_x, blocks_y, transform_area)?;
+    let resource_params = VarDctResourceParams::new(blocks_x, blocks_y)?;
+    let transform_index = TransformKind::ALL
+        .iter()
+        .position(|&candidate| candidate == packet.transform)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "regular transform index",
+        })?;
+    let matrix_offsets = [resource_layout.matrix_offset; VAR_DCT_STRATEGY_COUNT];
+    let artifact_config = HfMetadataArtifactConfig {
+        blocks_width: blocks_x,
+        blocks_height: blocks_y,
+        block_info_entries: 1,
+        strategy_offset_words: control.offsets[2],
+        hf_mul_offset_words: control.offsets[3],
+        raw_metadata_words: u64::from(control.capacities[1]),
+        pass_group_dim_blocks: 32,
+        lf_stride: blocks_x,
+        correlation_width: 1,
+        correlation_height: 1,
+        destination_origin: [0, 0],
+        afv_basis_offset: resource_layout.matrix_offset,
+        matrix_offsets,
+    };
+    let artifact_layout = VarDctArtifactLayout::plan(
+        &artifact_config,
+        VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
+    )?;
+    let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
+    let output_plan = VarDctOutputPlan::for_limits(
+        packet.profile.width,
+        packet.profile.height,
+        &backend.device().limits(),
+    )?;
+    let layout = ImageLayout::packed(
+        Extent2d::new(packet.profile.width, packet.profile.height),
+        vardct_rgb8_format(),
+    )?;
+    let opsin = inventory
+        .image_header
+        .opsin_inverse_matrix
+        .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
+    let inverse_opsin = VarDctInverseOpsin {
+        opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
+        inverse_opsin_matrix: opsin
+            .inverse_matrix
+            .map(|row| row.map(|value| value.to_f32())),
+        intensity_target: inventory
+            .image_header
+            .tone_mapping
+            .intensity_target
+            .to_f32(),
+    };
+    let quant_biases = [
+        opsin.quant_bias[0].to_f32(),
+        opsin.quant_bias[1].to_f32(),
+        opsin.quant_bias[2].to_f32(),
+        opsin.quant_bias_numerator.to_f32(),
+    ];
+    let scratch_scalars =
+        transform_area
+            .checked_mul(3)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "resident transform scratch scalars",
+            })?;
+    let resident_memory = ResidentVarDctMemoryPlan::new(scratch_scalars)?;
+    let memory = VarDctDecodeMemoryStats::plan(
+        codestream.bytes().len(),
+        &packet,
+        control,
+        resource_layout,
+        artifact_layout,
+        resident_memory,
+        output_plan,
+    )?;
+    validate_device_limits(backend.device(), memory)?;
+    Ok(VarDctSource {
+        codestream_storage: codestream.shared_storage(),
+        codestream_range: codestream.storage_range(),
+        packet,
+        control,
+        resource_layout,
+        resource_params,
+        artifact_layout,
+        artifact_params,
+        output_plan,
+        layout,
+        inverse_opsin,
+        quant_biases,
+        transform_index,
+        memory,
+    })
+}
+
+fn validate_device_limits(
+    device: &wgpu::Device,
+    memory: VarDctDecodeMemoryStats,
+) -> Result<(), VarDctDecodeError> {
+    let limits = device.limits();
+    for (resource, required, storage) in [
+        ("codestream upload", memory.codestream_bytes, true),
+        ("Modular metadata", memory.modular_metadata_bytes, true),
+        ("LF reconstruction", memory.reconstructed_bytes, true),
+        ("raw HF metadata", memory.raw_metadata_bytes, true),
+        ("coefficients", memory.coefficient_bytes, true),
+        ("packet status", memory.packet_status_bytes, true),
+        ("validation staging", memory.validation_staging_bytes, false),
+        ("LF temporary", memory.lf_temporary_bytes, true),
+        ("VarDCT resources", memory.resource_bytes, true),
+        ("VarDCT artifact", memory.artifact_bytes, true),
+        ("artifact occupancy", memory.occupancy_bytes, true),
+        ("one XYB plane", memory.xyb_plane_bytes / 3, true),
+        ("packed RGB8 output", memory.output_lease_bytes, true),
+    ] {
+        check_limit(resource, required, limits.max_buffer_size)?;
+        if storage {
+            check_limit(resource, required, limits.max_storage_buffer_binding_size)?;
+        }
+    }
+    for (resource, required) in [
+        ("packet control uniform", memory.packet_control_bytes),
+        ("LF resource uniform", memory.resource_uniform_bytes),
+        ("adaptive LF uniform", memory.adaptive_lf_uniform_bytes),
+        ("artifact uniform", memory.artifact_uniform_bytes),
+        ("output uniform", memory.output_uniform_bytes),
+    ] {
+        check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
+    }
+    check_limit(
+        "adaptive LF workgroup storage",
+        ADAPTIVE_LF_WORKGROUP_BYTES,
+        u64::from(limits.max_compute_workgroup_storage_size),
+    )?;
+    check_limit(
+        "adaptive LF workgroup invocations",
+        16 * 16,
+        u64::from(limits.max_compute_invocations_per_workgroup),
+    )?;
+    check_limit(
+        "adaptive LF workgroup Y size",
+        16,
+        u64::from(limits.max_compute_workgroup_size_y),
+    )?;
+    Ok(())
+}
+
+fn check_limit(
+    resource: &'static str,
+    required: u64,
+    available: u64,
+) -> Result<(), VarDctDecodeError> {
+    if required > available {
+        return Err(VarDctDecodeError::DeviceLimit {
+            resource,
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
+
+/// One-frame submission state for [`VarDctSubmissionEngine`].
+pub struct VarDctDecodeSession {
+    backend: WgpuBackend,
+    pipelines: Arc<VarDctPipelines>,
+    memory_stats: VarDctDecodeMemoryStats,
+    source: Option<VarDctSource>,
+    memory: MemoryBudget,
+}
+
+impl VarDctDecodeSession {
+    #[must_use]
+    pub const fn memory_stats(&self) -> VarDctDecodeMemoryStats {
+        self.memory_stats
+    }
+
+    #[must_use]
+    pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.memory.snapshot()
+    }
+}
+
+impl std::fmt::Debug for VarDctDecodeSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VarDctDecodeSession")
+            .field("submitted", &self.source.is_none())
+            .field("memory_stats", &self.memory_stats())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GpuSubmissionSession for VarDctDecodeSession {
+    type Frame = GpuImageFrame;
+    type Pending = VarDctPendingFrame;
+
+    fn submit_next(&mut self) -> DecodeResult<Option<Self::Pending>> {
+        let Some(source) = self.source.as_ref() else {
+            return Ok(None);
+        };
+        let poll_permit = self
+            .backend
+            .submission_poller()
+            .try_reserve()
+            .map_err(DecodeError::PollBackpressure)?;
+        let output_permit = self.memory.try_reserve(source.memory.output_lease_bytes)?;
+        let transient_permit = self.memory.try_reserve(source.memory.transient_bytes)?;
+        let pending = submit_vardct(
+            &self.backend,
+            &self.pipelines,
+            source,
+            VarDctMemoryPermits {
+                output: output_permit,
+                transient: transient_permit,
+            },
+            poll_permit,
+        )?;
+        self.source = None;
+        Ok(Some(pending))
+    }
+}
+
+struct VarDctMemoryPermits {
+    output: MemoryPermit,
+    transient: MemoryPermit,
+}
+
+struct VarDctJobLifetime {
+    output: Arc<wgpu::Buffer>,
+    status_staging: wgpu::Buffer,
+    status_mapped: AtomicBool,
+    output_permit: MemoryPermit,
+    _transient_permit: MemoryPermit,
+    _codestream: wgpu::Buffer,
+    _modular_metadata: wgpu::Buffer,
+    _reconstructed: wgpu::Buffer,
+    _raw_metadata: wgpu::Buffer,
+    _coefficients: wgpu::Buffer,
+    _packet_status: wgpu::Buffer,
+    _packet_control: wgpu::Buffer,
+    _modular_params: wgpu::Buffer,
+    _lf_temporary: wgpu::Buffer,
+    _resources: wgpu::Buffer,
+    _resource_uniform: wgpu::Buffer,
+    _adaptive_lf_uniform: wgpu::Buffer,
+    _artifact: wgpu::Buffer,
+    _occupancy: wgpu::Buffer,
+    _artifact_uniform: wgpu::Buffer,
+    _xyb_planes: [wgpu::Buffer; 3],
+    _resident_scratch: ResidentVarDctScratch,
+    _output_scratch: VarDctOutputScratch,
+}
+
+impl Drop for VarDctJobLifetime {
+    fn drop(&mut self) {
+        if self.status_mapped.swap(false, Ordering::AcqRel) {
+            self.status_staging.unmap();
+        }
+    }
+}
+
+/// Submitted VarDCT frame awaiting one mapped packet/artifact validation record.
+pub struct VarDctPendingFrame {
+    device: wgpu::Device,
+    lifetime: Option<Arc<VarDctJobLifetime>>,
+    completion: Arc<MapCompletion>,
+    token: SubmissionToken,
+    layout: ImageLayout,
+    transform: TransformKind,
+    expected_lf_samples: u32,
+    expected_hf_samples: u32,
+    expected_coefficients: u32,
+    expected_blocks: u32,
+}
+
+impl std::fmt::Debug for VarDctPendingFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VarDctPendingFrame")
+            .field("token", &self.token)
+            .field("layout", &self.layout)
+            .field("transform", &self.transform)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VarDctPendingFrame {
+    /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
+    pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        Ok(UnvalidatedGpuImageFrame {
+            token: self.token,
+            outputs: vec![UnvalidatedGpuImageOutput {
+                id: OutputId(0),
+                layout: self.layout.clone(),
+                buffer: GpuBufferLease::with_memory_permit(
+                    Arc::clone(&lifetime.output),
+                    lifetime.output_permit.clone(),
+                ),
+            }],
+        })
+    }
+
+    fn finish(
+        &mut self,
+        mapping: Result<(), String>,
+    ) -> DecodeResult<SubmittedGpuFrame<GpuImageFrame>> {
+        mapping.map_err(DecodeError::backend)?;
+        let lifetime = self
+            .lifetime
+            .take()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        let mapped = lifetime
+            .status_staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(DecodeError::backend)?;
+        let packet: GpuVarDctPacketStatus = mapped
+            .get(..PACKET_STATUS_BYTES as usize)
+            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+            .ok_or(VarDctDecodeError::StatusAbi { status: "packet" })?;
+        let artifact: GpuVarDctArtifactStatus = mapped
+            .get(PACKET_STATUS_BYTES as usize..VALIDATION_STAGING_BYTES as usize)
+            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+            .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
+        drop(mapped);
+        packet
+            .validate(
+                self.transform,
+                self.expected_lf_samples,
+                self.expected_hf_samples,
+            )
+            .map_err(VarDctDecodeError::from)?;
+        if packet.coefficient_words != self.expected_coefficients {
+            return Err(VarDctDecodeError::ArtifactStatus {
+                field: "packet coefficient_words",
+                expected: self.expected_coefficients,
+                actual: packet.coefficient_words,
+            }
+            .into());
+        }
+        artifact.validate().map_err(VarDctDecodeError::from)?;
+        for (field, expected, actual) in [
+            ("task_count", 1, artifact.task_count),
+            (
+                "coefficient_words",
+                self.expected_coefficients,
+                artifact.coefficient_words,
+            ),
+            (
+                "covered_blocks",
+                self.expected_blocks,
+                artifact.covered_blocks,
+            ),
+            (
+                "consumed_block_info_entries",
+                1,
+                artifact.consumed_block_info_entries,
+            ),
+            ("backend_requirements", 0, artifact.backend_requirements),
+        ] {
+            if actual != expected {
+                return Err(VarDctDecodeError::ArtifactStatus {
+                    field,
+                    expected,
+                    actual,
+                }
+                .into());
+            }
+        }
+        let output_id = OutputId(0);
+        let mut regions = BTreeMap::new();
+        regions.insert(
+            output_id,
+            vec![Region::new(
+                0,
+                0,
+                self.layout.extent.width,
+                self.layout.extent.height,
+            )],
+        );
+        Ok(SubmittedGpuFrame::new(
+            FrameMetadata {
+                index: 0,
+                duration: FrameDuration::still(),
+                presentation_ticks: 0,
+                timecode: None,
+                is_last: true,
+                is_keyframe: true,
+                name: String::new(),
+            },
+            GpuImageFrame {
+                token: self.token,
+                outputs: vec![GpuImageOutput {
+                    id: output_id,
+                    layout: self.layout.clone(),
+                    buffer: GpuBufferLease::with_memory_permit(
+                        Arc::clone(&lifetime.output),
+                        lifetime.output_permit.clone(),
+                    ),
+                }],
+                changed: ChangedRegions { outputs: regions },
+            },
+        ))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GpuPendingFrame for VarDctPendingFrame {
+    type Frame = GpuImageFrame;
+
+    fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
+        let mapping = self.completion.wait();
+        self.finish(mapping)
+    }
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            return Poll::Ready(Err(DecodeError::backend(error)));
+        }
+        match self.completion.poll(context) {
+            Some(mapping) => Poll::Ready(self.finish(mapping)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl GpuPendingFrame for VarDctPendingFrame {
+    type Frame = GpuImageFrame;
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            return Poll::Ready(Err(DecodeError::backend(error)));
+        }
+        match self.completion.poll(context) {
+            Some(mapping) => Poll::Ready(self.finish(mapping)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+fn resident_binding(
+    buffer: &wgpu::Buffer,
+) -> Result<ResidentStorageBinding<'_>, VarDctDecodeError> {
+    Ok(ResidentStorageBinding::entire(buffer)?)
+}
+
+fn submit_vardct(
+    backend: &WgpuBackend,
+    pipelines: &VarDctPipelines,
+    source: &VarDctSource,
+    permits: VarDctMemoryPermits,
+    poll_permit: SubmissionPollPermit,
+) -> Result<VarDctPendingFrame, VarDctDecodeError> {
+    let device = backend.device();
+    let codestream = source
+        .codestream_storage
+        .get(source.codestream_range.clone())
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "codestream storage range",
+        })?;
+    let upload_bytes = usize::try_from(source.memory.codestream_bytes).map_err(|_| {
+        VarDctDecodeError::ArithmeticOverflow {
+            field: "codestream upload host length",
+        }
+    })?;
+    let mut upload = Vec::with_capacity(upload_bytes);
+    upload.extend_from_slice(codestream);
+    upload.resize(upload_bytes, 0);
+    let codestream_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT codestream"),
+        contents: &upload,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let modular_metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT Modular metadata"),
+        contents: bytemuck::cast_slice(&source.packet.modular_metadata),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let storage = |label: &'static str, size: u64, extra: wgpu::BufferUsages| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | extra,
+            mapped_at_creation: false,
+        })
+    };
+    let reconstructed = storage(
+        "jxl-wgpu VarDCT LF reconstruction",
+        source.memory.reconstructed_bytes,
+        wgpu::BufferUsages::COPY_DST,
+    );
+    let raw_metadata = storage(
+        "jxl-wgpu VarDCT raw HF metadata",
+        source.memory.raw_metadata_bytes,
+        wgpu::BufferUsages::COPY_DST,
+    );
+    let coefficients = storage(
+        "jxl-wgpu VarDCT coefficients",
+        source.memory.coefficient_bytes,
+        wgpu::BufferUsages::COPY_DST,
+    );
+    let packet_status = storage(
+        "jxl-wgpu VarDCT packet status",
+        PACKET_STATUS_BYTES,
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    );
+    let packet_control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT packet control"),
+        contents: bytemuck::bytes_of(&source.control),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let params = VarDctModularParams::default().with_lz77_window(source.packet.lz77_window_words);
+    let modular_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT Modular params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let lf_temporary = storage(
+        "jxl-wgpu VarDCT dequantized LF temporary",
+        source.memory.lf_temporary_bytes,
+        wgpu::BufferUsages::COPY_DST,
+    );
+    let resource_values = source.resource_layout.initial_values();
+    let resources = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT resource vectors"),
+        contents: bytemuck::cast_slice(&resource_values),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let artifact = storage(
+        "jxl-wgpu VarDCT resident artifact",
+        source.artifact_layout.artifact_bytes,
+        wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    );
+    let occupancy = storage(
+        "jxl-wgpu VarDCT artifact occupancy",
+        source.artifact_layout.occupancy_bytes,
+        wgpu::BufferUsages::COPY_DST,
+    );
+    let artifact_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("jxl-wgpu VarDCT artifact params"),
+        contents: bytemuck::bytes_of(&source.artifact_params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let plane_bytes = source.memory.xyb_plane_bytes / 3;
+    let xyb_planes = [
+        "jxl-wgpu VarDCT X plane",
+        "jxl-wgpu VarDCT Y plane",
+        "jxl-wgpu VarDCT B plane",
+    ]
+    .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::COPY_DST));
+    let output = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("jxl-wgpu VarDCT packed RGB8 output"),
+        size: source.memory.output_lease_bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    }));
+    let status_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("jxl-wgpu VarDCT aggregate validation staging"),
+        size: VALIDATION_STAGING_BYTES,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("jxl-wgpu bounded VarDCT decode"),
+    });
+    for buffer in [
+        &reconstructed,
+        &raw_metadata,
+        &coefficients,
+        &packet_status,
+        &lf_temporary,
+        &artifact,
+        &occupancy,
+        &xyb_planes[0],
+        &xyb_planes[1],
+        &xyb_planes[2],
+        output.as_ref(),
+    ] {
+        commands.clear_buffer(buffer, 0, None);
+    }
+    pipelines.packet.encode(
+        device,
+        &mut commands,
+        VarDctPacketBuffers {
+            codestream: &codestream_buffer,
+            modular_metadata: &modular_metadata,
+            reconstructed_lf: &reconstructed,
+            raw_hf_metadata: &raw_metadata,
+            coefficients: &coefficients,
+            status: &packet_status,
+            control: &packet_control,
+            modular_params: &modular_params,
+        },
+    );
+    let resource_uniform = pipelines.resource.encode(
+        device,
+        &mut commands,
+        VarDctResourceBuffers {
+            quantized_lf: &reconstructed,
+            dequantized_lf: &lf_temporary,
+        },
+        source.resource_params,
+    );
+    let adaptive_lf_uniform = pipelines.adaptive_lf.encode(
+        device,
+        &mut commands,
+        AdaptiveLfBuffers {
+            input: &lf_temporary,
+            output: &resources,
+        },
+        AdaptiveLfParams::new(
+            source.control.geometry[2],
+            source.control.geometry[3],
+            0,
+            source.resource_layout.lf_offset,
+            source.resource_params.smoothing_thresholds(),
+        ),
+    );
+    pipelines.artifact.encode(
+        device,
+        &mut commands,
+        HfMetadataLoweringBuffers {
+            raw_metadata: &raw_metadata,
+            artifact: &artifact,
+            occupancy: &occupancy,
+            params: &artifact_uniform,
+        },
+    );
+
+    let (tasks_offset, tasks_size) = source.artifact_layout.task_binding();
+    let tasks = ResidentStorageBinding {
+        buffer: &artifact,
+        offset: tasks_offset,
+        size: NonZeroU64::new(tasks_size)
+            .ok_or(ResidentVarDctError::EmptyBinding { role: "task" })?,
+    };
+    let extent = source.packet.transform.pixel_extent();
+    let scratch_scalars = extent
+        .width
+        .checked_mul(extent.height)
+        .and_then(|area| area.checked_mul(3))
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "resident scratch scalars",
+        })?;
+    let indirect_offsets = [
+        source
+            .artifact_layout
+            .indirect_offset(source.transform_index, HfDispatchStage::Dequantize)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "dequantize indirect offset",
+            })?,
+        source
+            .artifact_layout
+            .indirect_offset(source.transform_index, HfDispatchStage::Horizontal)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "horizontal indirect offset",
+            })?,
+        source
+            .artifact_layout
+            .indirect_offset(source.transform_index, HfDispatchStage::Vertical)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "vertical indirect offset",
+            })?,
+    ];
+    let resident_outputs = xyb_planes.each_ref().map(|plane| {
+        resident_binding(plane).map(|storage| ResidentVarDctOutputPlane {
+            storage,
+            width: source.packet.profile.width,
+            height: source.packet.profile.height,
+            stride: source.packet.profile.width,
+        })
+    });
+    let [output_x, output_y, output_b] = resident_outputs;
+    let resident_scratch = pipelines.renderer.encode(
+        device,
+        &mut commands,
+        ResidentVarDctInputs {
+            coefficients: resident_binding(&coefficients)?,
+            tasks,
+            resources: resident_binding(&resources)?,
+            outputs: [output_x?, output_y?, output_b?],
+            indirect: &artifact,
+            indirect_offsets,
+            config: ResidentVarDctRenderConfig {
+                transform: source.packet.transform,
+                task_base: 0,
+                task_capacity: 1,
+                scratch_scalars,
+                quant_offset: source.resource_layout.quant_offset,
+                correlation_offset: source.resource_layout.correlation_offset,
+                lf_offset: source.resource_layout.lf_offset,
+                correlation_width: 1,
+                correlation_height: 1,
+                quant_biases: source.quant_biases,
+            },
+        },
+    )?;
+    let output_scratch = pipelines.output.encode(
+        device,
+        &mut commands,
+        VarDctOutputInputs {
+            planes: [
+                VarDctOutputPlane {
+                    storage: resident_binding(&xyb_planes[0])?,
+                    stride: source.packet.profile.width,
+                },
+                VarDctOutputPlane {
+                    storage: resident_binding(&xyb_planes[1])?,
+                    stride: source.packet.profile.width,
+                },
+                VarDctOutputPlane {
+                    storage: resident_binding(&xyb_planes[2])?,
+                    stride: source.packet.profile.width,
+                },
+            ],
+            output: resident_binding(&output)?,
+            config: VarDctOutputConfig {
+                width: source.packet.profile.width,
+                height: source.packet.profile.height,
+                inverse_opsin: source.inverse_opsin,
+            },
+        },
+    )?;
+    debug_assert_eq!(output_scratch.plan, source.output_plan);
+    commands.copy_buffer_to_buffer(&packet_status, 0, &status_staging, 0, PACKET_STATUS_BYTES);
+    commands.copy_buffer_to_buffer(
+        &artifact,
+        u64::from(source.artifact_layout.status_offset_words) * 4,
+        &status_staging,
+        PACKET_STATUS_BYTES,
+        ARTIFACT_STATUS_BYTES,
+    );
+
+    let completion = Arc::new(MapCompletion::default());
+    let lifetime = Arc::new(VarDctJobLifetime {
+        output: Arc::clone(&output),
+        status_staging,
+        status_mapped: AtomicBool::new(false),
+        output_permit: permits.output,
+        _transient_permit: permits.transient,
+        _codestream: codestream_buffer,
+        _modular_metadata: modular_metadata,
+        _reconstructed: reconstructed,
+        _raw_metadata: raw_metadata,
+        _coefficients: coefficients,
+        _packet_status: packet_status,
+        _packet_control: packet_control,
+        _modular_params: modular_params,
+        _lf_temporary: lf_temporary,
+        _resources: resources,
+        _resource_uniform: resource_uniform,
+        _adaptive_lf_uniform: adaptive_lf_uniform,
+        _artifact: artifact,
+        _occupancy: occupancy,
+        _artifact_uniform: artifact_uniform,
+        _xyb_planes: xyb_planes,
+        _resident_scratch: resident_scratch,
+        _output_scratch: output_scratch,
+    });
+    let callback_lifetime = Arc::clone(&lifetime);
+    let callback_completion = Arc::clone(&completion);
+    commands.map_buffer_on_submit(
+        &lifetime.status_staging,
+        wgpu::MapMode::Read,
+        ..,
+        move |result| {
+            if result.is_ok() {
+                callback_lifetime
+                    .status_mapped
+                    .store(true, Ordering::Release);
+            }
+            drop(callback_lifetime);
+            callback_completion.complete(
+                result.map_err(|error| format!("VarDCT validation mapping failed: {error}")),
+            );
+        },
+    );
+    let submission = backend.queue().submit([commands.finish()]);
+    let poll_completion = Arc::clone(&completion);
+    if let Err(error) = poll_permit.register(submission, move |error| {
+        poll_completion.complete(Err(error));
+    }) {
+        completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
+    }
+    let blocks = source.resource_layout.block_count;
+    Ok(VarDctPendingFrame {
+        device: device.clone(),
+        lifetime: Some(lifetime),
+        completion,
+        token: SubmissionToken(1),
+        layout: source.layout.clone(),
+        transform: source.packet.transform,
+        expected_lf_samples: blocks * 3,
+        expected_hf_samples: blocks + 4,
+        expected_coefficients: source.packet.coefficient_words(),
+        expected_blocks: blocks,
+    })
+}
+
+#[derive(Default)]
+struct MapCompletion {
+    state: Mutex<MapState>,
+    condition: Condvar,
+}
+
+#[derive(Default)]
+struct MapState {
+    result: Option<Result<(), String>>,
+    waker: Option<Waker>,
+}
+
+impl MapCompletion {
+    fn complete(&self, result: Result<(), String>) {
+        let waker = {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.result.is_some() {
+                return;
+            }
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.condition.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll(&self, context: &Context<'_>) -> Option<Result<(), String>> {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.result.is_none() {
+            state.waker = Some(context.waker().clone());
+        }
+        state.result.take()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(&self) -> Result<(), String> {
+        let mut state = lock_unpoisoned(&self.state);
+        while state.result.is_none() {
+            state = self
+                .condition
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state
+            .result
+            .take()
+            .expect("mapping result was checked as present")
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl GpuDecoder<VarDctSubmissionEngine> {
+    /// Constructs the bounded standard VarDCT GPU decoder on an existing backend.
+    #[must_use]
+    pub fn vardct_wgpu(backend: WgpuBackend) -> Self {
+        Self::new(VarDctSubmissionEngine::new(backend))
+    }
+}
+
+fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
+    value
+        .checked_add(3)
+        .map(|value| value & !3)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "four-byte buffer alignment",
+        })
+}

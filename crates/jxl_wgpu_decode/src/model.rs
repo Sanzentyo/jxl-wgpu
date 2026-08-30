@@ -7,7 +7,7 @@ use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingFieldKind,
     PixelFormat, PixelFormatClass, PlaneSampling, SampleKind, Swizzle, classify_pixel_format,
 };
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, TransformKind};
 
 use crate::{Error, Result};
 
@@ -20,6 +20,14 @@ pub enum DecodeProfile {
         channels: ModularChannels,
         prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
+    },
+    /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer.
+    ///
+    /// The transform is the single regular strategy covering the complete image in the current
+    /// deliberately bounded production profile.
+    VarDctRegular {
+        bits_per_sample: u8,
+        transform: TransformKind,
     },
 }
 
