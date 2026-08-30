@@ -1,10 +1,10 @@
 //! GPU-required JPEG XL decode orchestration.
 //!
-//! This crate has no production CPU pixel/entropy decoder and no fallback policy. Container and
-//! SHA-bound `jwgp` acceleration-index validation is performed by `jxl_gpu_bitstream`. The stock
-//! [`WgpuSubmissionEngine`] decodes the indexed single-group lossless Gray8 profile from actual
-//! `jxlc` token bits in WGSL and returns GPU-resident frames in the requested generic
-//! [`PixelFormat`]. Unsupported profiles and incomplete generic frontend stages are typed errors.
+//! This crate has no production CPU pixel/entropy decoder and no fallback policy. The stock
+//! [`WgpuSubmissionEngine`] inventories standard JPEG XL frame sections, parses only bounded
+//! Modular prefix metadata, and decodes single- or multi-group lossless Gray8 token bits in WGSL.
+//! It returns GPU-resident frames in the requested generic [`PixelFormat`]; no private sidecar box
+//! is required. Unsupported profiles and incomplete generic frontend stages are typed errors.
 //! Submission and completion are separate: sessions can prefetch an ordered bounded queue of
 //! [`GpuPendingFrame`] values before synchronously waiting or runtime-neutrally polling its front.
 //!

@@ -3,7 +3,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jxl_gpu_bitstream::Gray8AccelerationIndex;
 use jxl_gpu_formats::{PixelFormat, PixelFormatClass, classify_pixel_format};
 use jxl_gpu_protocol::Extent2d;
 
@@ -12,7 +11,7 @@ use crate::{Error, Result};
 /// A GPU decode profile negotiated before any frame is submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeProfile {
-    /// One-group, lossless Modular data reconstructed by a fixed predictor GPU kernel.
+    /// Lossless Modular data reconstructed by a fixed-predictor GPU kernel.
     ModularLossless {
         bits_per_sample: u8,
         predictor: FixedModularPredictor,
@@ -61,6 +60,11 @@ impl FixedModularPredictor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModularGrouping {
     SingleGroup,
+    /// Row-major 256x256 pass groups covering one canvas.
+    MultipleGroups {
+        columns: u32,
+        rows: u32,
+    },
 }
 
 /// Validated contiguous codestream handed to a GPU-only frontend.
@@ -69,21 +73,14 @@ pub struct GpuCodestream {
     storage: Arc<[u8]>,
     byte_range: Range<usize>,
     container: bool,
-    acceleration_index: Option<Gray8AccelerationIndex>,
 }
 
 impl GpuCodestream {
-    pub(crate) fn new(
-        storage: Arc<[u8]>,
-        byte_range: Range<usize>,
-        container: bool,
-        acceleration_index: Option<Gray8AccelerationIndex>,
-    ) -> Self {
+    pub(crate) fn new(storage: Arc<[u8]>, byte_range: Range<usize>, container: bool) -> Self {
         Self {
             storage,
             byte_range,
             container,
-            acceleration_index,
         }
     }
 
@@ -105,12 +102,6 @@ impl GpuCodestream {
     #[must_use]
     pub const fn is_container(&self) -> bool {
         self.container
-    }
-
-    /// Validated private acceleration metadata bound to these exact codestream bytes.
-    #[must_use]
-    pub const fn acceleration_index(&self) -> Option<&Gray8AccelerationIndex> {
-        self.acceleration_index.as_ref()
     }
 }
 

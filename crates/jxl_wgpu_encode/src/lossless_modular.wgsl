@@ -6,6 +6,8 @@ struct Params {
     output_word_offset: u32,
     channel: u32,
     channels: u32,
+    bytes_per_sample: u32,
+    sample_mask: u32,
 }
 
 @group(0) @binding(0)
@@ -24,11 +26,21 @@ const OUTPUT_HEADER_WORDS: u32 = 53u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
-fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
-    let byte_index = params.byte_offset + y * params.row_stride + x * params.channels + component;
+fn source_byte(byte_index: u32) -> u32 {
     let word = source_words[byte_index >> 2u];
     let shift = (byte_index & 3u) * 8u;
-    return i32((word >> shift) & 255u);
+    return (word >> shift) & 255u;
+}
+
+fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
+    let sample_index = x * params.channels + component;
+    let byte_index = params.byte_offset + y * params.row_stride
+        + sample_index * params.bytes_per_sample;
+    var value = source_byte(byte_index);
+    if params.bytes_per_sample == 2u {
+        value |= source_byte(byte_index + 1u) << 8u;
+    }
+    return i32(value & params.sample_mask);
 }
 
 // JPEG XL's reversible color transform type 0 maps RGB to YCoCg. Computing it

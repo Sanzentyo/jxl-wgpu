@@ -5,29 +5,29 @@ engine and has no dependency on the published `jxl` decoder.
 
 ## Executable profile
 
-The stock `WgpuSubmissionEngine` implements one deliberately narrow end-to-end profile:
+The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular profile:
 
-- a standard, reference-decodable JPEG XL container with one `jwgp` acceleration-index box;
-- one final still frame, 8-bit grayscale lossless Modular, one group (at most 256x256), one pass,
-  fixed Gradient predictor, prefix entropy, and the profile's distance-one zero-run coding;
+- a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
+  metadata requirement;
+- one final still frame, 8-bit grayscale lossless Modular, any bounded 256x256 pass-group grid,
+  one pass, fixed Gradient predictor, prefix entropy, and distance-one zero-run coding;
 - no transforms, restoration filters, extra channels, or animation references.
 
-`jwgp` contains no pixels, residuals, or entropy events. It contains the extent, actual `jxlc`
-token-bit range, and canonical prefix tables, all bound to the complete contiguous codestream by
-length and SHA-256. Before submission the decoder validates the fixed standard JPEG XL image/frame
-envelope and TOC, regenerates the DC-global/context-map/four-prefix-tree group prefix, compares it
-bit-for-bit with `jxlc`, and proves that its exact end is the indexed token offset. The private box
-therefore accelerates bounded parsing but cannot redefine the standard codestream.
+Before submission the decoder inventories the standard image header, frame header, and TOC with
+explicit limits. It parses the bounded DC-global/context-map/prefix metadata needed to build one
+shared GPU lookup table, then derives every pass-group token range and canvas origin directly from
+standard frame sections. It does not decode an entropy token, residual, predictor, or pixel on the
+CPU.
 
 The compute shader reads prefix/hybrid tokens from the actual codestream buffer, validates every
 bit and output bound, expands only the profile's constrained zero runs, unpacks signed residuals,
-and performs Gradient reconstruction. A mapped four-word status buffer is checked before a frame
-is reported as successful. No reconstructed sample is produced on the CPU.
+and performs Gradient reconstruction. Groups are recorded as independent dispatches in one queue
+submission and write their exact canvas rectangles. One aggregate status staging buffer is mapped
+once; every four-word group status is checked before the frame is reported. No reconstructed
+sample is produced on the CPU.
 
-Containers without a valid `jwgp` index and raw/generic JPEG XL codestreams return typed
-`UnsupportedProfile`/`AccelerationIndex` errors. VarDCT, adaptive predictors, multiple
-groups/passes, extra channels, patches, splines, noise, and reference-frame animation remain typed
-unsupported profiles.
+VarDCT, adaptive predictors, multiple passes, extra channels, patches, splines, noise, and
+reference-frame animation remain typed unsupported profiles.
 
 ## GPU output formats
 
@@ -102,11 +102,13 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL parameter ABI is a checked 96-byte `repr(C)` POD. It carries four plane
-offset/stride pairs, exact channel/order/depth/range/transfer codes, the resolved numeric mapping,
-and the shader-visible logical size. Codestream uploads are rounded to
+The CPU/WGSL per-group parameter ABI is a checked 112-byte `repr(C)` POD. It carries the token
+range, local extent, canvas origin, chroma-initialization ownership, four plane offset/stride
+pairs, exact channel/order/depth/range/transfer codes, the resolved numeric mapping, and the
+shader-visible logical size. Codestream uploads are rounded to
 four bytes and include an additional zero sentinel word for the shader's bounded cross-word peek.
-Prefix lookup (128 KiB), reconstruction, output, status/readback, codestream, and parameter sizes
+Prefix lookup (128 KiB), aligned group reconstruction slices, aggregate status/readback,
+parameters, output, and codestream sizes
 are checked with overflow detection against both storage-binding and device-buffer limits. The
 requested `max_frame_slots` multiplied by the complete per-frame allocation estimate must remain
 within a 64 MiB session exposure. `WgpuDecodeSession::memory_stats` reports the complete per-frame
@@ -129,8 +131,8 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for p
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while lookup and the 96-byte `ShaderParams`
-POD use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
+aligned spans directly from the shared input storage, while lookup and aligned 112-byte
+`ShaderParams` records use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.
 `WgpuSubmissionEngine::{buffer_pool_limits,set_buffer_pool_limits,clear_buffer_pool,buffer_pool_stats}`

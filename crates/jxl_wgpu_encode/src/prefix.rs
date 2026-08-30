@@ -23,6 +23,10 @@ const MIN_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [0; RAW_SYMBOLS + 1];
 const MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 10, 15, 15, 15, 15, 15, 15, 15, 15,
 ];
+const WIDE_MIN_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] =
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 7];
+const WIDE_MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] =
+    [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 10];
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrefixCode {
@@ -36,22 +40,14 @@ impl PrefixCode {
     pub(crate) fn from_aggregated_counts(
         raw_gpu: &[u64; RAW_SYMBOLS],
         lz77_gpu: &[u64; LZ77_SYMBOLS],
-    ) -> Result<Self, EncodeError> {
-        Self::from_aggregated_counts_with_max_token(raw_gpu, lz77_gpu, 9)
-    }
-
-    pub(crate) fn from_aggregated_ycocg_counts(
-        raw_gpu: &[u64; RAW_SYMBOLS],
-        lz77_gpu: &[u64; LZ77_SYMBOLS],
-    ) -> Result<Self, EncodeError> {
-        Self::from_aggregated_counts_with_max_token(raw_gpu, lz77_gpu, 10)
-    }
-
-    fn from_aggregated_counts_with_max_token(
-        raw_gpu: &[u64; RAW_SYMBOLS],
-        lz77_gpu: &[u64; LZ77_SYMBOLS],
         max_raw_token: usize,
+        wide_samples: bool,
     ) -> Result<Self, EncodeError> {
+        if max_raw_token >= RAW_SYMBOLS {
+            return Err(EncodeError::Backend(
+                "configured raw token bound exceeds the prefix alphabet".into(),
+            ));
+        }
         if raw_gpu[max_raw_token + 1..].iter().any(|&count| count != 0)
             || lz77_gpu[28..].iter().any(|&count| count != 0)
         {
@@ -60,9 +56,15 @@ impl PrefixCode {
             ));
         }
         let mut base_raw_counts = BASE_RAW_COUNTS;
-        if max_raw_token == 10 {
-            // Reversible YCoCg can require one more hybrid-uint symbol than a direct 8-bit plane.
-            base_raw_counts[10] = 5;
+        for (token, count) in base_raw_counts
+            .iter_mut()
+            .enumerate()
+            .take(max_raw_token + 1)
+            .skip(10)
+        {
+            // Keep the high-depth tree stable even when a small image does not exercise every
+            // legal hybrid-uint magnitude. The measured GPU counts still dominate after scaling.
+            *count = u64::try_from(RAW_SYMBOLS - token).unwrap_or(1);
         }
         let mut raw_counts = [0u64; RAW_SYMBOLS];
         let mut lz77_counts = [0u64; LZ77_SYMBOLS];
@@ -82,11 +84,11 @@ impl PrefixCode {
                     EncodeError::Backend("aggregate LZ77 histogram scaling overflow".into())
                 })?;
         }
-        Ok(Self::new(&raw_counts, &lz77_counts))
+        Ok(Self::new(&raw_counts, &lz77_counts, wide_samples))
     }
 
     pub(crate) fn fixed_unused_channel() -> Self {
-        Self::new(&BASE_RAW_COUNTS, &BASE_LZ77_COUNTS)
+        Self::new(&BASE_RAW_COUNTS, &BASE_LZ77_COUNTS, false)
     }
 
     pub(crate) fn raw_entries(&self) -> [PrefixCodeEntry; RAW_SYMBOLS] {
@@ -103,7 +105,11 @@ impl PrefixCode {
         })
     }
 
-    fn new(raw_counts: &[u64; RAW_SYMBOLS], lz77_counts: &[u64; LZ77_SYMBOLS]) -> Self {
+    fn new(
+        raw_counts: &[u64; RAW_SYMBOLS],
+        lz77_counts: &[u64; LZ77_SYMBOLS],
+        wide_samples: bool,
+    ) -> Self {
         let mut raw_nbits = [0; RAW_SYMBOLS];
         let mut raw_bits = [0; RAW_SYMBOLS];
         let mut lz77_nbits = [0; LZ77_SYMBOLS];
@@ -118,11 +124,16 @@ impl PrefixCode {
         level1_counts[num_raw] = lz77_counts.iter().sum();
 
         let mut level1_nbits = [0; RAW_SYMBOLS + 1];
+        let (min_raw_length, max_raw_length) = if wide_samples {
+            (&WIDE_MIN_RAW_LENGTH, &WIDE_MAX_RAW_LENGTH)
+        } else {
+            (&MIN_RAW_LENGTH, &MAX_RAW_LENGTH)
+        };
         compute_code_lengths(
             &level1_counts,
             num_raw + 1,
-            &MIN_RAW_LENGTH,
-            &MAX_RAW_LENGTH,
+            min_raw_length,
+            max_raw_length,
             &mut level1_nbits,
         );
 
@@ -229,7 +240,7 @@ impl PrefixCode {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU raw token overflow".into()))?;
         let expected_nbits = token.saturating_sub(1);
-        if token > 10
+        if token >= RAW_SYMBOLS
             || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
             || !extra_bits_are_canonical(nbits, bits)
         {

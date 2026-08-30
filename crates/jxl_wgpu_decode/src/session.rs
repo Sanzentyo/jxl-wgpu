@@ -7,9 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{
-    ACCELERATION_INDEX_BOX_TYPE, CODESTREAM_SIGNATURE, Gray8AccelerationIndex, ParseLimits,
-};
+use jxl_gpu_bitstream::{CODESTREAM_SIGNATURE, ParseLimits};
 
 use crate::{
     AnimationMetadata, DecodeProfile, Error, FrameMetadata, GpuCodestream, GpuOutputRequest,
@@ -285,21 +283,10 @@ fn parse_shared(encoded: Arc<[u8]>, limits: ParseLimits) -> Result<GpuCodestream
     if encoded.starts_with(&CODESTREAM_SIGNATURE) {
         jxl_gpu_bitstream::parse(&encoded, limits)?;
         let length = encoded.len();
-        return Ok(GpuCodestream::new(encoded, 0..length, false, None));
+        return Ok(GpuCodestream::new(encoded, 0..length, false));
     }
     let parsed = jxl_gpu_bitstream::parse(&encoded, limits)?;
     let is_container = parsed.is_container();
-    let acceleration_index = {
-        let mut index_boxes = parsed.boxes_of_type(ACCELERATION_INDEX_BOX_TYPE);
-        let acceleration_index = index_boxes
-            .next()
-            .map(|item| Gray8AccelerationIndex::parse_bound(item.payload, parsed.codestream()))
-            .transpose()?;
-        if index_boxes.next().is_some() {
-            return Err(Error::DuplicateAccelerationIndex);
-        }
-        acceleration_index
-    };
     let (storage, byte_range) = match parsed.into_codestream() {
         Cow::Borrowed(codestream) => {
             let storage_start = encoded.as_ptr() as usize;
@@ -323,12 +310,7 @@ fn parse_shared(encoded: Arc<[u8]>, limits: ParseLimits) -> Result<GpuCodestream
             (Arc::from(codestream), 0..length)
         }
     };
-    Ok(GpuCodestream::new(
-        storage,
-        byte_range,
-        is_container,
-        acceleration_index,
-    ))
+    Ok(GpuCodestream::new(storage, byte_range, is_container))
 }
 
 /// Bounded ownership wrapper for one GPU-resident output.

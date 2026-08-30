@@ -1,8 +1,13 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::process::Command;
 use std::sync::{Arc, mpsc};
 
+use jxl::api::{
+    JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
+    ProcessingResult, states,
+};
 use jxl_gpu_formats::{
     Channel, ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageLayout, PixelFormat,
     SampleKind, TransferFunction, classify_pixel_format, convert_rgb_f32,
@@ -18,6 +23,8 @@ use jxl_wgpu_decode::{
     F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
     PrefetchBackpressure, WgpuSubmissionEngine,
 };
+use jxl_wgpu_encode::{BufferImageSource, LosslessModularEncoder, WgpuContext};
+use wgpu::util::DeviceExt;
 
 mod common;
 
@@ -178,6 +185,163 @@ fn expected_pixels() -> Vec<u8> {
     pixels
 }
 
+fn patterned_pixels(width: u32, height: u32) -> Vec<u8> {
+    (0..u64::from(width) * u64::from(height))
+        .map(|index| {
+            let x = index % u64::from(width);
+            let y = index / u64::from(width);
+            ((x * 37 + y * 71 + (x * y) % 251) & 255) as u8
+        })
+        .collect()
+}
+
+fn encode_standard_gray8(
+    backend: &WgpuBackend,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    container: bool,
+) -> Vec<u8> {
+    let layout = ImageLayout::packed(
+        Extent2d::new(width, height),
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+    )
+    .unwrap();
+    let buffer = Arc::new(
+        backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("standard multi-group Gray8 decode test source"),
+                contents: pixels,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    );
+    let source = BufferImageSource::new(buffer, layout).unwrap();
+    let encoder = LosslessModularEncoder::new(WgpuContext::from_backend(backend));
+    if container {
+        encoder.encode_container(source).unwrap()
+    } else {
+        encoder.encode(source).unwrap()
+    }
+}
+
+fn rust_jxl_decode_gray8(encoded: &[u8]) -> Result<((usize, usize), Vec<u8>), String> {
+    let mut input = encoded;
+    let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let mut decoder = loop {
+        match decoder
+            .process(&mut input, None)
+            .map_err(|error| error.to_string())?
+        {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err("Rust jxl oracle needed more input before image info".into());
+                }
+                decoder = fallback;
+            }
+        }
+    };
+    let size = decoder.basic_info().size;
+    decoder.set_pixel_format(JxlPixelFormat {
+        color_type: JxlColorType::Grayscale,
+        color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+        extra_channel_format: Vec::new(),
+    });
+    let mut frame = loop {
+        match decoder
+            .process(&mut input, None)
+            .map_err(|error| error.to_string())?
+        {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err("Rust jxl oracle needed more input before frame info".into());
+                }
+                decoder = fallback;
+            }
+        }
+    };
+    let mut pixels = vec![0u8; size.0 * size.1];
+    {
+        let mut buffers = [JxlOutputBuffer::new(&mut pixels, size.1, size.0)];
+        loop {
+            match frame
+                .process(&mut input, &mut buffers, None)
+                .map_err(|error| error.to_string())?
+            {
+                ProcessingResult::Complete { .. } => break,
+                ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                    if input.is_empty() {
+                        return Err("Rust jxl oracle needed more input while rendering".into());
+                    }
+                    frame = fallback;
+                }
+            }
+        }
+    }
+    Ok((size, pixels))
+}
+
+fn parse_binary_pgm(bytes: &[u8]) -> Result<((usize, usize), &[u8]), String> {
+    fn token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+        loop {
+            while bytes
+                .get(*cursor)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                *cursor += 1;
+            }
+            if bytes.get(*cursor) != Some(&b'#') {
+                break;
+            }
+            while bytes.get(*cursor).is_some_and(|byte| *byte != b'\n') {
+                *cursor += 1;
+            }
+        }
+        let start = *cursor;
+        while bytes
+            .get(*cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            *cursor += 1;
+        }
+        bytes
+            .get(start..*cursor)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "truncated PGM header".into())
+    }
+
+    let mut cursor = 0usize;
+    if token(bytes, &mut cursor)? != b"P5" {
+        return Err("djxl did not emit a binary grayscale PGM".into());
+    }
+    let width = std::str::from_utf8(token(bytes, &mut cursor)?)
+        .map_err(|error| error.to_string())?
+        .parse::<usize>()
+        .map_err(|error| error.to_string())?;
+    let height = std::str::from_utf8(token(bytes, &mut cursor)?)
+        .map_err(|error| error.to_string())?
+        .parse::<usize>()
+        .map_err(|error| error.to_string())?;
+    if token(bytes, &mut cursor)? != b"255" {
+        return Err("djxl PGM did not use 8-bit samples".into());
+    }
+    match bytes.get(cursor..) {
+        Some([b'\r', b'\n', ..]) => cursor += 2,
+        Some([byte, ..]) if byte.is_ascii_whitespace() => cursor += 1,
+        _ => return Err("djxl PGM is missing its raster separator".into()),
+    }
+    let expected = width
+        .checked_mul(height)
+        .ok_or_else(|| "djxl PGM extent overflow".to_string())?;
+    let pixels = bytes
+        .get(cursor..)
+        .filter(|pixels| pixels.len() == expected)
+        .ok_or_else(|| "djxl PGM raster length mismatch".to_string())?;
+    Ok(((width, height), pixels))
+}
+
 fn srgb_to_linear(value: f32) -> f32 {
     if value <= 0.04045 {
         value / 12.92
@@ -290,6 +454,158 @@ fn indexed_jxl_entropy_and_gradient_reconstruct_exact_gray8_on_gpu() {
         (17, 13)
     );
     assert_eq!(read_output(&backend, output), expected_pixels());
+}
+
+#[test]
+fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping standard multi-group Gray8 test: no wgpu adapter");
+        return;
+    };
+    let decoder = GpuDecoder::wgpu(backend.clone());
+    for (width, height, container) in [
+        (513, 257, false),
+        (513, 257, true),
+        (1, 513, false),
+        (769, 1, true),
+        (257, 257, false),
+    ] {
+        let expected = patterned_pixels(width, height);
+        let encoded = encode_standard_gray8(&backend, width, height, &expected, container);
+        let (oracle_extent, oracle) = rust_jxl_decode_gray8(&encoded).unwrap_or_else(|error| {
+            panic!("{width}x{height} container={container} Rust jxl oracle failed: {error}")
+        });
+        assert_eq!(oracle_extent, (width as usize, height as usize));
+        assert_eq!(oracle, expected, "Rust jxl oracle {width}x{height}");
+        let request = GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+            NumericSampleMapping::NormalizedGray8,
+        )
+        .unwrap();
+        let mut session = decoder.open(&encoded, request).unwrap_or_else(|error| {
+            panic!("{width}x{height} container={container} did not open: {error}")
+        });
+        assert!(matches!(
+            session.profile(),
+            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+                grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
+                ..
+            }
+        ));
+        let frame = session
+            .next_frame()
+            .unwrap_or_else(|error| {
+                panic!("{width}x{height} container={container} failed: {error}")
+            })
+            .expect("one frame is returned");
+        let output = &frame.output().outputs[0];
+        assert_eq!(output.layout.extent, Extent2d::new(width, height));
+        assert_eq!(
+            read_output(&backend, output),
+            expected,
+            "{width}x{height} container={container}"
+        );
+    }
+}
+
+#[test]
+fn standard_multigroup_codestream_is_exact_in_djxl_when_available() {
+    if Command::new("djxl").arg("--version").output().is_err() {
+        eprintln!("skipping djxl oracle: djxl is not installed");
+        return;
+    }
+    let Some(backend) = backend() else {
+        eprintln!("skipping djxl oracle: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (513, 257);
+    let expected = patterned_pixels(width, height);
+    let encoded = encode_standard_gray8(&backend, width, height, &expected, true);
+    let unique = format!(
+        "jxl-wgpu-decode-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos()
+    );
+    let input = std::env::temp_dir().join(format!("{unique}.jxl"));
+    let output = std::env::temp_dir().join(format!("{unique}.pgm"));
+    std::fs::write(&input, encoded).expect("write temporary djxl input");
+    let command = Command::new("djxl")
+        .arg(&input)
+        .arg(&output)
+        .arg("--quiet")
+        .output()
+        .expect("run djxl oracle");
+    let decoded = std::fs::read(&output).unwrap_or_else(|error| {
+        panic!(
+            "djxl failed: status={} stderr={} read={error}",
+            command.status,
+            String::from_utf8_lossy(&command.stderr)
+        )
+    });
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+    assert!(
+        command.status.success(),
+        "djxl failed: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let (extent, pixels) = parse_binary_pgm(&decoded).expect("parse djxl PGM output");
+    assert_eq!(extent, (width as usize, height as usize));
+    assert_eq!(pixels, expected);
+}
+
+#[test]
+fn every_multigroup_gpu_status_is_validated_from_one_map() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping aggregate group-status test: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (513, 257);
+    let pixels = patterned_pixels(width, height);
+    let mut encoded = encode_standard_gray8(&backend, width, height, &pixels, false);
+    let parsed = jxl_gpu_bitstream::parse(&encoded, jxl_gpu_bitstream::ParseLimits::default())
+        .expect("generated raw codestream parses");
+    let inventory = parsed
+        .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+        .expect("generated raw codestream inventories");
+    let damaged = inventory.frames[0]
+        .sections
+        .iter()
+        .find(|section| {
+            section.kind
+                == jxl_gpu_bitstream::FrameSectionKind::PassGroup {
+                    pass_index: 0,
+                    group_index: 1,
+                }
+        })
+        .expect("second pass group exists")
+        .bytes;
+    let start = usize::try_from(damaged.offset).unwrap();
+    let end = usize::try_from(damaged.end().unwrap()).unwrap();
+    encoded[start] &= 0x0f;
+    encoded[start + 1..end].fill(0);
+
+    let decoder = GpuDecoder::wgpu(backend);
+    let request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        NumericSampleMapping::NormalizedGray8,
+    )
+    .unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("damaged entropy remains valid bounded metadata");
+    let error = session
+        .next_frame()
+        .expect_err("damaged second group must fail GPU status validation");
+    assert!(
+        error
+            .to_string()
+            .contains("group 1 rejected entropy stream"),
+        "unexpected aggregate status error: {error}"
+    );
 }
 
 #[test]

@@ -16,7 +16,9 @@ thiserror = "2.0.20"
 wgpu = "30.0.1"
 
 [dev-dependencies]
+jxl.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
+jxl_wgpu_encode.workspace = true
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = "1.0.1"
 

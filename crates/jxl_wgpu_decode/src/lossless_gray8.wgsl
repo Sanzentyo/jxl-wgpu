@@ -3,7 +3,10 @@ struct Params {
     token_end: u32,
     width: u32,
     height: u32,
+    origin_x: u32,
+    origin_y: u32,
     sample_count: u32,
+    initialize_chroma: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -23,6 +26,7 @@ struct Params {
     chroma_height: u32,
     logical_size: u32,
     numeric_mapping: u32,
+    _padding: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -401,11 +405,11 @@ fn emit_token(index: u32, packed: u32) {
     let sample = u32(prediction + unpack_signed(packed)) & 255u;
     reconstructed[index] = sample;
 
-    write_output_sample(x, y, sample);
+    write_output_sample(params.origin_x + x, params.origin_y + y, sample);
 }
 
 fn finalize_output() {
-    if params.output_kind == 2u {
+    if params.output_kind == 2u && params.initialize_chroma != 0u {
         let bytes_per_sample = params.storage_bits / 8u;
         let neutral = neutral_chroma_code();
         for (var y = 0u; y < params.chroma_height; y = y + 1u) {
@@ -415,7 +419,7 @@ fn finalize_output() {
                 write_stored_code(offset + bytes_per_sample, neutral);
             }
         }
-    } else if params.output_kind == 3u {
+    } else if params.output_kind == 3u && params.initialize_chroma != 0u {
         let bytes_per_sample = params.storage_bits / 8u;
         let neutral = neutral_chroma_code();
         for (var y = 0u; y < params.chroma_height; y = y + 1u) {
@@ -443,7 +447,12 @@ fn finalize_output() {
                 if params.order == 1u {
                     packed = neutral | (y0 << 8u) | (neutral << 16u) | (y1 << 24u);
                 }
-                write_word(params.plane0_offset + y * params.plane0_stride + pair * 4u, packed);
+                let output_y = params.origin_y + y;
+                let output_pair = params.origin_x / 2u + pair;
+                write_word(
+                    params.plane0_offset + output_y * params.plane0_stride + output_pair * 4u,
+                    packed,
+                );
             }
         }
     }
@@ -507,7 +516,12 @@ fn decode() {
     }
 
     if decode_error == 0u && bit_cursor != params.token_end {
-        decode_error = ERROR_TRAILING_BITS;
+        let padding_bits = params.token_end - bit_cursor;
+        if padding_bits > 7u || peek_bits(padding_bits) != 0u {
+            decode_error = ERROR_TRAILING_BITS;
+        } else {
+            bit_cursor = params.token_end;
+        }
     }
     if decode_error == 0u {
         finalize_output();

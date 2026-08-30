@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_bitstream::{Gray8AccelerationIndex, ParseLimits, PrefixCodeEntry};
+use jxl_gpu_bitstream::{InventoryLimits, ParseLimits, PrefixCodeEntry};
 use jxl_gpu_formats::{
     ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout, Packed422Order,
     PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
@@ -20,12 +21,12 @@ use jxl_wgpu::{
 use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
-use crate::profile::validate_gray8_envelope;
+use crate::profile::{Gray8Group, StandardGray8Profile, parse_standard_gray8_profile};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FixedModularPredictor, FrameDuration,
     FrameMetadata, GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
     GpuSubmissionEngine, GpuSubmissionSession, NumericSampleMapping, PreparedGpuSession, Result,
-    SubmittedGpuFrame, UnsupportedCodestreamFeature, UnsupportedProfile,
+    SubmittedGpuFrame,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
@@ -98,7 +99,10 @@ struct ShaderParams {
     token_end: u32,
     width: u32,
     height: u32,
+    origin_x: u32,
+    origin_y: u32,
     sample_count: u32,
+    initialize_chroma: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -118,6 +122,7 @@ struct ShaderParams {
     chroma_height: u32,
     logical_size: u32,
     numeric_mapping: u32,
+    _padding: u32,
 }
 
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
@@ -133,18 +138,18 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 96);
+    assert!(std::mem::size_of::<ShaderParams>() == 112);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
 };
 
-/// Stock GPU-only decoder for indexed single-group lossless Gray8 codestreams.
+/// Stock GPU-only decoder for the standard lossless Modular Gray8 profile.
 ///
-/// The `jwgp` box contains only SHA-bound bit offsets and canonical prefix tables. The shader
-/// reads entropy tokens from the actual `jxlc` bytes, expands the profile's distance-one zero
-/// runs, unpacks signed residuals, applies the Gradient predictor, and writes the requested GPU
-/// image layout. No CPU pixel or entropy fallback is present.
+/// The frontend inventories standard frame sections and parses only bounded prefix metadata. The
+/// shader reads entropy tokens from the actual `jxlc` bytes, expands distance-one zero runs,
+/// unpacks signed residuals, applies the Gradient predictor, and writes the requested GPU image
+/// layout. No private index, CPU pixel decoder, or CPU entropy fallback is required.
 #[derive(Clone)]
 pub struct WgpuSubmissionEngine {
     backend: WgpuBackend,
@@ -304,22 +309,18 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        let index = codestream.acceleration_index().cloned().ok_or_else(|| {
-            UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::AccelerationIndex,
-                "the stock GPU frontend currently requires a SHA-bound jwgp v1 index; generic JPEG XL parsing is not silently substituted",
-            )
-        })?;
-        if !codestream.is_container() {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::AccelerationIndex,
-                "jwgp acceleration metadata is carried by a JPEG XL container",
-            )
-            .into());
-        }
-        validate_gray8_envelope(codestream.bytes(), &index)?;
-        let prefix_lookup: Arc<[u32]> = build_prefix_lookup(&index)?.into();
-        let extent = Extent2d::new(index.width(), index.height());
+        let parsed = jxl_gpu_bitstream::parse(codestream.bytes(), self.parse_limits())?;
+        let inventory = parsed
+            .codestream_inventory(InventoryLimits {
+                max_frames: 1,
+                max_total_section_bytes: u64::try_from(codestream.bytes().len())
+                    .map_err(|_| Error::backend("codestream size exceeds u64"))?,
+                ..InventoryLimits::default()
+            })
+            .map_err(Error::CodestreamInventory)?;
+        let profile = parse_standard_gray8_profile(codestream.bytes(), &inventory)?;
+        let prefix_lookup: Arc<[u32]> = build_prefix_lookup(&profile)?.into();
+        let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(extent, request, self.capabilities())?;
         let pipeline = match output.f64_output_path {
             Some(F64OutputPath::NativeArithmetic) => self
@@ -337,17 +338,30 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             Some(F64OutputPath::ExactF32Widening) | None => Arc::clone(&self.pipeline),
         };
         let f64_output_path = output.f64_output_path;
+        let dispatch_layout = GroupDispatchLayout::new(self.backend.device(), &profile)?;
         let memory_stats = validate_device_limits(
             self.backend.device(),
             codestream.bytes(),
-            &index,
+            &profile,
+            &dispatch_layout,
             &output,
             request.max_frame_slots().get(),
         )?;
-        let predictor = FixedModularPredictor::new(Gray8AccelerationIndex::PREDICTOR)
-            .expect("the shared Gray8 schema uses a valid JPEG XL predictor");
+        let predictor = FixedModularPredictor::new(5)
+            .expect("the standard Gray8 profile uses the valid Gradient predictor index");
         Ok(PreparedGpuSession::new(
-            DecodeProfile::modular_lossless_8bit(predictor),
+            DecodeProfile::ModularLossless {
+                bits_per_sample: 8,
+                predictor,
+                grouping: if profile.groups.len() == 1 {
+                    crate::ModularGrouping::SingleGroup
+                } else {
+                    crate::ModularGrouping::MultipleGroups {
+                        columns: profile.group_columns,
+                        rows: profile.group_rows,
+                    }
+                },
+            },
             AnimationMetadata::still(extent),
             WgpuDecodeSession {
                 backend: self.backend.clone(),
@@ -355,7 +369,8 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 source: Some(DecodeSource {
                     codestream_storage: codestream.shared_storage(),
                     codestream_range: codestream.storage_range(),
-                    index,
+                    profile,
+                    dispatch_layout,
                     prefix_lookup,
                     output,
                 }),
@@ -368,7 +383,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
     }
 }
 
-/// One-frame runtime-neutral GPU decode session for the indexed Gray8 profile.
+/// One-frame runtime-neutral GPU decode session for the standard Gray8 profile.
 pub struct WgpuDecodeSession {
     backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
@@ -459,7 +474,8 @@ pub struct WgpuPendingFrame {
     token: SubmissionToken,
     layout: ImageLayout,
     completion: Arc<MapCompletion>,
-    sample_count: u32,
+    group_sample_counts: Arc<[u32]>,
+    status_stride: u64,
 }
 
 impl std::fmt::Debug for WgpuPendingFrame {
@@ -468,7 +484,7 @@ impl std::fmt::Debug for WgpuPendingFrame {
             .debug_struct("WgpuPendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
-            .field("sample_count", &self.sample_count)
+            .field("group_sample_counts", &self.group_sample_counts)
             .finish_non_exhaustive()
     }
 }
@@ -516,31 +532,46 @@ impl WgpuPendingFrame {
             .slice(..)
             .get_mapped_range()
             .map_err(Error::backend)?;
-        let status_bytes = mapped
-            .get(..STATUS_BYTES as usize)
-            .ok_or_else(|| Error::backend("GPU status buffer was truncated"))?;
-        let status = bytemuck::try_cast_slice::<u8, DecodeStatus>(status_bytes)
-            .map_err(|_| Error::backend("GPU status buffer has an invalid ABI layout"))
-            .and_then(|statuses| {
-                statuses
+        let statuses = self
+            .group_sample_counts
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(group_index, expected_samples)| {
+                let start = u64::try_from(group_index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(self.status_stride))
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(|| Error::backend("GPU status offset overflow"))?;
+                let end = start
+                    .checked_add(STATUS_BYTES as usize)
+                    .ok_or_else(|| Error::backend("GPU status range overflow"))?;
+                let bytes = mapped
+                    .get(start..end)
+                    .ok_or_else(|| Error::backend("GPU status buffer was truncated"))?;
+                let status = bytemuck::try_cast_slice::<u8, DecodeStatus>(bytes)
+                    .map_err(|_| Error::backend("GPU status buffer has an invalid ABI layout"))?
                     .first()
                     .copied()
-                    .ok_or_else(|| Error::backend("GPU status buffer was truncated"))
-            });
+                    .ok_or_else(|| Error::backend("GPU status buffer was truncated"))?;
+                Ok((group_index, expected_samples, status))
+            })
+            .collect::<Result<Vec<_>>>();
         drop(mapped);
-        let status = status?;
-        if status.code != STATUS_OK
-            || status.decoded_samples != self.sample_count
-            || status.cursor != status.expected_cursor
-        {
-            return Err(Error::backend(format!(
-                "Gray8 GPU decode rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
-                status.code,
-                status.decoded_samples,
-                self.sample_count,
-                status.cursor,
-                status.expected_cursor
-            )));
+        for (group_index, expected_samples, status) in statuses? {
+            if status.code != STATUS_OK
+                || status.decoded_samples != expected_samples
+                || status.cursor != status.expected_cursor
+            {
+                return Err(Error::backend(format!(
+                    "Gray8 GPU group {group_index} rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
+                    status.code,
+                    status.decoded_samples,
+                    expected_samples,
+                    status.cursor,
+                    status.expected_cursor
+                )));
+            }
         }
 
         let output_id = OutputId(0);
@@ -624,9 +655,10 @@ impl GpuPendingFrame for WgpuPendingFrame {
 struct DecodeSource {
     codestream_storage: Arc<[u8]>,
     codestream_range: std::ops::Range<usize>,
-    index: Gray8AccelerationIndex,
-    // Immutable within the session. Future multi-frame frontends can share this Arc whenever the
-    // canonical prefix set is unchanged without sharing mutable GPU transient allocations.
+    profile: StandardGray8Profile,
+    dispatch_layout: GroupDispatchLayout,
+    // Immutable within the session. All independently decoded groups share the standard
+    // DC-global prefix set without sharing mutable GPU transient allocations.
     prefix_lookup: Arc<[u32]>,
     output: OutputPlan,
 }
@@ -658,6 +690,62 @@ impl Drop for DecodeJobLifetime {
 struct DecodeMemoryPermits {
     output: MemoryPermit,
     transient: MemoryPermit,
+}
+
+#[derive(Clone, Debug)]
+struct GroupDispatchLayout {
+    reconstructed_offsets: Arc<[u64]>,
+    reconstructed_bytes: u64,
+    status_stride: u64,
+    status_bytes: u64,
+    params_stride: u64,
+    params_bytes: u64,
+}
+
+impl GroupDispatchLayout {
+    fn new(device: &wgpu::Device, profile: &StandardGray8Profile) -> Result<Self> {
+        let limits = device.limits();
+        let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(4));
+        let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(16));
+        let mut reconstructed_offsets = Vec::with_capacity(profile.groups.len());
+        let mut reconstructed_bytes = 0u64;
+        for group in &profile.groups {
+            reconstructed_bytes = align_to(reconstructed_bytes, storage_alignment)?;
+            reconstructed_offsets.push(reconstructed_bytes);
+            reconstructed_bytes =
+                reconstructed_bytes
+                    .checked_add(u64::from(group.sample_count()?).checked_mul(4).ok_or_else(
+                        || Error::backend("group reconstruction buffer size overflow"),
+                    )?)
+                    .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
+        }
+        reconstructed_bytes = align4(reconstructed_bytes)?;
+        let group_count = u64::try_from(profile.groups.len())
+            .map_err(|_| Error::backend("Gray8 group count exceeds u64"))?;
+        let status_stride = align_to(STATUS_BYTES, storage_alignment)?;
+        let status_bytes = status_stride
+            .checked_mul(group_count.saturating_sub(1))
+            .and_then(|bytes| bytes.checked_add(STATUS_BYTES))
+            .and_then(|bytes| align4(bytes).ok())
+            .ok_or_else(|| Error::backend("group status buffer size overflow"))?;
+        let params_stride = align_to(
+            std::mem::size_of::<ShaderParams>() as u64,
+            uniform_alignment,
+        )?;
+        let params_bytes = params_stride
+            .checked_mul(group_count.saturating_sub(1))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ShaderParams>() as u64))
+            .and_then(|bytes| align4(bytes).ok())
+            .ok_or_else(|| Error::backend("group parameter buffer size overflow"))?;
+        Ok(Self {
+            reconstructed_offsets: reconstructed_offsets.into(),
+            reconstructed_bytes,
+            status_stride,
+            status_bytes,
+            params_stride,
+            params_bytes,
+        })
+    }
 }
 
 #[repr(u32)]
@@ -976,26 +1064,25 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
 fn validate_device_limits(
     device: &wgpu::Device,
     codestream: &[u8],
-    index: &Gray8AccelerationIndex,
+    profile: &StandardGray8Profile,
+    dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
     max_frame_slots: usize,
 ) -> Result<WgpuDecodeMemoryStats> {
-    let token_end = index
-        .token_bit_offset()
-        .checked_add(index.token_bit_len())
-        .ok_or_else(|| Error::backend("indexed token range overflow"))?;
-    if token_end > u64::from(u32::MAX) {
+    if profile
+        .groups
+        .iter()
+        .any(|group| group.token_bit_end > u64::from(u32::MAX))
+    {
         return Err(Error::backend(
-            "indexed token offsets exceed the portable WGSL u32 address space",
+            "standard group token offsets exceed the portable WGSL u32 address space",
         ));
     }
     let storage_limit = device.limits().max_storage_buffer_binding_size;
+    let buffer_limit = device.limits().max_buffer_size;
     let codestream_bytes = stream_allocation_size(codestream.len())?;
     let lookup_bytes = u64::try_from(LOOKUP_SIZE * 4)
         .map_err(|_| Error::backend("prefix lookup size overflow"))?;
-    let sample_bytes = u64::from(index.sample_count())
-        .checked_mul(4)
-        .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
     let output_bytes = align4(output.layout.logical_size)?;
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
@@ -1006,24 +1093,45 @@ fn validate_device_limits(
     for (name, required) in [
         ("codestream", codestream_bytes),
         ("prefix lookup", lookup_bytes),
-        ("reconstructed samples", sample_bytes),
         ("requested output", output_bytes),
     ] {
-        if required > storage_limit || required > device.limits().max_buffer_size {
+        if required > storage_limit || required > buffer_limit {
             return Err(Error::backend(format!(
                 "{name} buffer requires {required} bytes, exceeding the device limit"
+            )));
+        }
+    }
+    if profile.groups.iter().any(|group| {
+        u64::from(group.width)
+            .checked_mul(u64::from(group.height))
+            .and_then(|samples| samples.checked_mul(4))
+            .is_none_or(|bytes| bytes > storage_limit)
+    }) {
+        return Err(Error::backend(
+            "a Gray8 group reconstruction binding exceeds the device storage-binding limit",
+        ));
+    }
+    for (name, required) in [
+        ("reconstructed samples", dispatch.reconstructed_bytes),
+        ("group statuses", dispatch.status_bytes),
+        ("group status readback", dispatch.status_bytes),
+        ("group parameters", dispatch.params_bytes),
+    ] {
+        if required > buffer_limit {
+            return Err(Error::backend(format!(
+                "{name} buffer requires {required} bytes, exceeding the device buffer limit"
             )));
         }
     }
     let per_frame = [
         codestream_bytes,
         lookup_bytes,
-        sample_bytes,
+        dispatch.reconstructed_bytes,
         output_bytes,
         native_f64_dummy_bytes,
-        STATUS_BYTES,
-        STATUS_BYTES,
-        std::mem::size_of::<ShaderParams>() as u64,
+        dispatch.status_bytes,
+        dispatch.status_bytes,
+        dispatch.params_bytes,
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1091,13 +1199,10 @@ fn submit_decode(
         bytemuck::cast_slice(source.prefix_lookup.as_ref()),
     );
 
-    let sample_bytes = u64::from(source.index.sample_count())
-        .checked_mul(4)
-        .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
     let reconstructed_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     let reconstructed = buffers.checkout(
         "jxl-wgpu decoded Gray8 samples",
-        sample_bytes,
+        source.dispatch_layout.reconstructed_bytes,
         reconstructed_usage,
         std::mem::align_of::<u32>() as u64,
     );
@@ -1126,72 +1231,127 @@ fn submit_decode(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
     let status = buffers.checkout(
         "jxl-wgpu decode status",
-        STATUS_BYTES,
+        source.dispatch_layout.status_bytes,
         status_usage,
         std::mem::align_of::<DecodeStatus>() as u64,
     );
     let status_staging_usage = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ;
     let status_staging = buffers.checkout(
         "jxl-wgpu decode status readback",
-        STATUS_BYTES,
+        source.dispatch_layout.status_bytes,
         status_staging_usage,
         wgpu::COPY_BUFFER_ALIGNMENT,
     );
 
-    let params = build_params(&source.index, &source.output)?;
     let params_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
     let params_buffer = buffers.checkout(
         "jxl-wgpu decode Gray8 parameters",
-        std::mem::size_of::<ShaderParams>() as u64,
+        source.dispatch_layout.params_bytes,
         params_usage,
         16,
     );
+    let mut params_upload = vec![
+        0u8;
+        usize::try_from(source.dispatch_layout.params_bytes).map_err(
+            |_| Error::backend("group parameter upload exceeds host address space")
+        )?
+    ];
+    for (index, &group) in source.profile.groups.iter().enumerate() {
+        let params = build_params(group, &source.output, index == 0)?;
+        let offset = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| Error::backend("group parameter offset overflow"))?;
+        let end = offset
+            .checked_add(std::mem::size_of::<ShaderParams>())
+            .ok_or_else(|| Error::backend("group parameter range overflow"))?;
+        params_upload
+            .get_mut(offset..end)
+            .ok_or_else(|| Error::backend("group parameter buffer is truncated"))?
+            .copy_from_slice(bytemuck::bytes_of(&params));
+    }
     backend
         .queue()
-        .write_buffer(params_buffer.buffer(), 0, bytemuck::bytes_of(&params));
+        .write_buffer(params_buffer.buffer(), 0, &params_upload);
 
     let word_output_binding = native_f64_dummy_words.as_ref().map_or_else(
         || output.as_entire_binding(),
         |buffer| buffer.buffer().as_entire_binding(),
     );
-    let mut binding_entries = vec![
-        wgpu::BindGroupEntry {
-            binding: 0,
-            resource: stream.as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 1,
-            resource: lookup_buffer.buffer().as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 2,
-            resource: reconstructed.buffer().as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 3,
-            resource: word_output_binding,
-        },
-        wgpu::BindGroupEntry {
-            binding: 4,
-            resource: status.buffer().as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 5,
-            resource: params_buffer.buffer().as_entire_binding(),
-        },
-    ];
-    if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
-        binding_entries.push(wgpu::BindGroupEntry {
-            binding: 6,
-            resource: output.as_entire_binding(),
+    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let mut bindings = Vec::with_capacity(source.profile.groups.len());
+    for (group_index, group) in source.profile.groups.iter().enumerate() {
+        let index = u64::try_from(group_index)
+            .map_err(|_| Error::backend("group binding index exceeds u64"))?;
+        let reconstructed_offset = *source
+            .dispatch_layout
+            .reconstructed_offsets
+            .get(group_index)
+            .ok_or_else(|| Error::backend("missing group reconstruction offset"))?;
+        let reconstructed_size = u64::from(group.sample_count()?)
+            .checked_mul(4)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| Error::backend("invalid group reconstruction binding size"))?;
+        let status_offset = index
+            .checked_mul(source.dispatch_layout.status_stride)
+            .ok_or_else(|| Error::backend("group status binding offset overflow"))?;
+        let params_offset = index
+            .checked_mul(source.dispatch_layout.params_stride)
+            .ok_or_else(|| Error::backend("group parameter binding offset overflow"))?;
+        let reconstructed_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: reconstructed.buffer(),
+            offset: reconstructed_offset,
+            size: Some(reconstructed_size),
         });
+        let status_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: status.buffer(),
+            offset: status_offset,
+            size: NonZeroU64::new(STATUS_BYTES),
+        });
+        let params_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: params_buffer.buffer(),
+            offset: params_offset,
+            size: NonZeroU64::new(std::mem::size_of::<ShaderParams>() as u64),
+        });
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: stream.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: lookup_buffer.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: reconstructed_binding,
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: word_output_binding.clone(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: status_binding,
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: params_binding,
+            },
+        ];
+        if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: output.as_entire_binding(),
+            });
+        }
+        bindings.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("jxl-wgpu decode Gray8 group bindings"),
+            layout: &bind_group_layout,
+            entries: &entries,
+        }));
     }
-    let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("jxl-wgpu decode Gray8 bindings"),
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &binding_entries,
-    });
-    drop(binding_entries);
     let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("jxl-wgpu decode Gray8 submission"),
     });
@@ -1207,10 +1367,18 @@ fn submit_decode(
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bindings, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        for binding in &bindings {
+            pass.set_bind_group(0, binding, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
     }
-    commands.copy_buffer_to_buffer(status.buffer(), 0, status_staging.buffer(), 0, STATUS_BYTES);
+    commands.copy_buffer_to_buffer(
+        status.buffer(),
+        0,
+        status_staging.buffer(),
+        0,
+        source.dispatch_layout.status_bytes,
+    );
 
     let completion = Arc::new(MapCompletion::default());
     let callback_completion = Arc::clone(&completion);
@@ -1259,21 +1427,29 @@ fn submit_decode(
         token: SubmissionToken(1),
         layout: source.output.layout.clone(),
         completion,
-        sample_count: source.index.sample_count(),
+        group_sample_counts: source
+            .profile
+            .groups
+            .iter()
+            .copied()
+            .map(Gray8Group::sample_count)
+            .collect::<Result<Vec<_>>>()?
+            .into(),
+        status_stride: source.dispatch_layout.status_stride,
     })
 }
 
-fn build_prefix_lookup(index: &Gray8AccelerationIndex) -> Result<Vec<u32>> {
+fn build_prefix_lookup(profile: &StandardGray8Profile) -> Result<Vec<u32>> {
     let mut lookup = vec![0u32; LOOKUP_SIZE];
-    for (symbol, entry) in index
-        .raw_prefix()
+    for (symbol, entry) in profile
+        .raw_prefix
         .iter()
         .copied()
         .enumerate()
         .map(|(symbol, entry)| (symbol as u32, entry))
         .chain(
-            index
-                .lz77_prefix()
+            profile
+                .lz77_prefix
                 .iter()
                 .copied()
                 .enumerate()
@@ -1291,7 +1467,7 @@ fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Res
     }
     if entry.bit_len > LOOKUP_BITS {
         return Err(Error::backend(format!(
-            "validated jwgp prefix length {} exceeds the {LOOKUP_BITS}-bit GPU lookup",
+            "validated standard prefix length {} exceeds the {LOOKUP_BITS}-bit GPU lookup",
             entry.bit_len
         )));
     }
@@ -1300,7 +1476,7 @@ fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Res
         let index = usize::from(entry.bits) | (suffix << entry.bit_len);
         if lookup[index] != 0 {
             return Err(Error::backend(
-                "validated jwgp prefix entries collide in the GPU lookup table",
+                "validated standard prefix entries collide in the GPU lookup table",
             ));
         }
         lookup[index] = (symbol << 8) | u32::from(entry.bit_len);
@@ -1308,11 +1484,11 @@ fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Res
     Ok(())
 }
 
-fn build_params(index: &Gray8AccelerationIndex, output: &OutputPlan) -> Result<ShaderParams> {
-    let token_end = index
-        .token_bit_offset()
-        .checked_add(index.token_bit_len())
-        .ok_or_else(|| Error::backend("indexed token range overflow"))?;
+fn build_params(
+    group: Gray8Group,
+    output: &OutputPlan,
+    initialize_chroma: bool,
+) -> Result<ShaderParams> {
     let to_u32 = |value: u64, name: &'static str| {
         u32::try_from(value).map_err(|_| Error::backend(format!("{name} exceeds WGSL u32")))
     };
@@ -1330,11 +1506,14 @@ fn build_params(index: &Gray8AccelerationIndex, output: &OutputPlan) -> Result<S
     let (plane3_offset, plane3_stride) = plane(3)?;
     let chroma = output.layout.plane(1);
     Ok(ShaderParams {
-        token_start: to_u32(index.token_bit_offset(), "token start")?,
-        token_end: to_u32(token_end, "token end")?,
-        width: index.width(),
-        height: index.height(),
-        sample_count: index.sample_count(),
+        token_start: to_u32(group.token_bit_offset, "token start")?,
+        token_end: to_u32(group.token_bit_end, "token end")?,
+        width: group.width,
+        height: group.height,
+        origin_x: group.x,
+        origin_y: group.y,
+        sample_count: group.sample_count()?,
+        initialize_chroma: u32::from(initialize_chroma),
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -1354,6 +1533,7 @@ fn build_params(index: &Gray8AccelerationIndex, output: &OutputPlan) -> Result<S
         chroma_height: chroma.map_or(0, |plane| plane.sample_extent.height),
         logical_size: to_u32(output.layout.logical_size, "output logical size")?,
         numeric_mapping: output.numeric_mapping,
+        _padding: 0,
     })
 }
 
@@ -1404,6 +1584,18 @@ fn align4(value: u64) -> Result<u64> {
         .checked_add(3)
         .map(|value| value & !3)
         .ok_or_else(|| Error::backend("GPU buffer size overflow"))
+}
+
+fn align_to(value: u64, alignment: u64) -> Result<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(Error::backend(
+            "wgpu reported a non-power-of-two buffer offset alignment",
+        ));
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or_else(|| Error::backend("GPU buffer alignment overflow"))
 }
 
 #[derive(Default)]
@@ -1747,43 +1939,47 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 96);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 112);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
             token_end: 2,
             width: 3,
             height: 4,
-            sample_count: 5,
-            output_kind: 6,
-            transfer: 7,
-            limited_range: 8,
-            channels: 9,
-            order: 10,
-            bits: 11,
-            storage_bits: 12,
-            plane0_offset: 13,
-            plane0_stride: 14,
-            plane1_offset: 15,
-            plane1_stride: 16,
-            plane2_offset: 17,
-            plane2_stride: 18,
-            plane3_offset: 19,
-            plane3_stride: 20,
-            chroma_width: 21,
-            chroma_height: 22,
-            logical_size: 23,
-            numeric_mapping: 24,
+            origin_x: 5,
+            origin_y: 6,
+            sample_count: 7,
+            initialize_chroma: 8,
+            output_kind: 9,
+            transfer: 10,
+            limited_range: 11,
+            channels: 12,
+            order: 13,
+            bits: 14,
+            storage_bits: 15,
+            plane0_offset: 16,
+            plane0_stride: 17,
+            plane1_offset: 18,
+            plane1_stride: 19,
+            plane2_offset: 20,
+            plane2_stride: 21,
+            plane3_offset: 22,
+            plane3_stride: 23,
+            chroma_width: 24,
+            chroma_height: 25,
+            logical_size: 26,
+            numeric_mapping: 27,
+            _padding: 28,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 24]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 28]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24,
+                24, 25, 26, 27, 28,
             ]
         );
         assert!(SHADER_TEMPLATE.contains(
-            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    sample_count: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n};"
+            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    origin_x: u32,\n    origin_y: u32,\n    sample_count: u32,\n    initialize_chroma: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n    _padding: u32,\n};"
         ));
 
         assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);

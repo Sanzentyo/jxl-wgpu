@@ -5,8 +5,10 @@
 //! through `wgpu`. The CPU side is limited to job coordination and deterministic
 //! JPEG XL bitstream/container assembly.
 //!
-//! [`LosslessModular8Encoder`] implements standard multi-group lossless Modular Gray8, RGB8, and
-//! RGBA8 while the generic [`GpuEncoder`] advertises only profiles implemented by its backend.
+//! [`LosslessModularEncoder`] implements standard multi-group lossless Modular Gray, RGB, and RGBA
+//! for every unsigned integer depth in `1..=16`. Samples remain GPU-resident through reversible
+//! color transform, prediction, residual tokenization, and histogram collection. The generic
+//! [`GpuEncoder`] advertises only profiles implemented by its backend.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -26,7 +28,7 @@ mod buffer_pool;
 mod capability;
 mod error;
 mod gpu;
-mod lossless_modular8;
+mod lossless_modular;
 mod packet;
 mod prefix;
 mod session;
@@ -43,11 +45,11 @@ pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
 };
-pub use lossless_modular8::{
-    LOSSLESS_MODULAR8_GROUP_DIMENSION, LosslessModular8Backend, LosslessModular8Encoder,
-    LosslessModular8Format, LosslessModular8Group, LosslessModular8GroupGrid,
-    LosslessModular8InFlightMemory, LosslessModular8Job, LosslessModular8MemoryLimits,
-    LosslessModular8MemoryPlan, LosslessModular8Submission,
+pub use lossless_modular::{
+    LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularBackend, LosslessModularEncoder,
+    LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
+    LosslessModularInFlightMemory, LosslessModularJob, LosslessModularMemoryLimits,
+    LosslessModularMemoryPlan, LosslessModularSubmission,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,

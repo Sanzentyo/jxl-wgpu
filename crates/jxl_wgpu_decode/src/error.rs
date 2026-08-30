@@ -3,11 +3,9 @@ use thiserror::Error;
 /// Codestream feature recognized by a frontend but outside its GPU profile.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UnsupportedCodestreamFeature {
-    AccelerationIndex,
     VarDct,
     ModularBitDepth(u8),
     AdaptiveModularPredictor,
-    MultipleGroups,
     MultiplePasses,
     ExtraChannels,
     Patches,
@@ -65,14 +63,12 @@ impl FrontendIncomplete {
 pub enum Error {
     #[error("JPEG XL container/codestream validation failed: {0}")]
     Bitstream(#[from] jxl_gpu_bitstream::Error),
-    #[error("invalid jwgp GPU acceleration index: {0}")]
-    AccelerationIndex(#[from] jxl_gpu_bitstream::AccelerationIndexError),
+    #[error("JPEG XL standard codestream inventory failed: {0}")]
+    CodestreamInventory(#[from] jxl_gpu_bitstream::InventoryError),
     #[error("invalid requested pixel format: {0}")]
     PixelFormat(#[from] jxl_gpu_formats::PixelFormatError),
     #[error("invalid requested image layout: {0}")]
     ImageLayout(#[from] jxl_gpu_formats::LayoutError),
-    #[error("the input contains more than one jwgp GPU acceleration index")]
-    DuplicateAccelerationIndex,
     #[error("the stock GPU decoder cannot produce the requested pixel format: {0}")]
     UnsupportedOutputFormat(String),
     #[error("a non-color numeric output requires an explicit NumericSampleMapping")]
