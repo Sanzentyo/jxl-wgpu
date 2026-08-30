@@ -1675,7 +1675,7 @@ fn validate_artifact<'a>(
                 left
             };
             let residual =
-                artifact.quantized_dc_yxb[base + block] - clamped_gradient_i32(top, left, top_left);
+                gradient_residual_i32(artifact.quantized_dc_yxb[base + block], top, left, top_left);
             let (token, extra_bit_count, extra) = signed_token(residual)?;
             let slot = base + block;
             if artifact.dc_raw_tokens[slot] != token || artifact.dc_extra_bits[slot] != extra {
@@ -1881,7 +1881,7 @@ fn validate_scalable_artifact<'a>(
                 left
             };
             let actual = quantized_dc[base + block] as i32;
-            let residual = actual - clamped_gradient_i32(top, left, top_left);
+            let residual = gradient_residual_i32(actual, top, left, top_left);
             let (token, extra_bit_count, extra) = signed_token(residual)?;
             let slot = base + block;
             if raw_tokens[slot] != token || extra_bits[slot] != extra {
@@ -2032,7 +2032,13 @@ fn read_fragment_slice(
 }
 
 fn clamped_gradient_i32(top: i32, left: i32, top_left: i32) -> i32 {
-    (top + left - top_left).clamp(top.min(left), top.max(left))
+    top.wrapping_add(left)
+        .wrapping_sub(top_left)
+        .clamp(top.min(left), top.max(left))
+}
+
+fn gradient_residual_i32(actual: i32, top: i32, left: i32, top_left: i32) -> i32 {
+    actual.wrapping_sub(clamped_gradient_i32(top, left, top_left))
 }
 
 fn signed_token(value: i32) -> Result<(u32, u32, u32), BackendError> {
@@ -2592,6 +2598,33 @@ mod tests {
     }
 
     #[test]
+    fn artifact_gradient_validation_matches_wgsl_wrapping_without_panicking() {
+        fn wgsl_gradient(top: i32, left: i32, top_left: i32) -> i32 {
+            let wrapped = i32::from_ne_bytes(
+                u32::from_ne_bytes(top.to_ne_bytes())
+                    .wrapping_add(u32::from_ne_bytes(left.to_ne_bytes()))
+                    .wrapping_sub(u32::from_ne_bytes(top_left.to_ne_bytes()))
+                    .to_ne_bytes(),
+            );
+            wrapped.clamp(top.min(left), top.max(left))
+        }
+
+        for (actual, top, left, top_left) in [
+            (i32::MAX, i32::MAX, i32::MAX, i32::MIN),
+            (i32::MIN, i32::MIN, i32::MIN, i32::MAX),
+            (0, i32::MIN, i32::MAX, 0),
+            (i32::MAX, i32::MIN, 1, i32::MAX),
+            (i32::MIN, -1, i32::MAX, i32::MIN),
+        ] {
+            let expected = wgsl_gradient(top, left, top_left);
+            assert_eq!(clamped_gradient_i32(top, left, top_left), expected);
+            let residual = gradient_residual_i32(actual, top, left, top_left);
+            assert_eq!(residual, actual.wrapping_sub(expected));
+            assert!(std::panic::catch_unwind(|| signed_token(residual)).is_ok());
+        }
+    }
+
+    #[test]
     fn scalable_layout_is_checked_and_preserves_large_orientation() {
         let code = fixed_prefix_code().unwrap();
         let portrait = ScalableArtifactLayout::new(VarDctStrategy::Dct256x128, &code).unwrap();
@@ -2643,6 +2676,63 @@ mod tests {
 
         let codestream = encoder.encode(source).unwrap();
         assert_eq!(decode_rgb8(&codestream), vec![0; 8 * 8 * 3]);
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn abandoned_scalable_job_retains_and_releases_its_exact_budget() {
+        let Some(base_context) = test_context() else {
+            return;
+        };
+        let strategy = VarDctStrategy::Dct256x256;
+        let pixels = vec![[0u8; 3]; 256 * 256];
+        let provisional = VarDctEncoder::new(base_context.clone(), strategy).unwrap();
+        let provisional_source = padded_rgb_source_sized(&base_context, 256, 256, &pixels);
+        let plan = provisional.memory_plan(&provisional_source).unwrap();
+        let limited_context = WgpuContext::with_memory_budget(
+            Arc::new(base_context.device().clone()),
+            Arc::new(base_context.queue().clone()),
+            NonZeroU64::new(plan.owned_bytes_per_job).unwrap(),
+        )
+        .unwrap();
+        let encoder = VarDctEncoder::new(limited_context.clone(), strategy).unwrap();
+        let source = padded_rgb_source_sized(&limited_context, 256, 256, &pixels);
+
+        let abandoned = encoder.submit(source.clone()).unwrap();
+        assert_eq!(
+            encoder.in_flight_memory_stats().reserved_bytes,
+            plan.owned_bytes_per_job
+        );
+        assert!(matches!(
+            encoder.submit(source),
+            Err(EncodeError::MemoryBackpressure(_))
+        ));
+        drop(abandoned);
+
+        let fence_commands =
+            limited_context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("abandoned scalable VarDCT completion fence"),
+                });
+        let fence = limited_context.queue().submit([fence_commands.finish()]);
+        limited_context
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(fence),
+                timeout: None,
+            })
+            .expect("abandoned scalable VarDCT work completes");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while encoder.in_flight_memory_stats().reserved_bytes != 0
+            && std::time::Instant::now() < deadline
+        {
+            limited_context
+                .device()
+                .poll(wgpu::PollType::Poll)
+                .expect("drive abandoned scalable VarDCT map callback");
+            std::thread::yield_now();
+        }
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
     }
 

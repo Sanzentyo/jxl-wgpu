@@ -113,16 +113,17 @@ is not yet a general quality or rate-control implementation.
 `VarDctMemoryPlan::kernel_layout` distinguishes the fixed and scalable artifacts. Fixed submissions
 reserve exactly 51,456 encoder-owned bytes: one 256-byte parameter record, one 25,600-byte artifact,
 and one equal-size readback. Scalable artifacts are computed from the live block/sample count and
-the maximum fragment bits derived from the actual prefix entries; they range from 3,584 bytes for
-64×64 to 50,944 bytes for 256×256, so the largest encoder-owned reservation is 102,144 bytes.
+the maximum fragment bits derived from the actual prefix entries; they range from 2,560 bytes for
+64×32 or 32×64 to 50,944 bytes for 256×256, so the largest encoder-owned reservation is 102,144
+bytes.
 Every section starts on a 256-byte boundary. Parameter/header records are `bytemuck::Pod`, all
 arithmetic is checked, and source binding, buffer, workgroup-storage, invocation, and dispatch
 limits are validated before submission. Completion supports blocking native use and a
 runtime-neutral `Future`, and is deterministic on one device. Actual-GPU tests run every strategy
 through the published Rust `jxl` decoder; black is exact and solid-red and gradient fixtures carry
 explicit quality guards. `djxl` verifies emitted streams, while `cjxl` serves as a development
-quality oracle. There is no CPU transform, quantization, residual, entropy, pixel-codec fallback,
-or compatibility alias.
+quality oracle rather than a strategy-selection oracle. There is no CPU transform, quantization,
+residual, entropy, pixel-codec fallback, or compatibility alias.
 
 ```rust,no_run
 # use jxl_wgpu_encode::{BufferImageSource, VarDctEncoder, VarDctStrategy, WgpuContext};
