@@ -771,11 +771,16 @@ pub fn run_stock_gpu_round_trip(
     }
     let image = LazyImage::new(case, max_row_bytes)?;
     let source_path = PathBuf::from(format!("<lazy-conformance:{}>", case.name));
+    let max_frame_slots = stock_max_frame_slots(case);
     let mut report = CodecCaseReport::new(
         case.name.clone(),
         &source_path,
         CodecOperation::RoundTrip,
-        WorkloadSpec::default(),
+        WorkloadSpec {
+            max_frame_slots: u32::try_from(max_frame_slots.get())
+                .expect("stock frame-slot count fits u32"),
+            ..WorkloadSpec::default()
+        },
         OutputTarget::CpuReadback,
         GpuPixelFormat::U8,
         case.size_class(),
@@ -1191,11 +1196,7 @@ fn execute_stock_gpu_round_trip(
         PixelModel::Rgb | PixelModel::Rgba => GpuOutputRequest::color(format.clone()),
     }
     .map_err(|source| StockGpuRoundTripError::OutputRequest { source })?;
-    let request = if case.category == ResolutionClass::Uhd16k {
-        request.with_max_frame_slots(NonZeroUsize::MIN)
-    } else {
-        request
-    };
+    let request = request.with_max_frame_slots(stock_max_frame_slots(case));
     let decoder = GpuDecoder::wgpu(backend.clone());
     let mut session = decoder
         .open_shared(Arc::clone(&encoded), request)
@@ -1277,6 +1278,14 @@ fn execute_stock_gpu_round_trip(
         readback_logical_bytes: readback_stats.logical_bytes,
         readback_staging_bytes: readback_stats.staging_bytes,
     })
+}
+
+fn stock_max_frame_slots(case: &ConformanceCase) -> NonZeroUsize {
+    if case.category == ResolutionClass::Uhd16k {
+        NonZeroUsize::MIN
+    } else {
+        NonZeroUsize::new(2).expect("two is nonzero")
+    }
 }
 
 fn hash_stock_output(
@@ -1833,6 +1842,7 @@ mod tests {
         assert_eq!(image.layout().active_row_bytes, 15_360);
         assert_eq!(image.layout().row_stride, 15_360);
         assert_eq!(image.layout().storage_bytes, 132_710_400);
+        assert_eq!(stock_max_frame_slots(&case), NonZeroUsize::MIN);
         assert_eq!(
             image.rows().next().unwrap().unwrap().storage().len(),
             15_360
