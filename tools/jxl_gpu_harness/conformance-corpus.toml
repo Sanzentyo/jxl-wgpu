@@ -146,6 +146,28 @@ support_note = "Extreme 1:4097 aspect ratio spanning seventeen vertical pass gro
 external_reference = true
 
 [[cases]]
+name = "extreme-panorama-gray8-16384x1"
+category = "panorama"
+extent = { width = 16384, height = 1 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 256, extra_padding = 3, padding_byte = 67 }
+pattern = { seed = 21 }
+expectation = "stock_gpu_round_trip"
+support_note = "Exact 16K-wide panorama with a non-four-byte logical storage tail."
+external_reference = true
+
+[[cases]]
+name = "extreme-tall-gray8-1x16384"
+category = "tall"
+extent = { width = 1, height = 16384 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 4, extra_padding = 1, padding_byte = 188 }
+pattern = { seed = 22 }
+expectation = "stock_gpu_round_trip"
+support_note = "Exact 16K-tall image with a five-byte source stride across sixty-four vertical pass groups."
+external_reference = true
+
+[[cases]]
 name = "hd-gray8-1280x720"
 category = "hd"
 extent = { width = 1280, height = 720 }
@@ -156,8 +178,8 @@ expectation = "stock_gpu_round_trip"
 support_note = "Fifteen-pass-group HD decode with an intentionally non-canonical source pitch."
 external_reference = true
 
-# Encode-capable profiles awaiting matching GPU decoder coverage. These remain visible but are not
-# reported as round-trip passes.
+# Native color and high-bit-depth profiles. These use the same executable GPU encode/readback
+# path as the Gray cases above.
 
 [[cases]]
 name = "odd-rgba8-19x11-opaque"
@@ -166,8 +188,8 @@ extent = { width = 19, height = 11 }
 source = { model = "rgba", depth = "u8", alpha = "opaque" }
 row_layout = { alignment = 64, extra_padding = 3, padding_byte = 44 }
 pattern = { seed = 11 }
-expectation = "future_gpu_profile"
-support_note = "GPU encode supports RGBA; GPU decode integration is pending. Alpha is fully opaque."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact GPU RGBA round trip with a standard unassociated alpha extra channel."
 external_reference = false
 
 [[cases]]
@@ -177,8 +199,8 @@ extent = { width = 64, height = 64 }
 source = { model = "rgba", depth = "u12", alpha = "checkerboard" }
 row_layout = { alignment = 256, extra_padding = 32, padding_byte = 75 }
 pattern = { seed = 12 }
-expectation = "future_gpu_profile"
-support_note = "GPU encode supports this profile; high-bit-depth RGBA GPU decode is pending."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact 12-bit GPU RGBA round trip with checkerboard alpha."
 external_reference = false
 
 [[cases]]
@@ -188,8 +210,8 @@ extent = { width = 127, height = 509 }
 source = { model = "gray", depth = "u16", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 2, padding_byte = 102 }
 pattern = { seed = 13 }
-expectation = "future_gpu_profile"
-support_note = "GPU encode supports this profile; Gray U16 GPU decode is pending."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact 16-bit GPU Gray round trip across two vertical pass groups."
 external_reference = true
 
 [[cases]]
@@ -199,8 +221,8 @@ extent = { width = 1280, height = 720 }
 source = { model = "rgb", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 0, padding_byte = 153 }
 pattern = { seed = 14 }
-expectation = "future_gpu_profile"
-support_note = "HD RGB GPU encode coverage; RGB GPU decode integration is pending."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact HD RGB8 GPU round trip across fifteen pass groups."
 external_reference = true
 
 [[cases]]
@@ -210,8 +232,8 @@ extent = { width = 1920, height = 1080 }
 source = { model = "rgba", depth = "u8", alpha = "horizontal_ramp" }
 row_layout = { alignment = 256, extra_padding = 17, padding_byte = 204 }
 pattern = { seed = 15 }
-expectation = "future_gpu_profile"
-support_note = "FHD RGBA metadata with a horizontal alpha ramp; future codec profile."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact FHD RGBA8 GPU round trip with a horizontal alpha ramp."
 external_reference = false
 
 [[cases]]
@@ -221,6 +243,28 @@ extent = { width = 3840, height = 2160 }
 source = { model = "rgb", depth = "u10", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 64, padding_byte = 51 }
 pattern = { seed = 16 }
-expectation = "future_gpu_profile"
-support_note = "UHD 4K RGB10 metadata and lazy-generation coverage; future codec profile."
+expectation = "stock_gpu_round_trip"
+support_note = "Exact UHD 4K RGB10 GPU round trip with bounded lazy source generation."
 external_reference = true
+
+[[cases]]
+name = "uhd8k-gray8-7680x4320"
+category = "uhd8k"
+extent = { width = 7680, height = 4320 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 256, extra_padding = 32, padding_byte = 110 }
+pattern = { seed = 23 }
+expectation = "stock_gpu_round_trip"
+support_note = "Exact UHD 8K Gray8 round trip with padded rows and row-bounded mapped GPU generation."
+external_reference = false
+
+[[cases]]
+name = "uhd16k-gray8-15360x8640"
+category = "uhd16k"
+extent = { width = 15360, height = 8640 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 256, extra_padding = 0, padding_byte = 0 }
+pattern = { seed = 24 }
+expectation = "stock_gpu_round_trip"
+support_note = "Exact full-frame UHD 16K Gray8 round trip; source rows are generated directly into a 126.6 MiB GPU buffer and decode uses one frame slot."
+external_reference = false

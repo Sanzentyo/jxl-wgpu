@@ -117,15 +117,29 @@ and does not silently change the production path or assert that either implement
 
 `conformance-corpus.toml` is a typed inventory of deterministic Gray, RGB, and RGBA inputs. It
 includes tiny, odd, square, portrait, landscape, panorama, tall, 255/256/257 boundary, HD, FHD,
-and UHD 4K extents. Each case records sample depth, alpha pattern, active bytes, row alignment,
-extra padding, and padding byte. Generation is row-lazy: validation, BLAKE3 hashing, raw output,
-and PGM/PPM/PAM output never allocate a complete large image.
+UHD 4K, UHD 8K, and full-frame UHD 16K extents, plus 16384x1 and 1x16384 aspect-ratio limits.
+Each case records sample depth, alpha pattern, active bytes, row alignment, extra padding, and
+padding byte. Generation is row-lazy: validation, BLAKE3 hashing, raw output, and PGM/PPM/PAM
+output never allocate a complete large image.
 
 `--action inventory` emits both a padded-storage `input_hash` and an active-pixel `pixel_hash`.
-`--action gpu-round-trip` executes only cases labelled `stock_gpu_round_trip`; currently that is
-the honest Gray U8 2..=256 profile. Its source is uploaded with the manifest's actual padded row
-stride before GPU encoding. RGB, RGBA, higher bit depth, 257+, HD, FHD, and 4K cases remain visible
-as `future_gpu_profile` and are not counted as successful codec execution.
+`--action gpu-round-trip` executes every case labelled `stock_gpu_round_trip`, including native
+unsigned Gray/RGB/RGBA input, 8/10/12/16-bit samples, extreme aspect ratios, and 8K/16K Gray8.
+The source is generated and hashed one row at a time directly in a four-byte-aligned,
+mapped-at-creation GPU buffer with the manifest's real padded stride; there is no full-image host
+`Vec`. The device's `max_buffer_size` is checked before allocation and failures retain their typed
+error chain. GPU actions reuse those generation hashes for inventory instead of generating the
+frame twice. The single-frame full 16K case explicitly uses one decoder frame slot, while smaller
+cases retain the normal two-slot concurrency contract. Reported codec submissions include the
+encoder's streamed histogram/serialization batches and the decoder's bounded stream batches.
+
+Local validation evidence from 2026-08-31 on the Apple M5 Metal adapter is deliberately recorded
+as machine-specific data, not a portable performance guarantee. The targeted 7680x4320 Gray8 case
+round-tripped exactly with 21 actual codec queue submissions. The complete
+`conformance_corpus` integration target passed all three tests in 398.39 seconds, including exact
+readback for all 24 stock cases and the 15360x8640 full-frame Gray8 case. The stock integration
+test prints each case name, codec submission count, and readback staging bytes so later runs retain
+their own progress and batching evidence.
 
 `--action external-fixtures` is development-only and a dry run unless `--apply` is present. With
 `--apply`, it streams a PGM/PPM source to the chosen `cjxl`, decodes the standard JXL through the

@@ -342,18 +342,14 @@ fn run_conformance(args: ConformanceArgs) -> Result<bool> {
     };
     let mut reports = Vec::with_capacity(cases.len());
     for case in cases {
-        let inventory = LazyImage::new(case, args.max_row_bytes)?.inventory()?;
-        let gpu_round_trip = if args.action == ConformanceAction::GpuRoundTrip
+        let (inventory, gpu_round_trip) = if args.action == ConformanceAction::GpuRoundTrip
             && case.expectation
                 == jxl_gpu_harness::conformance::ConformanceExpectation::StockGpuRoundTrip
         {
-            Some(run_stock_gpu_round_trip(
-                case,
-                backend.as_ref(),
-                args.max_row_bytes,
-            )?)
+            let result = run_stock_gpu_round_trip(case, backend.as_ref(), args.max_row_bytes)?;
+            (result.inventory, Some(result.report))
         } else {
-            None
+            (LazyImage::new(case, args.max_row_bytes)?.inventory()?, None)
         };
         let external_fixture = if args.action == ConformanceAction::ExternalFixtures {
             Some(external_fixture(

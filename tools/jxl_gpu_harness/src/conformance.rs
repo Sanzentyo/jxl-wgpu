@@ -7,18 +7,20 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
+use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout, PixelFormat};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::ImageReadbackPipeline;
 use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, NumericSampleMapping};
-use jxl_wgpu_encode::{BufferImageSource, LosslessModularEncoder, WgpuContext};
+use jxl_wgpu_encode::{
+    BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
+};
 use serde::{Deserialize, Serialize};
-use wgpu::util::DeviceExt;
 
 use crate::codec::{
     CodecOperation, DeclaredExtent, GpuPixelFormat, OutputTarget, SizeClass, WorkloadSpec,
@@ -30,7 +32,6 @@ use crate::report::{CaseStatus, CodecCaseReport, CodecIssue, CodecIssueKind};
 pub const CONFORMANCE_SCHEMA_VERSION: u16 = 1;
 /// Default maximum allocation made for one generated row.
 pub const DEFAULT_MAX_ROW_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_STOCK_GPU_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +77,8 @@ pub enum ResolutionClass {
     Hd,
     Fhd,
     Uhd4k,
+    Uhd8k,
+    Uhd16k,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +286,8 @@ impl ConformanceCase {
             ResolutionClass::Hd => self.extent.width == 1280 && self.extent.height == 720,
             ResolutionClass::Fhd => self.extent.width == 1920 && self.extent.height == 1080,
             ResolutionClass::Uhd4k => self.extent.width == 3840 && self.extent.height == 2160,
+            ResolutionClass::Uhd8k => self.extent.width == 7680 && self.extent.height == 4320,
+            ResolutionClass::Uhd16k => self.extent.width == 15360 && self.extent.height == 8640,
         };
         if !category_matches_extent {
             return Err(Error::InvalidConfig(format!(
@@ -316,7 +321,7 @@ impl ConformanceCase {
             && !self.is_stock_gpu_round_trip()
         {
             return Err(Error::InvalidConfig(format!(
-                "conformance case {} is marked stock, but the stock profile is Gray U8 with each dimension in 1..2^30",
+                "conformance case {} is marked stock, but the stock profile requires Gray/RGB/RGBA unsigned 1-16-bit input with each dimension in 1..2^30",
                 self.name
             )));
         }
@@ -331,9 +336,11 @@ impl ConformanceCase {
 
     #[must_use]
     pub fn is_stock_gpu_round_trip(&self) -> bool {
-        self.source.model == PixelModel::Gray
-            && self.source.depth == SampleDepth::U8
-            && self.source.alpha == AlphaPattern::None
+        let alpha_contract = match self.source.model {
+            PixelModel::Gray | PixelModel::Rgb => self.source.alpha == AlphaPattern::None,
+            PixelModel::Rgba => self.source.alpha != AlphaPattern::None,
+        };
+        alpha_contract
             && (1..(1_u32 << 30)).contains(&self.extent.width)
             && (1..(1_u32 << 30)).contains(&self.extent.height)
     }
@@ -353,7 +360,9 @@ impl ConformanceCase {
             | ResolutionClass::GroupBoundary257
             | ResolutionClass::Hd
             | ResolutionClass::Fhd
-            | ResolutionClass::Uhd4k => SizeClass::Large,
+            | ResolutionClass::Uhd4k
+            | ResolutionClass::Uhd8k
+            | ResolutionClass::Uhd16k => SizeClass::Large,
         }
     }
 }
@@ -694,6 +703,12 @@ pub struct ConformanceCaseReport {
     pub external_fixture: Option<ExternalFixtureReport>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StockGpuRoundTripResult {
+    pub inventory: ConformanceInventory,
+    pub report: CodecCaseReport,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConformanceReport {
     pub schema_version: u16,
@@ -742,7 +757,7 @@ pub fn run_stock_gpu_round_trip(
     case: &ConformanceCase,
     backend: Option<&jxl_wgpu::WgpuBackend>,
     max_row_bytes: u64,
-) -> Result<CodecCaseReport> {
+) -> Result<StockGpuRoundTripResult> {
     if case.expectation != ConformanceExpectation::StockGpuRoundTrip
         || !case.is_stock_gpu_round_trip()
     {
@@ -775,15 +790,39 @@ pub fn run_stock_gpu_round_trip(
             "no_adapter",
             "no compatible wgpu adapter was found",
         ));
-        return Ok(report);
+        return Ok(StockGpuRoundTripResult {
+            inventory: image.inventory()?,
+            report,
+        });
     };
     report.adapter = Some(backend.adapter_info().name.clone());
-    match execute_stock_gpu_round_trip(case, image, backend) {
+    let source = match create_stock_source_buffer(image, backend) {
+        Ok(source) => source,
+        Err(error) => {
+            report.status = CaseStatus::Error;
+            report.issue = Some(CodecIssue::new(
+                CodecIssueKind::Backend,
+                "conformance_corpus",
+                "gpu_round_trip",
+                format_error_chain(&error),
+            ));
+            return Ok(StockGpuRoundTripResult {
+                inventory: image.inventory()?,
+                report,
+            });
+        }
+    };
+    let inventory = ConformanceInventory {
+        case: case.clone(),
+        layout: source.generated.layout,
+        hashes: source.generated.hashes.clone(),
+    };
+    match execute_stock_gpu_round_trip(case, source, backend) {
         Ok(execution) => {
             report.frame_count = 1;
             report.output_bytes = image.layout().active_bytes;
             report.gpu_output_logical_bytes = execution.output_logical_bytes;
-            report.codec_submissions = 2;
+            report.codec_submissions = execution.codec_submissions;
             report.codec_completion_waits = 2;
             report.readback_submissions = 1;
             report.readback_completion_waits = 1;
@@ -806,50 +845,301 @@ pub fn run_stock_gpu_round_trip(
                 ));
             }
         }
-        Err(detail) => {
+        Err(error) => {
             report.status = CaseStatus::Error;
             report.issue = Some(CodecIssue::new(
                 CodecIssueKind::Backend,
                 "conformance_corpus",
                 "gpu_round_trip",
-                detail,
+                format_error_chain(&error),
             ));
         }
     }
-    Ok(report)
+    Ok(StockGpuRoundTripResult { inventory, report })
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    for _ in 0..8 {
+        let Some(current) = source else {
+            break;
+        };
+        detail.push_str(": ");
+        detail.push_str(&current.to_string());
+        source = current.source();
+    }
+    detail
 }
 
 struct StockGpuExecution {
     expected_hash: String,
     output_hash: String,
     output_logical_bytes: u64,
+    codec_submissions: u64,
     readback_logical_bytes: u64,
     readback_staging_bytes: u64,
 }
 
-fn execute_stock_gpu_round_trip(
-    case: &ConformanceCase,
+#[derive(Debug, thiserror::Error)]
+enum StockGpuRoundTripError {
+    #[error(
+        "stock GPU source needs {required} aligned bytes for {storage_bytes} bytes of row storage, above device max_buffer_size {limit}"
+    )]
+    SourceBufferDeviceLimit {
+        storage_bytes: u64,
+        required: u64,
+        limit: u64,
+    },
+    #[error("aligned stock GPU source buffer size {required} does not fit the host address space")]
+    SourceBufferHostLimit { required: u64 },
+    #[error("wgpu rejected the mapped-at-creation stock source buffer")]
+    SourceBufferCreation {
+        #[source]
+        source: wgpu::Error,
+    },
+    #[error("failed to access the mapped-at-creation stock source buffer")]
+    SourceBufferMapping {
+        #[source]
+        source: wgpu::MapRangeError,
+    },
+    #[error(
+        "mapped stock source buffer exposes {actual} bytes instead of the requested {expected} bytes"
+    )]
+    SourceBufferMappedLength { actual: usize, expected: usize },
+    #[error(
+        "generated source row {row} maps to {start}..{end}, outside the {mapped_len}-byte GPU buffer"
+    )]
+    SourceRowRange {
+        row: u32,
+        start: usize,
+        end: usize,
+        mapped_len: usize,
+    },
+    #[error("size arithmetic overflow while computing {what}")]
+    SizeOverflow { what: &'static str },
+    #[error("failed to generate the deterministic source image")]
+    Generate {
+        #[source]
+        source: Error,
+    },
+    #[error("failed to construct the canonical Modular pixel format")]
+    PixelFormat {
+        #[source]
+        source: jxl_wgpu_encode::EncodeError,
+    },
+    #[error("invalid padded GPU source layout")]
+    SourceLayout {
+        #[source]
+        source: jxl_gpu_formats::LayoutError,
+    },
+    #[error("invalid GPU encoder source")]
+    EncoderSource {
+        #[source]
+        source: jxl_wgpu_encode::EncodeError,
+    },
+    #[error("GPU encode failed")]
+    Encode {
+        #[source]
+        source: jxl_wgpu_encode::EncodeError,
+    },
+    #[error("GPU output request failed")]
+    OutputRequest {
+        #[source]
+        source: jxl_wgpu_decode::Error,
+    },
+    #[error("GPU decode {stage} failed")]
+    Decode {
+        stage: &'static str,
+        #[source]
+        source: jxl_wgpu_decode::Error,
+    },
+    #[error("GPU decoder returned no frame")]
+    NoFrame,
+    #[error("stock still-image decoder returned more than one frame")]
+    MultipleFrames,
+    #[error("GPU readback {stage} failed")]
+    Readback {
+        stage: &'static str,
+        #[source]
+        source: jxl_wgpu::Error,
+    },
+    #[error("stock decode returned {actual} outputs instead of one")]
+    OutputCount { actual: usize },
+    #[error("decoded extent {actual:?} differs from expected {expected:?}")]
+    OutputExtent {
+        actual: Extent2d,
+        expected: Extent2d,
+    },
+    #[error("decoded output has no pitch-linear plane")]
+    MissingOutputPlane,
+    #[error(
+        "decoded output layout does not match canonical {model:?} {depth:?} interleaved storage"
+    )]
+    OutputLayoutContract {
+        model: PixelModel,
+        depth: SampleDepth,
+    },
+    #[error("decoded output is shorter than its declared layout")]
+    OutputTooShort,
+}
+
+struct StockGpuSource {
+    buffer: Arc<wgpu::Buffer>,
+    generated: GenerationSummary,
+}
+
+fn aligned_stock_source_buffer_size(
+    storage_bytes: u64,
+) -> std::result::Result<u64, StockGpuRoundTripError> {
+    let alignment = wgpu::COPY_BUFFER_ALIGNMENT;
+    storage_bytes
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or(StockGpuRoundTripError::SizeOverflow {
+            what: "four-byte-aligned source buffer size",
+        })
+}
+
+fn populate_stock_source_buffer(
+    image: LazyImage<'_>,
+    mut mapped: wgpu::WriteOnly<'_, [u8]>,
+) -> std::result::Result<GenerationSummary, StockGpuRoundTripError> {
+    let storage_bytes = image.layout().storage_bytes;
+    let storage_len = usize::try_from(storage_bytes).map_err(|_| {
+        StockGpuRoundTripError::SourceBufferHostLimit {
+            required: storage_bytes,
+        }
+    })?;
+    let mut input = blake3::Hasher::new();
+    let mut pixels = blake3::Hasher::new();
+    let mut written_bytes = 0_u64;
+    for generated_row in image.rows() {
+        let row = generated_row.map_err(|source| StockGpuRoundTripError::Generate { source })?;
+        let row_offset = u64::from(row.index())
+            .checked_mul(image.layout().row_stride)
+            .ok_or(StockGpuRoundTripError::SizeOverflow {
+                what: "generated source row offset",
+            })?;
+        let row_end = row_offset.checked_add(image.layout().row_stride).ok_or(
+            StockGpuRoundTripError::SizeOverflow {
+                what: "generated source row end",
+            },
+        )?;
+        let start = usize::try_from(row_offset).map_err(|_| {
+            StockGpuRoundTripError::SourceBufferHostLimit {
+                required: row_offset,
+            }
+        })?;
+        let end = usize::try_from(row_end)
+            .map_err(|_| StockGpuRoundTripError::SourceBufferHostLimit { required: row_end })?;
+        let mapped_len = mapped.len();
+        if end > mapped_len {
+            return Err(StockGpuRoundTripError::SourceRowRange {
+                row: row.index(),
+                start,
+                end,
+                mapped_len,
+            });
+        }
+        let mut destination = mapped.slice(start..end);
+        destination.copy_from_slice(row.storage());
+        input.update(row.storage());
+        pixels.update(row.active());
+        written_bytes = written_bytes.checked_add(image.layout().row_stride).ok_or(
+            StockGpuRoundTripError::SizeOverflow {
+                what: "generated source byte count",
+            },
+        )?;
+    }
+    mapped.slice(storage_len..).fill(0);
+    Ok(GenerationSummary {
+        layout: image.layout(),
+        written_bytes,
+        hashes: GenerationHashes {
+            input_hash: input.finalize().to_hex().to_string(),
+            pixel_hash: pixels.finalize().to_hex().to_string(),
+        },
+    })
+}
+
+fn create_stock_source_buffer(
     image: LazyImage<'_>,
     backend: &jxl_wgpu::WgpuBackend,
-) -> std::result::Result<StockGpuExecution, String> {
-    if image.layout().storage_bytes > MAX_STOCK_GPU_SOURCE_BYTES {
-        return Err(format!(
-            "stock GPU source needs {} bytes, above the {}-byte materialization limit",
-            image.layout().storage_bytes,
-            MAX_STOCK_GPU_SOURCE_BYTES
-        ));
+) -> std::result::Result<StockGpuSource, StockGpuRoundTripError> {
+    let storage_bytes = image.layout().storage_bytes;
+    let buffer_size = aligned_stock_source_buffer_size(storage_bytes)?;
+    let device = backend.device();
+    let device_limit = device.limits().max_buffer_size;
+    if buffer_size > device_limit {
+        return Err(StockGpuRoundTripError::SourceBufferDeviceLimit {
+            storage_bytes,
+            required: buffer_size,
+            limit: device_limit,
+        });
     }
-    let capacity = usize::try_from(image.layout().storage_bytes)
-        .map_err(|_| "padded source size does not fit host usize".to_string())?;
-    let mut padded = Vec::with_capacity(capacity);
-    let generated = image
-        .write_padded_raw(&mut padded)
-        .map_err(|error| error.to_string())?;
-    let buffer_len = padded.len().div_ceil(4) * 4;
-    padded.resize(buffer_len, 0);
+    let mapped_len = usize::try_from(buffer_size).map_err(|_| {
+        StockGpuRoundTripError::SourceBufferHostLimit {
+            required: buffer_size,
+        }
+    })?;
+
+    let out_of_memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("jxl-gpu-harness row-generated conformance source"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: true,
+    });
+    let creation_error = pollster::block_on(internal_scope.pop())
+        .or_else(|| pollster::block_on(validation_scope.pop()))
+        .or_else(|| pollster::block_on(out_of_memory_scope.pop()));
+    if let Some(source) = creation_error {
+        return Err(StockGpuRoundTripError::SourceBufferCreation { source });
+    }
+
+    let generated = match buffer.slice(..).get_mapped_range_mut() {
+        Ok(mut mapped) => {
+            if mapped.len() != mapped_len {
+                Err(StockGpuRoundTripError::SourceBufferMappedLength {
+                    actual: mapped.len(),
+                    expected: mapped_len,
+                })
+            } else {
+                populate_stock_source_buffer(image, mapped.slice(..))
+            }
+        }
+        Err(source) => Err(StockGpuRoundTripError::SourceBufferMapping { source }),
+    };
+    buffer.unmap();
+
+    Ok(StockGpuSource {
+        buffer: Arc::new(buffer),
+        generated: generated?,
+    })
+}
+
+fn execute_stock_gpu_round_trip(
+    case: &ConformanceCase,
+    source: StockGpuSource,
+    backend: &jxl_wgpu::WgpuBackend,
+) -> std::result::Result<StockGpuExecution, StockGpuRoundTripError> {
+    let StockGpuSource {
+        buffer: source_buffer,
+        generated,
+    } = source;
 
     let extent = Extent2d::new(case.extent.width, case.extent.height);
-    let format = PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]);
+    let modular_format = match case.source.model {
+        PixelModel::Gray => LosslessModularFormat::Gray,
+        PixelModel::Rgb => LosslessModularFormat::Rgb,
+        PixelModel::Rgba => LosslessModularFormat::Rgba,
+    };
+    let format = modular_format
+        .pixel_format(case.source.depth.bits())
+        .map_err(|source| StockGpuRoundTripError::PixelFormat { source })?;
     let layout = ImageLayout::from_planes(
         extent,
         format.clone(),
@@ -861,39 +1151,75 @@ fn execute_stock_gpu_round_trip(
             row_bytes: generated.layout.active_row_bytes,
         }],
     )
-    .map_err(|error| format!("invalid padded Gray8 GPU layout: {error}"))?;
-    let source_buffer = Arc::new(backend.device().create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-gpu-harness conformance padded source"),
-            contents: &padded,
-            usage: wgpu::BufferUsages::STORAGE,
-        },
-    ));
+    .map_err(|source| StockGpuRoundTripError::SourceLayout { source })?;
     let source = BufferImageSource::new(source_buffer, layout)
-        .map_err(|error| format!("invalid GPU encoder source: {error}"))?;
+        .map_err(|source| StockGpuRoundTripError::EncoderSource { source })?;
     let encoder = LosslessModularEncoder::new(WgpuContext::from_backend(backend));
+    let encode_submissions = u64::from(
+        encoder
+            .memory_plan(&source)
+            .map_err(|source| StockGpuRoundTripError::Encode { source })?
+            .gpu_submission_count,
+    );
     let encoded = encoder
         .encode_container(source)
-        .map_err(|error| format!("GPU encode failed: {error}"))?;
+        .map_err(|source| StockGpuRoundTripError::Encode { source })?;
 
-    let request = GpuOutputRequest::numeric(format, NumericSampleMapping::NormalizedGray8)
-        .map_err(|error| format!("GPU output request failed: {error}"))?;
+    let request = match case.source.model {
+        PixelModel::Gray => {
+            GpuOutputRequest::numeric(format.clone(), NumericSampleMapping::NativeUnsigned)
+        }
+        PixelModel::Rgb | PixelModel::Rgba => GpuOutputRequest::color(format.clone()),
+    }
+    .map_err(|source| StockGpuRoundTripError::OutputRequest { source })?;
+    let request = if case.category == ResolutionClass::Uhd16k {
+        request.with_max_frame_slots(NonZeroUsize::MIN)
+    } else {
+        request
+    };
     let decoder = GpuDecoder::wgpu(backend.clone());
     let mut session = decoder
         .open_shared(Arc::<[u8]>::from(encoded), request)
-        .map_err(|error| format!("GPU decode session failed: {error}"))?;
+        .map_err(|source| StockGpuRoundTripError::Decode {
+            stage: "session creation",
+            source,
+        })?;
+    let decode_submissions = u64::try_from(
+        session
+            .submission_session()
+            .memory_stats()
+            .submissions_per_frame,
+    )
+    .map_err(|_| StockGpuRoundTripError::SizeOverflow {
+        what: "decode GPU submission count",
+    })?;
+    let codec_submissions = encode_submissions.checked_add(decode_submissions).ok_or(
+        StockGpuRoundTripError::SizeOverflow {
+            what: "round-trip GPU submission count",
+        },
+    )?;
     let frame = session
         .next_frame()
-        .map_err(|error| format!("GPU decode failed: {error}"))?
-        .ok_or_else(|| "GPU decoder returned no frame".to_string())?;
+        .map_err(|source| StockGpuRoundTripError::Decode {
+            stage: "frame completion",
+            source,
+        })?
+        .ok_or(StockGpuRoundTripError::NoFrame)?;
     let readback = ImageReadbackPipeline::new(backend);
-    let submission = readback
-        .submit(frame.output())
-        .map_err(|error| format!("GPU readback submission failed: {error}"))?;
+    let submission =
+        readback
+            .submit(frame.output())
+            .map_err(|source| StockGpuRoundTripError::Readback {
+                stage: "submission",
+                source,
+            })?;
     let readback_stats = submission.stats();
     let result = submission
         .wait()
-        .map_err(|error| format!("GPU readback failed: {error}"))?;
+        .map_err(|source| StockGpuRoundTripError::Readback {
+            stage: "completion",
+            source,
+        })?;
     let output_logical_bytes = result
         .frame
         .outputs
@@ -901,76 +1227,97 @@ fn execute_stock_gpu_round_trip(
         .try_fold(0_u64, |total, output| {
             total.checked_add(output.layout.logical_size)
         })
-        .ok_or_else(|| "decoded logical byte count overflow".to_string())?;
-    let output_hash = hash_gray8_outputs(&result.frame.outputs, extent)?;
+        .ok_or(StockGpuRoundTripError::SizeOverflow {
+            what: "decoded logical byte count",
+        })?;
+    let output_hash = hash_stock_output(
+        &result.frame.outputs,
+        extent,
+        &format,
+        case.source.model,
+        case.source.depth,
+        generated.layout.active_row_bytes,
+    )?;
     drop(frame);
     if session
         .next_frame()
-        .map_err(|error| format!("GPU decode tail validation failed: {error}"))?
+        .map_err(|source| StockGpuRoundTripError::Decode {
+            stage: "stream-tail validation",
+            source,
+        })?
         .is_some()
     {
-        return Err("stock still-image decode returned more than one frame".into());
+        return Err(StockGpuRoundTripError::MultipleFrames);
     }
     Ok(StockGpuExecution {
         expected_hash: generated.hashes.pixel_hash,
         output_hash,
         output_logical_bytes,
+        codec_submissions,
         readback_logical_bytes: readback_stats.logical_bytes,
         readback_staging_bytes: readback_stats.staging_bytes,
     })
 }
 
-fn hash_gray8_outputs(
+fn hash_stock_output(
     outputs: &[jxl_wgpu::CpuImageOutput],
     expected_extent: Extent2d,
-) -> std::result::Result<String, String> {
+    expected_format: &PixelFormat,
+    model: PixelModel,
+    depth: SampleDepth,
+    expected_row_bytes: u64,
+) -> std::result::Result<String, StockGpuRoundTripError> {
     if outputs.len() != 1 {
-        return Err(format!(
-            "stock Gray8 decode returned {} outputs instead of one",
-            outputs.len()
-        ));
+        return Err(StockGpuRoundTripError::OutputCount {
+            actual: outputs.len(),
+        });
     }
     let output = &outputs[0];
-    let expected_format = PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]);
     if output.layout.extent != expected_extent {
-        return Err(format!(
-            "decoded extent {:?} differs from expected {expected_extent:?}",
-            output.layout.extent
-        ));
+        return Err(StockGpuRoundTripError::OutputExtent {
+            actual: output.layout.extent,
+            expected: expected_extent,
+        });
     }
     let plane = output
         .layout
         .plane(0)
-        .ok_or_else(|| "decoded Gray8 output has no plane".to_string())?;
+        .ok_or(StockGpuRoundTripError::MissingOutputPlane)?;
     if output.layout.planes.len() != 1
-        || output.layout.format != expected_format
+        || output.layout.format != *expected_format
         || plane.sample_extent != expected_extent
-        || plane.row_bytes != u64::from(expected_extent.width)
+        || plane.row_bytes != expected_row_bytes
     {
-        return Err("decoded Gray8 plane layout is not one byte per active pixel".into());
+        return Err(StockGpuRoundTripError::OutputLayoutContract { model, depth });
     }
     let mut hasher = blake3::Hasher::new();
     for y in 0..expected_extent.height {
         let start = plane
             .offset
-            .checked_add(
-                plane
-                    .row_stride
-                    .checked_mul(u64::from(y))
-                    .ok_or_else(|| "decoded row offset overflow".to_string())?,
-            )
-            .ok_or_else(|| "decoded row offset overflow".to_string())?;
-        let end = start
-            .checked_add(plane.row_bytes)
-            .ok_or_else(|| "decoded row end overflow".to_string())?;
-        let start = usize::try_from(start)
-            .map_err(|_| "decoded row start does not fit host usize".to_string())?;
-        let end = usize::try_from(end)
-            .map_err(|_| "decoded row end does not fit host usize".to_string())?;
+            .checked_add(plane.row_stride.checked_mul(u64::from(y)).ok_or(
+                StockGpuRoundTripError::SizeOverflow {
+                    what: "decoded row offset",
+                },
+            )?)
+            .ok_or(StockGpuRoundTripError::SizeOverflow {
+                what: "decoded row offset",
+            })?;
+        let end =
+            start
+                .checked_add(plane.row_bytes)
+                .ok_or(StockGpuRoundTripError::SizeOverflow {
+                    what: "decoded row end",
+                })?;
+        let start = usize::try_from(start).map_err(|_| StockGpuRoundTripError::SizeOverflow {
+            what: "decoded row start",
+        })?;
+        let end = usize::try_from(end).map_err(|_| StockGpuRoundTripError::SizeOverflow {
+            what: "decoded row end",
+        })?;
         let row = output
             .bytes
             .get(start..end)
-            .ok_or_else(|| "decoded output is shorter than its declared layout".to_string())?;
+            .ok_or(StockGpuRoundTripError::OutputTooShort)?;
         hasher.update(row);
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -1445,6 +1792,50 @@ mod tests {
         assert!(image.layout().storage_bytes > 66_000_000);
         let row = image.rows().next().unwrap().unwrap();
         assert_eq!(row.storage().len(), 30_784);
+    }
+
+    #[test]
+    fn full_uhd16k_generation_remains_row_bounded() {
+        let mut case = test_case(PixelModel::Gray, SampleDepth::U8, AlphaPattern::None);
+        case.category = ResolutionClass::Uhd16k;
+        case.extent = ImageExtent {
+            width: 15_360,
+            height: 8640,
+        };
+        case.row_layout = RowLayoutSpec {
+            alignment: 256,
+            extra_padding: 0,
+            padding_byte: 0,
+        };
+        case.expectation = ConformanceExpectation::StockGpuRoundTrip;
+        case.validate().unwrap();
+        let image = LazyImage::new(&case, DEFAULT_MAX_ROW_BYTES).unwrap();
+        assert_eq!(image.layout().active_row_bytes, 15_360);
+        assert_eq!(image.layout().row_stride, 15_360);
+        assert_eq!(image.layout().storage_bytes, 132_710_400);
+        assert_eq!(
+            image.rows().next().unwrap().unwrap().storage().len(),
+            15_360
+        );
+    }
+
+    #[test]
+    fn mapped_source_population_aligns_only_the_gpu_buffer_tail() {
+        let case = test_case(PixelModel::Rgb, SampleDepth::U8, AlphaPattern::None);
+        let image = LazyImage::new(&case, 1024).unwrap();
+        assert_eq!(image.layout().storage_bytes, 57);
+        let buffer_size = aligned_stock_source_buffer_size(image.layout().storage_bytes).unwrap();
+        assert_eq!(buffer_size, 60);
+        let mut mapped = vec![0xff; buffer_size as usize];
+        let generated =
+            populate_stock_source_buffer(image, wgpu::WriteOnly::from_mut(mapped.as_mut_slice()))
+                .unwrap();
+        let mut expected = Vec::new();
+        let expected_summary = image.write_padded_raw(&mut expected).unwrap();
+        assert_eq!(&mapped[..expected.len()], expected);
+        assert_eq!(&mapped[expected.len()..], &[0_u8; 3]);
+        assert_eq!(generated, expected_summary);
+        assert!(aligned_stock_source_buffer_size(u64::MAX).is_err());
     }
 
     #[test]
