@@ -3,10 +3,10 @@ struct Task {
     scratch_or_basis_offset: u32,
     matrix_offset: u32,
     quant_index: u32,
-    correlation_index: u32,
+    coefficient_origin_x: u32,
     lf_offset: u32,
     channel_mask: u32,
-    _pad0: u32,
+    coefficient_origin_y: u32,
     destination_x_x: u32,
     destination_y_x: u32,
     destination_x_y: u32,
@@ -38,6 +38,9 @@ struct Params {
     output_height_b: u32,
     output_stride_b: u32,
     transform_kind: u32,
+    correlation_width: u32,
+    correlation_height: u32,
+    _padding: vec2<u32>,
     quant_biases: vec4<f32>,
 };
 
@@ -358,7 +361,14 @@ fn main(
         params.quant_biases.z,
         params.quant_biases.w,
     ) * quant.z * matrix.z;
-    let correlation = resources[params.correlation_offset + task.correlation_index].xy;
+    let frequency_x = lane / 8u;
+    let frequency_y = lane % 8u;
+    let correlation_cell_x = (task.coefficient_origin_x + frequency_x) / 64u;
+    let correlation_cell_y = (task.coefficient_origin_y + frequency_y) / 64u;
+    let correlation = resources[
+        params.correlation_offset + correlation_cell_y * params.correlation_width
+            + correlation_cell_x
+    ].xy;
     if (lane == 0u) {
         let lf = resources[params.lf_offset + task.lf_offset].xyz;
         block[0u] = lf.x;

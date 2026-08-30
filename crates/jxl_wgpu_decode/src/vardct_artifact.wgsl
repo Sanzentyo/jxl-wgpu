@@ -193,17 +193,16 @@ fn write_task(
 ) {
     let area = extent.x * extent.y * 64u;
     let task = params.artifact_offsets.z + task_index * 16u;
+    let destination_x = params.image.y + x * 8u;
+    let destination_y = params.image.z + y * 8u;
     artifact[task] = coefficient_offset;
     artifact[task + 1u] = select(coefficient_offset, params.image.w, strategy >= 14u && strategy <= 17u);
     artifact[task + 2u] = matrix_offset(strategy);
     artifact[task + 3u] = task_index;
-    // Correlation samples cover 64 pixels, i.e. eight 8x8 blocks.
-    artifact[task + 4u] = (y / 8u) * params.capacities.w + x / 8u;
+    artifact[task + 4u] = destination_x;
     artifact[task + 5u] = y * params.image.x + x;
     artifact[task + 6u] = 7u;
-    artifact[task + 7u] = 0u;
-    let destination_x = params.image.y + x * 8u;
-    let destination_y = params.image.z + y * 8u;
+    artifact[task + 7u] = destination_y;
     artifact[task + 8u] = destination_x;
     artifact[task + 9u] = destination_y;
     artifact[task + 10u] = destination_x;
@@ -267,10 +266,10 @@ fn lower_hf_metadata() {
             }
             occupy_transform(x, y, extent);
             let area = extent.x * extent.y;
-            let pixel_x = x * 8u;
-            let pixel_y = y * 8u;
-            let pixel_right = (x + extent.x) * 8u - 1u;
-            let pixel_bottom = (y + extent.y) * 8u - 1u;
+            let pixel_x = params.image.y + x * 8u;
+            let pixel_y = params.image.z + y * 8u;
+            let pixel_right = params.image.y + (x + extent.x) * 8u - 1u;
+            let pixel_bottom = params.image.z + (y + extent.y) * 8u - 1u;
             if (pixel_x / 64u != pixel_right / 64u
                 || pixel_y / 64u != pixel_bottom / 64u) {
                 backend_requirements |= BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID;

@@ -6,9 +6,8 @@
 //! indirect dispatch arguments remain GPU resident; callers supply all buffers so the decode
 //! session can reserve them against its shared transient budget before encoding commands.
 //!
-//! The 64-byte bridge task still contains the historical single `correlation_index`.  The status
-//! requirement bit identifies any varblock that spans more than one 64x64 HF correlation cell;
-//! such an artifact must not be submitted to a backend that lacks per-frequency CfL grid lookup.
+//! The 64-byte bridge task carries a global coefficient-grid origin.  The inverse backend uses it
+//! for per-frequency 64x64-cell CfL lookup, including DCT128/256 varblocks spanning several cells.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
@@ -579,10 +578,10 @@ pub struct GpuGeneralVarDctTask {
     pub scratch_or_basis_offset: u32,
     pub matrix_offset: u32,
     pub quant_index: u32,
-    pub correlation_index: u32,
+    pub coefficient_origin_x: u32,
     pub lf_offset: u32,
     pub channel_mask: u32,
-    pub _pad0: u32,
+    pub coefficient_origin_y: u32,
     pub destination_x_x: u32,
     pub destination_y_x: u32,
     pub destination_x_y: u32,

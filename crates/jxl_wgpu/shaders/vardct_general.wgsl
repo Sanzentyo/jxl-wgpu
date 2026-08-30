@@ -3,10 +3,10 @@ struct Task {
     scratch_or_basis_offset: u32,
     matrix_offset: u32,
     quant_index: u32,
-    correlation_index: u32,
+    coefficient_origin_x: u32,
     lf_offset: u32,
     channel_mask: u32,
-    _pad0: u32,
+    coefficient_origin_y: u32,
     destination_x_x: u32,
     destination_y_x: u32,
     destination_x_y: u32,
@@ -38,6 +38,9 @@ struct Params {
     output_height_b: u32,
     output_stride_b: u32,
     transform_kind: u32,
+    correlation_width: u32,
+    correlation_height: u32,
+    _padding: vec2<u32>,
     quant_biases: vec4<f32>,
 };
 
@@ -82,6 +85,12 @@ fn adjust_quantized(value: i32, small_bias: f32, large_bias: f32) -> f32 {
         return value_f * small_bias;
     }
     return value_f - large_bias / value_f;
+}
+
+fn hf_correlation(task: Task, frequency_x: u32, frequency_y: u32) -> vec2<f32> {
+    let cell_x = (task.coefficient_origin_x + frequency_x) / 64u;
+    let cell_y = (task.coefficient_origin_y + frequency_y) / 64u;
+    return resources[params.correlation_offset + cell_y * params.correlation_width + cell_x].xy;
 }
 
 fn lf_coefficient(task: Task, frequency_x: u32, frequency_y: u32) -> vec3<f32> {
@@ -142,7 +151,7 @@ fn dequantize(
             params.quant_biases.z,
             params.quant_biases.w,
         ) * quant.z * matrix.z;
-        let correlation = resources[params.correlation_offset + task.correlation_index].xy;
+        let correlation = hf_correlation(task, frequency_x, frequency_y);
         values = vec3<f32>(fma(correlation.x, y, x), y, fma(correlation.y, y, b));
     }
     dequantized[task.scratch_or_basis_offset + natural_index] = values.x;

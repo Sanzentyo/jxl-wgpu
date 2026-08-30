@@ -290,10 +290,10 @@ struct GpuTask {
     scratch_or_basis_offset: u32,
     matrix_offset: u32,
     quant_index: u32,
-    correlation_index: u32,
+    coefficient_origin_x: u32,
     lf_offset: u32,
     channel_mask: u32,
-    _pad0: u32,
+    coefficient_origin_y: u32,
     destination_x_x: u32,
     destination_y_x: u32,
     destination_x_y: u32,
@@ -331,6 +331,9 @@ struct GeneralUniform {
     output_height_b: u32,
     output_stride_b: u32,
     transform_kind: u32,
+    correlation_width: u32,
+    correlation_height: u32,
+    _padding: [u32; 2],
     quant_biases: [f32; 4],
 }
 
@@ -339,7 +342,7 @@ const _: () = {
     assert!(std::mem::align_of::<GpuTask>() == 4);
     assert!(std::mem::size_of::<GpuResourceVector>() == 16);
     assert!(std::mem::align_of::<GpuResourceVector>() == 16);
-    assert!(std::mem::size_of::<GeneralUniform>() == 96);
+    assert!(std::mem::size_of::<GeneralUniform>() == 112);
     assert!(std::mem::align_of::<GeneralUniform>() == 16);
 };
 
@@ -355,6 +358,8 @@ struct PreparedGeneral {
     resources: Vec<GpuResourceVector>,
     quant_offset: u32,
     correlation_offset: u32,
+    correlation_width: u32,
+    correlation_height: u32,
     lf_offset: u32,
     quant_biases: [f32; 4],
     scratch_scalars: u32,
@@ -366,6 +371,8 @@ struct ResourceLayout {
     vectors: Vec<GpuResourceVector>,
     quant_offset: u32,
     correlation_offset: u32,
+    correlation_width: u32,
+    correlation_height: u32,
     lf_offset: u32,
     afv_basis_offset: u32,
     matrix_offsets: Vec<u32>,
@@ -545,7 +552,6 @@ fn prepare(
             for task in &bucket.tasks {
                 let quant_index = usize::from(task.quant_index);
                 let matrix_index = usize::from(task.dequant_matrix_index);
-                let correlation_index = usize::from(task.correlation_index);
                 let Some(&matrix_offset) = layout.matrix_offsets.get(matrix_index) else {
                     return Err(Error::InvalidPayload(format!(
                         "VarDCT {:?} task references missing matrix {matrix_index}",
@@ -562,12 +568,35 @@ fn prepare(
                         bucket.transform
                     )));
                 }
-                if quant_index >= resource.quant_scales.len()
-                    || correlation_index >= resource.correlations.len()
+                if quant_index >= resource.quant_scales.len() {
+                    return Err(Error::InvalidPayload(format!(
+                        "VarDCT {:?} task references missing quantization data",
+                        bucket.transform
+                    )));
+                }
+                let correlation_width_pixels = resource
+                    .hf_correlation
+                    .extent
+                    .width
+                    .checked_mul(64)
+                    .ok_or(Error::BufferSizeOverflow)?;
+                let correlation_height_pixels = resource
+                    .hf_correlation
+                    .extent
+                    .height
+                    .checked_mul(64)
+                    .ok_or(Error::BufferSizeOverflow)?;
+                let coefficient_rect = Rect {
+                    x: task.coefficient_origin.0,
+                    y: task.coefficient_origin.1,
+                    width: extent.width,
+                    height: extent.height,
+                };
+                if !coefficient_rect.is_within(correlation_width_pixels, correlation_height_pixels)
                 {
                     return Err(Error::InvalidPayload(format!(
-                        "VarDCT {:?} task references missing quantization or correlation data",
-                        bucket.transform
+                        "VarDCT {:?} coefficient rectangle {coefficient_rect:?} exceeds the {}x{} HF correlation grid",
+                        bucket.transform, correlation_width_pixels, correlation_height_pixels
                     )));
                 }
                 let lf_start =
@@ -643,10 +672,10 @@ fn prepare(
                     scratch_or_basis_offset: task_scratch_offset,
                     matrix_offset,
                     quant_index: u32::from(task.quant_index),
-                    correlation_index: u32::from(task.correlation_index),
+                    coefficient_origin_x: task.coefficient_origin.0,
                     lf_offset: task.lf_offset,
                     channel_mask,
-                    _pad0: 0,
+                    coefficient_origin_y: task.coefficient_origin.1,
                     destination_x_x: destinations[0].0,
                     destination_y_x: destinations[0].1,
                     destination_x_y: destinations[1].0,
@@ -673,6 +702,8 @@ fn prepare(
         resources: layout.vectors,
         quant_offset: layout.quant_offset,
         correlation_offset: layout.correlation_offset,
+        correlation_width: layout.correlation_width,
+        correlation_height: layout.correlation_height,
         lf_offset: layout.lf_offset,
         quant_biases: resource.quant_biases,
         scratch_scalars,
@@ -688,7 +719,7 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
         .quant_biases
         .iter()
         .chain(resource.quant_scales.iter().flatten())
-        .chain(resource.correlations.iter().flatten())
+        .chain(resource.hf_correlation.values.iter().flatten())
         .chain(resource.lf_coefficients.iter().flatten())
         .chain(
             resource
@@ -702,6 +733,21 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
             "VarDCT resource contains a non-finite parameter".into(),
         ));
     }
+    let correlation_area = resource
+        .hf_correlation
+        .extent
+        .area()
+        .ok_or(Error::BufferSizeOverflow)?;
+    if resource.hf_correlation.extent.width == 0
+        || resource.hf_correlation.extent.height == 0
+        || resource.hf_correlation.values.len() != correlation_area
+    {
+        return Err(Error::InvalidPayload(format!(
+            "VarDCT HF correlation grid {:?} contains {} values, expected {correlation_area}",
+            resource.hf_correlation.extent,
+            resource.hf_correlation.values.len()
+        )));
+    }
     let mut vectors = Vec::new();
     let quant_offset = 0;
     vectors.extend(
@@ -713,7 +759,8 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
     let correlation_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
         resource
-            .correlations
+            .hf_correlation
+            .values
             .iter()
             .map(|value| GpuResourceVector([value[0], value[1], 0.0, 0.0])),
     );
@@ -756,6 +803,8 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
         vectors,
         quant_offset,
         correlation_offset,
+        correlation_width: resource.hf_correlation.extent.width,
+        correlation_height: resource.hf_correlation.extent.height,
         lf_offset,
         afv_basis_offset,
         matrix_offsets,
@@ -893,6 +942,9 @@ fn encode_prepared(
                 } else {
                     0
                 },
+                correlation_width: prepared.correlation_width,
+                correlation_height: prepared.correlation_height,
+                _padding: [0; 2],
                 quant_biases: prepared.quant_biases,
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1201,7 +1253,8 @@ mod tests {
         Border2d, Extent2d, FrameSessionDesc, GroupPayload, MemoryMode, OutputDesc, OutputId,
         OutputLayout, PackedCoefficients, PlaneData, PlaneDesc, PlaneRole, PrecisionContract,
         PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan, ResourceUpdate,
-        SaveParams, Scale2d, TransformBucket, TransformTask, VarDctDequantMatrix, VarDctPacket,
+        SaveParams, Scale2d, TransformBucket, TransformTask, VarDctCorrelationGrid,
+        VarDctDequantMatrix, VarDctPacket,
     };
 
     use crate::{WgpuBackend, WgpuBackendConfig};
@@ -1232,10 +1285,10 @@ mod tests {
             scratch_or_basis_offset: 2,
             matrix_offset: 3,
             quant_index: 4,
-            correlation_index: 5,
+            coefficient_origin_x: 5,
             lf_offset: 6,
             channel_mask: 7,
-            _pad0: 8,
+            coefficient_origin_y: 8,
             destination_x_x: 9,
             destination_y_x: 10,
             destination_x_y: 11,
@@ -1268,24 +1321,27 @@ mod tests {
             output_height_b: 18,
             output_stride_b: 19,
             transform_kind: 20,
+            correlation_width: 21,
+            correlation_height: 22,
+            _padding: [23, 24],
             quant_biases: [
-                f32::from_bits(21),
-                f32::from_bits(22),
-                f32::from_bits(23),
-                f32::from_bits(24),
+                f32::from_bits(25),
+                f32::from_bits(26),
+                f32::from_bits(27),
+                f32::from_bits(28),
             ],
         };
-        assert_eq!(abi_words(&params), &(1..=24).collect::<Vec<_>>());
+        assert_eq!(abi_words(&params), &(1..=28).collect::<Vec<_>>());
 
         let task_fields = [
             "coefficient_offset",
             "scratch_or_basis_offset",
             "matrix_offset",
             "quant_index",
-            "correlation_index",
+            "coefficient_origin_x",
             "lf_offset",
             "channel_mask",
-            "_pad0",
+            "coefficient_origin_y",
             "destination_x_x",
             "destination_y_x",
             "destination_x_y",
@@ -1316,6 +1372,9 @@ mod tests {
             "output_height_b",
             "output_stride_b",
             "transform_kind",
+            "correlation_width",
+            "correlation_height",
+            "_padding",
             "quant_biases",
         ];
         for shader in [
@@ -1326,6 +1385,34 @@ mod tests {
             assert_wgsl_fields(shader, "Params", &param_fields);
             assert!(shader.contains("var<storage, read> resources: array<vec4<f32>>;"));
         }
+    }
+
+    #[test]
+    fn general_transient_estimate_includes_grid_resources_and_expanded_abi() {
+        let prepared = PreparedGeneral {
+            coefficients: vec![0; 192],
+            resources: vec![GpuResourceVector::zeroed(); 4],
+            quant_offset: 0,
+            correlation_offset: 1,
+            correlation_width: 2,
+            correlation_height: 1,
+            lf_offset: 3,
+            quant_biases: [0.0; 4],
+            scratch_scalars: 32,
+            buckets: vec![PreparedBucket {
+                transform: TransformKind::Dct8x16,
+                tasks: vec![GpuTask::zeroed(); 2],
+            }],
+        };
+        let expected = 192 * std::mem::size_of::<i32>()
+            + 4 * std::mem::size_of::<GpuResourceVector>()
+            + 2 * 32 * std::mem::size_of::<f32>()
+            + 2 * std::mem::size_of::<GpuTask>()
+            + std::mem::size_of::<GeneralUniform>();
+        assert_eq!(
+            prepared_transient_bytes(&prepared).unwrap(),
+            expected as u64
+        );
     }
 
     fn test_backend() -> Option<WgpuBackend> {
@@ -1449,9 +1536,19 @@ mod tests {
         let lf_area = transform.lf_extent().area().unwrap();
         let matrix = &resource.dequant_matrices[usize::from(task.dequant_matrix_index)].scales;
         let quant = resource.quant_scales[usize::from(task.quant_index)];
-        let correlation = resource.correlations[usize::from(task.correlation_index)];
         let mut blocks: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; area]);
         for index in 0..area {
+            let extent = transform.pixel_extent();
+            let index_u32 = u32::try_from(index).unwrap();
+            let (frequency_x, frequency_y) = if extent.height < extent.width {
+                (index_u32 % extent.width, index_u32 / extent.width)
+            } else {
+                (index_u32 / extent.height, index_u32 % extent.height)
+            };
+            let cell_x = (task.coefficient_origin.0 + frequency_x) / 64;
+            let cell_y = (task.coefficient_origin.1 + frequency_y) / 64;
+            let correlation = resource.hf_correlation.values
+                [(cell_y * resource.hf_correlation.extent.width + cell_x) as usize];
             let mut values = [0.0; 3];
             for channel in 0..3 {
                 let value = coefficients[channel * area + index] as f32;
@@ -1502,7 +1599,7 @@ mod tests {
             destinations: [Some((1, 1)); 3],
             quant_index: 0,
             dequant_matrix_index: 0,
-            correlation_index: 0,
+            coefficient_origin: (32, 32),
             lf_offset: 0,
         };
         let frequencies = [
@@ -1520,6 +1617,10 @@ mod tests {
                     * if slot.is_multiple_of(2) { 1 } else { -1 };
             }
         }
+        let correlation_extent = Extent2d::new(
+            (task.coefficient_origin.0 + block_extent.width).div_ceil(64),
+            (task.coefficient_origin.1 + block_extent.height).div_ceil(64),
+        );
         let resource = VarDctResource {
             quant_biases: [1.0, 1.0, 1.0, 0.0],
             quant_scales: vec![[0.75, 1.0, 1.25]],
@@ -1532,7 +1633,15 @@ mod tests {
                     })
                     .collect(),
             }],
-            correlations: vec![[0.125, -0.1875]],
+            hf_correlation: VarDctCorrelationGrid {
+                extent: correlation_extent,
+                values: (0..correlation_extent.area().unwrap())
+                    .map(|index| {
+                        let scale = index as f32 + 1.0;
+                        [0.03125 * scale, -0.046875 * scale]
+                    })
+                    .collect(),
+            },
             lf_coefficients: (0..lf_area)
                 .map(|index| {
                     let value = (index % 11) as f32 * 0.125 - 0.5;
@@ -1600,7 +1709,12 @@ mod tests {
             return;
         };
         for transform in TransformKind::ALL {
-            if transform.is_special() {
+            if transform.is_special()
+                || matches!(
+                    transform,
+                    TransformKind::Dct128x128 | TransformKind::Dct256x256
+                )
+            {
                 continue;
             }
             if let Err(error) = run_regular_transform_case(&backend, transform) {
@@ -1623,6 +1737,27 @@ mod tests {
     }
 
     #[test]
+    fn dct128_and_dct256_cross_cfl_cells_on_gpu() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        for transform in [TransformKind::Dct128x128, TransformKind::Dct256x256] {
+            if let Err(error) = run_regular_transform_case(&backend, transform) {
+                let device_limited_256 = transform == TransformKind::Dct256x256
+                    && matches!(
+                        error,
+                        Error::ResourceLimit(_) | Error::MemoryBackpressure(_)
+                    );
+                if device_limited_256 {
+                    eprintln!("skipping {transform:?} GPU oracle case on this device: {error}");
+                    continue;
+                }
+                panic!("{transform:?} cross-cell GPU oracle case failed: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn mixed_rectangular_tasks_execute_at_odd_tail_on_gpu() {
         let Some(backend) = test_backend() else {
             return;
@@ -1635,7 +1770,7 @@ mod tests {
                 destinations: [Some((1, 1)), Some((2, 2)), None],
                 quant_index: 0,
                 dequant_matrix_index: 0,
-                correlation_index: 0,
+                coefficient_origin: (0, 0),
                 lf_offset: 0,
             },
             TransformTask {
@@ -1643,7 +1778,7 @@ mod tests {
                 destinations: [Some((20, 7)), Some((20, 8)), Some((19, 7))],
                 quant_index: 0,
                 dequant_matrix_index: 1,
-                correlation_index: 0,
+                coefficient_origin: (0, 0),
                 lf_offset: 2,
             },
         ];
@@ -1661,7 +1796,10 @@ mod tests {
                     scales: vec![[1.0, 0.5, 1.5]; 128],
                 })
                 .collect(),
-            correlations: vec![[0.125, -0.25]],
+            hf_correlation: VarDctCorrelationGrid {
+                extent: Extent2d::new(1, 1),
+                values: vec![[0.125, -0.25]],
+            },
             lf_coefficients: vec![
                 [2.0, -1.0, 0.5],
                 [-0.25, 1.5, 3.0],
@@ -1770,7 +1908,7 @@ mod tests {
             destinations: [Some(origins[index]); 3],
             quant_index: 0,
             dequant_matrix_index: u16::try_from(index).unwrap(),
-            correlation_index: 0,
+            coefficient_origin: (0, 0),
             lf_offset: u32::try_from(index).unwrap(),
         });
         let mut coefficients = vec![0i32; transforms.len() * 192];
@@ -1787,7 +1925,10 @@ mod tests {
                     scales: vec![[1.0, 0.75, 1.5]; 64],
                 })
                 .collect(),
-            correlations: vec![[0.2, -0.125]],
+            hf_correlation: VarDctCorrelationGrid {
+                extent: Extent2d::new(1, 1),
+                values: vec![[0.2, -0.125]],
+            },
             lf_coefficients: (0..transforms.len())
                 .map(|index| {
                     let value = index as f32 + 1.0;
@@ -1891,7 +2032,7 @@ mod tests {
             destinations: [Some(origins[index]); 3],
             quant_index: 0,
             dequant_matrix_index: u16::try_from(index).unwrap(),
-            correlation_index: 0,
+            coefficient_origin: (0, 0),
             lf_offset: u32::try_from(index).unwrap(),
         });
         let mut coefficients = vec![0i32; transforms.len() * 192];
@@ -1908,7 +2049,10 @@ mod tests {
                     scales: vec![[1.0, 0.75, 1.25]; 64],
                 })
                 .collect(),
-            correlations: vec![[0.1875, -0.0625]],
+            hf_correlation: VarDctCorrelationGrid {
+                extent: Extent2d::new(1, 1),
+                values: vec![[0.1875, -0.0625]],
+            },
             lf_coefficients: (0..transforms.len())
                 .map(|index| {
                     let value = index as f32 + 0.75;

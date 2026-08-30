@@ -565,6 +565,10 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     assert_eq!(tasks[3].coefficient_offset, 576);
     assert_eq!(tasks[3].scratch_or_basis_offset, 9_999);
     assert_eq!(
+        (tasks[1].coefficient_origin_x, tasks[1].coefficient_origin_y),
+        (16, 16)
+    );
+    assert_eq!(
         (tasks[1].destination_x_x, tasks[1].destination_y_x),
         (16, 16)
     );

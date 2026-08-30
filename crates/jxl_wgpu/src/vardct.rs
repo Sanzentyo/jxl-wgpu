@@ -27,7 +27,7 @@ const DCT8_CHANNELS: usize = 3;
 const DCT8_COEFFICIENTS_PER_TASK: usize = DCT8_COEFFICIENTS_PER_CHANNEL * DCT8_CHANNELS;
 const DCT8_WORKGROUP_STORAGE_BYTES: u32 = 2 * 192 * 4;
 
-type FlattenedResource = (Vec<GpuResourceVector>, u32, u32, u32, u32);
+type FlattenedResource = (Vec<GpuResourceVector>, u32, u32, u32, u32, u32, u32);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Rect {
@@ -133,8 +133,9 @@ struct GpuTask {
     destination_y: u32,
     quant_index: u32,
     matrix_index: u32,
-    correlation_index: u32,
     lf_index: u32,
+    coefficient_origin_x: u32,
+    coefficient_origin_y: u32,
 }
 
 #[repr(C, align(16))]
@@ -154,12 +155,13 @@ struct Dct8Uniform {
     matrix_offset: u32,
     correlation_offset: u32,
     lf_offset: u32,
-    _padding: [u32; 2],
+    correlation_width: u32,
+    correlation_height: u32,
     quant_biases: [f32; 4],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<GpuTask>() == 28);
+    assert!(std::mem::size_of::<GpuTask>() == 32);
     assert!(std::mem::align_of::<GpuTask>() == 4);
     assert!(std::mem::size_of::<GpuResourceVector>() == 16);
     assert!(std::mem::align_of::<GpuResourceVector>() == 16);
@@ -174,6 +176,8 @@ struct PreparedVarDct {
     quant_offset: u32,
     matrix_offset: u32,
     correlation_offset: u32,
+    correlation_width: u32,
+    correlation_height: u32,
     lf_offset: u32,
     quant_biases: [f32; 4],
 }
@@ -305,13 +309,28 @@ fn validate_resource(resource: &VarDctResource) -> Result<()> {
                 .iter()
                 .flat_map(|matrix| matrix.scales.iter().flatten()),
         )
-        .chain(resource.correlations.iter().flatten())
+        .chain(resource.hf_correlation.values.iter().flatten())
         .chain(resource.lf_coefficients.iter().flatten())
         .any(|value| !value.is_finite())
     {
         return Err(Error::InvalidPayload(
             "VarDCT resource contains a non-finite parameter".into(),
         ));
+    }
+    let correlation_area = resource
+        .hf_correlation
+        .extent
+        .area()
+        .ok_or(Error::BufferSizeOverflow)?;
+    if resource.hf_correlation.extent.width == 0
+        || resource.hf_correlation.extent.height == 0
+        || resource.hf_correlation.values.len() != correlation_area
+    {
+        return Err(Error::InvalidPayload(format!(
+            "VarDCT HF correlation grid {:?} contains {} values, expected {correlation_area}",
+            resource.hf_correlation.extent,
+            resource.hf_correlation.values.len()
+        )));
     }
     for (index, matrix) in resource.dequant_matrices.iter().enumerate() {
         if matrix.transform != TransformKind::Dct8
@@ -347,7 +366,8 @@ fn flatten_resource(resource: &VarDctResource) -> Result<FlattenedResource> {
     let correlation_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
         resource
-            .correlations
+            .hf_correlation
+            .values
             .iter()
             .map(|correlation| GpuResourceVector([correlation[0], correlation[1], 0.0, 0.0])),
     );
@@ -364,6 +384,8 @@ fn flatten_resource(resource: &VarDctResource) -> Result<FlattenedResource> {
         matrix_offset,
         correlation_offset,
         lf_offset,
+        resource.hf_correlation.extent.width,
+        resource.hf_correlation.extent.height,
     ))
 }
 
@@ -415,13 +437,36 @@ fn prepare(
                 task_rects.push(rect);
                 if usize::from(task.quant_index) >= resource.quant_scales.len()
                     || usize::from(task.dequant_matrix_index) >= resource.dequant_matrices.len()
-                    || usize::from(task.correlation_index) >= resource.correlations.len()
                     || usize::try_from(task.lf_offset)
                         .ok()
                         .is_none_or(|index| index >= resource.lf_coefficients.len())
                 {
                     return Err(Error::InvalidPayload(
-                        "DCT8 task references a missing dequantization or correlation entry".into(),
+                        "DCT8 task references a missing dequantization entry".into(),
+                    ));
+                }
+                let correlation_width_pixels = resource
+                    .hf_correlation
+                    .extent
+                    .width
+                    .checked_mul(64)
+                    .ok_or(Error::BufferSizeOverflow)?;
+                let correlation_height_pixels = resource
+                    .hf_correlation
+                    .extent
+                    .height
+                    .checked_mul(64)
+                    .ok_or(Error::BufferSizeOverflow)?;
+                if !(Rect {
+                    x: task.coefficient_origin.0,
+                    y: task.coefficient_origin.1,
+                    width: 8,
+                    height: 8,
+                })
+                .is_within(correlation_width_pixels, correlation_height_pixels)
+                {
+                    return Err(Error::InvalidPayload(
+                        "DCT8 task coefficient rectangle exceeds the HF correlation grid".into(),
                     ));
                 }
                 let source_start = task.coefficient_offset as usize;
@@ -437,8 +482,9 @@ fn prepare(
                     destination_y: rect.y,
                     quant_index: u32::from(task.quant_index),
                     matrix_index: u32::from(task.dequant_matrix_index),
-                    correlation_index: u32::from(task.correlation_index),
                     lf_index: task.lf_offset,
+                    coefficient_origin_x: task.coefficient_origin.0,
+                    coefficient_origin_y: task.coefficient_origin.1,
                 });
             }
         }
@@ -451,8 +497,15 @@ fn prepare(
         )));
     }
 
-    let (resource_vectors, quant_offset, matrix_offset, correlation_offset, lf_offset) =
-        flatten_resource(resource)?;
+    let (
+        resource_vectors,
+        quant_offset,
+        matrix_offset,
+        correlation_offset,
+        lf_offset,
+        correlation_width,
+        correlation_height,
+    ) = flatten_resource(resource)?;
     Ok(PreparedVarDct {
         coefficients,
         tasks,
@@ -460,6 +513,8 @@ fn prepare(
         quant_offset,
         matrix_offset,
         correlation_offset,
+        correlation_width,
+        correlation_height,
         lf_offset,
         quant_biases: resource.quant_biases,
     })
@@ -571,7 +626,8 @@ fn encode_dct8(
         matrix_offset: prepared.matrix_offset,
         correlation_offset: prepared.correlation_offset,
         lf_offset: prepared.lf_offset,
-        _padding: [0; 2],
+        correlation_width: prepared.correlation_width,
+        correlation_height: prepared.correlation_height,
         quant_biases: prepared.quant_biases,
     };
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -713,15 +769,20 @@ fn dequantized_reference_block(
     coefficients: &[i32],
     quant_index: usize,
     matrix_index: usize,
-    correlation_index: usize,
+    coefficient_origin: (u32, u32),
     lf_index: usize,
     resource: &VarDctResource,
 ) -> [[f32; 64]; 3] {
     let quant_scale = resource.quant_scales[quant_index];
     let matrix = &resource.dequant_matrices[matrix_index].scales;
-    let correlation = resource.correlations[correlation_index];
     let mut dequantized = [[0.0; 64]; 3];
     for index in 0..64 {
+        let frequency_x = index / 8;
+        let frequency_y = index % 8;
+        let cell_x = (coefficient_origin.0 as usize + frequency_x) / 64;
+        let cell_y = (coefficient_origin.1 as usize + frequency_y) / 64;
+        let correlation = resource.hf_correlation.values
+            [cell_y * resource.hf_correlation.extent.width as usize + cell_x];
         let mut values = [0.0; 3];
         for channel in 0..3 {
             values[channel] = adjust_quantized(
@@ -747,7 +808,7 @@ fn scalar_reference_block(
     coefficients: &[i32],
     quant_index: usize,
     matrix_index: usize,
-    correlation_index: usize,
+    coefficient_origin: (u32, u32),
     lf_index: usize,
     resource: &VarDctResource,
 ) -> [[f32; 64]; 3] {
@@ -755,7 +816,7 @@ fn scalar_reference_block(
         coefficients,
         quant_index,
         matrix_index,
-        correlation_index,
+        coefficient_origin,
         lf_index,
         resource,
     );
@@ -810,7 +871,7 @@ mod tests {
 
     #[test]
     fn vardct_gpu_abi_sizes_are_explicit_and_aligned() {
-        assert_eq!(size_of::<GpuTask>(), 28);
+        assert_eq!(size_of::<GpuTask>(), 32);
         assert_eq!(size_of::<GpuResourceVector>(), 16);
         assert_eq!(std::mem::align_of::<GpuResourceVector>(), 16);
         assert_eq!(size_of::<Dct8Uniform>(), 64);
@@ -827,10 +888,11 @@ mod tests {
             destination_y: 3,
             quant_index: 4,
             matrix_index: 5,
-            correlation_index: 6,
-            lf_index: 7,
+            lf_index: 6,
+            coefficient_origin_x: 7,
+            coefficient_origin_y: 8,
         };
-        assert_eq!(abi_words(&task), &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(abi_words(&task), &[1, 2, 3, 4, 5, 6, 7, 8]);
 
         let resource = GpuResourceVector([
             f32::from_bits(1),
@@ -851,7 +913,8 @@ mod tests {
             matrix_offset: 8,
             correlation_offset: 9,
             lf_offset: 10,
-            _padding: [11, 12],
+            correlation_width: 11,
+            correlation_height: 12,
             quant_biases: [
                 f32::from_bits(13),
                 f32::from_bits(14),
@@ -875,8 +938,9 @@ mod tests {
                 "destination_y",
                 "quant_index",
                 "matrix_index",
-                "correlation_index",
                 "lf_index",
+                "coefficient_origin_x",
+                "coefficient_origin_y",
             ],
         );
         assert_wgsl_fields(
@@ -893,8 +957,8 @@ mod tests {
                 "matrix_offset",
                 "correlation_offset",
                 "lf_offset",
-                "_pad0",
-                "_pad1",
+                "correlation_width",
+                "correlation_height",
                 "quant_biases",
             ],
         );
@@ -903,8 +967,8 @@ mod tests {
         Border2d, CoefficientOverflow, Extent2d, FrameSessionDesc, GroupPayload, MemoryMode,
         OutputDesc, OutputId, OutputLayout, PackedCoefficients, PlaneData, PlaneDesc, PlaneRole,
         PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan,
-        ResourceUpdate, SaveParams, Scale2d, TransformBucket, TransformTask, VarDctDequantMatrix,
-        VarDctPacket,
+        ResourceUpdate, SaveParams, Scale2d, TransformBucket, TransformTask, VarDctCorrelationGrid,
+        VarDctDequantMatrix, VarDctPacket,
     };
 
     use crate::{WgpuBackend, WgpuBackendConfig};
@@ -917,7 +981,10 @@ mod tests {
                 transform: TransformKind::Dct8,
                 scales: vec![[1.0, 1.0, 1.0]; 64],
             }],
-            correlations: vec![[0.25, -0.5]],
+            hf_correlation: VarDctCorrelationGrid {
+                extent: Extent2d::new(1, 1),
+                values: vec![[0.25, -0.5]],
+            },
             lf_coefficients: vec![[3.0, 4.0, 4.0], [-5.0, 2.0, 1.0]],
         }
     }
@@ -928,7 +995,7 @@ mod tests {
             destinations: [Some((destination_x, destination_y)); 3],
             quant_index: 0,
             dequant_matrix_index: 0,
-            correlation_index: 0,
+            coefficient_origin: (destination_x, destination_y),
             lf_offset: coefficient_offset / 192,
         }
     }
@@ -1036,7 +1103,7 @@ mod tests {
         coefficients: &[i32],
         quant_index: usize,
         matrix_index: usize,
-        correlation_index: usize,
+        coefficient_origin: (u32, u32),
         lf_index: usize,
         resource: &VarDctResource,
     ) -> [[f32; 64]; 3] {
@@ -1044,7 +1111,7 @@ mod tests {
             coefficients,
             quant_index,
             matrix_index,
-            correlation_index,
+            coefficient_origin,
             lf_index,
             resource,
         );
@@ -1073,7 +1140,7 @@ mod tests {
             coefficients,
             usize::from(task.quant_index),
             usize::from(task.dequant_matrix_index),
-            usize::from(task.correlation_index),
+            task.coefficient_origin,
             task.lf_offset as usize,
             resource,
         );
@@ -1220,6 +1287,8 @@ mod tests {
             quant_offset: 0,
             matrix_offset: 0,
             correlation_offset: 0,
+            correlation_width: 1,
+            correlation_height: 1,
             lf_offset: 0,
             quant_biases: [0.0; 4],
         };
@@ -1239,7 +1308,7 @@ mod tests {
         coefficients[0] = 2;
         coefficients[64] = 8;
         coefficients[128] = 3;
-        let output = scalar_reference_block(&coefficients, 0, 0, 0, 0, &resource());
+        let output = scalar_reference_block(&coefficients, 0, 0, (0, 0), 0, &resource());
         assert!(output[0].iter().all(|value| (*value - 3.0).abs() < 1.0e-6));
         assert!(output[1].iter().all(|value| (*value - 4.0).abs() < 1.0e-6));
         assert!(output[2].iter().all(|value| (*value - 4.0).abs() < 1.0e-6));
@@ -1259,8 +1328,8 @@ mod tests {
         coefficients[0] = 17;
         coefficients[64] = -13;
         coefficients[128] = 5;
-        let scalar = scalar_reference_block(&coefficients, 0, 0, 0, 0, &resource());
-        let codec = codec_reference_block(&coefficients, 0, 0, 0, 0, &resource());
+        let scalar = scalar_reference_block(&coefficients, 0, 0, (0, 0), 0, &resource());
+        let codec = codec_reference_block(&coefficients, 0, 0, (0, 0), 0, &resource());
         for channel in 0..3 {
             for index in 0..64 {
                 let tolerance = 1.0e-4_f32.max(codec[channel][index].abs() * 5.0e-6);
@@ -1277,7 +1346,7 @@ mod tests {
         // The entropy packet's coefficient-zero slot is deliberately ignored: codec DCT8 takes
         // DC from the separately decoded LF plane.
         dc_only[0] = 99;
-        let codec_dc = codec_reference_block(&dc_only, 0, 0, 0, 0, &resource());
+        let codec_dc = codec_reference_block(&dc_only, 0, 0, (0, 0), 0, &resource());
         assert!(
             codec_dc[0]
                 .iter()
@@ -1310,7 +1379,7 @@ mod tests {
                         destinations: [Some((0, 0)); 3],
                         quant_index: 0,
                         dequant_matrix_index: 0,
-                        correlation_index: 0,
+                        coefficient_origin: (0, 0),
                         lf_offset: 0,
                     }],
                 }],

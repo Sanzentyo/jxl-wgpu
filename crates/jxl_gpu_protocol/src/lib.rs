@@ -1068,7 +1068,10 @@ pub struct TransformTask {
     pub destinations: [Option<(u32, u32)>; 3],
     pub quant_index: u16,
     pub dequant_matrix_index: u16,
-    pub correlation_index: u16,
+    /// Top-left coordinate of this transform in the global HF coefficient grid.  CfL parameters
+    /// are selected per frequency from [`VarDctResource::hf_correlation`] rather than once per
+    /// varblock, so this origin is intentionally independent of the spatial destinations.
+    pub coefficient_origin: (u32, u32),
     /// First tightly packed X/Y/B LF tuple in [`VarDctResource::lf_coefficients`].
     pub lf_offset: u32,
 }
@@ -1099,16 +1102,28 @@ pub struct VarDctDequantMatrix {
     pub scales: Vec<[f32; 3]>,
 }
 
+/// Global 64x64-cell HF chroma-from-luma grid.
+///
+/// `values` is row-major and contains exactly `extent.width * extent.height` `[Y→X, Y→B]`
+/// multipliers.  A transform frequency at global coefficient coordinate `(x, y)` selects cell
+/// `(x / 64, y / 64)`.  This per-frequency lookup is required for large transforms that span
+/// several correlation cells.
+#[derive(Clone, Debug)]
+pub struct VarDctCorrelationGrid {
+    pub extent: Extent2d,
+    pub values: Vec<[f32; 2]>,
+}
+
 /// Typed late-bound parameters for GPU VarDCT rendering.
 ///
-/// A [`TransformTask`] selects one `quant_scales` entry with `quant_index`, one
-/// `dequant_matrices` entry with `dequant_matrix_index`, and one `correlations` entry with
-/// `correlation_index`. Its `lf_offset` selects the separately decoded LF rectangle. HF
+/// A [`TransformTask`] selects one `quant_scales` entry with `quant_index` and one
+/// `dequant_matrices` entry with `dequant_matrix_index`. Its `coefficient_origin` addresses the
+/// global HF correlation grid, while `lf_offset` selects the separately decoded LF rectangle. HF
 /// coefficients are bias-adjusted using `quant_biases`, multiplied by both selected dequantization
-/// factors, then Y is correlated into X/B using `[y_to_x, y_to_b]` before LF reinterpretation and
-/// inverse transform. Producers can therefore represent global scale, raw quantization, channel
-/// multipliers, quantization matrices, color correlation, and the LF image without an untyped
-/// positional `Vec<f32>` contract.
+/// factors, then Y is correlated into X/B through the global 64x64-cell grid before LF
+/// reinterpretation and inverse transform. Producers can therefore represent global scale, raw
+/// quantization, channel multipliers, quantization matrices, color correlation, and the LF image
+/// without an untyped positional `Vec<f32>` contract.
 #[derive(Clone, Debug)]
 pub struct VarDctResource {
     /// Biases for X/Y/B small coefficients followed by the large-coefficient numerator.
@@ -1116,8 +1131,7 @@ pub struct VarDctResource {
     /// Per-quantization-index X/Y/B multipliers.
     pub quant_scales: Vec<[f32; 3]>,
     pub dequant_matrices: Vec<VarDctDequantMatrix>,
-    /// Per-correlation-index `[y_to_x, y_to_b]` multipliers.
-    pub correlations: Vec<[f32; 2]>,
+    pub hf_correlation: VarDctCorrelationGrid,
     /// Tightly packed LF tuples in X/Y/B order. Regular large transforms reinterpret an `N/8` by
     /// `M/8` rectangle into their lowest frequencies before inverse DCT; special 8x8 transforms
     /// consume one tuple.

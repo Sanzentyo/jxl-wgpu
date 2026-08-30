@@ -4,8 +4,9 @@ struct Task {
     destination_y: u32,
     quant_index: u32,
     matrix_index: u32,
-    correlation_index: u32,
     lf_index: u32,
+    coefficient_origin_x: u32,
+    coefficient_origin_y: u32,
 };
 
 struct Params {
@@ -19,8 +20,8 @@ struct Params {
     matrix_offset: u32,
     correlation_offset: u32,
     lf_offset: u32,
-    _pad0: u32,
-    _pad1: u32,
+    correlation_width: u32,
+    correlation_height: u32,
     quant_biases: vec4<f32>,
 };
 
@@ -96,7 +97,14 @@ fn main(
     let matrix_scale = resources[
         params.matrix_offset + task.matrix_index * 64u + lane
     ];
-    let correlation = resources[params.correlation_offset + task.correlation_index];
+    let frequency_x = lane / 8u;
+    let frequency_y = lane % 8u;
+    let correlation_cell_x = (task.coefficient_origin_x + frequency_x) / 64u;
+    let correlation_cell_y = (task.coefficient_origin_y + frequency_y) / 64u;
+    let correlation = resources[
+        params.correlation_offset + correlation_cell_y * params.correlation_width
+            + correlation_cell_x
+    ];
 
     let quantized_x = coefficients[task.coefficient_offset + lane];
     let quantized_y = coefficients[task.coefficient_offset + 64u + lane];
