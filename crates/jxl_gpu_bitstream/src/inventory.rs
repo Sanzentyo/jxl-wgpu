@@ -161,6 +161,29 @@ pub enum FrameEncoding {
     Modular = 1,
 }
 
+/// Standard JPEG XL frame blending operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameBlendMode {
+    #[default]
+    Replace = 0,
+    Add = 1,
+    Blend = 2,
+    MultiplyAdd = 3,
+    Multiply = 4,
+}
+
+/// Blending contract for the color image or one extra channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameBlendInfo {
+    pub mode: FrameBlendMode,
+    /// Extra-channel index providing alpha when the mode uses alpha.
+    pub alpha_channel: Option<u32>,
+    pub clamp: bool,
+    /// Reference-frame slot supplying the destination canvas.
+    pub source: u32,
+}
+
 /// Logical meaning of a physical TOC entry when the TOC is not permuted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSectionKind {
@@ -209,6 +232,9 @@ pub struct FrameInventory {
     pub x0: i32,
     pub y0: i32,
     pub have_crop: bool,
+    pub color_blend: FrameBlendInfo,
+    /// One blending contract per image-header extra channel, in channel order.
+    pub extra_channel_blends: Vec<FrameBlendInfo>,
     pub num_passes: u32,
     pub duration_ticks: u32,
     pub timecode: Option<u32>,
@@ -414,6 +440,8 @@ pub(crate) fn parse_codestream_inventory(
             x0: header.x0,
             y0: header.y0,
             have_crop: header.have_crop,
+            color_blend: header.color_blend,
+            extra_channel_blends: header.extra_channel_blends,
             num_passes: header.num_passes,
             duration_ticks: header.duration,
             timecode: header.timecode,
@@ -675,6 +703,8 @@ struct ParsedFrameHeader {
     num_passes: u32,
     lf_level: u32,
     have_crop: bool,
+    color_blend: FrameBlendInfo,
+    extra_channel_blends: Vec<FrameBlendInfo>,
     x0: i32,
     y0: i32,
     width: u32,
@@ -696,6 +726,8 @@ fn parse_frame_header(
     limits: InventoryLimits,
 ) -> Result<ParsedFrameHeader, InventoryError> {
     zero_pad(reader)?;
+    let extra_channel_count = usize::try_from(context.num_extra_channels)
+        .map_err(|_| InventoryError::ResourceLimit("extra channels"))?;
     let all_default = read_bool(reader)?;
     if all_default {
         return Ok(ParsedFrameHeader {
@@ -709,6 +741,8 @@ fn parse_frame_header(
             num_passes: 1,
             lf_level: 0,
             have_crop: false,
+            color_blend: FrameBlendInfo::default(),
+            extra_channel_blends: vec![FrameBlendInfo::default(); extra_channel_count],
             x0: 0,
             y0: 0,
             width: context.width,
@@ -818,17 +852,29 @@ fn parse_frame_header(
     let full_frame = !have_crop || completely_covers;
 
     let normal_frame = matches!(frame_type, FrameType::Regular | FrameType::SkipProgressive);
-    let blending_mode = if normal_frame {
-        parse_blending_info(reader, context.num_extra_channels, full_frame)?
+    let color_blend = if normal_frame {
+        parse_blending_info(reader, context.num_extra_channels, full_frame, None)?
     } else {
-        0
+        FrameBlendInfo::default()
     };
-    let mut replace_all = blending_mode == 0;
+    let mut replace_all = color_blend.mode == FrameBlendMode::Replace;
+    let mut extra_channel_blends = Vec::new();
+    extra_channel_blends
+        .try_reserve_exact(extra_channel_count)
+        .map_err(|_| InventoryError::AllocationFailed("extra-channel blending"))?;
     if normal_frame {
         for _ in 0..context.num_extra_channels {
-            replace_all &=
-                parse_blending_info(reader, context.num_extra_channels, full_frame)? == 0;
+            let blend = parse_blending_info(
+                reader,
+                context.num_extra_channels,
+                full_frame,
+                Some(color_blend.mode),
+            )?;
+            replace_all &= blend.mode == FrameBlendMode::Replace;
+            extra_channel_blends.push(blend);
         }
+    } else {
+        extra_channel_blends.resize(extra_channel_count, FrameBlendInfo::default());
     }
     if is_preview && (have_crop || !replace_all) {
         return Err(InventoryError::InvalidFrame("preview cannot crop or blend"));
@@ -856,8 +902,10 @@ fn parse_frame_header(
     let can_be_referenced = !is_last
         && frame_type != FrameType::LowFrequency
         && (duration == 0 || save_as_reference != 0);
-    let save_before_default_false =
-        can_be_referenced && blending_mode == 0 && full_frame && normal_frame;
+    let save_before_default_false = can_be_referenced
+        && color_blend.mode == FrameBlendMode::Replace
+        && full_frame
+        && normal_frame;
     let save_before_color_transform =
         if frame_type == FrameType::ReferenceOnly || save_before_default_false {
             read_bool(reader)?
@@ -897,6 +945,8 @@ fn parse_frame_header(
         num_passes,
         lf_level,
         have_crop,
+        color_blend,
+        extra_channel_blends,
         x0,
         y0,
         width,
@@ -949,30 +999,51 @@ fn parse_blending_info(
     reader: &mut BitReader<'_>,
     num_extra_channels: u32,
     full_frame: bool,
-) -> Result<u32, InventoryError> {
+    canvas_mode: Option<FrameBlendMode>,
+) -> Result<FrameBlendInfo, InventoryError> {
     let mode = read_u32(reader, [c(0), c(1), c(2), b(3, 2)])?;
-    if mode > 4 {
-        return Err(InventoryError::InvalidEnum {
-            name: "BlendingMode",
-            value: mode,
-        });
-    }
-    let uses_alpha = matches!(mode, 2 | 3);
-    if num_extra_channels > 0 && uses_alpha {
+    let mode = match mode {
+        0 => FrameBlendMode::Replace,
+        1 => FrameBlendMode::Add,
+        2 => FrameBlendMode::Blend,
+        3 => FrameBlendMode::MultiplyAdd,
+        4 => FrameBlendMode::Multiply,
+        value => {
+            return Err(InventoryError::InvalidEnum {
+                name: "BlendingMode",
+                value,
+            });
+        }
+    };
+    let uses_alpha = matches!(mode, FrameBlendMode::Blend | FrameBlendMode::MultiplyAdd);
+    let alpha_channel = if num_extra_channels > 0 && uses_alpha {
         let alpha_channel = read_u32(reader, [c(0), c(1), c(2), b(3, 3)])?;
         if alpha_channel >= num_extra_channels {
             return Err(InventoryError::InvalidFrame(
                 "invalid blending alpha channel",
             ));
         }
-    }
-    if (num_extra_channels > 0 && uses_alpha) || mode == 4 {
-        let _ = read_bool(reader)?;
-    }
-    if !(full_frame && mode == 0) {
-        let _ = read_u32(reader, [c(0), c(1), c(2), c(3)])?;
-    }
-    Ok(mode)
+        Some(alpha_channel)
+    } else {
+        None
+    };
+    let clamp = if (num_extra_channels > 0 && uses_alpha) || mode == FrameBlendMode::Multiply {
+        read_bool(reader)?
+    } else {
+        false
+    };
+    let reset_mode = canvas_mode.unwrap_or(mode);
+    let source = if full_frame && reset_mode == FrameBlendMode::Replace {
+        0
+    } else {
+        read_u32(reader, [c(0), c(1), c(2), c(3)])?
+    };
+    Ok(FrameBlendInfo {
+        mode,
+        alpha_channel,
+        clamp,
+        source,
+    })
 }
 
 fn parse_restoration_filter(
@@ -1374,7 +1445,7 @@ fn div_ceil(value: u64, divisor: u64) -> Result<u64, InventoryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FragmentedContainerWriter, ParseLimits, parse, write_container};
+    use crate::{BitWriter, FragmentedContainerWriter, ParseLimits, parse, write_container};
     use sha2::{Digest, Sha256};
 
     fn inventory(input: &[u8]) -> CodestreamInventory {
@@ -1609,6 +1680,67 @@ mod tests {
             parsed.codestream_inventory(decoded_limit).unwrap_err(),
             InventoryError::ResourceLimit("decoded ICC profile bytes")
         );
+    }
+
+    #[test]
+    fn blending_inventory_preserves_alpha_clamp_and_main_canvas_source_rule() {
+        let mut color_bits = BitWriter::new();
+        color_bits.write_bits(2, 2).unwrap(); // Blend mode.
+        color_bits.write_bits(2, 2).unwrap(); // Alpha extra channel 2.
+        color_bits.write_bits(1, 1).unwrap(); // Clamp.
+        color_bits.write_bits(3, 2).unwrap(); // Reference source 3.
+        let mut color_reader = BitReader::new(color_bits.as_bytes());
+        assert_eq!(
+            parse_blending_info(&mut color_reader, 3, false, None).unwrap(),
+            FrameBlendInfo {
+                mode: FrameBlendMode::Blend,
+                alpha_channel: Some(2),
+                clamp: true,
+                source: 3,
+            }
+        );
+        assert_eq!(color_reader.bit_offset(), 7);
+
+        // An extra channel inherits the color blend mode for the source-field condition. A full
+        // Replace color frame resets the canvas, so the Add extra channel has no source bits.
+        let mut reset_extra_bits = BitWriter::new();
+        reset_extra_bits.write_bits(1, 2).unwrap(); // Add mode.
+        let mut reset_extra_reader = BitReader::new(reset_extra_bits.as_bytes());
+        assert_eq!(
+            parse_blending_info(
+                &mut reset_extra_reader,
+                1,
+                true,
+                Some(FrameBlendMode::Replace),
+            )
+            .unwrap(),
+            FrameBlendInfo {
+                mode: FrameBlendMode::Add,
+                alpha_channel: None,
+                clamp: false,
+                source: 0,
+            }
+        );
+        assert_eq!(reset_extra_reader.bit_offset(), 2);
+
+        // Conversely, a non-resetting color frame requires the source even when this extra
+        // channel's own operation is Replace.
+        let mut sourced_extra_bits = BitWriter::new();
+        sourced_extra_bits.write_bits(0, 2).unwrap(); // Replace mode.
+        sourced_extra_bits.write_bits(2, 2).unwrap(); // Reference source 2.
+        let mut sourced_extra_reader = BitReader::new(sourced_extra_bits.as_bytes());
+        assert_eq!(
+            parse_blending_info(
+                &mut sourced_extra_reader,
+                1,
+                true,
+                Some(FrameBlendMode::Add),
+            )
+            .unwrap()
+            .source,
+            2
+        );
+        assert_eq!(sourced_extra_reader.bit_offset(), 4);
     }
 
     #[test]

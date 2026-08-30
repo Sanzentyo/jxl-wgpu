@@ -76,8 +76,8 @@ pub use acceleration::{
 };
 pub use inventory::{
     AnimationInventory, BitRange, ByteRange, CodestreamInventory, EmbeddedIccInventory,
-    FrameEncoding, FrameInventory, FrameSection, FrameSectionKind, FrameType, ImageHeaderInventory,
-    InventoryError, InventoryLimits, SampleBitDepth,
+    FrameBlendInfo, FrameBlendMode, FrameEncoding, FrameInventory, FrameSection, FrameSectionKind,
+    FrameType, ImageHeaderInventory, InventoryError, InventoryLimits, SampleBitDepth,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).

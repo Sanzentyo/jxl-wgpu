@@ -6,8 +6,9 @@ Bounded JPEG XL transport and codestream inventory for GPU codec front ends.
 `jxlp` fragment sequences. Raw and single-`jxlc` codestreams remain borrowed; only fragmented
 streams are joined.
 After transport validation, `ParsedJxl::codestream_inventory` extracts the standard image header,
-animation timing, frame headers, TOC sizes, and byte/bit ranges for every physical frame section.
-It never decodes image samples or frame-section entropy.
+animation timing, complete color and extra-channel blending contracts, frame headers, TOC sizes,
+and byte/bit ranges for every physical frame section. It never decodes image samples or
+frame-section entropy.
 
 The image-header grammar comes from the lightweight `jxl-image` crate. Frame-header and TOC-size
 grammar is parsed locally with explicit limits. Entropy-coded TOC permutations use the published
