@@ -61,6 +61,10 @@ mod test_fixtures {
     pub(crate) fn gpu_gray8_lossless() -> Vec<u8> {
         decode_hex(include_str!("../test-data/gpu_gray8_lossless.jxl.hex"))
     }
+
+    pub(crate) fn has_permutation() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/has_permutation.jxl.hex"))
+    }
 }
 
 pub use acceleration::{

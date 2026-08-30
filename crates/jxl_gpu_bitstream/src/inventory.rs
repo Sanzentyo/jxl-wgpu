@@ -1,8 +1,8 @@
 //! Bounded standard-codestream header and TOC inventory.
 //!
-//! Image-header grammar is delegated to the header-only `jxl-image` crate. Frame headers and
-//! non-permuted TOCs are parsed locally because depending on a complete frame decoder would pull
-//! CPU entropy, Modular, and VarDCT implementations into the production graph.
+//! Image-header grammar is delegated to the header-only `jxl-image` crate. Frame headers are
+//! parsed locally, while the published `jxl-coding` metadata decoder is used only for the
+//! entropy-coded TOC permutation. No image sample, Modular, or VarDCT data is decoded here.
 
 use jxl_bitstream::Bitstream as ImageBitstream;
 use jxl_image::{BitDepth as JxlBitDepth, ImageHeader};
@@ -163,6 +163,9 @@ pub enum FrameSectionKind {
 /// One physical frame section and its exact byte/bit range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSection {
+    /// Position of this section among the physically serialized frame sections.
+    pub bitstream_index: u32,
+    /// Logical TOC index after undoing an optional entropy-coded permutation.
     pub toc_index: u32,
     pub kind: FrameSectionKind,
     pub bytes: ByteRange,
@@ -176,6 +179,7 @@ pub struct FrameInventory {
     pub is_preview: bool,
     pub header_bits: BitRange,
     pub toc_bits: BitRange,
+    pub toc_permuted: bool,
     pub frame_type: FrameType,
     pub encoding: FrameEncoding,
     pub flags: u64,
@@ -213,8 +217,6 @@ pub struct CodestreamInventory {
 pub enum UnsupportedCodestreamGrammar {
     /// Locating the first frame requires decoding the embedded ICC entropy stream.
     EmbeddedIccProfile,
-    /// Mapping and even locating TOC sizes requires decoding an entropy-coded permutation.
-    EntropyCodedTocPermutation,
 }
 
 /// Failure while constructing a bounded standard codestream inventory.
@@ -330,7 +332,7 @@ pub(crate) fn parse_codestream_inventory(
         }
 
         let toc_start = reader.bit_offset();
-        let entry_lengths = parse_toc(&mut reader, toc_entries)?;
+        let toc = parse_toc(&mut reader, toc_entries, codestream)?;
         let toc_end = reader.bit_offset();
         let section_start_byte = toc_end / 8;
         let mut section_cursor = section_start_byte;
@@ -339,7 +341,12 @@ pub(crate) fn parse_codestream_inventory(
             .try_reserve_exact(toc_entries)
             .map_err(|_| InventoryError::AllocationFailed("frame sections"))?;
 
-        for (toc_index, length) in entry_lengths.into_iter().enumerate() {
+        for (bitstream_index, (&toc_index, &length)) in toc
+            .logical_indices_in_bitstream_order
+            .iter()
+            .zip(&toc.entry_lengths_in_bitstream_order)
+            .enumerate()
+        {
             let length = u64::from(length);
             total_section_bytes = total_section_bytes
                 .checked_add(length)
@@ -360,6 +367,8 @@ pub(crate) fn parse_codestream_inventory(
                 .ok_or(InventoryError::SizeOverflow)?;
             let bit_length = length.checked_mul(8).ok_or(InventoryError::SizeOverflow)?;
             sections.push(FrameSection {
+                bitstream_index: u32::try_from(bitstream_index)
+                    .map_err(|_| InventoryError::SizeOverflow)?,
                 toc_index: u32::try_from(toc_index).map_err(|_| InventoryError::SizeOverflow)?,
                 kind: section_kind(toc_index as u64, counts, header.num_passes),
                 bytes: ByteRange {
@@ -388,6 +397,7 @@ pub(crate) fn parse_codestream_inventory(
             is_preview,
             header_bits: BitRange::between(header_start, header_end)?,
             toc_bits: BitRange::between(toc_start, toc_end)?,
+            toc_permuted: toc.permuted,
             frame_type: header.frame_type,
             encoding: header.encoding,
             flags: header.flags,
@@ -922,12 +932,62 @@ fn parse_extensions(
         .map_err(|error| map_reader_error(error, reader.bit_offset()))
 }
 
-fn parse_toc(reader: &mut BitReader<'_>, num_entries: usize) -> Result<Vec<u32>, InventoryError> {
-    if read_bool(reader)? {
-        return Err(InventoryError::UnsupportedGrammar(
-            UnsupportedCodestreamGrammar::EntropyCodedTocPermutation,
-        ));
-    }
+struct ParsedToc {
+    permuted: bool,
+    entry_lengths_in_bitstream_order: Vec<u32>,
+    logical_indices_in_bitstream_order: Vec<usize>,
+}
+
+fn parse_toc(
+    reader: &mut BitReader<'_>,
+    num_entries: usize,
+    codestream: &[u8],
+) -> Result<ParsedToc, InventoryError> {
+    let permuted = read_bool(reader)?;
+    let original_to_bitstream = if permuted {
+        let entropy_start = reader.bit_offset();
+        let entropy_start_usize =
+            usize::try_from(entropy_start).map_err(|_| InventoryError::SizeOverflow)?;
+        let entry_count = u32::try_from(num_entries)
+            .map_err(|_| InventoryError::ResourceLimit("TOC entries per frame"))?;
+        let mut bitstream = ImageBitstream::new(codestream);
+        if let Err(error) = bitstream.skip_bits(entropy_start_usize) {
+            return Err(map_metadata_bitstream_error(
+                error,
+                bitstream.num_read_bits(),
+            ));
+        }
+        let mut decoder = match jxl_coding::Decoder::parse(&mut bitstream, 8) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                return Err(map_toc_entropy_error(error, bitstream.num_read_bits()));
+            }
+        };
+        if let Err(error) = decoder.begin(&mut bitstream) {
+            return Err(map_toc_entropy_error(error, bitstream.num_read_bits()));
+        }
+        let permutation =
+            match jxl_coding::read_permutation(&mut bitstream, &mut decoder, entry_count, 0) {
+                Ok(permutation) => permutation,
+                Err(error) => {
+                    return Err(map_toc_entropy_error(error, bitstream.num_read_bits()));
+                }
+            };
+        if let Err(error) = decoder.finalize() {
+            return Err(map_toc_entropy_error(error, bitstream.num_read_bits()));
+        }
+        let entropy_end =
+            u64::try_from(bitstream.num_read_bits()).map_err(|_| InventoryError::SizeOverflow)?;
+        let entropy_bits = entropy_end
+            .checked_sub(entropy_start)
+            .ok_or(InventoryError::SizeOverflow)?;
+        reader
+            .skip_bits(entropy_bits)
+            .map_err(|error| map_reader_error(error, reader.bit_offset()))?;
+        Some(permutation)
+    } else {
+        None
+    };
     zero_pad(reader)?;
     let mut entries = Vec::new();
     entries
@@ -940,7 +1000,62 @@ fn parse_toc(reader: &mut BitReader<'_>, num_entries: usize) -> Result<Vec<u32>,
         )?);
     }
     zero_pad(reader)?;
-    Ok(entries)
+
+    let logical_indices_in_bitstream_order =
+        if let Some(original_to_bitstream) = original_to_bitstream {
+            if original_to_bitstream.len() != num_entries {
+                return Err(InventoryError::InvalidFrame(
+                    "invalid TOC permutation length",
+                ));
+            }
+            let mut bitstream_to_original = vec![usize::MAX; num_entries];
+            for (original_index, bitstream_index) in original_to_bitstream.into_iter().enumerate() {
+                let slot = bitstream_to_original.get_mut(bitstream_index).ok_or(
+                    InventoryError::InvalidFrame("invalid TOC permutation index"),
+                )?;
+                if *slot != usize::MAX {
+                    return Err(InventoryError::InvalidFrame(
+                        "duplicate TOC permutation index",
+                    ));
+                }
+                *slot = original_index;
+            }
+            if bitstream_to_original.contains(&usize::MAX) {
+                return Err(InventoryError::InvalidFrame("incomplete TOC permutation"));
+            }
+            bitstream_to_original
+        } else {
+            (0..num_entries).collect()
+        };
+    Ok(ParsedToc {
+        permuted,
+        entry_lengths_in_bitstream_order: entries,
+        logical_indices_in_bitstream_order,
+    })
+}
+
+fn map_toc_entropy_error(error: jxl_coding::Error, bit_offset: usize) -> InventoryError {
+    if error.unexpected_eof() {
+        InventoryError::UnexpectedEndOfBits {
+            bit_offset: u64::try_from(bit_offset).unwrap_or(u64::MAX),
+        }
+    } else {
+        InventoryError::InvalidFrame("invalid entropy-coded TOC permutation")
+    }
+}
+
+fn map_metadata_bitstream_error(error: jxl_bitstream::Error, bit_offset: usize) -> InventoryError {
+    if error.unexpected_eof() {
+        InventoryError::UnexpectedEndOfBits {
+            bit_offset: u64::try_from(bit_offset).unwrap_or(u64::MAX),
+        }
+    } else if matches!(error, jxl_bitstream::Error::NonZeroPadding) {
+        InventoryError::NonZeroPadding {
+            bit_offset: u64::try_from(bit_offset).unwrap_or(u64::MAX),
+        }
+    } else {
+        InventoryError::InvalidFrame("invalid TOC metadata bitstream")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1205,6 +1320,7 @@ mod tests {
         assert_eq!(
             frame.sections,
             vec![FrameSection {
+                bitstream_index: 0,
                 toc_index: 0,
                 kind: FrameSectionKind::Single,
                 bytes: ByteRange {
@@ -1289,6 +1405,55 @@ mod tests {
         );
         assert_eq!(frame.sections[0].bytes.offset, 31);
         assert_eq!(frame.sections.last().unwrap().bytes.end(), Some(88_995));
+    }
+
+    #[test]
+    fn entropy_coded_toc_permutation_maps_physical_sections_to_logical_kinds() {
+        let inventory = inventory(&crate::test_fixtures::has_permutation());
+        assert_eq!(inventory.codestream_bytes, 2_295);
+        assert_eq!(inventory.frames.len(), 1);
+        let frame = &inventory.frames[0];
+        assert!(frame.toc_permuted);
+        assert_eq!(frame.sections.len(), 49);
+
+        let original_to_bitstream = [
+            0usize, 1, 42, 48, 2, 3, 4, 5, 6, 7, 8, 9, 43, 10, 11, 12, 13, 14, 15, 16, 17, 44, 18,
+            19, 20, 21, 22, 23, 24, 25, 45, 26, 27, 28, 29, 30, 31, 32, 33, 46, 34, 35, 36, 37, 38,
+            39, 40, 41, 47,
+        ];
+        let lengths_in_bitstream_order = [
+            155u64, 992, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+            9, 9, 9, 9, 9, 9, 9, 5, 5, 5, 5, 5, 5, 5, 5, 697, 5, 5, 5, 5, 5, 60,
+        ];
+        let mut bitstream_to_original = [usize::MAX; 49];
+        for (original, &bitstream) in original_to_bitstream.iter().enumerate() {
+            bitstream_to_original[bitstream] = original;
+        }
+        assert_eq!(
+            frame
+                .sections
+                .iter()
+                .map(|section| usize::try_from(section.toc_index).unwrap())
+                .collect::<Vec<_>>(),
+            bitstream_to_original
+        );
+        assert_eq!(
+            frame
+                .sections
+                .iter()
+                .map(|section| section.bytes.length)
+                .collect::<Vec<_>>(),
+            lengths_in_bitstream_order
+        );
+        assert_eq!(
+            frame
+                .sections
+                .iter()
+                .map(|section| section.bitstream_index)
+                .collect::<Vec<_>>(),
+            (0..49).collect::<Vec<_>>()
+        );
+        assert_eq!(frame.sections.last().unwrap().bytes.end(), Some(2_295));
     }
 
     #[test]
@@ -1425,6 +1590,7 @@ mod tests {
             crate::test_fixtures::green_queen_vardct(),
             crate::test_fixtures::animation_spline(),
             crate::test_fixtures::fragmented_animation(),
+            crate::test_fixtures::has_permutation(),
         ];
         for fixture in fixtures {
             let expected = inventory(&fixture);
@@ -1511,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn toc_padding_permutation_and_declared_ranges_are_validated() {
+    fn toc_padding_and_declared_ranges_are_validated() {
         let basic = crate::test_fixtures::basic();
 
         let mut non_zero_padding = basic.clone();
@@ -1520,15 +1686,6 @@ mod tests {
             inventory_error(&non_zero_padding),
             InventoryError::NonZeroPadding { .. }
         ));
-
-        let mut permuted = basic.clone();
-        permuted[9] |= 1 << 2; // Codestream bit 74.
-        assert_eq!(
-            inventory_error(&permuted),
-            InventoryError::UnsupportedGrammar(
-                UnsupportedCodestreamGrammar::EntropyCodedTocPermutation
-            )
-        );
 
         let mut oversized = basic;
         for bit in 82..92 {

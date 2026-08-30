@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 jxl-bitstream = "=1.0.0"
+jxl-coding = "=1.0.1"
 jxl-image = "=0.13.0"
 jxl-oxide-common = "=1.0.0"
 sha2.workspace = true

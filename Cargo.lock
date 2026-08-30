@@ -547,6 +547,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxl-coding"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd972bcd125e776f1eb241ac50e39f956095a1c2770c64736c968f8946bd9a3c"
+dependencies = [
+ "jxl-bitstream",
+ "tracing",
+]
+
+[[package]]
 name = "jxl-grid"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -581,6 +591,7 @@ name = "jxl_gpu_bitstream"
 version = "0.1.0"
 dependencies = [
  "jxl-bitstream",
+ "jxl-coding",
  "jxl-image",
  "jxl-oxide-common",
  "sha2",
