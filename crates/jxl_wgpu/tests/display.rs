@@ -11,8 +11,11 @@ use jxl_gpu_protocol::{Extent2d, OutputId, OutputLayout, SampleType};
 use jxl_wgpu::{
     ChromaLocation2d, ChromaOrder, ChromaSubsampling, ColorRange, ColorSpace, ColorSpec,
     ColorSpecification, DirectReadbackPolicy, DisplayColorEncoding, DisplayPipeline,
-    DisplayTexture, DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer, Packed422Order,
-    PixelFormat, RgbChannelOrder, TransferFunction, WgpuBackend, WgpuBackendConfig, YcbcrEncoding,
+    DisplayTexture, DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer,
+    NumericDisplayChannels, NumericDisplayClamp, NumericDisplayContract, NumericDisplayPrecision,
+    NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy, Packed422Order,
+    PixelFormat, RgbChannelOrder, SampleKind, TransferFunction, WgpuBackend, WgpuBackendConfig,
+    YcbcrEncoding,
 };
 use wgpu::util::DeviceExt;
 
@@ -109,6 +112,10 @@ fn bt709_linear_code(encoded: f32) -> u8 {
         ((encoded + 0.099) / 1.099).powf(1.0 / 0.45)
     };
     (linear * 255.0).round() as u8
+}
+
+fn unorm8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 #[test]
@@ -388,4 +395,225 @@ fn odd_width_packed_422_preserves_color_and_tail_luma_order() {
             assert_eq!(pixel[3], 255);
         }
     }
+}
+
+#[test]
+fn all_vpi_numeric_formats_use_explicit_gpu_display_contracts() {
+    use jxl_gpu_formats::vpi::VpiPitchLinearFormat as Vpi;
+
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let display = DisplayPipeline::new(&backend);
+    let extent = Extent2d::new(4, 1);
+    let formats = [
+        Vpi::U8,
+        Vpi::S8,
+        Vpi::U16,
+        Vpi::U32,
+        Vpi::S32,
+        Vpi::S16,
+        Vpi::TwoS16,
+        Vpi::F32,
+        Vpi::F64,
+        Vpi::TwoF32,
+    ];
+
+    for (index, predefined) in formats.into_iter().enumerate() {
+        let (bytes, values) = numeric_source(predefined);
+        let format = predefined.pixel_format();
+        let contract = numeric_contract(predefined, format.sample_kind);
+        let layout = jxl_gpu_formats::ImageLayout::packed(extent, format).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            layout.logical_size,
+            "{}",
+            predefined.name()
+        );
+        let mut padded = bytes;
+        padded.resize(padded.len().div_ceil(4) * 4, 0);
+        let buffer = Arc::new(backend.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu VPI numeric display source"),
+                contents: &padded,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
+        ));
+        let source = GpuImageOutput {
+            id: OutputId(u32::try_from(index).unwrap()),
+            layout,
+            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+        };
+        let submission = display
+            .submit_numeric_image(&source, contract, DisplayTextureDescriptor::default())
+            .unwrap_or_else(|error| panic!("{} display submission: {error}", predefined.name()));
+        let precision = submission
+            .texture
+            .numeric_precision
+            .expect("numeric display reports its arithmetic path");
+        let actual = read_texture(&backend, &submission.texture);
+        let expected = numeric_display_oracle(predefined, &values, contract, precision);
+        assert_eq!(actual, expected, "{} ({precision:?})", predefined.name());
+    }
+}
+
+fn numeric_source(format: jxl_gpu_formats::vpi::VpiPitchLinearFormat) -> (Vec<u8>, Vec<[f64; 2]>) {
+    use jxl_gpu_formats::vpi::VpiPitchLinearFormat as Vpi;
+
+    let mut bytes = Vec::new();
+    let values = match format {
+        Vpi::U8 => vec![[0.0, 0.0], [64.0, 0.0], [128.0, 0.0], [255.0, 0.0]],
+        Vpi::S8 => vec![[-128.0, 0.0], [-64.0, 0.0], [0.0, 0.0], [127.0, 0.0]],
+        Vpi::U16 => vec![[0.0, 0.0], [16384.0, 0.0], [32768.0, 0.0], [65535.0, 0.0]],
+        Vpi::U32 => vec![
+            [0.0, 0.0],
+            [f64::from(1_u32 << 30), 0.0],
+            [f64::from(1_u32 << 31), 0.0],
+            [f64::from(u32::MAX), 0.0],
+        ],
+        Vpi::S32 => vec![
+            [f64::from(i32::MIN), 0.0],
+            [f64::from(-(1_i32 << 30)), 0.0],
+            [0.0, 0.0],
+            [f64::from(i32::MAX), 0.0],
+        ],
+        Vpi::S16 => vec![[-32768.0, 0.0], [-16384.0, 0.0], [0.0, 0.0], [32767.0, 0.0]],
+        Vpi::TwoS16 => vec![
+            [-32768.0, 32767.0],
+            [-16384.0, 16384.0],
+            [0.0, 0.0],
+            [32767.0, -32768.0],
+        ],
+        Vpi::F32 | Vpi::F64 => vec![
+            [f64::NAN, 0.0],
+            [f64::NEG_INFINITY, 0.0],
+            [f64::INFINITY, 0.0],
+            [0.5, 0.0],
+        ],
+        Vpi::TwoF32 => vec![[0.0, 1.0], [0.25, 0.75], [0.5, 0.5], [1.0, 0.0]],
+        _ => unreachable!("numeric test inventory contains only numeric formats"),
+    };
+    for value in &values {
+        match format {
+            Vpi::U8 => bytes.push(value[0] as u8),
+            Vpi::S8 => bytes.push((value[0] as i8) as u8),
+            Vpi::U16 => bytes.extend_from_slice(&(value[0] as u16).to_le_bytes()),
+            Vpi::U32 => bytes.extend_from_slice(&(value[0] as u32).to_le_bytes()),
+            Vpi::S32 => bytes.extend_from_slice(&(value[0] as i32).to_le_bytes()),
+            Vpi::S16 => bytes.extend_from_slice(&(value[0] as i16).to_le_bytes()),
+            Vpi::TwoS16 => {
+                bytes.extend_from_slice(&(value[0] as i16).to_le_bytes());
+                bytes.extend_from_slice(&(value[1] as i16).to_le_bytes());
+            }
+            Vpi::F32 => bytes.extend_from_slice(&(value[0] as f32).to_le_bytes()),
+            Vpi::F64 => bytes.extend_from_slice(&value[0].to_le_bytes()),
+            Vpi::TwoF32 => {
+                bytes.extend_from_slice(&(value[0] as f32).to_le_bytes());
+                bytes.extend_from_slice(&(value[1] as f32).to_le_bytes());
+            }
+            _ => unreachable!("numeric test inventory contains only numeric formats"),
+        }
+    }
+    (bytes, values)
+}
+
+fn numeric_contract(
+    format: jxl_gpu_formats::vpi::VpiPitchLinearFormat,
+    sample_kind: SampleKind,
+) -> NumericDisplayContract {
+    use jxl_gpu_formats::vpi::VpiPitchLinearFormat as Vpi;
+
+    let (scale, bias) = match format {
+        Vpi::U8 => (1.0 / f32::from(u8::MAX), 0.0),
+        Vpi::U16 => (1.0 / f32::from(u16::MAX), 0.0),
+        Vpi::U32 => (1.0 / u32::MAX as f32, 0.0),
+        Vpi::S8 => {
+            let scale = 1.0 / f32::from(u8::MAX);
+            (scale, -f32::from(i8::MIN) * scale)
+        }
+        Vpi::S16 | Vpi::TwoS16 => {
+            let scale = 1.0 / f32::from(u16::MAX);
+            (scale, -f32::from(i16::MIN) * scale)
+        }
+        Vpi::S32 => {
+            let scale = 1.0 / u32::MAX as f32;
+            (scale, -(i32::MIN as f32) * scale)
+        }
+        Vpi::F32 | Vpi::F64 | Vpi::TwoF32 => (1.0, 0.0),
+        _ => unreachable!("numeric test inventory contains only numeric formats"),
+    };
+    NumericDisplayContract {
+        source: match sample_kind {
+            SampleKind::Unsigned => NumericDisplaySource::Unsigned,
+            SampleKind::Signed => NumericDisplaySource::Signed,
+            SampleKind::Float => NumericDisplaySource::Floating {
+                non_finite: NumericNonFinitePolicy::Saturate,
+            },
+        },
+        scale,
+        bias,
+        channels: match format {
+            Vpi::TwoS16 => NumericDisplayChannels::LumaAlpha,
+            Vpi::TwoF32 => NumericDisplayChannels::RedGreen,
+            _ => NumericDisplayChannels::Luma,
+        },
+        transfer: if format == Vpi::F32 {
+            NumericDisplayTransfer::Srgb
+        } else {
+            NumericDisplayTransfer::Linear
+        },
+        clamp: NumericDisplayClamp::Unit,
+    }
+}
+
+fn numeric_display_oracle(
+    format: jxl_gpu_formats::vpi::VpiPitchLinearFormat,
+    values: &[[f64; 2]],
+    contract: NumericDisplayContract,
+    precision: NumericDisplayPrecision,
+) -> Vec<u8> {
+    let normalize = |value: f64| {
+        let value = if format == jxl_gpu_formats::vpi::VpiPitchLinearFormat::F64
+            && precision == NumericDisplayPrecision::NativeF64
+        {
+            (value * f64::from(contract.scale) + f64::from(contract.bias)) as f32
+        } else {
+            (value as f32) * contract.scale + contract.bias
+        };
+        let finite = if value.is_nan() {
+            0.0
+        } else if value.is_infinite() {
+            match contract.source {
+                NumericDisplaySource::Floating {
+                    non_finite: NumericNonFinitePolicy::Saturate,
+                } if value.is_sign_positive() => 1.0,
+                _ => 0.0,
+            }
+        } else {
+            value
+        };
+        finite.clamp(0.0, 1.0)
+    };
+    values
+        .iter()
+        .flat_map(|value| {
+            let x = normalize(value[0]);
+            let y = normalize(value[1]);
+            let mut rgba = match contract.channels {
+                NumericDisplayChannels::Luma => [x, x, x, 1.0],
+                NumericDisplayChannels::LumaAlpha => [x, x, x, y],
+                NumericDisplayChannels::RedGreen => [x, y, 0.0, 1.0],
+            };
+            if contract.transfer == NumericDisplayTransfer::Srgb {
+                for channel in &mut rgba[..3] {
+                    *channel = if *channel <= 0.04045 {
+                        *channel / 12.92
+                    } else {
+                        ((*channel + 0.055) / 1.055).powf(2.4)
+                    };
+                }
+            }
+            rgba.map(unorm8)
+        })
+        .collect()
 }

@@ -49,7 +49,9 @@ pub use context::{
 };
 pub use display::{
     DisplayColorEncoding, DisplayPipeline, DisplayPipelineCacheStats, DisplaySubmission,
-    DisplayTexture, DisplayTextureDescriptor,
+    DisplayTexture, DisplayTextureDescriptor, NumericDisplayChannels, NumericDisplayClamp,
+    NumericDisplayContract, NumericDisplayError, NumericDisplayPrecision, NumericDisplaySource,
+    NumericDisplayTransfer, NumericNonFinitePolicy,
 };
 pub use error::{Error, Result};
 pub use jxl_gpu_formats::{

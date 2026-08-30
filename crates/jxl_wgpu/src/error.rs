@@ -59,6 +59,8 @@ pub enum Error {
         bytes_per_row: u32,
         required_alignment: u32,
     },
+    #[error("numeric display contract is invalid: {0}")]
+    NumericDisplay(#[from] crate::display::NumericDisplayError),
     #[error("pitch-linear image layout is invalid: {0}")]
     ImageLayout(#[from] jxl_gpu_formats::LayoutError),
     #[error("GPU resource limit exceeded: {0}")]

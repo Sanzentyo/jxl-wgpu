@@ -24,7 +24,7 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
     ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
     NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
-    TransferFunction, WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
+    SampleKind, TransferFunction, WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputLayout, SampleType};
 use wgpu::util::DeviceExt;
@@ -36,6 +36,107 @@ use crate::{Error, Result};
 
 const WORKGROUP_SIZE: u32 = 16;
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+const NUMERIC_F64_MARKER: &str = "/*__JXL_NUMERIC_F64__*/";
+
+/// Declared interpretation of the stored scalar type for numeric visualization.
+///
+/// This must match the [`jxl_gpu_formats::SampleKind`] in the image's [`PixelFormat`]. Keeping it
+/// in the contract makes a numeric display request self-contained instead of silently deriving a
+/// normalization rule from storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericDisplaySource {
+    Unsigned,
+    Signed,
+    Floating { non_finite: NumericNonFinitePolicy },
+}
+
+/// Handling applied when a floating-point source, or its affine normalization, is not finite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericNonFinitePolicy {
+    /// NaN and both infinities become zero.
+    Zero,
+    /// NaN and negative infinity become zero; positive infinity becomes one.
+    Saturate,
+}
+
+/// Mapping from one- or two-component VPI numeric storage to display RGBA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericDisplayChannels {
+    /// Component X is replicated to RGB; alpha is one.
+    Luma,
+    /// Component X is replicated to RGB and component Y supplies alpha. Requires two components.
+    LumaAlpha,
+    /// Components X/Y supply red/green; blue is zero and alpha is one. Requires two components.
+    RedGreen,
+}
+
+/// Transfer interpretation of normalized numeric color components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericDisplayTransfer {
+    /// Normalized values already represent linear-light BT.709/sRGB-primary intensities.
+    Linear,
+    /// Normalized RGB values use the sRGB transfer and are decoded to linear light. Alpha is never
+    /// transfer-decoded.
+    Srgb,
+}
+
+/// Destination clamp applied after affine normalization and non-finite handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericDisplayClamp {
+    /// Clamp every normalized component to `[0, 1]` before writing `Rgba8Unorm`.
+    Unit,
+}
+
+/// Complete, explicit numeric-to-display contract.
+///
+/// For every finite stored scalar `x`, normalization first computes `x * scale + bias`. Floating
+/// non-finite results follow [`NumericNonFinitePolicy`]; integer affine overflow saturates by sign
+/// (`+Inf` to one and `-Inf` to zero). [`NumericDisplayClamp::Unit`] is then applied.
+/// [`NumericDisplayTransfer`] affects RGB only, after channel visualization; alpha stays linear.
+/// The output texture is linear-light BT.709 RGBA.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NumericDisplayContract {
+    pub source: NumericDisplaySource,
+    pub scale: f32,
+    pub bias: f32,
+    pub channels: NumericDisplayChannels,
+    pub transfer: NumericDisplayTransfer,
+    pub clamp: NumericDisplayClamp,
+}
+
+/// Arithmetic selected for one numeric display conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericDisplayPrecision {
+    /// Integer and F32 storage are converted and normalized with portable f32 arithmetic.
+    PortableF32,
+    /// F64 storage is rounded to f32 before the affine mapping because native shader f64 is not
+    /// enabled on this device, or because the supplied plane offset/row pitch is not naturally
+    /// eight-byte aligned.
+    F64RoundedToF32,
+    /// F64 storage and the affine mapping use native shader f64 before the display result is
+    /// rounded to f32.
+    NativeF64,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq)]
+pub enum NumericDisplayError {
+    #[error("numeric display scale must be finite, got {0}")]
+    NonFiniteScale(f32),
+    #[error("numeric display bias must be finite, got {0}")]
+    NonFiniteBias(f32),
+    #[error("numeric display requires a non-color numeric pixel format")]
+    NonNumericFormat,
+    #[error("numeric display source contract {declared:?} does not match stored kind {actual:?}")]
+    SourceKindMismatch {
+        declared: NumericDisplaySource,
+        actual: jxl_gpu_formats::SampleKind,
+    },
+    #[error("numeric channel mapping {mapping:?} requires two components, format has {components}")]
+    TwoComponentsRequired {
+        mapping: NumericDisplayChannels,
+        components: u8,
+    },
+}
 
 /// Texture properties used by a display conversion.
 ///
@@ -76,6 +177,8 @@ pub struct DisplayTexture {
     pub usage: wgpu::TextureUsages,
     /// The explicit interpretation of the normalized RGB texels.
     pub color_encoding: DisplayColorEncoding,
+    /// Arithmetic used for a numeric visualization, or `None` for color image/RGB conversion.
+    pub numeric_precision: Option<NumericDisplayPrecision>,
     texture: Arc<wgpu::Texture>,
     view: Arc<wgpu::TextureView>,
 }
@@ -123,11 +226,16 @@ enum DisplayPipelineKey {
         format: DisplayImageFormat,
         destination: wgpu::TextureFormat,
     },
+    Numeric {
+        native_f64: bool,
+        destination: wgpu::TextureFormat,
+    },
 }
 
 struct DisplayPipelineInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    native_f64_enabled: bool,
     pipelines: Mutex<HashMap<DisplayPipelineKey, Arc<wgpu::ComputePipeline>>>,
 }
 
@@ -149,19 +257,34 @@ impl fmt::Debug for DisplayPipeline {
 impl DisplayPipeline {
     /// Creates a display pipeline that submits convenience operations to `backend.queue()`.
     pub fn new(backend: &WgpuBackend) -> Self {
-        Self::from_device_queue(backend.device().clone(), backend.queue().clone())
+        Self::from_device_queue_with_f64(
+            backend.device().clone(),
+            backend.queue().clone(),
+            backend.native_f64_enabled(),
+        )
     }
 
     /// Creates a display pipeline for an application-owned device and its queue.
     ///
     /// Inputs passed to this pipeline must originate from `device`. To depend on an already
     /// exposed producer submission without an additional host wait, `queue` must be the same
-    /// queue used for that submission.
+    /// queue used for that submission. Native f64 display arithmetic is enabled exactly when the
+    /// supplied logical device exposes `wgpu::Features::SHADER_F64`.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let native_f64_enabled = device.features().contains(wgpu::Features::SHADER_F64);
+        Self::from_device_queue_with_f64(device, queue, native_f64_enabled)
+    }
+
+    fn from_device_queue_with_f64(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        native_f64_enabled: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(DisplayPipelineInner {
                 device,
                 queue,
+                native_f64_enabled,
                 pipelines: Mutex::new(HashMap::new()),
             }),
         }
@@ -173,6 +296,12 @@ impl DisplayPipeline {
 
     pub fn queue(&self) -> &wgpu::Queue {
         &self.inner.queue
+    }
+
+    /// Whether F64 numeric display input uses native shader f64 arithmetic.
+    #[must_use]
+    pub fn native_f64_enabled(&self) -> bool {
+        self.inner.native_f64_enabled
     }
 
     pub fn cache_stats(&self) -> DisplayPipelineCacheStats {
@@ -361,6 +490,124 @@ impl DisplayPipeline {
         })
     }
 
+    /// Encodes a non-color numeric pitch-linear image under an explicit affine/display contract.
+    ///
+    /// All ten numeric VPI 4.1 pitch-linear formats are accepted. No sample kind, scale, bias,
+    /// non-finite policy, clamp, transfer, or channel visualization is inferred. F64 uses native
+    /// shader f64 when the supplied device has `wgpu::Features::SHADER_F64` enabled and the F64
+    /// plane offset/row pitch are naturally eight-byte aligned; otherwise it follows the
+    /// documented [`NumericDisplayPrecision::F64RoundedToF32`] path.
+    pub fn encode_numeric_image(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &GpuImageOutput,
+        contract: NumericDisplayContract,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplayTexture> {
+        self.encode_numeric_image_source(
+            encoder,
+            &source.layout,
+            &source.buffer,
+            contract,
+            descriptor,
+            "jxl-wgpu numeric image display",
+        )
+    }
+
+    /// Encodes an unvalidated numeric decoder output under an explicit display contract.
+    pub fn encode_unvalidated_numeric_image(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &UnvalidatedGpuImageOutput,
+        contract: NumericDisplayContract,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplayTexture> {
+        self.encode_numeric_image_source(
+            encoder,
+            &source.layout,
+            &source.buffer,
+            contract,
+            descriptor,
+            "jxl-wgpu unvalidated numeric image display",
+        )
+    }
+
+    fn encode_numeric_image_source(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layout: &ImageLayout,
+        buffer: &crate::GpuBufferLease,
+        contract: NumericDisplayContract,
+        descriptor: DisplayTextureDescriptor,
+        label: &str,
+    ) -> Result<DisplayTexture> {
+        validate_display_descriptor(descriptor)?;
+        validate_extent(self.device(), layout.extent)?;
+        require_buffer_usage(
+            buffer.as_wgpu_buffer(),
+            wgpu::BufferUsages::STORAGE,
+            "numeric display source",
+        )?;
+        let validated = validate_numeric_image(layout, buffer.size(), contract)?;
+        validate_storage_binding(self.device(), validated.binding_size)?;
+
+        let native_f64 = validated.native_f64_compatible && self.native_f64_enabled();
+        let precision = if native_f64 {
+            NumericDisplayPrecision::NativeF64
+        } else if validated.is_f64 {
+            NumericDisplayPrecision::F64RoundedToF32
+        } else {
+            NumericDisplayPrecision::PortableF32
+        };
+        let mut texture = self.create_texture(layout.extent, descriptor, label);
+        texture.numeric_precision = Some(precision);
+        let pipeline = self.numeric_compute_pipeline(
+            DisplayPipelineKey::Numeric {
+                native_f64,
+                destination: descriptor.format,
+            },
+            label,
+            native_f64,
+        );
+        self.record_numeric_dispatch(
+            encoder,
+            &pipeline,
+            buffer.as_wgpu_buffer(),
+            validated.binding_size,
+            texture.view(),
+            &validated.params,
+            layout.extent,
+            native_f64,
+            "jxl-wgpu numeric display bindings",
+        );
+        Ok(texture)
+    }
+
+    /// Submits [`Self::encode_numeric_image`] without waiting for completion.
+    pub fn submit_numeric_image(
+        &self,
+        source: &GpuImageOutput,
+        contract: NumericDisplayContract,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplaySubmission> {
+        self.submit_encoded("jxl-wgpu numeric image display submission", |encoder| {
+            self.encode_numeric_image(encoder, source, contract, descriptor)
+        })
+    }
+
+    /// Submits [`Self::encode_unvalidated_numeric_image`] without waiting for codec validation.
+    pub fn submit_unvalidated_numeric_image(
+        &self,
+        source: &UnvalidatedGpuImageOutput,
+        contract: NumericDisplayContract,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplaySubmission> {
+        self.submit_encoded(
+            "jxl-wgpu unvalidated numeric image display submission",
+            |encoder| self.encode_unvalidated_numeric_image(encoder, source, contract, descriptor),
+        )
+    }
+
     /// Encodes a direct buffer-to-texture copy for tightly packed linear BT.709 RGBA8 input.
     ///
     /// This avoids a compute dispatch. Multi-row copies require `width * 4` to be a multiple of
@@ -468,6 +715,7 @@ impl DisplayPipeline {
             format: descriptor.format,
             usage,
             color_encoding: DisplayColorEncoding::LinearBt709,
+            numeric_precision: None,
             texture,
             view,
         }
@@ -496,6 +744,104 @@ impl DisplayPipeline {
         ));
         pipelines.insert(key, Arc::clone(&pipeline));
         pipeline
+    }
+
+    fn numeric_compute_pipeline(
+        &self,
+        key: DisplayPipelineKey,
+        label: &str,
+        native_f64: bool,
+    ) -> Arc<wgpu::ComputePipeline> {
+        let mut pipelines = self.pipelines();
+        if let Some(pipeline) = pipelines.get(&key) {
+            return Arc::clone(pipeline);
+        }
+        let source = numeric_shader_source(native_f64);
+        let module = self
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pipeline = Arc::new(self.device().create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ));
+        pipelines.insert(key, Arc::clone(&pipeline));
+        pipeline
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_numeric_dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        source: &wgpu::Buffer,
+        source_binding_size: u64,
+        destination: &wgpu::TextureView,
+        params: &DisplayNumericParams,
+        extent: Extent2d,
+        native_f64: bool,
+        label: &str,
+    ) {
+        let uniform = self
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::bytes_of(params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let layout = pipeline.get_bind_group_layout(0);
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: source,
+                    offset: 0,
+                    size: NonZeroU64::new(source_binding_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(destination),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform.as_entire_binding(),
+            },
+        ];
+        if native_f64 {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: source,
+                    offset: 0,
+                    size: NonZeroU64::new(source_binding_size),
+                }),
+            });
+        }
+        let bind_group = self.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &entries,
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            extent.width.div_ceil(WORKGROUP_SIZE),
+            extent.height.div_ceil(WORKGROUP_SIZE),
+            1,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -567,6 +913,132 @@ struct ValidatedRgb {
     layout: u8,
     logical_samples: u32,
     binding_size: u64,
+}
+
+struct ValidatedNumeric {
+    params: DisplayNumericParams,
+    binding_size: u64,
+    is_f64: bool,
+    native_f64_compatible: bool,
+}
+
+fn validate_numeric_image(
+    layout: &ImageLayout,
+    buffer_size: u64,
+    contract: NumericDisplayContract,
+) -> Result<ValidatedNumeric> {
+    if !contract.scale.is_finite() {
+        return Err(NumericDisplayError::NonFiniteScale(contract.scale).into());
+    }
+    if !contract.bias.is_finite() {
+        return Err(NumericDisplayError::NonFiniteBias(contract.bias).into());
+    }
+    if layout.extent.is_empty() {
+        return Err(Error::InvalidPayload(
+            "numeric display image extent must not be empty".into(),
+        ));
+    }
+    if layout.logical_size == 0 || layout.logical_size > buffer_size {
+        return Err(Error::InvalidPayload(format!(
+            "numeric image logical size {} exceeds buffer size {buffer_size}",
+            layout.logical_size
+        )));
+    }
+    let canonical =
+        ImageLayout::from_planes(layout.extent, layout.format.clone(), layout.planes.clone())?;
+    if canonical.logical_size != layout.logical_size {
+        return Err(Error::InvalidPayload(
+            "numeric image layout logical size is not canonical for its planes".into(),
+        ));
+    }
+    let numeric = match classify_pixel_format(&layout.format) {
+        Ok(PixelFormatClass::Numeric(numeric)) => numeric,
+        Ok(PixelFormatClass::Color(_)) => return Err(NumericDisplayError::NonNumericFormat.into()),
+        Err(error) => {
+            return Err(Error::Unsupported(format!(
+                "numeric display image format is unsupported: {error}"
+            )));
+        }
+    };
+    let source_matches = matches!(
+        (contract.source, numeric.sample_kind),
+        (NumericDisplaySource::Unsigned, SampleKind::Unsigned)
+            | (NumericDisplaySource::Signed, SampleKind::Signed)
+            | (NumericDisplaySource::Floating { .. }, SampleKind::Float)
+    );
+    if !source_matches {
+        return Err(NumericDisplayError::SourceKindMismatch {
+            declared: contract.source,
+            actual: numeric.sample_kind,
+        }
+        .into());
+    }
+    if numeric.components != 2
+        && matches!(
+            contract.channels,
+            NumericDisplayChannels::LumaAlpha | NumericDisplayChannels::RedGreen
+        )
+    {
+        return Err(NumericDisplayError::TwoComponentsRequired {
+            mapping: contract.channels,
+            components: numeric.components,
+        }
+        .into());
+    }
+    let plane = layout
+        .planes
+        .first()
+        .ok_or(NumericDisplayError::NonNumericFormat)?;
+    validate_image_plane_range(plane, layout.logical_size, buffer_size)?;
+    let binding_size = align_to_word(layout.logical_size)?;
+    if binding_size > buffer_size {
+        return Err(Error::InvalidPayload(format!(
+            "numeric image buffer size {buffer_size} does not include word padding through {binding_size}"
+        )));
+    }
+    let sample_kind = match numeric.sample_kind {
+        SampleKind::Unsigned => 0,
+        SampleKind::Signed => 1,
+        SampleKind::Float => 2,
+    };
+    let visualization = match contract.channels {
+        NumericDisplayChannels::Luma => 0,
+        NumericDisplayChannels::LumaAlpha => 1,
+        NumericDisplayChannels::RedGreen => 2,
+    };
+    let non_finite = match contract.source {
+        NumericDisplaySource::Floating {
+            non_finite: NumericNonFinitePolicy::Saturate,
+        }
+        | NumericDisplaySource::Unsigned
+        | NumericDisplaySource::Signed => 1,
+        NumericDisplaySource::Floating {
+            non_finite: NumericNonFinitePolicy::Zero,
+        } => 0,
+    };
+    let is_f64 = numeric.sample_kind == SampleKind::Float && numeric.bits_per_component == 64;
+    Ok(ValidatedNumeric {
+        params: DisplayNumericParams {
+            width: layout.extent.width,
+            height: layout.extent.height,
+            sample_kind,
+            bits: u32::from(numeric.bits_per_component),
+            components: u32::from(numeric.components),
+            plane_offset: shader_u32(plane.offset, "numeric plane offset")?,
+            plane_stride: shader_u32(plane.row_stride, "numeric plane row stride")?,
+            visualization,
+            non_finite,
+            transfer: u32::from(contract.transfer == NumericDisplayTransfer::Srgb),
+            clamp: 0,
+            _reserved: 0,
+            scale: contract.scale,
+            bias: contract.bias,
+            _padding: [0; 2],
+        },
+        binding_size,
+        is_f64,
+        native_f64_compatible: is_f64 && plane.offset % 8 == 0 && plane.row_stride % 8 == 0,
+    })
 }
 
 fn validate_rgb(source: &GpuOutputBuffer) -> Result<ValidatedRgb> {
@@ -1039,6 +1511,59 @@ fn extent_3d(extent: Extent2d) -> wgpu::Extent3d {
     }
 }
 
+const PORTABLE_F64_NORMALIZATION: &str = r#"
+fn f64_storage_to_f32(offset: u32) -> f32 {
+    let low = read_u32(offset);
+    let high = read_u32(offset + 4u);
+    let negative = (high & 0x80000000u) != 0u;
+    let exponent = (high >> 20u) & 0x7ffu;
+    let fraction_high = high & 0x000fffffu;
+    if exponent == 0x7ffu {
+        if fraction_high != 0u || low != 0u { return bitcast<f32>(0x7fc00000u); }
+        return bitcast<f32>(select(0x7f800000u, 0xff800000u, negative));
+    }
+    if exponent == 0u {
+        return bitcast<f32>(select(0u, 0x80000000u, negative));
+    }
+    let unbiased = i32(exponent) - 1023i;
+    if unbiased > 127i {
+        return bitcast<f32>(select(0x7f800000u, 0xff800000u, negative));
+    }
+    if unbiased < -149i {
+        return bitcast<f32>(select(0u, 0x80000000u, negative));
+    }
+    let fraction = f32(fraction_high) * 9.5367431640625e-7
+        + f32(low) * 2.220446049250313e-16;
+    let magnitude = ldexp(1.0 + fraction, unbiased);
+    return select(magnitude, -magnitude, negative);
+}
+
+fn normalized_f64(offset: u32) -> f32 {
+    return f64_storage_to_f32(offset) * params.scale + params.bias;
+}
+"#;
+
+const NATIVE_F64_NORMALIZATION: &str = r#"
+@group(0) @binding(3) var<storage, read> source_f64: array<f64>;
+
+fn normalized_f64(offset: u32) -> f32 {
+    let value = source_f64[offset >> 3u];
+    return f32(value * f64(params.scale) + f64(params.bias));
+}
+"#;
+
+fn numeric_shader_source(native_f64: bool) -> String {
+    let implementation = if native_f64 {
+        NATIVE_F64_NORMALIZATION
+    } else {
+        PORTABLE_F64_NORMALIZATION
+    };
+    let source =
+        include_str!("../shaders/display_numeric.wgsl").replace(NUMERIC_F64_MARKER, implementation);
+    debug_assert!(!source.contains(NUMERIC_F64_MARKER));
+    source
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DisplayRgbParams {
@@ -1048,6 +1573,26 @@ struct DisplayRgbParams {
     sample_type: u32,
     layout: u32,
     logical_samples: u32,
+    _padding: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DisplayNumericParams {
+    width: u32,
+    height: u32,
+    sample_kind: u32,
+    bits: u32,
+    components: u32,
+    plane_offset: u32,
+    plane_stride: u32,
+    visualization: u32,
+    non_finite: u32,
+    transfer: u32,
+    clamp: u32,
+    _reserved: u32,
+    scale: f32,
+    bias: f32,
     _padding: [u32; 2],
 }
 
@@ -1083,6 +1628,8 @@ struct DisplayImageParams {
 const _: () = {
     assert!(std::mem::size_of::<DisplayRgbParams>() == 32);
     assert!(std::mem::align_of::<DisplayRgbParams>() == 4);
+    assert!(std::mem::size_of::<DisplayNumericParams>() == 64);
+    assert!(std::mem::align_of::<DisplayNumericParams>() == 4);
     assert!(std::mem::size_of::<DisplayImageParams>() == 96);
     assert!(std::mem::align_of::<DisplayImageParams>() == 4);
 };
@@ -1146,12 +1693,161 @@ mod tests {
     }
 
     #[test]
+    fn explicit_numeric_contract_validates_all_ten_vpi_numeric_formats() {
+        let numeric = [
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::U8,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::S8,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::U16,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::U32,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::S32,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::S16,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::TwoS16,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::F32,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::F64,
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::TwoF32,
+        ];
+        for predefined in numeric {
+            let format = predefined.pixel_format();
+            let class = classify_pixel_format(&format).unwrap().numeric().unwrap();
+            let contract = NumericDisplayContract {
+                source: match class.sample_kind {
+                    SampleKind::Unsigned => NumericDisplaySource::Unsigned,
+                    SampleKind::Signed => NumericDisplaySource::Signed,
+                    SampleKind::Float => NumericDisplaySource::Floating {
+                        non_finite: NumericNonFinitePolicy::Saturate,
+                    },
+                },
+                scale: 1.0,
+                bias: 0.0,
+                channels: NumericDisplayChannels::Luma,
+                transfer: NumericDisplayTransfer::Linear,
+                clamp: NumericDisplayClamp::Unit,
+            };
+            let layout = ImageLayout::packed(Extent2d::new(3, 3), format).unwrap();
+            let validated = validate_numeric_image(
+                &layout,
+                align_to_word(layout.logical_size).unwrap(),
+                contract,
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", predefined.name()));
+            assert_eq!(validated.params.bits, u32::from(class.bits_per_component));
+            assert_eq!(validated.params.components, u32::from(class.components));
+            assert_eq!(
+                validated.is_f64,
+                predefined == jxl_gpu_formats::vpi::VpiPitchLinearFormat::F64
+            );
+            assert_eq!(validated.native_f64_compatible, validated.is_f64);
+        }
+    }
+
+    #[test]
+    fn numeric_contract_mismatches_and_non_finite_affine_terms_are_typed() {
+        let format = jxl_gpu_formats::vpi::VpiPitchLinearFormat::S16.pixel_format();
+        let layout = ImageLayout::packed(Extent2d::new(2, 2), format).unwrap();
+        let base = NumericDisplayContract {
+            source: NumericDisplaySource::Signed,
+            scale: 1.0,
+            bias: 0.0,
+            channels: NumericDisplayChannels::Luma,
+            transfer: NumericDisplayTransfer::Linear,
+            clamp: NumericDisplayClamp::Unit,
+        };
+        let buffer_size = align_to_word(layout.logical_size).unwrap();
+        assert_eq!(
+            validate_numeric_image(&layout, buffer_size, base)
+                .unwrap()
+                .params
+                .non_finite,
+            1,
+            "integer affine overflow follows unit-clamp saturation"
+        );
+        assert!(matches!(
+            validate_numeric_image(
+                &layout,
+                buffer_size,
+                NumericDisplayContract {
+                    source: NumericDisplaySource::Unsigned,
+                    ..base
+                }
+            ),
+            Err(Error::NumericDisplay(
+                NumericDisplayError::SourceKindMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            validate_numeric_image(
+                &layout,
+                buffer_size,
+                NumericDisplayContract {
+                    scale: f32::INFINITY,
+                    ..base
+                }
+            ),
+            Err(Error::NumericDisplay(
+                NumericDisplayError::NonFiniteScale(value)
+            )) if value == f32::INFINITY
+        ));
+    }
+
+    #[test]
+    fn unaligned_f64_plane_uses_the_reported_portable_path() {
+        let extent = Extent2d::new(2, 2);
+        let format = jxl_gpu_formats::vpi::VpiPitchLinearFormat::F64.pixel_format();
+        let layout = ImageLayout::from_planes(
+            extent,
+            format,
+            vec![jxl_gpu_formats::PitchLinearPlaneLayout {
+                plane_index: 0,
+                offset: 4,
+                row_stride: 20,
+                sample_extent: extent,
+                row_bytes: 16,
+            }],
+        )
+        .unwrap();
+        let validated = validate_numeric_image(
+            &layout,
+            layout.logical_size,
+            NumericDisplayContract {
+                source: NumericDisplaySource::Floating {
+                    non_finite: NumericNonFinitePolicy::Saturate,
+                },
+                scale: 1.0,
+                bias: 0.0,
+                channels: NumericDisplayChannels::Luma,
+                transfer: NumericDisplayTransfer::Linear,
+                clamp: NumericDisplayClamp::Unit,
+            },
+        )
+        .unwrap();
+        assert!(validated.is_f64);
+        assert!(!validated.native_f64_compatible);
+    }
+
+    #[test]
+    fn numeric_shader_variants_validate_with_exact_naga_capabilities() {
+        for (native_f64, capabilities) in [
+            (false, naga::valid::Capabilities::empty()),
+            (true, naga::valid::Capabilities::FLOAT64),
+        ] {
+            let module = naga::front::wgsl::parse_str(&numeric_shader_source(native_f64))
+                .unwrap_or_else(|error| panic!("numeric WGSL parse failed: {error}"));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("numeric WGSL validation failed: {error}"));
+        }
+    }
+
+    #[test]
     fn display_uniform_abi_sizes_are_explicit_and_aligned() {
         assert_eq!(size_of::<DisplayRgbParams>(), 32);
+        assert_eq!(size_of::<DisplayNumericParams>(), 64);
         assert_eq!(size_of::<DisplayImageParams>(), 96);
         assert_eq!(std::mem::align_of::<DisplayRgbParams>(), 4);
+        assert_eq!(std::mem::align_of::<DisplayNumericParams>(), 4);
         assert_eq!(std::mem::align_of::<DisplayImageParams>(), 4);
         assert_eq!(size_of::<DisplayRgbParams>() % 16, 0);
+        assert_eq!(size_of::<DisplayNumericParams>() % 16, 0);
         assert_eq!(size_of::<DisplayImageParams>() % 16, 0);
     }
 
@@ -1177,6 +1873,47 @@ mod tests {
                 "sample_type",
                 "storage_layout",
                 "logical_samples",
+                "_padding0",
+                "_padding1",
+            ],
+        );
+
+        let numeric = DisplayNumericParams {
+            width: 1,
+            height: 2,
+            sample_kind: 3,
+            bits: 4,
+            components: 5,
+            plane_offset: 6,
+            plane_stride: 7,
+            visualization: 8,
+            non_finite: 9,
+            transfer: 10,
+            clamp: 11,
+            _reserved: 12,
+            scale: f32::from_bits(13),
+            bias: f32::from_bits(14),
+            _padding: [15, 16],
+        };
+        assert_eq!(abi_words(&numeric), (1..=16).collect::<Vec<_>>());
+        assert_wgsl_fields(
+            include_str!("../shaders/display_numeric.wgsl"),
+            "NumericParams",
+            &[
+                "width",
+                "height",
+                "sample_kind",
+                "bits",
+                "components",
+                "plane_offset",
+                "plane_stride",
+                "visualization",
+                "non_finite",
+                "transfer",
+                "clamp",
+                "_reserved",
+                "scale",
+                "bias",
                 "_padding0",
                 "_padding1",
             ],

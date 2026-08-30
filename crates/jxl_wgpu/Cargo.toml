@@ -19,6 +19,7 @@ wgpu = "30.0.1"
 [dev-dependencies]
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_transforms.workspace = true
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = "1.0.1"
 
 [lints]

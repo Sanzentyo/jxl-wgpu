@@ -21,18 +21,25 @@ packed data. `ImageLayout::packed` makes rows tight and aligns plane starts to
 four bytes for convenient `wgpu` storage-buffer access. Callers can use
 `ImageLayout::from_planes` for larger pitches or gaps.
 
-This intentionally excludes VPI block-linear `_BL` and `_BL16` formats and
-opaque CUDA array, EGLImage, NvBuffer, and NvSciBuf storage. Those need
-vendor-specific allocation/import synchronization and must not be presented as
-ordinary portable `wgpu` buffers. VPI permits up to six planes and can describe
-separate plane base pointers; this crate's one-allocation/non-overlap rule is a
-smaller, safer portable contract.
+`vpi::VpiPredefinedFormat::ALL` inventories the non-invalid predefined names so
+an importer can distinguish storage from semantics. Calling
+`portable_pixel_format` on any block-linear `_BL` or `_BL16` entry returns the
+typed `VpiPortabilityError::NonPortableLayout`; it never fabricates a row pitch
+for NVIDIA's proprietary tiling. Opaque CUDA array, CUDA pointer, EGLImage,
+NvBuffer, and NvSciBuf handles likewise require vendor-specific import and
+synchronization outside this crate. VPI permits up to six planes and can
+describe separate plane base pointers; this crate's one-allocation/non-overlap
+rule is a smaller, safer portable contract.
 
 ## NVIDIA VPI inventory
 
 Audited against NVIDIA VPI **4.1.3** (the current 4.1 update documented on
-2026-06-03). `vpi::VpiPitchLinearFormat::ALL` contains the complete set of 30
-predefined pitch-linear formats from `ImageFormat.h`:
+2026-06-03). The official header has 60 non-invalid predefined names:
+
+- 30 directly addressable pitch-linear formats in
+  `vpi::VpiPitchLinearFormat::ALL`;
+- 15 `_BL` plus the corresponding 15 `_BL16` names, represented for typed
+  rejection only.
 
 | Logical family | VPI 4.1 pitch-linear predefined formats | Representation | Scalar oracle |
 |---|---|---|---|
@@ -44,9 +51,15 @@ predefined pitch-linear formats from `ImageFormat.h`:
 | Interleaved RGB | `RGB8`, `BGR8`, `RGBA8`, `BGRA8` | one plane, swizzle retains channel meaning | Yes |
 | Planar RGB | `RGB8p`, `BGR8p`, `RGBA8p`, `BGRA8p` | three or four planes | Yes |
 
-The related `_BL` and `_BL16` variants are explicitly **out of scope**. A VPI
+The 15 block-linear logical stems are `U8`, `S16`, `2S16`, `Y8`, `Y8_ER`,
+`Y16`, `Y16_ER`, `NV12`, `NV12_ER`, `NV24`, `NV24_ER`, `UYVY`, `UYVY_ER`,
+`YUYV`, and `YUYV_ER`; each has `_BL` and `_BL16`. They are explicitly
+**unsupported by portable wgpu**, not counted as implemented formats. A VPI
 predefined image format also does not imply that every VPI algorithm accepts
 it; NVIDIA documents algorithm support separately.
+
+The end-to-end codec, readback, display, normalization, and exclusion matrix is
+maintained in [`docs/VPI_FORMAT_COVERAGE.md`](../../docs/VPI_FORMAT_COVERAGE.md).
 
 ### VPI 4.1 named color specifications
 
@@ -112,4 +125,3 @@ matrices remain distinct.
 - [`ColorSpec.h` source](https://docs.nvidia.com/vpi/ColorSpec_8h_source.html)
 - [Data layout and packing](https://docs.nvidia.com/vpi/group__VPI__DataLayout.html)
 - [Image buffers and pitch-linear plane constraints](https://docs.nvidia.com/vpi/group__VPI__Image.html)
-

@@ -138,9 +138,13 @@ These contracts describe portable pitch-linear buffers. Vendor block-linear memo
 multi-plane texture handles are outside WebGPU's portable buffer model.
 
 Non-color numeric formats deliberately require an application-defined numeric-to-color mapping.
-The generic display pipeline therefore rejects them instead of guessing a range, channel, or
-transfer function; their checked layout and `GpuBufferLease::as_wgpu_buffer()` form the same-queue
-custom visualization boundary.
+`DisplayPipeline::encode_numeric_image`/`submit_numeric_image` accepts all ten numeric VPI
+pitch-linear formats only with a complete `NumericDisplayContract`: stored signed/unsigned/float
+kind, affine `x * scale + bias`, NaN/infinity policy, unit clamp, one/two-channel visualization,
+and Linear or sRGB transfer are explicit. F64 reports whether it used native shader f64 or the
+portable round-to-f32 path in `DisplayTexture::numeric_precision`; native f64 is selected whenever
+the logical device has `SHADER_F64` enabled and the supplied F64 plane offset/row pitch are
+naturally eight-byte aligned.
 
 ## Same-queue display
 
@@ -164,13 +168,16 @@ flight. The pipeline cache is keyed by the complete source-format and color-conv
 The compute path accepts arbitrary valid pitch-linear row strides. The direct RGBA8 copy path
 enforces WebGPU's 256-byte multi-row pitch requirement.
 
-Callers that already own a command encoder can use `encode_rgb`, `encode_image`, or
-`encode_rgba8_copy`, then submit all work as one application-defined batch.
+Callers that already own a command encoder can use `encode_rgb`, `encode_image`,
+`encode_numeric_image`, or `encode_rgba8_copy`, then submit all work as one application-defined
+batch.
 
 `encode_unvalidated_image` and `submit_unvalidated_image` accept only the visibly distinct
 `UnvalidatedGpuImageOutput` type. They preserve same-queue ordering without a host wait. If the
 codec subsequently rejects its mapped status, already-submitted display work is irreversible and
-the application must discard the texture.
+the application must discard the texture. Numeric outputs use the equally explicit
+`encode_unvalidated_numeric_image`/`submit_unvalidated_numeric_image` methods and still require a
+`NumericDisplayContract`.
 
 ## Aggregate CPU readback
 

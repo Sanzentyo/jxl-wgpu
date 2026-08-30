@@ -10,6 +10,7 @@ use crate::{
     ColorSpecification, Packed422Order, PixelFormat, RgbChannelOrder, SampleKind, TransferFunction,
     YcbcrEncoding,
 };
+use thiserror::Error;
 
 pub const VERSION: &str = "4.1.3";
 pub const RELEASE_NOTES_URL: &str = "https://docs.nvidia.com/vpi/release_notes.html";
@@ -19,6 +20,236 @@ pub const COLOR_SPEC_URL: &str = "https://docs.nvidia.com/vpi/group__VPI__ColorS
 pub const COLOR_SPEC_SOURCE_URL: &str = "https://docs.nvidia.com/vpi/ColorSpec_8h_source.html";
 pub const DATA_LAYOUT_URL: &str = "https://docs.nvidia.com/vpi/group__VPI__DataLayout.html";
 pub const IMAGE_BUFFER_URL: &str = "https://docs.nvidia.com/vpi/group__VPI__Image.html";
+
+/// Memory layouts used by the VPI 4.1 predefined image-format macros.
+///
+/// Only [`Self::PitchLinear`] has a portable byte-addressing contract. NVIDIA documents the two
+/// block-linear layouts as proprietary and not directly user-addressable, so they cannot be
+/// represented by [`crate::ImageLayout`] or an ordinary `wgpu::Buffer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VpiMemoryLayout {
+    PitchLinear,
+    BlockLinear,
+    Block16Linear,
+}
+
+/// Logical formats for which VPI 4.1 also publishes `_BL` and `_BL16` predefined forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VpiBlockLinearFormat {
+    U8,
+    S16,
+    TwoS16,
+    Y8,
+    Y8Er,
+    Y16,
+    Y16Er,
+    Nv12,
+    Nv12Er,
+    Nv24,
+    Nv24Er,
+    Uyvy,
+    UyvyEr,
+    Yuyv,
+    YuyvEr,
+}
+
+impl VpiBlockLinearFormat {
+    pub const ALL: [Self; 15] = [
+        Self::U8,
+        Self::S16,
+        Self::TwoS16,
+        Self::Y8,
+        Self::Y8Er,
+        Self::Y16,
+        Self::Y16Er,
+        Self::Nv12,
+        Self::Nv12Er,
+        Self::Nv24,
+        Self::Nv24Er,
+        Self::Uyvy,
+        Self::UyvyEr,
+        Self::Yuyv,
+        Self::YuyvEr,
+    ];
+
+    #[must_use]
+    pub const fn pitch_linear_semantics(self) -> VpiPitchLinearFormat {
+        match self {
+            Self::U8 => VpiPitchLinearFormat::U8,
+            Self::S16 => VpiPitchLinearFormat::S16,
+            Self::TwoS16 => VpiPitchLinearFormat::TwoS16,
+            Self::Y8 => VpiPitchLinearFormat::Y8,
+            Self::Y8Er => VpiPitchLinearFormat::Y8Er,
+            Self::Y16 => VpiPitchLinearFormat::Y16,
+            Self::Y16Er => VpiPitchLinearFormat::Y16Er,
+            Self::Nv12 => VpiPitchLinearFormat::Nv12,
+            Self::Nv12Er => VpiPitchLinearFormat::Nv12Er,
+            Self::Nv24 => VpiPitchLinearFormat::Nv24,
+            Self::Nv24Er => VpiPitchLinearFormat::Nv24Er,
+            Self::Uyvy => VpiPitchLinearFormat::Uyvy,
+            Self::UyvyEr => VpiPitchLinearFormat::UyvyEr,
+            Self::Yuyv => VpiPitchLinearFormat::Yuyv,
+            Self::YuyvEr => VpiPitchLinearFormat::YuyvEr,
+        }
+    }
+
+    const fn name(self, layout: VpiMemoryLayout) -> &'static str {
+        match (self, layout) {
+            (Self::U8, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_U8_BL",
+            (Self::U8, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_U8_BL16",
+            (Self::S16, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_S16_BL",
+            (Self::S16, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_S16_BL16",
+            (Self::TwoS16, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_2S16_BL",
+            (Self::TwoS16, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_2S16_BL16",
+            (Self::Y8, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_Y8_BL",
+            (Self::Y8, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_Y8_BL16",
+            (Self::Y8Er, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_Y8_ER_BL",
+            (Self::Y8Er, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_Y8_ER_BL16",
+            (Self::Y16, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_Y16_BL",
+            (Self::Y16, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_Y16_BL16",
+            (Self::Y16Er, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_Y16_ER_BL",
+            (Self::Y16Er, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_Y16_ER_BL16",
+            (Self::Nv12, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_NV12_BL",
+            (Self::Nv12, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_NV12_BL16",
+            (Self::Nv12Er, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_NV12_ER_BL",
+            (Self::Nv12Er, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_NV12_ER_BL16",
+            (Self::Nv24, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_NV24_BL",
+            (Self::Nv24, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_NV24_BL16",
+            (Self::Nv24Er, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_NV24_ER_BL",
+            (Self::Nv24Er, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_NV24_ER_BL16",
+            (Self::Uyvy, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_UYVY_BL",
+            (Self::Uyvy, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_UYVY_BL16",
+            (Self::UyvyEr, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_UYVY_ER_BL",
+            (Self::UyvyEr, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_UYVY_ER_BL16",
+            (Self::Yuyv, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_YUYV_BL",
+            (Self::Yuyv, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_YUYV_BL16",
+            (Self::YuyvEr, VpiMemoryLayout::BlockLinear) => "VPI_IMAGE_FORMAT_YUYV_ER_BL",
+            (Self::YuyvEr, VpiMemoryLayout::Block16Linear) => "VPI_IMAGE_FORMAT_YUYV_ER_BL16",
+            (_, VpiMemoryLayout::PitchLinear) => self.pitch_linear_semantics().name(),
+        }
+    }
+}
+
+/// Complete non-invalid predefined image-format inventory in VPI 4.1.3.
+///
+/// The 30 pitch-linear variants are portable. The remaining 30 entries are retained only so an
+/// importer can reject the exact NVIDIA name with [`VpiPortabilityError::NonPortableLayout`]
+/// instead of accidentally treating proprietary block-linear bytes as row-major pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VpiPredefinedFormat {
+    PitchLinear(VpiPitchLinearFormat),
+    BlockLinear(VpiBlockLinearFormat),
+    Block16Linear(VpiBlockLinearFormat),
+}
+
+impl VpiPredefinedFormat {
+    pub const ALL: [Self; 60] = [
+        Self::PitchLinear(VpiPitchLinearFormat::U8),
+        Self::PitchLinear(VpiPitchLinearFormat::S8),
+        Self::PitchLinear(VpiPitchLinearFormat::U16),
+        Self::PitchLinear(VpiPitchLinearFormat::U32),
+        Self::PitchLinear(VpiPitchLinearFormat::S32),
+        Self::PitchLinear(VpiPitchLinearFormat::S16),
+        Self::PitchLinear(VpiPitchLinearFormat::TwoS16),
+        Self::PitchLinear(VpiPitchLinearFormat::F32),
+        Self::PitchLinear(VpiPitchLinearFormat::F64),
+        Self::PitchLinear(VpiPitchLinearFormat::TwoF32),
+        Self::PitchLinear(VpiPitchLinearFormat::Y8),
+        Self::PitchLinear(VpiPitchLinearFormat::Y8Er),
+        Self::PitchLinear(VpiPitchLinearFormat::Y16),
+        Self::PitchLinear(VpiPitchLinearFormat::Y16Er),
+        Self::PitchLinear(VpiPitchLinearFormat::Nv12),
+        Self::PitchLinear(VpiPitchLinearFormat::Nv12Er),
+        Self::PitchLinear(VpiPitchLinearFormat::Nv24),
+        Self::PitchLinear(VpiPitchLinearFormat::Nv24Er),
+        Self::PitchLinear(VpiPitchLinearFormat::Uyvy),
+        Self::PitchLinear(VpiPitchLinearFormat::UyvyEr),
+        Self::PitchLinear(VpiPitchLinearFormat::Yuyv),
+        Self::PitchLinear(VpiPitchLinearFormat::YuyvEr),
+        Self::PitchLinear(VpiPitchLinearFormat::Rgb8),
+        Self::PitchLinear(VpiPitchLinearFormat::Bgr8),
+        Self::PitchLinear(VpiPitchLinearFormat::Rgba8),
+        Self::PitchLinear(VpiPitchLinearFormat::Bgra8),
+        Self::PitchLinear(VpiPitchLinearFormat::Rgb8Planar),
+        Self::PitchLinear(VpiPitchLinearFormat::Bgr8Planar),
+        Self::PitchLinear(VpiPitchLinearFormat::Rgba8Planar),
+        Self::PitchLinear(VpiPitchLinearFormat::Bgra8Planar),
+        Self::BlockLinear(VpiBlockLinearFormat::U8),
+        Self::BlockLinear(VpiBlockLinearFormat::S16),
+        Self::BlockLinear(VpiBlockLinearFormat::TwoS16),
+        Self::BlockLinear(VpiBlockLinearFormat::Y8),
+        Self::BlockLinear(VpiBlockLinearFormat::Y8Er),
+        Self::BlockLinear(VpiBlockLinearFormat::Y16),
+        Self::BlockLinear(VpiBlockLinearFormat::Y16Er),
+        Self::BlockLinear(VpiBlockLinearFormat::Nv12),
+        Self::BlockLinear(VpiBlockLinearFormat::Nv12Er),
+        Self::BlockLinear(VpiBlockLinearFormat::Nv24),
+        Self::BlockLinear(VpiBlockLinearFormat::Nv24Er),
+        Self::BlockLinear(VpiBlockLinearFormat::Uyvy),
+        Self::BlockLinear(VpiBlockLinearFormat::UyvyEr),
+        Self::BlockLinear(VpiBlockLinearFormat::Yuyv),
+        Self::BlockLinear(VpiBlockLinearFormat::YuyvEr),
+        Self::Block16Linear(VpiBlockLinearFormat::U8),
+        Self::Block16Linear(VpiBlockLinearFormat::S16),
+        Self::Block16Linear(VpiBlockLinearFormat::TwoS16),
+        Self::Block16Linear(VpiBlockLinearFormat::Y8),
+        Self::Block16Linear(VpiBlockLinearFormat::Y8Er),
+        Self::Block16Linear(VpiBlockLinearFormat::Y16),
+        Self::Block16Linear(VpiBlockLinearFormat::Y16Er),
+        Self::Block16Linear(VpiBlockLinearFormat::Nv12),
+        Self::Block16Linear(VpiBlockLinearFormat::Nv12Er),
+        Self::Block16Linear(VpiBlockLinearFormat::Nv24),
+        Self::Block16Linear(VpiBlockLinearFormat::Nv24Er),
+        Self::Block16Linear(VpiBlockLinearFormat::Uyvy),
+        Self::Block16Linear(VpiBlockLinearFormat::UyvyEr),
+        Self::Block16Linear(VpiBlockLinearFormat::Yuyv),
+        Self::Block16Linear(VpiBlockLinearFormat::YuyvEr),
+    ];
+
+    #[must_use]
+    pub const fn memory_layout(self) -> VpiMemoryLayout {
+        match self {
+            Self::PitchLinear(_) => VpiMemoryLayout::PitchLinear,
+            Self::BlockLinear(_) => VpiMemoryLayout::BlockLinear,
+            Self::Block16Linear(_) => VpiMemoryLayout::Block16Linear,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PitchLinear(format) => format.name(),
+            Self::BlockLinear(format) => format.name(VpiMemoryLayout::BlockLinear),
+            Self::Block16Linear(format) => format.name(VpiMemoryLayout::Block16Linear),
+        }
+    }
+
+    /// Returns the directly addressable descriptor, or a typed rejection for NVIDIA's proprietary
+    /// block-linear byte layouts.
+    pub fn portable_pixel_format(self) -> Result<PixelFormat, VpiPortabilityError> {
+        match self {
+            Self::PitchLinear(format) => Ok(format.pixel_format()),
+            Self::BlockLinear(_) | Self::Block16Linear(_) => {
+                Err(VpiPortabilityError::NonPortableLayout {
+                    format: self,
+                    layout: self.memory_layout(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum VpiPortabilityError {
+    #[error(
+        "{format:?} ({name}) uses proprietary VPI memory layout {layout:?}, which cannot be addressed as a portable wgpu pitch-linear buffer",
+        name = .format.name()
+    )]
+    NonPortableLayout {
+        format: VpiPredefinedFormat,
+        layout: VpiMemoryLayout,
+    },
+}
 
 /// Named color specifications in VPI 4.1, excluding the invalid sentinel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -322,6 +553,61 @@ impl VpiPitchLinearFormat {
 mod tests {
     use super::*;
     use crate::{ChromaSubsampling, ColorModel, Swizzle};
+
+    #[test]
+    fn complete_predefined_inventory_has_thirty_portable_and_thirty_typed_rejections() {
+        assert_eq!(VpiPredefinedFormat::ALL.len(), 60);
+        assert_eq!(VpiBlockLinearFormat::ALL.len(), 15);
+
+        let mut portable = 0;
+        let mut block = 0;
+        let mut block16 = 0;
+        for predefined in VpiPredefinedFormat::ALL {
+            match predefined.memory_layout() {
+                VpiMemoryLayout::PitchLinear => {
+                    portable += 1;
+                    predefined
+                        .portable_pixel_format()
+                        .unwrap()
+                        .validate()
+                        .unwrap();
+                    assert!(!predefined.name().ends_with("_BL"));
+                    assert!(!predefined.name().ends_with("_BL16"));
+                }
+                layout @ (VpiMemoryLayout::BlockLinear | VpiMemoryLayout::Block16Linear) => {
+                    if layout == VpiMemoryLayout::BlockLinear {
+                        block += 1;
+                        assert!(predefined.name().ends_with("_BL"));
+                    } else {
+                        block16 += 1;
+                        assert!(predefined.name().ends_with("_BL16"));
+                    }
+                    assert_eq!(
+                        predefined.portable_pixel_format(),
+                        Err(VpiPortabilityError::NonPortableLayout {
+                            format: predefined,
+                            layout,
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!((portable, block, block16), (30, 15, 15));
+    }
+
+    #[test]
+    fn block_linear_inventory_matches_the_official_fifteen_logical_stems() {
+        for logical in VpiBlockLinearFormat::ALL {
+            let pitch = VpiPredefinedFormat::PitchLinear(logical.pitch_linear_semantics());
+            let block = VpiPredefinedFormat::BlockLinear(logical);
+            let block16 = VpiPredefinedFormat::Block16Linear(logical);
+            assert_eq!(pitch.memory_layout(), VpiMemoryLayout::PitchLinear);
+            assert_eq!(block.memory_layout(), VpiMemoryLayout::BlockLinear);
+            assert_eq!(block16.memory_layout(), VpiMemoryLayout::Block16Linear);
+            assert!(block.name().starts_with(pitch.name()));
+            assert!(block16.name().starts_with(pitch.name()));
+        }
+    }
 
     #[test]
     fn every_pitch_linear_predefined_format_is_valid() {

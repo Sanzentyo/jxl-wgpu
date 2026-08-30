@@ -738,6 +738,7 @@ dependencies = [
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
  "jxl_transforms",
+ "naga",
  "pollster",
  "serde",
  "serde_json",
