@@ -36,6 +36,12 @@ aligned and every actual internal group edge ends on a distinct storage word, th
 ordinary word RMW/store. Layouts with an odd stride, offset, or group edge use the atomic byte-safe
 pipeline. The proof is performed on the host from the validated output layout and typed group
 rectangles; there is no caller hint that can force the non-atomic path.
+The validated MA-tree IR receives a second independent specialization proof. If every decision is
+channel-only and channels 0 through 3 all terminate at Gradient leaves with zero offset and unit
+multiplier, the shader lowers the four cluster ids into the parameter record and runs a nested-row
+Gradient loop without per-sample MA traversal, coordinate division, unused-neighbor loads, or
+predictor dispatch. Any unsupported property, malformed/cyclic route, non-Gradient leaf, or
+self-correcting requirement selects the complete generic MA-tree kernel instead.
 `DecodeProfile::ModularLossless` reports this as `ModularPredictionProfile::MetaAdaptive` with
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
@@ -50,16 +56,19 @@ On an Apple M5, the 36,643,474-byte 7680x4320 Gray8 conformance codestream decod
 readback (`warmup=1`, `iterations=7`) selected 64 invocations per workgroup. Before the aligned
 output and private distance-one history paths, 32/64/128/256 produced median latencies of
 280.151/280.387/292.455/303.263 ms respectively, while 64 had the best mean and p95
-(280.878/282.067 ms). With both paths enabled the selected 64-invocation pipeline measured
-209.949 ms median, 210.387 ms mean, 208.269 ms minimum, and 212.178 ms p95: 25.12% below that
-280.387 ms checkpoint and 6.94x faster than the earlier 64-lane, 8-MiB-window,
+(280.878/282.067 ms). Aligned output plus private distance-one history first reduced that to
+209.949 ms median. The subsequent host-proven channel-fixed Gradient kernel measured 132.569 ms
+median, 132.630 ms mean, 129.145 ms minimum, and 134.377 ms p95: 36.86% below the 209.949 ms
+checkpoint and 11.0x faster than the earlier 64-lane, 8-MiB-window,
 one-invocation-workgroup checkpoint (1.457 s). These are one-device engineering measurements, not
 cross-adapter performance guarantees; `memory_stats` exposes the resolved window, lanes,
-workgroups, write path, LZ storage, and submissions for each device and request.
+workgroups, output and reconstruction paths, LZ storage, and submissions for each device and
+request.
 
 The same selected pipeline decoded the exact 15360x8640 Gray8 hash from a 146,573,715-byte
-codestream in six bounded submissions: warm median 1.112 s (`warmup=1`, `iterations=3`), down
-26.00% from the preceding 1.502 s checkpoint and 5.27x from 5.861 s/32 submissions. The
+codestream in six bounded submissions: warm median 657.463 ms, mean 654.566 ms, and minimum
+648.663 ms (`warmup=1`, `iterations=3`), down 40.85% from the preceding 1.112 s checkpoint and
+8.91x from 5.861 s/32 submissions. The
 132,710,400-byte output remains persistent while the stream window and descriptor-sized parallel
 scratch are reused across waves.
 
@@ -141,12 +150,12 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 180-byte `repr(C)` POD. It carries the token
+The CPU/WGSL per-group parameter ABI is a checked 208-byte `repr(C)` POD. It carries the token
 range, local extent, canvas origin, source channel/depth/mask, chroma-initialization ownership,
 four plane offset/stride pairs, exact output channel/order/depth/range/transfer codes, the resolved
 numeric mapping, descriptor-derived LZ ring mask, global status index, MA stream index,
-weighted-predictor header, and
-shader-visible logical size. Records are a tightly packed read-only storage array; a separate
+the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, weighted-predictor
+header, and shader-visible logical size. Records are a tightly packed read-only storage array; a separate
 16-byte uniform selects the global group range and local scratch-lane stride for each wave.
 Codestream segments are rounded to four bytes and include a zero sentinel word for bounded
 cross-word peeks. Token offsets are rebased to their window rather than requiring a
@@ -165,8 +174,8 @@ no reconstruction storage; wider histories retain the descriptor-sized storage r
 not affordable but one complete frame is, the prepared backend narrows it and propagates the
 resolved bound into the actual session limiter and prefetch validation. `WgpuDecodeSession::memory_stats`
 reports complete per-frame, output-lease, transient, peak-window, resolved-slot, logical/physical
-LZ sizes, selected output write path, lane/workgroup counts, stream batches, and actual submission
-counts. Concurrent jobs opened through an engine or its
+LZ sizes, selected output-write and reconstruction-specialization paths, lane/workgroup counts,
+stream batches, and actual submission counts. Concurrent jobs opened through an engine or its
 clones use the `WgpuBackend`'s shared
 transient memory budget by default, so decode, encode, and generic readback apply one aggregate
 admission bound. `WgpuSubmissionEngine::with_memory_budget` instead accepts an explicit cloneable
@@ -186,7 +195,7 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for e
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while metadata and packed 180-byte
+aligned spans directly from the shared input storage, while metadata and packed 208-byte
 `ShaderParams` records use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.

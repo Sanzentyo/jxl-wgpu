@@ -21,7 +21,8 @@ use jxl_wgpu::{
 };
 use jxl_wgpu_decode::{
     F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels,
-    NumericSampleMapping, OutputWritePath, PrefetchBackpressure, WgpuSubmissionEngine,
+    ModularPredictor, ModularReconstructionSpecialization, NumericSampleMapping, OutputWritePath,
+    PrefetchBackpressure, WgpuSubmissionEngine,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
@@ -714,6 +715,16 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert!(stats.parallel_group_lanes <= 64);
             assert_eq!(stats.max_lz77_window_words, 1);
             assert_eq!(stats.max_lz77_scratch_words, 0);
+            assert_eq!(
+                stats.reconstruction_specialization,
+                ModularReconstructionSpecialization::ChannelFixed {
+                    predictor: ModularPredictor::Gradient,
+                    offset: 0,
+                    multiplier: 1,
+                    channel_count: 1,
+                    clusters: [1, 2, 3, 4],
+                }
+            );
             assert_eq!(stats.group_workgroup_size, 64);
             assert_eq!(stats.max_dispatch_workgroups, 1);
             assert_eq!(
@@ -812,6 +823,17 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         let stats = session.submission_session().memory_stats();
         assert_eq!(stats.max_lz77_window_words, 1);
         assert_eq!(stats.max_lz77_scratch_words, 0);
+        assert_eq!(
+            stats.reconstruction_specialization,
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                offset: 0,
+                multiplier: 1,
+                channel_count: u8::try_from(format.channel_count()).unwrap(),
+                clusters: [1, 2, 3, 4],
+            },
+            "{format:?} {bits_per_sample}-bit channel specialization"
+        );
         assert_eq!(
             stats.output_write_path,
             if row_bytes.is_multiple_of(4) {

@@ -27,13 +27,14 @@ use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modula
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
     GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
-    GpuSubmissionEngine, GpuSubmissionSession, ModularPredictionProfile, NumericSampleMapping,
-    PreparedGpuSession, Result, SubmittedGpuFrame,
+    GpuSubmissionEngine, GpuSubmissionSession, ModularPredictionProfile, ModularPredictor,
+    NumericSampleMapping, PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
 const MODULAR_ENTROPY_SHADER: &str = include_str!("modular_entropy.wgsl");
 const MODULAR_RECONSTRUCT_SHADER: &str = include_str!("modular_reconstruct.wgsl");
+const MODULAR_FIXED_GRADIENT_SHADER: &str = include_str!("modular_fixed_gradient.wgsl");
 const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
@@ -127,6 +128,8 @@ pub struct WgpuDecodeMemoryStats {
     pub max_dispatch_workgroups: u32,
     /// Output write implementation selected after proving the complete group/plane layout.
     pub output_write_path: OutputWritePath,
+    /// Reconstruction kernel selected from the fully validated MA-tree IR.
+    pub reconstruction_specialization: ModularReconstructionSpecialization,
 }
 
 /// GPU output update strategy selected for a validated frame layout.
@@ -136,6 +139,21 @@ pub enum OutputWritePath {
     AtomicBytes,
     /// Every plane row and internal group boundary is word-aligned, allowing ordinary RMW/store.
     WordAligned,
+}
+
+/// Typed Modular reconstruction specialization selected for one decoded frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularReconstructionSpecialization {
+    /// The complete MA tree and predictor family are evaluated per sample.
+    GenericMetaAdaptive,
+    /// Every channel resolves through channel-only decisions to one fixed leaf.
+    ChannelFixed {
+        predictor: ModularPredictor,
+        offset: i32,
+        multiplier: u32,
+        channel_count: u8,
+        clusters: [u8; 4],
+    },
 }
 
 /// F64 production path resolved for one output request.
@@ -192,6 +210,13 @@ struct ShaderParams {
     numeric_mapping: u32,
     status_index: u32,
     stream_index: u32,
+    fixed_leaf_predictor: u32,
+    fixed_leaf_offset: u32,
+    fixed_leaf_multiplier: u32,
+    fixed_leaf_cluster0: u32,
+    fixed_leaf_cluster1: u32,
+    fixed_leaf_cluster2: u32,
+    fixed_leaf_cluster3: u32,
     wp_p1: u32,
     wp_p2: u32,
     wp_p3a: u32,
@@ -228,7 +253,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 180);
+    assert!(std::mem::size_of::<ShaderParams>() == 208);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
@@ -236,10 +261,12 @@ const _: () = {
 
 /// Stock GPU-only decoder for the standard lossless 1-16-bit Gray/RGB/RGBA Modular profile.
 ///
-/// The frontend inventories standard frame sections and parses only bounded prefix metadata. The
-/// shader reads entropy tokens from the actual `jxlc` bytes, expands distance-one zero runs,
-/// unpacks signed residuals, applies the Gradient predictor, and writes the requested GPU image
-/// layout. No private index, CPU pixel decoder, or CPU entropy fallback is required.
+/// The frontend inventories standard frame sections and parses only bounded entropy and MA-tree
+/// metadata. The shader reads Prefix or ANS tokens from the actual `jxlc` bytes, applies LZ77,
+/// reconstructs the selected Modular predictors, and writes the requested GPU image layout. A
+/// host-proven channel-fixed Gradient tree uses a specialized kernel; all other accepted trees use
+/// the generic MA-tree kernel. No private index, CPU pixel decoder, or CPU entropy fallback is
+/// required.
 #[derive(Clone)]
 pub struct WgpuSubmissionEngine {
     backend: WgpuBackend,
@@ -251,8 +278,90 @@ pub struct WgpuSubmissionEngine {
 
 #[derive(Default)]
 struct DecodePipelineCache {
-    atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
-    word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
+    generic_atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
+    generic_word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
+    fixed_gradient_atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
+    fixed_gradient_word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
+}
+
+fn reconstruction_specialization(
+    profile: &StandardModularProfile,
+) -> ModularReconstructionSpecialization {
+    channel_fixed_gradient_specialization(
+        &profile.ma_config.nodes,
+        profile.channels.count(),
+        profile.ma_config.needs_self_correcting(),
+    )
+}
+
+fn channel_fixed_gradient_specialization(
+    nodes: &[MaTreeNodeIr],
+    source_channels: u32,
+    needs_self_correcting: bool,
+) -> ModularReconstructionSpecialization {
+    let generic = ModularReconstructionSpecialization::GenericMetaAdaptive;
+    let Ok(channel_count) = u8::try_from(source_channels) else {
+        return generic;
+    };
+    if !(1..=4).contains(&channel_count)
+        || needs_self_correcting
+        || nodes.is_empty()
+        || nodes.iter().any(|node| {
+            matches!(
+                node,
+                MaTreeNodeIr::Decision {
+                    property,
+                    ..
+                } if *property != 0
+            )
+        })
+    {
+        return generic;
+    }
+    let mut clusters = [0u8; 4];
+    for (channel, cluster) in [0i32, 1, 2, 3].into_iter().zip(clusters.iter_mut()) {
+        let mut node_index = 0u32;
+        let mut leaf = None;
+        for _ in 0..nodes.len() {
+            let Some(node) = usize::try_from(node_index)
+                .ok()
+                .and_then(|index| nodes.get(index))
+            else {
+                break;
+            };
+            match *node {
+                MaTreeNodeIr::Decision {
+                    property: 0,
+                    threshold,
+                    left,
+                    right,
+                } => {
+                    node_index = if channel > threshold { left } else { right };
+                }
+                MaTreeNodeIr::Leaf {
+                    cluster,
+                    predictor: 5,
+                    offset: 0,
+                    multiplier: 1,
+                } => {
+                    leaf = Some(cluster);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some(resolved) = leaf else {
+            return generic;
+        };
+        *cluster = resolved;
+    }
+    ModularReconstructionSpecialization::ChannelFixed {
+        predictor: ModularPredictor::Gradient,
+        offset: 0,
+        multiplier: 1,
+        channel_count,
+        clusters,
+    }
 }
 
 impl std::fmt::Debug for WgpuSubmissionEngine {
@@ -354,36 +463,62 @@ impl DecodePipelineCache {
         backend: &WgpuBackend,
         f64_path: F64OutputPath,
         output_write_path: OutputWritePath,
+        reconstruction: ModularReconstructionSpecialization,
     ) -> Arc<wgpu::ComputePipeline> {
-        let pipeline = match output_write_path {
-            OutputWritePath::AtomicBytes => &self.atomic,
-            OutputWritePath::WordAligned => &self.word_aligned,
+        let fixed_gradient = matches!(
+            reconstruction,
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                ..
+            }
+        );
+        let pipeline = match (fixed_gradient, output_write_path) {
+            (false, OutputWritePath::AtomicBytes) => &self.generic_atomic,
+            (false, OutputWritePath::WordAligned) => &self.generic_word_aligned,
+            (true, OutputWritePath::AtomicBytes) => &self.fixed_gradient_atomic,
+            (true, OutputWritePath::WordAligned) => &self.fixed_gradient_word_aligned,
         };
         Arc::clone(pipeline.get_or_init(|| {
-            let label = match (f64_path, output_write_path) {
-                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes) => {
-                    "jxl-wgpu decode Modular atomic output"
+            let label = match (f64_path, output_write_path, fixed_gradient) {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, false) => {
+                    "jxl-wgpu decode generic Modular atomic output"
                 }
-                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned) => {
-                    "jxl-wgpu decode Modular word-aligned output"
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, false) => {
+                    "jxl-wgpu decode generic Modular word-aligned output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes) => {
-                    "jxl-wgpu decode Modular native-f64 atomic output"
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, false) => {
+                    "jxl-wgpu decode generic Modular native-f64 atomic output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned) => {
-                    "jxl-wgpu decode Modular native-f64 word-aligned output"
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, false) => {
+                    "jxl-wgpu decode generic Modular native-f64 word-aligned output"
+                }
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, true) => {
+                    "jxl-wgpu decode fixed-Gradient Modular atomic output"
+                }
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, true) => {
+                    "jxl-wgpu decode fixed-Gradient Modular word-aligned output"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, true) => {
+                    "jxl-wgpu decode fixed-Gradient Modular native-f64 atomic output"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, true) => {
+                    "jxl-wgpu decode fixed-Gradient Modular native-f64 word-aligned output"
                 }
             };
             Arc::new(create_decode_pipeline(
                 backend,
                 label,
-                &shader_source(f64_path, output_write_path),
+                &shader_source(f64_path, output_write_path, reconstruction),
             ))
         }))
     }
 }
 
-fn shader_source(path: F64OutputPath, output_write_path: OutputWritePath) -> String {
+fn shader_source(
+    path: F64OutputPath,
+    output_write_path: OutputWritePath,
+    reconstruction: ModularReconstructionSpecialization,
+) -> String {
     let (implementation, binding) = match path {
         F64OutputPath::NativeArithmetic => (F64_NATIVE_ARITHMETIC, F64_NATIVE_BINDING),
         F64OutputPath::ExactF32Widening => (F64_EXACT_F32_WIDENING, ""),
@@ -400,9 +535,17 @@ fn shader_source(path: F64OutputPath, output_write_path: OutputWritePath) -> Str
             WORD_ALIGNED_WRITE_FULL_WORD,
         ),
     };
+    let reconstruction_shader = match reconstruction {
+        ModularReconstructionSpecialization::GenericMetaAdaptive => MODULAR_RECONSTRUCT_SHADER,
+        ModularReconstructionSpecialization::ChannelFixed {
+            predictor: ModularPredictor::Gradient,
+            ..
+        } => MODULAR_FIXED_GRADIENT_SHADER,
+        ModularReconstructionSpecialization::ChannelFixed { .. } => MODULAR_RECONSTRUCT_SHADER,
+    };
     let source = SHADER_TEMPLATE
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
-        .replace(MODULAR_RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT_SHADER)
+        .replace(MODULAR_RECONSTRUCT_MARKER, reconstruction_shader)
         .replace(F64_OUTPUT_MARKER, implementation)
         .replace(F64_BINDING_MARKER, binding)
         .replace(OUTPUT_WORDS_TYPE_MARKER, output_words_type)
@@ -492,6 +635,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             self.capabilities(),
         )?;
         let output_write_path = output.write_path_for_groups(&profile.groups)?;
+        let reconstruction_specialization = reconstruction_specialization(&profile);
         let (pipelines, pipeline_f64_path) = match output.f64_output_path {
             Some(F64OutputPath::NativeArithmetic) => (
                 self.native_f64_pipelines
@@ -503,7 +647,12 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 (&self.pipelines, F64OutputPath::ExactF32Widening)
             }
         };
-        let pipeline = pipelines.get_or_init(&self.backend, pipeline_f64_path, output_write_path);
+        let pipeline = pipelines.get_or_init(
+            &self.backend,
+            pipeline_f64_path,
+            output_write_path,
+            reconstruction_specialization,
+        );
         let f64_output_path = output.f64_output_path;
         let memory_limit_bytes = self.memory.snapshot().limit_bytes;
         let dispatch_layout = GroupDispatchLayout::new(
@@ -909,6 +1058,7 @@ struct GroupDispatchLayout {
     params_stride: u64,
     params_bytes: u64,
     output_write_path: OutputWritePath,
+    reconstruction_specialization: ModularReconstructionSpecialization,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -931,6 +1081,7 @@ impl GroupDispatchLayout {
         memory_limit_bytes: u64,
     ) -> Result<Self> {
         let output_write_path = output.write_path_for_groups(&profile.groups)?;
+        let reconstruction_specialization = reconstruction_specialization(profile);
         let limits = device.limits();
         if limits.max_compute_invocations_per_workgroup < MODULAR_GROUP_WORKGROUP_SIZE
             || limits.max_compute_workgroup_size_x < MODULAR_GROUP_WORKGROUP_SIZE
@@ -1050,6 +1201,7 @@ impl GroupDispatchLayout {
             params_stride,
             params_bytes,
             output_write_path,
+            reconstruction_specialization,
         })
     }
 }
@@ -1788,6 +1940,7 @@ fn validate_device_limits(
         group_workgroup_size: MODULAR_GROUP_WORKGROUP_SIZE,
         max_dispatch_workgroups,
         output_write_path: dispatch.output_write_path,
+        reconstruction_specialization: dispatch.reconstruction_specialization,
     })
 }
 
@@ -2148,6 +2301,22 @@ fn build_params(
     let (plane2_offset, plane2_stride) = plane(2)?;
     let (plane3_offset, plane3_stride) = plane(3)?;
     let chroma = output.layout.plane(1);
+    let (fixed_leaf_predictor, fixed_leaf_offset, fixed_leaf_multiplier, fixed_leaf_clusters) =
+        match reconstruction_specialization(profile) {
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor,
+                offset,
+                multiplier,
+                clusters,
+                ..
+            } => (
+                u32::from(predictor.index()),
+                u32::from_ne_bytes(offset.to_ne_bytes()),
+                multiplier,
+                clusters.map(u32::from),
+            ),
+            ModularReconstructionSpecialization::GenericMetaAdaptive => (0, 0, 0, [0; 4]),
+        };
     Ok(ShaderParams {
         token_start,
         token_end,
@@ -2188,6 +2357,13 @@ fn build_params(
         numeric_mapping: output.numeric_mapping,
         status_index,
         stream_index: group.stream_index,
+        fixed_leaf_predictor,
+        fixed_leaf_offset,
+        fixed_leaf_multiplier,
+        fixed_leaf_cluster0: fixed_leaf_clusters[0],
+        fixed_leaf_cluster1: fixed_leaf_clusters[1],
+        fixed_leaf_cluster2: fixed_leaf_clusters[2],
+        fixed_leaf_cluster3: fixed_leaf_clusters[3],
         wp_p1: profile.wp_header.p1,
         wp_p2: profile.wp_header.p2,
         wp_p3a: profile.wp_header.p3a,
@@ -2301,6 +2477,16 @@ mod tests {
     const PORTABLE_CAPABILITIES: WgpuDecodeCapabilities = WgpuDecodeCapabilities {
         native_f64_arithmetic: false,
     };
+    const GENERIC_RECONSTRUCTION: ModularReconstructionSpecialization =
+        ModularReconstructionSpecialization::GenericMetaAdaptive;
+    const FIXED_GRADIENT_RECONSTRUCTION: ModularReconstructionSpecialization =
+        ModularReconstructionSpecialization::ChannelFixed {
+            predictor: ModularPredictor::Gradient,
+            offset: 0,
+            multiplier: 1,
+            channel_count: 4,
+            clusters: [1, 2, 3, 4],
+        };
 
     #[test]
     fn stream_batches_rebase_unaligned_group_bits_and_respect_peak_window() {
@@ -2510,6 +2696,89 @@ mod tests {
         assert_eq!(lz77_scratch_words(1), 0);
         assert_eq!(lz77_scratch_words(2), 2);
         assert_eq!(lz77_scratch_words(1 << 20), 1 << 20);
+    }
+
+    #[test]
+    fn channel_fixed_gradient_proof_pins_channel_cluster_order_and_fallbacks() {
+        let leaf = |cluster| MaTreeNodeIr::Leaf {
+            cluster,
+            predictor: ModularPredictor::Gradient.index(),
+            offset: 0,
+            multiplier: 1,
+        };
+        let nodes = [
+            MaTreeNodeIr::Decision {
+                property: 0,
+                threshold: 1,
+                left: 1,
+                right: 4,
+            },
+            MaTreeNodeIr::Decision {
+                property: 0,
+                threshold: 2,
+                left: 2,
+                right: 3,
+            },
+            leaf(4),
+            leaf(3),
+            MaTreeNodeIr::Decision {
+                property: 0,
+                threshold: 0,
+                left: 5,
+                right: 6,
+            },
+            leaf(2),
+            leaf(1),
+        ];
+        assert_eq!(
+            channel_fixed_gradient_specialization(&nodes, 4, false),
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                offset: 0,
+                multiplier: 1,
+                channel_count: 4,
+                clusters: [1, 2, 3, 4],
+            }
+        );
+
+        let mut non_channel = nodes;
+        non_channel[0] = MaTreeNodeIr::Decision {
+            property: 3,
+            threshold: 1,
+            left: 1,
+            right: 4,
+        };
+        assert_eq!(
+            channel_fixed_gradient_specialization(&non_channel, 4, false),
+            ModularReconstructionSpecialization::GenericMetaAdaptive
+        );
+
+        let mut bad_unused_channel = nodes;
+        bad_unused_channel[2] = MaTreeNodeIr::Leaf {
+            cluster: 4,
+            predictor: ModularPredictor::West.index(),
+            offset: 0,
+            multiplier: 1,
+        };
+        assert_eq!(
+            channel_fixed_gradient_specialization(&bad_unused_channel, 1, false),
+            ModularReconstructionSpecialization::GenericMetaAdaptive
+        );
+
+        let cycle = [MaTreeNodeIr::Decision {
+            property: 0,
+            threshold: 0,
+            left: 0,
+            right: 0,
+        }];
+        assert_eq!(
+            channel_fixed_gradient_specialization(&cycle, 1, false),
+            ModularReconstructionSpecialization::GenericMetaAdaptive
+        );
+        assert_eq!(
+            channel_fixed_gradient_specialization(&nodes, 4, true),
+            ModularReconstructionSpecialization::GenericMetaAdaptive
+        );
     }
 
     #[test]
@@ -2757,7 +3026,7 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 180);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 208);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -2794,24 +3063,31 @@ mod tests {
             numeric_mapping: 32,
             status_index: 33,
             stream_index: 34,
-            wp_p1: 35,
-            wp_p2: 36,
-            wp_p3a: 37,
-            wp_p3b: 38,
-            wp_p3c: 39,
-            wp_p3d: 40,
-            wp_p3e: 41,
-            wp_w0: 42,
-            wp_w1: 43,
-            wp_w2: 44,
-            wp_w3: 45,
+            fixed_leaf_predictor: 35,
+            fixed_leaf_offset: 36,
+            fixed_leaf_multiplier: 37,
+            fixed_leaf_cluster0: 38,
+            fixed_leaf_cluster1: 39,
+            fixed_leaf_cluster2: 40,
+            fixed_leaf_cluster3: 41,
+            wp_p1: 42,
+            wp_p2: 43,
+            wp_p3a: 44,
+            wp_p3b: 45,
+            wp_p3c: 46,
+            wp_p3d: 47,
+            wp_p3e: 48,
+            wp_w0: 49,
+            wp_w1: 50,
+            wp_w2: 51,
+            wp_w3: 52,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 45]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 52]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45,
+                45, 46, 47, 48, 49, 50, 51, 52,
             ]
         );
         assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));
@@ -2822,6 +3098,7 @@ mod tests {
         let portable = shader_source(
             F64OutputPath::ExactF32Widening,
             OutputWritePath::WordAligned,
+            FIXED_GRADIENT_RECONSTRUCTION,
         );
         assert!(portable.contains("@compute @workgroup_size(64)"));
         assert!(portable.contains("@builtin(global_invocation_id)"));
@@ -2860,22 +3137,46 @@ mod tests {
     }
 
     #[test]
-    fn portable_and_native_f64_shader_sources_validate_with_exact_capabilities() {
+    fn every_reconstruction_write_and_f64_shader_variant_validates() {
         let portable_atomic = shader_source(
             F64OutputPath::ExactF32Widening,
             OutputWritePath::AtomicBytes,
+            GENERIC_RECONSTRUCTION,
         );
         let portable_aligned = shader_source(
             F64OutputPath::ExactF32Widening,
             OutputWritePath::WordAligned,
+            GENERIC_RECONSTRUCTION,
         );
         let native_atomic = shader_source(
             F64OutputPath::NativeArithmetic,
             OutputWritePath::AtomicBytes,
+            GENERIC_RECONSTRUCTION,
         );
         let native_aligned = shader_source(
             F64OutputPath::NativeArithmetic,
             OutputWritePath::WordAligned,
+            GENERIC_RECONSTRUCTION,
+        );
+        let fixed_gradient_atomic = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::AtomicBytes,
+            FIXED_GRADIENT_RECONSTRUCTION,
+        );
+        let fixed_gradient_aligned = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::WordAligned,
+            FIXED_GRADIENT_RECONSTRUCTION,
+        );
+        let native_fixed_gradient_atomic = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::AtomicBytes,
+            FIXED_GRADIENT_RECONSTRUCTION,
+        );
+        let native_fixed_gradient_aligned = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::WordAligned,
+            FIXED_GRADIENT_RECONSTRUCTION,
         );
         assert!(!portable_aligned.contains(F64_OUTPUT_MARKER));
         assert!(!native_aligned.contains(F64_OUTPUT_MARKER));
@@ -2890,6 +3191,11 @@ mod tests {
         assert!(portable_aligned.contains("output_words: array<u32>"));
         assert!(!portable_aligned.contains("atomicCompareExchangeWeak"));
         assert!(!native_aligned.contains("atomicStore"));
+        assert!(fixed_gradient_atomic.contains("atomicCompareExchangeWeak"));
+        assert!(fixed_gradient_aligned.contains("fn fixed_leaf_cluster"));
+        assert!(!fixed_gradient_aligned.contains("fn ma_leaf"));
+        assert!(!MODULAR_FIXED_GRADIENT_SHADER.contains(" % "));
+        assert!(!MODULAR_FIXED_GRADIENT_SHADER.contains(" / params.width"));
 
         let native_without_capability = naga::front::wgsl::parse_str(&native_aligned)
             .expect("native F64 WGSL syntax must parse before capability validation");
@@ -2920,6 +3226,26 @@ mod tests {
             (
                 "native-f64-aligned",
                 native_aligned,
+                naga::valid::Capabilities::FLOAT64,
+            ),
+            (
+                "portable-fixed-gradient-atomic",
+                fixed_gradient_atomic,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "portable-fixed-gradient-aligned",
+                fixed_gradient_aligned,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "native-f64-fixed-gradient-atomic",
+                native_fixed_gradient_atomic,
+                naga::valid::Capabilities::FLOAT64,
+            ),
+            (
+                "native-f64-fixed-gradient-aligned",
+                native_fixed_gradient_aligned,
                 naga::valid::Capabilities::FLOAT64,
             ),
         ] {
