@@ -145,11 +145,13 @@ impl VarDctStrategy {
     ];
 
     /// Regular strategies implemented end-to-end by this encoder.
-    pub const EXECUTABLE: [Self; 7] = [
+    pub const EXECUTABLE: [Self; 9] = [
         Self::Dct8,
         Self::Dct16x8,
         Self::Dct8x16,
         Self::Dct16x16,
+        Self::Dct32x8,
+        Self::Dct8x32,
         Self::Dct32x32,
         Self::Dct32x16,
         Self::Dct16x32,
@@ -197,6 +199,8 @@ impl VarDctStrategy {
                 | Self::Dct16x8
                 | Self::Dct8x16
                 | Self::Dct16x16
+                | Self::Dct32x8
+                | Self::Dct8x32
                 | Self::Dct32x32
                 | Self::Dct32x16
                 | Self::Dct16x32

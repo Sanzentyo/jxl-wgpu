@@ -94,9 +94,10 @@ provided by the application.
 ## Experimental VarDCT profile
 
 `VarDctEncoder::new` takes an explicit `VarDctStrategy` and accepts one padded, interleaved sRGB8
-image whose extent equals that transform. Seven regular strategies are executable end to end:
-`Dct8`, `Dct16x8` (8×16 pixels), `Dct8x16` (16×8), `Dct16x16`, `Dct32x32`, `Dct32x16` (16×32),
-and `Dct16x32` (32×16). `VarDctStrategy::EXECUTABLE` is the authoritative inventory; the other
+image whose extent equals that transform. Nine regular strategies are executable end to end:
+`Dct8`, `Dct16x8` (8×16 pixels), `Dct8x16` (16×8), `Dct16x16`, `Dct32x8` (8×32), `Dct8x32`
+(32×8), `Dct32x32`, `Dct32x16` (16×32), and `Dct16x32` (32×16).
+`VarDctStrategy::EXECUTABLE` is the authoritative inventory; the other
 standard identifiers remain typed but are rejected rather than silently lowered to DCT8.
 
 The GPU executes sRGB linearization, XYB conversion, the selected full regular forward transform,
