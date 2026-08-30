@@ -13,6 +13,10 @@
 //! timecodes, signed crop rectangles, all five blend modes, alpha extra-channel blending, and four
 //! reference slots. Its independent frame submissions support both blocking waits and a
 //! runtime-neutral [`Future`], so a caller can keep multiple frames in flight.
+//! [`VarDctEncoder`] is the first bounded lossy frontend: one 8x8 pitch-linear sRGB8 block is
+//! normalized, transformed to XYB, forward-DCT8 transformed, quantized, tokenized, and histogrammed
+//! on the GPU. Its fixed distance-25 profile retains DC and quantizes AC to zero; this narrow but
+//! complete standard profile keeps all 27 strategy identifiers in a typed expansion-ready IR.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -36,6 +40,7 @@ mod lossless_modular;
 mod packet;
 mod prefix;
 mod session;
+mod vardct_encoder;
 
 pub use buffer_pool::{
     DEFAULT_ENCODER_BUFFER_POOL_BYTES, EncoderBufferPoolStats, MAX_ENCODER_BUFFER_POOL_IDLE_SETS,
@@ -64,4 +69,8 @@ pub use session::{
     AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
     FrameEncodeRequest, FrameIndex, FrameOptions, FrameSubmission, FrameTiming,
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
+};
+pub use vardct_encoder::{
+    VarDctBackend, VarDctColorEncoding, VarDctEncoder, VarDctJob, VarDctMemoryPlan, VarDctStrategy,
+    VarDctSubmission,
 };

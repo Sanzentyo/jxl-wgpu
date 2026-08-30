@@ -24,6 +24,8 @@ pub enum BackendError {
     PollRegistration(#[source] jxl_wgpu::SubmissionPollerError),
     #[error("could not start the bounded GPU poll worker")]
     PollWorkerStart(#[source] std::io::Error),
+    #[error("could not start a streamed Modular encode worker")]
+    StreamingWorkerStart(#[source] std::io::Error),
 }
 
 impl From<&'static str> for BackendError {

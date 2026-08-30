@@ -357,13 +357,23 @@ pub struct LosslessModularMemoryPlan {
     pub bytes_per_sample: u8,
     /// Number of independently tokenized Modular channels (1, 3, or 4).
     pub channel_count: u32,
+    /// Full source byte range addressed by the logical frame.
     pub source_binding_bytes: u64,
+    /// Largest source window bound for any one streamed GPU batch.
+    pub peak_source_binding_bytes: u64,
+    /// Largest parameter allocation used by one streamed GPU batch.
     pub parameter_storage_bytes: u64,
+    /// Largest artifact allocation used by one streamed GPU batch.
     pub artifact_storage_bytes: u64,
+    /// Sum of the worst-case artifact ranges across every batch. This is diagnostic only; the
+    /// encoder never allocates the sum as one GPU buffer.
+    pub total_artifact_bytes: u64,
     /// Separate copy destination required before mapping. Zero when the device can map the
     /// primary storage buffer directly.
     pub readback_bytes: u64,
     pub direct_readback: bool,
+    pub batch_count: u32,
+    pub streaming: bool,
     pub owned_bytes_per_job: u64,
     pub addressed_bytes_per_job: u64,
 }
@@ -429,6 +439,8 @@ struct ModularDispatchBatch {
     dispatch_count: usize,
     artifact_byte_offset: u64,
     artifact_binding_size: NonZeroU64,
+    source_binding_offset: u64,
+    source_binding_size: NonZeroU64,
 }
 
 #[derive(Clone, Debug)]
@@ -441,8 +453,6 @@ struct ModularDispatchPlan {
     parameters: Vec<ModularParams>,
     groups: Vec<ModularGroupPlan>,
     batches: Vec<ModularDispatchBatch>,
-    source_binding_offset: u64,
-    source_binding_size: NonZeroU64,
     output_size: u64,
     memory: LosslessModularMemoryPlan,
 }
@@ -640,26 +650,6 @@ impl LosslessModularBackend {
                 "source storage binding size is not word-aligned",
             ));
         }
-        if source_binding_bytes > self.max_storage_binding_size {
-            return Err(UnsupportedFeature::DeviceLimit {
-                name: "max_storage_buffer_binding_size",
-                required: source_binding_bytes,
-                available: self.max_storage_binding_size,
-            }
-            .into());
-        }
-        let source_binding_size = NonZeroU64::new(source_binding_bytes)
-            .ok_or(EncodeError::InvalidSource("source binding is empty"))?;
-        let shader_last_byte = sample_end
-            .checked_sub(source_binding_offset)
-            .and_then(|value| value.checked_sub(1))
-            .ok_or(EncodeError::InvalidSource(
-                "source address arithmetic underflow",
-            ))?;
-        u32::try_from(shader_last_byte).map_err(|_| {
-            EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
-        })?;
-
         let dispatch_count = usize::try_from(dispatches)
             .map_err(|_| EncodeError::InvalidSource("Modular dispatch count overflow"))?;
         if !256_u64.is_multiple_of(self.storage_offset_alignment.max(1)) {
@@ -673,6 +663,7 @@ impl LosslessModularBackend {
         let artifact_alignment = self.storage_offset_alignment.max(4);
         let mut parameters = Vec::with_capacity(dispatch_count);
         let mut groups = Vec::with_capacity(dispatch_count);
+        let mut absolute_source_offsets = Vec::with_capacity(dispatch_count);
         let mut batches =
             Vec::with_capacity(dispatch_count.div_ceil(MAX_DISPATCHES_PER_ARTIFACT_BINDING));
         let mut output_size = 0u64;
@@ -697,6 +688,62 @@ impl LosslessModularBackend {
                 .ok()
                 .and_then(|words| words.checked_mul(4))
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            let mut proposed_output_size = output_size;
+            for _ in 0..channels {
+                proposed_output_size = align_up(proposed_output_size, artifact_alignment)
+                    .and_then(|value| value.checked_add(group_output_size))
+                    .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            }
+            let batch_dispatches = parameters.len() - batch_first_dispatch;
+            let proposed_batch_bytes = proposed_output_size
+                .checked_sub(batch_artifact_offset)
+                .ok_or(EncodeError::InvalidSource(
+                    "artifact batch offset underflow",
+                ))?;
+            if batch_dispatches != 0
+                && (batch_dispatches
+                    .checked_add(usize::try_from(channels).map_err(|_| {
+                        EncodeError::InvalidSource("Modular channel count overflow")
+                    })?)
+                    .is_none_or(|count| count > MAX_DISPATCHES_PER_ARTIFACT_BINDING)
+                    || proposed_batch_bytes > self.max_storage_binding_size)
+            {
+                let batch_end_dispatch = parameters.len();
+                batches.push(modular_dispatch_batch(
+                    batch_first_dispatch..batch_end_dispatch,
+                    batch_artifact_offset..output_size,
+                    &mut ModularBatchFinalizeContext {
+                        minimum_source_binding_offset: source_binding_offset,
+                        absolute_source_offsets: &absolute_source_offsets,
+                        parameters: &mut parameters,
+                        groups: &groups,
+                        source_alignment: artifact_alignment,
+                        max_storage_binding_size: self.max_storage_binding_size,
+                    },
+                )?);
+                batch_first_dispatch = parameters.len();
+                output_size = align_up(output_size, artifact_alignment).ok_or(
+                    EncodeError::InvalidSource("artifact batch alignment overflow"),
+                )?;
+                batch_artifact_offset = output_size;
+                proposed_output_size = output_size;
+                for _ in 0..channels {
+                    proposed_output_size = align_up(proposed_output_size, artifact_alignment)
+                        .and_then(|value| value.checked_add(group_output_size))
+                        .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+                }
+            }
+            if proposed_output_size
+                .checked_sub(batch_artifact_offset)
+                .is_none_or(|bytes| bytes > self.max_storage_binding_size)
+            {
+                return Err(UnsupportedFeature::DeviceLimit {
+                    name: "max_storage_buffer_binding_size",
+                    required: proposed_output_size.saturating_sub(batch_artifact_offset),
+                    available: self.max_storage_binding_size,
+                }
+                .into());
+            }
             let tile_byte_offset = plane
                 .offset
                 .checked_add(plane.row_stride.checked_mul(u64::from(y)).ok_or(
@@ -710,28 +757,10 @@ impl LosslessModularBackend {
                         })
                         .and_then(|x_offset| value.checked_add(x_offset))
                 })
-                .and_then(|value| value.checked_sub(source_binding_offset))
                 .ok_or(EncodeError::InvalidSource(
                     "source address arithmetic overflow",
                 ))?;
-            let byte_offset = u32::try_from(tile_byte_offset).map_err(|_| {
-                EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
-            })?;
             for channel in 0..channels {
-                if parameters.len() - batch_first_dispatch == MAX_DISPATCHES_PER_ARTIFACT_BINDING {
-                    batches.push(modular_dispatch_batch(
-                        batch_first_dispatch,
-                        parameters.len(),
-                        batch_artifact_offset,
-                        output_size,
-                        self.max_storage_binding_size,
-                    )?);
-                    batch_first_dispatch = parameters.len();
-                    output_size = align_up(output_size, artifact_alignment).ok_or(
-                        EncodeError::InvalidSource("artifact batch alignment overflow"),
-                    )?;
-                    batch_artifact_offset = output_size;
-                }
                 output_size = align_up(output_size, artifact_alignment).ok_or(
                     EncodeError::InvalidSource("artifact group alignment overflow"),
                 )?;
@@ -745,7 +774,7 @@ impl LosslessModularBackend {
                     width,
                     height,
                     row_stride,
-                    byte_offset,
+                    byte_offset: 0,
                     output_word_offset,
                     channel,
                     channels,
@@ -761,33 +790,33 @@ impl LosslessModularBackend {
                     output_size: group_output_size,
                     max_events,
                 });
+                absolute_source_offsets.push(tile_byte_offset);
                 output_size = output_size
                     .checked_add(group_output_size)
                     .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
             }
         }
         if parameters.len() > batch_first_dispatch {
+            let batch_end_dispatch = parameters.len();
             batches.push(modular_dispatch_batch(
-                batch_first_dispatch,
-                parameters.len(),
-                batch_artifact_offset,
-                output_size,
-                self.max_storage_binding_size,
+                batch_first_dispatch..batch_end_dispatch,
+                batch_artifact_offset..output_size,
+                &mut ModularBatchFinalizeContext {
+                    minimum_source_binding_offset: source_binding_offset,
+                    absolute_source_offsets: &absolute_source_offsets,
+                    parameters: &mut parameters,
+                    groups: &groups,
+                    source_alignment: artifact_alignment,
+                    max_storage_binding_size: self.max_storage_binding_size,
+                },
             )?);
         }
-        if output_size > self.max_buffer_size {
-            return Err(UnsupportedFeature::DeviceLimit {
-                name: "max_buffer_size",
-                required: output_size,
-                available: self.max_buffer_size,
-            }
-            .into());
-        }
-        let parameter_storage_bytes = u64::try_from(parameters.len())
-            .ok()
-            .and_then(|count| {
-                count.checked_mul(u64::try_from(std::mem::size_of::<ModularParams>()).ok()?)
-            })
+        let parameter_storage_bytes = batches
+            .iter()
+            .map(|batch| batch.dispatch_count)
+            .max()
+            .and_then(|count| u64::try_from(count).ok())
+            .and_then(|count| count.checked_mul(std::mem::size_of::<ModularParams>() as u64))
             .ok_or(EncodeError::InvalidSource(
                 "group parameter storage size overflow",
             ))?;
@@ -807,14 +836,44 @@ impl LosslessModularBackend {
             }
             .into());
         }
-        let readback_bytes = if self.direct_mapping { 0 } else { output_size };
-        let owned_bytes_per_job = output_size
+        let artifact_storage_bytes = batches
+            .iter()
+            .map(|batch| batch.artifact_binding_size.get())
+            .max()
+            .ok_or(EncodeError::InvalidSource("artifact batch plan is empty"))?;
+        if artifact_storage_bytes > self.max_buffer_size {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "max_buffer_size",
+                required: artifact_storage_bytes,
+                available: self.max_buffer_size,
+            }
+            .into());
+        }
+        let total_artifact_bytes = batches
+            .iter()
+            .try_fold(0u64, |total, batch| {
+                total.checked_add(batch.artifact_binding_size.get())
+            })
+            .ok_or(EncodeError::InvalidSource("total artifact size overflow"))?;
+        let peak_source_binding_bytes = batches
+            .iter()
+            .map(|batch| batch.source_binding_size.get())
+            .max()
+            .ok_or(EncodeError::InvalidSource("source batch plan is empty"))?;
+        let readback_bytes = if self.direct_mapping {
+            0
+        } else {
+            artifact_storage_bytes
+        };
+        let owned_bytes_per_job = artifact_storage_bytes
             .checked_add(readback_bytes)
             .and_then(|value| value.checked_add(parameter_storage_bytes))
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
         let addressed_bytes_per_job = owned_bytes_per_job
-            .checked_add(source_binding_bytes)
+            .checked_add(peak_source_binding_bytes)
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
+        let batch_count = u32::try_from(batches.len())
+            .map_err(|_| EncodeError::InvalidSource("artifact batch count overflow"))?;
         let memory = LosslessModularMemoryPlan {
             group_grid,
             format,
@@ -822,10 +881,14 @@ impl LosslessModularBackend {
             bytes_per_sample: source_spec.bytes_per_sample,
             channel_count: channels,
             source_binding_bytes,
+            peak_source_binding_bytes,
             parameter_storage_bytes,
-            artifact_storage_bytes: output_size,
+            artifact_storage_bytes,
+            total_artifact_bytes,
             readback_bytes,
             direct_readback: self.direct_mapping,
+            batch_count,
+            streaming: batch_count > 1,
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
@@ -838,8 +901,6 @@ impl LosslessModularBackend {
             parameters,
             groups,
             batches,
-            source_binding_offset,
-            source_binding_size,
             output_size,
             memory,
         })
@@ -854,13 +915,24 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .checked_mul(alignment)
 }
 
-fn modular_dispatch_batch(
-    first_dispatch: usize,
-    end_dispatch: usize,
-    artifact_byte_offset: u64,
-    artifact_end: u64,
+struct ModularBatchFinalizeContext<'a> {
+    minimum_source_binding_offset: u64,
+    absolute_source_offsets: &'a [u64],
+    parameters: &'a mut [ModularParams],
+    groups: &'a [ModularGroupPlan],
+    source_alignment: u64,
     max_storage_binding_size: u64,
+}
+
+fn modular_dispatch_batch(
+    dispatches: std::ops::Range<usize>,
+    artifact_range: std::ops::Range<u64>,
+    context: &mut ModularBatchFinalizeContext<'_>,
 ) -> Result<ModularDispatchBatch, EncodeError> {
+    let first_dispatch = dispatches.start;
+    let end_dispatch = dispatches.end;
+    let artifact_byte_offset = artifact_range.start;
+    let artifact_end = artifact_range.end;
     let dispatch_count =
         end_dispatch
             .checked_sub(first_dispatch)
@@ -878,23 +950,449 @@ fn modular_dispatch_batch(
             .ok_or(EncodeError::InvalidSource(
                 "artifact batch byte range underflow",
             ))?;
-    if artifact_binding_bytes > max_storage_binding_size {
+    if artifact_binding_bytes > context.max_storage_binding_size {
         return Err(UnsupportedFeature::DeviceLimit {
             name: "max_storage_buffer_binding_size",
             required: artifact_binding_bytes,
-            available: max_storage_binding_size,
+            available: context.max_storage_binding_size,
         }
         .into());
     }
     let artifact_binding_size = NonZeroU64::new(artifact_binding_bytes).ok_or(
         EncodeError::InvalidSource("artifact batch binding must not be empty"),
     )?;
+    let batch_offsets = context
+        .absolute_source_offsets
+        .get(first_dispatch..end_dispatch)
+        .ok_or(EncodeError::InvalidSource(
+            "source batch dispatch range is invalid",
+        ))?;
+    let mut source_binding_offset = *batch_offsets
+        .iter()
+        .min()
+        .ok_or(EncodeError::InvalidSource("source batch is empty"))?;
+    source_binding_offset -= source_binding_offset % context.source_alignment;
+    if source_binding_offset < context.minimum_source_binding_offset {
+        return Err(EncodeError::InvalidSource(
+            "source batch begins before the declared image plane",
+        ));
+    }
+    let mut source_binding_end = source_binding_offset;
+    for (index, &absolute_source_offset) in context
+        .absolute_source_offsets
+        .iter()
+        .enumerate()
+        .take(end_dispatch)
+        .skip(first_dispatch)
+    {
+        let params = context
+            .parameters
+            .get(index)
+            .ok_or(EncodeError::InvalidSource(
+                "parameter batch range is invalid",
+            ))?;
+        let group = context.groups.get(index).ok_or(EncodeError::InvalidSource(
+            "artifact batch range is invalid",
+        ))?;
+        let row_bytes = u64::from(group.width)
+            .checked_mul(u64::from(params.channels))
+            .and_then(|value| value.checked_mul(u64::from(params.bytes_per_sample)))
+            .ok_or(EncodeError::InvalidSource("source batch row size overflow"))?;
+        let source_end = absolute_source_offset
+            .checked_add(
+                u64::from(params.row_stride)
+                    .checked_mul(u64::from(group.height.saturating_sub(1)))
+                    .ok_or(EncodeError::InvalidSource("source batch address overflow"))?,
+            )
+            .and_then(|value| value.checked_add(row_bytes))
+            .ok_or(EncodeError::InvalidSource("source batch address overflow"))?;
+        source_binding_end = source_binding_end.max(source_end);
+    }
+    source_binding_end = align_up(source_binding_end, 4)
+        .ok_or(EncodeError::InvalidSource("source batch size overflow"))?;
+    let source_binding_bytes = source_binding_end
+        .checked_sub(source_binding_offset)
+        .ok_or(EncodeError::InvalidSource("source batch range underflow"))?;
+    if source_binding_bytes > context.max_storage_binding_size {
+        return Err(UnsupportedFeature::DeviceLimit {
+            name: "max_storage_buffer_binding_size",
+            required: source_binding_bytes,
+            available: context.max_storage_binding_size,
+        }
+        .into());
+    }
+    let source_binding_size = NonZeroU64::new(source_binding_bytes)
+        .ok_or(EncodeError::InvalidSource("source batch binding is empty"))?;
+    let shader_last_byte = source_binding_bytes
+        .checked_sub(1)
+        .ok_or(EncodeError::InvalidSource("source batch binding is empty"))?;
+    u32::try_from(shader_last_byte).map_err(|_| {
+        EncodeError::InvalidSource("source batch exceeds the WGSL u32 address space")
+    })?;
+    for (index, &absolute_source_offset) in context
+        .absolute_source_offsets
+        .iter()
+        .enumerate()
+        .take(end_dispatch)
+        .skip(first_dispatch)
+    {
+        context.parameters[index].byte_offset = u32::try_from(
+            absolute_source_offset
+                .checked_sub(source_binding_offset)
+                .ok_or(EncodeError::InvalidSource("source batch address underflow"))?,
+        )
+        .map_err(|_| EncodeError::InvalidSource("source batch address exceeds WGSL u32"))?;
+    }
     Ok(ModularDispatchBatch {
         first_dispatch,
         dispatch_count,
         artifact_byte_offset,
         artifact_binding_size,
+        source_binding_offset,
+        source_binding_size,
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LosslessModularBackend {
+    fn submit_streaming(
+        &self,
+        context: &WgpuContext,
+        source: crate::BufferImageSource,
+        plan: ModularDispatchPlan,
+        request: FrameEncodeRequest,
+    ) -> Result<LosslessModularJob, EncodeError> {
+        let completion = Arc::new(StreamingCompletion::default());
+        let worker_completion = Arc::clone(&completion);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = StreamingModularWorker {
+            context: context.clone(),
+            pipeline: Arc::clone(&self.pipeline),
+            buffer_pool: Arc::clone(&self.buffer_pool),
+            direct_mapping: self.direct_mapping,
+            source,
+            plan,
+            request,
+            cancelled: Arc::clone(&cancelled),
+        };
+        std::thread::Builder::new()
+            .name("jxl-wgpu-modular-stream".into())
+            .spawn(move || {
+                worker_completion.complete(worker.run());
+            })
+            .map_err(BackendError::StreamingWorkerStart)?;
+        Ok(LosslessModularJob {
+            state: LosslessModularJobState::Streaming(StreamingLosslessModularJob {
+                completion,
+                cancelled,
+            }),
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamingModularWorker {
+    context: WgpuContext,
+    pipeline: Arc<wgpu::ComputePipeline>,
+    buffer_pool: Arc<EncoderBufferPool>,
+    direct_mapping: bool,
+    source: crate::BufferImageSource,
+    plan: ModularDispatchPlan,
+    request: FrameEncodeRequest,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StreamingModularWorker {
+    fn run(&self) -> Result<GpuFrameArtifacts, EncodeError> {
+        let channels = usize::try_from(self.plan.format.channel_count())
+            .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+        let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
+        let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
+        for batch in &self.plan.batches {
+            ensure_streaming_job_active(&self.cancelled)?;
+            self.with_batch(batch, |bytes| {
+                for dispatch in batch.first_dispatch
+                    ..batch
+                        .first_dispatch
+                        .checked_add(batch.dispatch_count)
+                        .ok_or(EncodeError::InvalidSource(
+                            "artifact batch dispatch range overflow",
+                        ))?
+                {
+                    let group_plan =
+                        self.plan
+                            .groups
+                            .get(dispatch)
+                            .ok_or(EncodeError::InvalidSource(
+                                "artifact batch dispatch range is invalid",
+                            ))?;
+                    let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
+                    let header =
+                        parse_group_artifact_header(group_plan.max_events, artifact_bytes)?;
+                    let artifact = ValidatedModularArtifact {
+                        header,
+                        events: &[],
+                    };
+                    accumulate_artifact_histograms(
+                        dispatch % channels,
+                        &artifact,
+                        &mut aggregate_raw,
+                        &mut aggregate_lz77,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        let codes = build_prefix_codes(
+            self.plan.format,
+            self.plan.bits_per_sample,
+            &aggregate_raw,
+            &aggregate_lz77,
+        )?;
+        let frame = ModularFrameHeader {
+            animation: self.request.animation,
+            canvas_width: self.request.canvas_width,
+            canvas_height: self.request.canvas_height,
+            options: self.request.options.clone(),
+            is_last: self.request.is_last,
+        };
+        let mut assembler = ModularPacketAssembler::new(
+            self.plan.width,
+            self.plan.height,
+            self.plan.group_grid,
+            self.plan.format,
+            self.plan.bits_per_sample,
+            frame,
+            codes,
+        )?;
+        for batch in &self.plan.batches {
+            ensure_streaming_job_active(&self.cancelled)?;
+            self.with_batch(batch, |bytes| {
+                if batch.first_dispatch % channels != 0 || batch.dispatch_count % channels != 0 {
+                    return Err(EncodeError::Backend(
+                        "streaming batch splits a Modular channel group".into(),
+                    ));
+                }
+                let end_dispatch = batch
+                    .first_dispatch
+                    .checked_add(batch.dispatch_count)
+                    .ok_or(EncodeError::InvalidSource(
+                        "artifact batch dispatch range overflow",
+                    ))?;
+                for first_channel in (batch.first_dispatch..end_dispatch).step_by(channels) {
+                    let mut artifacts = Vec::with_capacity(channels);
+                    for dispatch in first_channel..first_channel + channels {
+                        let group_plan =
+                            self.plan
+                                .groups
+                                .get(dispatch)
+                                .ok_or(EncodeError::InvalidSource(
+                                    "artifact batch dispatch range is invalid",
+                                ))?;
+                        let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
+                        artifacts.push(parse_group_artifact(
+                            group_plan.width,
+                            group_plan.height,
+                            group_plan.max_events,
+                            artifact_bytes,
+                        )?);
+                    }
+                    let group_index = u32::try_from(first_channel / channels)
+                        .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?;
+                    assembler.push_group(group_index, &artifacts)?;
+                }
+                Ok(())
+            })?;
+        }
+        let (packets, acceleration) = assembler.finish()?;
+        Ok(GpuFrameArtifacts {
+            frame_index: self.request.frame_index,
+            is_last: self.request.is_last,
+            packets,
+            acceleration,
+        })
+    }
+
+    fn with_batch<T>(
+        &self,
+        batch: &ModularDispatchBatch,
+        inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
+    ) -> Result<T, EncodeError> {
+        let parameter_bytes = u64::try_from(batch.dispatch_count)
+            .ok()
+            .and_then(|count| count.checked_mul(std::mem::size_of::<ModularParams>() as u64))
+            .ok_or(EncodeError::InvalidSource(
+                "streaming parameter buffer size overflow",
+            ))?;
+        let artifact_bytes = batch.artifact_binding_size.get();
+        let owned_bytes = artifact_bytes
+            .checked_add(if self.direct_mapping {
+                0
+            } else {
+                artifact_bytes
+            })
+            .and_then(|value| value.checked_add(parameter_bytes))
+            .ok_or(EncodeError::InvalidSource(
+                "streaming batch memory size overflow",
+            ))?;
+        let memory_permit = self.context.memory_budget().try_reserve(owned_bytes)?;
+        let buffer_lease = self.buffer_pool.checkout(
+            self.context.device(),
+            parameter_bytes,
+            artifact_bytes,
+            self.direct_mapping,
+        );
+        let buffers = buffer_lease.buffers();
+        let end_dispatch = batch
+            .first_dispatch
+            .checked_add(batch.dispatch_count)
+            .ok_or(EncodeError::InvalidSource(
+                "streaming parameter range overflow",
+            ))?;
+        let parameters = self
+            .plan
+            .parameters
+            .get(batch.first_dispatch..end_dispatch)
+            .ok_or(EncodeError::InvalidSource(
+                "streaming parameter range is invalid",
+            ))?;
+        self.context
+            .queue()
+            .write_buffer(&buffers.parameters, 0, bytemuck::cast_slice(parameters));
+        let bind_group = self
+            .context
+            .device()
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jxl-wgpu streamed lossless modular bindings"),
+                layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.source.buffer,
+                            offset: batch.source_binding_offset,
+                            size: Some(batch.source_binding_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffers.artifact.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffers.parameters.as_entire_binding(),
+                    },
+                ],
+            });
+        let mut commands =
+            self.context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu streamed lossless modular encode"),
+                });
+        commands.clear_buffer(&buffers.artifact, 0, None);
+        {
+            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("jxl-wgpu streamed lossless modular tokenization"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                u32::try_from(batch.dispatch_count)
+                    .map_err(|_| EncodeError::InvalidSource("streaming dispatch count overflow"))?,
+                1,
+                1,
+            );
+        }
+        if !self.direct_mapping {
+            commands.copy_buffer_to_buffer(
+                &buffers.artifact,
+                0,
+                &buffers.readback,
+                0,
+                artifact_bytes,
+            );
+        }
+        let completion = Arc::new(MapCompletion::default());
+        let callback_completion = Arc::clone(&completion);
+        let readback_for_map = Arc::clone(&buffers.readback);
+        let lifetime = Arc::new(EncodeJobLifetime {
+            buffer_lease,
+            _memory_permit: memory_permit,
+            mapped: AtomicBool::new(false),
+        });
+        let callback_lifetime = Arc::clone(&lifetime);
+        commands.map_buffer_on_submit(
+            &readback_for_map,
+            wgpu::MapMode::Read,
+            0..artifact_bytes,
+            move |result| {
+                if result.is_ok() {
+                    callback_lifetime.mapped.store(true, Ordering::Release);
+                }
+                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
+                drop(callback_lifetime);
+            },
+        );
+        let poll_permit = self.context.submission_poller().try_reserve()?;
+        let submission_index = self.context.queue().submit([commands.finish()]);
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission_index, move |error| {
+            poll_completion.complete(Err(BackendError::PollWorker(error)));
+        }) {
+            completion.complete(Err(BackendError::PollRegistration(error)));
+        }
+        completion.wait()?;
+        let readback = &lifetime.buffer_lease.buffers().readback;
+        let mapped = readback
+            .slice(0..artifact_bytes)
+            .get_mapped_range()
+            .map_err(BackendError::ArtifactRange)?;
+        let expected = usize::try_from(artifact_bytes)
+            .map_err(|_| EncodeError::Backend("mapped artifact size overflow".into()))?;
+        let bytes = mapped
+            .get(..expected)
+            .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?;
+        let result = inspect(bytes);
+        drop(mapped);
+        readback.unmap();
+        lifetime.mapped.store(false, Ordering::Release);
+        drop(lifetime);
+        result
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_streaming_job_active(cancelled: &AtomicBool) -> Result<(), EncodeError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(BackendError::Invariant("streamed Modular encode was cancelled").into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn streaming_artifact_bytes<'a>(
+    group: &ModularGroupPlan,
+    batch: &ModularDispatchBatch,
+    bytes: &'a [u8],
+) -> Result<&'a [u8], EncodeError> {
+    let start = group
+        .artifact_byte_offset
+        .checked_sub(batch.artifact_byte_offset)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| EncodeError::Backend("streaming artifact offset overflow".into()))?;
+    let end = start
+        .checked_add(
+            usize::try_from(group.output_size)
+                .map_err(|_| EncodeError::Backend("streaming artifact size overflow".into()))?,
+        )
+        .ok_or_else(|| EncodeError::Backend("streaming artifact range overflow".into()))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| EncodeError::Backend("streaming GPU artifact is truncated".into()))
 }
 
 fn event_capacity(pixel_count: usize) -> Result<usize, EncodeError> {
@@ -1074,6 +1572,19 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 "requested Modular depth does not match the source valid bits",
             ));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if plan.memory.streaming {
+            return self.submit_streaming(context, source, plan, request.clone());
+        }
+        #[cfg(target_arch = "wasm32")]
+        if plan.memory.streaming {
+            return Err(UnsupportedFeature::DeviceLimit {
+                name: "browser streamed Modular artifact bytes",
+                required: plan.memory.total_artifact_bytes,
+                available: plan.memory.artifact_storage_bytes,
+            }
+            .into());
+        }
         let memory_permit = context
             .memory_budget()
             .try_reserve(plan.memory.owned_bytes_per_job)?;
@@ -1123,8 +1634,8 @@ impl GpuEncodeBackend for LosslessModularBackend {
                                     binding: 0,
                                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                         buffer: &source.buffer,
-                                        offset: plan.source_binding_offset,
-                                        size: Some(plan.source_binding_size),
+                                        offset: batch.source_binding_offset,
+                                        size: Some(batch.source_binding_size),
                                     }),
                                 },
                                 wgpu::BindGroupEntry {
@@ -1210,24 +1721,26 @@ impl GpuEncodeBackend for LosslessModularBackend {
         }
 
         Ok(LosslessModularJob {
-            lifetime: Some(lifetime),
-            completion,
-            output_size: plan.output_size,
-            group_grid: plan.group_grid,
-            groups: plan.groups,
-            format: plan.format,
-            bits_per_sample: plan.bits_per_sample,
-            width: plan.width,
-            height: plan.height,
-            frame_index: request.frame_index,
-            is_last: request.is_last,
-            header: ModularFrameHeader {
-                animation: request.animation,
-                canvas_width: request.canvas_width,
-                canvas_height: request.canvas_height,
-                options: request.options.clone(),
+            state: LosslessModularJobState::Resident(ResidentLosslessModularJob {
+                lifetime: Some(lifetime),
+                completion,
+                output_size: plan.output_size,
+                group_grid: plan.group_grid,
+                groups: plan.groups,
+                format: plan.format,
+                bits_per_sample: plan.bits_per_sample,
+                width: plan.width,
+                height: plan.height,
+                frame_index: request.frame_index,
                 is_last: request.is_last,
-            },
+                header: ModularFrameHeader {
+                    animation: request.animation,
+                    canvas_width: request.canvas_width,
+                    canvas_height: request.canvas_height,
+                    options: request.options.clone(),
+                    is_last: request.is_last,
+                },
+            }),
         })
     }
 }
@@ -1293,8 +1806,94 @@ impl MapCompletion {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct StreamingCompletion {
+    state: Mutex<StreamingCompletionState>,
+    condition: Condvar,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct StreamingCompletionState {
+    result: Option<Result<GpuFrameArtifacts, EncodeError>>,
+    waker: Option<Waker>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StreamingCompletion {
+    fn complete(&self, result: Result<GpuFrameArtifacts, EncodeError>) {
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.result.is_some() {
+                return;
+            }
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.condition.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll(&self, cx: &Context<'_>) -> Option<Result<GpuFrameArtifacts, EncodeError>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.result.is_none() {
+            state.waker = Some(cx.waker().clone());
+        }
+        state.result.take()
+    }
+
+    fn wait(&self) -> Result<GpuFrameArtifacts, EncodeError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.result.is_none() {
+            state = self
+                .condition
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state
+            .result
+            .take()
+            .expect("streaming completion was checked as present")
+    }
+}
+
 /// Runtime-neutral completion for the concrete GPU lossless profile.
 pub struct LosslessModularJob {
+    state: LosslessModularJobState,
+}
+
+enum LosslessModularJobState {
+    Resident(ResidentLosslessModularJob),
+    #[cfg(not(target_arch = "wasm32"))]
+    Streaming(StreamingLosslessModularJob),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamingLosslessModularJob {
+    completion: Arc<StreamingCompletion>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for StreamingLosslessModularJob {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct ResidentLosslessModularJob {
     lifetime: Option<Arc<EncodeJobLifetime>>,
     completion: Arc<MapCompletion>,
     output_size: u64,
@@ -1332,7 +1931,7 @@ impl Drop for EncodeJobLifetime {
     }
 }
 
-impl LosslessModularJob {
+impl ResidentLosslessModularJob {
     fn finish(
         &mut self,
         mapping: Result<(), BackendError>,
@@ -1381,18 +1980,29 @@ impl GpuEncodeJob for LosslessModularJob {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<GpuFrameArtifacts, EncodeError>> {
-        match self.completion.poll(cx) {
-            Some(result) => Poll::Ready(self.finish(result)),
-            None => Poll::Pending,
+        match &mut self.state {
+            LosslessModularJobState::Resident(job) => match job.completion.poll(cx) {
+                Some(result) => Poll::Ready(job.finish(result)),
+                None => Poll::Pending,
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            LosslessModularJobState::Streaming(job) => match job.completion.poll(cx) {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            },
         }
     }
 
     fn wait(self) -> Result<GpuFrameArtifacts, EncodeError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut job = self;
-            let result = job.completion.wait();
-            job.finish(result)
+            match self.state {
+                LosslessModularJobState::Resident(mut job) => {
+                    let result = job.completion.wait();
+                    job.finish(result)
+                }
+                LosslessModularJobState::Streaming(job) => job.completion.wait(),
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1857,6 +2467,223 @@ struct PacketBuildInput<'a> {
     bytes: &'a [u8],
 }
 
+type RawHistograms = [[u64; RAW_SYMBOLS]; 4];
+type Lz77Histograms = [[u64; LZ77_SYMBOLS]; 4];
+
+fn accumulate_artifact_histograms(
+    channel: usize,
+    artifact: &ValidatedModularArtifact<'_>,
+    aggregate_raw: &mut RawHistograms,
+    aggregate_lz77: &mut Lz77Histograms,
+) -> Result<(), EncodeError> {
+    for (total, count) in aggregate_raw[channel]
+        .iter_mut()
+        .zip(artifact.header.raw_counts)
+    {
+        *total = total
+            .checked_add(u64::from(count))
+            .ok_or_else(|| invalid_gpu_artifact("aggregate raw histogram overflow"))?;
+    }
+    for (total, count) in aggregate_lz77[channel]
+        .iter_mut()
+        .zip(artifact.header.lz77_counts)
+    {
+        *total = total
+            .checked_add(u64::from(count))
+            .ok_or_else(|| invalid_gpu_artifact("aggregate LZ77 histogram overflow"))?;
+    }
+    Ok(())
+}
+
+fn build_prefix_codes(
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    aggregate_raw: &RawHistograms,
+    aggregate_lz77: &Lz77Histograms,
+) -> Result<[PrefixCode; 4], EncodeError> {
+    let channels = usize::try_from(format.channel_count())
+        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+    let unused = PrefixCode::fixed_unused_channel();
+    let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
+    for channel in 0..channels {
+        let transformed_extra_token = u8::from(format != LosslessModularFormat::Gray);
+        let wide_samples = bits_per_sample > 14;
+        let max_raw_token = if wide_samples {
+            RAW_SYMBOLS - 1
+        } else {
+            usize::from(
+                bits_per_sample
+                    .saturating_add(1)
+                    .saturating_add(transformed_extra_token)
+                    .min((RAW_SYMBOLS - 1) as u8),
+            )
+        };
+        codes[channel] = PrefixCode::from_aggregated_counts(
+            &aggregate_raw[channel],
+            &aggregate_lz77[channel],
+            max_raw_token,
+            wide_samples,
+        )?;
+    }
+    Ok(codes)
+}
+
+struct ModularPacketAssembler {
+    width: u32,
+    height: u32,
+    group_grid: LosslessModularGroupGrid,
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    frame: ModularFrameHeader,
+    codes: [PrefixCode; 4],
+    packets: Vec<GroupPacket>,
+    single_group: Option<BitWriter>,
+    token_bit_offset_in_group: u64,
+    next_group: u32,
+}
+
+impl ModularPacketAssembler {
+    fn new(
+        width: u32,
+        height: u32,
+        group_grid: LosslessModularGroupGrid,
+        format: LosslessModularFormat,
+        bits_per_sample: u8,
+        frame: ModularFrameHeader,
+        codes: [PrefixCode; 4],
+    ) -> Result<Self, EncodeError> {
+        let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
+            let mut group = BitWriter::new();
+            write_dc_global(&mut group, &codes, format)?;
+            let token_bit_offset = u64::try_from(group.bit_len())
+                .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
+            (Vec::new(), Some(group), token_bit_offset)
+        } else {
+            let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
+            let mut packets = Vec::with_capacity(layout.toc_entries());
+            let mut dc_global = BitWriter::new();
+            write_dc_global(&mut dc_global, &codes, format)?;
+            dc_global.align_to_byte()?;
+            packets.push(GroupPacket::new(
+                GroupPacketKind::DcGlobal,
+                dc_global.into_bytes(),
+            ));
+            for group in 0..group_grid.lf_groups {
+                packets.push(GroupPacket::new(
+                    GroupPacketKind::DcGroup(group),
+                    Vec::new(),
+                ));
+            }
+            // Lossless Modular has no VarDCT HF-global payload.
+            packets.push(GroupPacket::new(GroupPacketKind::AcGlobal, Vec::new()));
+            (packets, None, 0)
+        };
+        Ok(Self {
+            width,
+            height,
+            group_grid,
+            format,
+            bits_per_sample,
+            frame,
+            codes,
+            packets,
+            single_group,
+            token_bit_offset_in_group,
+            next_group: 0,
+        })
+    }
+
+    fn push_group(
+        &mut self,
+        group_index: u32,
+        artifacts: &[ValidatedModularArtifact<'_>],
+    ) -> Result<(), EncodeError> {
+        if group_index != self.next_group {
+            return Err(EncodeError::Backend(
+                "GPU artifact groups are not in canonical order".into(),
+            ));
+        }
+        let channels = usize::try_from(self.format.channel_count())
+            .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+        if artifacts.len() != channels {
+            return Err(EncodeError::Backend(
+                "GPU group does not contain every Modular channel".into(),
+            ));
+        }
+        if let Some(group) = &mut self.single_group {
+            for (channel, artifact) in artifacts.iter().enumerate() {
+                write_events(group, &self.codes[channel], artifact.events)?;
+            }
+        } else {
+            let mut pass_group = BitWriter::new();
+            // GroupHeader: use the LF-global tree, default weighted predictor, no transforms.
+            pass_group.write_bits(1, 1)?;
+            pass_group.write_bits(1, 1)?;
+            pass_group.write_bits(0, 2)?;
+            for (channel, artifact) in artifacts.iter().enumerate() {
+                write_events(&mut pass_group, &self.codes[channel], artifact.events)?;
+            }
+            pass_group.align_to_byte()?;
+            self.packets.push(GroupPacket::new(
+                GroupPacketKind::AcGroup {
+                    pass: 0,
+                    group: group_index,
+                },
+                pass_group.into_bytes(),
+            ));
+        }
+        self.next_group = self
+            .next_group
+            .checked_add(1)
+            .ok_or_else(|| EncodeError::Backend("Modular group index overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
+        if self.next_group != self.group_grid.groups {
+            return Err(EncodeError::Backend(
+                "GPU artifact stream ended before every Modular group".into(),
+            ));
+        }
+        if let Some(mut group) = self.single_group.take() {
+            let token_bit_end = u64::try_from(group.bit_len())
+                .map_err(|_| EncodeError::Backend("gray8 token length overflow".into()))?;
+            let token_bit_len = token_bit_end
+                .checked_sub(self.token_bit_offset_in_group)
+                .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
+            group.align_to_byte()?;
+            let packets = FramePacketSet::new(
+                frame_header(self.format, &self.frame)?,
+                FrameGroupLayout::new(1, 1, 1)?,
+                [GroupPacket::new(
+                    GroupPacketKind::Single,
+                    group.into_bytes(),
+                )],
+            )?;
+            let acceleration = (self.format == LosslessModularFormat::Gray
+                && self.bits_per_sample == 8)
+                .then(|| GpuAccelerationArtifact::Gray8Prefix {
+                    width: self.width,
+                    height: self.height,
+                    token_bit_offset_in_group: self.token_bit_offset_in_group,
+                    token_bit_len,
+                    raw_prefix: self.codes[0].raw_entries(),
+                    lz77_prefix: self.codes[0].lz77_entries(),
+                });
+            return Ok((packets, acceleration));
+        }
+        let layout = FrameGroupLayout::new(self.group_grid.lf_groups, self.group_grid.groups, 1)?;
+        Ok((
+            FramePacketSet::new(
+                frame_header(self.format, &self.frame)?,
+                layout,
+                self.packets,
+            )?,
+            None,
+        ))
+    }
+}
+
 fn build_packets(
     input: PacketBuildInput<'_>,
 ) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
@@ -1903,126 +2730,36 @@ fn build_packets(
             .ok_or_else(|| EncodeError::Backend("GPU group artifact is truncated".into()))?;
         let artifact =
             parse_group_artifact(plan.width, plan.height, plan.max_events, artifact_bytes)?;
-        for (total, count) in aggregate_raw[channel]
-            .iter_mut()
-            .zip(artifact.header.raw_counts)
-        {
-            *total = total
-                .checked_add(u64::from(count))
-                .ok_or_else(|| invalid_gpu_artifact("aggregate raw histogram overflow"))?;
-        }
-        for (total, count) in aggregate_lz77[channel]
-            .iter_mut()
-            .zip(artifact.header.lz77_counts)
-        {
-            *total = total
-                .checked_add(u64::from(count))
-                .ok_or_else(|| invalid_gpu_artifact("aggregate LZ77 histogram overflow"))?;
-        }
+        accumulate_artifact_histograms(
+            channel,
+            &artifact,
+            &mut aggregate_raw,
+            &mut aggregate_lz77,
+        )?;
         artifacts.push(artifact);
     }
 
-    let unused = PrefixCode::fixed_unused_channel();
-    let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
-    for channel in 0..channels {
-        let transformed_extra_token = u8::from(format != LosslessModularFormat::Gray);
-        let wide_samples = bits_per_sample > 14;
-        let max_raw_token = if wide_samples {
-            RAW_SYMBOLS - 1
-        } else {
-            usize::from(
-                bits_per_sample
-                    .saturating_add(1)
-                    .saturating_add(transformed_extra_token)
-                    .min((RAW_SYMBOLS - 1) as u8),
-            )
-        };
-        codes[channel] = PrefixCode::from_aggregated_counts(
-            &aggregate_raw[channel],
-            &aggregate_lz77[channel],
-            max_raw_token,
-            wide_samples,
-        )?;
+    let codes = build_prefix_codes(format, bits_per_sample, &aggregate_raw, &aggregate_lz77)?;
+    let mut assembler = ModularPacketAssembler::new(
+        width,
+        height,
+        group_grid,
+        format,
+        bits_per_sample,
+        frame.clone(),
+        codes,
+    )?;
+    for group in 0..group_grid.groups {
+        let start = usize::try_from(group)
+            .ok()
+            .and_then(|group| group.checked_mul(channels))
+            .ok_or_else(|| EncodeError::Backend("Modular group index overflow".into()))?;
+        let end = start
+            .checked_add(channels)
+            .ok_or_else(|| EncodeError::Backend("Modular group index overflow".into()))?;
+        assembler.push_group(group, &artifacts[start..end])?;
     }
-    if group_grid.groups == 1 {
-        let mut group = BitWriter::new();
-        write_dc_global(&mut group, &codes, format)?;
-        let token_bit_offset_in_group = u64::try_from(group.bit_len())
-            .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
-        for channel in 0..channels {
-            write_events(&mut group, &codes[channel], artifacts[channel].events)?;
-        }
-        let token_bit_end = u64::try_from(group.bit_len())
-            .map_err(|_| EncodeError::Backend("gray8 token length overflow".into()))?;
-        let token_bit_len = token_bit_end
-            .checked_sub(token_bit_offset_in_group)
-            .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
-        group.align_to_byte()?;
-        let packets = FramePacketSet::new(
-            frame_header(format, frame)?,
-            FrameGroupLayout::new(1, 1, 1)?,
-            [GroupPacket::new(
-                GroupPacketKind::Single,
-                group.into_bytes(),
-            )],
-        )?;
-        let acceleration =
-            (format == LosslessModularFormat::Gray && bits_per_sample == 8).then(|| {
-                GpuAccelerationArtifact::Gray8Prefix {
-                    width,
-                    height,
-                    token_bit_offset_in_group,
-                    token_bit_len,
-                    raw_prefix: codes[0].raw_entries(),
-                    lz77_prefix: codes[0].lz77_entries(),
-                }
-            });
-        return Ok((packets, acceleration));
-    }
-
-    let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
-    let mut packets = Vec::with_capacity(layout.toc_entries());
-    let mut dc_global = BitWriter::new();
-    write_dc_global(&mut dc_global, &codes, format)?;
-    dc_global.align_to_byte()?;
-    packets.push(GroupPacket::new(
-        GroupPacketKind::DcGlobal,
-        dc_global.into_bytes(),
-    ));
-    for group in 0..group_grid.lf_groups {
-        packets.push(GroupPacket::new(
-            GroupPacketKind::DcGroup(group),
-            Vec::new(),
-        ));
-    }
-    // Lossless Modular has no VarDCT HF-global payload.
-    packets.push(GroupPacket::new(GroupPacketKind::AcGlobal, Vec::new()));
-    for group in 0..usize::try_from(group_grid.groups)
-        .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?
-    {
-        let mut pass_group = BitWriter::new();
-        // GroupHeader: use the LF-global tree, default weighted predictor, no transforms.
-        pass_group.write_bits(1, 1)?;
-        pass_group.write_bits(1, 1)?;
-        pass_group.write_bits(0, 2)?;
-        for channel in 0..channels {
-            let artifact = &artifacts[group * channels + channel];
-            write_events(&mut pass_group, &codes[channel], artifact.events)?;
-        }
-        pass_group.align_to_byte()?;
-        packets.push(GroupPacket::new(
-            GroupPacketKind::AcGroup {
-                pass: 0,
-                group: u32::try_from(group)
-                    .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?,
-            },
-            pass_group.into_bytes(),
-        ));
-    }
-    Ok((
-        FramePacketSet::new(frame_header(format, frame)?, layout, packets)?,
-        None,
-    ))
+    assembler.finish()
 }
 
 #[derive(Clone, Copy)]
@@ -2031,12 +2768,10 @@ struct ValidatedModularArtifact<'a> {
     events: &'a [ModularEvent],
 }
 
-fn parse_group_artifact<'a>(
-    width: u32,
-    height: u32,
+fn parse_group_artifact_header(
     max_events: usize,
-    bytes: &'a [u8],
-) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
+    bytes: &[u8],
+) -> Result<ModularArtifactHeader, EncodeError> {
     let header_bytes = bytes
         .get(..std::mem::size_of::<ModularArtifactHeader>())
         .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
@@ -2052,6 +2787,27 @@ fn parse_group_artifact<'a>(
             "GPU emitted more token events than the output allocation".into(),
         ));
     }
+    let required_bytes = event_count
+        .checked_mul(std::mem::size_of::<ModularEvent>())
+        .and_then(|event_bytes| {
+            std::mem::size_of::<ModularArtifactHeader>().checked_add(event_bytes)
+        })
+        .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
+    if bytes.len() < required_bytes {
+        return Err(EncodeError::Backend("GPU event stream is truncated".into()));
+    }
+    Ok(header)
+}
+
+fn parse_group_artifact<'a>(
+    width: u32,
+    height: u32,
+    max_events: usize,
+    bytes: &'a [u8],
+) -> Result<ValidatedModularArtifact<'a>, EncodeError> {
+    let header = parse_group_artifact_header(max_events, bytes)?;
+    let event_count = usize::try_from(header.event_count)
+        .map_err(|_| EncodeError::Backend("GPU event count overflow".into()))?;
     let event_bytes = event_count
         .checked_mul(std::mem::size_of::<ModularEvent>())
         .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
@@ -4319,6 +5075,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streamed_rgb8_16k_panorama_is_exact_and_runtime_neutral() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping streamed 16K GPU encode test: no wgpu adapter");
+            return;
+        };
+        let width = 16_384;
+        let height = 1;
+        let format = LosslessModularFormat::Rgb;
+        let (source, expected) = packed_color_test_source(&context, width, height, format);
+        let encoder = LosslessModularEncoder::new(context);
+        let memory = encoder.memory_plan(&source).unwrap();
+        assert!(memory.streaming);
+        assert!(memory.batch_count > 1);
+        assert!(memory.artifact_storage_bytes < memory.total_artifact_bytes);
+        assert!(memory.peak_source_binding_bytes < memory.source_binding_bytes);
+
+        let encoded = encoder.encode(source.clone()).unwrap();
+        let (size, decoded) = decode_color8(&encoded, format)
+            .unwrap_or_else(|error| panic!("Rust decoder rejected 16K RGB8: {error}"));
+        assert_eq!(size, (width as usize, height as usize));
+        assert_eq!(decoded, expected);
+        if let Some(decoded) = decode_color_with_djxl_if_available(&encoded, format) {
+            assert_eq!(
+                decoded.unwrap_or_else(|error| panic!("djxl rejected 16K RGB8: {error}")),
+                expected
+            );
+        }
+
+        let async_encoded = pollster::block_on(encoder.submit(source).unwrap())
+            .expect("runtime-neutral streamed 16K submission succeeds");
+        assert_eq!(async_encoded, encoded);
     }
 
     #[test]
