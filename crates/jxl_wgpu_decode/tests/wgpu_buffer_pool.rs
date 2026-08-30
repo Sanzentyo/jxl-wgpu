@@ -14,7 +14,7 @@ use jxl_wgpu_decode::{
 mod common;
 
 use common::gpu_gray8_lossless as indexed_gray8;
-const PORTABLE_TRANSIENT_BUFFERS_PER_JOB: u64 = 5;
+const PORTABLE_TRANSIENT_BUFFERS_PER_JOB: u64 = 6;
 
 fn backend() -> Option<WgpuBackend> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -249,7 +249,7 @@ fn byte_count_and_per_key_limits_are_hard_and_clearable() {
     let stats = engine.buffer_pool_stats();
     assert_eq!(stats.idle_buffers, 2);
     assert_eq!(stats.idle_bytes, 32);
-    assert_eq!(stats.evicted, 3);
+    assert_eq!(stats.evicted, 4);
     assert!(stats.idle_bytes <= stats.limits.max_idle_bytes);
     drop(frame);
 
@@ -261,11 +261,11 @@ fn byte_count_and_per_key_limits_are_hard_and_clearable() {
     let trimmed = engine.buffer_pool_stats();
     assert_eq!(trimmed.idle_buffers, 1);
     assert_eq!(trimmed.idle_bytes, 16);
-    assert_eq!(trimmed.evicted, 4);
+    assert_eq!(trimmed.evicted, 5);
 
     assert_eq!(engine.clear_buffer_pool(), 1);
     let cleared = engine.buffer_pool_stats();
     assert_eq!(cleared.idle_buffers, 0);
     assert_eq!(cleared.idle_bytes, 0);
-    assert_eq!(cleared.evicted, 5);
+    assert_eq!(cleared.evicted, 6);
 }

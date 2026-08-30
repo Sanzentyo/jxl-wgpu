@@ -698,6 +698,13 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
                 ..
             }
         ));
+        if (width, height, container) == (513, 257, false) {
+            let stats = session.submission_session().memory_stats();
+            assert!(stats.parallel_group_lanes > 1);
+            assert!(stats.parallel_group_lanes <= 64);
+            assert_eq!(stats.stream_batch_count, 1);
+            assert_eq!(stats.submissions_per_frame, 1);
+        }
         let frame = session
             .next_frame()
             .unwrap_or_else(|error| {
@@ -1234,7 +1241,7 @@ fn indexed_gpu_future_reports_and_releases_bounded_memory() {
     };
     let engine = WgpuSubmissionEngine::with_memory_budget(
         backend.clone(),
-        MemoryBudget::new(NonZeroU64::new(1024 * 1024).unwrap()),
+        MemoryBudget::new(NonZeroU64::new(2 * 1024 * 1024).unwrap()),
     );
     let decoder = GpuDecoder::new(engine);
     let request = GpuOutputRequest::numeric(

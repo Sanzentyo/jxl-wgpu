@@ -41,7 +41,7 @@ fn gradient_i32(north: i32, west: i32, north_west: i32) -> i32 {
 }
 
 fn sample_at(channel: u32, index: u32) -> i32 {
-    return bitcast<i32>(reconstructed[channel * params.sample_count + index]);
+    return bitcast<i32>(reconstruction_load(channel * params.sample_count + index));
 }
 
 fn wp_row_base() -> u32 {
@@ -49,17 +49,20 @@ fn wp_row_base() -> u32 {
 }
 
 fn wp_true_error(index: u32) -> i32 {
-    return bitcast<i32>(reconstructed[wp_row_base() + index]);
+    return bitcast<i32>(reconstruction_load(wp_row_base() + index));
 }
 
 fn wp_subpred_error(index: u32, component: u32) -> u32 {
-    return reconstructed[wp_row_base() + params.width + index * 4u + component];
+    return reconstruction_load(wp_row_base() + params.width + index * 4u + component);
 }
 
 fn wp_store_row(index: u32, true_error: i32, errors: array<u32, 4>) {
-    reconstructed[wp_row_base() + index] = bitcast<u32>(true_error);
+    reconstruction_store(wp_row_base() + index, bitcast<u32>(true_error));
     for (var component = 0u; component < 4u; component += 1u) {
-        reconstructed[wp_row_base() + params.width + index * 4u + component] = errors[component];
+        reconstruction_store(
+            wp_row_base() + params.width + index * 4u + component,
+            errors[component],
+        );
     }
 }
 
@@ -452,7 +455,10 @@ fn decode_adaptive_channel() -> u32 {
             decode_error = ERROR_RAW_TOKEN;
             break;
         }
-        reconstructed[current_channel * params.sample_count + decoded] = bitcast<u32>(sample);
+        reconstruction_store(
+            current_channel * params.sample_count + decoded,
+            bitcast<u32>(sample),
+        );
         if params.needs_self_correcting != 0u {
             weighted_record(weighted, sample);
         }
@@ -465,4 +471,3 @@ fn decode_adaptive_channel() -> u32 {
     }
     return decoded;
 }
-

@@ -190,14 +190,14 @@ fn entropy_window_base() -> u32 {
 }
 
 fn entropy_copy_value() -> u32 {
-    let value = reconstructed[entropy_window_base() + (entropy_copy_position & 0xfffffu)];
+    let value = reconstruction_load(entropy_window_base() + (entropy_copy_position & 0xfffffu));
     entropy_copy_position += 1u;
     entropy_copy_remaining -= 1u;
     return value;
 }
 
 fn entropy_record_value(value: u32) {
-    reconstructed[entropy_window_base() + (entropy_decoded & 0xfffffu)] = value;
+    reconstruction_store(entropy_window_base() + (entropy_decoded & 0xfffffu), value);
     entropy_decoded += 1u;
 }
 

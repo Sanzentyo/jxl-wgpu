@@ -30,7 +30,7 @@ struct Params {
     chroma_height: u32,
     logical_size: u32,
     numeric_mapping: u32,
-    _padding: u32,
+    status_index: u32,
     stream_index: u32,
     wp_p1: u32,
     wp_p2: u32,
@@ -45,17 +45,27 @@ struct Params {
     wp_w3: u32,
 };
 
+struct DispatchControl {
+    first_group: u32,
+    group_count: u32,
+    lane_stride_words: u32,
+    _padding: u32,
+};
+
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
 @group(0) @binding(1) var<storage, read> modular_metadata: array<u32>;
 @group(0) @binding(2) var<storage, read_write> reconstructed: array<u32>;
-@group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_words: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> status: array<u32>;
-@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read> params_table: array<Params>;
 /*__JXL_F64_BINDING__*/
+@group(0) @binding(7) var<uniform> dispatch_control: DispatchControl;
 
 var<private> bit_cursor: u32;
 var<private> decode_error: u32;
 var<private> current_channel: u32;
+var<private> reconstruction_base: u32;
+var<private> params: Params;
 
 const STATUS_OK: u32 = 1u;
 const ERROR_TRUNCATED_BITS: u32 = 2u;
@@ -70,6 +80,14 @@ const ERROR_ANS_STATE: u32 = 10u;
 const ERROR_ENTROPY_CLUSTER: u32 = 11u;
 const ERROR_MA_TREE: u32 = 12u;
 const ERROR_PREDICTOR: u32 = 13u;
+
+fn reconstruction_load(index: u32) -> u32 {
+    return reconstructed[reconstruction_base + index];
+}
+
+fn reconstruction_store(index: u32, value: u32) {
+    reconstructed[reconstruction_base + index] = value;
+}
 
 fn bit_mask(count: u32) -> u32 {
     if count == 0u {
@@ -109,53 +127,12 @@ fn read_bits(count: u32) -> u32 {
 
 /*__JXL_MODULAR_ENTROPY__*/
 
-fn read_prefix_symbol() -> u32 {
-    if decode_error != 0u || bit_cursor >= params.token_end {
-        decode_error = ERROR_TRUNCATED_BITS;
-        return 0xffffffffu;
-    }
-    let available = min(15u, params.token_end - bit_cursor);
-    let lookup_index = peek_bits(available);
-    let table_offset = current_channel << 15u;
-    let entry = modular_metadata[table_offset + lookup_index];
-    let bit_len = entry & 0xffu;
-    if bit_len == 0u || bit_len > available {
-        decode_error = ERROR_PREFIX;
-        return 0xffffffffu;
-    }
-    bit_cursor = bit_cursor + bit_len;
-    return entry >> 8u;
-}
-
-fn decode_raw_hybrid(token: u32) -> u32 {
-    if token == 0u {
-        return 0u;
-    }
-    if token >= 19u {
-        decode_error = ERROR_RAW_TOKEN;
-        return 0u;
-    }
-    let extra_count = token - 1u;
-    return (1u << extra_count) + read_bits(extra_count);
-}
-
-fn decode_lz77_hybrid(token: u32) -> u32 {
-    if token < 16u {
-        return token;
-    }
-    if token >= 33u {
-        decode_error = ERROR_LZ77_LENGTH;
-        return 0u;
-    }
-    let extra_count = token - 12u;
-    return (1u << extra_count) + read_bits(extra_count);
-}
-
 fn unpack_signed(value: u32) -> i32 {
     if (value & 1u) == 0u {
         return i32(value >> 1u);
     }
-    return -i32((value + 1u) >> 1u);
+    let magnitude = (value >> 1u) + 1u;
+    return bitcast<i32>(0u - magnitude);
 }
 
 fn write_byte(offset: u32, value: u32) {
@@ -166,7 +143,15 @@ fn write_byte(offset: u32, value: u32) {
     let word_index = offset >> 2u;
     let shift = (offset & 3u) << 3u;
     let mask = 0xffu << shift;
-    output_words[word_index] = (output_words[word_index] & ~mask) | ((value & 0xffu) << shift);
+    var previous = atomicLoad(&output_words[word_index]);
+    loop {
+        let updated = (previous & ~mask) | ((value & 0xffu) << shift);
+        let exchange = atomicCompareExchangeWeak(&output_words[word_index], previous, updated);
+        if exchange.exchanged {
+            break;
+        }
+        previous = exchange.old_value;
+    }
 }
 
 fn write_word(offset: u32, value: u32) {
@@ -178,7 +163,7 @@ fn write_word(offset: u32, value: u32) {
         decode_error = ERROR_OUTPUT_BOUNDS;
         return;
     }
-    output_words[offset >> 2u] = value;
+    atomicStore(&output_words[offset >> 2u], value);
 }
 
 fn write_stored_code(offset: u32, code: u32) {
@@ -220,13 +205,13 @@ fn write_native_pixel(x: u32, y: u32, index: u32) {
         + y * params.plane0_stride
         + x * params.channels * bytes_per_component;
     if params.source_channels == 1u {
-        write_native_code(pixel_offset, bitcast<i32>(reconstructed[index]));
+        write_native_code(pixel_offset, bitcast<i32>(reconstruction_load(index)));
         return;
     }
 
-    let y_value = bitcast<i32>(reconstructed[index]);
-    let co = bitcast<i32>(reconstructed[params.sample_count + index]);
-    let cg = bitcast<i32>(reconstructed[2u * params.sample_count + index]);
+    let y_value = bitcast<i32>(reconstruction_load(index));
+    let co = bitcast<i32>(reconstruction_load(params.sample_count + index));
+    let cg = bitcast<i32>(reconstruction_load(2u * params.sample_count + index));
     let temporary = y_value - (cg >> 1u);
     let green = cg + temporary;
     let blue = temporary - (co >> 1u);
@@ -235,7 +220,7 @@ fn write_native_pixel(x: u32, y: u32, index: u32) {
     write_native_code(pixel_offset + bytes_per_component, green);
     write_native_code(pixel_offset + 2u * bytes_per_component, blue);
     if params.source_channels == 4u {
-        let alpha = bitcast<i32>(reconstructed[3u * params.sample_count + index]);
+        let alpha = bitcast<i32>(reconstruction_load(3u * params.sample_count + index));
         write_native_code(pixel_offset + 3u * bytes_per_component, alpha);
     }
 }
@@ -447,45 +432,6 @@ fn write_output_sample(x: u32, y: u32, sample: u32) {
     }
 }
 
-fn emit_token(index: u32, packed: u32) {
-    let x = index % params.width;
-    let y = index / params.width;
-    let channel_base = current_channel * params.sample_count;
-    var left = 0i;
-    var top = 0i;
-    var top_left = 0i;
-    if x > 0u {
-        left = bitcast<i32>(reconstructed[channel_base + index - 1u]);
-    } else if y > 0u {
-        left = bitcast<i32>(reconstructed[channel_base + index - params.width]);
-    }
-    if y == 0u {
-        top = left;
-        top_left = left;
-    } else {
-        top = bitcast<i32>(reconstructed[channel_base + index - params.width]);
-        if x == 0u {
-            top_left = top;
-        } else {
-            top_left = bitcast<i32>(
-                reconstructed[channel_base + index - params.width - 1u]
-            );
-        }
-    }
-    let gradient = left + top - top_left;
-    let prediction = clamp(gradient, min(left, top), max(left, top));
-    let sample = prediction + unpack_signed(packed);
-    let maximum = i32(params.source_mask);
-    let signed_transform_channel = params.source_channels >= 3u
-        && (current_channel == 1u || current_channel == 2u);
-    if (!signed_transform_channel && (sample < 0i || sample > maximum))
-        || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
-        decode_error = ERROR_RAW_TOKEN;
-        return;
-    }
-    reconstructed[channel_base + index] = bitcast<u32>(sample);
-}
-
 fn finalize_output() {
     if params.source_channels != 1u || params.output_kind == 9u {
         if params.output_kind != 9u {
@@ -504,7 +450,7 @@ fn finalize_output() {
         for (var index = 0u; index < params.sample_count; index += 1u) {
             let x = params.origin_x + index % params.width;
             let y = params.origin_y + index / params.width;
-            write_output_sample(x, y, reconstructed[index]);
+            write_output_sample(x, y, reconstruction_load(index));
         }
     }
     if params.output_kind == 2u && params.initialize_chroma != 0u {
@@ -539,8 +485,8 @@ fn finalize_output() {
             for (var pair = 0u; pair < pair_count; pair += 1u) {
                 let x0 = pair * 2u;
                 let x1 = min(x0 + 1u, params.width - 1u);
-                let y0 = color_code(reconstructed[y * params.width + x0]);
-                let y1 = color_code(reconstructed[y * params.width + x1]);
+                let y0 = color_code(reconstruction_load(y * params.width + x0));
+                let y1 = color_code(reconstruction_load(y * params.width + x1));
                 var packed = y0 | (neutral << 8u) | (y1 << 16u) | (neutral << 24u);
                 if params.order == 1u {
                     packed = neutral | (y0 << 8u) | (neutral << 16u) | (y1 << 24u);
@@ -556,66 +502,16 @@ fn finalize_output() {
     }
 }
 
-fn decode_channel() -> u32 {
-    var decoded = 0u;
-    // The profile's RLE code may begin the stream. Its implicit distance-one history is zero.
-    var last_token = 0u;
-
-    while decoded < params.sample_count && decode_error == 0u {
-        let symbol = read_prefix_symbol();
-        if symbol == 0u {
-            // With LZ77 enabled raw zero is an escape candidate. The encoder emits its LZ77
-            // length code immediately afterwards; otherwise zero remains an ordinary literal.
-            let after_zero = bit_cursor;
-            var following = 0xffffffffu;
-            if bit_cursor < params.token_end {
-                following = read_prefix_symbol();
-            }
-            if following >= 224u && following < 257u {
-                let run_value = decode_lz77_hybrid(following - 224u);
-                let run_count = run_value + 8u;
-                if decode_error != 0u || run_count > params.sample_count - decoded {
-                    decode_error = ERROR_LZ77_LENGTH;
-                    break;
-                }
-                for (var copied = 0u; copied < run_count; copied = copied + 1u) {
-                    emit_token(decoded, 0u);
-                    decoded = decoded + 1u;
-                }
-                last_token = 0u;
-            } else {
-                bit_cursor = after_zero;
-                decode_error = 0u;
-                emit_token(decoded, 0u);
-                decoded = decoded + 1u;
-                last_token = 0u;
-            }
-        } else if symbol < 19u {
-            let packed = decode_raw_hybrid(symbol);
-            if decode_error == 0u {
-                emit_token(decoded, packed);
-                decoded = decoded + 1u;
-                last_token = packed;
-            }
-        } else if symbol >= 224u && symbol < 257u {
-            if last_token != 0u {
-                decode_error = ERROR_LZ77_STATE;
-                break;
-            }
-            // An LZ77 symbol must be consumed together with the preceding raw-zero escape.
-            decode_error = ERROR_LZ77_STATE;
-            break;
-        } else {
-            decode_error = ERROR_PREFIX;
-        }
-    }
-    return decoded;
-}
-
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
 @compute @workgroup_size(1)
-fn decode() {
+fn decode(@builtin(workgroup_id) workgroup_id: vec3<u32>) {
+    if workgroup_id.x >= dispatch_control.group_count {
+        return;
+    }
+    let group_index = dispatch_control.first_group + workgroup_id.x;
+    params = params_table[group_index];
+    reconstruction_base = workgroup_id.x * dispatch_control.lane_stride_words;
     bit_cursor = params.token_start;
     decode_error = 0u;
     current_channel = 0u;
@@ -639,12 +535,13 @@ fn decode() {
     if decode_error == 0u {
         finalize_output();
     }
+    let status_base = params.status_index * 4u;
     if decode_error == 0u {
-        status[0] = STATUS_OK;
+        status[status_base] = STATUS_OK;
     } else {
-        status[0] = decode_error;
+        status[status_base] = decode_error;
     }
-    status[1] = decoded;
-    status[2] = bit_cursor;
-    status[3] = params.token_end;
+    status[status_base + 1u] = decoded;
+    status[status_base + 2u] = bit_cursor;
+    status[status_base + 3u] = params.token_end;
 }

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -64,6 +64,7 @@ const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
 const TARGET_STREAM_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PARALLEL_GROUP_LANES: usize = 64;
 
 /// Conservative GPU allocation accounting for the stock decoder's bounded frame window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub struct WgpuDecodeMemoryStats {
     pub stream_batch_count: usize,
     /// Actual codec queue submissions per decoded frame.
     pub submissions_per_frame: usize,
+    /// Scratch-isolated Modular groups decoded concurrently by one compute dispatch.
+    pub parallel_group_lanes: usize,
 }
 
 /// F64 production path resolved for one output request.
@@ -133,7 +136,7 @@ struct ShaderParams {
     chroma_height: u32,
     logical_size: u32,
     numeric_mapping: u32,
-    _padding: u32,
+    status_index: u32,
     stream_index: u32,
     wp_p1: u32,
     wp_p2: u32,
@@ -146,6 +149,16 @@ struct ShaderParams {
     wp_w1: u32,
     wp_w2: u32,
     wp_w3: u32,
+}
+
+/// CPU/WGSL ABI selecting one bounded parallel group wave.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DispatchControl {
+    first_group: u32,
+    group_count: u32,
+    lane_stride_words: u32,
+    _padding: u32,
 }
 
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
@@ -380,16 +393,23 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             Some(F64OutputPath::ExactF32Widening) | None => Arc::clone(&self.pipeline),
         };
         let f64_output_path = output.f64_output_path;
-        let dispatch_layout =
-            GroupDispatchLayout::new(self.backend.device(), codestream.bytes(), &profile)?;
+        let memory_limit_bytes = self.memory.snapshot().limit_bytes;
+        let dispatch_layout = GroupDispatchLayout::new(
+            self.backend.device(),
+            codestream.bytes(),
+            &profile,
+            &modular_metadata,
+            &output,
+            request.max_frame_slots().get(),
+            memory_limit_bytes,
+        )?;
         let memory_stats = validate_device_limits(
             self.backend.device(),
-            &profile,
             &modular_metadata,
             &dispatch_layout,
             &output,
             request.max_frame_slots().get(),
-            self.memory.snapshot().limit_bytes,
+            memory_limit_bytes,
         )?;
         let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
             .expect("device admission always resolves at least one frame slot");
@@ -720,6 +740,7 @@ struct DecodeJobLifetime {
     status_staging: DecodeBufferLease,
     status_mapped: AtomicBool,
     _params: DecodeBufferLease,
+    _dispatch_control: DecodeBufferLease,
     output_permit: MemoryPermit,
     _transient_permit: MemoryPermit,
 }
@@ -742,7 +763,8 @@ struct DecodeMemoryPermits {
 
 #[derive(Clone, Debug)]
 struct GroupDispatchLayout {
-    reconstructed_offsets: Arc<[u64]>,
+    reconstruction_lane_stride: u64,
+    parallel_group_lanes: usize,
     reconstructed_bytes: u64,
     stream_windows: Arc<[GroupStreamWindow]>,
     stream_batches: Arc<[std::ops::Range<usize>]>,
@@ -767,47 +789,104 @@ impl GroupDispatchLayout {
         device: &wgpu::Device,
         codestream: &[u8],
         profile: &StandardModularProfile,
+        modular_metadata: &[u32],
+        output: &OutputPlan,
+        requested_frame_slots: usize,
+        memory_limit_bytes: u64,
     ) -> Result<Self> {
         let limits = device.limits();
-        let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(4));
-        let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(16));
-        let mut reconstructed_offsets = Vec::with_capacity(profile.groups.len());
-        let mut reconstructed_bytes = 0u64;
+        let mut reconstruction_lane_stride = 0u64;
         for group in &profile.groups {
-            // Group dispatches are encoded in one compute pass and execute in submission order.
-            // Each dispatch finishes reconstruction and writes its canvas tile before the next
-            // dispatch reuses this scratch allocation, so retaining every group's i32/LZ state
-            // concurrently only inflates memory without adding parallelism.
-            reconstructed_offsets.push(0);
-            reconstructed_bytes =
-                reconstructed_bytes.max(group_reconstructed_bytes(profile, *group)?);
+            reconstruction_lane_stride = reconstruction_lane_stride
+                .max(align4(group_reconstructed_bytes(profile, *group)?)?);
         }
-        reconstructed_bytes = align_to(align4(reconstructed_bytes)?, storage_alignment)?;
+        if reconstruction_lane_stride == 0 {
+            return Err(Error::backend("Modular reconstruction lane is empty"));
+        }
         let stream_limit = limits
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size)
             .min(TARGET_STREAM_BATCH_BYTES);
-        let (stream_windows, stream_batches, stream_bytes) =
-            build_stream_batches(codestream, &profile.groups, stream_limit)?;
         let group_count = u64::try_from(profile.groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
-        let status_stride = align_to(STATUS_BYTES, storage_alignment)?;
+        let status_stride = STATUS_BYTES;
         let status_bytes = status_stride
-            .checked_mul(group_count.saturating_sub(1))
-            .and_then(|bytes| bytes.checked_add(STATUS_BYTES))
-            .and_then(|bytes| align4(bytes).ok())
+            .checked_mul(group_count)
             .ok_or_else(|| Error::backend("group status buffer size overflow"))?;
-        let params_stride = align_to(
-            std::mem::size_of::<ShaderParams>() as u64,
-            uniform_alignment,
-        )?;
+        let params_stride = std::mem::size_of::<ShaderParams>() as u64;
         let params_bytes = params_stride
-            .checked_mul(group_count.saturating_sub(1))
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ShaderParams>() as u64))
-            .and_then(|bytes| align4(bytes).ok())
+            .checked_mul(group_count)
             .ok_or_else(|| Error::backend("group parameter buffer size overflow"))?;
+        let fixed_bytes = [
+            modular_metadata_bytes(modular_metadata)?,
+            align4(output.layout.logical_size)?,
+            if output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
+                NATIVE_F64_DUMMY_WORD_BYTES
+            } else {
+                0
+            },
+            status_bytes,
+            status_bytes,
+            params_bytes,
+            std::mem::size_of::<DispatchControl>() as u64,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| Error::backend("parallel Modular fixed memory size overflow"))?;
+        let device_lane_cap = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size)
+            / reconstruction_lane_stride;
+        let device_lane_cap = usize::try_from(device_lane_cap).unwrap_or(usize::MAX);
+        let workgroup_cap =
+            usize::try_from(limits.max_compute_workgroups_per_dimension).unwrap_or(usize::MAX);
+        let lane_cap = MAX_PARALLEL_GROUP_LANES
+            .min(profile.groups.len())
+            .min(device_lane_cap)
+            .min(workgroup_cap);
+        if lane_cap == 0 {
+            return Err(Error::backend(
+                "device limits cannot bind one Modular reconstruction lane",
+            ));
+        }
+        let requested_slots = u64::try_from(requested_frame_slots.max(1))
+            .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
+        let requested_target = memory_limit_bytes / requested_slots;
+        let selected = match select_parallel_group_layout(
+            codestream,
+            &profile.groups,
+            stream_limit,
+            lane_cap,
+            reconstruction_lane_stride,
+            fixed_bytes,
+            requested_target,
+        )? {
+            Some(selected) => Some(selected),
+            None => {
+            select_parallel_group_layout(
+                codestream,
+                &profile.groups,
+                stream_limit,
+                lane_cap,
+                reconstruction_lane_stride,
+                fixed_bytes,
+                memory_limit_bytes,
+            )
+            ?
+            }
+        }
+        .ok_or_else(|| {
+            Error::backend(format!(
+                "one bounded Modular lane plus fixed allocations exceeds the shared {memory_limit_bytes}-byte budget"
+            ))
+        })?;
+        let (parallel_group_lanes, stream_windows, stream_batches, stream_bytes) = selected;
+        let reconstructed_bytes = reconstruction_lane_stride
+            .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
+            .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
         Ok(Self {
-            reconstructed_offsets: reconstructed_offsets.into(),
+            reconstruction_lane_stride,
+            parallel_group_lanes,
             reconstructed_bytes,
             stream_windows: stream_windows.into(),
             stream_batches: stream_batches.into(),
@@ -824,7 +903,13 @@ fn build_stream_batches(
     codestream: &[u8],
     groups: &[ModularGroup],
     stream_limit: u64,
+    max_groups_per_batch: usize,
 ) -> Result<(Vec<GroupStreamWindow>, Vec<std::ops::Range<usize>>, u64)> {
+    if max_groups_per_batch == 0 {
+        return Err(Error::backend(
+            "bounded Modular stream batch has zero group lanes",
+        ));
+    }
     if stream_limit < STREAM_SENTINEL_BYTES + 4 {
         return Err(Error::backend(
             "device storage limit is too small for a bounded Modular stream window",
@@ -857,7 +942,9 @@ fn build_stream_batches(
             .and_then(|bytes| align4(bytes).ok())
             .and_then(|bytes| bytes.checked_add(STREAM_SENTINEL_BYTES))
             .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
-        if batch_bytes > stream_limit && index != batch_start {
+        if index != batch_start
+            && (batch_bytes > stream_limit || index - batch_start >= max_groups_per_batch)
+        {
             batches.push(batch_start..index);
             maximum_batch_bytes = maximum_batch_bytes.max(
                 align4(upload_cursor)?
@@ -913,6 +1000,46 @@ fn build_stream_batches(
     Ok((windows, batches, maximum_batch_bytes))
 }
 
+type ParallelGroupLayout = (
+    usize,
+    Vec<GroupStreamWindow>,
+    Vec<std::ops::Range<usize>>,
+    u64,
+);
+
+fn select_parallel_group_layout(
+    codestream: &[u8],
+    groups: &[ModularGroup],
+    stream_limit: u64,
+    lane_cap: usize,
+    lane_stride: u64,
+    fixed_bytes: u64,
+    per_frame_target: u64,
+) -> Result<Option<ParallelGroupLayout>> {
+    let available = match per_frame_target.checked_sub(fixed_bytes) {
+        Some(available) => available,
+        None => return Ok(None),
+    };
+    let budget_lane_cap = usize::try_from(available / lane_stride).unwrap_or(usize::MAX);
+    let mut lanes = lane_cap.min(budget_lane_cap);
+    while lanes != 0 {
+        let (windows, batches, stream_bytes) =
+            build_stream_batches(codestream, groups, stream_limit, lanes)?;
+        let scratch_bytes = lane_stride
+            .checked_mul(u64::try_from(lanes).unwrap_or(u64::MAX))
+            .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
+        let required = fixed_bytes
+            .checked_add(stream_bytes)
+            .and_then(|bytes| bytes.checked_add(scratch_bytes))
+            .ok_or_else(|| Error::backend("parallel Modular memory target overflow"))?;
+        if required <= per_frame_target {
+            return Ok(Some((lanes, windows, batches, stream_bytes)));
+        }
+        lanes -= 1;
+    }
+    Ok(None)
+}
+
 fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGroup) -> Result<u64> {
     const LZ77_WINDOW_WORDS: u64 = 1 << 20;
     let sample_words = u64::from(group.sample_count()?)
@@ -935,6 +1062,13 @@ fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGro
         .and_then(|words| words.checked_add(entropy_words))
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))
+}
+
+fn modular_metadata_bytes(metadata: &[u32]) -> Result<u64> {
+    u64::try_from(metadata.len())
+        .ok()
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u32>() as u64))
+        .ok_or_else(|| Error::backend("Modular metadata size overflow"))
 }
 
 #[repr(u32)]
@@ -1304,7 +1438,6 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
 
 fn validate_device_limits(
     device: &wgpu::Device,
-    profile: &StandardModularProfile,
     modular_metadata: &[u32],
     dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
@@ -1314,11 +1447,9 @@ fn validate_device_limits(
     let storage_limit = device.limits().max_storage_buffer_binding_size;
     let buffer_limit = device.limits().max_buffer_size;
     let stream_bytes = dispatch.stream_bytes;
-    let metadata_bytes = u64::try_from(modular_metadata.len())
-        .ok()
-        .and_then(|words| words.checked_mul(4))
-        .ok_or_else(|| Error::backend("Modular metadata size overflow"))?;
+    let metadata_bytes = modular_metadata_bytes(modular_metadata)?;
     let output_bytes = align4(output.layout.logical_size)?;
+    let dispatch_control_bytes = std::mem::size_of::<DispatchControl>() as u64;
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
         NATIVE_F64_DUMMY_WORD_BYTES
@@ -1328,7 +1459,13 @@ fn validate_device_limits(
     for (name, required) in [
         ("bounded group stream window", stream_bytes),
         ("Modular metadata", metadata_bytes),
+        (
+            "parallel reconstructed samples",
+            dispatch.reconstructed_bytes,
+        ),
         ("requested output", output_bytes),
+        ("group statuses", dispatch.status_bytes),
+        ("group parameters", dispatch.params_bytes),
     ] {
         if required > storage_limit || required > buffer_limit {
             return Err(Error::backend(format!(
@@ -1336,24 +1473,20 @@ fn validate_device_limits(
             )));
         }
     }
-    if profile.groups.iter().any(|group| {
-        group_reconstructed_bytes(profile, *group).map_or(true, |bytes| bytes > storage_limit)
-    }) {
-        return Err(Error::backend(
-            "a Modular group reconstruction binding exceeds the device storage-binding limit",
-        ));
-    }
     for (name, required) in [
-        ("reconstructed samples", dispatch.reconstructed_bytes),
-        ("group statuses", dispatch.status_bytes),
         ("group status readback", dispatch.status_bytes),
-        ("group parameters", dispatch.params_bytes),
+        ("parallel dispatch control", dispatch_control_bytes),
     ] {
         if required > buffer_limit {
             return Err(Error::backend(format!(
                 "{name} buffer requires {required} bytes, exceeding the device buffer limit"
             )));
         }
+    }
+    if dispatch_control_bytes > device.limits().max_uniform_buffer_binding_size {
+        return Err(Error::backend(
+            "parallel dispatch control exceeds the device uniform-binding limit",
+        ));
     }
     let per_frame = [
         stream_bytes,
@@ -1364,6 +1497,7 @@ fn validate_device_limits(
         dispatch.status_bytes,
         dispatch.status_bytes,
         dispatch.params_bytes,
+        dispatch_control_bytes,
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1393,6 +1527,7 @@ fn validate_device_limits(
         max_frame_window_bytes,
         stream_batch_count: dispatch.stream_batches.len(),
         submissions_per_frame: dispatch.stream_batches.len(),
+        parallel_group_lanes: dispatch.parallel_group_lanes,
     })
 }
 
@@ -1479,12 +1614,12 @@ fn submit_decode(
         wgpu::COPY_BUFFER_ALIGNMENT,
     );
 
-    let params_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+    let params_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     let params_buffer = buffers.checkout(
         "jxl-wgpu decode Modular parameters",
         source.dispatch_layout.params_bytes,
         params_usage,
-        16,
+        std::mem::align_of::<u32>() as u64,
     );
     let mut params_upload = vec![
         0u8;
@@ -1499,10 +1634,13 @@ fn submit_decode(
         .zip(source.dispatch_layout.stream_windows.iter())
         .enumerate()
     {
+        let status_index = u32::try_from(index)
+            .map_err(|_| Error::backend("group status index exceeds WGSL u32"))?;
         let params = build_params(
             group,
             window.token_start,
             window.token_end,
+            status_index,
             &source.profile,
             &source.output,
             index == 0,
@@ -1524,82 +1662,59 @@ fn submit_decode(
         .queue()
         .write_buffer(params_buffer.buffer(), 0, &params_upload);
 
+    let dispatch_control = buffers.checkout(
+        "jxl-wgpu decode Modular dispatch control",
+        std::mem::size_of::<DispatchControl>() as u64,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        std::mem::align_of::<DispatchControl>() as u64,
+    );
+
     let word_output_binding = native_f64_dummy_words.as_ref().map_or_else(
         || output.as_entire_binding(),
         |buffer| buffer.buffer().as_entire_binding(),
     );
     let bind_group_layout = pipeline.get_bind_group_layout(0);
-    let mut bindings = Vec::with_capacity(source.profile.groups.len());
-    for (group_index, group) in source.profile.groups.iter().enumerate() {
-        let index = u64::try_from(group_index)
-            .map_err(|_| Error::backend("group binding index exceeds u64"))?;
-        let reconstructed_offset = *source
-            .dispatch_layout
-            .reconstructed_offsets
-            .get(group_index)
-            .ok_or_else(|| Error::backend("missing group reconstruction offset"))?;
-        let reconstructed_size =
-            NonZeroU64::new(group_reconstructed_bytes(&source.profile, *group)?)
-                .ok_or_else(|| Error::backend("invalid group reconstruction binding size"))?;
-        let status_offset = index
-            .checked_mul(source.dispatch_layout.status_stride)
-            .ok_or_else(|| Error::backend("group status binding offset overflow"))?;
-        let params_offset = index
-            .checked_mul(source.dispatch_layout.params_stride)
-            .ok_or_else(|| Error::backend("group parameter binding offset overflow"))?;
-        let reconstructed_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: reconstructed.buffer(),
-            offset: reconstructed_offset,
-            size: Some(reconstructed_size),
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: stream.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: metadata_buffer.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: reconstructed.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: word_output_binding,
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: status.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: params_buffer.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 7,
+            resource: dispatch_control.buffer().as_entire_binding(),
+        },
+    ];
+    if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
+        entries.push(wgpu::BindGroupEntry {
+            binding: 6,
+            resource: output.as_entire_binding(),
         });
-        let status_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: status.buffer(),
-            offset: status_offset,
-            size: NonZeroU64::new(STATUS_BYTES),
-        });
-        let params_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: params_buffer.buffer(),
-            offset: params_offset,
-            size: NonZeroU64::new(std::mem::size_of::<ShaderParams>() as u64),
-        });
-        let mut entries = vec![
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: stream.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: metadata_buffer.buffer().as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: reconstructed_binding,
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: word_output_binding.clone(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: status_binding,
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: params_binding,
-            },
-        ];
-        if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 6,
-                resource: output.as_entire_binding(),
-            });
-        }
-        bindings.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu decode Modular group bindings"),
-            layout: &bind_group_layout,
-            entries: &entries,
-        }));
     }
+    let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("jxl-wgpu decode parallel Modular group bindings"),
+        layout: &bind_group_layout,
+        entries: &entries,
+    });
     let completion = Arc::new(MapCompletion::default());
     let lifetime = Arc::new(DecodeJobLifetime {
         output: Arc::clone(&output),
@@ -1610,6 +1725,7 @@ fn submit_decode(
         status_staging,
         status_mapped: AtomicBool::new(false),
         _params: params_buffer,
+        _dispatch_control: dispatch_control,
         output_permit: memory_permits.output,
         _transient_permit: memory_permits.transient,
     });
@@ -1638,6 +1754,20 @@ fn submit_decode(
                 .copy_from_slice(input);
         }
         backend.queue().write_buffer(&stream, 0, &stream_upload);
+        let control = DispatchControl {
+            first_group: u32::try_from(batch.start)
+                .map_err(|_| Error::backend("batch group index exceeds WGSL u32"))?,
+            group_count: u32::try_from(batch.len())
+                .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))?,
+            lane_stride_words: u32::try_from(source.dispatch_layout.reconstruction_lane_stride / 4)
+                .map_err(|_| Error::backend("reconstruction lane stride exceeds WGSL u32"))?,
+            _padding: 0,
+        };
+        backend.queue().write_buffer(
+            lifetime._dispatch_control.buffer(),
+            0,
+            bytemuck::bytes_of(&control),
+        );
 
         let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu decode bounded Modular batch"),
@@ -1656,13 +1786,8 @@ fn submit_decode(
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            for binding in bindings
-                .get(batch.clone())
-                .ok_or_else(|| Error::backend("group binding batch range is truncated"))?
-            {
-                pass.set_bind_group(0, binding, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
+            pass.set_bind_group(0, &binding, &[]);
+            pass.dispatch_workgroups(control.group_count, 1, 1);
         }
         let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
         if final_batch {
@@ -1738,6 +1863,7 @@ fn build_params(
     group: ModularGroup,
     token_start: u32,
     token_end: u32,
+    status_index: u32,
     profile: &StandardModularProfile,
     output: &OutputPlan,
     initialize_chroma: bool,
@@ -1790,7 +1916,7 @@ fn build_params(
         chroma_height: chroma.map_or(0, |plane| plane.sample_extent.height),
         logical_size: to_u32(output.layout.logical_size, "output logical size")?,
         numeric_mapping: output.numeric_mapping,
-        _padding: 0,
+        status_index,
         stream_index: group.stream_index,
         wp_p1: profile.wp_header.p1,
         wp_p2: profile.wp_header.p2,
@@ -1811,18 +1937,6 @@ fn align4(value: u64) -> Result<u64> {
         .checked_add(3)
         .map(|value| value & !3)
         .ok_or_else(|| Error::backend("GPU buffer size overflow"))
-}
-
-fn align_to(value: u64, alignment: u64) -> Result<u64> {
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return Err(Error::backend(
-            "wgpu reported a non-power-of-two buffer offset alignment",
-        ));
-    }
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| Error::backend("GPU buffer alignment overflow"))
 }
 
 #[derive(Default)]
@@ -1930,7 +2044,8 @@ mod tests {
             stream_index: 0,
         };
         let groups = [group(3, 67), group(75, 139), group(147, 211)];
-        let (windows, batches, peak) = build_stream_batches(&codestream, &groups, 20).unwrap();
+        let (windows, batches, peak) =
+            build_stream_batches(&codestream, &groups, 20, usize::MAX).unwrap();
         assert_eq!(batches, [0..1, 1..2, 2..3]);
         assert_eq!(peak, 16);
         for (window, original) in windows.iter().zip(groups) {
@@ -1946,6 +2061,27 @@ mod tests {
                 original.token_bit_end.div_ceil(8) as usize
             );
         }
+    }
+
+    #[test]
+    fn stream_batches_never_alias_more_groups_than_scratch_lanes() {
+        let codestream = vec![0u8; 32];
+        let groups = (0..5)
+            .map(|index| ModularGroup {
+                token_bit_offset: index * 16 + 3,
+                token_bit_end: index * 16 + 11,
+                x: index as u32,
+                y: 0,
+                width: 1,
+                height: 1,
+                stream_index: index as u32,
+            })
+            .collect::<Vec<_>>();
+        let (windows, batches, _) = build_stream_batches(&codestream, &groups, 1024, 2).unwrap();
+        assert_eq!(batches, [0..2, 2..4, 4..5]);
+        assert_eq!(windows[0].upload_offset, 0);
+        assert_eq!(windows[2].upload_offset, 0);
+        assert_eq!(windows[4].upload_offset, 0);
     }
 
     #[test]
@@ -2227,7 +2363,7 @@ mod tests {
             chroma_height: 29,
             logical_size: 30,
             numeric_mapping: 31,
-            _padding: 32,
+            status_index: 32,
             stream_index: 33,
             wp_p1: 34,
             wp_p2: 35,
@@ -2251,6 +2387,20 @@ mod tests {
         assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));
         assert!(SHADER_TEMPLATE.contains("stream_index: u32,"));
         assert!(SHADER_TEMPLATE.contains("wp_w3: u32,"));
+        assert!(SHADER_TEMPLATE.contains("params_table: array<Params>"));
+
+        assert_eq!(std::mem::size_of::<DispatchControl>(), 16);
+        assert_eq!(std::mem::align_of::<DispatchControl>(), 4);
+        let control = DispatchControl {
+            first_group: 1,
+            group_count: 2,
+            lane_stride_words: 3,
+            _padding: 4,
+        };
+        assert_eq!(
+            bytemuck::cast::<DispatchControl, [u32; 4]>(control),
+            [1, 2, 3, 4]
+        );
 
         assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);
         assert_eq!(std::mem::align_of::<DecodeStatus>(), 4);
@@ -2264,10 +2414,11 @@ mod tests {
             bytemuck::cast::<DecodeStatus, [u32; 4]>(status),
             [1, 2, 3, 4]
         );
-        assert!(SHADER_TEMPLATE.contains("status[0] = STATUS_OK;"));
-        assert!(SHADER_TEMPLATE.contains("status[1] = decoded;"));
-        assert!(SHADER_TEMPLATE.contains("status[2] = bit_cursor;"));
-        assert!(SHADER_TEMPLATE.contains("status[3] = params.token_end;"));
+        assert!(SHADER_TEMPLATE.contains("let status_base = params.status_index * 4u;"));
+        assert!(SHADER_TEMPLATE.contains("status[status_base] = STATUS_OK;"));
+        assert!(SHADER_TEMPLATE.contains("status[status_base + 1u] = decoded;"));
+        assert!(SHADER_TEMPLATE.contains("status[status_base + 2u] = bit_cursor;"));
+        assert!(SHADER_TEMPLATE.contains("status[status_base + 3u] = params.token_end;"));
     }
 
     #[test]
