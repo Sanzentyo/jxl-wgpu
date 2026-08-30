@@ -25,10 +25,13 @@ Modular codestream or `jxlc` container.
 - One GPU invocation handles each PassGroup/channel pair. Dispatch parameters and artifacts use
   group-major, channel-major order. Small jobs use one mapped artifact allocation. Larger jobs use
   complete-channel-group batches bounded by storage-binding and dispatch limits.
-- Native multi-batch jobs run through a runtime-neutral worker. A histogram pass first derives one
-  stream-wide prefix code; a second pass validates and serializes each batch immediately, then
-  releases its mapped artifact storage. Peak GPU memory is therefore bounded independently of the
-  total image area even though the final standard codestream remains contiguous.
+- Multi-batch jobs first run a histogram pass to derive one stream-wide prefix code; a second pass
+  validates and serializes each batch immediately, then releases its mapped artifact storage.
+  Native builds drive the sequence with one runtime-neutral worker. Browser WebGPU drives the same
+  two-pass sequence from map callbacks and the returned `Future`: each callback wakes the caller,
+  and the next poll records exactly one next batch without requiring a Web Worker or a particular
+  async runtime. Peak GPU memory is therefore bounded independently of total image area even though
+  the final standard codestream remains contiguous.
 - Every group/channel produces independent Gradient-predictor residuals, LZ77/raw token events, and
   histograms. The host validates every artifact, combines histograms per channel, creates the four
   JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
@@ -37,14 +40,18 @@ Modular codestream or `jxlc` container.
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, component storage bytes,
 full and peak source binding ranges, peak parameter/artifact/readback bytes, diagnostic total
-artifact bytes, batch count, streaming mode, total encoder-owned live bytes, and the group grid
-before submission. Every live batch uses the same shared `MemoryBudget`. Its exclusive buffer-pool
-lease and reservation survive until the map callback and mapped-range consumer are both finished,
-including when the returned future is abandoned.
+artifact bytes, batch count, exact GPU submission count, streaming mode, total encoder-owned live
+bytes, and the group grid before submission. Streamed jobs report exactly twice the batch count:
+one histogram and one serialization submission per batch. Every live batch uses the same shared
+`MemoryBudget`. Its exclusive buffer-pool lease and reservation survive until the map callback and
+mapped-range consumer are both finished, including when the returned future is abandoned.
 
 The returned `LosslessModularSubmission` implements `Future` without depending on an async runtime;
-native callers may instead use `wait`. `group_grid` and `ordered_groups` expose the exact dispatch
-rectangles and normative PassGroup order before completion.
+native callers may instead use `wait`. Browser builds intentionally reject blocking `wait`, because
+WebGPU completion is delivered by the browser event loop. Dropping an in-progress browser future
+keeps the active batch's lease and shared byte-budget reservation alive through its map callback,
+then releases them without submitting another batch. `group_grid` and `ordered_groups` expose the
+exact dispatch rectangles and normative PassGroup order before completion.
 
 ```rust,no_run
 # use jxl_wgpu_encode::{
@@ -80,7 +87,9 @@ RGB(A), and multi-group containers intentionally omit that private box; all rema
 interoperable JPEG XL containers. Conformance tests cover every depth `1..=16`, the
 1/255/256/257 group boundaries, and extreme aspect ratios. A streamed 16,384×1 RGB8 case is exact
 through both the published Rust `jxl` decoder and reference `djxl`, with identical blocking and
-runtime-neutral Future codestreams.
+runtime-neutral Future codestreams. Browser/WASM compilation covers that same multi-batch state
+machine; browser execution still requires a WebGPU-capable page and executor/event-loop integration
+provided by the application.
 
 ## Experimental VarDCT profile
 

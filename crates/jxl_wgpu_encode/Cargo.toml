@@ -17,6 +17,7 @@ wgpu = "30.0.1"
 [dev-dependencies]
 jxl.workspace = true
 jxl_gpu_protocol.workspace = true
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = "1.0.1"
 
 [lints]

@@ -12,7 +12,9 @@
 //! [`LosslessModularAnimationSession`] adds standard timebases, exact frame durations and
 //! timecodes, signed crop rectangles, all five blend modes, alpha extra-channel blending, and four
 //! reference slots. Its independent frame submissions support both blocking waits and a
-//! runtime-neutral [`Future`], so a caller can keep multiple frames in flight.
+//! runtime-neutral [`Future`], so a caller can keep multiple frames in flight. Multi-batch browser
+//! jobs advance one bounded map callback at a time from that same future and do not require a
+//! specific executor or Web Worker.
 //! [`VarDctEncoder`] is the first bounded lossy frontend: one 8x8 pitch-linear sRGB8 block is
 //! normalized, transformed to XYB, forward-DCT8 transformed, quantized, tokenized, and histogrammed
 //! on the GPU. Its fixed distance-25 profile retains DC and quantizes AC to zero; this narrow but

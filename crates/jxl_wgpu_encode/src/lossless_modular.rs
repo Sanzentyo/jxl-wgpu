@@ -13,14 +13,14 @@ use jxl_gpu_bitstream::{
     ACCELERATION_INDEX_BOX_TYPE, BitWriter, ContainerBox, Gray8AccelerationIndex,
     write_container_with_boxes,
 };
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use jxl_gpu_formats::RgbChannelOrder;
 use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingField,
     PackingFieldKind, PackingWord, PixelFormat, PlaneFormat, PlaneSampling, SampleKind, Swizzle,
 };
 use jxl_wgpu::MemoryPermit;
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use wgpu::util::DeviceExt;
 
 use crate::buffer_pool::EncoderBufferPool;
@@ -1103,6 +1103,31 @@ impl LosslessModularBackend {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl LosslessModularBackend {
+    fn submit_streaming(
+        &self,
+        context: &WgpuContext,
+        source: crate::BufferImageSource,
+        plan: ModularDispatchPlan,
+        request: FrameEncodeRequest,
+    ) -> Result<LosslessModularJob, EncodeError> {
+        Ok(LosslessModularJob {
+            state: LosslessModularJobState::Streaming(Box::new(
+                BrowserStreamingLosslessModularJob::new(
+                    context.clone(),
+                    Arc::clone(&self.pipeline),
+                    Arc::clone(&self.buffer_pool),
+                    self.direct_mapping,
+                    source,
+                    plan,
+                    request,
+                )?,
+            )),
+        })
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct StreamingModularWorker {
     context: WgpuContext,
@@ -1118,43 +1143,18 @@ struct StreamingModularWorker {
 #[cfg(not(target_arch = "wasm32"))]
 impl StreamingModularWorker {
     fn run(&self) -> Result<GpuFrameArtifacts, EncodeError> {
-        let channels = usize::try_from(self.plan.format.channel_count())
-            .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
         let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
         let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
             self.with_batch(batch, |bytes| {
-                for dispatch in batch.first_dispatch
-                    ..batch
-                        .first_dispatch
-                        .checked_add(batch.dispatch_count)
-                        .ok_or(EncodeError::InvalidSource(
-                            "artifact batch dispatch range overflow",
-                        ))?
-                {
-                    let group_plan =
-                        self.plan
-                            .groups
-                            .get(dispatch)
-                            .ok_or(EncodeError::InvalidSource(
-                                "artifact batch dispatch range is invalid",
-                            ))?;
-                    let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
-                    let header =
-                        parse_group_artifact_header(group_plan.max_events, artifact_bytes)?;
-                    let artifact = ValidatedModularArtifact {
-                        header,
-                        events: &[],
-                    };
-                    accumulate_artifact_histograms(
-                        dispatch % channels,
-                        &artifact,
-                        &mut aggregate_raw,
-                        &mut aggregate_lz77,
-                    )?;
-                }
-                Ok(())
+                accumulate_streaming_batch_histograms(
+                    &self.plan,
+                    batch,
+                    bytes,
+                    &mut aggregate_raw,
+                    &mut aggregate_lz77,
+                )
             })?;
         }
 
@@ -1183,40 +1183,7 @@ impl StreamingModularWorker {
         for batch in &self.plan.batches {
             ensure_streaming_job_active(&self.cancelled)?;
             self.with_batch(batch, |bytes| {
-                if batch.first_dispatch % channels != 0 || batch.dispatch_count % channels != 0 {
-                    return Err(EncodeError::Backend(
-                        "streaming batch splits a Modular channel group".into(),
-                    ));
-                }
-                let end_dispatch = batch
-                    .first_dispatch
-                    .checked_add(batch.dispatch_count)
-                    .ok_or(EncodeError::InvalidSource(
-                        "artifact batch dispatch range overflow",
-                    ))?;
-                for first_channel in (batch.first_dispatch..end_dispatch).step_by(channels) {
-                    let mut artifacts = Vec::with_capacity(channels);
-                    for dispatch in first_channel..first_channel + channels {
-                        let group_plan =
-                            self.plan
-                                .groups
-                                .get(dispatch)
-                                .ok_or(EncodeError::InvalidSource(
-                                    "artifact batch dispatch range is invalid",
-                                ))?;
-                        let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
-                        artifacts.push(parse_group_artifact(
-                            group_plan.width,
-                            group_plan.height,
-                            group_plan.max_events,
-                            artifact_bytes,
-                        )?);
-                    }
-                    let group_index = u32::try_from(first_channel / channels)
-                        .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?;
-                    assembler.push_group(group_index, &artifacts)?;
-                }
-                Ok(())
+                serialize_streaming_batch(&self.plan, batch, bytes, &mut assembler)
             })?;
         }
         let (packets, acceleration) = assembler.finish()?;
@@ -1233,138 +1200,49 @@ impl StreamingModularWorker {
         batch: &ModularDispatchBatch,
         inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
     ) -> Result<T, EncodeError> {
-        let parameter_bytes = u64::try_from(batch.dispatch_count)
-            .ok()
-            .and_then(|count| count.checked_mul(std::mem::size_of::<ModularParams>() as u64))
-            .ok_or(EncodeError::InvalidSource(
-                "streaming parameter buffer size overflow",
-            ))?;
-        let artifact_bytes = batch.artifact_binding_size.get();
-        let owned_bytes = artifact_bytes
-            .checked_add(if self.direct_mapping {
-                0
-            } else {
-                artifact_bytes
-            })
-            .and_then(|value| value.checked_add(parameter_bytes))
-            .ok_or(EncodeError::InvalidSource(
-                "streaming batch memory size overflow",
-            ))?;
-        let memory_permit = self.context.memory_budget().try_reserve(owned_bytes)?;
-        let buffer_lease = self.buffer_pool.checkout(
-            self.context.device(),
-            parameter_bytes,
-            artifact_bytes,
-            self.direct_mapping,
-        );
-        let buffers = buffer_lease.buffers();
-        let end_dispatch = batch
-            .first_dispatch
-            .checked_add(batch.dispatch_count)
-            .ok_or(EncodeError::InvalidSource(
-                "streaming parameter range overflow",
-            ))?;
-        let parameters = self
-            .plan
-            .parameters
-            .get(batch.first_dispatch..end_dispatch)
-            .ok_or(EncodeError::InvalidSource(
-                "streaming parameter range is invalid",
-            ))?;
-        self.context
-            .queue()
-            .write_buffer(&buffers.parameters, 0, bytemuck::cast_slice(parameters));
-        let bind_group = self
-            .context
-            .device()
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jxl-wgpu streamed lossless modular bindings"),
-                layout: &self.pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &self.source.buffer,
-                            offset: batch.source_binding_offset,
-                            size: Some(batch.source_binding_size),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: buffers.artifact.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: buffers.parameters.as_entire_binding(),
-                    },
-                ],
-            });
-        let mut commands =
-            self.context
-                .device()
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu streamed lossless modular encode"),
-                });
-        commands.clear_buffer(&buffers.artifact, 0, None);
-        {
-            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jxl-wgpu streamed lossless modular tokenization"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(
-                u32::try_from(batch.dispatch_count)
-                    .map_err(|_| EncodeError::InvalidSource("streaming dispatch count overflow"))?,
-                1,
-                1,
-            );
-        }
-        if !self.direct_mapping {
-            commands.copy_buffer_to_buffer(
-                &buffers.artifact,
-                0,
-                &buffers.readback,
-                0,
-                artifact_bytes,
-            );
-        }
-        let completion = Arc::new(MapCompletion::default());
-        let callback_completion = Arc::clone(&completion);
-        let readback_for_map = Arc::clone(&buffers.readback);
-        let lifetime = Arc::new(EncodeJobLifetime {
-            buffer_lease,
-            _memory_permit: memory_permit,
-            mapped: AtomicBool::new(false),
-        });
-        let callback_lifetime = Arc::clone(&lifetime);
-        commands.map_buffer_on_submit(
-            &readback_for_map,
-            wgpu::MapMode::Read,
-            0..artifact_bytes,
-            move |result| {
-                if result.is_ok() {
-                    callback_lifetime.mapped.store(true, Ordering::Release);
-                }
-                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
-                drop(callback_lifetime);
-            },
-        );
-        let poll_permit = self.context.submission_poller().try_reserve()?;
-        let submission_index = self.context.queue().submit([commands.finish()]);
-        let poll_completion = Arc::clone(&completion);
-        if let Err(error) = poll_permit.register(submission_index, move |error| {
-            poll_completion.complete(Err(BackendError::PollWorker(error)));
-        }) {
-            completion.complete(Err(BackendError::PollRegistration(error)));
-        }
-        completion.wait()?;
-        let readback = &lifetime.buffer_lease.buffers().readback;
+        let pending = submit_streaming_batch(StreamingBatchContext {
+            context: &self.context,
+            pipeline: &self.pipeline,
+            buffer_pool: &self.buffer_pool,
+            direct_mapping: self.direct_mapping,
+            source: &self.source,
+            plan: &self.plan,
+            batch,
+        })?;
+        let mapping = pending.completion.wait();
+        pending.finish(mapping, inspect)
+    }
+}
+
+struct StreamingBatchContext<'a> {
+    context: &'a WgpuContext,
+    pipeline: &'a wgpu::ComputePipeline,
+    buffer_pool: &'a Arc<EncoderBufferPool>,
+    direct_mapping: bool,
+    source: &'a crate::BufferImageSource,
+    plan: &'a ModularDispatchPlan,
+    batch: &'a ModularDispatchBatch,
+}
+
+struct PendingStreamingBatch {
+    completion: Arc<MapCompletion>,
+    lifetime: Arc<EncodeJobLifetime>,
+    artifact_bytes: u64,
+}
+
+impl PendingStreamingBatch {
+    fn finish<T>(
+        self,
+        mapping: Result<(), BackendError>,
+        inspect: impl FnOnce(&[u8]) -> Result<T, EncodeError>,
+    ) -> Result<T, EncodeError> {
+        mapping?;
+        let readback = &self.lifetime.buffer_lease.buffers().readback;
         let mapped = readback
-            .slice(0..artifact_bytes)
+            .slice(0..self.artifact_bytes)
             .get_mapped_range()
             .map_err(BackendError::ArtifactRange)?;
-        let expected = usize::try_from(artifact_bytes)
+        let expected = usize::try_from(self.artifact_bytes)
             .map_err(|_| EncodeError::Backend("mapped artifact size overflow".into()))?;
         let bytes = mapped
             .get(..expected)
@@ -1372,10 +1250,141 @@ impl StreamingModularWorker {
         let result = inspect(bytes);
         drop(mapped);
         readback.unmap();
-        lifetime.mapped.store(false, Ordering::Release);
-        drop(lifetime);
+        self.lifetime.mapped.store(false, Ordering::Release);
+        drop(self.lifetime);
         result
     }
+}
+
+fn submit_streaming_batch(
+    submission: StreamingBatchContext<'_>,
+) -> Result<PendingStreamingBatch, EncodeError> {
+    let StreamingBatchContext {
+        context,
+        pipeline,
+        buffer_pool,
+        direct_mapping,
+        source,
+        plan,
+        batch,
+    } = submission;
+    let parameter_bytes = u64::try_from(batch.dispatch_count)
+        .ok()
+        .and_then(|count| count.checked_mul(std::mem::size_of::<ModularParams>() as u64))
+        .ok_or(EncodeError::InvalidSource(
+            "streaming parameter buffer size overflow",
+        ))?;
+    let artifact_bytes = batch.artifact_binding_size.get();
+    let owned_bytes = artifact_bytes
+        .checked_add(if direct_mapping { 0 } else { artifact_bytes })
+        .and_then(|value| value.checked_add(parameter_bytes))
+        .ok_or(EncodeError::InvalidSource(
+            "streaming batch memory size overflow",
+        ))?;
+    let memory_permit = context.memory_budget().try_reserve(owned_bytes)?;
+    let buffer_lease = buffer_pool.checkout(
+        context.device(),
+        parameter_bytes,
+        artifact_bytes,
+        direct_mapping,
+    );
+    let buffers = buffer_lease.buffers();
+    let end_dispatch = batch
+        .first_dispatch
+        .checked_add(batch.dispatch_count)
+        .ok_or(EncodeError::InvalidSource(
+            "streaming parameter range overflow",
+        ))?;
+    let parameters = plan
+        .parameters
+        .get(batch.first_dispatch..end_dispatch)
+        .ok_or(EncodeError::InvalidSource(
+            "streaming parameter range is invalid",
+        ))?;
+    context
+        .queue()
+        .write_buffer(&buffers.parameters, 0, bytemuck::cast_slice(parameters));
+    let bind_group = context
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("jxl-wgpu streamed lossless modular bindings"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &source.buffer,
+                        offset: batch.source_binding_offset,
+                        size: Some(batch.source_binding_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.artifact.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.parameters.as_entire_binding(),
+                },
+            ],
+        });
+    let mut commands = context
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu streamed lossless modular encode"),
+        });
+    commands.clear_buffer(&buffers.artifact, 0, None);
+    {
+        let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("jxl-wgpu streamed lossless modular tokenization"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(
+            u32::try_from(batch.dispatch_count)
+                .map_err(|_| EncodeError::InvalidSource("streaming dispatch count overflow"))?,
+            1,
+            1,
+        );
+    }
+    if !direct_mapping {
+        commands.copy_buffer_to_buffer(&buffers.artifact, 0, &buffers.readback, 0, artifact_bytes);
+    }
+    let completion = Arc::new(MapCompletion::default());
+    let callback_completion = Arc::clone(&completion);
+    let readback_for_map = Arc::clone(&buffers.readback);
+    let lifetime = Arc::new(EncodeJobLifetime {
+        buffer_lease,
+        _memory_permit: memory_permit,
+        mapped: AtomicBool::new(false),
+    });
+    let callback_lifetime = Arc::clone(&lifetime);
+    commands.map_buffer_on_submit(
+        &readback_for_map,
+        wgpu::MapMode::Read,
+        0..artifact_bytes,
+        move |result| {
+            if result.is_ok() {
+                callback_lifetime.mapped.store(true, Ordering::Release);
+            }
+            callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
+            drop(callback_lifetime);
+        },
+    );
+    let poll_permit = context.submission_poller().try_reserve()?;
+    let submission_index = context.queue().submit([commands.finish()]);
+    let poll_completion = Arc::clone(&completion);
+    if let Err(error) = poll_permit.register(submission_index, move |error| {
+        poll_completion.complete(Err(BackendError::PollWorker(error)));
+    }) {
+        completion.complete(Err(BackendError::PollRegistration(error)));
+    }
+    Ok(PendingStreamingBatch {
+        completion,
+        lifetime,
+        artifact_bytes,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1386,7 +1395,6 @@ fn ensure_streaming_job_active(cancelled: &AtomicBool) -> Result<(), EncodeError
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn streaming_artifact_bytes<'a>(
     group: &ModularGroupPlan,
     batch: &ModularDispatchBatch,
@@ -1406,6 +1414,81 @@ fn streaming_artifact_bytes<'a>(
     bytes
         .get(start..end)
         .ok_or_else(|| EncodeError::Backend("streaming GPU artifact is truncated".into()))
+}
+
+fn accumulate_streaming_batch_histograms(
+    plan: &ModularDispatchPlan,
+    batch: &ModularDispatchBatch,
+    bytes: &[u8],
+    aggregate_raw: &mut [[u64; RAW_SYMBOLS]; 4],
+    aggregate_lz77: &mut [[u64; LZ77_SYMBOLS]; 4],
+) -> Result<(), EncodeError> {
+    let channels = usize::try_from(plan.format.channel_count())
+        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+    let end_dispatch = batch
+        .first_dispatch
+        .checked_add(batch.dispatch_count)
+        .ok_or(EncodeError::InvalidSource(
+            "artifact batch dispatch range overflow",
+        ))?;
+    for dispatch in batch.first_dispatch..end_dispatch {
+        let group_plan = plan.groups.get(dispatch).ok_or(EncodeError::InvalidSource(
+            "artifact batch dispatch range is invalid",
+        ))?;
+        let artifact_bytes = streaming_artifact_bytes(group_plan, batch, bytes)?;
+        let header = parse_group_artifact_header(group_plan.max_events, artifact_bytes)?;
+        accumulate_artifact_histograms(
+            dispatch % channels,
+            &ValidatedModularArtifact {
+                header,
+                events: &[],
+            },
+            aggregate_raw,
+            aggregate_lz77,
+        )?;
+    }
+    Ok(())
+}
+
+fn serialize_streaming_batch(
+    plan: &ModularDispatchPlan,
+    batch: &ModularDispatchBatch,
+    bytes: &[u8],
+    assembler: &mut ModularPacketAssembler,
+) -> Result<(), EncodeError> {
+    let channels = usize::try_from(plan.format.channel_count())
+        .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
+    if !batch.first_dispatch.is_multiple_of(channels)
+        || !batch.dispatch_count.is_multiple_of(channels)
+    {
+        return Err(EncodeError::Backend(
+            "streaming batch splits a Modular channel group".into(),
+        ));
+    }
+    let end_dispatch = batch
+        .first_dispatch
+        .checked_add(batch.dispatch_count)
+        .ok_or(EncodeError::InvalidSource(
+            "artifact batch dispatch range overflow",
+        ))?;
+    for first_channel in (batch.first_dispatch..end_dispatch).step_by(channels) {
+        let mut artifacts = Vec::with_capacity(channels);
+        for dispatch in first_channel..first_channel + channels {
+            let group_plan = plan.groups.get(dispatch).ok_or(EncodeError::InvalidSource(
+                "artifact batch dispatch range is invalid",
+            ))?;
+            artifacts.push(parse_group_artifact(
+                group_plan.width,
+                group_plan.height,
+                group_plan.max_events,
+                streaming_artifact_bytes(group_plan, batch, bytes)?,
+            )?);
+        }
+        let group_index = u32::try_from(first_channel / channels)
+            .map_err(|_| EncodeError::Backend("Modular group index overflow".into()))?;
+        assembler.push_group(group_index, &artifacts)?;
+    }
+    Ok(())
 }
 
 fn event_capacity(pixel_count: usize) -> Result<usize, EncodeError> {
@@ -1585,18 +1668,8 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 "requested Modular depth does not match the source valid bits",
             ));
         }
-        #[cfg(not(target_arch = "wasm32"))]
         if plan.memory.streaming {
             return self.submit_streaming(context, source, plan, request.clone());
-        }
-        #[cfg(target_arch = "wasm32")]
-        if plan.memory.streaming {
-            return Err(UnsupportedFeature::DeviceLimit {
-                name: "browser streamed Modular artifact bytes",
-                required: plan.memory.total_artifact_bytes,
-                available: plan.memory.artifact_storage_bytes,
-            }
-            .into());
         }
         let memory_permit = context
             .memory_budget()
@@ -1882,6 +1955,58 @@ impl StreamingCompletion {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamingPass {
+    Histogram,
+    Serialize,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamingCursor {
+    pass: StreamingPass,
+    batch_index: usize,
+    batch_count: usize,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamingAdvance {
+    SubmitNext,
+    BeginSerialization,
+    Complete,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl StreamingCursor {
+    fn new(batch_count: usize) -> Result<Self, EncodeError> {
+        if batch_count == 0 {
+            return Err(BackendError::Invariant("streaming dispatch plan has no batches").into());
+        }
+        Ok(Self {
+            pass: StreamingPass::Histogram,
+            batch_index: 0,
+            batch_count,
+        })
+    }
+
+    fn advance(&mut self) -> StreamingAdvance {
+        if self.batch_index + 1 < self.batch_count {
+            self.batch_index += 1;
+            return StreamingAdvance::SubmitNext;
+        }
+        match self.pass {
+            StreamingPass::Histogram => {
+                self.pass = StreamingPass::Serialize;
+                self.batch_index = 0;
+                StreamingAdvance::BeginSerialization
+            }
+            StreamingPass::Serialize => StreamingAdvance::Complete,
+        }
+    }
+}
+
 /// Runtime-neutral completion for the concrete GPU lossless profile.
 pub struct LosslessModularJob {
     state: LosslessModularJobState,
@@ -1891,6 +2016,8 @@ enum LosslessModularJobState {
     Resident(ResidentLosslessModularJob),
     #[cfg(not(target_arch = "wasm32"))]
     Streaming(StreamingLosslessModularJob),
+    #[cfg(target_arch = "wasm32")]
+    Streaming(Box<BrowserStreamingLosslessModularJob>),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1940,6 +2067,195 @@ impl Drop for EncodeJobLifetime {
     fn drop(&mut self) {
         if self.mapped.swap(false, Ordering::AcqRel) {
             self.buffer_lease.buffers().readback.unmap();
+        }
+    }
+}
+
+/// Browser WebGPU streams one mapped batch at a time from its event loop. The future itself is
+/// the scheduler: map callbacks only publish completion and wake the caller's executor, while the
+/// next queue submission is recorded by the following poll. No Web Worker or async runtime is
+/// required, and abandoning the future leaves the active map callback owning its budgeted lease.
+#[cfg(target_arch = "wasm32")]
+struct BrowserStreamingLosslessModularJob {
+    context: WgpuContext,
+    pipeline: Arc<wgpu::ComputePipeline>,
+    buffer_pool: Arc<EncoderBufferPool>,
+    direct_mapping: bool,
+    source: crate::BufferImageSource,
+    plan: ModularDispatchPlan,
+    request: FrameEncodeRequest,
+    cursor: StreamingCursor,
+    pending: Option<PendingStreamingBatch>,
+    aggregate_raw: [[u64; RAW_SYMBOLS]; 4],
+    aggregate_lz77: [[u64; LZ77_SYMBOLS]; 4],
+    assembler: Option<ModularPacketAssembler>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BrowserStreamingLosslessModularJob {
+    fn new(
+        context: WgpuContext,
+        pipeline: Arc<wgpu::ComputePipeline>,
+        buffer_pool: Arc<EncoderBufferPool>,
+        direct_mapping: bool,
+        source: crate::BufferImageSource,
+        plan: ModularDispatchPlan,
+        request: FrameEncodeRequest,
+    ) -> Result<Self, EncodeError> {
+        let cursor = StreamingCursor::new(plan.batches.len())?;
+        let mut job = Self {
+            context,
+            pipeline,
+            buffer_pool,
+            direct_mapping,
+            source,
+            plan,
+            request,
+            cursor,
+            pending: None,
+            aggregate_raw: [[0; RAW_SYMBOLS]; 4],
+            aggregate_lz77: [[0; LZ77_SYMBOLS]; 4],
+            assembler: None,
+        };
+        job.submit_current_batch()?;
+        Ok(job)
+    }
+
+    fn submit_current_batch(&mut self) -> Result<(), EncodeError> {
+        if self.pending.is_some() {
+            return Err(BackendError::Invariant(
+                "browser Modular scheduler already has an active batch",
+            )
+            .into());
+        }
+        let batch =
+            self.plan
+                .batches
+                .get(self.cursor.batch_index)
+                .ok_or(BackendError::Invariant(
+                    "browser Modular scheduler batch index is out of range",
+                ))?;
+        self.pending = Some(submit_streaming_batch(StreamingBatchContext {
+            context: &self.context,
+            pipeline: &self.pipeline,
+            buffer_pool: &self.buffer_pool,
+            direct_mapping: self.direct_mapping,
+            source: &self.source,
+            plan: &self.plan,
+            batch,
+        })?);
+        Ok(())
+    }
+
+    fn begin_serialization(&mut self) -> Result<(), EncodeError> {
+        let codes = build_prefix_codes(
+            self.plan.format,
+            self.plan.bits_per_sample,
+            &self.aggregate_raw,
+            &self.aggregate_lz77,
+        )?;
+        self.assembler = Some(ModularPacketAssembler::new(
+            self.plan.width,
+            self.plan.height,
+            self.plan.group_grid,
+            self.plan.format,
+            self.plan.bits_per_sample,
+            ModularFrameHeader {
+                animation: self.request.animation,
+                canvas_width: self.request.canvas_width,
+                canvas_height: self.request.canvas_height,
+                options: self.request.options.clone(),
+                is_last: self.request.is_last,
+            },
+            codes,
+        )?);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<GpuFrameArtifacts, EncodeError> {
+        let assembler = self.assembler.take().ok_or(BackendError::Invariant(
+            "browser Modular serialization finished without an assembler",
+        ))?;
+        let (packets, acceleration) = assembler.finish()?;
+        Ok(GpuFrameArtifacts {
+            frame_index: self.request.frame_index,
+            is_last: self.request.is_last,
+            packets,
+            acceleration,
+        })
+    }
+
+    fn poll_complete(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<GpuFrameArtifacts, EncodeError>> {
+        loop {
+            let mapping = match self.pending.as_ref() {
+                Some(pending) => match pending.completion.poll(cx) {
+                    Some(mapping) => mapping,
+                    None => return Poll::Pending,
+                },
+                None => {
+                    return Poll::Ready(Err(BackendError::Invariant(
+                        "browser Modular scheduler has no active batch",
+                    )
+                    .into()));
+                }
+            };
+            let pending = self
+                .pending
+                .take()
+                .expect("the browser Modular batch was checked as present");
+            let batch = match self.plan.batches.get(self.cursor.batch_index) {
+                Some(batch) => *batch,
+                None => {
+                    return Poll::Ready(Err(BackendError::Invariant(
+                        "browser Modular scheduler batch index is out of range",
+                    )
+                    .into()));
+                }
+            };
+            let inspected = match self.cursor.pass {
+                StreamingPass::Histogram => pending.finish(mapping, |bytes| {
+                    accumulate_streaming_batch_histograms(
+                        &self.plan,
+                        &batch,
+                        bytes,
+                        &mut self.aggregate_raw,
+                        &mut self.aggregate_lz77,
+                    )
+                }),
+                StreamingPass::Serialize => {
+                    let Some(assembler) = self.assembler.as_mut() else {
+                        return Poll::Ready(Err(BackendError::Invariant(
+                            "browser Modular serialization has no assembler",
+                        )
+                        .into()));
+                    };
+                    pending.finish(mapping, |bytes| {
+                        serialize_streaming_batch(&self.plan, &batch, bytes, assembler)
+                    })
+                }
+            };
+            if let Err(error) = inspected {
+                return Poll::Ready(Err(error));
+            }
+            match self.cursor.advance() {
+                StreamingAdvance::SubmitNext => {}
+                StreamingAdvance::BeginSerialization => {
+                    if let Err(error) = self.begin_serialization() {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                StreamingAdvance::Complete => {
+                    return Poll::Ready(self.finish());
+                }
+            }
+            if let Err(error) = self.submit_current_batch() {
+                return Poll::Ready(Err(error));
+            }
+            // Register the current executor waker with the newly submitted map before returning.
+            // If WebGPU completed it synchronously, consume it in this same poll instead.
         }
     }
 }
@@ -2003,6 +2319,8 @@ impl GpuEncodeJob for LosslessModularJob {
                 Some(result) => Poll::Ready(result),
                 None => Poll::Pending,
             },
+            #[cfg(target_arch = "wasm32")]
+            LosslessModularJobState::Streaming(job) => job.poll_complete(cx),
         }
     }
 
@@ -3362,6 +3680,25 @@ fn write_frame_duration(output: &mut BitWriter, duration: u32) -> Result<(), Enc
     Ok(())
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_compile_contract {
+    use super::*;
+
+    fn assert_gpu_job<T: GpuEncodeJob>() {}
+
+    fn assert_runtime_neutral_future<T>()
+    where
+        T: Future<Output = Result<Vec<u8>, EncodeError>>,
+    {
+    }
+
+    #[test]
+    fn browser_streaming_types_implement_the_public_completion_contracts() {
+        assert_gpu_job::<LosslessModularJob>();
+        assert_runtime_neutral_future::<LosslessModularSubmission>();
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::num::NonZeroU32;
@@ -3425,6 +3762,50 @@ mod tests {
         assert!(completion.poll(&context).is_none());
         completion.complete(Ok(()));
         assert!(observed_unlocked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn streaming_cursor_visits_every_batch_in_both_passes() {
+        let mut cursor = StreamingCursor::new(3).unwrap();
+        let mut visited = Vec::new();
+        loop {
+            visited.push((cursor.pass, cursor.batch_index));
+            if cursor.advance() == StreamingAdvance::Complete {
+                break;
+            }
+        }
+        assert_eq!(
+            visited,
+            vec![
+                (StreamingPass::Histogram, 0),
+                (StreamingPass::Histogram, 1),
+                (StreamingPass::Histogram, 2),
+                (StreamingPass::Serialize, 0),
+                (StreamingPass::Serialize, 1),
+                (StreamingPass::Serialize, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_cursor_rejects_an_empty_dispatch_plan() {
+        assert!(matches!(
+            StreamingCursor::new(0),
+            Err(EncodeError::Backend(BackendError::Invariant(
+                "streaming dispatch plan has no batches"
+            )))
+        ));
+    }
+
+    #[test]
+    fn naga_validates_the_streaming_modular_shader_abi() {
+        let module = naga::front::wgsl::parse_str(SHADER).expect("Modular WGSL parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("Modular WGSL validates with portable WebGPU capabilities");
     }
 
     #[test]
