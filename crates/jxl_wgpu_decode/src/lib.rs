@@ -55,6 +55,6 @@ pub use session::{
     PreparedGpuSession, SubmittedGpuFrame,
 };
 pub use wgpu_engine::{
-    F64OutputPath, WgpuDecodeCapabilities, WgpuDecodeMemoryStats, WgpuDecodeSession,
-    WgpuPendingFrame, WgpuSubmissionEngine,
+    F64OutputPath, OutputWritePath, WgpuDecodeCapabilities, WgpuDecodeMemoryStats,
+    WgpuDecodeSession, WgpuPendingFrame, WgpuSubmissionEngine,
 };

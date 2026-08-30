@@ -29,6 +29,7 @@ var<private> entropy_ans_state: u32;
 var<private> entropy_copy_remaining: u32;
 var<private> entropy_copy_position: u32;
 var<private> entropy_decoded: u32;
+var<private> entropy_last_value: u32;
 
 fn entropy_config_offset(cluster: u32) -> u32 {
     return modular_metadata[META_CONFIG_OFFSET] + cluster * 4u;
@@ -39,6 +40,7 @@ fn entropy_begin() {
     entropy_copy_remaining = 0u;
     entropy_copy_position = 0u;
     entropy_decoded = 0u;
+    entropy_last_value = 0u;
     if modular_metadata[META_CODER] == 1u {
         entropy_ans_state = read_bits(32u);
     }
@@ -191,19 +193,26 @@ fn entropy_window_base() -> u32 {
 }
 
 fn entropy_copy_value() -> u32 {
-    let value = reconstruction_load(
-        entropy_window_base() + (entropy_copy_position & params.lz77_window_mask)
-    );
+    var value = entropy_last_value;
+    if params.lz77_window_mask != 0u {
+        value = reconstruction_load(
+            entropy_window_base() + (entropy_copy_position & params.lz77_window_mask)
+        );
+    }
     entropy_copy_position += 1u;
     entropy_copy_remaining -= 1u;
     return value;
 }
 
 fn entropy_record_value(value: u32) {
-    reconstruction_store(
-        entropy_window_base() + (entropy_decoded & params.lz77_window_mask),
-        value,
-    );
+    if params.lz77_window_mask == 0u {
+        entropy_last_value = value;
+    } else {
+        reconstruction_store(
+            entropy_window_base() + (entropy_decoded & params.lz77_window_mask),
+            value,
+        );
+    }
     entropy_decoded += 1u;
 }
 

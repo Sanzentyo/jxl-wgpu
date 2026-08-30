@@ -21,7 +21,7 @@ use jxl_wgpu::{
 };
 use jxl_wgpu_decode::{
     F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels,
-    NumericSampleMapping, PrefetchBackpressure, WgpuSubmissionEngine,
+    NumericSampleMapping, OutputWritePath, PrefetchBackpressure, WgpuSubmissionEngine,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
@@ -675,6 +675,7 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
         (1, 513, false),
         (769, 1, true),
         (257, 257, false),
+        (516, 3, false),
     ] {
         let expected = patterned_pixels(width, height);
         let encoded = encode_standard_gray8(&backend, width, height, &expected, container);
@@ -712,6 +713,7 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert!(stats.parallel_group_lanes > 1);
             assert!(stats.parallel_group_lanes <= 64);
             assert_eq!(stats.max_lz77_window_words, 1);
+            assert_eq!(stats.max_lz77_scratch_words, 0);
             assert_eq!(stats.group_workgroup_size, 64);
             assert_eq!(stats.max_dispatch_workgroups, 1);
             assert_eq!(
@@ -721,6 +723,13 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert!(stats.stream_window_bytes < stats.transient_bytes);
             assert_eq!(stats.stream_batch_count, 1);
             assert_eq!(stats.submissions_per_frame, 1);
+            assert_eq!(stats.output_write_path, OutputWritePath::AtomicBytes);
+        }
+        if (width, height, container) == (516, 3, false) {
+            let stats = session.submission_session().memory_stats();
+            assert_eq!(stats.max_lz77_window_words, 1);
+            assert_eq!(stats.max_lz77_scratch_words, 0);
+            assert_eq!(stats.output_write_path, OutputWritePath::WordAligned);
         }
         let frame = session
             .next_frame()
@@ -798,6 +807,20 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
                 ..
             } if actual_bits == bits_per_sample && actual_channels == expected_channels
         ));
+        let bytes_per_sample = if bits_per_sample <= 8 { 1u64 } else { 2 };
+        let row_bytes = u64::from(width) * u64::from(format.channel_count()) * bytes_per_sample;
+        let stats = session.submission_session().memory_stats();
+        assert_eq!(stats.max_lz77_window_words, 1);
+        assert_eq!(stats.max_lz77_scratch_words, 0);
+        assert_eq!(
+            stats.output_write_path,
+            if row_bytes.is_multiple_of(4) {
+                OutputWritePath::WordAligned
+            } else {
+                OutputWritePath::AtomicBytes
+            },
+            "{format:?} {bits_per_sample}-bit output path"
+        );
         let frame = session
             .next_frame()
             .unwrap_or_else(|error| {

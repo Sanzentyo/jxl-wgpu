@@ -39,6 +39,9 @@ const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
 const WORKGROUP_SIZE_MARKER: &str = "/*__JXL_WORKGROUP_SIZE__*/";
+const OUTPUT_WORDS_TYPE_MARKER: &str = "/*__JXL_OUTPUT_WORDS_TYPE__*/";
+const WRITE_BYTE_WORD_MARKER: &str = "/*__JXL_WRITE_BYTE_WORD__*/";
+const WRITE_FULL_WORD_MARKER: &str = "/*__JXL_WRITE_FULL_WORD__*/";
 const F64_EXACT_F32_WIDENING: &str = r#"
                 if params.numeric_mapping != 1u {
                     decode_error = ERROR_OUTPUT_MAPPING;
@@ -62,6 +65,25 @@ const F64_NATIVE_ARITHMETIC: &str = r#"
 "#;
 const F64_NATIVE_BINDING: &str =
     "@group(0) @binding(6) var<storage, read_write> output_f64: array<f64>;";
+const ATOMIC_OUTPUT_WORDS_TYPE: &str = "array<atomic<u32>>";
+const WORD_ALIGNED_OUTPUT_WORDS_TYPE: &str = "array<u32>";
+const ATOMIC_WRITE_BYTE_WORD: &str = r#"
+    var previous = atomicLoad(&output_words[word_index]);
+    loop {
+        let updated = (previous & ~mask) | ((value & 0xffu) << shift);
+        let exchange = atomicCompareExchangeWeak(&output_words[word_index], previous, updated);
+        if exchange.exchanged {
+            break;
+        }
+        previous = exchange.old_value;
+    }
+"#;
+const WORD_ALIGNED_WRITE_BYTE_WORD: &str = r#"
+    let previous = output_words[word_index];
+    output_words[word_index] = (previous & ~mask) | ((value & 0xffu) << shift);
+"#;
+const ATOMIC_WRITE_FULL_WORD: &str = "atomicStore(&output_words[offset >> 2u], value);";
+const WORD_ALIGNED_WRITE_FULL_WORD: &str = "output_words[offset >> 2u] = value;";
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
@@ -89,6 +111,10 @@ pub struct WgpuDecodeMemoryStats {
     pub reconstruction_lane_stride_bytes: u64,
     /// Largest descriptor-derived LZ history ring used by one group lane.
     pub max_lz77_window_words: u32,
+    /// Largest physical LZ history ring stored in one reconstruction lane.
+    ///
+    /// A logical one-word ring uses invocation-private state and therefore reports zero here.
+    pub max_lz77_scratch_words: u32,
     /// Bounded stream uploads required for one frame. Each batch is one ordered queue submission.
     pub stream_batch_count: usize,
     /// Actual codec queue submissions per decoded frame.
@@ -99,6 +125,17 @@ pub struct WgpuDecodeMemoryStats {
     pub group_workgroup_size: u32,
     /// Largest compute-workgroup count submitted by one bounded stream batch.
     pub max_dispatch_workgroups: u32,
+    /// Output write implementation selected after proving the complete group/plane layout.
+    pub output_write_path: OutputWritePath,
+}
+
+/// GPU output update strategy selected for a validated frame layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutputWritePath {
+    /// Byte updates use atomics because distinct group rows may share a storage word.
+    AtomicBytes,
+    /// Every plane row and internal group boundary is word-aligned, allowing ordinary RMW/store.
+    WordAligned,
 }
 
 /// F64 production path resolved for one output request.
@@ -206,10 +243,16 @@ const _: () = {
 #[derive(Clone)]
 pub struct WgpuSubmissionEngine {
     backend: WgpuBackend,
-    pipeline: Arc<wgpu::ComputePipeline>,
-    native_f64_pipeline: Option<Arc<OnceLock<Arc<wgpu::ComputePipeline>>>>,
+    pipelines: Arc<DecodePipelineCache>,
+    native_f64_pipelines: Option<Arc<DecodePipelineCache>>,
     memory: MemoryBudget,
     buffers: Arc<DecodeBufferPool>,
+}
+
+#[derive(Default)]
+struct DecodePipelineCache {
+    atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
+    word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
 }
 
 impl std::fmt::Debug for WgpuSubmissionEngine {
@@ -237,24 +280,20 @@ impl WgpuSubmissionEngine {
     /// is the normal constructor.
     #[must_use]
     pub fn with_memory_budget(backend: WgpuBackend, memory_budget: MemoryBudget) -> Self {
-        let pipeline = Arc::new(create_decode_pipeline(
-            &backend,
-            "jxl-wgpu decode lossless modular",
-            &shader_source(F64OutputPath::ExactF32Widening),
-        ));
-        // Native f64 compilation is intentionally lazy: adapters that enable SHADER_F64 but
-        // never request F64 output do not pay the additional pipeline initialization cost.
-        let native_f64_pipeline = backend
+        // Pipelines are selected after the output layout is validated. Lazy caches avoid
+        // compiling the atomic fallback or native-f64 variants when a workload never needs them.
+        let pipelines = Arc::new(DecodePipelineCache::default());
+        let native_f64_pipelines = backend
             .native_f64_enabled()
-            .then(|| Arc::new(OnceLock::new()));
+            .then(|| Arc::new(DecodePipelineCache::default()));
         let buffers = DecodeBufferPool::new(
             backend.device().clone(),
             WgpuDecodeBufferPoolLimits::default(),
         );
         Self {
             backend,
-            pipeline,
-            native_f64_pipeline,
+            pipelines,
+            native_f64_pipelines,
             memory: memory_budget,
             buffers,
         }
@@ -278,7 +317,7 @@ impl WgpuSubmissionEngine {
     #[must_use]
     pub fn capabilities(&self) -> WgpuDecodeCapabilities {
         WgpuDecodeCapabilities {
-            native_f64_arithmetic: self.native_f64_pipeline.is_some(),
+            native_f64_arithmetic: self.native_f64_pipelines.is_some(),
         }
     }
 
@@ -309,16 +348,66 @@ impl WgpuSubmissionEngine {
     }
 }
 
-fn shader_source(path: F64OutputPath) -> String {
+impl DecodePipelineCache {
+    fn get_or_init(
+        &self,
+        backend: &WgpuBackend,
+        f64_path: F64OutputPath,
+        output_write_path: OutputWritePath,
+    ) -> Arc<wgpu::ComputePipeline> {
+        let pipeline = match output_write_path {
+            OutputWritePath::AtomicBytes => &self.atomic,
+            OutputWritePath::WordAligned => &self.word_aligned,
+        };
+        Arc::clone(pipeline.get_or_init(|| {
+            let label = match (f64_path, output_write_path) {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes) => {
+                    "jxl-wgpu decode Modular atomic output"
+                }
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned) => {
+                    "jxl-wgpu decode Modular word-aligned output"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes) => {
+                    "jxl-wgpu decode Modular native-f64 atomic output"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned) => {
+                    "jxl-wgpu decode Modular native-f64 word-aligned output"
+                }
+            };
+            Arc::new(create_decode_pipeline(
+                backend,
+                label,
+                &shader_source(f64_path, output_write_path),
+            ))
+        }))
+    }
+}
+
+fn shader_source(path: F64OutputPath, output_write_path: OutputWritePath) -> String {
     let (implementation, binding) = match path {
         F64OutputPath::NativeArithmetic => (F64_NATIVE_ARITHMETIC, F64_NATIVE_BINDING),
         F64OutputPath::ExactF32Widening => (F64_EXACT_F32_WIDENING, ""),
+    };
+    let (output_words_type, write_byte_word, write_full_word) = match output_write_path {
+        OutputWritePath::AtomicBytes => (
+            ATOMIC_OUTPUT_WORDS_TYPE,
+            ATOMIC_WRITE_BYTE_WORD,
+            ATOMIC_WRITE_FULL_WORD,
+        ),
+        OutputWritePath::WordAligned => (
+            WORD_ALIGNED_OUTPUT_WORDS_TYPE,
+            WORD_ALIGNED_WRITE_BYTE_WORD,
+            WORD_ALIGNED_WRITE_FULL_WORD,
+        ),
     };
     let source = SHADER_TEMPLATE
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
         .replace(MODULAR_RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT_SHADER)
         .replace(F64_OUTPUT_MARKER, implementation)
         .replace(F64_BINDING_MARKER, binding)
+        .replace(OUTPUT_WORDS_TYPE_MARKER, output_words_type)
+        .replace(WRITE_BYTE_WORD_MARKER, write_byte_word)
+        .replace(WRITE_FULL_WORD_MARKER, write_full_word)
         .replace(
             WORKGROUP_SIZE_MARKER,
             &MODULAR_GROUP_WORKGROUP_SIZE.to_string(),
@@ -327,6 +416,9 @@ fn shader_source(path: F64OutputPath) -> String {
     debug_assert!(!source.contains(MODULAR_RECONSTRUCT_MARKER));
     debug_assert!(!source.contains(F64_OUTPUT_MARKER));
     debug_assert!(!source.contains(F64_BINDING_MARKER));
+    debug_assert!(!source.contains(OUTPUT_WORDS_TYPE_MARKER));
+    debug_assert!(!source.contains(WRITE_BYTE_WORD_MARKER));
+    debug_assert!(!source.contains(WRITE_FULL_WORD_MARKER));
     debug_assert!(!source.contains(WORKGROUP_SIZE_MARKER));
     source
 }
@@ -399,21 +491,19 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             profile.bits_per_sample,
             self.capabilities(),
         )?;
-        let pipeline = match output.f64_output_path {
-            Some(F64OutputPath::NativeArithmetic) => self
-                .native_f64_pipeline
-                .as_ref()
-                .ok_or(Error::NativeF64Unavailable)?
-                .get_or_init(|| {
-                    Arc::new(create_decode_pipeline(
-                        &self.backend,
-                        "jxl-wgpu decode lossless modular native f64",
-                        &shader_source(F64OutputPath::NativeArithmetic),
-                    ))
-                })
-                .clone(),
-            Some(F64OutputPath::ExactF32Widening) | None => Arc::clone(&self.pipeline),
+        let output_write_path = output.write_path_for_groups(&profile.groups)?;
+        let (pipelines, pipeline_f64_path) = match output.f64_output_path {
+            Some(F64OutputPath::NativeArithmetic) => (
+                self.native_f64_pipelines
+                    .as_ref()
+                    .ok_or(Error::NativeF64Unavailable)?,
+                F64OutputPath::NativeArithmetic,
+            ),
+            Some(F64OutputPath::ExactF32Widening) | None => {
+                (&self.pipelines, F64OutputPath::ExactF32Widening)
+            }
         };
+        let pipeline = pipelines.get_or_init(&self.backend, pipeline_f64_path, output_write_path);
         let f64_output_path = output.f64_output_path;
         let memory_limit_bytes = self.memory.snapshot().limit_bytes;
         let dispatch_layout = GroupDispatchLayout::new(
@@ -808,6 +898,7 @@ struct DecodeMemoryPermits {
 struct GroupDispatchLayout {
     reconstruction_lane_stride: u64,
     max_lz77_window_words: u32,
+    max_lz77_scratch_words: u32,
     parallel_group_lanes: usize,
     reconstructed_bytes: u64,
     stream_windows: Arc<[GroupStreamWindow]>,
@@ -817,6 +908,7 @@ struct GroupDispatchLayout {
     status_bytes: u64,
     params_stride: u64,
     params_bytes: u64,
+    output_write_path: OutputWritePath,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -838,6 +930,7 @@ impl GroupDispatchLayout {
         requested_frame_slots: usize,
         memory_limit_bytes: u64,
     ) -> Result<Self> {
+        let output_write_path = output.write_path_for_groups(&profile.groups)?;
         let limits = device.limits();
         if limits.max_compute_invocations_per_workgroup < MODULAR_GROUP_WORKGROUP_SIZE
             || limits.max_compute_workgroup_size_x < MODULAR_GROUP_WORKGROUP_SIZE
@@ -848,13 +941,13 @@ impl GroupDispatchLayout {
         }
         let mut reconstruction_lane_stride = 0u64;
         let mut max_lz77_window_words = 0u32;
+        let mut max_lz77_scratch_words = 0u32;
         for group in &profile.groups {
             let decoded_symbol_count = group_decoded_symbol_count(profile, *group)?;
-            max_lz77_window_words = max_lz77_window_words.max(group_lz77_window_words(
-                profile,
-                *group,
-                decoded_symbol_count,
-            )?);
+            let lz77_window_words = group_lz77_window_words(profile, *group, decoded_symbol_count)?;
+            max_lz77_window_words = max_lz77_window_words.max(lz77_window_words);
+            max_lz77_scratch_words =
+                max_lz77_scratch_words.max(lz77_scratch_words(lz77_window_words));
             reconstruction_lane_stride = reconstruction_lane_stride
                 .max(align4(group_reconstructed_bytes(profile, *group)?)?);
         }
@@ -946,6 +1039,7 @@ impl GroupDispatchLayout {
         Ok(Self {
             reconstruction_lane_stride,
             max_lz77_window_words,
+            max_lz77_scratch_words,
             parallel_group_lanes,
             reconstructed_bytes,
             stream_windows: stream_windows.into(),
@@ -955,6 +1049,7 @@ impl GroupDispatchLayout {
             status_bytes,
             params_stride,
             params_bytes,
+            output_write_path,
         })
     }
 }
@@ -1109,7 +1204,11 @@ fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGro
     } else {
         0
     };
-    let entropy_words = u64::from(group_lz77_window_words(profile, group, sample_words)?);
+    let entropy_words = u64::from(lz77_scratch_words(group_lz77_window_words(
+        profile,
+        group,
+        sample_words,
+    )?));
     u64::from(sample_words)
         .checked_add(predictor_words)
         .and_then(|words| words.checked_add(entropy_words))
@@ -1136,6 +1235,10 @@ fn group_lz77_window_words(
         .ma_config
         .entropy
         .lz77_window_words(group.width, decoded_symbol_count)
+}
+
+const fn lz77_scratch_words(window_words: u32) -> u32 {
+    if window_words <= 1 { 0 } else { window_words }
 }
 
 fn modular_metadata_bytes(metadata: &[u32]) -> Result<u64> {
@@ -1462,6 +1565,69 @@ impl OutputPlan {
         }
         Ok(())
     }
+
+    fn write_path_for_groups(&self, groups: &[ModularGroup]) -> Result<OutputWritePath> {
+        if groups.is_empty() {
+            return Err(Error::backend("Modular output has no pass groups"));
+        }
+        if self
+            .layout
+            .planes
+            .iter()
+            .any(|plane| !plane.offset.is_multiple_of(4) || !plane.row_stride.is_multiple_of(4))
+        {
+            return Ok(OutputWritePath::AtomicBytes);
+        }
+        for &group in groups {
+            if !self.group_row_span_is_word_isolated(group)? {
+                return Ok(OutputWritePath::AtomicBytes);
+            }
+        }
+        Ok(OutputWritePath::WordAligned)
+    }
+
+    /// Proves that one group's row writes cannot share a storage word with a horizontal neighbor.
+    /// Plane offsets and strides are checked separately by [`Self::write_path_for_groups`].
+    fn group_row_span_is_word_isolated(&self, group: ModularGroup) -> Result<bool> {
+        let end_x = group
+            .x
+            .checked_add(group.width)
+            .ok_or_else(|| Error::backend("Modular group horizontal extent overflow"))?;
+        if end_x > self.layout.extent.width {
+            return Err(Error::backend("Modular group exceeds the output width"));
+        }
+        let internal_right_boundary = end_x != self.layout.extent.width;
+        if self.kind == OutputKind::Yuv422Packed {
+            // Each output word owns a pair. An odd internal edge would make adjacent groups write
+            // the same pair even though both plane rows themselves begin on word boundaries.
+            return Ok(
+                group.x.is_multiple_of(2) && (!internal_right_boundary || end_x.is_multiple_of(2))
+            );
+        }
+        let bytes_per_pixel = match self.kind {
+            OutputKind::NumericUnsigned | OutputKind::NumericSigned | OutputKind::NumericFloat => {
+                u64::from(self.channels)
+                    .checked_mul(u64::from(self.bits / 8))
+                    .ok_or_else(|| Error::backend("numeric output pixel size overflow"))?
+            }
+            OutputKind::Luma | OutputKind::YuvSemiplanar | OutputKind::YuvPlanar => {
+                u64::from(self.storage_bits / 8)
+            }
+            OutputKind::RgbInterleaved => u64::from(self.channels),
+            OutputKind::RgbPlanar => 1,
+            OutputKind::NativeModular => u64::from(self.channels)
+                .checked_mul(u64::from(self.storage_bits / 8))
+                .ok_or_else(|| Error::backend("native Modular output pixel size overflow"))?,
+            OutputKind::Yuv422Packed => unreachable!("packed 4:2:2 was handled above"),
+        };
+        let start = u64::from(group.x)
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| Error::backend("Modular group output start overflow"))?;
+        let end = u64::from(end_x)
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| Error::backend("Modular group output end overflow"))?;
+        Ok(start.is_multiple_of(4) && (!internal_right_boundary || end.is_multiple_of(4)))
+    }
 }
 
 fn resolve_f64_output_path(
@@ -1615,11 +1781,13 @@ fn validate_device_limits(
         reconstruction_scratch_bytes: dispatch.reconstructed_bytes,
         reconstruction_lane_stride_bytes: dispatch.reconstruction_lane_stride,
         max_lz77_window_words: dispatch.max_lz77_window_words,
+        max_lz77_scratch_words: dispatch.max_lz77_scratch_words,
         stream_batch_count: dispatch.stream_batches.len(),
         submissions_per_frame: dispatch.stream_batches.len(),
         parallel_group_lanes: dispatch.parallel_group_lanes,
         group_workgroup_size: MODULAR_GROUP_WORKGROUP_SIZE,
         max_dispatch_workgroups,
+        output_write_path: dispatch.output_write_path,
     })
 }
 
@@ -2111,6 +2279,7 @@ impl GpuDecoder<WgpuSubmissionEngine> {
 mod tests {
     use super::*;
     use jxl_gpu_formats::vpi::VpiPitchLinearFormat as Vpi;
+    use jxl_wgpu_encode::LosslessModularFormat;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::Wake;
@@ -2216,6 +2385,131 @@ mod tests {
         assert_eq!(lanes, 3);
         assert_eq!(batches, [0..3, 3..6, 6..8]);
         assert_eq!(peak, 3 * 1024 + STREAM_SENTINEL_BYTES);
+    }
+
+    #[test]
+    fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
+        let extent = Extent2d::new(516, 3);
+        let groups = [
+            ModularGroup {
+                token_bit_offset: 0,
+                token_bit_end: 1,
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 3,
+                stream_index: 0,
+            },
+            ModularGroup {
+                token_bit_offset: 1,
+                token_bit_end: 2,
+                x: 256,
+                y: 0,
+                width: 256,
+                height: 3,
+                stream_index: 1,
+            },
+            ModularGroup {
+                token_bit_offset: 2,
+                token_bit_end: 3,
+                x: 512,
+                y: 0,
+                width: 4,
+                height: 3,
+                stream_index: 2,
+            },
+        ];
+        let mut cases = Vpi::ALL
+            .iter()
+            .filter_map(|&format| {
+                let pixel_format = format.pixel_format();
+                let request = match classify_pixel_format(&pixel_format).ok()? {
+                    PixelFormatClass::Numeric(numeric) => {
+                        let mapping = if numeric.sample_kind == SampleKind::Float
+                            && numeric.bits_per_component == 64
+                        {
+                            NumericSampleMapping::NormalizedGray8F64(
+                                F64OutputPolicy::ExactF32Widening,
+                            )
+                        } else {
+                            NumericSampleMapping::NormalizedGray8
+                        };
+                        GpuOutputRequest::numeric(pixel_format, mapping).ok()?
+                    }
+                    PixelFormatClass::Color(_) => GpuOutputRequest::color(pixel_format).ok()?,
+                };
+                Some((format.name(), request, crate::ModularChannels::Gray))
+            })
+            .collect::<Vec<_>>();
+        cases.extend([
+            (
+                "native-gray8",
+                GpuOutputRequest::numeric(
+                    LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+                    NumericSampleMapping::NativeUnsigned,
+                )
+                .unwrap(),
+                crate::ModularChannels::Gray,
+            ),
+            (
+                "native-rgb8",
+                GpuOutputRequest::color(LosslessModularFormat::Rgb.pixel_format(8).unwrap())
+                    .unwrap(),
+                crate::ModularChannels::Rgb,
+            ),
+            (
+                "native-rgba8",
+                GpuOutputRequest::color(LosslessModularFormat::Rgba.pixel_format(8).unwrap())
+                    .unwrap(),
+                crate::ModularChannels::Rgba,
+            ),
+        ]);
+        for (name, request, source_channels) in cases {
+            let output =
+                OutputPlan::new(extent, &request, source_channels, 8, PORTABLE_CAPABILITIES)
+                    .unwrap_or_else(|error| panic!("{name} output plan failed: {error}"));
+            assert_eq!(
+                output.write_path_for_groups(&groups).unwrap(),
+                OutputWritePath::WordAligned,
+                "{name} standard 256-pixel group boundaries"
+            );
+        }
+
+        let rgb_request = GpuOutputRequest::color(Vpi::Rgb8.pixel_format()).unwrap();
+        let mut rgb = OutputPlan::new(
+            extent,
+            &rgb_request,
+            crate::ModularChannels::Gray,
+            8,
+            PORTABLE_CAPABILITIES,
+        )
+        .unwrap();
+        let nonisolated = [ModularGroup {
+            token_bit_offset: 0,
+            token_bit_end: 1,
+            x: 1,
+            y: 0,
+            width: 255,
+            height: 3,
+            stream_index: 0,
+        }];
+        assert_eq!(
+            rgb.write_path_for_groups(&nonisolated).unwrap(),
+            OutputWritePath::AtomicBytes
+        );
+        rgb.layout.planes[0].row_stride += 1;
+        assert_eq!(
+            rgb.write_path_for_groups(&groups).unwrap(),
+            OutputWritePath::AtomicBytes
+        );
+    }
+
+    #[test]
+    fn distance_one_lz_history_uses_no_storage_scratch() {
+        assert_eq!(lz77_scratch_words(0), 0);
+        assert_eq!(lz77_scratch_words(1), 0);
+        assert_eq!(lz77_scratch_words(2), 2);
+        assert_eq!(lz77_scratch_words(1 << 20), 1 << 20);
     }
 
     #[test]
@@ -2525,7 +2819,10 @@ mod tests {
         assert!(SHADER_TEMPLATE.contains("stream_index: u32,"));
         assert!(SHADER_TEMPLATE.contains("wp_w3: u32,"));
         assert!(SHADER_TEMPLATE.contains("params_table: array<Params>"));
-        let portable = shader_source(F64OutputPath::ExactF32Widening);
+        let portable = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::WordAligned,
+        );
         assert!(portable.contains("@compute @workgroup_size(64)"));
         assert!(portable.contains("@builtin(global_invocation_id)"));
         assert!(portable.contains("let lane_index = global_invocation_id.x;"));
@@ -2564,17 +2861,37 @@ mod tests {
 
     #[test]
     fn portable_and_native_f64_shader_sources_validate_with_exact_capabilities() {
-        let portable = shader_source(F64OutputPath::ExactF32Widening);
-        let native = shader_source(F64OutputPath::NativeArithmetic);
-        assert!(!portable.contains(F64_OUTPUT_MARKER));
-        assert!(!native.contains(F64_OUTPUT_MARKER));
-        assert!(!portable.contains(F64_BINDING_MARKER));
-        assert!(!native.contains(F64_BINDING_MARKER));
-        assert!(!portable.contains("f64(sample)"));
-        assert!(native.contains("f64(sample) / 255.0"));
-        assert!(native.contains("output_f64: array<f64>"));
+        let portable_atomic = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::AtomicBytes,
+        );
+        let portable_aligned = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::WordAligned,
+        );
+        let native_atomic = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::AtomicBytes,
+        );
+        let native_aligned = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::WordAligned,
+        );
+        assert!(!portable_aligned.contains(F64_OUTPUT_MARKER));
+        assert!(!native_aligned.contains(F64_OUTPUT_MARKER));
+        assert!(!portable_aligned.contains(F64_BINDING_MARKER));
+        assert!(!native_aligned.contains(F64_BINDING_MARKER));
+        assert!(!portable_aligned.contains("f64(sample)"));
+        assert!(native_aligned.contains("f64(sample) / 255.0"));
+        assert!(native_aligned.contains("output_f64: array<f64>"));
+        assert!(portable_atomic.contains("array<atomic<u32>>"));
+        assert!(portable_atomic.contains("atomicCompareExchangeWeak"));
+        assert!(native_atomic.contains("atomicStore"));
+        assert!(portable_aligned.contains("output_words: array<u32>"));
+        assert!(!portable_aligned.contains("atomicCompareExchangeWeak"));
+        assert!(!native_aligned.contains("atomicStore"));
 
-        let native_without_capability = naga::front::wgsl::parse_str(&native)
+        let native_without_capability = naga::front::wgsl::parse_str(&native_aligned)
             .expect("native F64 WGSL syntax must parse before capability validation");
         let error = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -2585,8 +2902,26 @@ mod tests {
         assert!(format!("{error:?}").contains("FLOAT64"));
 
         for (name, source, capabilities) in [
-            ("portable", portable, naga::valid::Capabilities::empty()),
-            ("native-f64", native, naga::valid::Capabilities::FLOAT64),
+            (
+                "portable-atomic",
+                portable_atomic,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "portable-aligned",
+                portable_aligned,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "native-f64-atomic",
+                native_atomic,
+                naga::valid::Capabilities::FLOAT64,
+            ),
+            (
+                "native-f64-aligned",
+                native_aligned,
+                naga::valid::Capabilities::FLOAT64,
+            ),
         ] {
             let module = naga::front::wgsl::parse_str(&source)
                 .unwrap_or_else(|error| panic!("{name} WGSL did not parse: {error}"));

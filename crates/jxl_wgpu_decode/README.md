@@ -31,6 +31,11 @@ compute workgroup and their canvas rectangles do not overlap. Large frames use o
 by one reusable stream window instead of binding the full codestream. One
 aggregate status staging buffer is mapped once after the last batch, and every four-word group
 status is checked before the frame is reported. No reconstructed sample is produced on the CPU.
+Output pipeline selection is also per frame. When every plane offset and row stride is four-byte
+aligned and every actual internal group edge ends on a distinct storage word, the shader uses
+ordinary word RMW/store. Layouts with an odd stride, offset, or group edge use the atomic byte-safe
+pipeline. The proof is performed on the host from the validated output layout and typed group
+rectangles; there is no caller hint that can force the non-atomic path.
 `DecodeProfile::ModularLossless` reports this as `ModularPredictionProfile::MetaAdaptive` with
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
@@ -42,17 +47,21 @@ patches, splines, noise, and reference-frame animation remain typed unsupported 
 
 On an Apple M5, the 36,643,474-byte 7680x4320 Gray8 conformance codestream decoded to the exact
 33,177,600-byte source hash in one codec submission. Warm sequential decode plus staged UMA
-readback (`warmup=1`, `iterations=7`) selected 64 invocations per workgroup: 32/64/128/256 produced
-median latencies of 280.151/280.387/292.455/303.263 ms respectively, while 64 had the best mean
-and p95 (280.878/282.067 ms). The chosen pipeline is 5.20x faster than the earlier 64-lane,
-8-MiB-window, one-invocation-workgroup checkpoint (1.457 s). These are one-device engineering
-measurements, not cross-adapter performance guarantees; `memory_stats` exposes the resolved
-window, lanes, workgroups, and submissions for each device and request.
+readback (`warmup=1`, `iterations=7`) selected 64 invocations per workgroup. Before the aligned
+output and private distance-one history paths, 32/64/128/256 produced median latencies of
+280.151/280.387/292.455/303.263 ms respectively, while 64 had the best mean and p95
+(280.878/282.067 ms). With both paths enabled the selected 64-invocation pipeline measured
+209.949 ms median, 210.387 ms mean, 208.269 ms minimum, and 212.178 ms p95: 25.12% below that
+280.387 ms checkpoint and 6.94x faster than the earlier 64-lane, 8-MiB-window,
+one-invocation-workgroup checkpoint (1.457 s). These are one-device engineering measurements, not
+cross-adapter performance guarantees; `memory_stats` exposes the resolved window, lanes,
+workgroups, write path, LZ storage, and submissions for each device and request.
 
 The same selected pipeline decoded the exact 15360x8640 Gray8 hash from a 146,573,715-byte
-codestream in six bounded submissions: warm median 1.502 s (`warmup=1`, `iterations=3`), down from
-5.861 s and 32 submissions at the earlier checkpoint. The 132,710,400-byte output remains
-persistent while the stream window and descriptor-sized parallel scratch are reused across waves.
+codestream in six bounded submissions: warm median 1.112 s (`warmup=1`, `iterations=3`), down
+26.00% from the preceding 1.502 s checkpoint and 5.27x from 5.861 s/32 submissions. The
+132,710,400-byte output remains persistent while the stream window and descriptor-sized parallel
+scratch are reused across waves.
 
 ## GPU output formats
 
@@ -151,11 +160,13 @@ buffer limits. Lane count is the minimum of the 512-lane watchdog cap, group cou
 limits, and the scratch plus actual peak stream space affordable per requested frame slot. The LZ
 ring itself is the next power of two above the largest reachable back-reference derived from the
 distance histogram, hybrid-integer configuration, and group width; it is never sized by decoding
-residuals on the host. If the requested slot count is
+residuals on the host. A proven one-word ring uses invocation-private last-value state and consumes
+no reconstruction storage; wider histories retain the descriptor-sized storage ring. If the requested slot count is
 not affordable but one complete frame is, the prepared backend narrows it and propagates the
 resolved bound into the actual session limiter and prefetch validation. `WgpuDecodeSession::memory_stats`
-reports complete per-frame, output-lease, transient, peak-window, resolved-slot, stream/scratch/LZ
-sizes, lane/workgroup counts, stream batches, and actual submission counts. Concurrent jobs opened through an engine or its
+reports complete per-frame, output-lease, transient, peak-window, resolved-slot, logical/physical
+LZ sizes, selected output write path, lane/workgroup counts, stream batches, and actual submission
+counts. Concurrent jobs opened through an engine or its
 clones use the `WgpuBackend`'s shared
 transient memory budget by default, so decode, encode, and generic readback apply one aggregate
 admission bound. `WgpuSubmissionEngine::with_memory_budget` instead accepts an explicit cloneable

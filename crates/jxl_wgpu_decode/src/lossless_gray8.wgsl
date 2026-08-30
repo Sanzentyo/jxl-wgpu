@@ -56,7 +56,7 @@ struct DispatchControl {
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
 @group(0) @binding(1) var<storage, read> modular_metadata: array<u32>;
 @group(0) @binding(2) var<storage, read_write> reconstructed: array<u32>;
-@group(0) @binding(3) var<storage, read_write> output_words: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> output_words: /*__JXL_OUTPUT_WORDS_TYPE__*/;
 @group(0) @binding(4) var<storage, read_write> status: array<u32>;
 @group(0) @binding(5) var<storage, read> params_table: array<Params>;
 /*__JXL_F64_BINDING__*/
@@ -144,15 +144,7 @@ fn write_byte(offset: u32, value: u32) {
     let word_index = offset >> 2u;
     let shift = (offset & 3u) << 3u;
     let mask = 0xffu << shift;
-    var previous = atomicLoad(&output_words[word_index]);
-    loop {
-        let updated = (previous & ~mask) | ((value & 0xffu) << shift);
-        let exchange = atomicCompareExchangeWeak(&output_words[word_index], previous, updated);
-        if exchange.exchanged {
-            break;
-        }
-        previous = exchange.old_value;
-    }
+    /*__JXL_WRITE_BYTE_WORD__*/
 }
 
 fn write_word(offset: u32, value: u32) {
@@ -164,7 +156,7 @@ fn write_word(offset: u32, value: u32) {
         decode_error = ERROR_OUTPUT_BOUNDS;
         return;
     }
-    atomicStore(&output_words[offset >> 2u], value);
+    /*__JXL_WRITE_FULL_WORD__*/
 }
 
 fn write_stored_code(offset: u32, code: u32) {
