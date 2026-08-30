@@ -810,9 +810,11 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use jxl_gpu_protocol::OutputOrientation;
     use jxl_gpu_protocol::{
-        Border2d, ChromaAxis, GaborishParams, HostPlane, MemoryMode, OutputDesc, OutputId,
-        OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy,
-        RenderNode, RenderOp, SaveParams, Scale2d, UpsampleParams,
+        BlendComponent, BlendMode as ProtocolBlendMode, BlendParams, Border2d, ChromaAxis,
+        GaborishParams, HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData,
+        PlaneDesc, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderNode, RenderOp,
+        SaveParams, Scale2d, TransferFunction as ProtocolTransferFunction, TransferParams,
+        UpsampleParams, XybParams,
     };
 
     fn test_backend() -> Option<WgpuBackend> {
@@ -1150,6 +1152,640 @@ mod tests {
             frame.changed.outputs[&output_id][0],
             Region::new(0, 0, 2, 2)
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn xyb_inverse_executes_stream_parameters_in_one_gpu_dispatch() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let extent = Extent2d::new(3, 1);
+        let output = OutputId(0);
+        let plan = Arc::new(RenderPlan {
+            planes: (0..6)
+                .map(|id| {
+                    plane_desc(
+                        id,
+                        extent,
+                        SampleType::F32,
+                        if id < 3 {
+                            PlaneRole::Source
+                        } else {
+                            PlaneRole::Intermediate
+                        },
+                    )
+                })
+                .collect(),
+            nodes: vec![
+                render_node(
+                    "XYB inverse",
+                    RenderOp::XybToRgb(XybParams {
+                        opsin_bias: [-0.003_793_073_4; 3],
+                        inverse_opsin_matrix: [
+                            [11.031_567, -9.866_944, -0.164_622_99],
+                            [-3.254_147_3, 4.418_770_3, -0.164_622_99],
+                            [-3.658_851_4, 2.712_923, 1.945_928_2],
+                        ],
+                        intensity_target: 255.0,
+                    }),
+                    &[0, 1, 2],
+                    &[3, 4, 5],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::Float {
+                        absolute: 2.0e-5,
+                        relative: 2.0e-5,
+                        rmse: 2.0e-6,
+                    },
+                ),
+                render_node(
+                    "save linear RGB",
+                    RenderOp::Save(SaveParams {
+                        output,
+                        sample_type: SampleType::F32,
+                        channels: vec![PlaneId(3), PlaneId(4), PlaneId(5)],
+                        layout: OutputLayout::Planar,
+                        orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                    }),
+                    &[3, 4, 5],
+                    &[],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::Exact,
+                ),
+            ],
+            outputs: vec![OutputDesc {
+                id: output,
+                extent,
+                sample_type: SampleType::F32,
+                channels: 3,
+                layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::Rgb(
+                    jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                ),
+            }],
+        });
+        let mut session = backend
+            .create_session(&frame_desc(extent), plan)
+            .expect("create XYB GPU session");
+        session
+            .enqueue(GroupPayload {
+                group: GroupId(0),
+                revision: 0,
+                complete: true,
+                planes: vec![
+                    HostPlane {
+                        id: PlaneId(0),
+                        extent,
+                        stride: extent.width,
+                        origin: (0, 0),
+                        data: PlaneData::F32(vec![0.028100073, -0.015386105, 0.0]),
+                    },
+                    HostPlane {
+                        id: PlaneId(1),
+                        extent,
+                        stride: extent.width,
+                        origin: (0, 0),
+                        data: PlaneData::F32(vec![0.4881882, 0.71478134, 0.2781282]),
+                    },
+                    HostPlane {
+                        id: PlaneId(2),
+                        extent,
+                        stride: extent.width,
+                        origin: (0, 0),
+                        data: PlaneData::F32(vec![0.471659, 0.43707693, 0.66613984]),
+                    },
+                ],
+                vardct: None,
+            })
+            .expect("enqueue XYB source planes");
+        let token = session
+            .submit(RenderIntent::Final)
+            .expect("submit XYB inverse");
+        assert_eq!(
+            session
+                .last_submission_stats()
+                .expect("XYB submission stats")
+                .compute_dispatches,
+            4,
+            "one XYB dispatch plus three planar Save dispatches"
+        );
+        let rendered = session.wait(token).expect("read linear RGB");
+        let PlaneData::F32(actual) = &rendered.outputs[0].data else {
+            panic!("expected F32 RGB output");
+        };
+        let expected = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2.0e-5,
+                "linear RGB sample {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn all_standard_transfer_curves_execute_on_gpu() {
+        fn signed_map(value: f32, function: impl FnOnce(f32) -> f32) -> f32 {
+            function(value.abs()).copysign(value)
+        }
+
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let extent = Extent2d::new(4, 1);
+        let source = [0.0_f32, 0.003, 0.203, 1.0];
+        let cases = [
+            (ProtocolTransferFunction::Linear, 1.0),
+            (ProtocolTransferFunction::Srgb, 1.0),
+            (ProtocolTransferFunction::Bt709, 1.0),
+            (ProtocolTransferFunction::Gamma, 0.5),
+            (ProtocolTransferFunction::Pq, 1.0),
+            (ProtocolTransferFunction::Hlg, 1.0),
+        ];
+        for (function, gamma) in cases {
+            let params = TransferParams {
+                function,
+                gamma,
+                intensity_target: 1000.0,
+                min_nits: 0.0,
+                luminance_rgb: [0.2126, 0.7152, 0.0722],
+            };
+            let output = OutputId(0);
+            let plan = Arc::new(RenderPlan {
+                planes: (0..6)
+                    .map(|id| {
+                        plane_desc(
+                            id,
+                            extent,
+                            SampleType::F32,
+                            if id < 3 {
+                                PlaneRole::Source
+                            } else {
+                                PlaneRole::Intermediate
+                            },
+                        )
+                    })
+                    .collect(),
+                nodes: vec![
+                    render_node(
+                        "linear transfer",
+                        RenderOp::TransferFunction(params),
+                        &[0, 1, 2],
+                        &[3, 4, 5],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Float {
+                            absolute: 5.0e-5,
+                            relative: 5.0e-5,
+                            rmse: 5.0e-6,
+                        },
+                    ),
+                    render_node(
+                        "save transferred RGB",
+                        RenderOp::Save(SaveParams {
+                            output,
+                            sample_type: SampleType::F32,
+                            channels: vec![PlaneId(3), PlaneId(4), PlaneId(5)],
+                            layout: OutputLayout::Planar,
+                            orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                        }),
+                        &[3, 4, 5],
+                        &[],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Exact,
+                    ),
+                ],
+                outputs: vec![OutputDesc {
+                    id: output,
+                    extent,
+                    sample_type: SampleType::F32,
+                    channels: 3,
+                    layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::Rgb(
+                        jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                    ),
+                }],
+            });
+            let mut session = backend
+                .create_session(&frame_desc(extent), plan)
+                .expect("create transfer GPU session");
+            session
+                .enqueue(GroupPayload {
+                    group: GroupId(0),
+                    revision: 0,
+                    complete: true,
+                    planes: (0..3)
+                        .map(|id| HostPlane {
+                            id: PlaneId(id),
+                            extent,
+                            stride: extent.width,
+                            origin: (0, 0),
+                            data: PlaneData::F32(source.to_vec()),
+                        })
+                        .collect(),
+                    vardct: None,
+                })
+                .expect("enqueue transfer source planes");
+            let token = session
+                .submit(RenderIntent::Final)
+                .expect("submit transfer function");
+            let rendered = session.wait(token).expect("read transferred RGB");
+            let PlaneData::F32(actual) = &rendered.outputs[0].data else {
+                panic!("expected F32 transfer output");
+            };
+            let expected = source.map(|value| match function {
+                ProtocolTransferFunction::Linear => value,
+                ProtocolTransferFunction::Srgb => signed_map(value, |magnitude| {
+                    if magnitude <= 0.0031308 {
+                        12.92 * magnitude
+                    } else {
+                        1.055 * magnitude.powf(1.0 / 2.4) - 0.055
+                    }
+                }),
+                ProtocolTransferFunction::Bt709 => signed_map(value, |magnitude| {
+                    if magnitude <= 0.018 {
+                        4.5 * magnitude
+                    } else {
+                        1.099 * magnitude.powf(0.45) - 0.099
+                    }
+                }),
+                ProtocolTransferFunction::Gamma => {
+                    signed_map(value, |magnitude| magnitude.powf(gamma))
+                }
+                ProtocolTransferFunction::Pq => signed_map(value, |magnitude| {
+                    if magnitude == 0.0 {
+                        return 0.0;
+                    }
+                    let m1 = 2610.0 / 16384.0;
+                    let m2 = (2523.0 / 4096.0) * 128.0;
+                    let c1 = 3424.0 / 4096.0;
+                    let c2 = (2413.0 / 4096.0) * 32.0;
+                    let c3 = (2392.0 / 4096.0) * 32.0;
+                    let powered = (magnitude * 1000.0 / 10000.0).powf(m1);
+                    ((c1 + c2 * powered) / (1.0 + c3 * powered)).powf(m2)
+                }),
+                ProtocolTransferFunction::Hlg => {
+                    if value == 0.0 {
+                        0.0
+                    } else {
+                        let system_gamma = 1.2 * 1.111_f32.powf((1000.0_f32 / 1000.0).log2());
+                        let scene = value * value.powf((1.0 - system_gamma) / system_gamma);
+                        if scene <= 1.0 / 12.0 {
+                            (3.0 * scene).sqrt()
+                        } else {
+                            0.17883277 * (12.0 * scene - (1.0 - 4.0 * 0.17883277)).ln()
+                                + 0.559_910_7
+                        }
+                    }
+                }
+            });
+            for (index, (&actual, &expected)) in
+                actual.iter().zip(expected.iter().cycle()).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() < 5.0e-5,
+                    "{function:?} sample {index}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn all_jpeg_xl_patch_and_frame_blend_modes_execute_on_gpu() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let extent = Extent2d::new(1, 1);
+        let base = 0.25_f32;
+        let source = 0.8_f32;
+        let base_alpha = 0.4_f32;
+        let source_alpha = 0.5_f32;
+        let cases = [
+            (ProtocolBlendMode::Keep, false, base),
+            (ProtocolBlendMode::Replace, false, source),
+            (ProtocolBlendMode::Add, false, base + source),
+            (ProtocolBlendMode::Multiply, false, base * source),
+            (
+                ProtocolBlendMode::BlendAbove,
+                false,
+                (source * source_alpha + base * base_alpha * (1.0 - source_alpha)) / 0.7,
+            ),
+            (
+                ProtocolBlendMode::BlendBelow,
+                false,
+                (base * base_alpha + source * source_alpha * (1.0 - base_alpha)) / 0.7,
+            ),
+            (
+                ProtocolBlendMode::BlendAbove,
+                true,
+                source + base * (1.0 - source_alpha),
+            ),
+            (
+                ProtocolBlendMode::AlphaWeightedAddAbove,
+                false,
+                base + source * source_alpha,
+            ),
+            (
+                ProtocolBlendMode::AlphaWeightedAddBelow,
+                false,
+                source + base * base_alpha,
+            ),
+        ];
+
+        for (mode, alpha_associated, expected) in cases {
+            let output = OutputId(0);
+            let plan = Arc::new(RenderPlan {
+                planes: (0..5)
+                    .map(|id| {
+                        plane_desc(
+                            id,
+                            extent,
+                            SampleType::F32,
+                            if id < 4 {
+                                PlaneRole::Source
+                            } else {
+                                PlaneRole::Intermediate
+                            },
+                        )
+                    })
+                    .collect(),
+                nodes: vec![
+                    render_node(
+                        "blend scalar channel",
+                        RenderOp::Blend(BlendParams {
+                            mode,
+                            component: BlendComponent::Color { alpha_associated },
+                            clamp: true,
+                        }),
+                        &[0, 1, 2, 3],
+                        &[4],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Float {
+                            absolute: 1.0e-6,
+                            relative: 1.0e-6,
+                            rmse: 1.0e-6,
+                        },
+                    ),
+                    render_node(
+                        "save blended scalar",
+                        RenderOp::Save(SaveParams {
+                            output,
+                            sample_type: SampleType::F32,
+                            channels: vec![PlaneId(4)],
+                            layout: OutputLayout::Planar,
+                            orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                        }),
+                        &[4],
+                        &[],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Exact,
+                    ),
+                ],
+                outputs: vec![OutputDesc {
+                    id: output,
+                    extent,
+                    sample_type: SampleType::F32,
+                    channels: 1,
+                    layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+                }],
+            });
+            let mut session = backend
+                .create_session(&frame_desc(extent), plan)
+                .unwrap_or_else(|error| panic!("create {mode:?} GPU session: {error}"));
+            session
+                .enqueue(GroupPayload {
+                    group: GroupId(0),
+                    revision: 0,
+                    complete: true,
+                    planes: [base, source, base_alpha, source_alpha]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, value)| HostPlane {
+                            id: PlaneId(u32::try_from(id).unwrap()),
+                            extent,
+                            stride: extent.width,
+                            origin: (0, 0),
+                            data: PlaneData::F32(vec![value]),
+                        })
+                        .collect(),
+                    vardct: None,
+                })
+                .unwrap_or_else(|error| panic!("enqueue {mode:?} inputs: {error}"));
+            let token = session
+                .submit(RenderIntent::Final)
+                .unwrap_or_else(|error| panic!("submit {mode:?}: {error}"));
+            assert_eq!(
+                session
+                    .last_submission_stats()
+                    .expect("blend submission stats")
+                    .compute_dispatches,
+                2,
+                "one {mode:?} dispatch plus one Save dispatch"
+            );
+            let rendered = session
+                .wait(token)
+                .unwrap_or_else(|error| panic!("read {mode:?}: {error}"));
+            let PlaneData::F32(actual) = &rendered.outputs[0].data else {
+                panic!("expected F32 blend output");
+            };
+            assert!(
+                (actual[0] - expected).abs() < 1.0e-6,
+                "{mode:?}, associated={alpha_associated}: {} != {expected}",
+                actual[0]
+            );
+        }
+
+        for (mode, expected) in [
+            (ProtocolBlendMode::BlendAbove, 0.7_f32),
+            (ProtocolBlendMode::BlendBelow, 0.7_f32),
+            (ProtocolBlendMode::AlphaWeightedAddAbove, base_alpha),
+            (ProtocolBlendMode::AlphaWeightedAddBelow, source_alpha),
+        ] {
+            let output = OutputId(0);
+            let plan = Arc::new(RenderPlan {
+                planes: (0..3)
+                    .map(|id| {
+                        plane_desc(
+                            id,
+                            extent,
+                            SampleType::F32,
+                            if id < 2 {
+                                PlaneRole::Source
+                            } else {
+                                PlaneRole::Intermediate
+                            },
+                        )
+                    })
+                    .collect(),
+                nodes: vec![
+                    render_node(
+                        "blend alpha channel",
+                        RenderOp::Blend(BlendParams {
+                            mode,
+                            component: BlendComponent::Alpha,
+                            clamp: true,
+                        }),
+                        &[0, 1],
+                        &[2],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Float {
+                            absolute: 1.0e-6,
+                            relative: 1.0e-6,
+                            rmse: 1.0e-6,
+                        },
+                    ),
+                    render_node(
+                        "save blended alpha",
+                        RenderOp::Save(SaveParams {
+                            output,
+                            sample_type: SampleType::F32,
+                            channels: vec![PlaneId(2)],
+                            layout: OutputLayout::Planar,
+                            orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                        }),
+                        &[2],
+                        &[],
+                        Scale2d::IDENTITY,
+                        PrecisionContract::Exact,
+                    ),
+                ],
+                outputs: vec![OutputDesc {
+                    id: output,
+                    extent,
+                    sample_type: SampleType::F32,
+                    channels: 1,
+                    layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+                }],
+            });
+            let mut session = backend
+                .create_session(&frame_desc(extent), plan)
+                .expect("create alpha blend session");
+            session
+                .enqueue(GroupPayload {
+                    group: GroupId(0),
+                    revision: 0,
+                    complete: true,
+                    planes: [base_alpha, source_alpha]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, value)| HostPlane {
+                            id: PlaneId(u32::try_from(id).unwrap()),
+                            extent,
+                            stride: extent.width,
+                            origin: (0, 0),
+                            data: PlaneData::F32(vec![value]),
+                        })
+                        .collect(),
+                    vardct: None,
+                })
+                .expect("enqueue alpha inputs");
+            let token = session
+                .submit(RenderIntent::Final)
+                .expect("submit alpha blend");
+            let rendered = session.wait(token).expect("read blended alpha");
+            let PlaneData::F32(actual) = &rendered.outputs[0].data else {
+                panic!("expected F32 alpha output");
+            };
+            assert!((actual[0] - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn partial_animation_frame_extends_and_crops_on_gpu() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let image_extent = Extent2d::new(4, 3);
+        let frame_extent = Extent2d::new(3, 2);
+        let output = OutputId(0);
+        let plan = Arc::new(RenderPlan {
+            planes: vec![
+                plane_desc(0, frame_extent, SampleType::I32, PlaneRole::Source),
+                plane_desc(1, image_extent, SampleType::I32, PlaneRole::Source),
+                plane_desc(2, image_extent, SampleType::I32, PlaneRole::Intermediate),
+            ],
+            nodes: vec![
+                render_node(
+                    "extend partial animation frame",
+                    RenderOp::Extend {
+                        image_extent,
+                        origin: (-1, 1),
+                    },
+                    &[0, 1],
+                    &[2],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::Exact,
+                ),
+                render_node(
+                    "save extended frame",
+                    RenderOp::Save(SaveParams {
+                        output,
+                        sample_type: SampleType::I32,
+                        channels: vec![PlaneId(2)],
+                        layout: OutputLayout::Planar,
+                        orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                    }),
+                    &[2],
+                    &[],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::Exact,
+                ),
+            ],
+            outputs: vec![OutputDesc {
+                id: output,
+                extent: image_extent,
+                sample_type: SampleType::I32,
+                channels: 1,
+                layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+            }],
+        });
+        let mut session = backend
+            .create_session(&frame_desc(image_extent), plan)
+            .expect("create Extend GPU session");
+        session
+            .enqueue(GroupPayload {
+                group: GroupId(0),
+                revision: 0,
+                complete: true,
+                planes: vec![
+                    HostPlane {
+                        id: PlaneId(0),
+                        extent: frame_extent,
+                        stride: frame_extent.width,
+                        origin: (0, 0),
+                        data: PlaneData::I32(vec![100, 101, 102, 103, 104, 105]),
+                    },
+                    HostPlane {
+                        id: PlaneId(1),
+                        extent: image_extent,
+                        stride: image_extent.width,
+                        origin: (0, 0),
+                        data: PlaneData::I32((0..12).collect()),
+                    },
+                ],
+                vardct: None,
+            })
+            .expect("enqueue partial frame and reference canvas");
+        let token = session
+            .submit(RenderIntent::Final)
+            .expect("submit animation extension");
+        assert_eq!(
+            session
+                .last_submission_stats()
+                .expect("Extend submission stats")
+                .compute_dispatches,
+            2,
+            "one Extend dispatch plus one Save dispatch"
+        );
+        let rendered = session.wait(token).expect("read extended frame");
+        let PlaneData::I32(actual) = &rendered.outputs[0].data else {
+            panic!("expected I32 extended output");
+        };
+        assert_eq!(actual, &[0, 1, 2, 3, 101, 102, 6, 7, 104, 105, 10, 11]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

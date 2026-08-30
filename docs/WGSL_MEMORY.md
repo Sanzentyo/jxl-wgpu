@@ -42,7 +42,11 @@ name shown in parentheses.
 | `jxl_wgpu/epf.wgsl` | `EpfUniform` / `Params` | dimensions/6 image strides, sigma dimensions/stride/kind, 6 filter floats, `_pad0, _pad1` | 80 | 4 | uniform |
 | `jxl_wgpu/upsample.wgsl` | `UpsampleUniform` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, factor, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
+| `jxl_wgpu/xyb_to_rgb.wgsl` | `XybUniform` / `Params` | dimensions/6 strides, three padded inverse-opsin rows, padded cube-root bias, padded scaled bias, `intensity_scale`, 3 pads | 128 | 4 | uniform |
+| `jxl_wgpu/transfer_function.wgsl` | `TransferUniform` / `Params` | dimensions/6 strides, `transfer, gamma, intensity_target, min_nits, luminance_rgb` | 64 | 4 | uniform |
+| `jxl_wgpu/blend.wgsl` | `BlendUniform` / `Params` | dimensions/5 value strides, 2 alpha strides, `mode, component, clamp, alpha_associated, has_alpha` | 48 | 4 | uniform |
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
+| `jxl_wgpu/extend.wgsl` | `ExtendUniform` / `Params` | image/frame dimensions, 3 strides, signed origin, `has_reference`, 2 pads | 48 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad | 128 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
@@ -95,7 +99,11 @@ the device and checks every dispatched dimension against `max_compute_workgroups
 | `epf0`, `epf1`, `epf2` | X/Y/B/sigma RO, X/Y/B RW, U | 16x16 | checked common extent, sigma shape and all strides |
 | `upsample` | input/weights RO, output RW, U | 16x16 | checked factor, output extent, weights and strides |
 | `ycbcr_to_rgb` | Cb/Y/Cr RO, output RW, U | 16x16 | one checked dispatch per output component |
+| `xyb_to_rgb` | X/Y/B RO, R/G/B RW, U | 16x16 | one dispatch; checked common F32 extent, per-plane strides, finite inverse-opsin parameters and positive intensity target |
+| `transfer_function` | R/G/B RO, R/G/B RW, U | 16x16 | one dispatch; checked common F32 extent and Linear/sRGB/BT.709/Gamma/PQ/HLG parameters |
+| `blend` | base/source/base-alpha/source-alpha RO, output RW, U | 16x16 | one scalar-channel dispatch; two or four equal F32 inputs keep the shader within portable storage-binding limits |
 | `premultiply_alpha` | color/alpha RO, output RW, U | 16x16 | one checked dispatch per color component |
+| `extend` | frame/reference RO, full-canvas output RW, U | 16x16 | exact u32 word copy for I32/F32; checked signed origin, crop, target extent and optional reference canvas |
 | `save` | source RO, packed output RW, U | 16x16 | checked orientation and exact packed allocation |
 | `rgb_to_image` | R/G/B RO, packed output RW, U | 256x1 | checked linear word count is split into a legal 2-D dispatch; shader checks `logical_size` before stores |
 | `display_rgb` | source RO, destination T, U | 16x16 | source must have `STORAGE`; logical samples and final source address fit the bound range/WGSL `u32` |
@@ -187,7 +195,7 @@ capability, so a source containing `array<f64>` cannot leak into the portable pi
 ## Regression coverage
 
 The ABI tests pin every Rust size, natural alignment, and field order, including the 16-byte
-VarDCT alignment and both Gray8 readback schemas.
+VarDCT alignment, the color/transfer/blend uniforms, and both Gray8 readback schemas.
 GPU tests compile and execute every portable core shader, all display formats, VarDCT DCT8, the
 deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
 
@@ -204,6 +212,8 @@ deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
 - typed rejection of missing/mismatched numeric mappings and native-required F64 on devices without
   enabled `SHADER_F64`, plus an explicitly skipped native-F64 GPU test on unsupported adapters;
 - the 1,536-byte VarDCT workgroup-storage requirement; and
+- stream-defined inverse XYB, all six standard transfer curves, and all eight JPEG XL patch/frame
+  blend modes, including straight and associated alpha; and
 - the encoder's worst-case event capacity.
 
 Any new WGSL host record must extend the ABI table and size/alignment tests. Any new buffer must be

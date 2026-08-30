@@ -20,9 +20,13 @@ pub(crate) fn capabilities(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> B
             RenderOpKind::Epf,
             RenderOpKind::Upsample,
             RenderOpKind::VarDct,
+            RenderOpKind::XybToRgb,
             RenderOpKind::YcbcrToRgb,
+            RenderOpKind::TransferFunction,
+            RenderOpKind::Blend,
             RenderOpKind::PremultiplyAlpha,
             RenderOpKind::Convert,
+            RenderOpKind::Extend,
             RenderOpKind::Save,
         ]
         .into_iter()

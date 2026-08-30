@@ -14,11 +14,11 @@ use jxl_gpu_formats::{
     YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{
-    ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId, GroupPayload, MemoryMode,
-    OutputColorEncoding, OutputDesc, OutputId, OutputLayout, OutputOrientation, PlaneDesc, PlaneId,
-    PlaneRole, RenderNode, RenderOp, RenderOpKind, RenderPlan, ResourceData, ResourceId,
-    ResourceUpdate, RgbColorEncoding, RgbPrimaries, SampleType,
-    TransferFunction as SourceTransferFunction,
+    BlendComponent, BlendMode, BlendParams, ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId,
+    GroupPayload, MemoryMode, OutputColorEncoding, OutputDesc, OutputId, OutputLayout,
+    OutputOrientation, PlaneDesc, PlaneId, PlaneRole, RenderNode, RenderOp, RenderOpKind,
+    RenderPlan, ResourceData, ResourceId, ResourceUpdate, RgbColorEncoding, RgbPrimaries,
+    SampleType, TransferFunction as SourceTransferFunction,
 };
 use wgpu::util::DeviceExt;
 
@@ -121,8 +121,12 @@ impl Scheduler {
                 | RenderOp::Gaborish(_)
                 | RenderOp::Epf(_)
                 | RenderOp::VarDct { .. }
+                | RenderOp::XybToRgb(_)
                 | RenderOp::YcbcrToRgb
-                | RenderOp::PremultiplyAlpha { .. } => {}
+                | RenderOp::TransferFunction(_)
+                | RenderOp::Blend(_)
+                | RenderOp::PremultiplyAlpha { .. }
+                | RenderOp::Extend { .. } => {}
                 RenderOp::Upsample(params) if matches!(params.factor, 2 | 4 | 8) => {}
                 RenderOp::Upsample(params) => {
                     return Err(Error::Unsupported(format!(
@@ -499,10 +503,28 @@ impl Scheduler {
                             encode_upsample(&factory, &mut encoder, node, &planes, params)?;
                             1
                         }
+                        RenderOp::XybToRgb(params) => {
+                            encode_xyb_to_rgb(&factory, &mut encoder, node, &planes, params)?;
+                            1
+                        }
                         RenderOp::YcbcrToRgb => {
                             encode_ycbcr(&factory, &mut encoder, node, &planes)?;
                             u32::try_from(node.outputs.len())
                                 .map_err(|_| Error::BufferSizeOverflow)?
+                        }
+                        RenderOp::TransferFunction(params) => {
+                            encode_transfer_function(
+                                &factory,
+                                &mut encoder,
+                                node,
+                                &planes,
+                                params,
+                            )?;
+                            1
+                        }
+                        RenderOp::Blend(params) => {
+                            encode_blend(&factory, &mut encoder, node, &planes, params)?;
+                            1
                         }
                         RenderOp::PremultiplyAlpha { alpha_plane } => {
                             encode_premultiply(
@@ -516,6 +538,20 @@ impl Scheduler {
                         }
                         RenderOp::Convert { output_type } => {
                             encode_convert(&factory, &mut encoder, node, &planes, *output_type)?;
+                            1
+                        }
+                        RenderOp::Extend {
+                            image_extent,
+                            origin,
+                        } => {
+                            encode_extend(
+                                &factory,
+                                &mut encoder,
+                                node,
+                                &planes,
+                                *image_extent,
+                                *origin,
+                            )?;
                             1
                         }
                         RenderOp::Save(save) => {
@@ -764,9 +800,12 @@ fn transient_bytes(
                 add_uniform::<UpsampleUniform>(&mut bytes)?;
                 add_slice::<f32>(&mut bytes, params.weights.len())?;
             }
+            RenderOp::XybToRgb(_) => add_uniform::<XybUniform>(&mut bytes)?,
             RenderOp::YcbcrToRgb => {
                 add_uniforms::<YcbcrUniform>(&mut bytes, node.outputs.len())?;
             }
+            RenderOp::TransferFunction(_) => add_uniform::<TransferUniform>(&mut bytes)?,
+            RenderOp::Blend(_) => add_uniform::<BlendUniform>(&mut bytes)?,
             RenderOp::PremultiplyAlpha { alpha_plane } => {
                 let color_count = node.inputs.iter().filter(|id| *id != alpha_plane).count();
                 add_uniforms::<PremultiplyUniform>(&mut bytes, color_count)?;
@@ -788,6 +827,7 @@ fn transient_bytes(
                     add_uniform::<ModularParams>(&mut bytes)?;
                 }
             }
+            RenderOp::Extend { .. } => add_uniform::<ExtendUniform>(&mut bytes)?,
             RenderOp::Save(save) => {
                 let output = plan
                     .outputs
@@ -1957,6 +1997,282 @@ fn encode_ycbcr(
     Ok(())
 }
 
+fn encode_xyb_to_rgb(
+    factory: &PipelineFactory<'_>,
+    encoder: &mut wgpu::CommandEncoder,
+    node: &RenderNode,
+    planes: &BTreeMap<PlaneId, UploadedPlane>,
+    xyb: &jxl_gpu_protocol::XybParams,
+) -> Result<()> {
+    let [x_id, y_id, b_id] = node.inputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "XYB conversion requires exactly three inputs".into(),
+        ));
+    };
+    let [r_id, g_id, output_b_id] = node.outputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "XYB conversion requires exactly three outputs".into(),
+        ));
+    };
+    let [x, y, b, r, g, output_b] = [
+        plane(planes, *x_id)?,
+        plane(planes, *y_id)?,
+        plane(planes, *b_id)?,
+        plane(planes, *r_id)?,
+        plane(planes, *g_id)?,
+        plane(planes, *output_b_id)?,
+    ];
+    let extent = x.desc.extent;
+    if [y, b, r, g, output_b]
+        .iter()
+        .any(|plane| plane.desc.sample_type != SampleType::F32 || plane.desc.extent != extent)
+        || x.desc.sample_type != SampleType::F32
+    {
+        return Err(Error::InvalidPayload(
+            "XYB conversion requires six equal-extent F32 planes".into(),
+        ));
+    }
+
+    let intensity_scale = 255.0 / xyb.intensity_target;
+    let bias_cbrt = xyb.opsin_bias.map(f32::cbrt);
+    let scaled_bias = xyb.opsin_bias.map(|value| value * intensity_scale);
+    let params = XybUniform {
+        width: extent.width,
+        height: extent.height,
+        input_stride_x: stride(&x.desc),
+        input_stride_y: stride(&y.desc),
+        input_stride_b: stride(&b.desc),
+        output_stride_r: stride(&r.desc),
+        output_stride_g: stride(&g.desc),
+        output_stride_b: stride(&output_b.desc),
+        matrix_r: [
+            xyb.inverse_opsin_matrix[0][0],
+            xyb.inverse_opsin_matrix[0][1],
+            xyb.inverse_opsin_matrix[0][2],
+            0.0,
+        ],
+        matrix_g: [
+            xyb.inverse_opsin_matrix[1][0],
+            xyb.inverse_opsin_matrix[1][1],
+            xyb.inverse_opsin_matrix[1][2],
+            0.0,
+        ],
+        matrix_b: [
+            xyb.inverse_opsin_matrix[2][0],
+            xyb.inverse_opsin_matrix[2][1],
+            xyb.inverse_opsin_matrix[2][2],
+            0.0,
+        ],
+        bias_cbrt: [bias_cbrt[0], bias_cbrt[1], bias_cbrt[2], 0.0],
+        scaled_bias: [scaled_bias[0], scaled_bias[1], scaled_bias[2], 0.0],
+        intensity_scale,
+        _padding: [0; 3],
+    };
+    let uniform = create_uniform(factory.device, "jxl-wgpu XYB params", &params);
+    let pipeline = create_pipeline(
+        factory,
+        "jxl-wgpu XYB-to-RGB",
+        wgpu::include_wgsl!("../shaders/xyb_to_rgb.wgsl"),
+    );
+    record_dispatch(
+        factory.device,
+        encoder,
+        &pipeline,
+        &[
+            x.binding(),
+            y.binding(),
+            b.binding(),
+            r.binding(),
+            g.binding(),
+            output_b.binding(),
+            uniform.as_entire_binding(),
+        ],
+        extent.width,
+        extent.height,
+    );
+    Ok(())
+}
+
+fn encode_transfer_function(
+    factory: &PipelineFactory<'_>,
+    encoder: &mut wgpu::CommandEncoder,
+    node: &RenderNode,
+    planes: &BTreeMap<PlaneId, UploadedPlane>,
+    transfer: &jxl_gpu_protocol::TransferParams,
+) -> Result<()> {
+    let [input_r_id, input_g_id, input_b_id] = node.inputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "transfer function requires exactly three inputs".into(),
+        ));
+    };
+    let [output_r_id, output_g_id, output_b_id] = node.outputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "transfer function requires exactly three outputs".into(),
+        ));
+    };
+    let [input_r, input_g, input_b, output_r, output_g, output_b] = [
+        plane(planes, *input_r_id)?,
+        plane(planes, *input_g_id)?,
+        plane(planes, *input_b_id)?,
+        plane(planes, *output_r_id)?,
+        plane(planes, *output_g_id)?,
+        plane(planes, *output_b_id)?,
+    ];
+    let extent = input_r.desc.extent;
+    if [input_r, input_g, input_b, output_r, output_g, output_b]
+        .iter()
+        .any(|plane| plane.desc.sample_type != SampleType::F32 || plane.desc.extent != extent)
+    {
+        return Err(Error::InvalidPayload(
+            "transfer function requires six equal-extent F32 planes".into(),
+        ));
+    }
+    let transfer_code = match transfer.function {
+        SourceTransferFunction::Linear => 0,
+        SourceTransferFunction::Srgb => 1,
+        SourceTransferFunction::Bt709 => 2,
+        SourceTransferFunction::Pq => 3,
+        SourceTransferFunction::Hlg => 4,
+        SourceTransferFunction::Gamma => 5,
+    };
+    let params = TransferUniform {
+        width: extent.width,
+        height: extent.height,
+        input_stride_r: stride(&input_r.desc),
+        input_stride_g: stride(&input_g.desc),
+        input_stride_b: stride(&input_b.desc),
+        output_stride_r: stride(&output_r.desc),
+        output_stride_g: stride(&output_g.desc),
+        output_stride_b: stride(&output_b.desc),
+        transfer: transfer_code,
+        gamma: transfer.gamma,
+        intensity_target: transfer.intensity_target,
+        min_nits: transfer.min_nits,
+        luminance_rgb: [
+            transfer.luminance_rgb[0],
+            transfer.luminance_rgb[1],
+            transfer.luminance_rgb[2],
+            0.0,
+        ],
+    };
+    let uniform = create_uniform(factory.device, "jxl-wgpu transfer params", &params);
+    let pipeline = create_pipeline(
+        factory,
+        "jxl-wgpu transfer function",
+        wgpu::include_wgsl!("../shaders/transfer_function.wgsl"),
+    );
+    record_dispatch(
+        factory.device,
+        encoder,
+        &pipeline,
+        &[
+            input_r.binding(),
+            input_g.binding(),
+            input_b.binding(),
+            output_r.binding(),
+            output_g.binding(),
+            output_b.binding(),
+            uniform.as_entire_binding(),
+        ],
+        extent.width,
+        extent.height,
+    );
+    Ok(())
+}
+
+fn encode_blend(
+    factory: &PipelineFactory<'_>,
+    encoder: &mut wgpu::CommandEncoder,
+    node: &RenderNode,
+    planes: &BTreeMap<PlaneId, UploadedPlane>,
+    blend: &BlendParams,
+) -> Result<()> {
+    let [output_id] = node.outputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "Blend requires exactly one output".into(),
+        ));
+    };
+    let (base_id, source_id, base_alpha_id, source_alpha_id, component, has_alpha) =
+        match (blend.component, node.inputs.as_slice()) {
+            (BlendComponent::Color { .. }, [base, source]) => {
+                (*base, *source, *base, *source, 0, false)
+            }
+            (BlendComponent::Color { .. }, [base, source, base_alpha, source_alpha]) => {
+                (*base, *source, *base_alpha, *source_alpha, 0, true)
+            }
+            (BlendComponent::Alpha, [base, source]) => (*base, *source, *base, *source, 1, true),
+            _ => {
+                return Err(Error::InvalidPayload(
+                    "Blend input arity does not match its component".into(),
+                ));
+            }
+        };
+    let base = plane(planes, base_id)?;
+    let source = plane(planes, source_id)?;
+    let base_alpha = plane(planes, base_alpha_id)?;
+    let source_alpha = plane(planes, source_alpha_id)?;
+    let output = plane(planes, *output_id)?;
+    require_f32_equal_extent("Blend", base, source)?;
+    require_f32_equal_extent("Blend", base, base_alpha)?;
+    require_f32_equal_extent("Blend", base, source_alpha)?;
+    require_f32_equal_extent("Blend", base, output)?;
+
+    let mode = match blend.mode {
+        BlendMode::Keep => 0,
+        BlendMode::Replace => 1,
+        BlendMode::Add => 2,
+        BlendMode::Multiply => 3,
+        BlendMode::BlendAbove => 4,
+        BlendMode::BlendBelow => 5,
+        BlendMode::AlphaWeightedAddAbove => 6,
+        BlendMode::AlphaWeightedAddBelow => 7,
+    };
+    let alpha_associated = match blend.component {
+        BlendComponent::Color { alpha_associated } => alpha_associated,
+        BlendComponent::Alpha => false,
+    };
+    let extent = base.desc.extent;
+    let uniform = create_uniform(
+        factory.device,
+        "jxl-wgpu blend params",
+        &BlendUniform {
+            width: extent.width,
+            height: extent.height,
+            base_stride: stride(&base.desc),
+            source_stride: stride(&source.desc),
+            output_stride: stride(&output.desc),
+            base_alpha_stride: stride(&base_alpha.desc),
+            source_alpha_stride: stride(&source_alpha.desc),
+            mode,
+            component,
+            clamp: u32::from(blend.clamp),
+            alpha_associated: u32::from(alpha_associated),
+            has_alpha: u32::from(has_alpha),
+        },
+    );
+    let pipeline = create_pipeline(
+        factory,
+        "jxl-wgpu JPEG XL blend",
+        wgpu::include_wgsl!("../shaders/blend.wgsl"),
+    );
+    record_dispatch(
+        factory.device,
+        encoder,
+        &pipeline,
+        &[
+            base.binding(),
+            source.binding(),
+            base_alpha.binding(),
+            source_alpha.binding(),
+            output.binding(),
+            uniform.as_entire_binding(),
+        ],
+        extent.width,
+        extent.height,
+    );
+    Ok(())
+}
+
 fn encode_premultiply(
     factory: &PipelineFactory<'_>,
     encoder: &mut wgpu::CommandEncoder,
@@ -2069,6 +2385,80 @@ fn encode_convert(
         "Convert {:?} -> {output_type:?} is not representable without a rounding contract",
         input.desc.sample_type
     )))
+}
+
+fn encode_extend(
+    factory: &PipelineFactory<'_>,
+    encoder: &mut wgpu::CommandEncoder,
+    node: &RenderNode,
+    planes: &BTreeMap<PlaneId, UploadedPlane>,
+    image_extent: Extent2d,
+    origin: (i32, i32),
+) -> Result<()> {
+    let (frame_id, reference_id, has_reference) = match node.inputs.as_slice() {
+        [frame] => (*frame, *frame, false),
+        [frame, reference] => (*frame, *reference, true),
+        _ => {
+            return Err(Error::InvalidPayload(
+                "Extend requires a frame and optional reference input".into(),
+            ));
+        }
+    };
+    let [output_id] = node.outputs.as_slice() else {
+        return Err(Error::InvalidPayload(
+            "Extend requires exactly one output".into(),
+        ));
+    };
+    let frame = plane(planes, frame_id)?;
+    let reference = plane(planes, reference_id)?;
+    let output = plane(planes, *output_id)?;
+    if !matches!(frame.desc.sample_type, SampleType::I32 | SampleType::F32)
+        || reference.desc.sample_type != frame.desc.sample_type
+        || output.desc.sample_type != frame.desc.sample_type
+        || output.desc.extent != image_extent
+        || (has_reference && reference.desc.extent != image_extent)
+    {
+        return Err(Error::InvalidPayload(
+            "Extend requires matching I32/F32 planes and a full-canvas output/reference".into(),
+        ));
+    }
+
+    let uniform = create_uniform(
+        factory.device,
+        "jxl-wgpu extend params",
+        &ExtendUniform {
+            width: image_extent.width,
+            height: image_extent.height,
+            frame_width: frame.desc.extent.width,
+            frame_height: frame.desc.extent.height,
+            frame_stride: stride(&frame.desc),
+            reference_stride: stride(&reference.desc),
+            output_stride: stride(&output.desc),
+            origin_x: origin.0,
+            origin_y: origin.1,
+            has_reference: u32::from(has_reference),
+            _padding: [0; 2],
+        },
+    );
+    let pipeline = create_pipeline(
+        factory,
+        "jxl-wgpu extend to image canvas",
+        wgpu::include_wgsl!("../shaders/extend.wgsl"),
+    );
+    record_dispatch(
+        factory.device,
+        encoder,
+        &pipeline,
+        &[
+            frame.binding(),
+            reference.binding(),
+            output.binding(),
+            uniform.as_entire_binding(),
+        ],
+        image_extent.width,
+        image_extent.height,
+    );
+    Ok(())
 }
 
 fn encode_save(
@@ -2924,6 +3314,61 @@ struct YcbcrUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct XybUniform {
+    width: u32,
+    height: u32,
+    input_stride_x: u32,
+    input_stride_y: u32,
+    input_stride_b: u32,
+    output_stride_r: u32,
+    output_stride_g: u32,
+    output_stride_b: u32,
+    matrix_r: [f32; 4],
+    matrix_g: [f32; 4],
+    matrix_b: [f32; 4],
+    bias_cbrt: [f32; 4],
+    scaled_bias: [f32; 4],
+    intensity_scale: f32,
+    _padding: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TransferUniform {
+    width: u32,
+    height: u32,
+    input_stride_r: u32,
+    input_stride_g: u32,
+    input_stride_b: u32,
+    output_stride_r: u32,
+    output_stride_g: u32,
+    output_stride_b: u32,
+    transfer: u32,
+    gamma: f32,
+    intensity_target: f32,
+    min_nits: f32,
+    luminance_rgb: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlendUniform {
+    width: u32,
+    height: u32,
+    base_stride: u32,
+    source_stride: u32,
+    output_stride: u32,
+    base_alpha_stride: u32,
+    source_alpha_stride: u32,
+    mode: u32,
+    component: u32,
+    clamp: u32,
+    alpha_associated: u32,
+    has_alpha: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct PremultiplyUniform {
     width: u32,
     height: u32,
@@ -2931,6 +3376,22 @@ struct PremultiplyUniform {
     alpha_stride: u32,
     output_stride: u32,
     _padding: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ExtendUniform {
+    width: u32,
+    height: u32,
+    frame_width: u32,
+    frame_height: u32,
+    frame_stride: u32,
+    reference_stride: u32,
+    output_stride: u32,
+    origin_x: i32,
+    origin_y: i32,
+    has_reference: u32,
+    _padding: [u32; 2],
 }
 
 #[repr(C)]
@@ -3002,8 +3463,16 @@ const _: () = {
     assert!(std::mem::align_of::<UpsampleUniform>() == 4);
     assert!(std::mem::size_of::<YcbcrUniform>() == 32);
     assert!(std::mem::align_of::<YcbcrUniform>() == 4);
+    assert!(std::mem::size_of::<XybUniform>() == 128);
+    assert!(std::mem::align_of::<XybUniform>() == 4);
+    assert!(std::mem::size_of::<TransferUniform>() == 64);
+    assert!(std::mem::align_of::<TransferUniform>() == 4);
+    assert!(std::mem::size_of::<BlendUniform>() == 48);
+    assert!(std::mem::align_of::<BlendUniform>() == 4);
     assert!(std::mem::size_of::<PremultiplyUniform>() == 32);
     assert!(std::mem::align_of::<PremultiplyUniform>() == 4);
+    assert!(std::mem::size_of::<ExtendUniform>() == 48);
+    assert!(std::mem::align_of::<ExtendUniform>() == 4);
     assert!(std::mem::size_of::<SaveUniform>() == 32);
     assert!(std::mem::align_of::<SaveUniform>() == 4);
     assert!(std::mem::size_of::<ImageOutputUniform>() == 128);
@@ -3094,6 +3563,8 @@ mod tests {
             ("EpfUniform", size_of::<EpfUniform>(), 80),
             ("UpsampleUniform", size_of::<UpsampleUniform>(), 32),
             ("YcbcrUniform", size_of::<YcbcrUniform>(), 32),
+            ("XybUniform", size_of::<XybUniform>(), 128),
+            ("TransferUniform", size_of::<TransferUniform>(), 64),
             ("PremultiplyUniform", size_of::<PremultiplyUniform>(), 32),
             ("SaveUniform", size_of::<SaveUniform>(), 32),
             ("ImageOutputUniform", size_of::<ImageOutputUniform>(), 128),
@@ -3112,7 +3583,11 @@ mod tests {
             ("EpfUniform", align_of::<EpfUniform>()),
             ("UpsampleUniform", align_of::<UpsampleUniform>()),
             ("YcbcrUniform", align_of::<YcbcrUniform>()),
+            ("XybUniform", align_of::<XybUniform>()),
+            ("TransferUniform", align_of::<TransferUniform>()),
+            ("BlendUniform", align_of::<BlendUniform>()),
             ("PremultiplyUniform", align_of::<PremultiplyUniform>()),
+            ("ExtendUniform", align_of::<ExtendUniform>()),
             ("SaveUniform", align_of::<SaveUniform>()),
             ("ImageOutputUniform", align_of::<ImageOutputUniform>()),
         ] {
@@ -3388,6 +3863,145 @@ mod tests {
             ],
         );
 
+        assert_sequential_words(&XybUniform {
+            width: 1,
+            height: 2,
+            input_stride_x: 3,
+            input_stride_y: 4,
+            input_stride_b: 5,
+            output_stride_r: 6,
+            output_stride_g: 7,
+            output_stride_b: 8,
+            matrix_r: [
+                f32::from_bits(9),
+                f32::from_bits(10),
+                f32::from_bits(11),
+                f32::from_bits(12),
+            ],
+            matrix_g: [
+                f32::from_bits(13),
+                f32::from_bits(14),
+                f32::from_bits(15),
+                f32::from_bits(16),
+            ],
+            matrix_b: [
+                f32::from_bits(17),
+                f32::from_bits(18),
+                f32::from_bits(19),
+                f32::from_bits(20),
+            ],
+            bias_cbrt: [
+                f32::from_bits(21),
+                f32::from_bits(22),
+                f32::from_bits(23),
+                f32::from_bits(24),
+            ],
+            scaled_bias: [
+                f32::from_bits(25),
+                f32::from_bits(26),
+                f32::from_bits(27),
+                f32::from_bits(28),
+            ],
+            intensity_scale: f32::from_bits(29),
+            _padding: [30, 31, 32],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/xyb_to_rgb.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride_x",
+                "input_stride_y",
+                "input_stride_b",
+                "output_stride_r",
+                "output_stride_g",
+                "output_stride_b",
+                "matrix_r",
+                "matrix_g",
+                "matrix_b",
+                "bias_cbrt",
+                "scaled_bias",
+                "intensity_scale",
+                "_pad0",
+                "_pad1",
+                "_pad2",
+            ],
+        );
+
+        assert_sequential_words(&TransferUniform {
+            width: 1,
+            height: 2,
+            input_stride_r: 3,
+            input_stride_g: 4,
+            input_stride_b: 5,
+            output_stride_r: 6,
+            output_stride_g: 7,
+            output_stride_b: 8,
+            transfer: 9,
+            gamma: f32::from_bits(10),
+            intensity_target: f32::from_bits(11),
+            min_nits: f32::from_bits(12),
+            luminance_rgb: [
+                f32::from_bits(13),
+                f32::from_bits(14),
+                f32::from_bits(15),
+                f32::from_bits(16),
+            ],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/transfer_function.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "input_stride_r",
+                "input_stride_g",
+                "input_stride_b",
+                "output_stride_r",
+                "output_stride_g",
+                "output_stride_b",
+                "transfer",
+                "gamma",
+                "intensity_target",
+                "min_nits",
+                "luminance_rgb",
+            ],
+        );
+
+        assert_sequential_words(&BlendUniform {
+            width: 1,
+            height: 2,
+            base_stride: 3,
+            source_stride: 4,
+            output_stride: 5,
+            base_alpha_stride: 6,
+            source_alpha_stride: 7,
+            mode: 8,
+            component: 9,
+            clamp: 10,
+            alpha_associated: 11,
+            has_alpha: 12,
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/blend.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "base_stride",
+                "source_stride",
+                "output_stride",
+                "base_alpha_stride",
+                "source_alpha_stride",
+                "mode",
+                "component",
+                "clamp",
+                "alpha_associated",
+                "has_alpha",
+            ],
+        );
+
         assert_sequential_words(&PremultiplyUniform {
             width: 1,
             height: 2,
@@ -3408,6 +4022,38 @@ mod tests {
                 "_pad0",
                 "_pad1",
                 "_pad2",
+            ],
+        );
+
+        assert_sequential_words(&ExtendUniform {
+            width: 1,
+            height: 2,
+            frame_width: 3,
+            frame_height: 4,
+            frame_stride: 5,
+            reference_stride: 6,
+            output_stride: 7,
+            origin_x: 8,
+            origin_y: 9,
+            has_reference: 10,
+            _padding: [11, 12],
+        });
+        assert_wgsl_fields(
+            include_str!("../shaders/extend.wgsl"),
+            "Params",
+            &[
+                "width",
+                "height",
+                "frame_width",
+                "frame_height",
+                "frame_stride",
+                "reference_stride",
+                "output_stride",
+                "origin_x",
+                "origin_y",
+                "has_reference",
+                "_pad0",
+                "_pad1",
             ],
         );
 

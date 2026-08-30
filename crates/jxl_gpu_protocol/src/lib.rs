@@ -287,11 +287,41 @@ pub enum OutputColorEncoding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
+    /// Preserve the base sample.
+    Keep,
+    /// Replace the base sample with the source sample.
     Replace,
+    /// Add the source sample to the base sample.
     Add,
-    Blend,
+    /// Multiply the base sample by the optionally clamped source sample.
     Multiply,
-    MulAdd,
+    /// Composite the source above the base.
+    BlendAbove,
+    /// Composite the source below the base.
+    BlendBelow,
+    /// Add the source weighted by its alpha to the base.
+    AlphaWeightedAddAbove,
+    /// Place the source below the base, weighting the base by its alpha.
+    AlphaWeightedAddBelow,
+}
+
+/// Interpretation of one scalar [`RenderOp::Blend`] result.
+///
+/// A scalar contract keeps the portable shader below the minimum WebGPU storage-buffer binding
+/// limit. Frontends emit one node per color or extra channel and may fuse or pack those nodes on a
+/// backend with stronger binding-array capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendComponent {
+    /// A color or non-alpha extra-channel sample.
+    ///
+    /// With alpha, node inputs are `[base, source, base_alpha, source_alpha]`. Without alpha,
+    /// inputs are `[base, source]`; blend modes then use JPEG XL's no-alpha fallbacks.
+    Color {
+        /// Whether both color inputs use associated (premultiplied) alpha.
+        alpha_associated: bool,
+    },
+    /// The alpha channel itself. Inputs are `[base_alpha, source_alpha]`.
+    Alpha,
 }
 
 #[derive(Clone, Debug)]
@@ -367,15 +397,22 @@ pub struct XybParams {
 #[derive(Clone, Debug)]
 pub struct TransferParams {
     pub function: TransferFunction,
+    /// Encoding exponent for [`TransferFunction::Gamma`]. JPEG XL stores the inverse display
+    /// gamma (for example, `1 / 2.2`), not the display gamma itself.
     pub gamma: f32,
     pub intensity_target: f32,
     pub min_nits: f32,
+    /// Linear-light RGB luminance coefficients used by the HLG inverse OOTF. Frontends must
+    /// derive these from the encoded primaries; keeping them explicit prevents BT.709 constants
+    /// from being applied to BT.2020 or custom primaries.
+    pub luminance_rgb: [f32; 3],
 }
 
 #[derive(Clone, Debug)]
 pub struct BlendParams {
     pub mode: BlendMode,
-    pub alpha_plane: Option<PlaneId>,
+    pub component: BlendComponent,
+    /// Apply the JPEG XL blend-mode clamp at the point required by the specification.
     pub clamp: bool,
 }
 
@@ -459,6 +496,11 @@ pub enum RenderOp {
     Convert {
         output_type: SampleType,
     },
+    /// Extend or crop a frame plane to the full image canvas.
+    ///
+    /// Inputs are `[frame]` to fill uncovered pixels with zero, or `[frame, reference]` to fill
+    /// them from an equal-sized reference canvas. The single output has `image_extent`; `origin`
+    /// places the frame's `(0, 0)` sample in canvas coordinates and may be negative.
     Extend {
         image_extent: Extent2d,
         origin: (i32, i32),

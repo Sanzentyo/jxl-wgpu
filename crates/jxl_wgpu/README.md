@@ -259,6 +259,11 @@ The current planner and scheduler execute these protocol stages:
 - EPF passes 0, 1, and 2 with constant or supplied sigma;
 - 2x, 4x, and 8x image upsampling with validated weights;
 - DCT8 VarDCT dequantization, color correlation, inverse transform, and LF composition;
+- stream-defined inverse XYB-to-linear-RGB and Linear, sRGB, BT.709, Gamma, PQ, and HLG transfer
+  functions;
+- all JPEG XL frame and patch blend modes for straight or associated alpha, including alpha-channel
+  composition and the no-alpha fallbacks;
+- exact partial-frame extension/cropping to the animation canvas with an optional reference slot;
 - YCbCr-to-RGB components, alpha premultiplication, sample conversion, orientation, Save packing,
   and generic image packing; and
 - direct generic-image and RGBA display conversion.

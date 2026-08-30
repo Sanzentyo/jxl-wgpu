@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use jxl_gpu_protocol::{
-    ChromaAxis, EpfParams, Extent2d, FrameSessionDesc, MemoryMode, PlaneId, PlaneRole,
-    PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, RenderOpKind, RenderPlan, ResourceId,
-    SampleType,
+    BlendComponent, BlendParams, ChromaAxis, EpfParams, Extent2d, FrameSessionDesc, MemoryMode,
+    PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, RenderOpKind,
+    RenderPlan, ResourceId, SampleType,
 };
 
 use crate::arena::{ArenaPlan, ArenaPlanner};
@@ -344,9 +344,13 @@ fn portable_supported_ops() -> BTreeSet<RenderOpKind> {
         RenderOpKind::Epf,
         RenderOpKind::Upsample,
         RenderOpKind::VarDct,
+        RenderOpKind::XybToRgb,
         RenderOpKind::YcbcrToRgb,
+        RenderOpKind::TransferFunction,
+        RenderOpKind::Blend,
         RenderOpKind::PremultiplyAlpha,
         RenderOpKind::Convert,
+        RenderOpKind::Extend,
         RenderOpKind::Save,
     ]
     .into_iter()
@@ -565,6 +569,9 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             }
             Ok(())
         }
+        RenderOp::XybToRgb(params) => validate_xyb_to_rgb(index, node, params, plan),
+        RenderOp::TransferFunction(params) => validate_transfer_function(index, node, params, plan),
+        RenderOp::Blend(params) => validate_blend(index, node, params, plan),
         RenderOp::PremultiplyAlpha { alpha_plane } => {
             let alpha_count = node
                 .inputs
@@ -646,11 +653,220 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             }
             Ok(())
         }
-        RenderOp::Extend { image_extent, .. } if image_extent.is_empty() => Err(
-            Error::InvalidPayload(format!("node {index} has an empty extend extent")),
-        ),
+        RenderOp::Extend {
+            image_extent,
+            origin,
+        } => validate_extend(index, node, *image_extent, *origin, plan),
         _ => Ok(()),
     }
+}
+
+fn validate_extend(
+    index: usize,
+    node: &RenderNode,
+    image_extent: Extent2d,
+    origin: (i32, i32),
+    plan: &RenderPlan,
+) -> Result<()> {
+    if image_extent.is_empty()
+        || !matches!(node.inputs.len(), 1 | 2)
+        || node.outputs.len() != 1
+        || !node.resources.is_empty()
+        || node.scale != jxl_gpu_protocol::Scale2d::IDENTITY
+        || node.border != jxl_gpu_protocol::Border2d::default()
+        || node.inputs.contains(&node.outputs[0])
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Extend has an invalid extent, arity, dependency, scale, or border contract"
+        )));
+    }
+    let descriptor = |id: PlaneId| {
+        plan.planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .ok_or(Error::MissingPlane(id))
+    };
+    let frame = descriptor(node.inputs[0])?;
+    let output = descriptor(node.outputs[0])?;
+    if !matches!(frame.sample_type, SampleType::I32 | SampleType::F32)
+        || output.sample_type != frame.sample_type
+        || output.extent != image_extent
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Extend requires matching I32 or F32 frame/output planes and the declared image extent"
+        )));
+    }
+    if let Some(reference_id) = node.inputs.get(1) {
+        let reference = descriptor(*reference_id)?;
+        if reference.sample_type != frame.sample_type || reference.extent != image_extent {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} Extend reference must match the output type and full image extent"
+            )));
+        }
+    }
+
+    let coordinate_is_safe = |frame_size: u32, image_size: u32, offset: i32| {
+        let frame_size = i64::from(frame_size);
+        let image_size = i64::from(image_size);
+        let offset = i64::from(offset);
+        frame_size + image_size <= i64::from(i32::MAX)
+            && offset >= -frame_size
+            && offset <= image_size
+    };
+    if !coordinate_is_safe(frame.extent.width, image_extent.width, origin.0)
+        || !coordinate_is_safe(frame.extent.height, image_extent.height, origin.1)
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Extend origin or extent is outside the safe JPEG XL canvas coordinate range"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_blend(
+    index: usize,
+    node: &RenderNode,
+    params: &BlendParams,
+    plan: &RenderPlan,
+) -> Result<()> {
+    let valid_arity = match params.component {
+        BlendComponent::Alpha => node.inputs.len() == 2,
+        BlendComponent::Color { alpha_associated } => {
+            matches!(node.inputs.len(), 2 | 4) && (!alpha_associated || node.inputs.len() == 4)
+        }
+    };
+    if !valid_arity
+        || node.outputs.len() != 1
+        || !node.resources.is_empty()
+        || node.scale != jxl_gpu_protocol::Scale2d::IDENTITY
+        || node.border != jxl_gpu_protocol::Border2d::default()
+        || node.inputs.contains(&node.outputs[0])
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Blend has an invalid component, arity, dependency, scale, or border contract"
+        )));
+    }
+
+    let descriptor = |id: PlaneId| {
+        plan.planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .ok_or(Error::MissingPlane(id))
+    };
+    let first = descriptor(node.inputs[0])?;
+    for id in node.inputs.iter().chain(&node.outputs) {
+        let plane = descriptor(*id)?;
+        if plane.sample_type != SampleType::F32 || plane.extent != first.extent {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} Blend requires equal-extent F32 base, source, alpha, and output planes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_xyb_to_rgb(
+    index: usize,
+    node: &RenderNode,
+    params: &jxl_gpu_protocol::XybParams,
+    plan: &RenderPlan,
+) -> Result<()> {
+    if !params.intensity_target.is_finite()
+        || params.intensity_target <= 0.0
+        || params.opsin_bias.iter().any(|value| !value.is_finite())
+        || params
+            .inverse_opsin_matrix
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} XYB conversion has invalid opsin or intensity parameters"
+        )));
+    }
+    if node.inputs.len() != 3
+        || node.outputs.len() != 3
+        || node.scale != jxl_gpu_protocol::Scale2d::IDENTITY
+        || node.border != jxl_gpu_protocol::Border2d::default()
+        || !node.resources.is_empty()
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} XYB conversion requires three inputs, three outputs, identity scale, no border, and no resources"
+        )));
+    }
+
+    let descriptor = |id: PlaneId| {
+        plan.planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .ok_or(Error::MissingPlane(id))
+    };
+    let first = descriptor(node.inputs[0])?;
+    for id in node.inputs.iter().chain(&node.outputs) {
+        let plane = descriptor(*id)?;
+        if plane.sample_type != SampleType::F32 || plane.extent != first.extent {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} XYB conversion requires six equal-extent F32 planes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transfer_function(
+    index: usize,
+    node: &RenderNode,
+    params: &jxl_gpu_protocol::TransferParams,
+    plan: &RenderPlan,
+) -> Result<()> {
+    let basic_parameters_valid = params.intensity_target.is_finite()
+        && params.intensity_target > 0.0
+        && params.min_nits.is_finite()
+        && params.min_nits >= 0.0
+        && params.min_nits <= params.intensity_target
+        && params.gamma.is_finite()
+        && params.luminance_rgb.iter().all(|value| value.is_finite());
+    let function_parameters_valid = match params.function {
+        jxl_gpu_protocol::TransferFunction::Gamma => {
+            (0.0..=1.0).contains(&params.gamma) && params.gamma > 0.0
+        }
+        jxl_gpu_protocol::TransferFunction::Hlg => {
+            params.luminance_rgb.iter().all(|&value| value >= 0.0)
+                && params.luminance_rgb.iter().sum::<f32>() > 0.0
+        }
+        _ => true,
+    };
+    if !basic_parameters_valid || !function_parameters_valid {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} has invalid transfer-function parameters"
+        )));
+    }
+    if node.inputs.len() != 3
+        || node.outputs.len() != 3
+        || node.scale != jxl_gpu_protocol::Scale2d::IDENTITY
+        || node.border != jxl_gpu_protocol::Border2d::default()
+        || !node.resources.is_empty()
+    {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} transfer function requires three inputs, three outputs, identity scale, no border, and no resources"
+        )));
+    }
+    let descriptor = |id: PlaneId| {
+        plan.planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .ok_or(Error::MissingPlane(id))
+    };
+    let first = descriptor(node.inputs[0])?;
+    for id in node.inputs.iter().chain(&node.outputs) {
+        let plane = descriptor(*id)?;
+        if plane.sample_type != SampleType::F32 || plane.extent != first.extent {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} transfer function requires six equal-extent F32 planes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_chroma_upsample(
