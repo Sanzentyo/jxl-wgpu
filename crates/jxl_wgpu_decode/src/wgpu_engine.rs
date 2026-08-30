@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_bitstream::{InventoryLimits, ParseLimits, PrefixCodeEntry};
+use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{
     ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout, Packed422Order,
     PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
@@ -31,6 +31,10 @@ use crate::{
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
+const MODULAR_ENTROPY_SHADER: &str = include_str!("modular_entropy.wgsl");
+const MODULAR_RECONSTRUCT_SHADER: &str = include_str!("modular_reconstruct.wgsl");
+const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
+const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
 const F64_EXACT_F32_WIDENING: &str = r#"
@@ -56,12 +60,10 @@ const F64_NATIVE_ARITHMETIC: &str = r#"
 "#;
 const F64_NATIVE_BINDING: &str =
     "@group(0) @binding(6) var<storage, read_write> output_f64: array<f64>;";
-const LOOKUP_BITS: u8 = 15;
-const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
-const MAX_SESSION_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
+const TARGET_STREAM_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Conservative GPU allocation accounting for the stock decoder's bounded frame window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +76,10 @@ pub struct WgpuDecodeMemoryStats {
     pub max_frame_slots: usize,
     /// Maximum exposure implied by `per_frame_bytes * max_frame_slots`.
     pub max_frame_window_bytes: u64,
+    /// Bounded stream uploads required for one frame. Each batch is one ordered queue submission.
+    pub stream_batch_count: usize,
+    /// Actual codec queue submissions per decoded frame.
+    pub submissions_per_frame: usize,
 }
 
 /// F64 production path resolved for one output request.
@@ -107,7 +113,7 @@ struct ShaderParams {
     source_channels: u32,
     source_bits: u32,
     source_mask: u32,
-    _source_padding: u32,
+    needs_self_correcting: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -128,6 +134,18 @@ struct ShaderParams {
     logical_size: u32,
     numeric_mapping: u32,
     _padding: u32,
+    stream_index: u32,
+    wp_p1: u32,
+    wp_p2: u32,
+    wp_p3a: u32,
+    wp_p3b: u32,
+    wp_p3c: u32,
+    wp_p3d: u32,
+    wp_p3e: u32,
+    wp_w0: u32,
+    wp_w1: u32,
+    wp_w2: u32,
+    wp_w3: u32,
 }
 
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
@@ -143,7 +161,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 128);
+    assert!(std::mem::size_of::<ShaderParams>() == 176);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
@@ -267,8 +285,12 @@ fn shader_source(path: F64OutputPath) -> String {
         F64OutputPath::ExactF32Widening => (F64_EXACT_F32_WIDENING, ""),
     };
     let source = SHADER_TEMPLATE
+        .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
+        .replace(MODULAR_RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT_SHADER)
         .replace(F64_OUTPUT_MARKER, implementation)
         .replace(F64_BINDING_MARKER, binding);
+    debug_assert!(!source.contains(MODULAR_ENTROPY_MARKER));
+    debug_assert!(!source.contains(MODULAR_RECONSTRUCT_MARKER));
     debug_assert!(!source.contains(F64_OUTPUT_MARKER));
     debug_assert!(!source.contains(F64_BINDING_MARKER));
     source
@@ -301,11 +323,20 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
     type Session = WgpuDecodeSession;
 
     fn parse_limits(&self) -> ParseLimits {
+        let policy_ceiling = ParseLimits::default().max_codestream_bytes;
+        let budget_scaled = self.memory.snapshot().limit_bytes.saturating_mul(4);
+        let device_scaled = self
+            .backend
+            .device()
+            .limits()
+            .max_buffer_size
+            .saturating_mul(4);
+        let host_codestream_limit = policy_ceiling.min(budget_scaled.max(device_scaled));
         ParseLimits {
-            max_input_bytes: 16 * 1024 * 1024,
+            max_input_bytes: host_codestream_limit,
             max_boxes: 32,
-            max_box_bytes: 16 * 1024 * 1024,
-            max_codestream_bytes: 16 * 1024 * 1024,
+            max_box_bytes: host_codestream_limit,
+            max_codestream_bytes: host_codestream_limit,
         }
     }
 
@@ -324,7 +355,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             })
             .map_err(Error::CodestreamInventory)?;
         let profile = parse_standard_modular_profile(codestream.bytes(), &inventory)?;
-        let prefix_lookup: Arc<[u32]> = build_prefix_lookup(&profile)?.into();
+        let modular_metadata: Arc<[u32]> = profile.ma_config.pack_gpu_metadata()?.words.into();
         let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(
             extent,
@@ -349,15 +380,19 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             Some(F64OutputPath::ExactF32Widening) | None => Arc::clone(&self.pipeline),
         };
         let f64_output_path = output.f64_output_path;
-        let dispatch_layout = GroupDispatchLayout::new(self.backend.device(), &profile)?;
+        let dispatch_layout =
+            GroupDispatchLayout::new(self.backend.device(), codestream.bytes(), &profile)?;
         let memory_stats = validate_device_limits(
             self.backend.device(),
-            codestream.bytes(),
             &profile,
+            &modular_metadata,
             &dispatch_layout,
             &output,
             request.max_frame_slots().get(),
+            self.memory.snapshot().limit_bytes,
         )?;
+        let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
+            .expect("device admission always resolves at least one frame slot");
         let predictor = FixedModularPredictor::new(5)
             .expect("the standard Modular profile uses the valid Gradient predictor index");
         Ok(PreparedGpuSession::new(
@@ -383,7 +418,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                     codestream_range: codestream.storage_range(),
                     profile,
                     dispatch_layout,
-                    prefix_lookup,
+                    modular_metadata,
                     output,
                 }),
                 memory_stats,
@@ -391,7 +426,8 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 buffers: Arc::clone(&self.buffers),
                 f64_output_path,
             },
-        ))
+        )
+        .with_resolved_frame_slots(resolved_frame_slots))
     }
 }
 
@@ -670,14 +706,14 @@ struct DecodeSource {
     profile: StandardModularProfile,
     dispatch_layout: GroupDispatchLayout,
     // Immutable within the session. All independently decoded groups share the standard
-    // DC-global prefix set without sharing mutable GPU transient allocations.
-    prefix_lookup: Arc<[u32]>,
+    // DC-global MA/entropy descriptor without sharing mutable GPU transient allocations.
+    modular_metadata: Arc<[u32]>,
     output: OutputPlan,
 }
 
 struct DecodeJobLifetime {
     output: Arc<wgpu::Buffer>,
-    _lookup: DecodeBufferLease,
+    _modular_metadata: DecodeBufferLease,
     _reconstructed: DecodeBufferLease,
     _native_f64_dummy_words: Option<DecodeBufferLease>,
     _status: DecodeBufferLease,
@@ -708,34 +744,51 @@ struct DecodeMemoryPermits {
 struct GroupDispatchLayout {
     reconstructed_offsets: Arc<[u64]>,
     reconstructed_bytes: u64,
+    stream_windows: Arc<[GroupStreamWindow]>,
+    stream_batches: Arc<[std::ops::Range<usize>]>,
+    stream_bytes: u64,
     status_stride: u64,
     status_bytes: u64,
     params_stride: u64,
     params_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GroupStreamWindow {
+    input_start: usize,
+    input_end: usize,
+    upload_offset: usize,
+    token_start: u32,
+    token_end: u32,
+}
+
 impl GroupDispatchLayout {
-    fn new(device: &wgpu::Device, profile: &StandardModularProfile) -> Result<Self> {
+    fn new(
+        device: &wgpu::Device,
+        codestream: &[u8],
+        profile: &StandardModularProfile,
+    ) -> Result<Self> {
         let limits = device.limits();
         let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(4));
         let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(16));
         let mut reconstructed_offsets = Vec::with_capacity(profile.groups.len());
         let mut reconstructed_bytes = 0u64;
         for group in &profile.groups {
-            reconstructed_bytes = align_to(reconstructed_bytes, storage_alignment)?;
-            reconstructed_offsets.push(reconstructed_bytes);
-            reconstructed_bytes = reconstructed_bytes
-                .checked_add(
-                    u64::from(group.sample_count()?)
-                        .checked_mul(u64::from(profile.channels.count()))
-                        .and_then(|samples| samples.checked_mul(4))
-                        .ok_or_else(|| {
-                            Error::backend("group reconstruction buffer size overflow")
-                        })?,
-                )
-                .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
+            // Group dispatches are encoded in one compute pass and execute in submission order.
+            // Each dispatch finishes reconstruction and writes its canvas tile before the next
+            // dispatch reuses this scratch allocation, so retaining every group's i32/LZ state
+            // concurrently only inflates memory without adding parallelism.
+            reconstructed_offsets.push(0);
+            reconstructed_bytes =
+                reconstructed_bytes.max(group_reconstructed_bytes(profile, *group)?);
         }
-        reconstructed_bytes = align4(reconstructed_bytes)?;
+        reconstructed_bytes = align_to(align4(reconstructed_bytes)?, storage_alignment)?;
+        let stream_limit = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size)
+            .min(TARGET_STREAM_BATCH_BYTES);
+        let (stream_windows, stream_batches, stream_bytes) =
+            build_stream_batches(codestream, &profile.groups, stream_limit)?;
         let group_count = u64::try_from(profile.groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
         let status_stride = align_to(STATUS_BYTES, storage_alignment)?;
@@ -756,12 +809,132 @@ impl GroupDispatchLayout {
         Ok(Self {
             reconstructed_offsets: reconstructed_offsets.into(),
             reconstructed_bytes,
+            stream_windows: stream_windows.into(),
+            stream_batches: stream_batches.into(),
+            stream_bytes,
             status_stride,
             status_bytes,
             params_stride,
             params_bytes,
         })
     }
+}
+
+fn build_stream_batches(
+    codestream: &[u8],
+    groups: &[ModularGroup],
+    stream_limit: u64,
+) -> Result<(Vec<GroupStreamWindow>, Vec<std::ops::Range<usize>>, u64)> {
+    if stream_limit < STREAM_SENTINEL_BYTES + 4 {
+        return Err(Error::backend(
+            "device storage limit is too small for a bounded Modular stream window",
+        ));
+    }
+    let mut windows = Vec::with_capacity(groups.len());
+    let mut batches = Vec::new();
+    let mut batch_start = 0usize;
+    let mut upload_cursor = 0u64;
+    let mut maximum_batch_bytes = 0u64;
+    for (index, group) in groups.iter().copied().enumerate() {
+        let input_start = usize::try_from(group.token_bit_offset / 8)
+            .map_err(|_| Error::backend("group stream start exceeds host address space"))?;
+        let input_end = usize::try_from(
+            group
+                .token_bit_end
+                .checked_add(7)
+                .ok_or_else(|| Error::backend("group stream end overflow"))?
+                / 8,
+        )
+        .map_err(|_| Error::backend("group stream end exceeds host address space"))?;
+        let input = codestream
+            .get(input_start..input_end)
+            .ok_or_else(|| Error::backend("group stream window exceeds the codestream"))?;
+        let packet_bytes = u64::try_from(input.len())
+            .map_err(|_| Error::backend("group stream size exceeds u64"))?;
+        let mut segment_start = align4(upload_cursor)?;
+        let mut batch_bytes = segment_start
+            .checked_add(packet_bytes)
+            .and_then(|bytes| align4(bytes).ok())
+            .and_then(|bytes| bytes.checked_add(STREAM_SENTINEL_BYTES))
+            .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
+        if batch_bytes > stream_limit && index != batch_start {
+            batches.push(batch_start..index);
+            maximum_batch_bytes = maximum_batch_bytes.max(
+                align4(upload_cursor)?
+                    .checked_add(STREAM_SENTINEL_BYTES)
+                    .ok_or_else(|| Error::backend("group stream batch size overflow"))?,
+            );
+            batch_start = index;
+            segment_start = 0;
+            batch_bytes = align4(packet_bytes)?
+                .checked_add(STREAM_SENTINEL_BYTES)
+                .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
+        }
+        if batch_bytes > stream_limit {
+            return Err(Error::backend(format!(
+                "one Modular group stream requires {batch_bytes} bytes, exceeding the bounded {stream_limit}-byte GPU window"
+            )));
+        }
+        let segment_start_bits = segment_start
+            .checked_mul(8)
+            .ok_or_else(|| Error::backend("group stream bit offset overflow"))?;
+        let leading_bits = group.token_bit_offset & 7;
+        let token_start = segment_start_bits
+            .checked_add(leading_bits)
+            .and_then(|bits| u32::try_from(bits).ok())
+            .ok_or_else(|| Error::backend("group stream start exceeds WGSL u32"))?;
+        let token_end = u64::from(token_start)
+            .checked_add(group.token_bit_end - group.token_bit_offset)
+            .and_then(|bits| u32::try_from(bits).ok())
+            .ok_or_else(|| Error::backend("group stream end exceeds WGSL u32"))?;
+        windows.push(GroupStreamWindow {
+            input_start,
+            input_end,
+            upload_offset: usize::try_from(segment_start)
+                .map_err(|_| Error::backend("group upload offset exceeds host address space"))?,
+            token_start,
+            token_end,
+        });
+        upload_cursor = segment_start
+            .checked_add(packet_bytes)
+            .ok_or_else(|| Error::backend("group stream batch cursor overflow"))?;
+    }
+    if batch_start < groups.len() {
+        batches.push(batch_start..groups.len());
+        maximum_batch_bytes = maximum_batch_bytes.max(
+            align4(upload_cursor)?
+                .checked_add(STREAM_SENTINEL_BYTES)
+                .ok_or_else(|| Error::backend("group stream batch size overflow"))?,
+        );
+    }
+    if windows.len() != groups.len() || batches.is_empty() || maximum_batch_bytes == 0 {
+        return Err(Error::backend("Modular stream batch layout is empty"));
+    }
+    Ok((windows, batches, maximum_batch_bytes))
+}
+
+fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGroup) -> Result<u64> {
+    const LZ77_WINDOW_WORDS: u64 = 1 << 20;
+    let sample_words = u64::from(group.sample_count()?)
+        .checked_mul(u64::from(profile.channels.count()))
+        .ok_or_else(|| Error::backend("group reconstruction sample count overflow"))?;
+    let predictor_words = if profile.ma_config.needs_self_correcting() {
+        u64::from(group.width)
+            .checked_mul(5)
+            .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
+    } else {
+        0
+    };
+    let entropy_words = if profile.ma_config.entropy.lz77.is_some() {
+        sample_words.min(LZ77_WINDOW_WORDS)
+    } else {
+        0
+    };
+    sample_words
+        .checked_add(predictor_words)
+        .and_then(|words| words.checked_add(entropy_words))
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))
 }
 
 #[repr(u32)]
@@ -1131,29 +1304,20 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
 
 fn validate_device_limits(
     device: &wgpu::Device,
-    codestream: &[u8],
     profile: &StandardModularProfile,
+    modular_metadata: &[u32],
     dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
-    max_frame_slots: usize,
+    requested_frame_slots: usize,
+    memory_limit_bytes: u64,
 ) -> Result<WgpuDecodeMemoryStats> {
-    if profile
-        .groups
-        .iter()
-        .any(|group| group.token_bit_end > u64::from(u32::MAX))
-    {
-        return Err(Error::backend(
-            "standard group token offsets exceed the portable WGSL u32 address space",
-        ));
-    }
     let storage_limit = device.limits().max_storage_buffer_binding_size;
     let buffer_limit = device.limits().max_buffer_size;
-    let codestream_bytes = stream_allocation_size(codestream.len())?;
-    let lookup_bytes = u64::try_from(LOOKUP_SIZE)
+    let stream_bytes = dispatch.stream_bytes;
+    let metadata_bytes = u64::try_from(modular_metadata.len())
         .ok()
-        .and_then(|entries| entries.checked_mul(u64::from(profile.channels.count())))
-        .and_then(|entries| entries.checked_mul(4))
-        .ok_or_else(|| Error::backend("prefix lookup size overflow"))?;
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| Error::backend("Modular metadata size overflow"))?;
     let output_bytes = align4(output.layout.logical_size)?;
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
@@ -1162,8 +1326,8 @@ fn validate_device_limits(
         0
     };
     for (name, required) in [
-        ("codestream", codestream_bytes),
-        ("prefix lookup", lookup_bytes),
+        ("bounded group stream window", stream_bytes),
+        ("Modular metadata", metadata_bytes),
         ("requested output", output_bytes),
     ] {
         if required > storage_limit || required > buffer_limit {
@@ -1173,11 +1337,7 @@ fn validate_device_limits(
         }
     }
     if profile.groups.iter().any(|group| {
-        u64::from(group.width)
-            .checked_mul(u64::from(group.height))
-            .and_then(|samples| samples.checked_mul(u64::from(profile.channels.count())))
-            .and_then(|samples| samples.checked_mul(4))
-            .is_none_or(|bytes| bytes > storage_limit)
+        group_reconstructed_bytes(profile, *group).map_or(true, |bytes| bytes > storage_limit)
     }) {
         return Err(Error::backend(
             "a Modular group reconstruction binding exceeds the device storage-binding limit",
@@ -1196,8 +1356,8 @@ fn validate_device_limits(
         }
     }
     let per_frame = [
-        codestream_bytes,
-        lookup_bytes,
+        stream_bytes,
+        metadata_bytes,
         dispatch.reconstructed_bytes,
         output_bytes,
         native_f64_dummy_bytes,
@@ -1208,18 +1368,20 @@ fn validate_device_limits(
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
     .ok_or_else(|| Error::backend("Modular GPU memory budget overflow"))?;
+    let affordable_slots = memory_limit_bytes / per_frame;
+    if affordable_slots == 0 {
+        return Err(Error::backend(format!(
+            "one Modular GPU frame requires {per_frame} bytes, exceeding the shared {memory_limit_bytes}-byte budget"
+        )));
+    }
+    let max_frame_slots =
+        requested_frame_slots.min(usize::try_from(affordable_slots).unwrap_or(usize::MAX));
     let max_frame_window_bytes = per_frame
         .checked_mul(
             u64::try_from(max_frame_slots)
-                .map_err(|_| Error::backend("frame-slot count overflow"))?,
+                .map_err(|_| Error::backend("resolved frame-slot count exceeds u64"))?,
         )
         .ok_or_else(|| Error::backend("bounded in-flight GPU memory budget overflow"))?;
-    if max_frame_window_bytes > MAX_SESSION_IN_FLIGHT_BYTES {
-        return Err(Error::backend(format!(
-            "bounded Modular session exposes {max_frame_window_bytes} bytes ({per_frame} per frame), exceeding the {}-byte session limit",
-            MAX_SESSION_IN_FLIGHT_BYTES
-        )));
-    }
     let transient_bytes = per_frame
         .checked_sub(output_bytes)
         .ok_or_else(|| Error::backend("Modular transient memory accounting underflow"))?;
@@ -1229,6 +1391,8 @@ fn validate_device_limits(
         transient_bytes,
         max_frame_slots,
         max_frame_window_bytes,
+        stream_batch_count: dispatch.stream_batches.len(),
+        submissions_per_frame: dispatch.stream_batches.len(),
     })
 }
 
@@ -1245,32 +1409,30 @@ fn submit_decode(
         .codestream_storage
         .get(source.codestream_range.clone())
         .ok_or_else(|| Error::backend("codestream storage range is invalid"))?;
-    // The raw source is intentionally not pooled: it is session data, not a reusable transient
-    // shape. Upload aligned spans directly from the shared input Arc rather than allocating a
-    // second full codestream Vec on the host.
+    // Only a bounded batch of pass-group packets is storage-bound at once. The host keeps the
+    // validated codestream Arc, while queue ordering lets every batch reuse this one GPU window.
     let stream = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("jxl-wgpu decode codestream"),
-        size: stream_allocation_size(codestream.len())?,
+        label: Some("jxl-wgpu decode bounded group stream window"),
+        size: source.dispatch_layout.stream_bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    upload_codestream(backend.queue(), &stream, codestream)?;
 
-    let lookup_bytes = u64::try_from(source.prefix_lookup.len())
+    let metadata_bytes = u64::try_from(source.modular_metadata.len())
         .ok()
         .and_then(|entries| entries.checked_mul(u64::try_from(std::mem::size_of::<u32>()).ok()?))
-        .ok_or_else(|| Error::backend("prefix lookup size overflow"))?;
-    let lookup_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-    let lookup_buffer = buffers.checkout(
-        "jxl-wgpu decode prefix lookup",
-        lookup_bytes,
-        lookup_usage,
+        .ok_or_else(|| Error::backend("Modular metadata size overflow"))?;
+    let metadata_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let metadata_buffer = buffers.checkout(
+        "jxl-wgpu decode Modular metadata",
+        metadata_bytes,
+        metadata_usage,
         std::mem::align_of::<u32>() as u64,
     );
     backend.queue().write_buffer(
-        lookup_buffer.buffer(),
+        metadata_buffer.buffer(),
         0,
-        bytemuck::cast_slice(source.prefix_lookup.as_ref()),
+        bytemuck::cast_slice(source.modular_metadata.as_ref()),
     );
 
     let reconstructed_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
@@ -1330,11 +1492,18 @@ fn submit_decode(
             |_| Error::backend("group parameter upload exceeds host address space")
         )?
     ];
-    for (index, &group) in source.profile.groups.iter().enumerate() {
+    for (index, (&group, window)) in source
+        .profile
+        .groups
+        .iter()
+        .zip(source.dispatch_layout.stream_windows.iter())
+        .enumerate()
+    {
         let params = build_params(
             group,
-            source.profile.channels,
-            source.profile.bits_per_sample,
+            window.token_start,
+            window.token_end,
+            &source.profile,
             &source.output,
             index == 0,
         )?;
@@ -1369,11 +1538,9 @@ fn submit_decode(
             .reconstructed_offsets
             .get(group_index)
             .ok_or_else(|| Error::backend("missing group reconstruction offset"))?;
-        let reconstructed_size = u64::from(group.sample_count()?)
-            .checked_mul(u64::from(source.profile.channels.count()))
-            .and_then(|samples| samples.checked_mul(4))
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| Error::backend("invalid group reconstruction binding size"))?;
+        let reconstructed_size =
+            NonZeroU64::new(group_reconstructed_bytes(&source.profile, *group)?)
+                .ok_or_else(|| Error::backend("invalid group reconstruction binding size"))?;
         let status_offset = index
             .checked_mul(source.dispatch_layout.status_stride)
             .ok_or_else(|| Error::backend("group status binding offset overflow"))?;
@@ -1402,7 +1569,7 @@ fn submit_decode(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: lookup_buffer.buffer().as_entire_binding(),
+                resource: metadata_buffer.buffer().as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -1433,39 +1600,10 @@ fn submit_decode(
             entries: &entries,
         }));
     }
-    let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("jxl-wgpu decode Modular submission"),
-    });
-    commands.clear_buffer(reconstructed.buffer(), 0, None);
-    commands.clear_buffer(&output, 0, None);
-    if let Some(dummy) = &native_f64_dummy_words {
-        commands.clear_buffer(dummy.buffer(), 0, None);
-    }
-    commands.clear_buffer(status.buffer(), 0, None);
-    {
-        let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("jxl-wgpu entropy and Gradient reconstruction"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        for binding in &bindings {
-            pass.set_bind_group(0, binding, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-    }
-    commands.copy_buffer_to_buffer(
-        status.buffer(),
-        0,
-        status_staging.buffer(),
-        0,
-        source.dispatch_layout.status_bytes,
-    );
-
     let completion = Arc::new(MapCompletion::default());
-    let callback_completion = Arc::clone(&completion);
     let lifetime = Arc::new(DecodeJobLifetime {
-        output,
-        _lookup: lookup_buffer,
+        output: Arc::clone(&output),
+        _modular_metadata: metadata_buffer,
         _reconstructed: reconstructed,
         _native_f64_dummy_words: native_f64_dummy_words,
         _status: status,
@@ -1475,26 +1613,95 @@ fn submit_decode(
         output_permit: memory_permits.output,
         _transient_permit: memory_permits.transient,
     });
-    let callback_lifetime = Arc::clone(&lifetime);
-    commands.map_buffer_on_submit(
-        lifetime.status_staging.buffer(),
-        wgpu::MapMode::Read,
-        ..,
-        move |result| {
-            // Release the callback's ownership before waking a waiter. The pending frame keeps
-            // the job alive through status validation; an abandoned pending frame instead makes
-            // this the final Arc, so staging is unmapped and recycled at this proven boundary.
-            if result.is_ok() {
-                callback_lifetime
-                    .status_mapped
-                    .store(true, Ordering::Release);
+    let upload_len = usize::try_from(source.dispatch_layout.stream_bytes)
+        .map_err(|_| Error::backend("bounded stream upload exceeds host address space"))?;
+    let mut stream_upload = vec![0u8; upload_len];
+    let mut final_submission = None;
+    for (batch_index, batch) in source.dispatch_layout.stream_batches.iter().enumerate() {
+        stream_upload.fill(0);
+        for group_index in batch.clone() {
+            let window = source
+                .dispatch_layout
+                .stream_windows
+                .get(group_index)
+                .ok_or_else(|| Error::backend("group stream window is missing"))?;
+            let input = codestream
+                .get(window.input_start..window.input_end)
+                .ok_or_else(|| Error::backend("group stream input range is truncated"))?;
+            let end = window
+                .upload_offset
+                .checked_add(input.len())
+                .ok_or_else(|| Error::backend("group stream upload range overflow"))?;
+            stream_upload
+                .get_mut(window.upload_offset..end)
+                .ok_or_else(|| Error::backend("group stream upload range is truncated"))?
+                .copy_from_slice(input);
+        }
+        backend.queue().write_buffer(&stream, 0, &stream_upload);
+
+        let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu decode bounded Modular batch"),
+        });
+        if batch_index == 0 {
+            commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
+            commands.clear_buffer(&lifetime.output, 0, None);
+            if let Some(dummy) = &lifetime._native_f64_dummy_words {
+                commands.clear_buffer(dummy.buffer(), 0, None);
             }
-            drop(callback_lifetime);
-            callback_completion
-                .complete(result.map_err(|error| format!("GPU status mapping failed: {error}")));
-        },
-    );
-    let submission = backend.queue().submit([commands.finish()]);
+            commands.clear_buffer(lifetime._status.buffer(), 0, None);
+        }
+        {
+            let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("jxl-wgpu generic Modular entropy and MA reconstruction"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            for binding in bindings
+                .get(batch.clone())
+                .ok_or_else(|| Error::backend("group binding batch range is truncated"))?
+            {
+                pass.set_bind_group(0, binding, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+        }
+        let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
+        if final_batch {
+            commands.copy_buffer_to_buffer(
+                lifetime._status.buffer(),
+                0,
+                lifetime.status_staging.buffer(),
+                0,
+                source.dispatch_layout.status_bytes,
+            );
+            let callback_lifetime = Arc::clone(&lifetime);
+            let callback_completion = Arc::clone(&completion);
+            commands.map_buffer_on_submit(
+                lifetime.status_staging.buffer(),
+                wgpu::MapMode::Read,
+                ..,
+                move |result| {
+                    // Release the callback's ownership before waking a waiter. The pending frame
+                    // keeps the job alive through validation; an abandoned pending frame instead
+                    // makes this the final Arc and safely unmaps/recycles staging.
+                    if result.is_ok() {
+                        callback_lifetime
+                            .status_mapped
+                            .store(true, Ordering::Release);
+                    }
+                    drop(callback_lifetime);
+                    callback_completion.complete(
+                        result.map_err(|error| format!("GPU status mapping failed: {error}")),
+                    );
+                },
+            );
+        }
+        let submission = backend.queue().submit([commands.finish()]);
+        if final_batch {
+            final_submission = Some(submission);
+        }
+    }
+    let submission = final_submission
+        .ok_or_else(|| Error::backend("bounded Modular stream produced no GPU submission"))?;
     let poll_completion = Arc::clone(&completion);
     if let Err(error) = poll_permit.register(submission, move |error| {
         poll_completion.complete(Err(error));
@@ -1527,66 +1734,11 @@ fn submit_decode(
     })
 }
 
-fn build_prefix_lookup(profile: &StandardModularProfile) -> Result<Vec<u32>> {
-    let channel_count = usize::try_from(profile.channels.count())
-        .map_err(|_| Error::backend("Modular channel count exceeds usize"))?;
-    let mut lookup = vec![0u32; LOOKUP_SIZE * channel_count];
-    for channel in 0..channel_count {
-        let table_start = channel
-            .checked_mul(LOOKUP_SIZE)
-            .ok_or_else(|| Error::backend("prefix lookup channel offset overflow"))?;
-        let table_end = table_start
-            .checked_add(LOOKUP_SIZE)
-            .ok_or_else(|| Error::backend("prefix lookup channel range overflow"))?;
-        let table = lookup
-            .get_mut(table_start..table_end)
-            .ok_or_else(|| Error::backend("prefix lookup channel range is truncated"))?;
-        for (symbol, entry) in profile.raw_prefix[channel]
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(symbol, entry)| (symbol as u32, entry))
-            .chain(
-                profile.lz77_prefix[channel]
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(symbol, entry)| (224 + symbol as u32, entry)),
-            )
-        {
-            insert_prefix(table, symbol, entry)?;
-        }
-    }
-    Ok(lookup)
-}
-
-fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Result<()> {
-    if entry.bit_len == 0 {
-        return Ok(());
-    }
-    if entry.bit_len > LOOKUP_BITS {
-        return Err(Error::backend(format!(
-            "validated standard prefix length {} exceeds the {LOOKUP_BITS}-bit GPU lookup",
-            entry.bit_len
-        )));
-    }
-    let suffix_bits = LOOKUP_BITS - entry.bit_len;
-    for suffix in 0..1usize << suffix_bits {
-        let index = usize::from(entry.bits) | (suffix << entry.bit_len);
-        if lookup[index] != 0 {
-            return Err(Error::backend(
-                "validated standard prefix entries collide in the GPU lookup table",
-            ));
-        }
-        lookup[index] = (symbol << 8) | u32::from(entry.bit_len);
-    }
-    Ok(())
-}
-
 fn build_params(
     group: ModularGroup,
-    source_channels: crate::ModularChannels,
-    source_bits: u8,
+    token_start: u32,
+    token_end: u32,
+    profile: &StandardModularProfile,
     output: &OutputPlan,
     initialize_chroma: bool,
 ) -> Result<ShaderParams> {
@@ -1607,18 +1759,18 @@ fn build_params(
     let (plane3_offset, plane3_stride) = plane(3)?;
     let chroma = output.layout.plane(1);
     Ok(ShaderParams {
-        token_start: to_u32(group.token_bit_offset, "token start")?,
-        token_end: to_u32(group.token_bit_end, "token end")?,
+        token_start,
+        token_end,
         width: group.width,
         height: group.height,
         origin_x: group.x,
         origin_y: group.y,
         sample_count: group.sample_count()?,
         initialize_chroma: u32::from(initialize_chroma),
-        source_channels: source_channels.count(),
-        source_bits: u32::from(source_bits),
-        source_mask: (1u32 << source_bits) - 1,
-        _source_padding: 0,
+        source_channels: profile.channels.count(),
+        source_bits: u32::from(profile.bits_per_sample),
+        source_mask: (1u32 << profile.bits_per_sample) - 1,
+        needs_self_correcting: u32::from(profile.ma_config.needs_self_correcting()),
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -1639,49 +1791,19 @@ fn build_params(
         logical_size: to_u32(output.layout.logical_size, "output logical size")?,
         numeric_mapping: output.numeric_mapping,
         _padding: 0,
+        stream_index: group.stream_index,
+        wp_p1: profile.wp_header.p1,
+        wp_p2: profile.wp_header.p2,
+        wp_p3a: profile.wp_header.p3a,
+        wp_p3b: profile.wp_header.p3b,
+        wp_p3c: profile.wp_header.p3c,
+        wp_p3d: profile.wp_header.p3d,
+        wp_p3e: profile.wp_header.p3e,
+        wp_w0: profile.wp_header.w0,
+        wp_w1: profile.wp_header.w1,
+        wp_w2: profile.wp_header.w2,
+        wp_w3: profile.wp_header.w3,
     })
-}
-
-fn stream_allocation_size(byte_len: usize) -> Result<u64> {
-    let byte_len = u64::try_from(byte_len)
-        .map_err(|_| Error::backend("codestream allocation size overflow"))?;
-    align4(byte_len)?
-        .checked_add(STREAM_SENTINEL_BYTES)
-        .ok_or_else(|| Error::backend("codestream sentinel allocation overflow"))
-}
-
-fn upload_codestream(
-    queue: &wgpu::Queue,
-    destination: &wgpu::Buffer,
-    codestream: &[u8],
-) -> Result<()> {
-    let aligned_prefix = codestream.len() & !(wgpu::COPY_BUFFER_ALIGNMENT as usize - 1);
-    if aligned_prefix != 0 {
-        queue.write_buffer(destination, 0, &codestream[..aligned_prefix]);
-    }
-
-    let remainder = &codestream[aligned_prefix..];
-    if !remainder.is_empty() {
-        let mut tail = [0u8; wgpu::COPY_BUFFER_ALIGNMENT as usize];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        queue.write_buffer(
-            destination,
-            u64::try_from(aligned_prefix)
-                .map_err(|_| Error::backend("codestream upload offset overflow"))?,
-            &tail,
-        );
-    }
-
-    let sentinel_offset = align4(
-        u64::try_from(codestream.len())
-            .map_err(|_| Error::backend("codestream sentinel offset overflow"))?,
-    )?;
-    queue.write_buffer(
-        destination,
-        sentinel_offset,
-        &[0u8; wgpu::COPY_BUFFER_ALIGNMENT as usize],
-    );
-    Ok(())
 }
 
 fn align4(value: u64) -> Result<u64> {
@@ -1794,6 +1916,37 @@ mod tests {
     const PORTABLE_CAPABILITIES: WgpuDecodeCapabilities = WgpuDecodeCapabilities {
         native_f64_arithmetic: false,
     };
+
+    #[test]
+    fn stream_batches_rebase_unaligned_group_bits_and_respect_peak_window() {
+        let codestream = vec![0u8; 32];
+        let group = |start, end| ModularGroup {
+            token_bit_offset: start,
+            token_bit_end: end,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            stream_index: 0,
+        };
+        let groups = [group(3, 67), group(75, 139), group(147, 211)];
+        let (windows, batches, peak) = build_stream_batches(&codestream, &groups, 20).unwrap();
+        assert_eq!(batches, [0..1, 1..2, 2..3]);
+        assert_eq!(peak, 16);
+        for (window, original) in windows.iter().zip(groups) {
+            assert_eq!(window.upload_offset, 0);
+            assert_eq!(window.token_start, (original.token_bit_offset & 7) as u32);
+            assert_eq!(
+                window.token_end - window.token_start,
+                u32::try_from(original.token_bit_end - original.token_bit_offset).unwrap()
+            );
+            assert_eq!(window.input_start, (original.token_bit_offset / 8) as usize);
+            assert_eq!(
+                window.input_end,
+                original.token_bit_end.div_ceil(8) as usize
+            );
+        }
+    }
 
     #[test]
     fn output_negotiation_rejects_rgb_without_explicit_transfer_and_range() {
@@ -2024,34 +2177,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_table_uses_lsb_first_prefixes() {
-        let mut lookup = vec![0u32; LOOKUP_SIZE];
-        insert_prefix(
-            &mut lookup,
-            7,
-            PrefixCodeEntry {
-                bit_len: 3,
-                bits: 0b101,
-            },
-        )
-        .unwrap();
-        assert_eq!(lookup[0b101] >> 8, 7);
-        assert_eq!(lookup[0b1_0101] >> 8, 7);
-        assert_eq!(lookup[0b101] & 0xff, 3);
-        assert!(matches!(
-            insert_prefix(
-                &mut lookup,
-                8,
-                PrefixCodeEntry {
-                    bit_len: LOOKUP_BITS + 1,
-                    bits: 0,
-                },
-            ),
-            Err(Error::Backend(_))
-        ));
-    }
-
-    #[test]
     fn map_completion_wakes_after_releasing_state_lock() {
         let completion = Arc::new(MapCompletion::default());
         let wake = Arc::new(ReentrantCompletionWake {
@@ -2068,7 +2193,7 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 128);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 176);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -2082,7 +2207,7 @@ mod tests {
             source_channels: 9,
             source_bits: 10,
             source_mask: 11,
-            _source_padding: 12,
+            needs_self_correcting: 12,
             output_kind: 13,
             transfer: 14,
             limited_range: 15,
@@ -2103,17 +2228,29 @@ mod tests {
             logical_size: 30,
             numeric_mapping: 31,
             _padding: 32,
+            stream_index: 33,
+            wp_p1: 34,
+            wp_p2: 35,
+            wp_p3a: 36,
+            wp_p3b: 37,
+            wp_p3c: 38,
+            wp_p3d: 39,
+            wp_p3e: 40,
+            wp_w0: 41,
+            wp_w1: 42,
+            wp_w2: 43,
+            wp_w3: 44,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 32]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 44]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
             ]
         );
-        assert!(SHADER_TEMPLATE.contains(
-            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    origin_x: u32,\n    origin_y: u32,\n    sample_count: u32,\n    initialize_chroma: u32,\n    source_channels: u32,\n    source_bits: u32,\n    source_mask: u32,\n    _source_padding: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n    _padding: u32,\n};"
-        ));
+        assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));
+        assert!(SHADER_TEMPLATE.contains("stream_index: u32,"));
+        assert!(SHADER_TEMPLATE.contains("wp_w3: u32,"));
 
         assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);
         assert_eq!(std::mem::align_of::<DecodeStatus>(), 4);
@@ -2131,8 +2268,6 @@ mod tests {
         assert!(SHADER_TEMPLATE.contains("status[1] = decoded;"));
         assert!(SHADER_TEMPLATE.contains("status[2] = bit_cursor;"));
         assert!(SHADER_TEMPLATE.contains("status[3] = params.token_end;"));
-        assert_eq!(stream_allocation_size(4).unwrap(), 8);
-        assert_eq!(stream_allocation_size(5).unwrap(), 12);
     }
 
     #[test]
@@ -2165,7 +2300,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name} WGSL did not parse: {error}"));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
                 .validate(&module)
-                .unwrap_or_else(|error| panic!("{name} WGSL did not validate: {error}"));
+                .unwrap_or_else(|error| panic!("{name} WGSL did not validate: {error:?}"));
         }
     }
 

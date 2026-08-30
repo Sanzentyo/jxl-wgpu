@@ -27,6 +27,7 @@ mod buffer_pool;
 mod error;
 mod inflight;
 mod model;
+mod modular_tree;
 mod profile;
 mod session;
 mod wgpu_engine;
@@ -36,8 +37,8 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
 pub use error::{
-    Error, FrontendIncomplete, FrontendStage, Result, UnsupportedCodestreamFeature,
-    UnsupportedProfile,
+    Error, FrontendIncomplete, FrontendStage, ModularTransformFeature, ModularTreeError, Result,
+    UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use jxl_gpu_bitstream::ParseLimits;

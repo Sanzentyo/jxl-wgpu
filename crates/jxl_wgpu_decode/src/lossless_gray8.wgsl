@@ -10,7 +10,7 @@ struct Params {
     source_channels: u32,
     source_bits: u32,
     source_mask: u32,
-    _source_padding: u32,
+    needs_self_correcting: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -31,10 +31,22 @@ struct Params {
     logical_size: u32,
     numeric_mapping: u32,
     _padding: u32,
+    stream_index: u32,
+    wp_p1: u32,
+    wp_p2: u32,
+    wp_p3a: u32,
+    wp_p3b: u32,
+    wp_p3c: u32,
+    wp_p3d: u32,
+    wp_p3e: u32,
+    wp_w0: u32,
+    wp_w1: u32,
+    wp_w2: u32,
+    wp_w3: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
-@group(0) @binding(1) var<storage, read> prefix_lookup: array<u32>;
+@group(0) @binding(1) var<storage, read> modular_metadata: array<u32>;
 @group(0) @binding(2) var<storage, read_write> reconstructed: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
 @group(0) @binding(4) var<storage, read_write> status: array<u32>;
@@ -54,10 +66,17 @@ const ERROR_LZ77_LENGTH: u32 = 6u;
 const ERROR_TRAILING_BITS: u32 = 7u;
 const ERROR_OUTPUT_BOUNDS: u32 = 8u;
 const ERROR_OUTPUT_MAPPING: u32 = 9u;
+const ERROR_ANS_STATE: u32 = 10u;
+const ERROR_ENTROPY_CLUSTER: u32 = 11u;
+const ERROR_MA_TREE: u32 = 12u;
+const ERROR_PREDICTOR: u32 = 13u;
 
 fn bit_mask(count: u32) -> u32 {
     if count == 0u {
         return 0u;
+    }
+    if count == 32u {
+        return 0xffffffffu;
     }
     return (1u << count) - 1u;
 }
@@ -79,7 +98,7 @@ fn read_bits(count: u32) -> u32 {
     if decode_error != 0u {
         return 0u;
     }
-    if count > 31u || bit_cursor > params.token_end || count > params.token_end - bit_cursor {
+    if count > 32u || bit_cursor > params.token_end || count > params.token_end - bit_cursor {
         decode_error = ERROR_TRUNCATED_BITS;
         return 0u;
     }
@@ -87,6 +106,8 @@ fn read_bits(count: u32) -> u32 {
     bit_cursor = bit_cursor + count;
     return value;
 }
+
+/*__JXL_MODULAR_ENTROPY__*/
 
 fn read_prefix_symbol() -> u32 {
     if decode_error != 0u || bit_cursor >= params.token_end {
@@ -96,7 +117,7 @@ fn read_prefix_symbol() -> u32 {
     let available = min(15u, params.token_end - bit_cursor);
     let lookup_index = peek_bits(available);
     let table_offset = current_channel << 15u;
-    let entry = prefix_lookup[table_offset + lookup_index];
+    let entry = modular_metadata[table_offset + lookup_index];
     let bit_len = entry & 0xffu;
     if bit_len == 0u || bit_len > available {
         decode_error = ERROR_PREFIX;
@@ -591,17 +612,21 @@ fn decode_channel() -> u32 {
     return decoded;
 }
 
+/*__JXL_MODULAR_RECONSTRUCT__*/
+
 @compute @workgroup_size(1)
 fn decode() {
     bit_cursor = params.token_start;
     decode_error = 0u;
     current_channel = 0u;
     var decoded = 0u;
+    entropy_begin();
 
     while current_channel < params.source_channels && decode_error == 0u {
-        decoded += decode_channel();
+        decoded += decode_adaptive_channel();
         current_channel += 1u;
     }
+    entropy_finalize();
 
     if decode_error == 0u && bit_cursor != params.token_end {
         let padding_bits = params.token_end - bit_cursor;

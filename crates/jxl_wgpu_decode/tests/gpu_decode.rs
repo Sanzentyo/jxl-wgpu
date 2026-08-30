@@ -658,6 +658,56 @@ fn prefetch_depth_cannot_exceed_frame_slot_limit() {
 }
 
 #[derive(Debug)]
+struct ResolvedSlotEngine;
+
+impl GpuSubmissionEngine for ResolvedSlotEngine {
+    type Session = ReadySession;
+
+    fn open(
+        &self,
+        _codestream: GpuCodestream,
+        _request: &GpuOutputRequest,
+    ) -> Result<PreparedGpuSession<Self::Session>> {
+        Ok(PreparedGpuSession::new(
+            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
+            ReadySession {
+                frames: VecDeque::from([frame(0, false), frame(1, true)]),
+            },
+        )
+        .with_resolved_frame_slots(NonZeroUsize::new(1).unwrap()))
+    }
+}
+
+#[test]
+fn backend_resolved_frame_slots_drive_limiter_and_prefetch() {
+    let decoder = GpuDecoder::new(ResolvedSlotEngine);
+    let mut session = decoder.open(raw_still(), output_request(2)).unwrap();
+
+    assert_eq!(session.request().max_frame_slots().get(), 2);
+    assert_eq!(session.resolved_frame_slots().get(), 1);
+    assert!(matches!(
+        session.prefetch(NonZeroUsize::new(2).unwrap()),
+        Err(Error::PrefetchDepthExceedsLimit {
+            requested: 2,
+            limit: 1,
+        })
+    ));
+
+    let progress = session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert_eq!(progress.queued, 1);
+    assert_eq!(session.active_frame_slots(), 1);
+    let first = session.next_frame().unwrap().unwrap();
+    let blocked = session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert_eq!(
+        blocked.backpressure,
+        Some(PrefetchBackpressure::FrameSlots { limit: 1 })
+    );
+    drop(first);
+    assert_eq!(session.active_frame_slots(), 0);
+}
+
+#[derive(Debug)]
 struct TypedRejectEngine {
     expected_container: bool,
     unsupported: bool,

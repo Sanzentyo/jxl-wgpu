@@ -11,8 +11,46 @@ pub enum UnsupportedCodestreamFeature {
     Patches,
     Splines,
     Noise,
+    ModularTransform(ModularTransformFeature),
     AnimationReferences,
     Other(String),
+}
+
+/// Standard Modular transform that has not yet been lowered to the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularTransformFeature {
+    ReversibleColor { begin_channel: u32, rct_type: u32 },
+    Palette,
+    Squeeze,
+    Invalid,
+}
+
+/// Invalid or resource-exhausting standard Modular metadata.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ModularTreeError {
+    #[error("Modular metadata exceeded the bounded {resource} limit of {limit}")]
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+    #[error("invalid Modular entropy descriptor: {reason}")]
+    InvalidEntropy { reason: &'static str },
+    #[error(
+        "invalid Modular hybrid integer config at bit {bit_offset} for log alphabet {log_alphabet_size}: split exponent {split_exponent}, MSB {msb_in_token}, LSB {lsb_in_token}"
+    )]
+    InvalidHybridConfig {
+        bit_offset: u64,
+        log_alphabet_size: u32,
+        split_exponent: u32,
+        msb_in_token: u32,
+        lsb_in_token: u32,
+    },
+    #[error("invalid Modular MA tree: {reason}")]
+    InvalidTree { reason: &'static str },
+    #[error("Modular MA tree predictor index {predictor} is outside 0 through 13")]
+    InvalidPredictor { predictor: u32 },
+    #[error("Modular MA tree depth {depth} exceeds the bounded limit {limit}")]
+    TreeDepthExceeded { depth: usize, limit: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -85,6 +123,8 @@ pub enum Error {
     UnsupportedProfile(#[from] UnsupportedProfile),
     #[error(transparent)]
     FrontendIncomplete(#[from] FrontendIncomplete),
+    #[error(transparent)]
+    ModularTree(#[from] ModularTreeError),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
     #[error("GPU decode memory backpressure: {0}")]

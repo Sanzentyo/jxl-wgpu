@@ -34,6 +34,7 @@ pub struct PreparedGpuSession<S> {
     pub profile: DecodeProfile,
     pub metadata: AnimationMetadata,
     pub session: S,
+    resolved_frame_slots: Option<NonZeroUsize>,
 }
 
 impl<S> PreparedGpuSession<S> {
@@ -43,7 +44,22 @@ impl<S> PreparedGpuSession<S> {
             profile,
             metadata,
             session,
+            resolved_frame_slots: None,
         }
+    }
+
+    /// Narrows the caller's requested frame window to the number of slots this prepared backend
+    /// session can actually keep resident within its device and shared-memory budgets.
+    #[must_use]
+    pub const fn with_resolved_frame_slots(mut self, slots: NonZeroUsize) -> Self {
+        self.resolved_frame_slots = Some(slots);
+        self
+    }
+
+    /// Backend-resolved frame-slot bound, or `None` when the request remains unchanged.
+    #[must_use]
+    pub const fn resolved_frame_slots(&self) -> Option<NonZeroUsize> {
+        self.resolved_frame_slots
     }
 }
 
@@ -362,11 +378,19 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
     fn new(prepared: PreparedGpuSession<S>, request: GpuOutputRequest) -> Result<Self> {
         validate_stream_metadata(&prepared.metadata)?;
         validate_profile(prepared.profile)?;
+        let resolved_frame_slots = prepared
+            .resolved_frame_slots
+            .unwrap_or_else(|| request.max_frame_slots());
+        if resolved_frame_slots > request.max_frame_slots() {
+            return Err(Error::EngineContract(
+                "resolved frame-slot limit exceeds the caller's request",
+            ));
+        }
         Ok(Self {
             engine: prepared.session,
             profile: prepared.profile,
             metadata: prepared.metadata,
-            limiter: InFlightLimiter::new(request.max_frame_slots()),
+            limiter: InFlightLimiter::new(resolved_frame_slots),
             request,
             pending: VecDeque::new(),
             submitted_count: 0,
@@ -391,6 +415,12 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
     #[must_use]
     pub const fn request(&self) -> &GpuOutputRequest {
         &self.request
+    }
+
+    /// Effective frame-slot limit after backend memory/device admission narrows the request.
+    #[must_use]
+    pub fn resolved_frame_slots(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.limiter.limit()).expect("the frame-slot limiter is nonzero")
     }
 
     /// Concrete GPU submission state, for backend-specific diagnostics such as memory accounting.
@@ -442,8 +472,8 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
     /// engine reports end-of-stream, or a typed admission boundary is encountered.
     ///
     /// The target is a queue depth, not an additional count, and cannot exceed the request's
-    /// `max_frame_slots` bound. Already returned frame leases retain their slots and can therefore
-    /// make a synchronous attempt report [`PrefetchBackpressure::FrameSlots`].
+    /// backend-resolved frame-slot bound. Already returned frame leases retain their slots and can
+    /// therefore make a synchronous attempt report [`PrefetchBackpressure::FrameSlots`].
     pub fn prefetch(&mut self, target_depth: NonZeroUsize) -> Result<PrefetchProgress> {
         self.validate_prefetch(target_depth)?;
         if self.failed {

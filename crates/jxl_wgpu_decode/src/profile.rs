@@ -1,17 +1,15 @@
 use jxl_gpu_bitstream::{
     BitReader, CodestreamInventory, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
-    ImageHeaderInventory, PrefixCodeEntry, SampleBitDepth,
+    ImageHeaderInventory, SampleBitDepth,
 };
 
 use crate::{ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile};
+use crate::{
+    ModularTransformFeature,
+    modular_tree::{MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config},
+};
 
-const MAX_CODESTREAM_BYTES: usize = 16 * 1024 * 1024;
 const GROUP_DIMENSION: u32 = 256;
-const PREFIX_ALPHABET_SIZE: usize = 257;
-const RAW_SYMBOLS: usize = 19;
-const LZ77_SYMBOLS: usize = 33;
-const LZ77_SYMBOL_OFFSET: usize = 224;
-const MAX_PREFIX_BITS: u8 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularGroup {
@@ -21,6 +19,7 @@ pub(crate) struct ModularGroup {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+    pub stream_index: u32,
 }
 
 impl ModularGroup {
@@ -40,8 +39,8 @@ pub(crate) struct StandardModularProfile {
     pub group_columns: u32,
     pub group_rows: u32,
     pub groups: Vec<ModularGroup>,
-    pub raw_prefix: [[PrefixCodeEntry; RAW_SYMBOLS]; 4],
-    pub lz77_prefix: [[PrefixCodeEntry; LZ77_SYMBOLS]; 4],
+    pub ma_config: MaConfigIr,
+    pub wp_header: WpHeaderIr,
 }
 
 fn validate_image_header(
@@ -174,9 +173,6 @@ pub(crate) fn parse_standard_modular_profile(
     codestream: &[u8],
     inventory: &CodestreamInventory,
 ) -> Result<StandardModularProfile> {
-    if codestream.len() > MAX_CODESTREAM_BYTES {
-        return unsupported("the lossless Modular GPU profile codestream exceeds 16 MiB");
-    }
     let image = &inventory.image_header;
     if image.width == 0 || image.height == 0 {
         return unsupported("the lossless Modular GPU profile requires a non-empty image");
@@ -272,7 +268,8 @@ pub(crate) fn parse_standard_modular_profile(
     .ok_or_else(|| unsupported_error("the Modular frame is missing DC-global metadata"))?;
     let mut reader = BitReader::new(codestream);
     reader.skip_bits(dc_global.bits.offset)?;
-    let prefix = parse_dc_global(&mut reader, channels)?;
+    parse_lf_channel_dequantization(&mut reader)?;
+    let (ma_config, wp_header) = parse_dc_global_ir(&mut reader, channels)?;
     let dc_end = dc_global
         .bits
         .end()
@@ -289,6 +286,7 @@ pub(crate) fn parse_standard_modular_profile(
             y: 0,
             width: image.width,
             height: image.height,
+            stream_index: 0,
         }]
     } else {
         if !bits_are_zero(codestream, reader.bit_offset(), dc_end) {
@@ -333,14 +331,26 @@ pub(crate) fn parse_standard_modular_profile(
                 .bits
                 .end()
                 .ok_or_else(|| unsupported_error("Modular pass-group bit range overflow"))?;
-            *slot = Some(ModularGroup {
-                token_bit_offset: group_reader.bit_offset(),
-                token_bit_end,
-                x,
-                y,
-                width: image.width.saturating_sub(x).min(GROUP_DIMENSION),
-                height: image.height.saturating_sub(y).min(GROUP_DIMENSION),
-            });
+            *slot =
+                Some(ModularGroup {
+                    token_bit_offset: group_reader.bit_offset(),
+                    token_bit_end,
+                    x,
+                    y,
+                    width: image.width.saturating_sub(x).min(GROUP_DIMENSION),
+                    height: image.height.saturating_sub(y).min(GROUP_DIMENSION),
+                    stream_index: u32::try_from(
+                        18u64
+                            .checked_add(
+                                frame.low_frequency_group_count.checked_mul(3).ok_or_else(
+                                    || unsupported_error("Modular stream index overflow"),
+                                )?,
+                            )
+                            .and_then(|value| value.checked_add(group_index))
+                            .ok_or_else(|| unsupported_error("Modular stream index overflow"))?,
+                    )
+                    .map_err(|_| unsupported_error("Modular stream index exceeds u32"))?,
+                });
         }
         groups
             .into_iter()
@@ -377,9 +387,83 @@ pub(crate) fn parse_standard_modular_profile(
         group_columns,
         group_rows,
         groups,
-        raw_prefix: prefix.map(|code| code.raw),
-        lz77_prefix: prefix.map(|code| code.lz77),
+        ma_config,
+        wp_header,
     })
+}
+
+/// Advances across `LfChannelDequantization`, which precedes `GlobalModular` in LF-global.
+///
+/// These values only affect VarDCT. A lossless Modular frame must still carry the bundle, so the
+/// frontend parses its bounded wire shape before locating the global MA tree.
+fn parse_lf_channel_dequantization(reader: &mut BitReader<'_>) -> Result<()> {
+    let all_default = reader.read_bits(1)? != 0;
+    if !all_default {
+        // m_x_lf, m_y_lf, and m_b_lf are IEEE-754 binary16 values on the wire. Their values are
+        // irrelevant to Modular reconstruction, but consuming all three fields is required to
+        // locate GlobalModular without depending on a CPU image decoder.
+        for _ in 0..3 {
+            reader.read_bits(16)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_dc_global_ir(
+    reader: &mut BitReader<'_>,
+    channels: ModularChannels,
+) -> Result<(MaConfigIr, WpHeaderIr)> {
+    expect(reader, 1, 1, "global Modular MA tree")?;
+    let ma_config = parse_ma_config(reader, MaTreeLimits::default())?;
+    expect(reader, 1, 1, "global Modular tree selection")?;
+    let wp_header = WpHeaderIr::parse(reader)?;
+    let transform_count = read_u32_selector(reader, [(0, 0), (1, 0), (2, 4), (18, 8)])?;
+    match (channels, transform_count) {
+        (ModularChannels::Gray, 0) => {}
+        (ModularChannels::Rgb | ModularChannels::Rgba, 1) => {
+            let transform_id = reader.read_bits(2)?;
+            if transform_id != 0 {
+                return unsupported_transform(match transform_id {
+                    1 => ModularTransformFeature::Palette,
+                    2 => ModularTransformFeature::Squeeze,
+                    _ => ModularTransformFeature::Invalid,
+                });
+            }
+            let begin_channel = read_u32_selector(reader, [(0, 3), (8, 6), (72, 10), (1096, 13)])?;
+            let rct_type = read_u32_selector(reader, [(6, 0), (0, 2), (2, 4), (10, 6)])?;
+            if begin_channel != 0 || rct_type != 6 {
+                return unsupported_transform(ModularTransformFeature::ReversibleColor {
+                    begin_channel,
+                    rct_type,
+                });
+            }
+        }
+        (_, 0) => {
+            return unsupported(
+                "the standard Modular color profile requires its reversible color transform",
+            );
+        }
+        _ => return unsupported_transform(ModularTransformFeature::Invalid),
+    }
+    Ok((ma_config, wp_header))
+}
+
+fn read_u32_selector(reader: &mut BitReader<'_>, variants: [(u32, u8); 4]) -> Result<u32> {
+    let selector = usize::try_from(reader.read_bits(2)?)
+        .map_err(|_| unsupported_error("U32 selector exceeds host address space"))?;
+    let (base, bits) = variants[selector];
+    let extra = u32::try_from(reader.read_bits(bits)?)
+        .map_err(|_| unsupported_error("U32 field exceeds u32"))?;
+    base.checked_add(extra)
+        .ok_or_else(|| unsupported_error("U32 field overflows").into())
+}
+
+fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {
+    Err(UnsupportedProfile::new(
+        UnsupportedCodestreamFeature::ModularTransform(feature),
+        "the Modular transform is parsed but has not been lowered to a GPU kernel",
+    )
+    .into())
 }
 
 fn validate_empty_non_pass_sections(
@@ -410,322 +494,6 @@ fn validate_empty_non_pass_sections(
         }
     }
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct ParsedPrefix {
-    raw: [PrefixCodeEntry; RAW_SYMBOLS],
-    lz77: [PrefixCodeEntry; LZ77_SYMBOLS],
-}
-
-fn parse_dc_global(
-    reader: &mut BitReader<'_>,
-    channels: ModularChannels,
-) -> Result<[ParsedPrefix; 4]> {
-    for (count, value, name) in [
-        (1, 1, "Modular global tree"),
-        (1, 1, "Modular WP header"),
-        (1, 0, "default Modular WP parameters"),
-        (1, 1, "Modular transform tree"),
-        (2, 0, "Modular tree size selector"),
-        (1, 1, "Modular tree entropy LZ77"),
-        (4, 0, "Modular tree LZ77 minimum length"),
-        (6, 0b100011, "Modular tree LZ77 hybrid config"),
-        (2, 1, "Modular tree context count"),
-        (2, 3, "Modular tree context-map selector"),
-    ] {
-        expect(reader, count, value, name)?;
-    }
-    for symbol in 0..4 {
-        expect(reader, 2, symbol, "Modular tree context-map symbol")?;
-    }
-    expect(reader, 1, 0, "Modular tree context-map MTF")?;
-
-    const TREE_INDICES: [usize; 26] = [
-        1, 2, 1, 4, 1, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0,
-    ];
-    const SYMBOL_BITS: [u64; 6] = [0b00, 0b10, 0b001, 0b101, 0b0011, 0b0111];
-    const SYMBOL_NBITS: [u8; 6] = [2, 2, 3, 3, 4, 4];
-    for index in TREE_INDICES {
-        expect(
-            reader,
-            SYMBOL_NBITS[index],
-            SYMBOL_BITS[index],
-            "fixed Modular decision tree",
-        )?;
-    }
-
-    for (count, value, name) in [
-        (1, 1, "Modular global entropy LZ77"),
-        (2, 0, "Modular global LZ77 minimum-length selector"),
-        (4, 0b1010, "Modular global LZ77 minimum length"),
-        (4, 4, "Modular global LZ77 length config split exponent"),
-        (3, 0, "Modular global LZ77 length config msb"),
-        (3, 0, "Modular global LZ77 length config lsb"),
-        (1, 1, "Modular global simple cluster map"),
-        (2, 3, "Modular global cluster count"),
-    ] {
-        expect(reader, count, value, name)?;
-    }
-    for context in [4, 3, 2, 1, 0] {
-        expect(reader, 3, context, "Modular global context cluster")?;
-    }
-    expect(reader, 1, 1, "Modular global cluster-map MTF")?;
-    expect(reader, 4, 0, "Modular global cluster-map MTF prefix")?;
-    for _ in 0..4 {
-        expect(reader, 4, 0, "Modular global cluster-map MTF symbol")?;
-    }
-    expect(reader, 5, 1, "Modular global histogram count")?;
-    for _ in 0..4 {
-        expect(reader, 1, 1, "Modular global hybrid config selector")?;
-        expect(reader, 4, 8, "Modular global hybrid config split exponent")?;
-        expect(reader, 8, 0, "Modular global hybrid config low bits")?;
-    }
-    expect(reader, 2, 1, "Modular global entropy coder")?;
-    expect(reader, 2, 0, "Modular global entropy selector")?;
-    expect(reader, 1, 1, "Modular global prefix histogram mode")?;
-
-    let prefixes = [
-        parse_prefix_histogram(reader)?,
-        parse_prefix_histogram(reader)?,
-        parse_prefix_histogram(reader)?,
-        parse_prefix_histogram(reader)?,
-    ];
-    expect(reader, 1, 1, "Modular global distance multiplier")?;
-    expect(reader, 1, 1, "Modular global predictor tree")?;
-    if channels == ModularChannels::Gray {
-        expect(reader, 2, 0, "no Modular color transforms")?;
-    } else {
-        expect(reader, 2, 1, "one Modular color transform")?;
-        expect(reader, 2, 0, "reversible color transform")?;
-        expect(reader, 5, 0, "reversible color transform first channel")?;
-        expect(reader, 2, 0, "reversible YCoCg transform type")?;
-    }
-    Ok(prefixes)
-}
-
-fn parse_prefix_histogram(reader: &mut BitReader<'_>) -> Result<ParsedPrefix> {
-    expect(reader, 2, 0, "complex prefix histogram")?;
-    const CODE_LENGTH_ORDER: [usize; 18] =
-        [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-    let mut code_length_lengths = [0u8; 18];
-    let mut bit_accumulator = 0u32;
-    let mut nonzero_count = 0u32;
-    let mut nonzero_symbol = 0usize;
-    for symbol in CODE_LENGTH_ORDER {
-        let length = read_code_length_code(reader)?;
-        code_length_lengths[symbol] = length;
-        if length != 0 {
-            bit_accumulator = bit_accumulator
-                .checked_add(32u32 >> length)
-                .ok_or_else(|| unsupported_error("prefix code-length histogram overflow"))?;
-            nonzero_count += 1;
-            nonzero_symbol = symbol;
-            if bit_accumulator == 32 {
-                break;
-            }
-            if bit_accumulator > 32 {
-                return unsupported("invalid prefix code-length histogram");
-            }
-        }
-    }
-    if bit_accumulator != 32 {
-        return unsupported("incomplete prefix code-length histogram");
-    }
-
-    let code_length_entries = canonical_entries(&code_length_lengths)?;
-    let mut code_lengths = [0u8; PREFIX_ALPHABET_SIZE];
-    let mut index = 0usize;
-    let mut bit_accumulator = 0u32;
-    let mut previous_symbol = 8u8;
-    let mut last_nonzero_length = 8u8;
-    let mut last_repeat_count = 0usize;
-    let mut repeat_count = 0usize;
-    let mut repeat_length = 0u8;
-
-    while index < PREFIX_ALPHABET_SIZE {
-        let length = if repeat_count != 0 {
-            repeat_count -= 1;
-            repeat_length
-        } else {
-            let symbol = if nonzero_count == 1 {
-                u8::try_from(nonzero_symbol)
-                    .map_err(|_| unsupported_error("prefix code-length symbol overflow"))?
-            } else {
-                u8::try_from(read_prefix_symbol(reader, &code_length_entries)?)
-                    .map_err(|_| unsupported_error("prefix code-length symbol overflow"))?
-            };
-            let length = match symbol {
-                0 => 0,
-                1..=15 => {
-                    last_nonzero_length = symbol;
-                    symbol
-                }
-                16 => {
-                    let mut current = usize::try_from(reader.read_bits(2)?)
-                        .map_err(|_| unsupported_error("prefix repeat count overflow"))?
-                        + 3;
-                    if previous_symbol == 16 {
-                        current = current
-                            .checked_add(
-                                last_repeat_count
-                                    .checked_mul(3)
-                                    .and_then(|value| value.checked_sub(8))
-                                    .ok_or_else(|| {
-                                        unsupported_error("prefix repeat count overflow")
-                                    })?,
-                            )
-                            .ok_or_else(|| unsupported_error("prefix repeat count overflow"))?;
-                        last_repeat_count = last_repeat_count
-                            .checked_add(current)
-                            .ok_or_else(|| unsupported_error("prefix repeat count overflow"))?;
-                    } else {
-                        last_repeat_count = current;
-                    }
-                    repeat_count = current
-                        .checked_sub(1)
-                        .ok_or_else(|| unsupported_error("zero prefix repeat count"))?;
-                    repeat_length = last_nonzero_length;
-                    last_nonzero_length
-                }
-                17 => {
-                    let mut current = usize::try_from(reader.read_bits(3)?)
-                        .map_err(|_| unsupported_error("prefix zero-repeat count overflow"))?
-                        + 3;
-                    if previous_symbol == 17 {
-                        current = current
-                            .checked_add(
-                                last_repeat_count
-                                    .checked_mul(7)
-                                    .and_then(|value| value.checked_sub(16))
-                                    .ok_or_else(|| {
-                                        unsupported_error("prefix zero-repeat count overflow")
-                                    })?,
-                            )
-                            .ok_or_else(|| {
-                                unsupported_error("prefix zero-repeat count overflow")
-                            })?;
-                        last_repeat_count =
-                            last_repeat_count.checked_add(current).ok_or_else(|| {
-                                unsupported_error("prefix zero-repeat count overflow")
-                            })?;
-                    } else {
-                        last_repeat_count = current;
-                    }
-                    repeat_count = current
-                        .checked_sub(1)
-                        .ok_or_else(|| unsupported_error("zero prefix repeat count"))?;
-                    repeat_length = 0;
-                    0
-                }
-                _ => return unsupported("invalid prefix code-length symbol"),
-            };
-            previous_symbol = symbol;
-            length
-        };
-        code_lengths[index] = length;
-        index += 1;
-        if length != 0 {
-            bit_accumulator = bit_accumulator
-                .checked_add(1u32 << (u32::from(MAX_PREFIX_BITS) - u32::from(length)))
-                .ok_or_else(|| unsupported_error("prefix histogram accumulator overflow"))?;
-            if bit_accumulator > 1u32 << MAX_PREFIX_BITS {
-                return unsupported("over-subscribed prefix histogram");
-            }
-            if bit_accumulator == 1u32 << MAX_PREFIX_BITS && repeat_count == 0 {
-                break;
-            }
-        }
-    }
-    if bit_accumulator != 1u32 << MAX_PREFIX_BITS || repeat_count != 0 {
-        return unsupported("incomplete prefix histogram");
-    }
-
-    let entries = canonical_entries(&code_lengths)?;
-    Ok(ParsedPrefix {
-        raw: std::array::from_fn(|index| entries[index]),
-        lz77: std::array::from_fn(|index| entries[LZ77_SYMBOL_OFFSET + index]),
-    })
-}
-
-fn read_code_length_code(reader: &mut BitReader<'_>) -> Result<u8> {
-    Ok(match reader.read_bits(2)? {
-        0 => 0,
-        1 => 4,
-        2 => 3,
-        3 => match reader.read_bits(1)? {
-            0 => 2,
-            1 => {
-                if reader.read_bits(1)? == 0 {
-                    1
-                } else {
-                    5
-                }
-            }
-            _ => unreachable!(),
-        },
-        _ => unreachable!(),
-    })
-}
-
-fn read_prefix_symbol(reader: &mut BitReader<'_>, entries: &[PrefixCodeEntry]) -> Result<u32> {
-    let mut bits = 0u16;
-    for length in 1..=MAX_PREFIX_BITS {
-        let bit = u16::try_from(reader.read_bits(1)?)
-            .map_err(|_| unsupported_error("prefix bit overflow"))?;
-        bits |= bit << (length - 1);
-        if let Some(symbol) = entries
-            .iter()
-            .position(|entry| entry.bit_len == length && entry.bits == bits)
-        {
-            return u32::try_from(symbol)
-                .map_err(|_| unsupported_error("prefix symbol exceeds u32").into());
-        }
-    }
-    unsupported("invalid prefix symbol")
-}
-
-fn canonical_entries<const N: usize>(lengths: &[u8; N]) -> Result<[PrefixCodeEntry; N]> {
-    let mut counts = [0u16; MAX_PREFIX_BITS as usize + 1];
-    for &length in lengths {
-        if length > MAX_PREFIX_BITS {
-            return unsupported("prefix code length exceeds 15 bits");
-        }
-        if length != 0 {
-            counts[usize::from(length)] = counts[usize::from(length)]
-                .checked_add(1)
-                .ok_or_else(|| unsupported_error("prefix code-length count overflow"))?;
-        }
-    }
-    let mut next_code = [0u16; MAX_PREFIX_BITS as usize + 1];
-    let mut code = 0u16;
-    for length in 1..=MAX_PREFIX_BITS as usize {
-        code = code
-            .checked_add(counts[length - 1])
-            .and_then(|value| value.checked_shl(1))
-            .ok_or_else(|| unsupported_error("canonical prefix code overflow"))?;
-        next_code[length] = code;
-    }
-    Ok(std::array::from_fn(|symbol| {
-        let length = lengths[symbol];
-        if length == 0 {
-            return PrefixCodeEntry {
-                bit_len: 0,
-                bits: 0,
-            };
-        }
-        let length_index = usize::from(length);
-        let bits = reverse_prefix_bits(length, next_code[length_index]);
-        next_code[length_index] = next_code[length_index].wrapping_add(1);
-        PrefixCodeEntry {
-            bit_len: length,
-            bits,
-        }
-    }))
-}
-
-fn reverse_prefix_bits(length: u8, bits: u16) -> u16 {
-    bits.reverse_bits() >> (u16::BITS - u32::from(length))
 }
 
 fn expect(reader: &mut BitReader<'_>, count: u8, expected: u64, field: &str) -> Result<()> {
@@ -764,7 +532,7 @@ fn unsupported_error(detail: impl Into<String>) -> UnsupportedProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{bits_are_zero, canonical_entries};
+    use super::bits_are_zero;
 
     #[test]
     fn checks_unaligned_padding_bits() {
@@ -775,13 +543,5 @@ mod tests {
         assert!(bits_are_zero(&[0b0000_0111, 0, 0b1110_0000], 3, 21));
         assert!(!bits_are_zero(&[0; 1], 0, 9));
         assert!(!bits_are_zero(&[0; 1], 7, 6));
-    }
-
-    #[test]
-    fn canonical_entries_use_lsb_first_wire_codes() {
-        let entries = canonical_entries(&[1, 2, 2]).unwrap();
-        assert_eq!((entries[0].bit_len, entries[0].bits), (1, 0));
-        assert_eq!((entries[1].bit_len, entries[1].bits), (2, 1));
-        assert_eq!((entries[2].bit_len, entries[2].bits), (2, 3));
     }
 }
