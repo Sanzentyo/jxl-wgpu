@@ -16,7 +16,7 @@ use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat,
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::ImageReadbackPipeline;
 use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, NumericSampleMapping};
-use jxl_wgpu_encode::{BufferImageSource, LosslessGray8Encoder, WgpuContext};
+use jxl_wgpu_encode::{BufferImageSource, LosslessModularEncoder, WgpuContext};
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 
@@ -316,7 +316,7 @@ impl ConformanceCase {
             && !self.is_stock_gpu_round_trip()
         {
             return Err(Error::InvalidConfig(format!(
-                "conformance case {} is marked stock, but the stock profile is Gray U8 at 2..=256 pixels per dimension",
+                "conformance case {} is marked stock, but the stock profile is Gray U8 with each dimension in 1..2^30",
                 self.name
             )));
         }
@@ -334,10 +334,8 @@ impl ConformanceCase {
         self.source.model == PixelModel::Gray
             && self.source.depth == SampleDepth::U8
             && self.source.alpha == AlphaPattern::None
-            && self.extent.width >= 2
-            && self.extent.width <= 256
-            && self.extent.height >= 2
-            && self.extent.height <= 256
+            && (1..(1_u32 << 30)).contains(&self.extent.width)
+            && (1..(1_u32 << 30)).contains(&self.extent.height)
     }
 
     #[must_use]
@@ -873,7 +871,7 @@ fn execute_stock_gpu_round_trip(
     ));
     let source = BufferImageSource::new(source_buffer, layout)
         .map_err(|error| format!("invalid GPU encoder source: {error}"))?;
-    let encoder = LosslessGray8Encoder::new(WgpuContext::from_backend(backend));
+    let encoder = LosslessModularEncoder::new(WgpuContext::from_backend(backend));
     let encoded = encoder
         .encode_container(source)
         .map_err(|error| format!("GPU encode failed: {error}"))?;

@@ -23,7 +23,7 @@ use jxl_wgpu::{
 use jxl_wgpu_decode::{
     Error as DecodeError, F64OutputPolicy, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
 };
-use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessGray8Encoder, WgpuContext};
+use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessModularEncoder, WgpuContext};
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 
@@ -589,7 +589,7 @@ fn run_encode(
 }
 
 struct PreparedGray8Encode {
-    encoder: LosslessGray8Encoder,
+    encoder: LosslessModularEncoder,
     source: BufferImageSource,
     source_hash: String,
 }
@@ -616,12 +616,12 @@ fn prepare_gray8_encode(
             "the gray8 encoder requires --extent WIDTHxHEIGHT or a corpus extent",
         )
     })?;
-    if !(2..=256).contains(&extent.width) || !(2..=256).contains(&extent.height) {
+    if !(1..(1 << 30)).contains(&extent.width) || !(1..(1 << 30)).contains(&extent.height) {
         return Err(CodecIssue::new(
             CodecIssueKind::Unsupported,
             "gpu_encode_profile",
             "extent",
-            "the current gray8 profile requires width and height in 2..=256",
+            "the 8-bit Modular encode workload requires width and height in 1..2^30",
         ));
     }
     let mut bytes = std::fs::read(path).map_err(|error| {
@@ -673,7 +673,7 @@ fn prepare_gray8_encode(
     let source = BufferImageSource::new(buffer, layout).map_err(encode_issue)?;
     let context = WgpuContext::from_backend(backend);
     Ok(PreparedGray8Encode {
-        encoder: LosslessGray8Encoder::new(context),
+        encoder: LosslessModularEncoder::new(context),
         source,
         source_hash,
     })
@@ -1109,6 +1109,12 @@ fn decode_issue(error: DecodeError) -> CodecIssue {
             "parse",
             error.to_string(),
         ),
+        DecodeError::CodestreamInventory(error) => CodecIssue::new(
+            CodecIssueKind::InvalidInput,
+            "jxl_codestream_inventory",
+            "parse",
+            error.to_string(),
+        ),
         DecodeError::PixelFormat(error) => CodecIssue::new(
             CodecIssueKind::Unsupported,
             "pixel_format",
@@ -1126,18 +1132,6 @@ fn decode_issue(error: DecodeError) -> CodecIssue {
             "gpu_decode_output",
             "pixel_format",
             detail,
-        ),
-        DecodeError::AccelerationIndex(error) => CodecIssue::new(
-            CodecIssueKind::InvalidInput,
-            "gpu_acceleration_index",
-            "invalid_index",
-            error.to_string(),
-        ),
-        DecodeError::DuplicateAccelerationIndex => CodecIssue::new(
-            CodecIssueKind::InvalidInput,
-            "gpu_acceleration_index",
-            "duplicate_index",
-            "the input contains more than one GPU acceleration index",
         ),
         DecodeError::Backend(message) => CodecIssue::new(
             CodecIssueKind::Backend,

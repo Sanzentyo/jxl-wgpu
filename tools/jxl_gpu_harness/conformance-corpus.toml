@@ -1,6 +1,17 @@
 version = 1
 
-# Executable stock GPU profile: lossless Gray U8, 2..=256 in each dimension.
+# Executable GPU round-trip profile: lossless Gray U8, standard single- or multi-group framing.
+
+[[cases]]
+name = "singleton-gray8-1x1"
+category = "tiny"
+extent = { width = 1, height = 1 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 4, extra_padding = 3, padding_byte = 231 }
+pattern = { seed = 17 }
+expectation = "stock_gpu_round_trip"
+support_note = "Minimum standard extent with non-zero row padding."
+external_reference = true
 
 [[cases]]
 name = "tiny-gray8-2x2"
@@ -10,7 +21,7 @@ source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 1, extra_padding = 0, padding_byte = 0 }
 pattern = { seed = 1 }
 expectation = "stock_gpu_round_trip"
-support_note = "Minimum executable stock-profile extent."
+support_note = "Compact 2x2 baseline used by external libjxl fixture generation."
 external_reference = true
 
 [[cases]]
@@ -65,7 +76,7 @@ source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 1, padding_byte = 126 }
 pattern = { seed = 6 }
 expectation = "stock_gpu_round_trip"
-support_note = "Wide panorama at the encoder's upper width neighborhood."
+support_note = "Wide panorama immediately below a 256-pixel pass-group edge."
 external_reference = true
 
 [[cases]]
@@ -76,7 +87,7 @@ source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 64, extra_padding = 0, padding_byte = 129 }
 pattern = { seed = 7 }
 expectation = "stock_gpu_round_trip"
-support_note = "Tall image at the encoder's upper height neighborhood."
+support_note = "Tall image immediately below a 256-pixel pass-group edge."
 external_reference = true
 
 [[cases]]
@@ -87,7 +98,7 @@ source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 0, padding_byte = 222 }
 pattern = { seed = 8 }
 expectation = "stock_gpu_round_trip"
-support_note = "One pixel below the current 256-pixel stock-profile boundary."
+support_note = "One pixel below both 256-pixel pass-group edges."
 external_reference = true
 
 [[cases]]
@@ -98,10 +109,8 @@ source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 13, padding_byte = 17 }
 pattern = { seed = 9 }
 expectation = "stock_gpu_round_trip"
-support_note = "Exact upper boundary of the current stock-profile encoder."
+support_note = "Exactly one full 256x256 pass group."
 external_reference = true
-
-# Future-profile inventory. These are deliberately visible but never reported as stock passes.
 
 [[cases]]
 name = "group-boundary-gray8-257x257"
@@ -110,9 +119,45 @@ extent = { width = 257, height = 257 }
 source = { model = "gray", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 0, padding_byte = 238 }
 pattern = { seed = 10 }
-expectation = "future_gpu_profile"
-support_note = "One pixel beyond the current stock-profile extent limit."
+expectation = "stock_gpu_round_trip"
+support_note = "One pixel past both 256-pixel group edges; exercises a 2x2 pass-group grid."
 external_reference = true
+
+[[cases]]
+name = "extreme-panorama-gray8-4097x1"
+category = "panorama"
+extent = { width = 4097, height = 1 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 256, extra_padding = 31, padding_byte = 41 }
+pattern = { seed = 18 }
+expectation = "stock_gpu_round_trip"
+support_note = "Extreme 4097:1 aspect ratio spanning seventeen horizontal pass groups."
+external_reference = true
+
+[[cases]]
+name = "extreme-tall-gray8-1x4097"
+category = "tall"
+extent = { width = 1, height = 4097 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 16, extra_padding = 1, padding_byte = 214 }
+pattern = { seed = 19 }
+expectation = "stock_gpu_round_trip"
+support_note = "Extreme 1:4097 aspect ratio spanning seventeen vertical pass groups."
+external_reference = true
+
+[[cases]]
+name = "hd-gray8-1280x720"
+category = "hd"
+extent = { width = 1280, height = 720 }
+source = { model = "gray", depth = "u8", alpha = "none" }
+row_layout = { alignment = 256, extra_padding = 29, padding_byte = 118 }
+pattern = { seed = 20 }
+expectation = "stock_gpu_round_trip"
+support_note = "Fifteen-pass-group HD decode with an intentionally non-canonical source pitch."
+external_reference = true
+
+# Encode-capable profiles awaiting matching GPU decoder coverage. These remain visible but are not
+# reported as round-trip passes.
 
 [[cases]]
 name = "odd-rgba8-19x11-opaque"
@@ -122,7 +167,7 @@ source = { model = "rgba", depth = "u8", alpha = "opaque" }
 row_layout = { alignment = 64, extra_padding = 3, padding_byte = 44 }
 pattern = { seed = 11 }
 expectation = "future_gpu_profile"
-support_note = "RGBA encode is not in the executable stock profile; alpha is fully opaque."
+support_note = "GPU encode supports RGBA; GPU decode integration is pending. Alpha is fully opaque."
 external_reference = false
 
 [[cases]]
@@ -133,7 +178,7 @@ source = { model = "rgba", depth = "u12", alpha = "checkerboard" }
 row_layout = { alignment = 256, extra_padding = 32, padding_byte = 75 }
 pattern = { seed = 12 }
 expectation = "future_gpu_profile"
-support_note = "High-bit-depth RGBA and checkerboard alpha remain future codec work."
+support_note = "GPU encode supports this profile; high-bit-depth RGBA GPU decode is pending."
 external_reference = false
 
 [[cases]]
@@ -144,7 +189,7 @@ source = { model = "gray", depth = "u16", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 2, padding_byte = 102 }
 pattern = { seed = 13 }
 expectation = "future_gpu_profile"
-support_note = "Gray U16 encode and extents above 256 remain future codec work."
+support_note = "GPU encode supports this profile; Gray U16 GPU decode is pending."
 external_reference = true
 
 [[cases]]
@@ -155,7 +200,7 @@ source = { model = "rgb", depth = "u8", alpha = "none" }
 row_layout = { alignment = 256, extra_padding = 0, padding_byte = 153 }
 pattern = { seed = 14 }
 expectation = "future_gpu_profile"
-support_note = "HD RGB metadata and generator coverage; RGB encoding is not implemented."
+support_note = "HD RGB GPU encode coverage; RGB GPU decode integration is pending."
 external_reference = true
 
 [[cases]]

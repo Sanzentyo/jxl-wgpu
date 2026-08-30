@@ -5,14 +5,17 @@ multi-resolution image coverage. It does not claim that every listed image can a
 or decoded by the stock GPU profile. Instead, every case has one of two explicit expectations:
 
 - `stock_gpu_round_trip`: executable today through the GPU encoder, GPU decoder, and exact CPU
-  readback comparison. The current boundary is pitch-linear Gray U8 with width and height in
-  `2..=256`.
+  readback comparison. The current boundary is pitch-linear Gray U8 with nonzero dimensions below
+  `2^30`, subject to the adapter and harness memory limits. Single- and multi-group streams use the
+  same path.
 - `future_gpu_profile`: deterministic generator and inventory coverage only. This currently
-  includes RGB, RGBA, 10/12/16-bit samples, extents above 256, and HD/FHD/UHD 4K cases.
+  includes RGB, RGBA, and 10/12/16-bit decode. Their GPU encoder path already exists; they remain
+  future round-trip entries until the corresponding GPU decoder profiles land.
 
-The checked-in inventory includes tiny, odd, square, portrait, landscape, panorama, tall,
-255/256/257 boundary, HD 1280x720, FHD 1920x1080, and UHD 4K 3840x2160 metadata. Future entries
-stay in reports when GPU round-trip mode is selected, but have no fabricated execution result.
+The checked-in inventory includes 1x1, tiny, odd, square, portrait, landscape, panorama, tall,
+4097:1 and 1:4097 extremes, 255/256/257 group boundaries, HD 1280x720, FHD 1920x1080, and UHD 4K
+3840x2160 metadata. Future entries stay in reports when GPU round-trip mode is selected, but have
+no fabricated execution result.
 
 ## Deterministic source contract
 
