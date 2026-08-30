@@ -4,12 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    CodecOperation, DeclaredExtent, GpuPixelFormat, OutputTarget, SizeClass, WorkloadSpec,
+    CodecOperation, CpuReadbackMode, DeclaredExtent, GpuPixelFormat, OutputTarget, SizeClass,
+    WorkloadExecutionModel, WorkloadSpec,
 };
 use crate::compare::{AccuracyMetrics, ThresholdEvaluation};
 use crate::error::{Error, Result};
 
-pub const RUN_REPORT_SCHEMA_VERSION: u16 = 2;
+pub const RUN_REPORT_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,14 +127,29 @@ pub struct CodecCaseReport {
     pub size_class: SizeClass,
     pub declared_extent: Option<DeclaredExtent>,
     pub input_bytes: u64,
+    /// Operation result bytes: encoded container bytes for encode, logical image bytes otherwise.
     pub output_bytes: u64,
+    /// Sum of addressable bytes in decoded GPU image layouts.
+    pub gpu_output_logical_bytes: u64,
     pub frame_count: u32,
+    /// Codec queue submissions during measured operations; warmup is excluded.
     pub codec_submissions: u64,
+    /// Blocking codec completion paths during measured operations.
+    pub codec_completion_waits: u64,
     pub display_submissions: u64,
+    pub display_completion_waits: u64,
     pub readback_submissions: u64,
+    pub readback_completion_waits: u64,
+    pub readback_logical_bytes: u64,
+    pub readback_staging_bytes: u64,
+    pub readback_mode: Option<CpuReadbackMode>,
+    /// `false` until several images or frames are encoded into one GPU submission.
+    pub coalesced_gpu_batching: bool,
     pub output_hash: Option<String>,
     pub timing: Option<CodecTiming>,
     pub issue: Option<CodecIssue>,
+    /// Opt-in external CPU comparator. This is never a production codec path.
+    pub cpu_baseline: Option<CpuBaselineReport>,
 }
 
 impl CodecCaseReport {
@@ -163,15 +179,123 @@ impl CodecCaseReport {
             declared_extent,
             input_bytes,
             output_bytes: 0,
+            gpu_output_logical_bytes: 0,
             frame_count: 0,
             codec_submissions: 0,
+            codec_completion_waits: 0,
             display_submissions: 0,
+            display_completion_waits: 0,
             readback_submissions: 0,
+            readback_completion_waits: 0,
+            readback_logical_bytes: 0,
+            readback_staging_bytes: 0,
+            readback_mode: None,
+            coalesced_gpu_batching: false,
             output_hash: None,
             timing: None,
             issue: None,
+            cpu_baseline: None,
         }
     }
+}
+
+/// Outcome of an opt-in, development-only external CPU codec comparator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuBaselineStatus {
+    Completed,
+    VerificationFailed,
+    Skipped,
+    Unsupported,
+    TimedOut,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuBaselineIssueKind {
+    UnsupportedContract,
+    ExecutableUnavailable,
+    Timeout,
+    ProcessExit,
+    InvalidOutput,
+    Io,
+    NondeterministicOutput,
+    VerificationMismatch,
+    WorkerPanic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBaselineIssue {
+    pub kind: CpuBaselineIssueKind,
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuBaselineProcessModel {
+    ExternalProcessPerOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBaselineProvenance {
+    pub implementation: String,
+    pub executable: String,
+    pub version: Option<String>,
+    pub version_query_error: Option<String>,
+    pub process_model: CpuBaselineProcessModel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBaselineConfiguration {
+    pub warmup: u32,
+    pub iterations: u32,
+    pub timeout_ms_per_process: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBaselineColdTiming {
+    pub elapsed_ns: u64,
+    pub includes_process_spawn: bool,
+    pub includes_output_file_io_and_hash: bool,
+    pub input_bytes: u64,
+    pub decoded_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub output_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuBaselineWarmRepetition {
+    pub samples: u32,
+    pub minimum_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub mean_ns: f64,
+    pub wall_ns: u64,
+    pub operations_per_second: f64,
+    pub parallelism: u32,
+    pub workload_execution_model: WorkloadExecutionModel,
+    pub process_model: CpuBaselineProcessModel,
+    pub total_input_bytes: u64,
+    pub total_decoded_bytes: u64,
+    pub decoded_bytes_per_operation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub output_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CpuBaselineReport {
+    pub status: CpuBaselineStatus,
+    pub provenance: CpuBaselineProvenance,
+    pub configuration: CpuBaselineConfiguration,
+    pub cold: Option<CpuBaselineColdTiming>,
+    pub warm_repetition: Option<CpuBaselineWarmRepetition>,
+    /// Exact U8 pixel equality with the GPU decode + CPU-readback result.
+    pub verified: Option<bool>,
+    pub issue: Option<CpuBaselineIssue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -184,6 +308,7 @@ pub struct CodecTiming {
 pub struct WorkloadTiming {
     pub operations: u64,
     pub parallelism: u32,
+    pub execution_model: WorkloadExecutionModel,
     pub wall_ns: u64,
     pub operations_per_second: f64,
 }
@@ -317,5 +442,34 @@ mod tests {
             schema["properties"]["schema_version"]["const"],
             RUN_REPORT_SCHEMA_VERSION
         );
+        assert!(schema["$defs"]["cpu_baseline"].is_object());
+        assert!(
+            schema["$defs"]["codec_case"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "cpu_baseline")
+        );
+    }
+
+    #[test]
+    fn codec_report_serializes_path_and_scheduling_telemetry() {
+        let case = CodecCaseReport::new(
+            "case".into(),
+            Path::new("case.jxl"),
+            CodecOperation::Decode,
+            WorkloadSpec::default(),
+            OutputTarget::CpuReadback,
+            GpuPixelFormat::U8,
+            SizeClass::Small,
+            None,
+            10,
+        );
+        let value = serde_json::to_value(case).unwrap();
+        assert!(value["readback_mode"].is_null());
+        assert_eq!(value["coalesced_gpu_batching"], false);
+        assert_eq!(value["codec_completion_waits"], 0);
+        assert_eq!(value["readback_staging_bytes"], 0);
+        assert!(value["cpu_baseline"].is_null());
     }
 }

@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -46,21 +49,45 @@ impl<S> PreparedGpuSession<S> {
     }
 }
 
-/// Per-codestream GPU submission state.
+/// One already-submitted GPU frame whose host-visible validation has not necessarily completed.
 ///
-/// `next_frame` may synchronously wait for GPU completion. `poll_next_frame` must not block: it
-/// registers `context.waker()` before returning `Pending` and wakes it after GPU callback or input
-/// progress makes another poll useful.
+/// Submission and completion are deliberately separate: codec sessions can enqueue several
+/// animation frames before waiting for the oldest one. Completion must not reorder the public
+/// frame stream; [`GpuDecodeSession`] always consumes pending values from its queue front.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait GpuPendingFrame: Send + Unpin + 'static {
+    type Frame: Send + 'static;
+
+    /// Blocks until this exact submission completes and returns its validated GPU frame.
+    fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>>;
+
+    /// Polls this exact submission without blocking an executor thread.
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>>;
+}
+
+/// Browser WebGPU pending handles are main-thread-local and complete through the event loop.
+#[cfg(target_arch = "wasm32")]
+pub trait GpuPendingFrame: Unpin + 'static {
+    type Frame: 'static;
+
+    fn poll_complete(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>>;
+}
+
+/// Per-codestream GPU submission state. `submit_next` records queue work only and never waits for
+/// host-visible completion.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait GpuSubmissionSession: Send + 'static {
     type Frame: Send + 'static;
+    type Pending: GpuPendingFrame<Frame = Self::Frame>;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>>;
-
-    fn poll_next_frame(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>>;
+    /// Enqueues the next visible frame. `None` means the submission stream reached its end.
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>>;
 }
 
 /// Browser WebGPU session handles are main-thread-local. The async contract is
@@ -68,13 +95,33 @@ pub trait GpuSubmissionSession: Send + 'static {
 #[cfg(target_arch = "wasm32")]
 pub trait GpuSubmissionSession: 'static {
     type Frame: 'static;
+    type Pending: GpuPendingFrame<Frame = Self::Frame>;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>>;
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>>;
+}
 
-    fn poll_next_frame(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>>;
+/// Exact reason a prefetch attempt stopped below its requested queue depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefetchBackpressure {
+    /// Pending frames plus caller-owned frame leases exhausted the configured frame slots.
+    FrameSlots { limit: usize },
+    /// The shared byte-weighted GPU memory budget rejected the next submission.
+    Memory(jxl_wgpu::MemoryBudgetError),
+    /// The backend's bounded native submission-poll worker rejected the next submission.
+    SubmissionPoller(jxl_wgpu::SubmissionPollerError),
+}
+
+/// Observable result of filling the ordered pending-frame queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefetchProgress {
+    /// Total frames successfully submitted by this decode session since it opened.
+    pub submitted: usize,
+    /// Frames currently queued in submission order and not yet returned to the caller.
+    pub queued: usize,
+    /// Whether the submission engine has explicitly returned end-of-stream.
+    pub end_reached: bool,
+    /// Why the requested depth could not be reached. `None` means target depth or stream end.
+    pub backpressure: Option<PrefetchBackpressure>,
 }
 
 /// Opens validated codestreams as GPU-only frame submission sessions.
@@ -85,6 +132,11 @@ pub trait GpuSubmissionSession: 'static {
 #[cfg(not(target_arch = "wasm32"))]
 pub trait GpuSubmissionEngine: Send + Sync + 'static {
     type Session: GpuSubmissionSession;
+
+    /// Hard parser limits for this engine's implemented GPU profiles.
+    fn parse_limits(&self) -> ParseLimits {
+        ParseLimits::default()
+    }
 
     fn open(
         &self,
@@ -98,6 +150,11 @@ pub trait GpuSubmissionEngine: Send + Sync + 'static {
 #[cfg(target_arch = "wasm32")]
 pub trait GpuSubmissionEngine: 'static {
     type Session: GpuSubmissionSession;
+
+    /// Hard parser limits for this engine's implemented GPU profiles.
+    fn parse_limits(&self) -> ParseLimits {
+        ParseLimits::default()
+    }
 
     fn open(
         &self,
@@ -115,23 +172,26 @@ pub struct GpuDecoder<E: GpuSubmissionEngine> {
 impl<E: GpuSubmissionEngine> GpuDecoder<E> {
     #[must_use]
     pub fn new(engine: E) -> Self {
+        let parse_limits = engine.parse_limits();
         Self {
             engine: Arc::new(engine),
-            parse_limits: ParseLimits::default(),
+            parse_limits,
         }
     }
 
     #[must_use]
     pub fn from_shared(engine: Arc<E>) -> Self {
+        let parse_limits = engine.parse_limits();
         Self {
             engine,
-            parse_limits: ParseLimits::default(),
+            parse_limits,
         }
     }
 
     #[must_use]
-    pub const fn with_parse_limits(mut self, parse_limits: ParseLimits) -> Self {
-        self.parse_limits = parse_limits;
+    pub fn with_parse_limits(mut self, parse_limits: ParseLimits) -> Self {
+        let engine_limits = self.engine.parse_limits();
+        self.parse_limits = intersect_parse_limits(parse_limits, engine_limits);
         self
     }
 
@@ -151,6 +211,7 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
         encoded: &[u8],
         request: GpuOutputRequest,
     ) -> Result<GpuDecodeSession<E::Session>> {
+        validate_total_input_size(encoded.len(), self.parse_limits)?;
         self.open_shared(Arc::from(encoded), request)
     }
 
@@ -160,11 +221,45 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
         encoded: Arc<[u8]>,
         request: GpuOutputRequest,
     ) -> Result<GpuDecodeSession<E::Session>> {
-        request.format.validate()?;
+        request.format().validate()?;
         let codestream = parse_shared(encoded, self.parse_limits)?;
         let prepared = self.engine.open(codestream, &request)?;
         GpuDecodeSession::new(prepared, request)
     }
+}
+
+const fn intersect_parse_limits(requested: ParseLimits, engine: ParseLimits) -> ParseLimits {
+    ParseLimits {
+        max_input_bytes: if requested.max_input_bytes < engine.max_input_bytes {
+            requested.max_input_bytes
+        } else {
+            engine.max_input_bytes
+        },
+        max_boxes: if requested.max_boxes < engine.max_boxes {
+            requested.max_boxes
+        } else {
+            engine.max_boxes
+        },
+        max_box_bytes: if requested.max_box_bytes < engine.max_box_bytes {
+            requested.max_box_bytes
+        } else {
+            engine.max_box_bytes
+        },
+        max_codestream_bytes: if requested.max_codestream_bytes < engine.max_codestream_bytes {
+            requested.max_codestream_bytes
+        } else {
+            engine.max_codestream_bytes
+        },
+    }
+}
+
+fn validate_total_input_size(length: usize, limits: ParseLimits) -> Result<()> {
+    if u64::try_from(length).map_err(|_| jxl_gpu_bitstream::Error::SizeOverflow)?
+        > limits.max_input_bytes
+    {
+        return Err(jxl_gpu_bitstream::Error::ResourceLimit("input size").into());
+    }
+    Ok(())
 }
 
 impl<E: GpuSubmissionEngine> Clone for GpuDecoder<E> {
@@ -189,27 +284,59 @@ impl<E: GpuSubmissionEngine + fmt::Debug> fmt::Debug for GpuDecoder<E> {
 fn parse_shared(encoded: Arc<[u8]>, limits: ParseLimits) -> Result<GpuCodestream> {
     if encoded.starts_with(&CODESTREAM_SIGNATURE) {
         jxl_gpu_bitstream::parse(&encoded, limits)?;
-        return Ok(GpuCodestream::new(encoded, false, None));
+        let length = encoded.len();
+        return Ok(GpuCodestream::new(encoded, 0..length, false, None));
     }
     let parsed = jxl_gpu_bitstream::parse(&encoded, limits)?;
     let is_container = parsed.is_container();
-    let mut index_boxes = parsed.boxes_of_type(ACCELERATION_INDEX_BOX_TYPE);
-    let acceleration_index = index_boxes
-        .next()
-        .map(|item| Gray8AccelerationIndex::parse_bound(item.payload, parsed.codestream()))
-        .transpose()?;
-    if index_boxes.next().is_some() {
-        return Err(Error::DuplicateAccelerationIndex);
-    }
-    let codestream = Arc::from(parsed.codestream());
+    let acceleration_index = {
+        let mut index_boxes = parsed.boxes_of_type(ACCELERATION_INDEX_BOX_TYPE);
+        let acceleration_index = index_boxes
+            .next()
+            .map(|item| Gray8AccelerationIndex::parse_bound(item.payload, parsed.codestream()))
+            .transpose()?;
+        if index_boxes.next().is_some() {
+            return Err(Error::DuplicateAccelerationIndex);
+        }
+        acceleration_index
+    };
+    let (storage, byte_range) = match parsed.into_codestream() {
+        Cow::Borrowed(codestream) => {
+            let storage_start = encoded.as_ptr() as usize;
+            let codestream_start = codestream.as_ptr() as usize;
+            let start =
+                codestream_start
+                    .checked_sub(storage_start)
+                    .ok_or(Error::EngineContract(
+                        "borrowed codestream is outside its input storage",
+                    ))?;
+            let end = start
+                .checked_add(codestream.len())
+                .filter(|&end| end <= encoded.len())
+                .ok_or(Error::EngineContract(
+                    "borrowed codestream range exceeds its input storage",
+                ))?;
+            (Arc::clone(&encoded), start..end)
+        }
+        Cow::Owned(codestream) => {
+            let length = codestream.len();
+            (Arc::from(codestream), 0..length)
+        }
+    };
     Ok(GpuCodestream::new(
-        codestream,
+        storage,
+        byte_range,
         is_container,
         acceleration_index,
     ))
 }
 
 /// Bounded ownership wrapper for one GPU-resident output.
+///
+/// This wrapper alone owns the session's frame-slot permit. Borrowing `output` and cloning a nested
+/// GPU handle does not retain that count slot. The stock wgpu frame/output containers are
+/// intentionally non-cloneable; custom submission engines must apply the same distinction to
+/// their own output types.
 pub struct GpuFrameLease<F> {
     pub metadata: FrameMetadata,
     output: F,
@@ -233,15 +360,18 @@ impl<F: fmt::Debug> fmt::Debug for GpuFrameLease<F> {
     }
 }
 
-/// Sequential GPU-only decode session with bounded returned frame ownership.
+/// Ordered GPU-only decode session with bounded pending and returned frame ownership.
 pub struct GpuDecodeSession<S: GpuSubmissionSession> {
     engine: S,
     request: GpuOutputRequest,
     profile: DecodeProfile,
     metadata: AnimationMetadata,
     limiter: InFlightLimiter,
-    pending_permit: Option<InFlightPermit>,
+    pending: VecDeque<(InFlightPermit, S::Pending)>,
+    submitted_count: usize,
     next_index: usize,
+    next_presentation_ticks: u64,
+    engine_end_reached: bool,
     finished: bool,
     failed: bool,
 }
@@ -254,10 +384,13 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
             engine: prepared.session,
             profile: prepared.profile,
             metadata: prepared.metadata,
-            limiter: InFlightLimiter::new(request.max_in_flight),
+            limiter: InFlightLimiter::new(request.max_frame_slots()),
             request,
-            pending_permit: None,
+            pending: VecDeque::new(),
+            submitted_count: 0,
             next_index: 0,
+            next_presentation_ticks: 0,
+            engine_end_reached: false,
             finished: false,
             failed: false,
         })
@@ -286,12 +419,36 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
 
     #[must_use]
     pub const fn frames_submitted(&self) -> usize {
-        self.next_index
+        self.submitted_count
     }
 
     #[must_use]
-    pub fn in_flight(&self) -> usize {
-        self.limiter.in_flight()
+    pub fn queued_frames(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Borrows the submitted pending frames in public presentation order.
+    ///
+    /// This read-only view does not complete, remove, or reorder submissions and does not expose
+    /// the session's frame-slot permits. Backend-specific pending types may use the borrow for
+    /// explicitly unvalidated same-queue handoff. Authoritative frame metadata remains available
+    /// only from [`Self::next_frame`] or [`Self::next_frame_async`].
+    pub fn pending_frames(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &S::Pending> + ExactSizeIterator {
+        self.pending.iter().map(|(_, pending)| pending)
+    }
+
+    /// Borrows the oldest submitted pending frame without completing it.
+    #[must_use]
+    pub fn front_pending_frame(&self) -> Option<&S::Pending> {
+        self.pending.front().map(|(_, pending)| pending)
+    }
+
+    /// Number of slots currently occupied by queued submissions and caller-held frame leases.
+    #[must_use]
+    pub fn active_frame_slots(&self) -> usize {
+        self.limiter.active_slots()
     }
 
     #[must_use]
@@ -299,7 +456,78 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         self.finished
     }
 
-    /// Synchronously submits/waits for the next GPU frame according to the engine contract.
+    /// Submits frames without waiting until the ordered pending queue reaches `target_depth`, the
+    /// engine reports end-of-stream, or a typed admission boundary is encountered.
+    ///
+    /// The target is a queue depth, not an additional count, and cannot exceed the request's
+    /// `max_frame_slots` bound. Already returned frame leases retain their slots and can therefore
+    /// make a synchronous attempt report [`PrefetchBackpressure::FrameSlots`].
+    pub fn prefetch(&mut self, target_depth: NonZeroUsize) -> Result<PrefetchProgress> {
+        self.validate_prefetch(target_depth)?;
+        if self.failed {
+            return Err(Error::SessionPoisoned);
+        }
+        if self.finished {
+            self.engine_end_reached = true;
+            return Ok(self.prefetch_progress(None));
+        }
+        while self.pending.len() < target_depth.get() && !self.engine_end_reached {
+            let Some(permit) = self.limiter.try_acquire() else {
+                return Ok(
+                    self.prefetch_progress(Some(PrefetchBackpressure::FrameSlots {
+                        limit: self.limiter.limit(),
+                    })),
+                );
+            };
+            if let Some(progress) = self.submit_one(permit)? {
+                return Ok(progress);
+            }
+        }
+        Ok(self.prefetch_progress(None))
+    }
+
+    /// Nonblocking prefetch counterpart. `Pending` is returned only while waiting for a retained
+    /// frame lease to release a slot; memory and poll-worker admission failures are returned as a
+    /// ready [`PrefetchProgress`] because those external budgets do not own task wakers.
+    pub fn poll_prefetch(
+        &mut self,
+        target_depth: NonZeroUsize,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<PrefetchProgress>> {
+        if let Err(error) = self.validate_prefetch(target_depth) {
+            return Poll::Ready(Err(error));
+        }
+        if self.failed {
+            return Poll::Ready(Err(Error::SessionPoisoned));
+        }
+        if self.finished {
+            self.engine_end_reached = true;
+            return Poll::Ready(Ok(self.prefetch_progress(None)));
+        }
+        while self.pending.len() < target_depth.get() && !self.engine_end_reached {
+            let permit = match self.limiter.poll_acquire(context) {
+                Poll::Ready(permit) => permit,
+                Poll::Pending => return Poll::Pending,
+            };
+            match self.submit_one(permit) {
+                Ok(Some(progress)) => return Poll::Ready(Ok(progress)),
+                Ok(None) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        Poll::Ready(Ok(self.prefetch_progress(None)))
+    }
+
+    #[must_use = "futures do nothing unless polled"]
+    pub const fn prefetch_async(&mut self, target_depth: NonZeroUsize) -> PrefetchGpuFrames<'_, S> {
+        PrefetchGpuFrames {
+            session: self,
+            target_depth,
+        }
+    }
+
+    /// Waits for and returns the oldest submitted GPU frame. If the queue is empty, exactly one
+    /// frame is submitted first.
     pub fn next_frame(&mut self) -> Result<Option<GpuFrameLease<S::Frame>>> {
         if self.failed {
             return Err(Error::SessionPoisoned);
@@ -307,20 +535,25 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         if self.finished {
             return Ok(None);
         }
-        if self.pending_permit.is_some() {
-            return Err(Error::OperationInProgress);
-        }
-        let permit = self.limiter.try_acquire().ok_or(Error::Backpressure {
-            limit: self.limiter.limit(),
-        })?;
-        let submitted = match self.engine.next_frame() {
-            Ok(submitted) => submitted,
-            Err(error) => {
-                self.failed = true;
-                return Err(error);
+        self.ensure_front_sync()?;
+        let (permit, pending) = self.pending.pop_front().ok_or(Error::EngineContract(
+            "prefetch reported a frame without queueing a pending submission",
+        ))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match pending.wait() {
+                Ok(submitted) => self.finish_frame(permit, submitted).map(Some),
+                Err(error) => {
+                    self.failed = true;
+                    Err(error)
+                }
             }
-        };
-        self.finish_frame(permit, submitted)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            drop((permit, pending));
+            Err(Error::BlockingWaitUnavailable)
+        }
     }
 
     /// Polls GPU submission/completion without blocking an executor thread.
@@ -334,22 +567,43 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         if self.finished {
             return Poll::Ready(Ok(None));
         }
-        let permit = match self.pending_permit.take() {
-            Some(permit) => permit,
-            None => match self.limiter.poll_acquire(context) {
-                Poll::Ready(permit) => permit,
+        if self.pending.is_empty() {
+            let target = NonZeroUsize::new(1).expect("one is nonzero");
+            match self.poll_prefetch(target, context) {
                 Poll::Pending => return Poll::Pending,
-            },
-        };
-        match self.engine.poll_next_frame(context) {
-            Poll::Pending => {
-                self.pending_permit = Some(permit);
-                Poll::Pending
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(progress)) => {
+                    if let Some(backpressure) = progress.backpressure {
+                        return Poll::Ready(Err(prefetch_backpressure_error(backpressure)));
+                    }
+                }
             }
-            Poll::Ready(Ok(submitted)) => Poll::Ready(self.finish_frame(permit, submitted)),
-            Poll::Ready(Err(error)) => {
-                self.failed = true;
-                Poll::Ready(Err(error))
+        }
+        if self.pending.is_empty() {
+            self.failed = true;
+            return Poll::Ready(Err(Error::MissingFinalFrame));
+        }
+        let completion = {
+            let (_, pending) = self
+                .pending
+                .front_mut()
+                .expect("the pending queue was checked as non-empty");
+            Pin::new(pending).poll_complete(context)
+        };
+        match completion {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                let (permit, _) = self
+                    .pending
+                    .pop_front()
+                    .expect("the completed pending frame remains at the queue front");
+                match result {
+                    Ok(submitted) => Poll::Ready(self.finish_frame(permit, submitted).map(Some)),
+                    Err(error) => {
+                        self.failed = true;
+                        Poll::Ready(Err(error))
+                    }
+                }
             }
         }
     }
@@ -358,15 +612,81 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         NextGpuFrame { session: self }
     }
 
+    fn validate_prefetch(&self, target_depth: NonZeroUsize) -> Result<()> {
+        if target_depth.get() > self.limiter.limit() {
+            return Err(Error::PrefetchDepthExceedsLimit {
+                requested: target_depth.get(),
+                limit: self.limiter.limit(),
+            });
+        }
+        Ok(())
+    }
+
+    fn submit_one(&mut self, permit: InFlightPermit) -> Result<Option<PrefetchProgress>> {
+        let next_submitted_count = self.submitted_count.checked_add(1).ok_or_else(|| {
+            self.failed = true;
+            Error::EngineContract("submitted frame count overflow")
+        })?;
+        match self.engine.submit_next() {
+            Ok(Some(pending)) => {
+                self.submitted_count = next_submitted_count;
+                self.pending.push_back((permit, pending));
+                Ok(None)
+            }
+            Ok(None) => {
+                self.engine_end_reached = true;
+                drop(permit);
+                Ok(Some(self.prefetch_progress(None)))
+            }
+            Err(Error::MemoryBackpressure(error)) => {
+                drop(permit);
+                Ok(Some(self.prefetch_progress(Some(
+                    PrefetchBackpressure::Memory(error),
+                ))))
+            }
+            Err(Error::PollBackpressure(error @ jxl_wgpu::SubmissionPollerError::Full { .. })) => {
+                drop(permit);
+                Ok(Some(self.prefetch_progress(Some(
+                    PrefetchBackpressure::SubmissionPoller(error),
+                ))))
+            }
+            Err(error) => {
+                drop(permit);
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn prefetch_progress(&self, backpressure: Option<PrefetchBackpressure>) -> PrefetchProgress {
+        PrefetchProgress {
+            submitted: self.submitted_count,
+            queued: self.pending.len(),
+            end_reached: self.engine_end_reached || self.finished,
+            backpressure,
+        }
+    }
+
+    fn ensure_front_sync(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            return Ok(());
+        }
+        let progress = self.prefetch(NonZeroUsize::new(1).expect("one is nonzero"))?;
+        if let Some(backpressure) = progress.backpressure {
+            return Err(prefetch_backpressure_error(backpressure));
+        }
+        if self.pending.is_empty() {
+            self.failed = true;
+            return Err(Error::MissingFinalFrame);
+        }
+        Ok(())
+    }
+
     fn finish_frame(
         &mut self,
         permit: InFlightPermit,
-        submitted: Option<SubmittedGpuFrame<S::Frame>>,
-    ) -> Result<Option<GpuFrameLease<S::Frame>>> {
-        let Some(submitted) = submitted else {
-            self.failed = true;
-            return Err(Error::MissingFinalFrame);
-        };
+        submitted: SubmittedGpuFrame<S::Frame>,
+    ) -> Result<GpuFrameLease<S::Frame>> {
         if submitted.metadata.index != self.next_index {
             self.failed = true;
             return Err(Error::UnexpectedFrameIndex {
@@ -386,6 +706,24 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
                 index: submitted.metadata.index,
             });
         }
+        if submitted.metadata.presentation_ticks != self.next_presentation_ticks {
+            self.failed = true;
+            return Err(Error::FramePresentationTicksMismatch {
+                index: submitted.metadata.index,
+                expected: self.next_presentation_ticks,
+                actual: submitted.metadata.presentation_ticks,
+            });
+        }
+        let stream_has_timecodes = self.metadata.has_timecodes.unwrap_or(false);
+        let frame_has_timecode = submitted.metadata.timecode.is_some();
+        if frame_has_timecode != stream_has_timecodes {
+            self.failed = true;
+            return Err(Error::FrameTimecodePresenceMismatch {
+                index: submitted.metadata.index,
+                stream_has_timecodes,
+                frame_has_timecode,
+            });
+        }
         if self.metadata.timebase.is_none()
             && (submitted.metadata.index != 0 || !submitted.metadata.is_last)
         {
@@ -398,6 +736,15 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
             self.failed = true;
             return Err(Error::EngineContract("visible frame index overflow"));
         };
+        let next_presentation_ticks = self
+            .next_presentation_ticks
+            .checked_add(u64::from(submitted.metadata.duration.ticks))
+            .ok_or_else(|| {
+                self.failed = true;
+                Error::FramePresentationTicksOverflow {
+                    index: submitted.metadata.index,
+                }
+            })?;
         if let Some(hint) = self.metadata.frame_count_hint
             && (next_index > hint || (submitted.metadata.is_last && next_index != hint))
         {
@@ -407,13 +754,46 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
                 actual: next_index,
             });
         }
+        if submitted.metadata.is_last && !self.pending.is_empty() {
+            self.failed = true;
+            return Err(Error::EngineContract(
+                "submission engine queued visible frames after the final frame",
+            ));
+        }
         self.next_index = next_index;
+        self.next_presentation_ticks = next_presentation_ticks;
         self.finished = submitted.metadata.is_last;
-        Ok(Some(GpuFrameLease {
+        if self.finished {
+            self.engine_end_reached = true;
+        }
+        Ok(GpuFrameLease {
             metadata: submitted.metadata,
             output: submitted.output,
             _permit: permit,
-        }))
+        })
+    }
+}
+
+fn prefetch_backpressure_error(backpressure: PrefetchBackpressure) -> Error {
+    match backpressure {
+        PrefetchBackpressure::FrameSlots { limit } => Error::Backpressure { limit },
+        PrefetchBackpressure::Memory(error) => Error::MemoryBackpressure(error),
+        PrefetchBackpressure::SubmissionPoller(error) => Error::PollBackpressure(error),
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+pub struct PrefetchGpuFrames<'session, S: GpuSubmissionSession> {
+    session: &'session mut GpuDecodeSession<S>,
+    target_depth: NonZeroUsize,
+}
+
+impl<S: GpuSubmissionSession> Future for PrefetchGpuFrames<'_, S> {
+    type Output = Result<PrefetchProgress>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let future = self.get_mut();
+        future.session.poll_prefetch(future.target_depth, context)
     }
 }
 
@@ -460,7 +840,77 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
             ..
         } => Ok(()),
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
-            "prototype Modular profile must use 8 or 16 bits per sample",
+            "fixed-predictor Modular profile must use 8 or 16 bits per sample",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(input: &str) -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid checked-in fixture hex digit"),
+            }
+        }
+
+        let digits = input
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
+        digits
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    #[test]
+    fn raw_and_single_codestream_container_share_the_caller_allocation() {
+        for encoded in [
+            fixture(include_str!("../test-data/basic.jxl.hex")),
+            fixture(include_str!("../test-data/gpu_gray8_lossless.jxl.hex")),
+        ] {
+            let storage: Arc<[u8]> = Arc::from(encoded);
+            let parsed = parse_shared(Arc::clone(&storage), ParseLimits::default()).unwrap();
+            assert!(Arc::ptr_eq(&storage, &parsed.shared_storage()));
+            assert!(parsed.bytes().starts_with(&CODESTREAM_SIGNATURE));
+            assert_eq!(
+                &parsed.shared_storage()[parsed.storage_range()],
+                parsed.bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn requested_parser_limits_can_only_tighten_engine_limits() {
+        let engine = ParseLimits {
+            max_input_bytes: 16,
+            max_boxes: 8,
+            max_box_bytes: 12,
+            max_codestream_bytes: 14,
+        };
+        let requested = ParseLimits {
+            max_input_bytes: 32,
+            max_boxes: 4,
+            max_box_bytes: 24,
+            max_codestream_bytes: 7,
+        };
+        assert_eq!(
+            intersect_parse_limits(requested, engine),
+            ParseLimits {
+                max_input_bytes: 16,
+                max_boxes: 4,
+                max_box_bytes: 12,
+                max_codestream_bytes: 7,
+            }
+        );
+        assert!(validate_total_input_size(17, engine).is_err());
+        assert!(validate_total_input_size(16, engine).is_ok());
     }
 }

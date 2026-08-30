@@ -10,9 +10,9 @@ use std::sync::{Arc, mpsc};
 use jxl_gpu_protocol::{Extent2d, OutputId, OutputLayout, SampleType};
 use jxl_wgpu::{
     ChromaLocation2d, ChromaOrder, ChromaSubsampling, ColorRange, ColorSpace, ColorSpec,
-    ColorSpecification, DirectReadbackPolicy, DisplayPipeline, DisplayTexture,
-    DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer, Packed422Order, PixelFormat,
-    RgbChannelOrder, TransferFunction, WgpuBackend, WgpuBackendConfig, YcbcrEncoding,
+    ColorSpecification, DirectReadbackPolicy, DisplayColorEncoding, DisplayPipeline,
+    DisplayTexture, DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer, Packed422Order,
+    PixelFormat, RgbChannelOrder, TransferFunction, WgpuBackend, WgpuBackendConfig, YcbcrEncoding,
 };
 use wgpu::util::DeviceExt;
 
@@ -102,6 +102,15 @@ fn read_texture(backend: &WgpuBackend, texture: &DisplayTexture) -> Vec<u8> {
     packed
 }
 
+fn bt709_linear_code(encoded: f32) -> u8 {
+    let linear = if encoded < 0.081 {
+        encoded / 4.5
+    } else {
+        ((encoded + 0.099) / 1.099).powf(1.0 / 0.45)
+    };
+    (linear * 255.0).round() as u8
+}
+
 #[test]
 fn rgb_and_nv12_become_queue_ordered_display_textures() {
     let Some(backend) = test_backend() else {
@@ -125,11 +134,15 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: rgb_buffer.size(),
-        buffer: rgb_buffer,
+        buffer: jxl_wgpu::GpuBufferLease::new(rgb_buffer),
     };
     let submitted = display
         .submit_rgb(&rgb_output, DisplayTextureDescriptor::default())
         .expect("submit RGB display conversion");
+    assert_eq!(
+        submitted.texture.color_encoding,
+        DisplayColorEncoding::LinearBt709
+    );
     drop(rgb_output);
     let rgba = read_texture(&backend, &submitted.texture);
     assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
@@ -164,17 +177,27 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
     let yuv_output = GpuImageOutput {
         id: OutputId(1),
         layout,
-        buffer: yuv_buffer,
+        buffer: jxl_wgpu::GpuBufferLease::new(yuv_buffer),
     };
     let submitted = display
         .submit_image(&yuv_output, DisplayTextureDescriptor::default())
         .expect("submit NV12 display conversion");
     drop(yuv_output);
     let rgba = read_texture(&backend, &submitted.texture);
+    let expected_gray = bt709_linear_code(0.5);
     for pixel in rgba.chunks_exact(4) {
-        assert!(pixel[0].abs_diff(128) <= 2, "red channel: {pixel:?}");
-        assert!(pixel[1].abs_diff(128) <= 2, "green channel: {pixel:?}");
-        assert!(pixel[2].abs_diff(128) <= 2, "blue channel: {pixel:?}");
+        assert!(
+            pixel[0].abs_diff(expected_gray) <= 2,
+            "red channel: {pixel:?}"
+        );
+        assert!(
+            pixel[1].abs_diff(expected_gray) <= 2,
+            "green channel: {pixel:?}"
+        );
+        assert!(
+            pixel[2].abs_diff(expected_gray) <= 2,
+            "blue channel: {pixel:?}"
+        );
         assert_eq!(pixel[3], 255);
     }
     assert_eq!(display.cache_stats().pipelines, 2);
@@ -206,7 +229,7 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: buffer.size(),
-        buffer,
+        buffer: jxl_wgpu::GpuBufferLease::new(buffer),
     };
     let submitted = display
         .submit_rgba8_copy(&output, DisplayTextureDescriptor::default())
@@ -233,7 +256,7 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: buffer.size(),
-        buffer,
+        buffer: jxl_wgpu::GpuBufferLease::new(buffer),
     };
     assert!(matches!(
         display.submit_rgba8_copy(&output, DisplayTextureDescriptor::default()),
@@ -284,18 +307,85 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
         let output = GpuImageOutput {
             id: OutputId(u32::try_from(index).unwrap()),
             layout: converted.layout,
-            buffer,
+            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
         };
         let submitted = display
             .submit_image(&output, DisplayTextureDescriptor::default())
             .expect("submit generic display conversion");
         let rgba = read_texture(&backend, &submitted.texture);
+        let expected_gray = bt709_linear_code(0.5);
         for pixel in rgba.chunks_exact(4) {
-            assert!(pixel[0].abs_diff(128) <= 2, "red {format:?}: {pixel:?}");
-            assert!(pixel[1].abs_diff(128) <= 2, "green {format:?}: {pixel:?}");
-            assert!(pixel[2].abs_diff(128) <= 2, "blue {format:?}: {pixel:?}");
+            assert!(
+                pixel[0].abs_diff(expected_gray) <= 4,
+                "red {format:?}: {pixel:?}"
+            );
+            assert!(
+                pixel[1].abs_diff(expected_gray) <= 4,
+                "green {format:?}: {pixel:?}"
+            );
+            assert!(
+                pixel[2].abs_diff(expected_gray) <= 4,
+                "blue {format:?}: {pixel:?}"
+            );
             assert_eq!(pixel[3], 255);
         }
     }
     assert_eq!(display.cache_stats().pipelines, format_count);
+}
+
+#[test]
+fn odd_width_packed_422_preserves_color_and_tail_luma_order() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let display = DisplayPipeline::new(&backend);
+    let extent = Extent2d::new(3, 1);
+    let encoded_rgb = [0.72f32, 0.31, 0.12];
+    let red = vec![encoded_rgb[0]; extent.area().unwrap()];
+    let green = vec![encoded_rgb[1]; extent.area().unwrap()];
+    let blue = vec![encoded_rgb[2]; extent.area().unwrap()];
+    let color = ColorSpecification::Defined(ColorSpec {
+        space: ColorSpace::Bt709,
+        encoding: YcbcrEncoding::Bt709,
+        transfer: TransferFunction::Bt709,
+        range: ColorRange::Full,
+        chroma_location: ChromaLocation2d::CENTER,
+    });
+
+    for (index, order) in [Packed422Order::Yuyv, Packed422Order::Uyvy]
+        .into_iter()
+        .enumerate()
+    {
+        let format = PixelFormat::packed_yuv4228(order, color);
+        let converted = jxl_gpu_formats::convert_rgb_f32([&red, &green, &blue], extent, &format)
+            .expect("convert packed 4:2:2 display input");
+        let mut bytes = converted.bytes;
+        bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+        let buffer = Arc::new(backend.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu packed 4:2:2 color input"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
+        ));
+        let output = GpuImageOutput {
+            id: OutputId(u32::try_from(index).unwrap()),
+            layout: converted.layout,
+            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+        };
+        let submitted = display
+            .submit_image(&output, DisplayTextureDescriptor::default())
+            .expect("submit packed 4:2:2 display conversion");
+        let rgba = read_texture(&backend, &submitted.texture);
+        let expected = encoded_rgb.map(bt709_linear_code);
+        for pixel in rgba.chunks_exact(4) {
+            for channel in 0..3 {
+                assert!(
+                    pixel[channel].abs_diff(expected[channel]) <= 7,
+                    "{order:?} channel {channel}: got {pixel:?}, expected {expected:?}"
+                );
+            }
+            assert_eq!(pixel[3], 255);
+        }
+    }
 }

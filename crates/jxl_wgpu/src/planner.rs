@@ -565,6 +565,68 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             }
             Ok(())
         }
+        RenderOp::PremultiplyAlpha { alpha_plane } => {
+            let alpha_count = node
+                .inputs
+                .iter()
+                .filter(|&&input| input == *alpha_plane)
+                .count();
+            let colors = node
+                .inputs
+                .iter()
+                .copied()
+                .filter(|input| input != alpha_plane)
+                .collect::<Vec<_>>();
+            if alpha_count != 1
+                || colors.is_empty()
+                || !matches!(node.outputs.len(), count if count == colors.len() || count == node.inputs.len())
+                || node.scale != jxl_gpu_protocol::Scale2d::IDENTITY
+                || node.border != jxl_gpu_protocol::Border2d::default()
+            {
+                return Err(Error::InvalidPayload(format!(
+                    "node {index} PremultiplyAlpha has an invalid dependency, arity, scale, or border contract"
+                )));
+            }
+            let descriptor = |id: PlaneId| {
+                plan.planes
+                    .iter()
+                    .find(|plane| plane.id == id)
+                    .ok_or(Error::MissingPlane(id))
+            };
+            let alpha = descriptor(*alpha_plane)?;
+            if alpha.sample_type != SampleType::F32 {
+                return Err(Error::InvalidPayload(format!(
+                    "node {index} PremultiplyAlpha requires an F32 alpha plane"
+                )));
+            }
+            let pairs = if node.outputs.len() == colors.len() {
+                colors
+                    .iter()
+                    .copied()
+                    .zip(node.outputs.iter().copied())
+                    .collect::<Vec<_>>()
+            } else {
+                node.inputs
+                    .iter()
+                    .copied()
+                    .zip(node.outputs.iter().copied())
+                    .collect::<Vec<_>>()
+            };
+            for (input_id, output_id) in pairs {
+                let input = descriptor(input_id)?;
+                let output = descriptor(output_id)?;
+                if input.sample_type != SampleType::F32
+                    || output.sample_type != SampleType::F32
+                    || input.extent != alpha.extent
+                    || output.extent != input.extent
+                {
+                    return Err(Error::InvalidPayload(format!(
+                        "node {index} PremultiplyAlpha requires equal-extent F32 color, alpha, and output planes"
+                    )));
+                }
+            }
+            Ok(())
+        }
         RenderOp::Save(save) => {
             let output = plan.outputs.iter().find(|output| output.id == save.output);
             if save.channels.is_empty()
@@ -1018,6 +1080,7 @@ mod tests {
             max_resident_bytes: 64 * 1024 * 1024,
             max_scratch_bytes: 16 * 1024 * 1024,
             max_transient_bytes: 16 * 1024 * 1024,
+            max_in_flight_transient_bytes: 16 * 1024 * 1024,
             max_cached_buffer_bytes: 16 * 1024 * 1024,
             prefer_streaming: false,
         }
@@ -1161,6 +1224,46 @@ mod tests {
         assert!(matches!(
             Planner::new(wgpu::Limits::default(), memory()).plan(&frame(MemoryMode::Auto), &plan),
             Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn premultiply_requires_explicit_equal_f32_alpha_dependency() {
+        let valid = RenderPlan {
+            planes: vec![
+                plane(0, PlaneRole::Source, SampleType::F32),
+                plane(1, PlaneRole::Source, SampleType::F32),
+                plane(2, PlaneRole::Output, SampleType::F32),
+            ],
+            nodes: vec![node(
+                "premultiply",
+                RenderOp::PremultiplyAlpha {
+                    alpha_plane: PlaneId(1),
+                },
+                &[0, 1],
+                &[2],
+                PrecisionContract::default(),
+            )],
+            outputs: Vec::new(),
+        };
+        Planner::new(wgpu::Limits::default(), memory())
+            .plan(&frame(MemoryMode::Resident), &valid)
+            .expect("explicit F32 alpha dependency is plannable");
+
+        let mut hidden = valid.clone();
+        hidden.nodes[0].inputs.pop();
+        assert!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Resident), &hidden)
+                .is_err()
+        );
+
+        let mut wrong_type = valid;
+        wrong_type.planes[1].sample_type = SampleType::I32;
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Resident), &wrong_type),
+            Err(Error::InvalidPayload(message)) if message.contains("F32 alpha")
         ));
     }
 
@@ -1390,6 +1493,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 1,
                 layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         };
         let execution = Planner::new(wgpu::Limits::default(), memory())

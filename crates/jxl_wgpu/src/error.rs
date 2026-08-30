@@ -23,14 +23,17 @@ pub enum Error {
     InvalidPayload(String),
     #[error("GPU buffer size overflow")]
     BufferSizeOverflow,
-    #[error("generic image readback requires at least one output")]
-    ImageReadbackEmpty,
-    #[error("generic image readback output {output} does not have COPY_SRC usage")]
-    ImageReadbackSourceUsage { output: usize },
+    #[error("generic image readback requires at least one frame")]
+    ImageReadbackNoFrames,
+    #[error("generic image readback frame {frame} requires at least one output")]
+    ImageReadbackFrameEmpty { frame: usize },
+    #[error("generic image readback frame {frame} output {output} does not have COPY_SRC usage")]
+    ImageReadbackSourceUsage { frame: usize, output: usize },
     #[error(
-        "generic image readback output {output} buffer is too small: requires {required} bytes, has {actual}"
+        "generic image readback frame {frame} output {output} buffer is too small: requires {required} bytes, has {actual}"
     )]
     ImageReadbackSourceSize {
+        frame: usize,
         output: usize,
         required: u64,
         actual: u64,
@@ -43,6 +46,10 @@ pub enum Error {
         "generic image readback staging requires {required} bytes, exceeding device buffer limit {limit}"
     )]
     ImageReadbackDeviceLimit { required: u64, limit: u64 },
+    #[error("GPU transient-memory admission failed: {0}")]
+    MemoryBackpressure(#[from] crate::MemoryBudgetError),
+    #[error("GPU submission-poll admission failed: {0}")]
+    PollAdmission(#[from] crate::SubmissionPollerError),
     #[error("display texture extent {width}x{height} exceeds the device 2D texture limit {limit}")]
     DisplayTextureExtent { width: u32, height: u32, limit: u32 },
     #[error(
@@ -90,23 +97,31 @@ impl From<Error> for BackendError {
             }
             Error::ResourceLimit(message) => Self::ResourceLimit(message),
             Error::BufferSizeOverflow => Self::ResourceLimit("GPU buffer size overflow".into()),
-            Error::ImageReadbackEmpty => {
-                Self::InvalidPayload("generic image readback frame has no outputs".into())
+            Error::ImageReadbackNoFrames => {
+                Self::InvalidPayload("generic image readback has no frames".into())
             }
-            Error::ImageReadbackSourceUsage { output } => Self::InvalidPayload(format!(
-                "generic image readback output {output} does not have COPY_SRC usage"
+            Error::ImageReadbackFrameEmpty { frame } => Self::InvalidPayload(format!(
+                "generic image readback frame {frame} has no outputs"
+            )),
+            Error::ImageReadbackSourceUsage { frame, output } => Self::InvalidPayload(format!(
+                "generic image readback frame {frame} output {output} does not have COPY_SRC usage"
             )),
             Error::ImageReadbackSourceSize {
+                frame,
                 output,
                 required,
                 actual,
             } => Self::InvalidPayload(format!(
-                "generic image readback output {output} requires {required} bytes, has {actual}"
+                "generic image readback frame {frame} output {output} requires {required} bytes, has {actual}"
             )),
             Error::ImageReadbackTransientLimit { required, limit }
             | Error::ImageReadbackDeviceLimit { required, limit } => Self::ResourceLimit(format!(
                 "generic image readback requires {required} bytes, limit is {limit}"
             )),
+            Error::MemoryBackpressure(error) => Self::ResourceLimit(error.to_string()),
+            Error::PollAdmission(error @ crate::SubmissionPollerError::Full { .. }) => {
+                Self::ResourceLimit(error.to_string())
+            }
             Error::ImageLayout(error) => Self::InvalidPayload(error.to_string()),
             other => Self::Execution(other.to_string()),
         }

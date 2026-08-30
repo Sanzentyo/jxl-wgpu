@@ -153,6 +153,7 @@ fn epf_plan(pass: EpfPass, mode: SigmaMode) -> Arc<RenderPlan> {
             sample_type: SampleType::F32,
             channels: 3,
             layout: OutputLayout::Planar,
+            color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
         }],
     })
 }

@@ -22,7 +22,7 @@ struct Params {
     plane3_stride: u32,
     chroma_width: u32,
     chroma_height: u32,
-    _padding0: u32,
+    transfer: u32,
 };
 
 @group(0) @binding(0) var<storage, read> source: array<u32>;
@@ -49,7 +49,9 @@ fn normalized_y(code: f32) -> f32 {
 }
 
 fn normalized_chroma(code: f32) -> f32 {
-    if params.range == 0u { return code / maximum_code() - 0.5; }
+    if params.range == 0u {
+        return (code - f32(1u << (params.bits - 1u))) / maximum_code();
+    }
     return (code / f32(1u << (params.bits - 8u)) - 128.0) / 224.0;
 }
 
@@ -76,6 +78,15 @@ fn rgb_sample(pixel: vec2<u32>, canonical: u32) -> f32 {
 }
 
 fn luma_code(pixel: vec2<u32>) -> f32 {
+    if params.kind == 6u {
+        let pair = pixel.x / 2u;
+        let within_pair = pixel.x & 1u;
+        var byte = within_pair * 2u;
+        if params.order == 1u {
+            byte += 1u;
+        }
+        return f32(read_byte(params.plane0_offset + pixel.y * params.plane0_stride + pair * 4u + byte));
+    }
     let bytes_per_sample = params.storage_bits / 8u;
     return read_code(params.plane0_offset + pixel.y * params.plane0_stride + pixel.x * bytes_per_sample);
 }
@@ -150,6 +161,23 @@ fn yuv_rgb(pixel: vec2<u32>) -> vec3<f32> {
     return vec3<f32>(r, g, b);
 }
 
+fn to_linear(encoded: f32) -> f32 {
+    let value = clamp(encoded, 0.0, 1.0);
+    if params.transfer == 0u {
+        return value;
+    }
+    if params.transfer == 1u {
+        if value <= 0.04045 {
+            return value / 12.92;
+        }
+        return pow((value + 0.055) / 1.055, 2.4);
+    }
+    if value < 0.081 {
+        return value / 4.5;
+    }
+    return pow((value + 0.099) / 1.099, 1.0 / 0.45);
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if invocation.x >= params.width || invocation.y >= params.height { return; }
@@ -160,5 +188,11 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     } else {
         rgba = vec4<f32>(yuv_rgb(pixel), 1.0);
     }
+    rgba = vec4<f32>(
+        to_linear(rgba.r),
+        to_linear(rgba.g),
+        to_linear(rgba.b),
+        rgba.a,
+    );
     textureStore(destination, vec2<i32>(pixel), rgba);
 }

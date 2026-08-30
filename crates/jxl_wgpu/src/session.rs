@@ -19,16 +19,25 @@ use crate::context::WgpuBackend;
 use crate::readback::{ReadbackRequest, resolve_outputs};
 use crate::scheduler::Scheduler;
 use crate::video::{
-    CpuImageFrame, GpuImageFrame, GpuImageOutput, ImageOutputRequest, ImageReadbackRequest,
-    resolve_image_outputs,
+    CpuImageFrame, GpuBufferLease, GpuImageFrame, GpuImageOutput, ImageOutputRequest,
+    ImageReadbackRequest, resolve_image_outputs,
 };
-use crate::{Error, ExecutionPlan, Result};
+use crate::{Error, ExecutionPlan, MemoryPermit, Result, SubmissionPollPermit};
 
 /// One packed output that remains owned by the caller after its frame session is dropped.
 ///
 /// Commands submitted later to the same [`wgpu::Queue`] may consume `buffer` immediately;
-/// WebGPU queue ordering makes an explicit host wait unnecessary.
-#[derive(Clone, Debug)]
+/// WebGPU queue ordering makes an explicit host wait unnecessary. Its buffer lease and the
+/// engine-owned pending-submission release guard share one byte reservation with any sibling
+/// outputs; those reported reservation sizes are therefore not additive. Clone the buffer lease
+/// explicitly when extending accounted ownership. The containing output is intentionally not
+/// cloneable.
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<jxl_wgpu::GpuOutputBuffer>();
+/// ```
+#[derive(Debug)]
 pub struct GpuOutputBuffer {
     pub id: OutputId,
     pub extent: Extent2d,
@@ -38,11 +47,16 @@ pub struct GpuOutputBuffer {
     /// Number of meaningful bytes in `buffer`. The allocation may be padded for WebGPU copy and
     /// binding alignment requirements.
     pub logical_size: u64,
-    pub buffer: Arc<wgpu::Buffer>,
+    pub buffer: GpuBufferLease,
 }
 
 /// Non-blocking result of [`WgpuFrameSession::submit_gpu`].
-#[derive(Clone, Debug)]
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<jxl_wgpu::GpuFrame>();
+/// ```
+#[derive(Debug)]
 pub struct GpuFrame {
     pub token: SubmissionToken,
     pub outputs: Vec<GpuOutputBuffer>,
@@ -80,6 +94,7 @@ enum PendingSubmission {
         changed: ChangedRegions,
         recycle_after_wait: Vec<PooledBuffer>,
         transient_bytes: u64,
+        memory_permit: MemoryPermit,
     },
     CpuImageReadback {
         submission: wgpu::SubmissionIndex,
@@ -87,11 +102,14 @@ enum PendingSubmission {
         changed: ChangedRegions,
         recycle_after_wait: Vec<PooledBuffer>,
         transient_bytes: u64,
+        memory_permit: MemoryPermit,
     },
     GpuOnly {
         #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
         submission: wgpu::SubmissionIndex,
         transient_bytes: u64,
+        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        memory_permit: MemoryPermit,
     },
 }
 
@@ -262,6 +280,14 @@ impl WgpuFrameSession {
     pub fn submit(&mut self, intent: RenderIntent) -> Result<SubmissionToken> {
         self.validate_submission(intent)?;
 
+        let estimated_transient = Scheduler::estimate_transient(
+            &self.backend,
+            &self.plan,
+            &self.execution,
+            &self.groups,
+            &self.resources,
+        )?;
+        let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode(
             &self.backend,
             &self.plan,
@@ -269,6 +295,7 @@ impl WgpuFrameSession {
             &self.groups,
             &self.resources,
         )?;
+        Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
             planned_dispatches: encoded.planned_dispatches,
             compute_dispatches: encoded.compute_dispatches,
@@ -279,7 +306,7 @@ impl WgpuFrameSession {
         };
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.backend.queue.submit([encoded.command_buffer]);
+        let submission = self.submit_admitted(encoded.command_buffer, &memory_permit, poll_permit);
         recycle_submitted(encoded.recycle_after_submit);
         self.last_submission_stats = Some(stats);
         let changed = self.changed_regions();
@@ -291,6 +318,7 @@ impl WgpuFrameSession {
                 changed,
                 recycle_after_wait: encoded.recycle_after_wait,
                 transient_bytes: encoded.transient_bytes,
+                memory_permit,
             },
         );
         Ok(token)
@@ -305,6 +333,14 @@ impl WgpuFrameSession {
     pub fn submit_gpu(&mut self, intent: RenderIntent) -> Result<GpuFrame> {
         self.validate_submission(intent)?;
 
+        let estimated_transient = Scheduler::estimate_gpu_transient(
+            &self.backend,
+            &self.plan,
+            &self.execution,
+            &self.groups,
+            &self.resources,
+        )?;
+        let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode_gpu(
             &self.backend,
             &self.plan,
@@ -312,6 +348,7 @@ impl WgpuFrameSession {
             &self.groups,
             &self.resources,
         )?;
+        Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
             planned_dispatches: encoded.planned_dispatches,
             compute_dispatches: encoded.compute_dispatches,
@@ -330,12 +367,12 @@ impl WgpuFrameSession {
                 channels: output.channels,
                 layout: output.layout,
                 logical_size: output.logical_size,
-                buffer: output.buffer,
+                buffer: GpuBufferLease::with_memory_permit(output.buffer, memory_permit.clone()),
             })
             .collect();
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.backend.queue.submit([encoded.command_buffer]);
+        let submission = self.submit_admitted(encoded.command_buffer, &memory_permit, poll_permit);
         recycle_submitted(encoded.recycle_after_submit);
         debug_assert!(encoded.recycle_after_wait.is_empty());
         self.last_submission_stats = Some(stats);
@@ -344,6 +381,7 @@ impl WgpuFrameSession {
             PendingSubmission::GpuOnly {
                 submission,
                 transient_bytes: encoded.transient_bytes,
+                memory_permit,
             },
         );
         Ok(GpuFrame {
@@ -363,6 +401,15 @@ impl WgpuFrameSession {
         request: ImageOutputRequest,
     ) -> Result<SubmissionToken> {
         self.validate_submission(intent)?;
+        let estimated_transient = Scheduler::estimate_image_transient(
+            &self.backend,
+            &self.plan,
+            &self.execution,
+            &self.groups,
+            &self.resources,
+            &request,
+        )?;
+        let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode_image(
             &self.backend,
             &self.plan,
@@ -371,6 +418,7 @@ impl WgpuFrameSession {
             &self.resources,
             &request,
         )?;
+        Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
             planned_dispatches: encoded.planned_dispatches,
             compute_dispatches: encoded.compute_dispatches,
@@ -381,7 +429,7 @@ impl WgpuFrameSession {
         };
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.backend.queue.submit([encoded.command_buffer]);
+        let submission = self.submit_admitted(encoded.command_buffer, &memory_permit, poll_permit);
         recycle_submitted(encoded.recycle_after_submit);
         self.last_submission_stats = Some(stats);
         let changed = self.changed_regions();
@@ -393,6 +441,7 @@ impl WgpuFrameSession {
                 changed,
                 recycle_after_wait: encoded.recycle_after_wait,
                 transient_bytes: encoded.transient_bytes,
+                memory_permit,
             },
         );
         Ok(token)
@@ -408,6 +457,15 @@ impl WgpuFrameSession {
         request: ImageOutputRequest,
     ) -> Result<GpuImageFrame> {
         self.validate_submission(intent)?;
+        let estimated_transient = Scheduler::estimate_gpu_image_transient(
+            &self.backend,
+            &self.plan,
+            &self.execution,
+            &self.groups,
+            &self.resources,
+            &request,
+        )?;
+        let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode_gpu_image(
             &self.backend,
             &self.plan,
@@ -416,6 +474,7 @@ impl WgpuFrameSession {
             &self.resources,
             &request,
         )?;
+        Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
             planned_dispatches: encoded.planned_dispatches,
             compute_dispatches: encoded.compute_dispatches,
@@ -430,12 +489,12 @@ impl WgpuFrameSession {
             .map(|output| GpuImageOutput {
                 id: output.id,
                 layout: output.layout,
-                buffer: output.buffer,
+                buffer: GpuBufferLease::with_memory_permit(output.buffer, memory_permit.clone()),
             })
             .collect();
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.backend.queue.submit([encoded.command_buffer]);
+        let submission = self.submit_admitted(encoded.command_buffer, &memory_permit, poll_permit);
         recycle_submitted(encoded.recycle_after_submit);
         debug_assert!(encoded.recycle_after_wait.is_empty());
         self.last_submission_stats = Some(stats);
@@ -444,6 +503,7 @@ impl WgpuFrameSession {
             PendingSubmission::GpuOnly {
                 submission,
                 transient_bytes: encoded.transient_bytes,
+                memory_permit,
             },
         );
         Ok(GpuImageFrame {
@@ -475,6 +535,54 @@ impl WgpuFrameSession {
             }
         }
         Ok(())
+    }
+
+    /// Atomically admits both byte-weighted transient storage and one completion-poll job before
+    /// queue submission. If either non-blocking reservation fails, the other is dropped here and
+    /// no GPU work has been submitted.
+    fn admit_submission(
+        &self,
+        transient_bytes: u64,
+    ) -> Result<(MemoryPermit, SubmissionPollPermit)> {
+        let memory_permit = self
+            .backend
+            .transient_memory_budget()
+            .try_reserve(transient_bytes)?;
+        let poll_permit = self.backend.submission_poller().try_reserve()?;
+        Ok((memory_permit, poll_permit))
+    }
+
+    fn validate_transient_estimate(estimated: u64, actual: u64) -> Result<()> {
+        if estimated != actual {
+            return Err(Error::Execution(format!(
+                "transient preflight estimated {estimated} bytes, but encoding allocated {actual} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Submits pre-admitted work and couples the shared memory reservation to the command buffer's
+    /// completion callback. `MemoryPermit` clones refer to one reservation, so the callback,
+    /// pending token, and public output leases do not multiply the charged byte count.
+    fn submit_admitted(
+        &self,
+        command_buffer: wgpu::CommandBuffer,
+        memory_permit: &MemoryPermit,
+        poll_permit: SubmissionPollPermit,
+    ) -> wgpu::SubmissionIndex {
+        let callback_permit = memory_permit.clone();
+        command_buffer.on_submitted_work_done(move || drop(callback_permit));
+        let submission = self.backend.queue.submit([command_buffer]);
+
+        if let Err(error) = poll_permit.register(submission.clone(), move |message| {
+            tracing::error!(%message, "GPU submission poll failed");
+        }) {
+            // Capacity and worker availability were checked before submission. Only a worker
+            // failure racing this registration can reach this branch; the command callback and
+            // PendingSubmission still retain the memory permit safely.
+            tracing::error!(%error, "failed to register pre-admitted GPU submission poll");
+        }
+        submission
     }
 
     fn allocate_token(&mut self) -> Result<SubmissionToken> {
@@ -541,12 +649,14 @@ impl WgpuFrameSession {
             changed,
             recycle_after_wait,
             transient_bytes: _,
+            memory_permit,
         } = pending
         else {
             unreachable!("submission mode was checked before removal")
         };
         let outputs = resolve_outputs(&self.backend.device, submission, readbacks)?;
         recycle_unmapped(recycle_after_wait);
+        drop(memory_permit);
         Ok(RenderedFrame {
             token,
             outputs,
@@ -578,12 +688,14 @@ impl WgpuFrameSession {
             changed,
             recycle_after_wait,
             transient_bytes: _,
+            memory_permit,
         } = pending
         else {
             unreachable!("submission mode was checked before removal")
         };
         let outputs = resolve_image_outputs(&self.backend.device, submission, readbacks)?;
         recycle_unmapped(recycle_after_wait);
+        drop(memory_permit);
         Ok(CpuImageFrame {
             token,
             outputs,
@@ -624,6 +736,7 @@ impl WgpuFrameSession {
             let PendingSubmission::GpuOnly {
                 submission,
                 transient_bytes: _,
+                memory_permit,
             } = pending
             else {
                 unreachable!("submission mode was checked before removal")
@@ -632,6 +745,7 @@ impl WgpuFrameSession {
                 submission_index: Some(submission),
                 timeout: None,
             })?;
+            drop(memory_permit);
             Ok(())
         }
     }
@@ -713,6 +827,45 @@ mod tests {
             }
             Err(error) => panic!("failed to initialize GPU test device: {error}"),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn budget_backend(limit_bytes: u64) -> Option<WgpuBackend> {
+        let config = WgpuBackendConfig {
+            enable_timestamps: false,
+            memory: WgpuMemoryPolicy {
+                max_transient_bytes: limit_bytes,
+                max_in_flight_transient_bytes: limit_bytes,
+                ..WgpuMemoryPolicy::default()
+            },
+            ..WgpuBackendConfig::default()
+        };
+        match pollster::block_on(WgpuBackend::request_default(config)) {
+            Ok(backend) => Some(backend),
+            Err(Error::NoAdapter) => {
+                eprintln!("skipping GPU test: no wgpu adapter is available");
+                None
+            }
+            Err(error) => panic!("failed to initialize GPU test device: {error}"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_for_transient_reservation(backend: &WgpuBackend, expected_bytes: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while backend.transient_memory_stats().reserved_bytes != expected_bytes
+            && std::time::Instant::now() < deadline
+        {
+            backend
+                .device()
+                .poll(wgpu::PollType::Poll)
+                .expect("drive transient reservation completion callback");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            backend.transient_memory_stats().reserved_bytes,
+            expected_bytes
+        );
     }
 
     fn frame_desc(extent: Extent2d) -> FrameSessionDesc {
@@ -817,6 +970,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 1,
                 layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         })
     }
@@ -857,7 +1011,7 @@ mod tests {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu zero-copy consumer test"),
                 });
-        encoder.copy_buffer_to_buffer(&output.buffer, 0, &staging, 0, copy_size);
+        encoder.copy_buffer_to_buffer(output.buffer.as_wgpu_buffer(), 0, &staging, 0, copy_size);
         let submission = backend.queue().submit([encoder.finish()]);
         let (sender, receiver) = mpsc::sync_channel(1);
         staging
@@ -959,6 +1113,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 1,
                 layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         });
         let frame = frame_desc(extent);
@@ -1069,6 +1224,7 @@ mod tests {
                     sample_type: SampleType::F32,
                     channels: 1,
                     layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
                 }],
             });
             let mut session = backend
@@ -1175,6 +1331,9 @@ mod tests {
                     sample_type: SampleType::F32,
                     channels: 3,
                     layout: OutputLayout::Interleaved,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::Rgb(
+                        jxl_gpu_protocol::RgbColorEncoding::BT709,
+                    ),
                 }],
             });
             let mut session = backend
@@ -1199,7 +1358,13 @@ mod tests {
                 })
                 .expect("enqueue oriented native YUV source");
             let token = session
-                .submit_image(RenderIntent::Final, ImageOutputRequest::new(format.clone()))
+                .submit_image(
+                    RenderIntent::Final,
+                    ImageOutputRequest::new(
+                        jxl_gpu_protocol::RgbColorEncoding::BT709,
+                        format.clone(),
+                    ),
+                )
                 .expect("submit oriented native YUV");
             let rendered = session.wait_image(token).expect("read oriented native YUV");
             let output = &rendered.outputs[0];
@@ -1260,12 +1425,15 @@ mod tests {
             [Region::new(0, 0, 3, 2)]
         );
 
-        let output = output.clone();
-        drop(frame);
+        let output = frame
+            .outputs
+            .into_iter()
+            .next()
+            .expect("the single output remains present");
         drop(session);
 
         // This dependent copy is submitted without waiting for the frame submission. Waiting only
-        // for this later command proves same-queue ordering and that the Arc-owned output survives
+        // for this later command proves same-queue ordering and that the leased output survives
         // destruction of its frame session.
         let actual = f32_values(&copy_gpu_output_to_host(&backend, &output));
         assert_eq!(actual, expected);
@@ -1302,6 +1470,340 @@ mod tests {
         assert_eq!(session.pending_transient_bytes(), per_submission);
         session.wait_gpu(second.token).expect("wait second frame");
         assert_eq!(session.pending_transient_bytes(), 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn all_session_modes_reject_shared_memory_backpressure_before_encoding() {
+        let Some(backend) = budget_backend(1024) else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let mut session = backend
+            .create_session(&frame_desc(extent), copy_chain_plan(extent))
+            .expect("create shared-admission session");
+        enqueue_copy_source(&mut session, extent, vec![0.25; 9]);
+        backend.clear_buffer_pool();
+        let before_pool = backend.buffer_pool_stats();
+        let blocker = backend
+            .transient_memory_budget()
+            .try_reserve(1024)
+            .expect("reserve the complete test budget");
+        let request = ImageOutputRequest::new(
+            jxl_gpu_protocol::RgbColorEncoding::BT709,
+            PixelFormat::non_color(
+                jxl_gpu_formats::SampleKind::Unsigned,
+                8,
+                &[jxl_gpu_formats::Channel::X],
+            ),
+        );
+
+        assert!(matches!(
+            session.submit(RenderIntent::Final),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    reserved_bytes: 1024,
+                    limit_bytes: 1024,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            session.submit_gpu(RenderIntent::Final),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    reserved_bytes: 1024,
+                    limit_bytes: 1024,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            session.submit_image(RenderIntent::Final, request.clone()),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    reserved_bytes: 1024,
+                    limit_bytes: 1024,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            session.submit_gpu_image(RenderIntent::Final, request),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    reserved_bytes: 1024,
+                    limit_bytes: 1024,
+                    ..
+                }
+            ))
+        ));
+
+        assert_eq!(session.next_token, 1);
+        assert!(session.pending.is_empty());
+        assert_eq!(session.pending_transient_bytes(), 0);
+        assert!(session.last_submission_stats().is_none());
+        assert_eq!(backend.buffer_pool_stats(), before_pool);
+        assert_eq!(backend.submission_poller().in_flight(), 0);
+        drop(blocker);
+
+        let frame = session
+            .submit_gpu(RenderIntent::Final)
+            .expect("retry after releasing shared admission");
+        session
+            .wait_gpu(frame.token)
+            .expect("wait retried shared-admission frame");
+        drop(frame);
+        wait_for_transient_reservation(&backend, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn poll_admission_is_reserved_before_frame_encoding_and_queue_submit() {
+        let Some(backend) = budget_backend(1024) else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let mut session = backend
+            .create_session(&frame_desc(extent), copy_chain_plan(extent))
+            .expect("create poll-admission session");
+        enqueue_copy_source(&mut session, extent, vec![0.5; 9]);
+        backend.clear_buffer_pool();
+        let before_pool = backend.buffer_pool_stats();
+        let poll_blockers = (0..crate::SUBMISSION_POLLER_CAPACITY)
+            .map(|_| backend.submission_poller().try_reserve().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            session.submit_gpu(RenderIntent::Final),
+            Err(Error::PollAdmission(crate::SubmissionPollerError::Full {
+                capacity: crate::SUBMISSION_POLLER_CAPACITY
+            }))
+        ));
+        assert_eq!(backend.transient_memory_stats().reserved_bytes, 0);
+        assert_eq!(backend.buffer_pool_stats(), before_pool);
+        assert_eq!(session.next_token, 1);
+        assert!(session.pending.is_empty());
+
+        drop(poll_blockers);
+        let frame = session
+            .submit_gpu(RenderIntent::Final)
+            .expect("retry after poll admission is available");
+        session.wait_gpu(frame.token).expect("wait retried frame");
+        drop(frame);
+        wait_for_transient_reservation(&backend, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shared_budget_spans_backend_clones_and_last_gpu_buffer_lease() {
+        const SUBMISSION_BYTES: u64 = 116;
+        let Some(backend) = budget_backend(SUBMISSION_BYTES) else {
+            return;
+        };
+        let backend_clone = backend.clone();
+        let extent = Extent2d::new(3, 3);
+        let plan = copy_chain_plan(extent);
+        let mut first = backend
+            .create_session(&frame_desc(extent), Arc::clone(&plan))
+            .expect("create first cloned-backend session");
+        let mut second = backend_clone
+            .create_session(&frame_desc(extent), plan)
+            .expect("create second cloned-backend session");
+        enqueue_copy_source(&mut first, extent, vec![1.0; 9]);
+        enqueue_copy_source(&mut second, extent, vec![2.0; 9]);
+
+        let frame = first
+            .submit_gpu(RenderIntent::Final)
+            .expect("admit first cloned-backend frame");
+        assert_eq!(frame.outputs[0].buffer.reserved_bytes(), SUBMISSION_BYTES);
+        assert_eq!(
+            backend_clone.transient_memory_stats().reserved_bytes,
+            SUBMISSION_BYTES
+        );
+        for _ in 0..8 {
+            assert!(matches!(
+                second.submit_gpu(RenderIntent::Final),
+                Err(Error::MemoryBackpressure(
+                    crate::MemoryBudgetError::Exhausted {
+                        requested_bytes: SUBMISSION_BYTES,
+                        reserved_bytes: SUBMISSION_BYTES,
+                        limit_bytes: SUBMISSION_BYTES,
+                    }
+                ))
+            ));
+        }
+        assert_eq!(second.next_token, 1);
+
+        let retained_output_lease = frame.outputs[0].buffer.clone();
+        first
+            .wait_gpu(frame.token)
+            .expect("complete first cloned-backend frame");
+        drop(frame);
+        assert_eq!(
+            backend.transient_memory_stats().reserved_bytes,
+            SUBMISSION_BYTES
+        );
+        drop(retained_output_lease);
+        wait_for_transient_reservation(&backend, 0);
+
+        let frame = second
+            .submit_gpu(RenderIntent::Final)
+            .expect("admit second session after final buffer lease drops");
+        second.wait_gpu(frame.token).expect("complete second frame");
+        drop(frame);
+        wait_for_transient_reservation(&backend, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn many_pending_tokens_are_byte_bounded_and_release_independently() {
+        const SUBMISSION_BYTES: u64 = 116;
+        const TOKEN_COUNT: u64 = 8;
+        let limit = SUBMISSION_BYTES * TOKEN_COUNT;
+        let Some(backend) = budget_backend(limit) else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let mut session = backend
+            .create_session(&frame_desc(extent), copy_chain_plan(extent))
+            .expect("create multi-token session");
+        enqueue_copy_source(&mut session, extent, vec![0.75; 9]);
+
+        let frames = (0..TOKEN_COUNT)
+            .map(|_| {
+                session
+                    .submit_gpu(RenderIntent::Final)
+                    .expect("admit bounded token")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(session.pending.len(), TOKEN_COUNT as usize);
+        assert_eq!(session.pending_transient_bytes(), limit);
+        assert_eq!(backend.transient_memory_stats().reserved_bytes, limit);
+        assert!(matches!(
+            session.submit_gpu(RenderIntent::Final),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    requested_bytes: SUBMISSION_BYTES,
+                    reserved_bytes,
+                    limit_bytes,
+                }
+            )) if reserved_bytes == limit && limit_bytes == limit
+        ));
+        assert_eq!(session.next_token, TOKEN_COUNT + 1);
+
+        for frame in &frames {
+            session
+                .wait_gpu(frame.token)
+                .expect("complete bounded token");
+        }
+        assert_eq!(session.pending_transient_bytes(), 0);
+        // Caller-visible leases intentionally keep each submission's one reservation alive.
+        assert_eq!(backend.transient_memory_stats().reserved_bytes, limit);
+        drop(frames);
+        wait_for_transient_reservation(&backend, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn frame_session_and_aggregate_readback_share_one_budget() {
+        const SUBMISSION_BYTES: u64 = 116;
+        let Some(backend) = budget_backend(SUBMISSION_BYTES) else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let layout = jxl_gpu_formats::ImageLayout::packed(
+            extent,
+            PixelFormat::non_color(
+                jxl_gpu_formats::SampleKind::Unsigned,
+                8,
+                &[jxl_gpu_formats::Channel::X],
+            ),
+        )
+        .expect("create cross-component layout");
+        let source = Arc::new(backend.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jxl-wgpu cross-component readback source"),
+            size: 12,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        backend.queue().write_buffer(&source, 0, &[7; 12]);
+        let source_frame = GpuImageFrame {
+            token: SubmissionToken(999),
+            outputs: vec![GpuImageOutput {
+                id: OutputId(99),
+                layout,
+                buffer: GpuBufferLease::new(source),
+            }],
+            changed: ChangedRegions::default(),
+        };
+        let readback = crate::ImageReadbackPipeline::new(&backend)
+            .submit(&source_frame)
+            .expect("admit aggregate readback");
+        assert_eq!(readback.stats().staging_bytes, 12);
+        assert_eq!(backend.transient_memory_stats().reserved_bytes, 12);
+
+        let mut session = backend
+            .create_session(&frame_desc(extent), copy_chain_plan(extent))
+            .expect("create cross-component frame session");
+        enqueue_copy_source(&mut session, extent, vec![0.0; 9]);
+        assert!(matches!(
+            session.submit_gpu(RenderIntent::Final),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    requested_bytes: SUBMISSION_BYTES,
+                    reserved_bytes: 12,
+                    limit_bytes: SUBMISSION_BYTES,
+                }
+            ))
+        ));
+
+        readback.wait().expect("complete aggregate readback");
+        assert_eq!(backend.transient_memory_stats().reserved_bytes, 0);
+        let frame = session
+            .submit_gpu(RenderIntent::Final)
+            .expect("admit frame session after readback release");
+        session
+            .wait_gpu(frame.token)
+            .expect("complete frame session");
+        drop(frame);
+        wait_for_transient_reservation(&backend, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn abandoned_frame_session_releases_budget_after_gpu_completion() {
+        const SUBMISSION_BYTES: u64 = 116;
+        let Some(backend) = budget_backend(SUBMISSION_BYTES) else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let mut session = backend
+            .create_session(&frame_desc(extent), copy_chain_plan(extent))
+            .expect("create abandonment session");
+        enqueue_copy_source(&mut session, extent, vec![1.0; 9]);
+        let frame = session
+            .submit_gpu(RenderIntent::Final)
+            .expect("submit abandoned frame");
+        let submission = match session.pending.get(&frame.token) {
+            Some(PendingSubmission::GpuOnly { submission, .. }) => submission.clone(),
+            _ => panic!("expected pending GPU-only submission"),
+        };
+        assert_eq!(
+            backend.transient_memory_stats().reserved_bytes,
+            SUBMISSION_BYTES
+        );
+
+        drop(frame);
+        drop(session);
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .expect("drive abandoned frame completion callback");
+        wait_for_transient_reservation(&backend, 0);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1784,6 +2286,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 4,
                 layout: OutputLayout::Interleaved,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         });
         let mut session = backend
@@ -1899,6 +2402,7 @@ mod tests {
                     sample_type: SampleType::F32,
                     channels: 1,
                     layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
                 }],
             });
             let mut session = backend
@@ -1982,6 +2486,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 1,
                 layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         });
         let mut session = backend

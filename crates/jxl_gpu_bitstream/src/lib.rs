@@ -13,6 +13,38 @@ use thiserror::Error;
 
 mod acceleration;
 
+#[cfg(test)]
+mod test_fixtures {
+    fn hex_nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("invalid checked-in fixture hex digit"),
+        }
+    }
+
+    fn decode_hex(input: &str) -> Vec<u8> {
+        let digits = input
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
+        digits
+            .chunks_exact(2)
+            .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+            .collect()
+    }
+
+    pub(crate) fn fragmented_animation() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/fragmented_animation.jxl.hex"))
+    }
+
+    pub(crate) fn gpu_gray8_lossless() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/gpu_gray8_lossless.jxl.hex"))
+    }
+}
+
 pub use acceleration::{
     ACCELERATION_INDEX_BOX_TYPE, AccelerationIndexError, Gray8AccelerationIndex, PrefixCodeEntry,
 };
@@ -793,8 +825,8 @@ mod tests {
 
     #[test]
     fn real_fragmented_animation_container_is_reassembled() {
-        let input = include_bytes!("../../../fixtures/fragmented_animation.jxl");
-        let parsed = parse(input, ParseLimits::default()).unwrap();
+        let input = crate::test_fixtures::fragmented_animation();
+        let parsed = parse(&input, ParseLimits::default()).unwrap();
         assert!(parsed.is_container());
         assert!(parsed.codestream().starts_with(&CODESTREAM_SIGNATURE));
         assert!(parsed.codestream().len() < input.len());
@@ -802,8 +834,8 @@ mod tests {
 
     #[test]
     fn real_gpu_index_is_bound_to_its_standard_codestream() {
-        let input = include_bytes!("../../../fixtures/gpu_gray8_lossless.jxl");
-        let parsed = parse(input, ParseLimits::default()).unwrap();
+        let input = crate::test_fixtures::gpu_gray8_lossless();
+        let parsed = parse(&input, ParseLimits::default()).unwrap();
         let boxes = parsed
             .boxes_of_type(ACCELERATION_INDEX_BOX_TYPE)
             .collect::<Vec<_>>();
@@ -887,11 +919,11 @@ mod tests {
 
     #[test]
     fn truncated_real_container_prefixes_never_panic() {
-        let input = include_bytes!("../../../fixtures/fragmented_animation.jxl");
+        let input = crate::test_fixtures::fragmented_animation();
         for length in (0..input.len()).step_by(97) {
             let _ = parse(&input[..length], ParseLimits::default());
         }
-        let _ = parse(input, ParseLimits::default()).unwrap();
+        let _ = parse(&input, ParseLimits::default()).unwrap();
     }
 
     #[test]

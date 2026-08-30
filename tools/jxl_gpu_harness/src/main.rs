@@ -13,6 +13,7 @@ use jxl_gpu_harness::codec::{
     run_codec_case,
 };
 use jxl_gpu_harness::config::{CorpusConfig, SyntheticCaseConfig, ThresholdConfig};
+use jxl_gpu_harness::cpu_baseline::{DjxlBaselineOptions, run_djxl_baseline};
 use jxl_gpu_harness::error::{Error, Result};
 use jxl_gpu_harness::replay::{BackendKind, create_backend, verify_capture};
 use jxl_gpu_harness::report::{CaseReport, CaseStatus, RunReport};
@@ -101,12 +102,25 @@ struct CodecArgs {
     warmup: u32,
     #[arg(long, default_value_t = 1)]
     iterations: u32,
+    /// Host threads released as one barrier-synchronized burst; this is not GPU batching.
     #[arg(long, default_value_t = 1)]
-    batch_size: u32,
+    burst_size: u32,
     #[arg(long, default_value_t = 1)]
     concurrency: u32,
     #[arg(long, default_value_t = 2)]
-    max_in_flight: u32,
+    max_frame_slots: u32,
+    /// Opt-in development-only external djxl CPU decode comparator.
+    #[arg(long, value_name = "PATH")]
+    cpu_baseline_djxl: Option<PathBuf>,
+    /// Override comparator warmup groups; defaults to --warmup.
+    #[arg(long, requires = "cpu_baseline_djxl")]
+    cpu_baseline_warmup: Option<u32>,
+    /// Override comparator repetitions; defaults to --iterations.
+    #[arg(long, requires = "cpu_baseline_djxl")]
+    cpu_baseline_iterations: Option<u32>,
+    /// Per-process comparator timeout; defaults to 30000 ms.
+    #[arg(long, requires = "cpu_baseline_djxl")]
+    cpu_baseline_timeout_ms: Option<u64>,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -289,9 +303,9 @@ fn run_codec(args: CodecArgs) -> Result<bool> {
             kind: args.workload,
             warmup: args.warmup,
             iterations: args.iterations,
-            batch_size: args.batch_size,
+            burst_size: args.burst_size,
             concurrency: args.concurrency,
-            max_in_flight: args.max_in_flight,
+            max_frame_slots: args.max_frame_slots,
         },
         output_target: args.output_target,
         format: args.format,
@@ -299,14 +313,34 @@ fn run_codec(args: CodecArgs) -> Result<bool> {
         extent: args.extent,
     }
     .validate()?;
+    let cpu_baseline = args
+        .cpu_baseline_djxl
+        .clone()
+        .map(|executable| {
+            DjxlBaselineOptions::new(
+                executable,
+                options.workload,
+                args.cpu_baseline_warmup,
+                args.cpu_baseline_iterations,
+                args.cpu_baseline_timeout_ms,
+            )
+        })
+        .transpose()?;
     let mut report = RunReport::new("codec");
     report.adapters = enumerate_adapters();
     let backend = request_backend()?;
-    report.codec_cases.extend(
-        inputs
-            .iter()
-            .map(|case| run_codec_case(case, backend.as_ref(), &options)),
-    );
+    report.codec_cases.extend(inputs.iter().map(|case| {
+        let mut case_report = run_codec_case(case, backend.as_ref(), &options);
+        if let Some(baseline) = &cpu_baseline {
+            case_report.cpu_baseline = Some(run_djxl_baseline(
+                &case.path,
+                &options,
+                &case_report,
+                baseline,
+            ));
+        }
+        case_report
+    }));
     let passed = report.passed();
     write_json(&report, args.output.output.as_deref())?;
     Ok(passed)

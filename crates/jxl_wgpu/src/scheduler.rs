@@ -8,14 +8,17 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
-    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
-    WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpace, ColorSpecification,
+    ImageLayout, NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass,
+    RgbChannelOrder, RgbStorage, TransferFunction as ImageTransferFunction, WgslNumericCapability,
+    YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{
-    ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId, GroupPayload, MemoryMode, OutputDesc,
-    OutputId, OutputLayout, OutputOrientation, PlaneDesc, PlaneId, PlaneRole, RenderNode, RenderOp,
-    RenderOpKind, RenderPlan, ResourceData, ResourceId, ResourceUpdate, SampleType,
+    ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId, GroupPayload, MemoryMode,
+    OutputColorEncoding, OutputDesc, OutputId, OutputLayout, OutputOrientation, PlaneDesc, PlaneId,
+    PlaneRole, RenderNode, RenderOp, RenderOpKind, RenderPlan, ResourceData, ResourceId,
+    ResourceUpdate, RgbColorEncoding, RgbPrimaries, SampleType,
+    TransferFunction as SourceTransferFunction,
 };
 use wgpu::util::DeviceExt;
 
@@ -173,6 +176,28 @@ impl Scheduler {
         )
     }
 
+    /// Computes the exact explicit transient allocation for [`Self::encode`] without creating
+    /// GPU resources. Callers use this preflight value for backend-wide admission before any
+    /// submission-owned buffer is allocated.
+    pub(crate) fn estimate_transient(
+        backend: &WgpuBackend,
+        plan: &RenderPlan,
+        execution: &ExecutionPlan,
+        groups: &BTreeMap<GroupId, GroupPayload>,
+        resources: &BTreeMap<ResourceId, ResourceUpdate>,
+    ) -> Result<u64> {
+        Self::preflight_with_mode(
+            backend,
+            plan,
+            execution,
+            groups,
+            resources,
+            OutputMode::CpuReadback,
+            OutputEncoding::Original,
+        )
+        .map(|(_, transient_bytes)| transient_bytes)
+    }
+
     pub(crate) fn encode_gpu(
         backend: &WgpuBackend,
         plan: &RenderPlan,
@@ -189,6 +214,27 @@ impl Scheduler {
             OutputMode::GpuOnly,
             OutputEncoding::Original,
         )
+    }
+
+    /// Computes the exact explicit transient allocation for [`Self::encode_gpu`] without
+    /// creating GPU resources.
+    pub(crate) fn estimate_gpu_transient(
+        backend: &WgpuBackend,
+        plan: &RenderPlan,
+        execution: &ExecutionPlan,
+        groups: &BTreeMap<GroupId, GroupPayload>,
+        resources: &BTreeMap<ResourceId, ResourceUpdate>,
+    ) -> Result<u64> {
+        Self::preflight_with_mode(
+            backend,
+            plan,
+            execution,
+            groups,
+            resources,
+            OutputMode::GpuOnly,
+            OutputEncoding::Original,
+        )
+        .map(|(_, transient_bytes)| transient_bytes)
     }
 
     pub(crate) fn encode_image(
@@ -210,6 +256,28 @@ impl Scheduler {
         )
     }
 
+    /// Computes the exact explicit transient allocation for [`Self::encode_image`] without
+    /// creating GPU resources.
+    pub(crate) fn estimate_image_transient(
+        backend: &WgpuBackend,
+        plan: &RenderPlan,
+        execution: &ExecutionPlan,
+        groups: &BTreeMap<GroupId, GroupPayload>,
+        resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        request: &ImageOutputRequest,
+    ) -> Result<u64> {
+        Self::preflight_with_mode(
+            backend,
+            plan,
+            execution,
+            groups,
+            resources,
+            OutputMode::CpuReadback,
+            OutputEncoding::Image(request),
+        )
+        .map(|(_, transient_bytes)| transient_bytes)
+    }
+
     pub(crate) fn encode_gpu_image(
         backend: &WgpuBackend,
         plan: &RenderPlan,
@@ -229,6 +297,51 @@ impl Scheduler {
         )
     }
 
+    /// Computes the exact explicit transient allocation for [`Self::encode_gpu_image`] without
+    /// creating GPU resources.
+    pub(crate) fn estimate_gpu_image_transient(
+        backend: &WgpuBackend,
+        plan: &RenderPlan,
+        execution: &ExecutionPlan,
+        groups: &BTreeMap<GroupId, GroupPayload>,
+        resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        request: &ImageOutputRequest,
+    ) -> Result<u64> {
+        Self::preflight_with_mode(
+            backend,
+            plan,
+            execution,
+            groups,
+            resources,
+            OutputMode::GpuOnly,
+            OutputEncoding::Image(request),
+        )
+        .map(|(_, transient_bytes)| transient_bytes)
+    }
+
+    fn preflight_with_mode<'a>(
+        backend: &WgpuBackend,
+        plan: &RenderPlan,
+        execution: &ExecutionPlan,
+        groups: &BTreeMap<GroupId, GroupPayload>,
+        resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        output_mode: OutputMode,
+        output_encoding: OutputEncoding<'a>,
+    ) -> Result<(OutputTarget<'a>, u64)> {
+        Self::validate(plan)?;
+        validate_resources(plan, resources)?;
+        let output_target = OutputTarget {
+            mode: output_mode,
+            encoding: output_encoding,
+            direct_readback: output_mode == OutputMode::CpuReadback
+                && backend.direct_readback_enabled(),
+        };
+        validate_execution(&backend.device, plan, execution)?;
+        let transient_bytes =
+            validate_transient_budget(backend, plan, execution, groups, resources, output_target)?;
+        Ok((output_target, transient_bytes))
+    }
+
     fn encode_with_mode(
         backend: &WgpuBackend,
         plan: &RenderPlan,
@@ -238,19 +351,16 @@ impl Scheduler {
         output_mode: OutputMode,
         output_encoding: OutputEncoding<'_>,
     ) -> Result<EncodedSubmission> {
-        Self::validate(plan)?;
-        validate_resources(plan, resources)?;
         let device = &backend.device;
-        let direct_readback =
-            output_mode == OutputMode::CpuReadback && backend.direct_readback_enabled();
-        let output_target = OutputTarget {
-            mode: output_mode,
-            encoding: output_encoding,
-            direct_readback,
-        };
-        validate_execution(device, plan, execution)?;
-        let transient_bytes =
-            validate_transient_budget(backend, plan, execution, groups, resources, output_target)?;
+        let (output_target, transient_bytes) = Self::preflight_with_mode(
+            backend,
+            plan,
+            execution,
+            groups,
+            resources,
+            output_mode,
+            output_encoding,
+        )?;
         let factory = PipelineFactory {
             device,
             cache: &backend.pipelines,
@@ -2085,6 +2195,23 @@ fn encode_image_save(
             output.id
         )));
     }
+    let source_encoding = match output.color_encoding {
+        OutputColorEncoding::Rgb(encoding) => encoding,
+        OutputColorEncoding::NonColor => {
+            return Err(Error::Unsupported(format!(
+                "generic image output {:?} requires an explicit RGB source color encoding",
+                output.id
+            )));
+        }
+    };
+    if source_encoding != request.source_encoding {
+        return Err(Error::InvalidPayload(format!(
+            "generic image output {:?} declares source color {:?}, but the request declares {:?}",
+            output.id, source_encoding, request.source_encoding
+        )));
+    }
+    let (source_transfer, target_transfer) =
+        image_transfer_params(source_encoding, &request.format)?;
     let channels = save
         .channels
         .iter()
@@ -2149,7 +2276,9 @@ fn encode_image_save(
         logical_size: to_shader_u32(layout.logical_size)?,
         dispatch_width,
         orientation: orientation_code(save.orientation),
-        _padding: [0; 3],
+        source_transfer,
+        target_transfer,
+        _padding: 0,
     };
     let uniform = create_uniform(factory.device, "jxl-wgpu generic image params", &params);
     let pipeline = create_pipeline(
@@ -2316,6 +2445,50 @@ fn numeric_image_output_error(numeric: NumericFormatClass) -> Error {
     }
 }
 
+fn image_transfer_params(source: RgbColorEncoding, target: &PixelFormat) -> Result<(u32, u32)> {
+    if source.primaries != RgbPrimaries::Bt709 {
+        return Err(Error::Unsupported(format!(
+            "generic GPU output supports only BT.709 source primaries, not {:?}",
+            source.primaries
+        )));
+    }
+    let source_transfer = match source.transfer {
+        SourceTransferFunction::Linear => 0,
+        SourceTransferFunction::Srgb => 1,
+        SourceTransferFunction::Bt709 => 2,
+        unsupported => {
+            return Err(Error::Unsupported(format!(
+                "generic GPU output source transfer {unsupported:?} is unsupported"
+            )));
+        }
+    };
+    let target_color = match target.color_spec {
+        ColorSpecification::Defined(color) => color,
+        ColorSpecification::Default | ColorSpecification::Undefined => {
+            return Err(Error::Unsupported(
+                "generic GPU output requires an explicit target color specification".into(),
+            ));
+        }
+    };
+    if target_color.space != ColorSpace::Bt709 {
+        return Err(Error::Unsupported(format!(
+            "generic GPU output supports only BT.709 target primaries, not {:?}",
+            target_color.space
+        )));
+    }
+    let target_transfer = match target_color.transfer {
+        ImageTransferFunction::Linear => 0,
+        ImageTransferFunction::Srgb | ImageTransferFunction::Sycc => 1,
+        ImageTransferFunction::Bt709 => 2,
+        unsupported => {
+            return Err(Error::Unsupported(format!(
+                "generic GPU output target transfer {unsupported:?} is unsupported"
+            )));
+        }
+    };
+    Ok((source_transfer, target_transfer))
+}
+
 fn image_color_params(layout: &ImageLayout) -> Result<(u32, u32, u8, u8)> {
     let color = match layout.format.color_spec {
         ColorSpecification::Defined(color) => color,
@@ -2328,7 +2501,6 @@ fn image_color_params(layout: &ImageLayout) -> Result<(u32, u32, u8, u8)> {
     let matrix = match color.encoding {
         YcbcrEncoding::Bt601 => 0,
         YcbcrEncoding::Bt709 => 1,
-        YcbcrEncoding::Bt2020 => 2,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "YCbCr GPU output matrix {unsupported:?} is unsupported"
@@ -2806,7 +2978,9 @@ struct ImageOutputUniform {
     logical_size: u32,
     dispatch_width: u32,
     orientation: u32,
-    _padding: [u32; 3],
+    source_transfer: u32,
+    target_transfer: u32,
+    _padding: u32,
 }
 
 const _: () = {
@@ -3292,7 +3466,9 @@ mod tests {
             logical_size: 27,
             dispatch_width: 28,
             orientation: 29,
-            _padding: [30, 31, 32],
+            source_transfer: 30,
+            target_transfer: 31,
+            _padding: 32,
         });
         assert_wgsl_fields(
             include_str!("../shaders/rgb_to_image.wgsl"),
@@ -3327,9 +3503,9 @@ mod tests {
                 "logical_size",
                 "dispatch_width",
                 "orientation",
-                "_padding0",
-                "_padding1",
-                "_padding2",
+                "source_transfer",
+                "target_transfer",
+                "_padding",
             ],
         );
     }
@@ -3465,6 +3641,7 @@ mod tests {
                 sample_type: SampleType::F32,
                 channels: 1,
                 layout: OutputLayout::Planar,
+                color_encoding: OutputColorEncoding::NonColor,
             }],
         };
         let expected = std::mem::size_of::<CopyParams>()

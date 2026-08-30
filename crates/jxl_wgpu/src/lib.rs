@@ -10,6 +10,15 @@
 #![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 
 //! A portable `wgpu` implementation of [`jxl_gpu_protocol::RenderBackend`].
+//!
+//! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
+//! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
+//! compile time rather than silently reinterpreting native-endian `Pod` bytes.
+
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "jxl_wgpu requires a little-endian target because WGSL host-shareable buffer values are little-endian"
+);
 
 mod arena;
 mod autotune;
@@ -19,9 +28,11 @@ mod capability;
 mod context;
 mod display;
 mod error;
+mod memory_budget;
 mod metrics;
 mod pipeline_cache;
 mod planner;
+mod poller;
 mod readback;
 mod scheduler;
 mod session;
@@ -32,10 +43,12 @@ mod video;
 pub use arena::{ArenaAllocation, ArenaPlan, ArenaPlanner};
 pub use autotune::{AdapterFingerprint, AutotuneProfile, KernelVariant, TunedKernel};
 pub use buffer_pool::WgpuBufferPoolStats;
-pub use context::{DirectReadbackPolicy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy};
+pub use context::{
+    DirectReadbackPolicy, ShaderF64Policy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy,
+};
 pub use display::{
-    DisplayPipeline, DisplayPipelineCacheStats, DisplaySubmission, DisplayTexture,
-    DisplayTextureDescriptor,
+    DisplayColorEncoding, DisplayPipeline, DisplayPipelineCacheStats, DisplaySubmission,
+    DisplayTexture, DisplayTextureDescriptor,
 };
 pub use error::{Error, Result};
 pub use jxl_gpu_formats::{
@@ -45,13 +58,22 @@ pub use jxl_gpu_formats::{
     PlaneSampling, RgbChannelOrder, SampleKind, Swizzle, SwizzleComponent, TransferFunction,
     YcbcrEncoding,
 };
+pub use jxl_gpu_protocol::{OutputColorEncoding, RgbColorEncoding, RgbPrimaries};
+pub use memory_budget::{MemoryBudget, MemoryBudgetError, MemoryBudgetSnapshot, MemoryPermit};
 pub use metrics::{AccuracyMetrics, TimingBreakdown};
 pub use planner::{ExecutionPlan, FusedKernel, PlannedDispatch, Planner};
+pub use poller::{
+    SUBMISSION_POLLER_CAPACITY, SubmissionPollPermit, SubmissionPoller, SubmissionPollerError,
+};
 pub use readback::{
-    ImageReadbackLimits, ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats,
-    ImageReadbackSubmission,
+    ImageReadbackBatchResult, ImageReadbackBatchSubmission, ImageReadbackLimits,
+    ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats, ImageReadbackSubmission,
+    UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
 };
 pub use session::{
     GpuFrame, GpuOutputBuffer, SubmissionMode, WgpuFrameSession, WgpuSubmissionStats,
 };
-pub use video::{CpuImageFrame, CpuImageOutput, GpuImageFrame, GpuImageOutput, ImageOutputRequest};
+pub use video::{
+    CpuImageFrame, CpuImageOutput, GpuBufferLease, GpuImageFrame, GpuImageOutput,
+    ImageOutputRequest, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
+};

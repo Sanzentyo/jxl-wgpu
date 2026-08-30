@@ -10,10 +10,13 @@ use jxl_gpu_protocol::{
     Border2d, Extent2d, FrameSessionDesc, GroupId, GroupPayload, HostPlane, MemoryMode, OutputDesc,
     OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole, PrecisionContract,
     PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan, SaveParams, Scale2d,
+    TransferFunction as SourceTransferFunction,
 };
 use jxl_wgpu::{
-    ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, Error, ImageOutputRequest,
-    Packed422Order, PixelFormat, RgbChannelOrder, WgpuBackend, WgpuBackendConfig,
+    ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, Error,
+    ImageOutputRequest, OutputColorEncoding, Packed422Order, PixelFormat, RgbChannelOrder,
+    RgbColorEncoding, RgbPrimaries, TransferFunction, WgpuBackend, WgpuBackendConfig,
+    YcbcrEncoding,
 };
 
 fn backend() -> Option<WgpuBackend> {
@@ -42,7 +45,7 @@ fn frame_desc(extent: Extent2d) -> FrameSessionDesc {
     }
 }
 
-fn plan(extent: Extent2d) -> Arc<RenderPlan> {
+fn plan(extent: Extent2d, source_encoding: RgbColorEncoding) -> Arc<RenderPlan> {
     let output = OutputId(0);
     let channels = vec![PlaneId(0), PlaneId(1), PlaneId(2)];
     Arc::new(RenderPlan {
@@ -78,6 +81,7 @@ fn plan(extent: Extent2d) -> Arc<RenderPlan> {
             sample_type: jxl_gpu_protocol::SampleType::F32,
             channels: 3,
             layout: OutputLayout::Interleaved,
+            color_encoding: OutputColorEncoding::Rgb(source_encoding),
         }],
     })
 }
@@ -120,6 +124,65 @@ fn color(range: ColorRange, location: ChromaLocation2d) -> ColorSpecification {
     ColorSpecification::Defined(ColorSpec::bt709(range, location))
 }
 
+fn rgb_color(space: ColorSpace, transfer: TransferFunction) -> ColorSpecification {
+    ColorSpecification::Defined(ColorSpec {
+        space,
+        encoding: YcbcrEncoding::Undefined,
+        transfer,
+        range: ColorRange::Full,
+        chroma_location: ChromaLocation2d::BOTH,
+    })
+}
+
+fn submit_rgb8(
+    backend: &WgpuBackend,
+    source_encoding: RgbColorEncoding,
+    request_encoding: RgbColorEncoding,
+    target_color: ColorSpecification,
+    samples: [f32; 3],
+) -> Result<Vec<u8>, Error> {
+    let extent = Extent2d::new(1, 1);
+    let channels = [vec![samples[0]], vec![samples[1]], vec![samples[2]]];
+    let mut session = backend.create_session(&frame_desc(extent), plan(extent, source_encoding))?;
+    enqueue(&mut session, extent, &channels);
+    let token = session.submit_image(
+        RenderIntent::Final,
+        ImageOutputRequest::new(
+            request_encoding,
+            PixelFormat::rgb8(RgbChannelOrder::Rgb, false, target_color),
+        ),
+    )?;
+    Ok(session.wait_image(token)?.outputs.remove(0).bytes)
+}
+
+fn srgb_from_linear(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn bt709_to_linear(value: f32) -> f32 {
+    if value < 0.081 {
+        value / 4.5
+    } else {
+        ((value + 0.099) / 1.099).powf(1.0 / 0.45)
+    }
+}
+
+fn quantize8(value: f32) -> u8 {
+    (255.0 * value).round().clamp(0.0, 255.0) as u8
+}
+
 #[test]
 fn canonical_pitch_linear_formats_match_scalar_oracle() {
     let Some(backend) = backend() else {
@@ -129,6 +192,10 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
     let channels = rgb_planes(extent);
     let limited_center = color(ColorRange::Limited, ChromaLocation2d::CENTER);
     let full_center = color(ColorRange::Full, ChromaLocation2d::CENTER);
+    let bt601_limited = ColorSpecification::Defined(ColorSpec::bt601(
+        ColorRange::Limited,
+        ChromaLocation2d::CENTER,
+    ));
     let formats = vec![
         PixelFormat::luma(8, limited_center),
         PixelFormat::luma(16, limited_center),
@@ -136,6 +203,7 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
         PixelFormat::i422(8, 8, limited_center).unwrap(),
         PixelFormat::i420(8, 8, limited_center).unwrap(),
         PixelFormat::nv12(limited_center),
+        PixelFormat::nv12(bt601_limited),
         PixelFormat::nv21(limited_center),
         PixelFormat::nv24(full_center),
         PixelFormat::nv42(full_center),
@@ -155,11 +223,14 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
 
     for format in formats {
         let mut session = backend
-            .create_session(&frame_desc(extent), plan(extent))
+            .create_session(&frame_desc(extent), plan(extent, RgbColorEncoding::BT709))
             .expect("create generic image session");
         enqueue(&mut session, extent, &channels);
         let token = session
-            .submit_image(RenderIntent::Final, ImageOutputRequest::new(format.clone()))
+            .submit_image(
+                RenderIntent::Final,
+                ImageOutputRequest::new(RgbColorEncoding::BT709, format.clone()),
+            )
             .expect("submit generic image readback");
         let frame = session.wait_image(token).expect("wait image readback");
         let expected = convert_rgb_f32([&channels[0], &channels[1], &channels[2]], extent, &format)
@@ -183,11 +254,14 @@ fn nv12_gpu_output_handles_degenerate_odd_edges_without_readback() {
     ] {
         let channels = rgb_planes(extent);
         let mut session = backend
-            .create_session(&frame_desc(extent), plan(extent))
+            .create_session(&frame_desc(extent), plan(extent, RgbColorEncoding::BT709))
             .expect("create zero-copy NV12 session");
         enqueue(&mut session, extent, &channels);
         let frame = session
-            .submit_gpu_image(RenderIntent::Final, ImageOutputRequest::new(format.clone()))
+            .submit_gpu_image(
+                RenderIntent::Final,
+                ImageOutputRequest::new(RgbColorEncoding::BT709, format.clone()),
+            )
             .expect("submit zero-copy NV12");
         let expected = jxl_wgpu::ImageLayout::packed(extent, format.clone()).unwrap();
         assert_eq!(frame.outputs.len(), 1);
@@ -200,5 +274,131 @@ fn nv12_gpu_output_handles_degenerate_odd_edges_without_readback() {
             Some(false)
         );
         session.wait_gpu(frame.token).expect("wait zero-copy NV12");
+    }
+}
+
+#[test]
+fn gpu_output_converts_declared_transfer_functions() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    let samples = [0.18, 0.5, 0.82];
+    let bt709_as_linear = submit_rgb8(
+        &backend,
+        RgbColorEncoding::BT709,
+        RgbColorEncoding::BT709,
+        rgb_color(ColorSpace::Bt709, TransferFunction::Linear),
+        samples,
+    )
+    .expect("BT.709 to linear RGB8");
+    let expected_linear = samples.map(|value| quantize8(bt709_to_linear(value)));
+    assert!(
+        bt709_as_linear
+            .iter()
+            .zip(expected_linear)
+            .all(|(&actual, expected)| actual.abs_diff(expected) <= 1),
+        "GPU linear bytes {bt709_as_linear:?}, expected {expected_linear:?}"
+    );
+
+    let srgb_as_linear = submit_rgb8(
+        &backend,
+        RgbColorEncoding::SRGB_BT709,
+        RgbColorEncoding::SRGB_BT709,
+        rgb_color(ColorSpace::Bt709, TransferFunction::Linear),
+        samples,
+    )
+    .expect("sRGB to linear RGB8");
+    let expected_srgb_as_linear = samples.map(|value| quantize8(srgb_to_linear(value)));
+    assert!(
+        srgb_as_linear
+            .iter()
+            .zip(expected_srgb_as_linear)
+            .all(|(&actual, expected)| actual.abs_diff(expected) <= 1),
+        "GPU sRGB-decoded bytes {srgb_as_linear:?}, expected {expected_srgb_as_linear:?}"
+    );
+
+    let identity_linear = submit_rgb8(
+        &backend,
+        RgbColorEncoding::LINEAR_BT709,
+        RgbColorEncoding::LINEAR_BT709,
+        rgb_color(ColorSpace::Bt709, TransferFunction::Linear),
+        samples,
+    )
+    .expect("linear to linear RGB8");
+    assert_eq!(identity_linear, samples.map(quantize8));
+
+    let srgb = submit_rgb8(
+        &backend,
+        RgbColorEncoding::LINEAR_BT709,
+        RgbColorEncoding::LINEAR_BT709,
+        rgb_color(ColorSpace::Bt709, TransferFunction::Srgb),
+        samples,
+    )
+    .expect("linear to sRGB RGB8");
+    let expected_srgb = samples.map(|value| quantize8(srgb_from_linear(value)));
+    assert!(
+        srgb.iter()
+            .zip(expected_srgb)
+            .all(|(&actual, expected)| actual.abs_diff(expected) <= 1),
+        "GPU sRGB bytes {srgb:?}, expected {expected_srgb:?}"
+    );
+    assert_ne!(
+        identity_linear, srgb,
+        "target transfer must change output bytes"
+    );
+}
+
+#[test]
+fn generic_output_rejects_mismatched_or_unsupported_color_contracts() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    let supported_target = rgb_color(ColorSpace::Bt709, TransferFunction::Bt709);
+    let mismatch = submit_rgb8(
+        &backend,
+        RgbColorEncoding::BT709,
+        RgbColorEncoding::SRGB_BT709,
+        supported_target,
+        [0.25, 0.5, 0.75],
+    )
+    .expect_err("source encoding mismatch must fail");
+    assert!(matches!(mismatch, Error::InvalidPayload(_)));
+
+    for (name, source, target) in [
+        (
+            "wide source",
+            RgbColorEncoding {
+                primaries: RgbPrimaries::Bt2020,
+                transfer: SourceTransferFunction::Linear,
+            },
+            supported_target,
+        ),
+        (
+            "HDR source",
+            RgbColorEncoding {
+                primaries: RgbPrimaries::Bt709,
+                transfer: SourceTransferFunction::Pq,
+            },
+            supported_target,
+        ),
+        (
+            "wide target",
+            RgbColorEncoding::BT709,
+            rgb_color(ColorSpace::Bt2020, TransferFunction::Bt2020),
+        ),
+        (
+            "HDR target",
+            RgbColorEncoding::BT709,
+            rgb_color(ColorSpace::Bt709, TransferFunction::Pq),
+        ),
+        (
+            "undefined target",
+            RgbColorEncoding::BT709,
+            ColorSpecification::Undefined,
+        ),
+    ] {
+        let error =
+            submit_rgb8(&backend, source, source, target, [0.25, 0.5, 0.75]).expect_err(name);
+        assert!(matches!(error, Error::Unsupported(_)), "{name}: {error}");
     }
 }

@@ -161,7 +161,7 @@ pub struct EncoderCapabilities {
 
 impl EncoderCapabilities {
     #[must_use]
-    pub fn prototype() -> Self {
+    pub fn empty() -> Self {
         Self {
             profiles: Vec::new(),
             max_progressive_passes: 0,
@@ -188,7 +188,7 @@ impl EncoderCapabilities {
                 requested: requested_passes,
             });
         }
-        if request.frame_index.get() != 0 && !self.animation {
+        if (request.animation.is_animation() || request.frame_index.get() != 0) && !self.animation {
             return Err(UnsupportedFeature::Animation);
         }
         if self.determinism < request.minimum_determinism {
@@ -200,5 +200,46 @@ impl EncoderCapabilities {
     #[must_use]
     pub fn has_stage(&self, stage: KernelStage) -> bool {
         self.implemented_stages.contains(&stage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use crate::{AnimationHeader, FrameIndex, FrameOptions};
+
+    use super::*;
+
+    #[test]
+    fn animation_header_is_negotiated_even_for_frame_zero() {
+        let capabilities = EncoderCapabilities {
+            profiles: vec![ProfileCapability::ModularLossless {
+                min_bits_per_sample: 8,
+                max_bits_per_sample: 8,
+            }],
+            max_progressive_passes: 1,
+            animation: false,
+            determinism: Determinism::Assembly,
+            implemented_stages: Vec::new(),
+        };
+        let request = FrameEncodeRequest {
+            frame_index: FrameIndex::new(0),
+            is_last: true,
+            profile: EncodeProfile::ModularLossless { bits_per_sample: 8 },
+            progressive: ProgressivePlan::single(),
+            minimum_determinism: Determinism::Assembly,
+            animation: AnimationHeader::Animation {
+                ticks_per_second_numerator: NonZeroU32::new(24).unwrap(),
+                ticks_per_second_denominator: NonZeroU32::new(1).unwrap(),
+                num_loops: 0,
+                have_timecodes: false,
+            },
+            options: FrameOptions::default(),
+        };
+        assert_eq!(
+            capabilities.negotiate(&request),
+            Err(UnsupportedFeature::Animation)
+        );
     }
 }

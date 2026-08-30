@@ -168,6 +168,7 @@ fn fused_chroma_2d_matches_separable_scalar_on_odd_mirror_edges() -> Result<()> 
             sample_type: SampleType::F32,
             channels: 1,
             layout: OutputLayout::Planar,
+            color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
         }],
     });
     let frame = frame(output_extent);
@@ -343,6 +344,7 @@ fn fused_gaborish_rgb_matches_scalar_with_channel_specific_weights() -> Result<(
             sample_type: SampleType::F32,
             channels: 3,
             layout: OutputLayout::Planar,
+            color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
         }],
     });
     let frame = frame(extent);

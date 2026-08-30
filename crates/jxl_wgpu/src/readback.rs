@@ -4,6 +4,8 @@
 // license that can be found in the LICENSE file.
 
 use std::future::Future;
+use std::num::NonZeroU64;
+use std::ops::Range;
 use std::pin::Pin;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
@@ -15,7 +17,10 @@ use jxl_gpu_protocol::PlaneData;
 use jxl_gpu_protocol::{Extent2d, OutputDesc, OutputId, RenderedOutput, SampleType};
 
 use crate::upload::aligned_buffer_size;
-use crate::{CpuImageFrame, CpuImageOutput, Error, GpuImageFrame, ImageLayout, Result};
+use crate::{
+    CpuImageFrame, CpuImageOutput, Error, GpuBufferLease, GpuImageFrame, ImageLayout, MemoryBudget,
+    MemoryBudgetSnapshot, MemoryPermit, Result, UnvalidatedGpuImageFrame,
+};
 
 #[derive(Debug)]
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -180,13 +185,17 @@ fn ensure_sample_count(data: PlaneData, expected: usize) -> Result<PlaneData> {
 /// Memory limit applied to one aggregate generic-image readback submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageReadbackLimits {
+    /// Maximum staging bytes in one readback submission.
     pub max_transient_bytes: u64,
+    /// Maximum staging bytes held by all concurrent submissions sharing this pipeline budget.
+    pub max_in_flight_bytes: u64,
 }
 
 impl Default for ImageReadbackLimits {
     fn default() -> Self {
         Self {
             max_transient_bytes: 256 * 1024 * 1024,
+            max_in_flight_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -194,11 +203,15 @@ impl Default for ImageReadbackLimits {
 /// Byte accounting known before a generic-image readback is submitted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageReadbackStats {
+    /// Number of source frames represented by this submission.
+    pub frame_count: usize,
     pub output_count: usize,
     /// Sum of the addressable bytes declared by all image layouts.
     pub logical_bytes: u64,
     /// Size of the single aggregate staging buffer, including four-byte copy padding.
     pub staging_bytes: u64,
+    /// Bytes present only to satisfy four-byte buffer-copy alignment.
+    pub padding_bytes: u64,
 }
 
 /// Completed explicit CPU readback of one decoder-owned GPU image frame.
@@ -208,18 +221,39 @@ pub struct ImageReadbackResult {
     pub stats: ImageReadbackStats,
 }
 
+/// Completed explicit CPU readback of multiple decoder-owned GPU image frames.
+#[derive(Clone, Debug)]
+pub struct ImageReadbackBatchResult {
+    pub frames: Vec<CpuImageFrame>,
+    pub stats: ImageReadbackStats,
+}
+
+/// Completed explicit readback whose producing codec frame has not been validated.
+///
+/// No changed regions or authoritative frame metadata are exposed. The bytes must be discarded if
+/// the producer later reports validation failure.
+#[derive(Clone, Debug)]
+pub struct UnvalidatedImageReadbackResult {
+    pub token: jxl_gpu_protocol::SubmissionToken,
+    pub outputs: Vec<CpuImageOutput>,
+    pub stats: ImageReadbackStats,
+}
+
 struct ImageReadbackPipelineInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    poller: crate::SubmissionPoller,
     limits: ImageReadbackLimits,
+    memory_budget: MemoryBudget,
 }
 
-/// Reusable batch readback state for generic pitch-linear decoder output.
+/// Reusable aggregate readback state for generic pitch-linear decoder output.
 ///
-/// Every output in a [`GpuImageFrame`] is copied into one aggregate `MAP_READ` buffer. Source and
-/// destination copy ranges are padded independently to four bytes, while returned byte vectors
-/// contain only each layout's `logical_size` bytes. This is an explicit host transfer of GPU
-/// decode results; it is not a CPU codec fallback.
+/// [`Self::submit_frames`] copies every output across every supplied [`GpuImageFrame`] into one
+/// aggregate `MAP_READ` buffer and records all copies in one command buffer. Source and destination
+/// copy ranges are padded independently to four bytes, while returned byte vectors contain only
+/// each layout's `logical_size` bytes. This is an explicit host transfer of GPU decode results; it
+/// is not a CPU codec fallback or a claim that the codec submissions themselves were batched.
 #[derive(Clone)]
 pub struct ImageReadbackPipeline {
     inner: Arc<ImageReadbackPipelineInner>,
@@ -238,29 +272,47 @@ impl ImageReadbackPipeline {
     /// Uses the backend's transient-memory policy and exact device/queue pair.
     #[must_use]
     pub fn new(backend: &crate::WgpuBackend) -> Self {
-        Self::from_device_queue(
-            backend.device().clone(),
-            backend.queue().clone(),
-            ImageReadbackLimits {
-                max_transient_bytes: backend.config.memory.max_transient_bytes,
-            },
-        )
+        Self {
+            inner: Arc::new(ImageReadbackPipelineInner {
+                device: backend.device().clone(),
+                queue: backend.queue().clone(),
+                poller: backend.submission_poller().clone(),
+                limits: ImageReadbackLimits {
+                    max_transient_bytes: backend.config.memory.max_transient_bytes,
+                    max_in_flight_bytes: backend.config.memory.max_in_flight_transient_bytes,
+                },
+                memory_budget: backend.transient_memory_budget().clone(),
+            }),
+        }
     }
 
     /// Creates an application-owned readback pipeline for outputs from the same device and queue.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an execution error if the native bounded poll worker cannot be created.
     pub fn from_device_queue(
         device: wgpu::Device,
         queue: wgpu::Queue,
         limits: ImageReadbackLimits,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let memory_limit = NonZeroU64::new(limits.max_in_flight_bytes).ok_or_else(|| {
+            Error::ResourceLimit("readback max_in_flight_bytes must be greater than zero".into())
+        })?;
+        let poller = crate::SubmissionPoller::new(device.clone()).map_err(|error| {
+            Error::Execution(format!(
+                "could not start the bounded GPU poll worker: {error}"
+            ))
+        })?;
+        Ok(Self {
             inner: Arc::new(ImageReadbackPipelineInner {
                 device,
                 queue,
+                poller,
                 limits,
+                memory_budget: MemoryBudget::new(memory_limit),
             }),
-        }
+        })
     }
 
     #[must_use]
@@ -268,9 +320,61 @@ impl ImageReadbackPipeline {
         self.inner.limits
     }
 
-    /// Records one aggregate copy and returns immediately without a host wait.
+    /// Returns aggregate byte-weighted admission state shared by all pipeline clones.
+    #[must_use]
+    pub fn memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.inner.memory_budget.snapshot()
+    }
+
+    /// Records one frame's outputs as one aggregate copy and returns without a host wait.
+    ///
+    /// Use [`Self::submit_frames`] when multiple already-produced GPU frames should share one
+    /// staging allocation, queue submission, mapping callback, and completion future.
     pub fn submit(&self, frame: &GpuImageFrame) -> Result<ImageReadbackSubmission> {
-        let plan = ReadbackPlan::new(&self.inner.device, self.inner.limits, frame)?;
+        self.submit_frames(std::slice::from_ref(frame))
+            .map(ImageReadbackSubmission::from_batch)
+    }
+
+    /// Records one explicitly unvalidated frame for readback without waiting for codec validation.
+    ///
+    /// The pipeline must use the producer's device and queue. The copy is then ordered after the
+    /// producer submission. Completing this readback does not validate the codec frame; if later
+    /// validation fails, the returned bytes are non-authoritative and must be discarded.
+    pub fn submit_unvalidated(
+        &self,
+        frame: &UnvalidatedGpuImageFrame,
+    ) -> Result<UnvalidatedImageReadbackSubmission> {
+        let transport_frame = GpuImageFrame {
+            token: frame.token,
+            outputs: frame
+                .outputs
+                .iter()
+                .map(|output| crate::GpuImageOutput {
+                    id: output.id,
+                    layout: output.layout.clone(),
+                    buffer: output.buffer.clone(),
+                })
+                .collect(),
+            // This value is private transport metadata only. The public unvalidated result does
+            // not expose it as an authoritative changed-region statement.
+            changed: jxl_gpu_protocol::ChangedRegions::default(),
+        };
+        self.submit(&transport_frame)
+            .map(UnvalidatedImageReadbackSubmission::new)
+    }
+
+    /// Records all outputs from multiple GPU frames into one aggregate readback submission.
+    ///
+    /// Frame order, output order, submission tokens, changed regions, layouts, and logical byte
+    /// boundaries are preserved in [`ImageReadbackBatchResult`]. This method only coalesces the
+    /// explicit buffer-to-host transport; it does not coalesce the codec submissions that produced
+    /// the frames.
+    pub fn submit_frames(&self, frames: &[GpuImageFrame]) -> Result<ImageReadbackBatchSubmission> {
+        let plan = ReadbackPlan::new(&self.inner.device, self.inner.limits, frames)?;
+        let memory_permit = self
+            .inner
+            .memory_budget
+            .try_reserve(plan.stats.staging_bytes)?;
         let staging = Arc::new(self.inner.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu aggregate image readback"),
             size: plan.stats.staging_bytes,
@@ -283,9 +387,13 @@ impl ImageReadbackPipeline {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu aggregate image readback"),
                 });
-        for (output, entry) in frame.outputs.iter().zip(&plan.entries) {
+        for (output, entry) in frames
+            .iter()
+            .flat_map(|frame| &frame.outputs)
+            .zip(&plan.entries)
+        {
             commands.copy_buffer_to_buffer(
-                &output.buffer,
+                output.buffer.as_wgpu_buffer(),
                 0,
                 &staging,
                 entry.staging_offset,
@@ -295,36 +403,41 @@ impl ImageReadbackPipeline {
 
         let completion = Arc::new(BatchMapCompletion::default());
         let callback_completion = Arc::clone(&completion);
-        commands.map_buffer_on_submit(&staging, wgpu::MapMode::Read, .., move |result| {
+        let lifetime = Arc::new(ImageReadbackLifetime {
+            staging,
+            source_leases: frames
+                .iter()
+                .flat_map(|frame| &frame.outputs)
+                .map(|output| output.buffer.clone())
+                .collect(),
+            memory_permit,
+        });
+        let callback_lifetime = Arc::clone(&lifetime);
+        commands.map_buffer_on_submit(&lifetime.staging, wgpu::MapMode::Read, .., move |result| {
             callback_completion.complete(
                 result.map_err(|error| format!("aggregate image mapping failed: {error}")),
             );
+            drop(callback_lifetime);
         });
+        let poll_permit = self.inner.poller.try_reserve()?;
         let submission = self.inner.queue.submit([commands.finish()]);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let poll_device = self.inner.device.clone();
-            let poll_submission = submission.clone();
-            let poll_completion = Arc::clone(&completion);
-            std::thread::spawn(move || {
-                if let Err(error) = poll_device.poll(wgpu::PollType::Wait {
-                    submission_index: Some(poll_submission),
-                    timeout: None,
-                }) {
-                    poll_completion.complete(Err(format!("GPU readback poll failed: {error}")));
-                }
-            });
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission.clone(), move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!(
+                "GPU readback poll registration failed: {error}"
+            )));
         }
 
-        Ok(ImageReadbackSubmission {
+        Ok(ImageReadbackBatchSubmission {
             device: self.inner.device.clone(),
             submission,
-            staging: Some(staging),
+            lifetime: Some(lifetime),
             completion,
             entries: plan.entries,
+            frames: plan.frames,
             stats: plan.stats,
-            token: frame.token,
-            changed: frame.changed.clone(),
         })
     }
 }
@@ -337,8 +450,16 @@ struct ReadbackEntry {
     copy_size: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ReadbackFrame {
+    token: jxl_gpu_protocol::SubmissionToken,
+    changed: jxl_gpu_protocol::ChangedRegions,
+    entries: Range<usize>,
+}
+
 struct ReadbackPlan {
     entries: Vec<ReadbackEntry>,
+    frames: Vec<ReadbackFrame>,
     stats: ImageReadbackStats,
 }
 
@@ -346,46 +467,123 @@ impl ReadbackPlan {
     fn new(
         device: &wgpu::Device,
         limits: ImageReadbackLimits,
-        frame: &GpuImageFrame,
+        source_frames: &[GpuImageFrame],
     ) -> Result<Self> {
-        if frame.outputs.is_empty() {
-            return Err(Error::ImageReadbackEmpty);
+        if source_frames.is_empty() {
+            return Err(Error::ImageReadbackNoFrames);
         }
+
+        let mut metadata = Vec::new();
+        let mut logical_sizes = Vec::with_capacity(source_frames.len());
+        for (frame_index, frame) in source_frames.iter().enumerate() {
+            if frame.outputs.is_empty() {
+                return Err(Error::ImageReadbackFrameEmpty { frame: frame_index });
+            }
+            let mut frame_sizes = Vec::with_capacity(frame.outputs.len());
+            for (output_index, output) in frame.outputs.iter().enumerate() {
+                let layout = ImageLayout::from_planes(
+                    output.layout.extent,
+                    output.layout.format.clone(),
+                    output.layout.planes.clone(),
+                )?;
+                if !output.buffer.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+                    return Err(Error::ImageReadbackSourceUsage {
+                        frame: frame_index,
+                        output: output_index,
+                    });
+                }
+                let copy_size = aligned_buffer_size(layout.logical_size)?;
+                if output.buffer.size() < copy_size {
+                    return Err(Error::ImageReadbackSourceSize {
+                        frame: frame_index,
+                        output: output_index,
+                        required: copy_size,
+                        actual: output.buffer.size(),
+                    });
+                }
+                frame_sizes.push(layout.logical_size);
+                metadata.push((output.id, layout));
+            }
+            logical_sizes.push(frame_sizes);
+        }
+
+        let packing =
+            ReadbackPacking::new(&logical_sizes, limits, device.limits().max_buffer_size)?;
+        let entries = metadata
+            .into_iter()
+            .zip(&packing.entries)
+            .map(|((id, layout), packed)| ReadbackEntry {
+                id,
+                layout,
+                staging_offset: packed.staging_offset,
+                copy_size: packed.copy_size,
+            })
+            .collect();
+        let frames = source_frames
+            .iter()
+            .zip(packing.frame_entries)
+            .map(|(frame, entries)| ReadbackFrame {
+                token: frame.token,
+                changed: frame.changed.clone(),
+                entries,
+            })
+            .collect();
+        Ok(Self {
+            entries,
+            frames,
+            stats: packing.stats,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedReadbackEntry {
+    staging_offset: u64,
+    copy_size: u64,
+}
+
+#[derive(Debug)]
+struct ReadbackPacking {
+    entries: Vec<PackedReadbackEntry>,
+    frame_entries: Vec<Range<usize>>,
+    stats: ImageReadbackStats,
+}
+
+impl ReadbackPacking {
+    /// Pure checked packing logic, deliberately independent of a GPU device for deterministic
+    /// limit and offset tests.
+    fn new(
+        logical_sizes: &[Vec<u64>],
+        limits: ImageReadbackLimits,
+        device_limit: u64,
+    ) -> Result<Self> {
+        if logical_sizes.is_empty() {
+            return Err(Error::ImageReadbackNoFrames);
+        }
+
+        let mut entries = Vec::new();
+        let mut frame_entries = Vec::with_capacity(logical_sizes.len());
         let mut logical_bytes = 0_u64;
         let mut staging_bytes = 0_u64;
-        let mut entries = Vec::with_capacity(frame.outputs.len());
-        for (output_index, output) in frame.outputs.iter().enumerate() {
-            let layout = ImageLayout::from_planes(
-                output.layout.extent,
-                output.layout.format.clone(),
-                output.layout.planes.clone(),
-            )?;
-            if !output.buffer.usage().contains(wgpu::BufferUsages::COPY_SRC) {
-                return Err(Error::ImageReadbackSourceUsage {
-                    output: output_index,
-                });
+        for (frame_index, frame_sizes) in logical_sizes.iter().enumerate() {
+            if frame_sizes.is_empty() {
+                return Err(Error::ImageReadbackFrameEmpty { frame: frame_index });
             }
-            let copy_size = aligned_buffer_size(layout.logical_size)?;
-            if output.buffer.size() < copy_size {
-                return Err(Error::ImageReadbackSourceSize {
-                    output: output_index,
-                    required: copy_size,
-                    actual: output.buffer.size(),
+            let first_entry = entries.len();
+            for &logical_size in frame_sizes {
+                let copy_size = aligned_buffer_size(logical_size)?;
+                entries.push(PackedReadbackEntry {
+                    staging_offset: staging_bytes,
+                    copy_size,
                 });
+                staging_bytes = staging_bytes
+                    .checked_add(copy_size)
+                    .ok_or(Error::BufferSizeOverflow)?;
+                logical_bytes = logical_bytes
+                    .checked_add(logical_size)
+                    .ok_or(Error::BufferSizeOverflow)?;
             }
-            let staging_offset = staging_bytes;
-            staging_bytes = staging_bytes
-                .checked_add(copy_size)
-                .ok_or(Error::BufferSizeOverflow)?;
-            logical_bytes = logical_bytes
-                .checked_add(layout.logical_size)
-                .ok_or(Error::BufferSizeOverflow)?;
-            entries.push(ReadbackEntry {
-                id: output.id,
-                layout,
-                staging_offset,
-                copy_size,
-            });
+            frame_entries.push(first_entry..entries.len());
         }
         if staging_bytes > limits.max_transient_bytes {
             return Err(Error::ImageReadbackTransientLimit {
@@ -393,7 +591,6 @@ impl ReadbackPlan {
                 limit: limits.max_transient_bytes,
             });
         }
-        let device_limit = device.limits().max_buffer_size;
         if staging_bytes > device_limit {
             return Err(Error::ImageReadbackDeviceLimit {
                 required: staging_bytes,
@@ -402,10 +599,15 @@ impl ReadbackPlan {
         }
         Ok(Self {
             entries,
+            frame_entries,
             stats: ImageReadbackStats {
-                output_count: frame.outputs.len(),
+                frame_count: logical_sizes.len(),
+                output_count: logical_sizes.iter().map(Vec::len).sum(),
                 logical_bytes,
                 staging_bytes,
+                padding_bytes: staging_bytes
+                    .checked_sub(logical_bytes)
+                    .ok_or(Error::BufferSizeOverflow)?,
             },
         })
     }
@@ -425,13 +627,17 @@ struct BatchMapState {
 
 impl BatchMapCompletion {
     fn complete(&self, result: std::result::Result<(), String>) {
-        let mut state = lock_unpoisoned(&self.state);
-        if state.result.is_none() {
-            state.result = Some(result);
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
+        let waker = {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.result.is_some() {
+                return;
             }
-            self.condition.notify_all();
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.condition.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 
@@ -465,30 +671,88 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// In-flight aggregate readback. Await it or call [`Self::wait`] exactly once.
+/// In-flight aggregate readback for multiple GPU frames.
+///
+/// Await it or call [`Self::wait`] exactly once. Dropping the future before completion is safe:
+/// the mapping callback retains the staging buffer, source leases, and memory permit until the GPU
+/// has finished the copy.
 #[must_use = "readback submissions do nothing useful unless awaited or waited"]
-pub struct ImageReadbackSubmission {
+pub struct ImageReadbackBatchSubmission {
     device: wgpu::Device,
     submission: wgpu::SubmissionIndex,
-    staging: Option<Arc<wgpu::Buffer>>,
+    lifetime: Option<Arc<ImageReadbackLifetime>>,
     completion: Arc<BatchMapCompletion>,
     entries: Vec<ReadbackEntry>,
+    frames: Vec<ReadbackFrame>,
     stats: ImageReadbackStats,
-    token: jxl_gpu_protocol::SubmissionToken,
-    changed: jxl_gpu_protocol::ChangedRegions,
 }
 
-impl std::fmt::Debug for ImageReadbackSubmission {
+/// In-flight aggregate readback for one GPU frame.
+///
+/// This is the single-frame convenience returned by [`ImageReadbackPipeline::submit`]. Use
+/// [`ImageReadbackPipeline::submit_frames`] to coalesce transport for multiple frames.
+#[must_use = "readback submissions do nothing useful unless awaited or waited"]
+pub struct ImageReadbackSubmission {
+    batch: ImageReadbackBatchSubmission,
+}
+
+/// In-flight explicit readback of one unvalidated GPU frame.
+///
+/// Dropping the future is safe. The callback retains its staging buffer, source buffer leases, and
+/// byte-budget permit until GPU completion, just like [`ImageReadbackSubmission`].
+#[must_use = "unvalidated readback submissions do nothing useful unless awaited or waited"]
+pub struct UnvalidatedImageReadbackSubmission {
+    submission: ImageReadbackSubmission,
+}
+
+struct ImageReadbackLifetime {
+    staging: Arc<wgpu::Buffer>,
+    source_leases: Vec<GpuBufferLease>,
+    memory_permit: MemoryPermit,
+}
+
+impl std::fmt::Debug for ImageReadbackLifetime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ImageReadbackSubmission")
+            .debug_struct("ImageReadbackLifetime")
+            .field("staging_bytes", &self.staging.size())
+            .field("source_count", &self.source_leases.len())
+            .field("reserved_bytes", &self.memory_permit.bytes())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ImageReadbackBatchSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImageReadbackBatchSubmission")
             .field("submission", &self.submission)
             .field("stats", &self.stats)
             .finish_non_exhaustive()
     }
 }
 
-impl ImageReadbackSubmission {
+impl std::fmt::Debug for ImageReadbackSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImageReadbackSubmission")
+            .field("submission", &self.batch.submission)
+            .field("stats", &self.batch.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for UnvalidatedImageReadbackSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnvalidatedImageReadbackSubmission")
+            .field("submission", self.submission.submission())
+            .field("stats", &self.submission.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImageReadbackBatchSubmission {
     #[must_use]
     pub const fn stats(&self) -> ImageReadbackStats {
         self.stats
@@ -499,7 +763,7 @@ impl ImageReadbackSubmission {
         &self.submission
     }
 
-    pub fn wait(self) -> Result<ImageReadbackResult> {
+    pub fn wait(self) -> Result<ImageReadbackBatchResult> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut submission = self;
@@ -515,58 +779,72 @@ impl ImageReadbackSubmission {
         }
     }
 
-    fn finish(&mut self, mapping: std::result::Result<(), String>) -> Result<ImageReadbackResult> {
-        mapping.map_err(Error::Execution)?;
-        let staging = self
-            .staging
+    fn finish(
+        &mut self,
+        mapping: std::result::Result<(), String>,
+    ) -> Result<ImageReadbackBatchResult> {
+        let lifetime = self
+            .lifetime
             .take()
-            .ok_or_else(|| Error::Execution("image readback was already consumed".into()))?;
-        let mapped = staging
+            .ok_or_else(|| Error::Execution("batch image readback was already consumed".into()))?;
+        mapping.map_err(Error::Execution)?;
+        let mapped = lifetime
+            .staging
             .slice(..)
             .get_mapped_range()
             .map_err(|error| Error::Execution(format!("mapped image range is invalid: {error}")))?;
-        let outputs = self
-            .entries
+        let frames = self
+            .frames
             .iter()
-            .map(|entry| {
-                let start =
-                    usize::try_from(entry.staging_offset).map_err(|_| Error::BufferSizeOverflow)?;
-                let logical_size = usize::try_from(entry.layout.logical_size)
-                    .map_err(|_| Error::BufferSizeOverflow)?;
-                let end = start
-                    .checked_add(logical_size)
-                    .ok_or(Error::BufferSizeOverflow)?;
-                let bytes = mapped
-                    .get(start..end)
-                    .ok_or_else(|| {
-                        Error::Execution(
-                            "aggregate mapped output was shorter than its readback plan".into(),
-                        )
-                    })?
-                    .to_vec();
-                Ok(CpuImageOutput {
-                    id: entry.id,
-                    layout: entry.layout.clone(),
-                    bytes,
+            .map(|frame| {
+                let entries = self.entries.get(frame.entries.clone()).ok_or_else(|| {
+                    Error::Execution("batch readback frame range escaped its output plan".into())
+                })?;
+                let outputs = entries
+                    .iter()
+                    .map(|entry| {
+                        let start = usize::try_from(entry.staging_offset)
+                            .map_err(|_| Error::BufferSizeOverflow)?;
+                        let logical_size = usize::try_from(entry.layout.logical_size)
+                            .map_err(|_| Error::BufferSizeOverflow)?;
+                        let end = start
+                            .checked_add(logical_size)
+                            .ok_or(Error::BufferSizeOverflow)?;
+                        let bytes = mapped
+                            .get(start..end)
+                            .ok_or_else(|| {
+                                Error::Execution(
+                                    "aggregate mapped output was shorter than its readback plan"
+                                        .into(),
+                                )
+                            })?
+                            .to_vec();
+                        Ok(CpuImageOutput {
+                            id: entry.id,
+                            layout: entry.layout.clone(),
+                            bytes,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(CpuImageFrame {
+                    token: frame.token,
+                    outputs,
+                    changed: frame.changed.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>();
         drop(mapped);
-        staging.unmap();
-        let outputs = outputs?;
-        Ok(ImageReadbackResult {
-            frame: CpuImageFrame {
-                token: self.token,
-                outputs,
-                changed: self.changed.clone(),
-            },
+        lifetime.staging.unmap();
+        drop(lifetime);
+        Ok(ImageReadbackBatchResult {
+            frames: frames?,
             stats: self.stats,
         })
     }
 }
 
-impl Future for ImageReadbackSubmission {
-    type Output = Result<ImageReadbackResult>;
+impl Future for ImageReadbackBatchSubmission {
+    type Output = Result<ImageReadbackBatchResult>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let submission = self.get_mut();
@@ -580,14 +858,119 @@ impl Future for ImageReadbackSubmission {
     }
 }
 
+impl ImageReadbackSubmission {
+    fn from_batch(batch: ImageReadbackBatchSubmission) -> Self {
+        debug_assert_eq!(batch.stats.frame_count, 1);
+        Self { batch }
+    }
+
+    #[must_use]
+    pub const fn stats(&self) -> ImageReadbackStats {
+        self.batch.stats()
+    }
+
+    #[must_use]
+    pub const fn submission(&self) -> &wgpu::SubmissionIndex {
+        self.batch.submission()
+    }
+
+    pub fn wait(self) -> Result<ImageReadbackResult> {
+        single_readback_result(self.batch.wait()?)
+    }
+}
+
+impl Future for ImageReadbackSubmission {
+    type Output = Result<ImageReadbackResult>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let submission = self.get_mut();
+        match Pin::new(&mut submission.batch).poll(context) {
+            Poll::Ready(result) => Poll::Ready(result.and_then(single_readback_result)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl UnvalidatedImageReadbackSubmission {
+    fn new(submission: ImageReadbackSubmission) -> Self {
+        Self { submission }
+    }
+
+    #[must_use]
+    pub const fn stats(&self) -> ImageReadbackStats {
+        self.submission.stats()
+    }
+
+    #[must_use]
+    pub const fn submission(&self) -> &wgpu::SubmissionIndex {
+        self.submission.submission()
+    }
+
+    pub fn wait(self) -> Result<UnvalidatedImageReadbackResult> {
+        Ok(unvalidated_readback_result(self.submission.wait()?))
+    }
+}
+
+impl Future for UnvalidatedImageReadbackSubmission {
+    type Output = Result<UnvalidatedImageReadbackResult>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let submission = self.get_mut();
+        match Pin::new(&mut submission.submission).poll(context) {
+            Poll::Ready(result) => Poll::Ready(result.map(unvalidated_readback_result)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn unvalidated_readback_result(result: ImageReadbackResult) -> UnvalidatedImageReadbackResult {
+    UnvalidatedImageReadbackResult {
+        token: result.frame.token,
+        outputs: result.frame.outputs,
+        stats: result.stats,
+    }
+}
+
+fn single_readback_result(mut batch: ImageReadbackBatchResult) -> Result<ImageReadbackResult> {
+    if batch.frames.len() != 1 {
+        return Err(Error::Execution(format!(
+            "single-frame readback completed with {} frames",
+            batch.frames.len()
+        )));
+    }
+    Ok(ImageReadbackResult {
+        frame: batch.frames.remove(0),
+        stats: batch.stats,
+    })
+}
+
 #[cfg(test)]
 mod batch_tests {
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use jxl_gpu_formats::{Channel, PixelFormat, SampleKind};
-    use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, SubmissionToken};
+    use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
     use wgpu::util::DeviceExt;
 
     use super::*;
     use crate::{GpuImageOutput, WgpuBackendConfig};
+
+    struct ReentrantWake {
+        completion: Arc<BatchMapCompletion>,
+        observed_unlocked: Arc<AtomicBool>,
+    }
+
+    impl std::task::Wake for ReentrantWake {
+        fn wake(self: Arc<Self>) {
+            let _guard = self
+                .completion
+                .state
+                .try_lock()
+                .expect("completion mutex must be unlocked before invoking a waker");
+            self.observed_unlocked.store(true, Ordering::Release);
+        }
+    }
 
     fn backend() -> Option<crate::WgpuBackend> {
         match pollster::block_on(crate::WgpuBackend::request_default(WgpuBackendConfig {
@@ -625,16 +1008,106 @@ mod batch_tests {
         GpuImageOutput {
             id: OutputId(id),
             layout,
-            buffer,
+            buffer: crate::GpuBufferLease::new(buffer),
+        }
+    }
+
+    fn frame_with_token(token: u64, outputs: Vec<GpuImageOutput>) -> GpuImageFrame {
+        GpuImageFrame {
+            token: SubmissionToken(token),
+            outputs,
+            changed: ChangedRegions::default(),
         }
     }
 
     fn frame(outputs: Vec<GpuImageOutput>) -> GpuImageFrame {
-        GpuImageFrame {
-            token: SubmissionToken(7),
-            outputs,
-            changed: ChangedRegions::default(),
-        }
+        frame_with_token(7, outputs)
+    }
+
+    #[test]
+    fn pure_cross_frame_packing_reports_ranges_offsets_and_padding() {
+        let packing = ReadbackPacking::new(
+            &[vec![9, 4], vec![1, 6]],
+            ImageReadbackLimits {
+                max_transient_bytes: 28,
+                max_in_flight_bytes: 28,
+            },
+            28,
+        )
+        .unwrap();
+        assert_eq!(packing.frame_entries, [0..2, 2..4]);
+        assert_eq!(
+            packing.entries,
+            [
+                PackedReadbackEntry {
+                    staging_offset: 0,
+                    copy_size: 12,
+                },
+                PackedReadbackEntry {
+                    staging_offset: 12,
+                    copy_size: 4,
+                },
+                PackedReadbackEntry {
+                    staging_offset: 16,
+                    copy_size: 4,
+                },
+                PackedReadbackEntry {
+                    staging_offset: 20,
+                    copy_size: 8,
+                },
+            ]
+        );
+        assert_eq!(
+            packing.stats,
+            ImageReadbackStats {
+                frame_count: 2,
+                output_count: 4,
+                logical_bytes: 20,
+                staging_bytes: 28,
+                padding_bytes: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn pure_cross_frame_packing_typed_rejects_shape_limits_and_overflow() {
+        let limits = ImageReadbackLimits {
+            max_transient_bytes: u64::MAX,
+            max_in_flight_bytes: u64::MAX,
+        };
+        assert!(matches!(
+            ReadbackPacking::new(&[], limits, u64::MAX),
+            Err(Error::ImageReadbackNoFrames)
+        ));
+        assert!(matches!(
+            ReadbackPacking::new(&[vec![4], vec![]], limits, u64::MAX),
+            Err(Error::ImageReadbackFrameEmpty { frame: 1 })
+        ));
+        assert!(matches!(
+            ReadbackPacking::new(
+                &[vec![9], vec![4]],
+                ImageReadbackLimits {
+                    max_transient_bytes: 15,
+                    max_in_flight_bytes: 100,
+                },
+                100,
+            ),
+            Err(Error::ImageReadbackTransientLimit {
+                required: 16,
+                limit: 15,
+            })
+        ));
+        assert!(matches!(
+            ReadbackPacking::new(&[vec![9], vec![4]], limits, 15),
+            Err(Error::ImageReadbackDeviceLimit {
+                required: 16,
+                limit: 15,
+            })
+        ));
+        assert!(matches!(
+            ReadbackPacking::new(&[vec![u64::MAX]], limits, u64::MAX),
+            Err(Error::BufferSizeOverflow)
+        ));
     }
 
     #[test]
@@ -664,9 +1137,11 @@ mod batch_tests {
         assert_eq!(
             submission.stats(),
             ImageReadbackStats {
+                frame_count: 1,
                 output_count: 2,
                 logical_bytes: 13,
                 staging_bytes: 16,
+                padding_bytes: 3,
             }
         );
         let result = submission.wait().unwrap();
@@ -674,6 +1149,110 @@ mod batch_tests {
         assert_eq!(result.frame.outputs[0].bytes, first);
         assert_eq!(result.frame.outputs[1].bytes, second);
         assert_eq!(result.stats.logical_bytes, 13);
+    }
+
+    #[test]
+    fn multi_frame_future_uses_one_submission_and_preserves_every_boundary() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let first_a = (10..19).collect::<Vec<u8>>();
+        let first_b = vec![21, 22, 23, 24];
+        let second_a = vec![31];
+        let second_b = vec![41, 42, 43, 44, 45, 46];
+        let mut frames = vec![
+            frame_with_token(
+                100,
+                vec![
+                    output(
+                        &backend,
+                        10,
+                        Extent2d::new(3, 3),
+                        &first_a,
+                        wgpu::BufferUsages::COPY_SRC,
+                    ),
+                    output(
+                        &backend,
+                        11,
+                        Extent2d::new(2, 2),
+                        &first_b,
+                        wgpu::BufferUsages::COPY_SRC,
+                    ),
+                ],
+            ),
+            frame_with_token(
+                200,
+                vec![
+                    output(
+                        &backend,
+                        20,
+                        Extent2d::new(1, 1),
+                        &second_a,
+                        wgpu::BufferUsages::COPY_SRC,
+                    ),
+                    output(
+                        &backend,
+                        21,
+                        Extent2d::new(3, 2),
+                        &second_b,
+                        wgpu::BufferUsages::COPY_SRC,
+                    ),
+                ],
+            ),
+        ];
+        frames[0]
+            .changed
+            .outputs
+            .insert(OutputId(10), vec![Region::new(1, 2, 3, 4)]);
+        frames[1]
+            .changed
+            .outputs
+            .insert(OutputId(21), vec![Region::new(-1, 0, 2, 2)]);
+        let pipeline = ImageReadbackPipeline::new(&backend);
+        let pending = pipeline.submit_frames(&frames).unwrap();
+        assert_eq!(
+            pending.stats(),
+            ImageReadbackStats {
+                frame_count: 2,
+                output_count: 4,
+                logical_bytes: 20,
+                staging_bytes: 28,
+                padding_bytes: 8,
+            }
+        );
+        let result = pollster::block_on(pending).unwrap();
+        assert_eq!(result.frames.len(), 2);
+        assert_eq!(result.frames[0].token, SubmissionToken(100));
+        assert_eq!(result.frames[1].token, SubmissionToken(200));
+        assert_eq!(result.frames[0].outputs[0].id, OutputId(10));
+        assert_eq!(result.frames[0].outputs[0].bytes, first_a);
+        assert_eq!(result.frames[0].outputs[1].bytes, first_b);
+        assert_eq!(result.frames[1].outputs[0].id, OutputId(20));
+        assert_eq!(result.frames[1].outputs[0].bytes, second_a);
+        assert_eq!(result.frames[1].outputs[1].bytes, second_b);
+        assert_eq!(
+            result.frames[0].changed.outputs[&OutputId(10)],
+            [Region::new(1, 2, 3, 4)]
+        );
+        assert_eq!(
+            result.frames[1].changed.outputs[&OutputId(21)],
+            [Region::new(-1, 0, 2, 2)]
+        );
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn completion_wakes_after_releasing_its_mutex() {
+        let completion = Arc::new(BatchMapCompletion::default());
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(ReentrantWake {
+            completion: Arc::clone(&completion),
+            observed_unlocked: Arc::clone(&observed_unlocked),
+        }));
+        let context = Context::from_waker(&waker);
+        assert!(completion.poll(&context).is_none());
+        completion.complete(Ok(()));
+        assert!(observed_unlocked.load(Ordering::Acquire));
     }
 
     #[test]
@@ -712,8 +1291,10 @@ mod batch_tests {
             backend.queue().clone(),
             ImageReadbackLimits {
                 max_transient_bytes: 11,
+                max_in_flight_bytes: 11,
             },
-        );
+        )
+        .unwrap();
         assert!(matches!(
             limited.submit(&valid),
             Err(Error::ImageReadbackTransientLimit {
@@ -731,11 +1312,160 @@ mod batch_tests {
         )]);
         assert!(matches!(
             ImageReadbackPipeline::new(&backend).submit(&wrong_usage),
-            Err(Error::ImageReadbackSourceUsage { output: 0 })
+            Err(Error::ImageReadbackSourceUsage {
+                frame: 0,
+                output: 0,
+            })
         ));
         assert!(matches!(
             ImageReadbackPipeline::new(&backend).submit(&frame(Vec::new())),
-            Err(Error::ImageReadbackEmpty)
+            Err(Error::ImageReadbackFrameEmpty { frame: 0 })
         ));
+        assert!(matches!(
+            ImageReadbackPipeline::new(&backend).submit_frames(&[]),
+            Err(Error::ImageReadbackNoFrames)
+        ));
+    }
+
+    #[test]
+    fn abandoned_batch_future_releases_budget_after_gpu_completion() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let frame = frame(vec![output(
+            &backend,
+            30,
+            Extent2d::new(3, 3),
+            &[9; 9],
+            wgpu::BufferUsages::COPY_SRC,
+        )]);
+        let pipeline = ImageReadbackPipeline::new(&backend);
+        let pending = pipeline.submit_frames(&[frame]).unwrap();
+        let submission = pending.submission().clone();
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 12);
+        drop(pending);
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .expect("wait for abandoned readback callback");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pipeline.memory_stats().reserved_bytes != 0 && std::time::Instant::now() < deadline {
+            backend
+                .device()
+                .poll(wgpu::PollType::Poll)
+                .expect("drive abandoned readback callback");
+            std::thread::yield_now();
+        }
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn aggregate_readback_retains_only_explicit_source_buffer_leases() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let extent = Extent2d::new(3, 3);
+        let layout = ImageLayout::packed(
+            extent,
+            PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        )
+        .unwrap();
+        let source = Arc::new(backend.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu tracked readback source"),
+                contents: &[5; 12],
+                usage: wgpu::BufferUsages::COPY_SRC,
+            },
+        ));
+        let source_budget = MemoryBudget::new(NonZeroU64::new(12).unwrap());
+        let source_permit = source_budget.try_reserve(12).unwrap();
+        let frame = frame(vec![GpuImageOutput {
+            id: OutputId(32),
+            layout,
+            buffer: GpuBufferLease::with_memory_permit(source, source_permit),
+        }]);
+
+        let pipeline = ImageReadbackPipeline::new(&backend);
+        let pending = pipeline
+            .submit_frames(std::slice::from_ref(&frame))
+            .unwrap();
+        drop(frame);
+        assert_eq!(source_budget.snapshot().reserved_bytes, 12);
+
+        pending.wait().unwrap();
+        assert_eq!(source_budget.snapshot().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_submissions_use_byte_weighted_backpressure() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let frame = frame(vec![output(
+            &backend,
+            6,
+            Extent2d::new(3, 3),
+            &[7; 9],
+            wgpu::BufferUsages::COPY_SRC,
+        )]);
+        let pipeline = ImageReadbackPipeline::from_device_queue(
+            backend.device().clone(),
+            backend.queue().clone(),
+            ImageReadbackLimits {
+                max_transient_bytes: 12,
+                max_in_flight_bytes: 12,
+            },
+        )
+        .unwrap();
+
+        let first = pipeline.submit(&frame).unwrap();
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 12);
+        assert!(matches!(
+            pipeline.submit(&frame),
+            Err(Error::MemoryBackpressure(
+                crate::MemoryBudgetError::Exhausted {
+                    requested_bytes: 12,
+                    reserved_bytes: 12,
+                    limit_bytes: 12,
+                }
+            ))
+        ));
+        first.wait().unwrap();
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+        pipeline.submit(&frame).unwrap().wait().unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn saturated_poll_admission_rejects_before_readback_submission() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let permits = (0..crate::SUBMISSION_POLLER_CAPACITY)
+            .map(|_| backend.submission_poller().try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        let frame = frame(vec![output(
+            &backend,
+            31,
+            Extent2d::new(3, 3),
+            &[4; 9],
+            wgpu::BufferUsages::COPY_SRC,
+        )]);
+        let pipeline = ImageReadbackPipeline::new(&backend);
+
+        assert!(matches!(
+            pipeline.submit(&frame),
+            Err(Error::PollAdmission(crate::SubmissionPollerError::Full {
+                capacity: crate::SUBMISSION_POLLER_CAPACITY
+            }))
+        ));
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
+
+        drop(permits);
+        assert_eq!(backend.submission_poller().in_flight(), 0);
+        pipeline.submit(&frame).unwrap().wait().unwrap();
     }
 }

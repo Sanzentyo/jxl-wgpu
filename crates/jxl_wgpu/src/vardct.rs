@@ -1020,6 +1020,7 @@ mod tests {
                 sample_type: jxl_gpu_protocol::SampleType::F32,
                 channels: 3,
                 layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
             }],
         }
     }

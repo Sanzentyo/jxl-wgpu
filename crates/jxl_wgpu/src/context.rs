@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -15,7 +16,7 @@ use crate::buffer_pool::{BufferPool, WgpuBufferPoolStats};
 use crate::capability::capabilities;
 use crate::pipeline_cache::PipelineCache;
 use crate::session::WgpuFrameSession;
-use crate::{Error, Planner, Result};
+use crate::{Error, MemoryBudget, MemoryBudgetSnapshot, Planner, Result, SubmissionPoller};
 
 #[derive(Clone, Debug)]
 pub struct WgpuMemoryPolicy {
@@ -28,6 +29,10 @@ pub struct WgpuMemoryPolicy {
     /// Maximum bytes allocated by one submission for explicit transient GPU buffers, including
     /// VarDCT packet uploads, immutable kernel tables, packed outputs, and readback staging.
     pub max_transient_bytes: u64,
+    /// Maximum aggregate bytes admitted for transient jobs that can coexist across backend
+    /// clones. Frame sessions, generic image readback, decoder outputs, and encoder contexts
+    /// created from this backend share this byte-weighted budget.
+    pub max_in_flight_transient_bytes: u64,
     /// Maximum idle bytes retained by the backend-wide internal buffer pool. This is separate
     /// from the live resident and transient submission budgets; set it to zero to disable reuse.
     pub max_cached_buffer_bytes: u64,
@@ -42,6 +47,7 @@ impl Default for WgpuMemoryPolicy {
             max_resident_bytes: 512 * 1024 * 1024,
             max_scratch_bytes: 256 * 1024 * 1024,
             max_transient_bytes: 256 * 1024 * 1024,
+            max_in_flight_transient_bytes: 256 * 1024 * 1024,
             max_cached_buffer_bytes: 128 * 1024 * 1024,
             prefer_streaming: false,
         }
@@ -60,6 +66,23 @@ pub enum DirectReadbackPolicy {
     Force,
 }
 
+/// Policy for enabling native double-precision shader arithmetic.
+///
+/// `wgpu` currently exposes [`wgpu::Features::SHADER_F64`] only on native Vulkan adapters.
+/// Merely storing IEEE-754 binary64 values in a buffer does not imply that this feature is
+/// enabled; callers can use [`WgpuBackend::native_f64_enabled`] to distinguish native arithmetic
+/// from a compatibility packing path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShaderF64Policy {
+    /// Enable native shader `f64` whenever the selected adapter advertises it.
+    #[default]
+    Auto,
+    /// Never request native shader `f64`, even when the adapter supports it.
+    Disabled,
+    /// Require native shader `f64` and fail backend creation when it is unavailable.
+    Require,
+}
+
 #[derive(Clone, Debug)]
 pub struct WgpuBackendConfig {
     pub label: String,
@@ -67,6 +90,8 @@ pub struct WgpuBackendConfig {
     pub memory: WgpuMemoryPolicy,
     /// Chooses safe automatic UMA mapping, portable staging, or explicitly forced direct mapping.
     pub direct_readback_policy: DirectReadbackPolicy,
+    /// Controls optional native double-precision shader arithmetic.
+    pub shader_f64_policy: ShaderF64Policy,
     pub enable_timestamps: bool,
     pub strict_features: bool,
 }
@@ -78,6 +103,7 @@ impl Default for WgpuBackendConfig {
             power_preference: wgpu::PowerPreference::HighPerformance,
             memory: WgpuMemoryPolicy::default(),
             direct_readback_policy: DirectReadbackPolicy::Auto,
+            shader_f64_policy: ShaderF64Policy::Auto,
             enable_timestamps: true,
             strict_features: false,
         }
@@ -92,6 +118,8 @@ pub struct WgpuBackend {
     pub(crate) config: WgpuBackendConfig,
     pub(crate) pipelines: Arc<PipelineCache>,
     pub(crate) buffers: Arc<BufferPool>,
+    pub(crate) poller: SubmissionPoller,
+    pub(crate) transient_memory: MemoryBudget,
 }
 
 impl fmt::Debug for WgpuBackend {
@@ -121,6 +149,14 @@ impl WgpuBackend {
                 "TIMESTAMP_QUERY was requested but is unavailable on the supplied device".into(),
             ));
         }
+        if config.shader_f64_policy == ShaderF64Policy::Require
+            && !device.features().contains(wgpu::Features::SHADER_F64)
+        {
+            return Err(Error::Unsupported(
+                "native f64 shaders were required but SHADER_F64 is unavailable on the supplied device"
+                    .into(),
+            ));
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if direct_readback_requested(&config, info.device_type)
             && config.direct_readback_policy == DirectReadbackPolicy::Force
@@ -140,6 +176,18 @@ impl WgpuBackend {
             ));
         }
         let buffers = BufferPool::new(device.clone(), config.memory.max_cached_buffer_bytes);
+        let transient_limit = NonZeroU64::new(config.memory.max_in_flight_transient_bytes)
+            .ok_or_else(|| {
+                Error::ResourceLimit(
+                    "max_in_flight_transient_bytes must be greater than zero".into(),
+                )
+            })?;
+        let transient_memory = MemoryBudget::new(transient_limit);
+        let poller = SubmissionPoller::new(device.clone()).map_err(|error| {
+            Error::Execution(format!(
+                "could not start the bounded GPU poll worker: {error}"
+            ))
+        })?;
         Ok(Self {
             device,
             queue,
@@ -147,6 +195,8 @@ impl WgpuBackend {
             config,
             pipelines: Arc::new(PipelineCache::default()),
             buffers,
+            poller,
+            transient_memory,
         })
     }
 
@@ -171,6 +221,8 @@ impl WgpuBackend {
                 "TIMESTAMP_QUERY was requested but is unavailable".into(),
             ));
         }
+        required_features |=
+            requested_shader_f64_features(config.shader_f64_policy, adapter_features)?;
         // Unified-memory native adapters can map the final storage buffer directly. This avoids a
         // full output copy while preserving the portable staging path on other adapters.
         #[cfg(not(target_arch = "wasm32"))]
@@ -205,6 +257,24 @@ impl WgpuBackend {
         &self.queue
     }
 
+    /// Returns the bounded completion driver shared by this backend and all of its clones.
+    #[must_use]
+    pub const fn submission_poller(&self) -> &SubmissionPoller {
+        &self.poller
+    }
+
+    /// Returns the byte-weighted transient admission budget shared by backend clones.
+    #[must_use]
+    pub const fn transient_memory_budget(&self) -> &MemoryBudget {
+        &self.transient_memory
+    }
+
+    /// Reports the current shared transient reservation without blocking.
+    #[must_use]
+    pub fn transient_memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.transient_memory.snapshot()
+    }
+
     pub const fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.info
     }
@@ -223,6 +293,17 @@ impl WgpuBackend {
         {
             false
         }
+    }
+
+    /// Whether this logical device can execute native double-precision shader operations.
+    ///
+    /// This reports the feature enabled on the device, not merely hardware support advertised by
+    /// an adapter, and also honors an explicit [`ShaderF64Policy::Disabled`] policy on a
+    /// caller-supplied device. It is therefore safe to use as a shader-specialization capability
+    /// check.
+    #[must_use]
+    pub fn native_f64_enabled(&self) -> bool {
+        native_f64_is_enabled(&self.config, self.device.features())
     }
 
     /// Drops lazily compiled pipelines, for example after a device-specific tuning reset.
@@ -250,6 +331,27 @@ impl WgpuBackend {
         let execution =
             Planner::new(self.device.limits(), self.config.memory.clone()).plan(frame, &plan)?;
         WgpuFrameSession::new(self.clone(), frame.clone(), plan, execution)
+    }
+}
+
+fn native_f64_is_enabled(config: &WgpuBackendConfig, features: wgpu::Features) -> bool {
+    config.shader_f64_policy != ShaderF64Policy::Disabled
+        && features.contains(wgpu::Features::SHADER_F64)
+}
+
+fn requested_shader_f64_features(
+    policy: ShaderF64Policy,
+    adapter_features: wgpu::Features,
+) -> Result<wgpu::Features> {
+    match policy {
+        ShaderF64Policy::Auto => Ok(adapter_features & wgpu::Features::SHADER_F64),
+        ShaderF64Policy::Disabled => Ok(wgpu::Features::empty()),
+        ShaderF64Policy::Require if adapter_features.contains(wgpu::Features::SHADER_F64) => {
+            Ok(wgpu::Features::SHADER_F64)
+        }
+        ShaderF64Policy::Require => Err(Error::Unsupported(
+            "native f64 shaders were required but SHADER_F64 is unavailable".into(),
+        )),
     }
 }
 
@@ -286,7 +388,10 @@ impl RenderBackend for WgpuBackend {
 mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use super::direct_readback_requested;
-    use super::{DirectReadbackPolicy, WgpuBackendConfig};
+    use super::{
+        DirectReadbackPolicy, ShaderF64Policy, WgpuBackendConfig, native_f64_is_enabled,
+        requested_shader_f64_features,
+    };
 
     #[test]
     fn automatic_direct_readback_is_the_default_policy() {
@@ -294,6 +399,56 @@ mod tests {
             WgpuBackendConfig::default().direct_readback_policy,
             DirectReadbackPolicy::Auto
         );
+        assert_eq!(
+            WgpuBackendConfig::default().shader_f64_policy,
+            ShaderF64Policy::Auto
+        );
+    }
+
+    #[test]
+    fn explicit_f64_disable_overrides_an_already_enabled_device_feature() {
+        let disabled = WgpuBackendConfig {
+            shader_f64_policy: ShaderF64Policy::Disabled,
+            ..WgpuBackendConfig::default()
+        };
+        assert!(!native_f64_is_enabled(
+            &disabled,
+            wgpu::Features::SHADER_F64
+        ));
+
+        for policy in [ShaderF64Policy::Auto, ShaderF64Policy::Require] {
+            let config = WgpuBackendConfig {
+                shader_f64_policy: policy,
+                ..WgpuBackendConfig::default()
+            };
+            assert!(native_f64_is_enabled(&config, wgpu::Features::SHADER_F64));
+            assert!(!native_f64_is_enabled(&config, wgpu::Features::empty()));
+        }
+    }
+
+    #[test]
+    fn f64_policy_selects_the_exact_device_feature_request() {
+        let supported = wgpu::Features::SHADER_F64 | wgpu::Features::TIMESTAMP_QUERY;
+        assert_eq!(
+            requested_shader_f64_features(ShaderF64Policy::Auto, supported).unwrap(),
+            wgpu::Features::SHADER_F64
+        );
+        assert_eq!(
+            requested_shader_f64_features(ShaderF64Policy::Auto, wgpu::Features::empty()).unwrap(),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            requested_shader_f64_features(ShaderF64Policy::Disabled, supported).unwrap(),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            requested_shader_f64_features(ShaderF64Policy::Require, supported).unwrap(),
+            wgpu::Features::SHADER_F64
+        );
+        assert!(matches!(
+            requested_shader_f64_features(ShaderF64Policy::Require, wgpu::Features::empty()),
+            Err(crate::Error::Unsupported(message)) if message.contains("SHADER_F64")
+        ));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -385,5 +540,22 @@ mod tests {
             super::WgpuBackend::from_device(device, queue, info, strict_timestamps),
             Err(crate::Error::Unsupported(message)) if message.contains("TIMESTAMP_QUERY")
         ));
+
+        let Some((device, queue, info)) = test_device() else {
+            eprintln!("skipping supplied-device f64 invariant test: no third adapter request");
+            return;
+        };
+        if !device.features().contains(wgpu::Features::SHADER_F64) {
+            let require_f64 = WgpuBackendConfig {
+                enable_timestamps: false,
+                direct_readback_policy: DirectReadbackPolicy::Disabled,
+                shader_f64_policy: ShaderF64Policy::Require,
+                ..WgpuBackendConfig::default()
+            };
+            assert!(matches!(
+                super::WgpuBackend::from_device(device, queue, info, require_f64),
+                Err(crate::Error::Unsupported(message)) if message.contains("SHADER_F64")
+            ));
+        }
     }
 }

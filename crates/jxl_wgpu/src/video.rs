@@ -17,37 +17,170 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use jxl_gpu_formats::{ImageLayout, PixelFormat};
-use jxl_gpu_protocol::{ChangedRegions, OutputId, SubmissionToken};
+use jxl_gpu_protocol::{ChangedRegions, OutputId, RgbColorEncoding, SubmissionToken};
 
 use crate::upload::aligned_buffer_size;
-use crate::{Error, Result};
+use crate::{Error, MemoryPermit, Result};
 
 /// Requested portable pitch-linear output format.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImageOutputRequest {
+    /// Encoding of the three F32 RGB planes consumed by the conversion.
+    ///
+    /// This must agree with the corresponding render-plan output descriptor. Requiring both
+    /// sides to state the contract prevents an output request from silently reinterpreting the
+    /// same source samples with different color metadata.
+    pub source_encoding: RgbColorEncoding,
     pub format: PixelFormat,
 }
 
 impl ImageOutputRequest {
-    pub const fn new(format: PixelFormat) -> Self {
-        Self { format }
+    pub const fn new(source_encoding: RgbColorEncoding, format: PixelFormat) -> Self {
+        Self {
+            source_encoding,
+            format,
+        }
+    }
+}
+
+/// Cloneable GPU buffer ownership that keeps an optional byte reservation alive.
+///
+/// Clone this lease, rather than the raw [`wgpu::Buffer`], when ownership must remain covered by
+/// the crate's byte budget. [`Self::as_wgpu_buffer`] deliberately makes raw access explicit:
+/// `wgpu::Buffer` is itself cloneable, and a raw handle cloned through that borrow is outside this
+/// lease's accounting. Safe Rust cannot keep a reservation coupled to a handle after callers clone
+/// the raw wgpu value.
+///
+/// ```compile_fail
+/// fn implicit_raw(lease: &jxl_wgpu::GpuBufferLease) -> &wgpu::Buffer {
+///     lease
+/// }
+/// ```
+#[derive(Clone)]
+pub struct GpuBufferLease {
+    buffer: Arc<wgpu::Buffer>,
+    memory_permit: Option<MemoryPermit>,
+}
+
+impl GpuBufferLease {
+    #[must_use]
+    pub fn new(buffer: Arc<wgpu::Buffer>) -> Self {
+        Self {
+            buffer,
+            memory_permit: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_memory_permit(buffer: Arc<wgpu::Buffer>, memory_permit: MemoryPermit) -> Self {
+        Self {
+            buffer,
+            memory_permit: Some(memory_permit),
+        }
+    }
+
+    /// Borrows the underlying buffer for wgpu interoperability.
+    ///
+    /// Cloning the returned raw handle does not clone this lease or its byte reservation. Keep a
+    /// [`GpuBufferLease`] clone alive whenever the raw handle must remain covered by the budget.
+    #[must_use]
+    pub fn as_wgpu_buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+
+    /// Size of the underlying wgpu allocation.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.buffer.size()
+    }
+
+    /// Usage flags of the underlying wgpu allocation.
+    #[must_use]
+    pub fn usage(&self) -> wgpu::BufferUsages {
+        self.buffer.usage()
+    }
+
+    /// Size of the shared reservation retained by this lease, or zero for externally managed
+    /// buffers.
+    ///
+    /// Sibling outputs and clones from one submission report the same reservation rather than
+    /// independent charges. Do not add their values together.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> u64 {
+        self.memory_permit.as_ref().map_or(0, MemoryPermit::bytes)
+    }
+}
+
+impl std::fmt::Debug for GpuBufferLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuBufferLease")
+            .field("size", &self.size())
+            .field("usage", &self.usage())
+            .field("reserved_bytes", &self.reserved_bytes())
+            .finish_non_exhaustive()
     }
 }
 
 /// Generic pitch-linear image output stored entirely on the GPU.
-#[derive(Clone, Debug)]
+///
+/// This container is intentionally not cloneable. Clone [`GpuBufferLease`] explicitly when a
+/// second owner must retain the tracked allocation.
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<jxl_wgpu::GpuImageOutput>();
+/// ```
+#[derive(Debug)]
 pub struct GpuImageOutput {
     pub id: OutputId,
     pub layout: ImageLayout,
-    pub buffer: Arc<wgpu::Buffer>,
+    pub buffer: GpuBufferLease,
 }
 
 /// Non-blocking generic image result.
-#[derive(Clone, Debug)]
+///
+/// The frame is intentionally not cloneable; individual buffer leases express retained GPU
+/// ownership without implying that a decoder frame slot was duplicated.
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<jxl_wgpu::GpuImageFrame>();
+/// ```
+#[derive(Debug)]
 pub struct GpuImageFrame {
     pub token: SubmissionToken,
     pub outputs: Vec<GpuImageOutput>,
     pub changed: ChangedRegions,
+}
+
+/// One queue-submitted GPU image output whose codec validation has not completed.
+///
+/// This type is intentionally distinct from [`GpuImageOutput`]. Its layout and allocation are
+/// usable immediately by commands submitted to the producer's device and queue, but its bytes are
+/// not authoritative until the codec returns the corresponding validated frame. Cloning
+/// [`Self::buffer`] retains the producer's byte-budget reservation; cloning the raw wgpu handle
+/// obtained from [`GpuBufferLease::as_wgpu_buffer`] does not.
+#[derive(Debug)]
+pub struct UnvalidatedGpuImageOutput {
+    pub id: OutputId,
+    pub layout: ImageLayout,
+    pub buffer: GpuBufferLease,
+}
+
+/// Queue-submitted GPU image made available before codec validation completes.
+///
+/// The absence of frame metadata and changed regions is deliberate: neither is authoritative at
+/// this point. Same-queue display, readback, or custom GPU work can consume the outputs without a
+/// host wait. If later validation fails, already-submitted consumer work cannot be rolled back and
+/// every value derived from this frame must be discarded by the application.
+///
+/// This container is intentionally not cloneable. Clone individual [`GpuBufferLease`] values when
+/// a consumer must retain an allocation under the shared memory budget.
+#[derive(Debug)]
+pub struct UnvalidatedGpuImageFrame {
+    pub token: SubmissionToken,
+    pub outputs: Vec<UnvalidatedGpuImageOutput>,
 }
 
 /// CPU-visible generic image output. Consult `layout` rather than assuming contiguous planes.

@@ -75,22 +75,54 @@ pub enum Error {
     DuplicateAccelerationIndex,
     #[error("the stock GPU decoder cannot produce the requested pixel format: {0}")]
     UnsupportedOutputFormat(String),
+    #[error("a non-color numeric output requires an explicit NumericSampleMapping")]
+    NumericMappingRequired,
+    #[error("a numeric sample mapping cannot be attached to a color output format")]
+    NumericMappingForColorOutput,
+    #[error("F64 output requires an explicit F64OutputPolicy")]
+    F64OutputPolicyRequired,
+    #[error("an F64 output policy cannot be attached to a non-F64 numeric format")]
+    F64OutputPolicyForNonF64,
+    #[error("native F64 output was required but the wgpu device lacks enabled SHADER_F64")]
+    NativeF64Unavailable,
     #[error(transparent)]
     UnsupportedProfile(#[from] UnsupportedProfile),
     #[error(transparent)]
     FrontendIncomplete(#[from] FrontendIncomplete),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
+    #[error("GPU decode memory backpressure: {0}")]
+    MemoryBackpressure(#[from] jxl_wgpu::MemoryBudgetError),
+    #[error("GPU decode submission-poll backpressure: {0}")]
+    PollBackpressure(#[from] jxl_wgpu::SubmissionPollerError),
     #[error("GPU decode engine violated its public contract: {0}")]
     EngineContract(&'static str),
     #[error("all {limit} bounded GPU frame slots are in flight")]
     Backpressure { limit: usize },
-    #[error("an asynchronously-polled GPU frame is already pending")]
-    OperationInProgress,
+    #[error("prefetch depth {requested} exceeds the configured frame-slot limit {limit}")]
+    PrefetchDepthExceedsLimit { requested: usize, limit: usize },
+    #[error("blocking GPU completion waits are unavailable on browser WebGPU")]
+    BlockingWaitUnavailable,
     #[error("expected visible frame index {expected}, engine returned {actual}")]
     UnexpectedFrameIndex { expected: usize, actual: usize },
     #[error("frame {index} timing does not use the stream timebase")]
     FrameTimebaseMismatch { index: usize },
+    #[error("frame {index} presentation tick is {actual}, expected {expected}")]
+    FramePresentationTicksMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("presentation tick accumulation overflowed after frame {index}")]
+    FramePresentationTicksOverflow { index: usize },
+    #[error(
+        "frame {index} timecode presence ({frame_has_timecode}) does not match the stream declaration ({stream_has_timecodes})"
+    )]
+    FrameTimecodePresenceMismatch {
+        index: usize,
+        stream_has_timecodes: bool,
+        frame_has_timecode: bool,
+    },
     #[error("stream advertised {hint} visible frames but produced {actual}")]
     FrameCountMismatch { hint: usize, actual: usize },
     #[error("GPU frontend ended without returning a final visible frame")]

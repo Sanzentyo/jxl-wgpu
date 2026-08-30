@@ -11,12 +11,16 @@ cargo run -p jxl_gpu_harness -- bench --backend wgpu --warmup 10 --iterations 10
 cargo run -p jxl_gpu_harness -- codec --corpus tools/jxl_gpu_harness/codec-corpus.toml
 cargo run -p jxl_gpu_harness -- codec image.jxl --format nv12 --output-target gpu-resident
 cargo run -p jxl_gpu_harness -- codec image.jxl --workload warm-sequential --warmup 3 --iterations 20
-cargo run -p jxl_gpu_harness -- codec image.jxl --workload batch --batch-size 8 --iterations 10
+cargo run -p jxl_gpu_harness -- codec image.jxl --workload concurrent-burst --burst-size 8 --iterations 10
 cargo run -p jxl_gpu_harness -- codec image.jxl --workload concurrent --concurrency 4 --iterations 20
 cargo run -p jxl_gpu_harness -- codec animation.jxl --workload animation --output-target display-texture
 cargo run -p jxl_gpu_harness -- codec image.jxl --output-target cpu-readback
-cargo run -p jxl_gpu_harness -- codec input.gray --operation encode --format gray8 --extent 256x256
-cargo run -p jxl_gpu_harness -- codec input.gray --operation round-trip --format gray8 --extent 256x256 --output-target cpu-readback
+cargo run -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl --format u8 \
+  --output-target cpu-readback --workload warm-sequential --iterations 20 \
+  --cpu-baseline-djxl /opt/homebrew/bin/djxl --cpu-baseline-warmup 3 \
+  --cpu-baseline-iterations 20 --cpu-baseline-timeout-ms 30000
+cargo run -p jxl_gpu_harness -- codec input.gray --operation encode --format u8 --extent 256x256
+cargo run -p jxl_gpu_harness -- codec input.gray --operation round-trip --format u8 --extent 256x256 --output-target cpu-readback
 cargo run -p jxl_gpu_harness -- capture --name gaborish_edge_17x19 --operation gaborish -o case.jxlcap
 cargo run -p jxl_gpu_harness -- replay --input case.jxlcap --backend wgpu
 cargo run -p jxl_gpu_harness -- tune --output tuning.json --candidates reference,wgpu
@@ -38,12 +42,72 @@ requires an exact decoded-byte hash match. Other recognized but unimplemented pr
 typed `unsupported` and make the command exit unsuccessfully. CPU `jxl`, `cjxl`, and `djxl` may be
 used only by a separately labelled reference/oracle validation, never as the production codec path.
 
-The generic format selector covers non-color Gray8, luma 8/16, planar 4:2:0/4:2:2/4:4:4, NV12/NV21/NV16/NV61/
-NV24/NV42, P010/P012/P016, YUYV/UYVY, and interleaved or planar RGB/BGR/RGBA/BGRA. The output target
-is independent of scheduling, so cold latency, warm sequential reuse, batches, simultaneous
-workers, and animation can each retain GPU pitch-linear output, enqueue same-queue display
-conversion, or request explicit host readback. `codec-corpus.toml` labels small, odd-extent, and
-large inputs in the versioned report.
+The generic format selector covers all VPI numeric layouts (`u8`, `s8`, `u16`, `u32`, `s32`,
+`s16`, `2s16`, `f32`, `f64`, `2f32`), luma 8/16, planar 4:2:0/4:2:2/4:4:4,
+NV12/NV21/NV16/NV61/NV24/NV42, P010/P012/P016, YUYV/UYVY, and interleaved or planar
+RGB/BGR/RGBA/BGRA. The decoded-image output target is independent of scheduling: a run can retain
+GPU pitch-linear output, enqueue same-queue display conversion, or request explicit host readback.
+The encode command always returns standard container bytes to the host; decoded-image output target
+telemetry does not describe those bytes. `codec-corpus.toml` labels small, odd-extent, and large
+inputs in the report.
+
+The `f64` selector explicitly requests `NativeOrExactF32Widening`: native shader F64 is used when
+the backend enabled `SHADER_F64`; otherwise output is the documented exact widening of normalized
+F32, not a full-precision F64 division. Library callers that cannot accept that compatibility path
+must use `F64OutputPolicy::NativeRequired`, which returns a typed error instead of downgrading.
+
+## Workload and telemetry semantics
+
+The workload names describe what this implementation actually schedules:
+
+- `single-latency` measures one operation after the requested warmup; `iterations` does not multiply
+  the measured sample.
+- `warm-sequential` repeats an operation on one host thread while reusing the backend objects.
+- `concurrent-burst` releases `burst-size` independent host threads at a barrier for each iteration.
+  Every worker still makes its own codec submission and completion wait.
+- `concurrent` starts `concurrency` persistent host workers. Each worker performs `iterations`
+  operations sequentially; workers overlap one another without a barrier between operations.
+- `animation` opens and advances an actual animated codestream session. A still input is rejected,
+  and the current stock Gray8 profile reports animation as unsupported. Repeating a still with
+  `warm-sequential` is only a repeated-still proxy, not an animation result.
+
+Neither host fan-out workload is GPU batching. The current runner does not encode several images or
+frames into one command buffer. Reports therefore set `coalesced_gpu_batching` to `false` and expose
+the measured-operation counts `codec_submissions`, `codec_completion_waits`,
+`display_submissions`, `display_completion_waits`, `readback_submissions`, and
+`readback_completion_waits`. Warmup activity is excluded from these counters.
+
+`gpu_output_logical_bytes` sums the addressable decoded GPU layouts. For `cpu_readback`,
+`readback_logical_bytes` and `readback_staging_bytes` come from the aggregate readback plan; staging
+bytes include four-byte copy padding. `readback_mode` is currently `staged_copy`. A
+`display_texture` run enqueues conversion on the same queue but does not wait for display conversion
+completion, so it reports display submissions and zero display waits rather than pretending to be
+end-to-end presentation latency. `gpu_resident` performs no image readback. `output_bytes` is the
+encoded container size for encode and the decoded logical-image total for decode/round-trip.
+Per-operation latency starts after a burst/worker start barrier; workload wall time includes thread
+creation, synchronization, all operations, and joins. Throughput is derived from that wall time.
+
+## Opt-in external CPU comparator
+
+`--cpu-baseline-djxl PATH` adds a development-only libjxl `djxl` decode record to each codec case.
+It never becomes a production fallback and adds no CPU codec dependency to the library crates. The
+byte-comparable contract is deliberately narrow: `decode --format u8 --output-target cpu-readback`
+on a still Gray8 input. Other operation, format, target, and animation combinations report a typed
+`unsupported` comparator without starting `djxl`; a missing executable is a typed `skipped` result.
+
+The comparator first records one cold decode whose interval includes process creation, decode,
+temporary PGM file I/O, PGM parsing, and BLAKE3 hashing. It then runs the requested warmup and emits
+`warm_repetition` p50/p95, wall throughput, input/output bytes, extent, and hash. Warmup and
+iteration overrides default to the GPU workload values. `concurrent-burst` uses the same start
+barrier and `concurrent` uses the same persistent host-worker shape, but every CPU operation still
+launches a fresh external process. JSON therefore fixes `process_model` to
+`external_process_per_operation`; “warm” does not mean a persistent libjxl decoder instance.
+
+Each process has an independently configurable timeout. Captured stdout/stderr diagnostics are
+drained to avoid pipe deadlock and bounded to 16 KiB in the report. Version provenance comes from
+the selected executable's `--version` output. `verified=true` requires both the per-operation byte
+count and pixel hash to match GPU decode + CPU readback. Comparator status is reported separately
+and does not silently change the production path or assert that either implementation is faster.
 
 ## Synthetic capture/replay
 

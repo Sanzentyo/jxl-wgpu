@@ -3,6 +3,7 @@ use jxl_gpu_bitstream::{BitReader, Gray8AccelerationIndex};
 use crate::{Result, UnsupportedCodestreamFeature, UnsupportedProfile};
 
 const MAX_DIMENSION: u32 = 256;
+const MAX_CODESTREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Verifies the fixed JPEG XL envelope around the indexed entropy stream.
 ///
@@ -14,6 +15,9 @@ pub(crate) fn validate_gray8_envelope(
     codestream: &[u8],
     index: &Gray8AccelerationIndex,
 ) -> Result<()> {
+    if codestream.len() > MAX_CODESTREAM_BYTES {
+        return unsupported("the fixed Gray8 profile codestream exceeds 16 MiB");
+    }
     let mut reader = BitReader::new(codestream);
     expect(&mut reader, 16, 0x0aff, "JPEG XL codestream signature")?;
     expect(&mut reader, 1, 0, "non-small image header")?;
@@ -77,12 +81,7 @@ pub(crate) fn validate_gray8_envelope(
 
     let group_size = read_toc_size(&mut reader)?;
     reader.align_to_byte()?;
-    let group_start = u64::try_from(reader.bit_offset()).map_err(|_| {
-        UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::Other("size-overflow".into()),
-            "group bit offset does not fit the GPU profile",
-        )
-    })?;
+    let group_start = reader.bit_offset();
     // Regenerate the fixed DC-global/context-map/four-prefix-tree prefix from the bound index,
     // compare it bit-for-bit with the standard codestream, and prove that it ends at the exact
     // indexed token offset. The private box can therefore accelerate parsing but cannot redefine
@@ -148,12 +147,38 @@ fn expect(reader: &mut BitReader<'_>, count: u8, expected: u64, field: &str) -> 
 }
 
 fn bits_are_zero(bytes: &[u8], start: u64, end: u64) -> bool {
-    (start..end).all(|bit| {
-        usize::try_from(bit / 8)
-            .ok()
-            .and_then(|byte| bytes.get(byte))
-            .is_some_and(|value| value & (1 << (bit % 8)) == 0)
-    })
+    let available_bits = u64::try_from(bytes.len())
+        .ok()
+        .and_then(|length| length.checked_mul(8));
+    if start > end || available_bits.is_none_or(|available| end > available) {
+        return false;
+    }
+
+    let mut cursor = start;
+    while cursor < end && !cursor.is_multiple_of(8) {
+        let byte = usize::try_from(cursor / 8).expect("validated bit offset fits usize");
+        if bytes[byte] & (1u8 << (cursor % 8)) != 0 {
+            return false;
+        }
+        cursor += 1;
+    }
+
+    let whole_byte_end = end - end % 8;
+    let byte_start = usize::try_from(cursor / 8).expect("validated bit offset fits usize");
+    let byte_end = usize::try_from(whole_byte_end / 8).expect("validated bit offset fits usize");
+    if !bytes[byte_start..byte_end].iter().all(|&byte| byte == 0) {
+        return false;
+    }
+
+    cursor = whole_byte_end;
+    while cursor < end {
+        let byte = usize::try_from(cursor / 8).expect("validated bit offset fits usize");
+        if bytes[byte] & (1u8 << (cursor % 8)) != 0 {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
 }
 
 fn unsupported<T>(detail: impl Into<String>) -> Result<T> {
@@ -175,5 +200,10 @@ mod tests {
     fn checks_unaligned_padding_bits() {
         assert!(bits_are_zero(&[0b0000_0101], 3, 8));
         assert!(!bits_are_zero(&[0b0001_0101], 3, 8));
+        assert!(bits_are_zero(&[0xff, 0, 0, 0xff], 8, 24));
+        assert!(!bits_are_zero(&[0xff, 0, 1, 0xff], 8, 24));
+        assert!(bits_are_zero(&[0b0000_0111, 0, 0b1110_0000], 3, 21));
+        assert!(!bits_are_zero(&[0; 1], 0, 9));
+        assert!(!bits_are_zero(&[0; 1], 7, 6));
     }
 }

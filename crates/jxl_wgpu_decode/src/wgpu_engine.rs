@@ -1,42 +1,93 @@
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_bitstream::{Gray8AccelerationIndex, PrefixCodeEntry};
+use jxl_gpu_bitstream::{Gray8AccelerationIndex, ParseLimits, PrefixCodeEntry};
 use jxl_gpu_formats::{
-    Channel, ChromaOrder, ColorRange, ColorSpecification, ImageLayout, PixelFormat, SampleKind,
-    TransferFunction,
+    ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout, Packed422Order,
+    PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
+    classify_pixel_format,
 };
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
-use jxl_wgpu::{GpuImageFrame, GpuImageOutput, WgpuBackend};
-use wgpu::util::DeviceExt;
-
-use crate::profile::validate_gray8_envelope;
-use crate::{
-    AnimationMetadata, DecodeProfile, Error, FixedModularPredictor, FrameDuration, FrameMetadata,
-    GpuCodestream, GpuDecoder, GpuOutputRequest, GpuSubmissionEngine, GpuSubmissionSession,
-    PreparedGpuSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
-    UnsupportedProfile,
+use jxl_wgpu::{
+    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
+    MemoryPermit, SubmissionPollPermit, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
+    WgpuBackend,
 };
 
-const SHADER: &str = include_str!("lossless_gray8.wgsl");
+use crate::buffer_pool::{
+    DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
+};
+use crate::profile::validate_gray8_envelope;
+use crate::{
+    AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FixedModularPredictor, FrameDuration,
+    FrameMetadata, GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
+    GpuSubmissionEngine, GpuSubmissionSession, NumericSampleMapping, PreparedGpuSession, Result,
+    SubmittedGpuFrame, UnsupportedCodestreamFeature, UnsupportedProfile,
+};
+
+const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
+const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
+const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
+const F64_EXACT_F32_WIDENING: &str = r#"
+                if params.numeric_mapping != 1u {
+                    decode_error = ERROR_OUTPUT_MAPPING;
+                } else {
+                    let words = widen_normalized_f32_to_f64_words(normalized_bits);
+                    write_word(offset, words.x);
+                    write_word(offset + 4u, words.y);
+                }
+"#;
+const F64_NATIVE_ARITHMETIC: &str = r#"
+                if params.numeric_mapping != 2u {
+                    decode_error = ERROR_OUTPUT_MAPPING;
+                } else {
+                    if (offset & 7u) != 0u || offset > params.logical_size
+                        || params.logical_size - offset < 8u {
+                        decode_error = ERROR_OUTPUT_BOUNDS;
+                    } else {
+                        output_f64[offset >> 3u] = f64(sample) / 255.0;
+                    }
+                }
+"#;
+const F64_NATIVE_BINDING: &str =
+    "@group(0) @binding(6) var<storage, read_write> output_f64: array<f64>;";
 const LOOKUP_BITS: u8 = 15;
 const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
-const MAX_SESSION_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_CONCURRENT_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
+const MAX_SESSION_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Conservative GPU allocation accounting for one open stock decode session.
-///
-/// The reservation multiplies the complete per-frame allocation estimate by the requested
-/// bounded in-flight count. It remains held until the session is dropped.
+/// Conservative GPU allocation accounting for the stock decoder's bounded frame window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WgpuDecodeMemoryStats {
     pub per_frame_bytes: u64,
-    pub max_in_flight: usize,
-    pub reserved_bytes: u64,
+    /// Bytes that remain reserved with the caller-owned output buffer.
+    pub output_lease_bytes: u64,
+    /// Per-frame bytes released when status readback completes.
+    pub transient_bytes: u64,
+    pub max_frame_slots: usize,
+    /// Maximum exposure implied by `per_frame_bytes * max_frame_slots`.
+    pub max_frame_window_bytes: u64,
+}
+
+/// F64 production path resolved for one output request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum F64OutputPath {
+    /// The shader evaluates the normalization with native f64 arithmetic.
+    NativeArithmetic,
+    /// The shader constructs the exact binary64 widening of a correctly-rounded f32 value.
+    ExactF32Widening,
+}
+
+/// Capabilities of the stock wgpu decode engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WgpuDecodeCapabilities {
+    /// Whether `SHADER_F64` is enabled on the device and the native F64 pipeline is available.
+    pub native_f64_arithmetic: bool,
 }
 
 /// CPU/WGSL ABI for `Params` in `lossless_gray8.wgsl`.
@@ -48,17 +99,25 @@ struct ShaderParams {
     width: u32,
     height: u32,
     sample_count: u32,
-    output_mode: u32,
+    output_kind: u32,
     transfer: u32,
     limited_range: u32,
+    channels: u32,
+    order: u32,
+    bits: u32,
+    storage_bits: u32,
     plane0_offset: u32,
     plane0_stride: u32,
     plane1_offset: u32,
     plane1_stride: u32,
     plane2_offset: u32,
     plane2_stride: u32,
+    plane3_offset: u32,
+    plane3_stride: u32,
     chroma_width: u32,
     chroma_height: u32,
+    logical_size: u32,
+    numeric_mapping: u32,
 }
 
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
@@ -74,52 +133,11 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 64);
+    assert!(std::mem::size_of::<ShaderParams>() == 96);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
 };
-
-struct EngineMemoryBudget {
-    limit: u64,
-    reserved: Mutex<u64>,
-}
-
-impl EngineMemoryBudget {
-    fn reserve(self: &Arc<Self>, bytes: u64) -> Result<EngineMemoryReservation> {
-        let mut reserved = lock_unpoisoned(&self.reserved);
-        let next = reserved
-            .checked_add(bytes)
-            .ok_or_else(|| Error::backend("concurrent GPU decode memory budget overflow"))?;
-        if next > self.limit {
-            return Err(Error::backend(format!(
-                "concurrent GPU decode sessions would reserve {next} bytes, exceeding the {}-byte engine budget",
-                self.limit
-            )));
-        }
-        *reserved = next;
-        Ok(EngineMemoryReservation {
-            budget: Arc::clone(self),
-            bytes,
-        })
-    }
-
-    fn reserved(&self) -> u64 {
-        *lock_unpoisoned(&self.reserved)
-    }
-}
-
-struct EngineMemoryReservation {
-    budget: Arc<EngineMemoryBudget>,
-    bytes: u64,
-}
-
-impl Drop for EngineMemoryReservation {
-    fn drop(&mut self) {
-        let mut reserved = lock_unpoisoned(&self.budget.reserved);
-        *reserved = reserved.saturating_sub(self.bytes);
-    }
-}
 
 /// Stock GPU-only decoder for indexed single-group lossless Gray8 codestreams.
 ///
@@ -131,7 +149,9 @@ impl Drop for EngineMemoryReservation {
 pub struct WgpuSubmissionEngine {
     backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
-    memory: Arc<EngineMemoryBudget>,
+    native_f64_pipeline: Option<Arc<OnceLock<Arc<wgpu::ComputePipeline>>>>,
+    memory: MemoryBudget,
+    buffers: Arc<DecodeBufferPool>,
 }
 
 impl std::fmt::Debug for WgpuSubmissionEngine {
@@ -139,8 +159,8 @@ impl std::fmt::Debug for WgpuSubmissionEngine {
         formatter
             .debug_struct("WgpuSubmissionEngine")
             .field("backend", &self.backend)
-            .field("memory_budget_bytes", &self.memory.limit)
-            .field("reserved_session_bytes", &self.memory.reserved())
+            .field("memory", &self.memory.snapshot())
+            .field("buffer_pool", &self.buffers.stats())
             .finish_non_exhaustive()
     }
 }
@@ -148,40 +168,37 @@ impl std::fmt::Debug for WgpuSubmissionEngine {
 impl WgpuSubmissionEngine {
     #[must_use]
     pub fn new(backend: WgpuBackend) -> Self {
-        Self::with_memory_budget(
-            backend,
-            NonZeroU64::new(DEFAULT_CONCURRENT_MEMORY_BUDGET)
-                .expect("the default concurrent memory budget is non-zero"),
-        )
+        let memory_budget = backend.transient_memory_budget().clone();
+        Self::with_memory_budget(backend, memory_budget)
     }
 
-    /// Constructs an engine with an explicit aggregate reservation bound across cloned engines
-    /// and concurrently open decode sessions.
+    /// Constructs an engine with an explicitly supplied aggregate reservation budget.
+    ///
+    /// Passing a clone of another component's [`MemoryBudget`] makes decode jobs participate in
+    /// that component's admission bound. [`Self::new`] uses the backend-wide transient budget and
+    /// is the normal constructor.
     #[must_use]
-    pub fn with_memory_budget(backend: WgpuBackend, memory_budget: NonZeroU64) -> Self {
-        let module = backend
-            .device()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("jxl-wgpu decode lossless gray8"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-            });
-        let pipeline = Arc::new(backend.device().create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu decode lossless gray8 pipeline"),
-                layout: None,
-                module: &module,
-                entry_point: Some("decode"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            },
+    pub fn with_memory_budget(backend: WgpuBackend, memory_budget: MemoryBudget) -> Self {
+        let pipeline = Arc::new(create_decode_pipeline(
+            &backend,
+            "jxl-wgpu decode lossless gray8",
+            &shader_source(F64OutputPath::ExactF32Widening),
         ));
+        // Native f64 compilation is intentionally lazy: adapters that enable SHADER_F64 but
+        // never request F64 output do not pay the additional pipeline initialization cost.
+        let native_f64_pipeline = backend
+            .native_f64_enabled()
+            .then(|| Arc::new(OnceLock::new()));
+        let buffers = DecodeBufferPool::new(
+            backend.device().clone(),
+            WgpuDecodeBufferPoolLimits::default(),
+        );
         Self {
             backend,
             pipeline,
-            memory: Arc::new(EngineMemoryBudget {
-                limit: memory_budget.get(),
-                reserved: Mutex::new(0),
-            }),
+            native_f64_pipeline,
+            memory: memory_budget,
+            buffers,
         }
     }
 
@@ -192,17 +209,95 @@ impl WgpuSubmissionEngine {
 
     #[must_use]
     pub fn memory_budget_bytes(&self) -> u64 {
-        self.memory.limit
+        self.memory.snapshot().limit_bytes
     }
 
     #[must_use]
-    pub fn reserved_session_bytes(&self) -> u64 {
-        self.memory.reserved()
+    pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.memory.snapshot()
     }
+
+    #[must_use]
+    pub fn capabilities(&self) -> WgpuDecodeCapabilities {
+        WgpuDecodeCapabilities {
+            native_f64_arithmetic: self.native_f64_pipeline.is_some(),
+        }
+    }
+
+    /// Current idle-cache limits. Active allocations remain governed by `MemoryBudget`.
+    #[must_use]
+    pub fn buffer_pool_limits(&self) -> WgpuDecodeBufferPoolLimits {
+        self.buffers.limits()
+    }
+
+    /// Changes idle-cache limits and immediately evicts allocations outside the new bounds.
+    pub fn set_buffer_pool_limits(&self, limits: WgpuDecodeBufferPoolLimits) {
+        self.buffers.set_limits(limits);
+    }
+
+    /// Drops every idle allocation and invalidates all currently leased pool generations.
+    ///
+    /// In-flight jobs remain valid. Their transient buffers are discarded, rather than cached,
+    /// after GPU completion. The returned generation is also published in
+    /// [`Self::buffer_pool_stats`].
+    pub fn clear_buffer_pool(&self) -> u64 {
+        self.buffers.clear()
+    }
+
+    /// Reports physical idle/leased buffer reuse independently from logical byte admission.
+    #[must_use]
+    pub fn buffer_pool_stats(&self) -> WgpuDecodeBufferPoolStats {
+        self.buffers.stats()
+    }
+}
+
+fn shader_source(path: F64OutputPath) -> String {
+    let (implementation, binding) = match path {
+        F64OutputPath::NativeArithmetic => (F64_NATIVE_ARITHMETIC, F64_NATIVE_BINDING),
+        F64OutputPath::ExactF32Widening => (F64_EXACT_F32_WIDENING, ""),
+    };
+    let source = SHADER_TEMPLATE
+        .replace(F64_OUTPUT_MARKER, implementation)
+        .replace(F64_BINDING_MARKER, binding);
+    debug_assert!(!source.contains(F64_OUTPUT_MARKER));
+    debug_assert!(!source.contains(F64_BINDING_MARKER));
+    source
+}
+
+fn create_decode_pipeline(
+    backend: &WgpuBackend,
+    label: &str,
+    shader: &str,
+) -> wgpu::ComputePipeline {
+    let module = backend
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
+        });
+    backend
+        .device()
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: None,
+            module: &module,
+            entry_point: Some("decode"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
 }
 
 impl GpuSubmissionEngine for WgpuSubmissionEngine {
     type Session = WgpuDecodeSession;
+
+    fn parse_limits(&self) -> ParseLimits {
+        ParseLimits {
+            max_input_bytes: 16 * 1024 * 1024,
+            max_boxes: 32,
+            max_box_bytes: 16 * 1024 * 1024,
+            max_codestream_bytes: 16 * 1024 * 1024,
+        }
+    }
 
     fn open(
         &self,
@@ -223,33 +318,51 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             .into());
         }
         validate_gray8_envelope(codestream.bytes(), &index)?;
+        let prefix_lookup: Arc<[u32]> = build_prefix_lookup(&index)?.into();
         let extent = Extent2d::new(index.width(), index.height());
-        let output = OutputPlan::new(extent, request.format.clone())?;
+        let output = OutputPlan::new(extent, request, self.capabilities())?;
+        let pipeline = match output.f64_output_path {
+            Some(F64OutputPath::NativeArithmetic) => self
+                .native_f64_pipeline
+                .as_ref()
+                .ok_or(Error::NativeF64Unavailable)?
+                .get_or_init(|| {
+                    Arc::new(create_decode_pipeline(
+                        &self.backend,
+                        "jxl-wgpu decode lossless gray8 native f64",
+                        &shader_source(F64OutputPath::NativeArithmetic),
+                    ))
+                })
+                .clone(),
+            Some(F64OutputPath::ExactF32Widening) | None => Arc::clone(&self.pipeline),
+        };
+        let f64_output_path = output.f64_output_path;
         let memory_stats = validate_device_limits(
             self.backend.device(),
             codestream.bytes(),
             &index,
             &output,
-            request.max_in_flight.get(),
+            request.max_frame_slots().get(),
         )?;
-        let memory_reservation = self.memory.reserve(memory_stats.reserved_bytes)?;
         let predictor = FixedModularPredictor::new(Gray8AccelerationIndex::PREDICTOR)
             .expect("the shared Gray8 schema uses a valid JPEG XL predictor");
         Ok(PreparedGpuSession::new(
-            DecodeProfile::prototype_8bit(predictor),
+            DecodeProfile::modular_lossless_8bit(predictor),
             AnimationMetadata::still(extent),
             WgpuDecodeSession {
                 backend: self.backend.clone(),
-                pipeline: Arc::clone(&self.pipeline),
+                pipeline,
                 source: Some(DecodeSource {
-                    codestream: codestream.shared_bytes(),
+                    codestream_storage: codestream.shared_storage(),
+                    codestream_range: codestream.storage_range(),
                     index,
+                    prefix_lookup,
                     output,
                 }),
-                pending: None,
-                emitted: false,
                 memory_stats,
-                _memory_reservation: memory_reservation,
+                memory_budget: self.memory.clone(),
+                buffers: Arc::clone(&self.buffers),
+                f64_output_path,
             },
         ))
     }
@@ -260,18 +373,17 @@ pub struct WgpuDecodeSession {
     backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
     source: Option<DecodeSource>,
-    pending: Option<PendingDecode>,
-    emitted: bool,
     memory_stats: WgpuDecodeMemoryStats,
-    _memory_reservation: EngineMemoryReservation,
+    memory_budget: MemoryBudget,
+    buffers: Arc<DecodeBufferPool>,
+    f64_output_path: Option<F64OutputPath>,
 }
 
 impl std::fmt::Debug for WgpuDecodeSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("WgpuDecodeSession")
-            .field("submitted", &self.pending.is_some())
-            .field("emitted", &self.emitted)
+            .field("submitted", &self.source.is_none())
             .field("memory_stats", &self.memory_stats)
             .finish_non_exhaustive()
     }
@@ -279,47 +391,38 @@ impl std::fmt::Debug for WgpuDecodeSession {
 
 impl GpuSubmissionSession for WgpuDecodeSession {
     type Frame = GpuImageFrame;
+    type Pending = WgpuPendingFrame;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>> {
-        if self.emitted {
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
+        let Some(source) = self.source.as_ref() else {
             return Ok(None);
-        }
-        self.ensure_submitted()?;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let completion = Arc::clone(&self.pending_ref()?.completion);
-            let mapping = completion.wait();
-            self.finish(mapping).map(Some)
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            Err(Error::backend(
-                "blocking GPU decode waits are unavailable on browser WebGPU; poll the frame future",
-            ))
-        }
-    }
-
-    fn poll_next_frame(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>> {
-        if self.emitted {
-            return Poll::Ready(Ok(None));
-        }
-        if let Err(error) = self.ensure_submitted() {
-            return Poll::Ready(Err(error));
-        }
-        if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
-            return Poll::Ready(Err(Error::backend(error)));
-        }
-        let completion = match self.pending_ref() {
-            Ok(pending) => Arc::clone(&pending.completion),
-            Err(error) => return Poll::Ready(Err(error)),
         };
-        match completion.poll(context) {
-            Some(mapping) => Poll::Ready(self.finish(mapping).map(Some)),
-            None => Poll::Pending,
-        }
+        // Admission must precede Queue::submit and source consumption. Saturation leaves the
+        // exact decode source available for a later prefetch attempt.
+        let poll_permit = self
+            .backend
+            .submission_poller()
+            .try_reserve()
+            .map_err(Error::PollBackpressure)?;
+        let output_permit = self
+            .memory_budget
+            .try_reserve(self.memory_stats.output_lease_bytes)?;
+        let transient_permit = self
+            .memory_budget
+            .try_reserve(self.memory_stats.transient_bytes)?;
+        let pending = submit_decode(
+            &self.backend,
+            &self.pipeline,
+            source,
+            &self.buffers,
+            DecodeMemoryPermits {
+                output: output_permit,
+                transient: transient_permit,
+            },
+            poll_permit,
+        )?;
+        self.source = None;
+        Ok(Some(pending))
     }
 }
 
@@ -329,27 +432,74 @@ impl WgpuDecodeSession {
         self.memory_stats
     }
 
-    /// Conservative allocation reservation held by this session, including its requested bound.
+    /// Maximum byte exposure allowed by this session's requested frame window.
     #[must_use]
-    pub const fn reserved_gpu_bytes(&self) -> u64 {
-        self.memory_stats.reserved_bytes
+    pub const fn max_frame_window_gpu_bytes(&self) -> u64 {
+        self.memory_stats.max_frame_window_bytes
     }
 
-    fn ensure_submitted(&mut self) -> Result<()> {
-        if self.pending.is_some() {
-            return Ok(());
-        }
-        let source = self.source.take().ok_or(Error::EngineContract(
-            "Gray8 decode source was consumed without a pending GPU job",
+    /// Reports allocations currently retained by jobs and output leases across engine clones.
+    #[must_use]
+    pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.memory_budget.snapshot()
+    }
+
+    /// Resolved F64 path for this session, or `None` when the requested output is not F64.
+    #[must_use]
+    pub const fn f64_output_path(&self) -> Option<F64OutputPath> {
+        self.f64_output_path
+    }
+}
+
+/// One submitted stock Gray8 frame. Queue submission has completed, while mapped validation may
+/// still be pending.
+pub struct WgpuPendingFrame {
+    device: wgpu::Device,
+    lifetime: Option<Arc<DecodeJobLifetime>>,
+    token: SubmissionToken,
+    layout: ImageLayout,
+    completion: Arc<MapCompletion>,
+    sample_count: u32,
+}
+
+impl std::fmt::Debug for WgpuPendingFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WgpuPendingFrame")
+            .field("token", &self.token)
+            .field("layout", &self.layout)
+            .field("sample_count", &self.sample_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WgpuPendingFrame {
+    /// Clones a budget-tracked lease to the queue-submitted output before validation completes.
+    ///
+    /// Submit consumers only to the same [`WgpuBackend`] device and queue that created this decode
+    /// session. Queue ordering then permits display, readback, or custom GPU work without a host
+    /// wait. This value deliberately has no authoritative frame metadata or changed regions. If
+    /// [`GpuDecodeSession::next_frame`](crate::GpuDecodeSession::next_frame) later returns an error,
+    /// already-submitted consumer work cannot be rolled back and all derived data must be
+    /// discarded.
+    ///
+    /// The returned [`GpuBufferLease`] clone retains the output allocation's shared byte-budget
+    /// permit. Keep that lease alive instead of cloning its raw wgpu buffer handle.
+    pub fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
+        let lifetime = self.lifetime.as_ref().ok_or(Error::EngineContract(
+            "Gray8 GPU pending frame was already consumed",
         ))?;
-        self.pending = Some(submit_decode(&self.backend, &self.pipeline, source)?);
-        Ok(())
-    }
-
-    fn pending_ref(&self) -> Result<&PendingDecode> {
-        self.pending.as_ref().ok_or(Error::EngineContract(
-            "Gray8 GPU completion was queried before submission",
-        ))
+        Ok(UnvalidatedGpuImageFrame {
+            token: self.token,
+            outputs: vec![UnvalidatedGpuImageOutput {
+                id: OutputId(0),
+                layout: self.layout.clone(),
+                buffer: GpuBufferLease::with_memory_permit(
+                    Arc::clone(&lifetime.output),
+                    lifetime.output_permit.clone(),
+                ),
+            }],
+        })
     }
 
     fn finish(
@@ -357,11 +507,12 @@ impl WgpuDecodeSession {
         mapping: std::result::Result<(), String>,
     ) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
         mapping.map_err(Error::backend)?;
-        let pending = self.pending.take().ok_or(Error::EngineContract(
+        let lifetime = self.lifetime.take().ok_or(Error::EngineContract(
             "Gray8 GPU completion was consumed more than once",
         ))?;
-        let mapped = pending
+        let mapped = lifetime
             .status_staging
+            .buffer()
             .slice(..)
             .get_mapped_range()
             .map_err(Error::backend)?;
@@ -377,17 +528,16 @@ impl WgpuDecodeSession {
                     .ok_or_else(|| Error::backend("GPU status buffer was truncated"))
             });
         drop(mapped);
-        pending.status_staging.unmap();
         let status = status?;
         if status.code != STATUS_OK
-            || status.decoded_samples != pending.sample_count
+            || status.decoded_samples != self.sample_count
             || status.cursor != status.expected_cursor
         {
             return Err(Error::backend(format!(
                 "Gray8 GPU decode rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
                 status.code,
                 status.decoded_samples,
-                pending.sample_count,
+                self.sample_count,
                 status.cursor,
                 status.expected_cursor
             )));
@@ -400,25 +550,29 @@ impl WgpuDecodeSession {
             vec![Region::new(
                 0,
                 0,
-                pending.layout.extent.width,
-                pending.layout.extent.height,
+                self.layout.extent.width,
+                self.layout.extent.height,
             )],
         );
-        self.emitted = true;
         Ok(SubmittedGpuFrame::new(
             FrameMetadata {
                 index: 0,
                 duration: FrameDuration::still(),
+                presentation_ticks: 0,
+                timecode: None,
                 is_last: true,
                 is_keyframe: true,
                 name: String::new(),
             },
             GpuImageFrame {
-                token: SubmissionToken(1),
+                token: self.token,
                 outputs: vec![GpuImageOutput {
                     id: output_id,
-                    layout: pending.layout,
-                    buffer: pending.output,
+                    layout: self.layout.clone(),
+                    buffer: GpuBufferLease::with_memory_permit(
+                        Arc::clone(&lifetime.output),
+                        lifetime.output_permit.clone(),
+                    ),
                 }],
                 changed: ChangedRegions { outputs: regions },
             },
@@ -426,78 +580,377 @@ impl WgpuDecodeSession {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl GpuPendingFrame for WgpuPendingFrame {
+    type Frame = GpuImageFrame;
+
+    fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
+        let mapping = self.completion.wait();
+        self.finish(mapping)
+    }
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            return Poll::Ready(Err(Error::backend(error)));
+        }
+        match self.completion.poll(context) {
+            Some(mapping) => Poll::Ready(self.finish(mapping)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl GpuPendingFrame for WgpuPendingFrame {
+    type Frame = GpuImageFrame;
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            return Poll::Ready(Err(Error::backend(error)));
+        }
+        match self.completion.poll(context) {
+            Some(mapping) => Poll::Ready(self.finish(mapping)),
+            None => Poll::Pending,
+        }
+    }
+}
+
 struct DecodeSource {
-    codestream: Arc<[u8]>,
+    codestream_storage: Arc<[u8]>,
+    codestream_range: std::ops::Range<usize>,
     index: Gray8AccelerationIndex,
+    // Immutable within the session. Future multi-frame frontends can share this Arc whenever the
+    // canonical prefix set is unchanged without sharing mutable GPU transient allocations.
+    prefix_lookup: Arc<[u32]>,
     output: OutputPlan,
 }
 
-struct PendingDecode {
+struct DecodeJobLifetime {
     output: Arc<wgpu::Buffer>,
-    layout: ImageLayout,
-    status_staging: Arc<wgpu::Buffer>,
-    completion: Arc<MapCompletion>,
-    sample_count: u32,
+    _lookup: DecodeBufferLease,
+    _reconstructed: DecodeBufferLease,
+    _native_f64_dummy_words: Option<DecodeBufferLease>,
+    _status: DecodeBufferLease,
+    status_staging: DecodeBufferLease,
+    status_mapped: AtomicBool,
+    _params: DecodeBufferLease,
+    output_permit: MemoryPermit,
+    _transient_permit: MemoryPermit,
 }
 
-#[derive(Clone, Copy)]
-enum OutputMode {
-    NonColor = 0,
+impl Drop for DecodeJobLifetime {
+    fn drop(&mut self) {
+        // A successful map remains mapped until explicitly released. This also covers abandoned
+        // sessions/Futures: the callback owns the final Arc until mapping has completed, then this
+        // drop runs and unmaps before field destruction returns the staging lease to the pool.
+        if self.status_mapped.swap(false, Ordering::AcqRel) {
+            self.status_staging.buffer().unmap();
+        }
+    }
+}
+
+struct DecodeMemoryPermits {
+    output: MemoryPermit,
+    transient: MemoryPermit,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputKind {
+    NumericUnsigned = 0,
     Luma = 1,
-    Semiplanar = 2,
-    Planar = 3,
+    YuvSemiplanar = 2,
+    YuvPlanar = 3,
+    Yuv422Packed = 4,
+    RgbInterleaved = 5,
+    RgbPlanar = 6,
+    NumericSigned = 7,
+    NumericFloat = 8,
 }
 
 struct OutputPlan {
     layout: ImageLayout,
-    mode: OutputMode,
+    kind: OutputKind,
     transfer: u32,
     limited_range: bool,
+    channels: u32,
+    order: u32,
+    bits: u32,
+    storage_bits: u32,
+    numeric_mapping: u32,
+    f64_output_path: Option<F64OutputPath>,
 }
 
 impl OutputPlan {
-    fn new(extent: Extent2d, format: PixelFormat) -> Result<Self> {
-        let non_color = PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]);
-        if format == non_color {
-            return Ok(Self {
-                layout: ImageLayout::packed(extent, format)?,
-                mode: OutputMode::NonColor,
-                transfer: 0,
-                limited_range: false,
-            });
-        }
-
-        let mode = if format == PixelFormat::luma(8, format.color_spec) {
-            OutputMode::Luma
-        } else if [ChromaOrder::CbCr, ChromaOrder::CrCb]
-            .into_iter()
-            .filter_map(|order| {
-                PixelFormat::yuv_semiplanar(
-                    format.chroma_subsampling,
-                    8,
-                    8,
-                    order,
-                    format.color_spec,
-                )
-                .ok()
-            })
-            .any(|candidate| candidate == format)
-        {
-            OutputMode::Semiplanar
-        } else if PixelFormat::yuv_planar(format.chroma_subsampling, 8, 8, format.color_spec)
-            .is_ok_and(|candidate| candidate == format)
-        {
-            OutputMode::Planar
-        } else {
-            return Err(Error::UnsupportedOutputFormat(format!("{format:?}")));
-        };
-        let (transfer, limited_range) = color_conversion(&format)?;
-        Ok(Self {
-            layout: ImageLayout::packed(extent, format)?,
-            mode,
+    fn new(
+        extent: Extent2d,
+        request: &GpuOutputRequest,
+        capabilities: WgpuDecodeCapabilities,
+    ) -> Result<Self> {
+        let format = request.format().clone();
+        let class = classify_pixel_format(&format)
+            .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?;
+        let (
+            kind,
             transfer,
             limited_range,
-        })
+            channels,
+            order,
+            bits,
+            storage_bits,
+            numeric_mapping,
+            f64_output_path,
+        ) = match (class, request.mapping()) {
+            (
+                PixelFormatClass::Numeric(numeric),
+                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedGray8),
+            ) => {
+                if numeric.sample_kind == SampleKind::Float && numeric.bits_per_component == 64 {
+                    return Err(Error::F64OutputPolicyRequired);
+                }
+                let kind = match numeric.sample_kind {
+                    SampleKind::Unsigned => OutputKind::NumericUnsigned,
+                    SampleKind::Signed => OutputKind::NumericSigned,
+                    SampleKind::Float => OutputKind::NumericFloat,
+                };
+                (
+                    kind,
+                    0,
+                    false,
+                    u32::from(numeric.components),
+                    0,
+                    u32::from(numeric.bits_per_component),
+                    u32::from(numeric.bits_per_component),
+                    1,
+                    None,
+                )
+            }
+            (
+                PixelFormatClass::Numeric(numeric),
+                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedGray8F64(policy)),
+            ) => {
+                if numeric.sample_kind != SampleKind::Float
+                    || numeric.bits_per_component != 64
+                    || numeric.components != 1
+                {
+                    return Err(Error::F64OutputPolicyForNonF64);
+                }
+                let path = resolve_f64_output_path(policy, capabilities)?;
+                (
+                    OutputKind::NumericFloat,
+                    0,
+                    false,
+                    1,
+                    0,
+                    64,
+                    64,
+                    match path {
+                        F64OutputPath::ExactF32Widening => 1,
+                        F64OutputPath::NativeArithmetic => 2,
+                    },
+                    Some(path),
+                )
+            }
+            (PixelFormatClass::Numeric(_), GpuOutputMapping::Color) => {
+                return Err(Error::NumericMappingRequired);
+            }
+            (PixelFormatClass::Color(_), GpuOutputMapping::Numeric(_)) => {
+                return Err(Error::NumericMappingForColorOutput);
+            }
+            (PixelFormatClass::Color(color), GpuOutputMapping::Color) => {
+                let (transfer, limited_range) = color_conversion(&format)?;
+                let (kind, channels, order, bits, storage_bits) = match color {
+                    ColorFormatClass::Rgb8 { storage, order } => {
+                        if limited_range {
+                            return Err(Error::UnsupportedOutputFormat(
+                                "RGB output requires an explicit full-range color specification"
+                                    .into(),
+                            ));
+                        }
+                        let (channels, order) = rgb_output_shape(order);
+                        let kind = match storage {
+                            RgbStorage::Interleaved => OutputKind::RgbInterleaved,
+                            RgbStorage::Planar => OutputKind::RgbPlanar,
+                        };
+                        (kind, channels, order, 8, 8)
+                    }
+                    ColorFormatClass::Luma { bits, storage_bits }
+                        if matches!((bits, storage_bits), (8, 8) | (16, 16)) =>
+                    {
+                        (
+                            OutputKind::Luma,
+                            1,
+                            0,
+                            u32::from(bits),
+                            u32::from(storage_bits),
+                        )
+                    }
+                    ColorFormatClass::YuvSemiplanar {
+                        bits: 8,
+                        storage_bits: 8,
+                        chroma_order,
+                        ..
+                    } => (
+                        OutputKind::YuvSemiplanar,
+                        3,
+                        match chroma_order {
+                            ChromaOrder::CbCr => 0,
+                            ChromaOrder::CrCb => 1,
+                        },
+                        8,
+                        8,
+                    ),
+                    ColorFormatClass::YuvPlanar {
+                        bits: 8,
+                        storage_bits: 8,
+                        ..
+                    } => (OutputKind::YuvPlanar, 3, 0, 8, 8),
+                    ColorFormatClass::Yuv422Packed { order } => (
+                        OutputKind::Yuv422Packed,
+                        3,
+                        match order {
+                            Packed422Order::Yuyv => 0,
+                            Packed422Order::Uyvy => 1,
+                        },
+                        8,
+                        8,
+                    ),
+                    unsupported => {
+                        return Err(Error::UnsupportedOutputFormat(format!(
+                            "the Gray8 GPU decoder does not implement color storage {unsupported:?}"
+                        )));
+                    }
+                };
+                (
+                    kind,
+                    transfer,
+                    limited_range,
+                    channels,
+                    order,
+                    bits,
+                    storage_bits,
+                    0,
+                    None,
+                )
+            }
+        };
+        let output = Self {
+            layout: ImageLayout::packed(extent, format)?,
+            kind,
+            transfer,
+            limited_range,
+            channels,
+            order,
+            bits,
+            storage_bits,
+            numeric_mapping,
+            f64_output_path,
+        };
+        output.validate_shader_layout()?;
+        Ok(output)
+    }
+
+    fn validate_shader_layout(&self) -> Result<()> {
+        let expected_planes = match self.kind {
+            OutputKind::NumericUnsigned
+            | OutputKind::NumericSigned
+            | OutputKind::NumericFloat
+            | OutputKind::Luma
+            | OutputKind::Yuv422Packed
+            | OutputKind::RgbInterleaved => 1,
+            OutputKind::YuvSemiplanar => 2,
+            OutputKind::YuvPlanar => 3,
+            OutputKind::RgbPlanar => usize::try_from(self.channels)
+                .map_err(|_| Error::backend("RGB plane count overflow"))?,
+        };
+        if self.layout.planes.len() != expected_planes || expected_planes > 4 {
+            return Err(Error::backend(format!(
+                "requested output has {} planes; {:?} requires {expected_planes}",
+                self.layout.planes.len(),
+                self.kind
+            )));
+        }
+        u32::try_from(self.layout.logical_size)
+            .map_err(|_| Error::backend("requested output exceeds the WGSL u32 address space"))?;
+        for plane in &self.layout.planes {
+            for (name, value) in [
+                ("offset", plane.offset),
+                ("row stride", plane.row_stride),
+                ("row bytes", plane.row_bytes),
+                ("end offset", plane.end_offset()?),
+            ] {
+                u32::try_from(value).map_err(|_| {
+                    Error::backend(format!(
+                        "output plane {} {name} exceeds the WGSL u32 address space",
+                        plane.plane_index
+                    ))
+                })?;
+            }
+        }
+        if matches!(self.kind, OutputKind::Yuv422Packed)
+            || (self.kind == OutputKind::RgbInterleaved && self.channels == 4)
+        {
+            let plane = &self.layout.planes[0];
+            if !plane.offset.is_multiple_of(4) || !plane.row_stride.is_multiple_of(4) {
+                return Err(Error::backend(
+                    "four-byte packed output requires four-byte-aligned rows",
+                ));
+            }
+        }
+        if matches!(
+            self.kind,
+            OutputKind::NumericUnsigned | OutputKind::NumericSigned | OutputKind::NumericFloat
+        ) && self.bits >= 32
+        {
+            let plane = &self.layout.planes[0];
+            if !plane.offset.is_multiple_of(4) || !plane.row_stride.is_multiple_of(4) {
+                return Err(Error::backend(
+                    "32/64-bit numeric output requires four-byte-aligned rows",
+                ));
+            }
+        }
+        if self.kind == OutputKind::NumericFloat && self.bits == 64 {
+            let plane = &self.layout.planes[0];
+            if !plane.offset.is_multiple_of(8) || !plane.row_stride.is_multiple_of(8) {
+                return Err(Error::backend(
+                    "F64 numeric output requires eight-byte-aligned rows",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_f64_output_path(
+    policy: F64OutputPolicy,
+    capabilities: WgpuDecodeCapabilities,
+) -> Result<F64OutputPath> {
+    match policy {
+        F64OutputPolicy::NativeRequired => capabilities
+            .native_f64_arithmetic
+            .then_some(F64OutputPath::NativeArithmetic)
+            .ok_or(Error::NativeF64Unavailable),
+        F64OutputPolicy::NativeOrExactF32Widening => Ok(if capabilities.native_f64_arithmetic {
+            F64OutputPath::NativeArithmetic
+        } else {
+            F64OutputPath::ExactF32Widening
+        }),
+        F64OutputPolicy::ExactF32Widening => Ok(F64OutputPath::ExactF32Widening),
+    }
+}
+
+fn rgb_output_shape(order: RgbChannelOrder) -> (u32, u32) {
+    match order {
+        RgbChannelOrder::Rgb => (3, 0),
+        RgbChannelOrder::Bgr => (3, 1),
+        RgbChannelOrder::Rgba => (4, 2),
+        RgbChannelOrder::Bgra => (4, 3),
     }
 }
 
@@ -525,7 +978,7 @@ fn validate_device_limits(
     codestream: &[u8],
     index: &Gray8AccelerationIndex,
     output: &OutputPlan,
-    max_in_flight: usize,
+    max_frame_slots: usize,
 ) -> Result<WgpuDecodeMemoryStats> {
     let token_end = index
         .token_bit_offset()
@@ -544,6 +997,12 @@ fn validate_device_limits(
         .checked_mul(4)
         .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
     let output_bytes = align4(output.layout.logical_size)?;
+    let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
+    {
+        NATIVE_F64_DUMMY_WORD_BYTES
+    } else {
+        0
+    };
     for (name, required) in [
         ("codestream", codestream_bytes),
         ("prefix lookup", lookup_bytes),
@@ -561,6 +1020,7 @@ fn validate_device_limits(
         lookup_bytes,
         sample_bytes,
         output_bytes,
+        native_f64_dummy_bytes,
         STATUS_BYTES,
         STATUS_BYTES,
         std::mem::size_of::<ShaderParams>() as u64,
@@ -568,59 +1028,79 @@ fn validate_device_limits(
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
     .ok_or_else(|| Error::backend("Gray8 GPU memory budget overflow"))?;
-    let reserved = per_frame
+    let max_frame_window_bytes = per_frame
         .checked_mul(
-            u64::try_from(max_in_flight)
-                .map_err(|_| Error::backend("max-in-flight count overflow"))?,
+            u64::try_from(max_frame_slots)
+                .map_err(|_| Error::backend("frame-slot count overflow"))?,
         )
         .ok_or_else(|| Error::backend("bounded in-flight GPU memory budget overflow"))?;
-    if reserved > MAX_SESSION_RESERVATION_BYTES {
+    if max_frame_window_bytes > MAX_SESSION_IN_FLIGHT_BYTES {
         return Err(Error::backend(format!(
-            "bounded Gray8 session reserves {reserved} bytes ({per_frame} per frame), exceeding the {}-byte session limit",
-            MAX_SESSION_RESERVATION_BYTES
+            "bounded Gray8 session exposes {max_frame_window_bytes} bytes ({per_frame} per frame), exceeding the {}-byte session limit",
+            MAX_SESSION_IN_FLIGHT_BYTES
         )));
     }
+    let transient_bytes = per_frame
+        .checked_sub(output_bytes)
+        .ok_or_else(|| Error::backend("Gray8 transient memory accounting underflow"))?;
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
-        max_in_flight,
-        reserved_bytes: reserved,
+        output_lease_bytes: output_bytes,
+        transient_bytes,
+        max_frame_slots,
+        max_frame_window_bytes,
     })
 }
 
 fn submit_decode(
     backend: &WgpuBackend,
     pipeline: &wgpu::ComputePipeline,
-    source: DecodeSource,
-) -> Result<PendingDecode> {
+    source: &DecodeSource,
+    buffers: &Arc<DecodeBufferPool>,
+    memory_permits: DecodeMemoryPermits,
+    poll_permit: SubmissionPollPermit,
+) -> Result<WgpuPendingFrame> {
     let device = backend.device();
-    let mut codestream_bytes = source.codestream.to_vec();
-    codestream_bytes.resize(
-        usize::try_from(stream_allocation_size(codestream_bytes.len())?)
-            .map_err(|_| Error::backend("codestream allocation size overflow"))?,
-        0,
-    );
-    let stream = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let codestream = source
+        .codestream_storage
+        .get(source.codestream_range.clone())
+        .ok_or_else(|| Error::backend("codestream storage range is invalid"))?;
+    // The raw source is intentionally not pooled: it is session data, not a reusable transient
+    // shape. Upload aligned spans directly from the shared input Arc rather than allocating a
+    // second full codestream Vec on the host.
+    let stream = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu decode codestream"),
-        contents: &codestream_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
+        size: stream_allocation_size(codestream.len())?,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
+    upload_codestream(backend.queue(), &stream, codestream)?;
 
-    let lookup = build_prefix_lookup(&source.index)?;
-    let lookup = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu decode prefix lookup"),
-        contents: bytemuck::cast_slice(&lookup),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let lookup_bytes = u64::try_from(LOOKUP_SIZE * std::mem::size_of::<u32>())
+        .map_err(|_| Error::backend("prefix lookup size overflow"))?;
+    let lookup_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let lookup_buffer = buffers.checkout(
+        "jxl-wgpu decode prefix lookup",
+        lookup_bytes,
+        lookup_usage,
+        std::mem::align_of::<u32>() as u64,
+    );
+    backend.queue().write_buffer(
+        lookup_buffer.buffer(),
+        0,
+        bytemuck::cast_slice(source.prefix_lookup.as_ref()),
+    );
 
     let sample_bytes = u64::from(source.index.sample_count())
         .checked_mul(4)
         .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
-    let reconstructed = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("jxl-wgpu decoded Gray8 samples"),
-        size: sample_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let reconstructed_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let reconstructed = buffers.checkout(
+        "jxl-wgpu decoded Gray8 samples",
+        sample_bytes,
+        reconstructed_usage,
+        std::mem::align_of::<u32>() as u64,
+    );
     let output_size = align4(source.output.layout.logical_size)?;
     let output = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu decoded image output"),
@@ -630,64 +1110,97 @@ fn submit_decode(
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }));
-    let status = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("jxl-wgpu decode status"),
-        size: STATUS_BYTES,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let status_staging = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("jxl-wgpu decode status readback"),
-        size: STATUS_BYTES,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    }));
+    // The native shader declares the caller-visible allocation exactly once as `array<f64>`.
+    // Its otherwise-unused raw-word binding receives a distinct dummy allocation, avoiding two
+    // writable storage aliases for the same buffer.
+    let native_f64_dummy_words =
+        (source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic)).then(|| {
+            buffers.checkout(
+                "jxl-wgpu native F64 dummy word output",
+                NATIVE_F64_DUMMY_WORD_BYTES,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                std::mem::align_of::<u32>() as u64,
+            )
+        });
+    let status_usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let status = buffers.checkout(
+        "jxl-wgpu decode status",
+        STATUS_BYTES,
+        status_usage,
+        std::mem::align_of::<DecodeStatus>() as u64,
+    );
+    let status_staging_usage = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ;
+    let status_staging = buffers.checkout(
+        "jxl-wgpu decode status readback",
+        STATUS_BYTES,
+        status_staging_usage,
+        wgpu::COPY_BUFFER_ALIGNMENT,
+    );
 
     let params = build_params(&source.index, &source.output)?;
-    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu decode Gray8 parameters"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let params_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
+    let params_buffer = buffers.checkout(
+        "jxl-wgpu decode Gray8 parameters",
+        std::mem::size_of::<ShaderParams>() as u64,
+        params_usage,
+        16,
+    );
+    backend
+        .queue()
+        .write_buffer(params_buffer.buffer(), 0, bytemuck::bytes_of(&params));
 
+    let word_output_binding = native_f64_dummy_words.as_ref().map_or_else(
+        || output.as_entire_binding(),
+        |buffer| buffer.buffer().as_entire_binding(),
+    );
+    let mut binding_entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: stream.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: lookup_buffer.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: reconstructed.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: word_output_binding,
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: status.buffer().as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: params_buffer.buffer().as_entire_binding(),
+        },
+    ];
+    if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
+        binding_entries.push(wgpu::BindGroupEntry {
+            binding: 6,
+            resource: output.as_entire_binding(),
+        });
+    }
     let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("jxl-wgpu decode Gray8 bindings"),
         layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: stream.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: lookup.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: reconstructed.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: output.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: status.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: params.as_entire_binding(),
-            },
-        ],
+        entries: &binding_entries,
     });
+    drop(binding_entries);
     let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("jxl-wgpu decode Gray8 submission"),
     });
-    commands.clear_buffer(&reconstructed, 0, None);
+    commands.clear_buffer(reconstructed.buffer(), 0, None);
     commands.clear_buffer(&output, 0, None);
-    commands.clear_buffer(&status, 0, None);
+    if let Some(dummy) = &native_f64_dummy_words {
+        commands.clear_buffer(dummy.buffer(), 0, None);
+    }
+    commands.clear_buffer(status.buffer(), 0, None);
     {
         let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu entropy and Gradient reconstruction"),
@@ -697,35 +1210,54 @@ fn submit_decode(
         pass.set_bind_group(0, &bindings, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
-    commands.copy_buffer_to_buffer(&status, 0, &status_staging, 0, STATUS_BYTES);
+    commands.copy_buffer_to_buffer(status.buffer(), 0, status_staging.buffer(), 0, STATUS_BYTES);
 
     let completion = Arc::new(MapCompletion::default());
     let callback_completion = Arc::clone(&completion);
-    commands.map_buffer_on_submit(&status_staging, wgpu::MapMode::Read, .., move |result| {
-        callback_completion
-            .complete(result.map_err(|error| format!("GPU status mapping failed: {error}")));
-    });
-    let submission = backend.queue().submit([commands.finish()]);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let poll_device = device.clone();
-        let poll_completion = Arc::clone(&completion);
-        std::thread::spawn(move || {
-            if let Err(error) = poll_device.poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            }) {
-                poll_completion.complete(Err(format!("GPU submission failed: {error}")));
-            }
-        });
-    }
-    #[cfg(target_arch = "wasm32")]
-    let _ = submission;
-
-    Ok(PendingDecode {
+    let lifetime = Arc::new(DecodeJobLifetime {
         output,
-        layout: source.output.layout,
+        _lookup: lookup_buffer,
+        _reconstructed: reconstructed,
+        _native_f64_dummy_words: native_f64_dummy_words,
+        _status: status,
         status_staging,
+        status_mapped: AtomicBool::new(false),
+        _params: params_buffer,
+        output_permit: memory_permits.output,
+        _transient_permit: memory_permits.transient,
+    });
+    let callback_lifetime = Arc::clone(&lifetime);
+    commands.map_buffer_on_submit(
+        lifetime.status_staging.buffer(),
+        wgpu::MapMode::Read,
+        ..,
+        move |result| {
+            // Release the callback's ownership before waking a waiter. The pending frame keeps
+            // the job alive through status validation; an abandoned pending frame instead makes
+            // this the final Arc, so staging is unmapped and recycled at this proven boundary.
+            if result.is_ok() {
+                callback_lifetime
+                    .status_mapped
+                    .store(true, Ordering::Release);
+            }
+            drop(callback_lifetime);
+            callback_completion
+                .complete(result.map_err(|error| format!("GPU status mapping failed: {error}")));
+        },
+    );
+    let submission = backend.queue().submit([commands.finish()]);
+    let poll_completion = Arc::clone(&completion);
+    if let Err(error) = poll_permit.register(submission, move |error| {
+        poll_completion.complete(Err(error));
+    }) {
+        completion.complete(Err(format!("GPU poll registration failed: {error}")));
+    }
+
+    Ok(WgpuPendingFrame {
+        device: backend.device().clone(),
+        lifetime: Some(lifetime),
+        token: SubmissionToken(1),
+        layout: source.output.layout.clone(),
         completion,
         sample_count: source.index.sample_count(),
     })
@@ -777,12 +1309,6 @@ fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Res
 }
 
 fn build_params(index: &Gray8AccelerationIndex, output: &OutputPlan) -> Result<ShaderParams> {
-    let plane0 = output
-        .layout
-        .plane(0)
-        .ok_or_else(|| Error::backend("requested output has no first plane"))?;
-    let plane1 = output.layout.plane(1);
-    let plane2 = output.layout.plane(2);
     let token_end = index
         .token_bit_offset()
         .checked_add(index.token_bit_len())
@@ -790,29 +1316,44 @@ fn build_params(index: &Gray8AccelerationIndex, output: &OutputPlan) -> Result<S
     let to_u32 = |value: u64, name: &'static str| {
         u32::try_from(value).map_err(|_| Error::backend(format!("{name} exceeds WGSL u32")))
     };
+    let plane = |index: usize| -> Result<(u32, u32)> {
+        output.layout.plane(index).map_or(Ok((0, 0)), |plane| {
+            Ok((
+                to_u32(plane.offset, "plane offset")?,
+                to_u32(plane.row_stride, "plane row stride")?,
+            ))
+        })
+    };
+    let (plane0_offset, plane0_stride) = plane(0)?;
+    let (plane1_offset, plane1_stride) = plane(1)?;
+    let (plane2_offset, plane2_stride) = plane(2)?;
+    let (plane3_offset, plane3_stride) = plane(3)?;
+    let chroma = output.layout.plane(1);
     Ok(ShaderParams {
         token_start: to_u32(index.token_bit_offset(), "token start")?,
         token_end: to_u32(token_end, "token end")?,
         width: index.width(),
         height: index.height(),
         sample_count: index.sample_count(),
-        output_mode: output.mode as u32,
+        output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
-        plane0_offset: to_u32(plane0.offset, "plane 0 offset")?,
-        plane0_stride: to_u32(plane0.row_stride, "plane 0 row stride")?,
-        plane1_offset: to_u32(plane1.map_or(0, |plane| plane.offset), "plane 1 offset")?,
-        plane1_stride: to_u32(
-            plane1.map_or(0, |plane| plane.row_stride),
-            "plane 1 row stride",
-        )?,
-        plane2_offset: to_u32(plane2.map_or(0, |plane| plane.offset), "plane 2 offset")?,
-        plane2_stride: to_u32(
-            plane2.map_or(0, |plane| plane.row_stride),
-            "plane 2 row stride",
-        )?,
-        chroma_width: plane1.map_or(0, |plane| plane.sample_extent.width),
-        chroma_height: plane1.map_or(0, |plane| plane.sample_extent.height),
+        channels: output.channels,
+        order: output.order,
+        bits: output.bits,
+        storage_bits: output.storage_bits,
+        plane0_offset,
+        plane0_stride,
+        plane1_offset,
+        plane1_stride,
+        plane2_offset,
+        plane2_stride,
+        plane3_offset,
+        plane3_stride,
+        chroma_width: chroma.map_or(0, |plane| plane.sample_extent.width),
+        chroma_height: chroma.map_or(0, |plane| plane.sample_extent.height),
+        logical_size: to_u32(output.layout.logical_size, "output logical size")?,
+        numeric_mapping: output.numeric_mapping,
     })
 }
 
@@ -822,6 +1363,40 @@ fn stream_allocation_size(byte_len: usize) -> Result<u64> {
     align4(byte_len)?
         .checked_add(STREAM_SENTINEL_BYTES)
         .ok_or_else(|| Error::backend("codestream sentinel allocation overflow"))
+}
+
+fn upload_codestream(
+    queue: &wgpu::Queue,
+    destination: &wgpu::Buffer,
+    codestream: &[u8],
+) -> Result<()> {
+    let aligned_prefix = codestream.len() & !(wgpu::COPY_BUFFER_ALIGNMENT as usize - 1);
+    if aligned_prefix != 0 {
+        queue.write_buffer(destination, 0, &codestream[..aligned_prefix]);
+    }
+
+    let remainder = &codestream[aligned_prefix..];
+    if !remainder.is_empty() {
+        let mut tail = [0u8; wgpu::COPY_BUFFER_ALIGNMENT as usize];
+        tail[..remainder.len()].copy_from_slice(remainder);
+        queue.write_buffer(
+            destination,
+            u64::try_from(aligned_prefix)
+                .map_err(|_| Error::backend("codestream upload offset overflow"))?,
+            &tail,
+        );
+    }
+
+    let sentinel_offset = align4(
+        u64::try_from(codestream.len())
+            .map_err(|_| Error::backend("codestream sentinel offset overflow"))?,
+    )?;
+    queue.write_buffer(
+        destination,
+        sentinel_offset,
+        &[0u8; wgpu::COPY_BUFFER_ALIGNMENT as usize],
+    );
+    Ok(())
 }
 
 fn align4(value: u64) -> Result<u64> {
@@ -845,13 +1420,17 @@ struct MapState {
 
 impl MapCompletion {
     fn complete(&self, result: std::result::Result<(), String>) {
-        let mut state = lock_unpoisoned(&self.state);
-        if state.result.is_none() {
-            state.result = Some(result);
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
+        let waker = {
+            let mut state = lock_unpoisoned(&self.state);
+            if state.result.is_some() {
+                return;
             }
-            self.condition.notify_all();
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.condition.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 
@@ -896,18 +1475,231 @@ impl GpuDecoder<WgpuSubmissionEngine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jxl_gpu_formats::vpi::VpiPitchLinearFormat as Vpi;
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Wake;
+
+    struct ReentrantCompletionWake {
+        completion: Arc<MapCompletion>,
+        entered: AtomicBool,
+    }
+
+    impl Wake for ReentrantCompletionWake {
+        fn wake(self: Arc<Self>) {
+            self.entered.store(true, Ordering::SeqCst);
+            let waker = Waker::from(Arc::clone(&self));
+            let context = Context::from_waker(&waker);
+            assert_eq!(self.completion.poll(&context), Some(Ok(())));
+        }
+    }
+
+    const PORTABLE_CAPABILITIES: WgpuDecodeCapabilities = WgpuDecodeCapabilities {
+        native_f64_arithmetic: false,
+    };
 
     #[test]
-    fn output_negotiation_rejects_unimplemented_packed_rgb() {
+    fn output_negotiation_rejects_rgb_without_explicit_transfer_and_range() {
         let format = PixelFormat::rgb8(
             jxl_gpu_formats::RgbChannelOrder::Rgb,
             false,
             ColorSpecification::Undefined,
         );
+        let request = GpuOutputRequest::color(format).unwrap();
         assert!(matches!(
-            OutputPlan::new(Extent2d::new(2, 2), format),
+            OutputPlan::new(Extent2d::new(2, 2), &request, PORTABLE_CAPABILITIES),
             Err(Error::UnsupportedOutputFormat(_))
         ));
+    }
+
+    #[test]
+    fn output_negotiation_rejects_shader_address_overflow() {
+        let request = GpuOutputRequest::color(Vpi::Rgba8.pixel_format()).unwrap();
+        assert!(matches!(
+            OutputPlan::new(Extent2d::new(u32::MAX, 1), &request, PORTABLE_CAPABILITIES,),
+            Err(Error::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
+        let color_formats = [
+            (Vpi::Y8, OutputKind::Luma, 1, 0, 8, 1, true, 1),
+            (Vpi::Y8Er, OutputKind::Luma, 1, 0, 8, 1, false, 1),
+            (Vpi::Y16, OutputKind::Luma, 1, 0, 16, 1, true, 1),
+            (Vpi::Y16Er, OutputKind::Luma, 1, 0, 16, 1, false, 1),
+            (Vpi::Nv12, OutputKind::YuvSemiplanar, 3, 0, 8, 2, true, 1),
+            (Vpi::Nv12Er, OutputKind::YuvSemiplanar, 3, 0, 8, 2, false, 1),
+            (Vpi::Nv24, OutputKind::YuvSemiplanar, 3, 0, 8, 2, true, 1),
+            (Vpi::Nv24Er, OutputKind::YuvSemiplanar, 3, 0, 8, 2, false, 1),
+            (Vpi::Uyvy, OutputKind::Yuv422Packed, 3, 1, 8, 1, true, 1),
+            (Vpi::UyvyEr, OutputKind::Yuv422Packed, 3, 1, 8, 1, false, 1),
+            (Vpi::Yuyv, OutputKind::Yuv422Packed, 3, 0, 8, 1, true, 1),
+            (Vpi::YuyvEr, OutputKind::Yuv422Packed, 3, 0, 8, 1, false, 1),
+            (Vpi::Rgb8, OutputKind::RgbInterleaved, 3, 0, 8, 1, false, 2),
+            (Vpi::Bgr8, OutputKind::RgbInterleaved, 3, 1, 8, 1, false, 2),
+            (Vpi::Rgba8, OutputKind::RgbInterleaved, 4, 2, 8, 1, false, 2),
+            (Vpi::Bgra8, OutputKind::RgbInterleaved, 4, 3, 8, 1, false, 2),
+            (Vpi::Rgb8Planar, OutputKind::RgbPlanar, 3, 0, 8, 3, false, 2),
+            (Vpi::Bgr8Planar, OutputKind::RgbPlanar, 3, 1, 8, 3, false, 2),
+            (
+                Vpi::Rgba8Planar,
+                OutputKind::RgbPlanar,
+                4,
+                2,
+                8,
+                4,
+                false,
+                2,
+            ),
+            (
+                Vpi::Bgra8Planar,
+                OutputKind::RgbPlanar,
+                4,
+                3,
+                8,
+                4,
+                false,
+                2,
+            ),
+        ];
+        assert_eq!(color_formats.len(), 20);
+        for (format, kind, channels, order, bits, planes, limited, transfer) in color_formats {
+            let pixel_format = format.pixel_format();
+            assert!(matches!(
+                classify_pixel_format(&pixel_format),
+                Ok(PixelFormatClass::Color(_))
+            ));
+            let request = GpuOutputRequest::color(pixel_format).unwrap();
+            let output = OutputPlan::new(Extent2d::new(5, 3), &request, PORTABLE_CAPABILITIES)
+                .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
+            assert_eq!(output.kind, kind, "{} kind", format.name());
+            assert_eq!(output.channels, channels, "{} channels", format.name());
+            assert_eq!(output.order, order, "{} order", format.name());
+            assert_eq!(output.bits, bits, "{} bits", format.name());
+            assert_eq!(output.storage_bits, bits, "{} storage bits", format.name());
+            assert_eq!(
+                output.layout.planes.len(),
+                planes,
+                "{} planes",
+                format.name()
+            );
+            assert_eq!(output.limited_range, limited, "{} range", format.name());
+            assert_eq!(output.transfer, transfer, "{} transfer", format.name());
+            assert!(output.layout.logical_size <= u64::from(u32::MAX));
+        }
+
+        let numeric_formats = [
+            Vpi::U8,
+            Vpi::S8,
+            Vpi::U16,
+            Vpi::U32,
+            Vpi::S32,
+            Vpi::S16,
+            Vpi::TwoS16,
+            Vpi::F32,
+            Vpi::F64,
+            Vpi::TwoF32,
+        ];
+        assert_eq!(numeric_formats.len(), 10);
+        for format in numeric_formats {
+            let mapping = if format == Vpi::F64 {
+                NumericSampleMapping::NormalizedGray8F64(F64OutputPolicy::ExactF32Widening)
+            } else {
+                NumericSampleMapping::NormalizedGray8
+            };
+            let request = GpuOutputRequest::numeric(format.pixel_format(), mapping).unwrap();
+            let output = OutputPlan::new(Extent2d::new(5, 3), &request, PORTABLE_CAPABILITIES)
+                .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
+            let numeric = classify_pixel_format(request.format())
+                .unwrap()
+                .numeric()
+                .unwrap();
+            assert_eq!(
+                output.kind,
+                match numeric.sample_kind {
+                    SampleKind::Unsigned => OutputKind::NumericUnsigned,
+                    SampleKind::Signed => OutputKind::NumericSigned,
+                    SampleKind::Float => OutputKind::NumericFloat,
+                },
+                "{} kind",
+                format.name()
+            );
+            assert_eq!(output.channels, u32::from(numeric.components));
+            assert_eq!(output.bits, u32::from(numeric.bits_per_component));
+            assert_eq!(output.numeric_mapping, 1);
+            assert_eq!(output.layout.planes.len(), 1);
+            if format == Vpi::F64 {
+                let plane = &output.layout.planes[0];
+                assert_eq!(output.layout.logical_size, 5 * 3 * 8);
+                assert!(plane.offset.is_multiple_of(8));
+                assert!(plane.row_stride.is_multiple_of(8));
+                assert_eq!(
+                    output.f64_output_path,
+                    Some(F64OutputPath::ExactF32Widening)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_request_requires_mapping_to_match_the_format_class() {
+        assert!(matches!(
+            GpuOutputRequest::color(Vpi::U8.pixel_format()),
+            Err(Error::NumericMappingRequired)
+        ));
+        assert!(matches!(
+            GpuOutputRequest::numeric(
+                Vpi::Rgba8.pixel_format(),
+                NumericSampleMapping::NormalizedGray8,
+            ),
+            Err(Error::NumericMappingForColorOutput)
+        ));
+        assert!(matches!(
+            GpuOutputRequest::numeric(
+                Vpi::F64.pixel_format(),
+                NumericSampleMapping::NormalizedGray8,
+            ),
+            Err(Error::F64OutputPolicyRequired)
+        ));
+        assert!(matches!(
+            GpuOutputRequest::numeric(
+                Vpi::U8.pixel_format(),
+                NumericSampleMapping::NormalizedGray8F64(F64OutputPolicy::NativeRequired),
+            ),
+            Err(Error::F64OutputPolicyForNonF64)
+        ));
+    }
+
+    #[test]
+    fn f64_policy_resolution_never_silently_downgrades_native_required() {
+        assert!(matches!(
+            resolve_f64_output_path(F64OutputPolicy::NativeRequired, PORTABLE_CAPABILITIES),
+            Err(Error::NativeF64Unavailable)
+        ));
+        assert_eq!(
+            resolve_f64_output_path(
+                F64OutputPolicy::NativeOrExactF32Widening,
+                PORTABLE_CAPABILITIES,
+            )
+            .unwrap(),
+            F64OutputPath::ExactF32Widening
+        );
+        let native = WgpuDecodeCapabilities {
+            native_f64_arithmetic: true,
+        };
+        assert_eq!(
+            resolve_f64_output_path(F64OutputPolicy::NativeRequired, native).unwrap(),
+            F64OutputPath::NativeArithmetic
+        );
+        assert_eq!(
+            resolve_f64_output_path(F64OutputPolicy::NativeOrExactF32Widening, native).unwrap(),
+            F64OutputPath::NativeArithmetic
+        );
+        assert_eq!(
+            resolve_f64_output_path(F64OutputPolicy::ExactF32Widening, native).unwrap(),
+            F64OutputPath::ExactF32Widening
+        );
     }
 
     #[test]
@@ -939,8 +1731,23 @@ mod tests {
     }
 
     #[test]
+    fn map_completion_wakes_after_releasing_state_lock() {
+        let completion = Arc::new(MapCompletion::default());
+        let wake = Arc::new(ReentrantCompletionWake {
+            completion: Arc::clone(&completion),
+            entered: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        let context = Context::from_waker(&waker);
+        assert_eq!(completion.poll(&context), None);
+
+        completion.complete(Ok(()));
+        assert!(wake.entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 64);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 96);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -948,24 +1755,35 @@ mod tests {
             width: 3,
             height: 4,
             sample_count: 5,
-            output_mode: 6,
+            output_kind: 6,
             transfer: 7,
             limited_range: 8,
-            plane0_offset: 9,
-            plane0_stride: 10,
-            plane1_offset: 11,
-            plane1_stride: 12,
-            plane2_offset: 13,
-            plane2_stride: 14,
-            chroma_width: 15,
-            chroma_height: 16,
+            channels: 9,
+            order: 10,
+            bits: 11,
+            storage_bits: 12,
+            plane0_offset: 13,
+            plane0_stride: 14,
+            plane1_offset: 15,
+            plane1_stride: 16,
+            plane2_offset: 17,
+            plane2_stride: 18,
+            plane3_offset: 19,
+            plane3_stride: 20,
+            chroma_width: 21,
+            chroma_height: 22,
+            logical_size: 23,
+            numeric_mapping: 24,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 16]>(params),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            bytemuck::cast::<ShaderParams, [u32; 24]>(params),
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24,
+            ]
         );
-        assert!(SHADER.contains(
-            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,"
+        assert!(SHADER_TEMPLATE.contains(
+            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    sample_count: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n};"
         ));
 
         assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);
@@ -980,25 +1798,59 @@ mod tests {
             bytemuck::cast::<DecodeStatus, [u32; 4]>(status),
             [1, 2, 3, 4]
         );
-        assert!(SHADER.contains("status[0] = STATUS_OK;"));
-        assert!(SHADER.contains("status[1] = decoded;"));
-        assert!(SHADER.contains("status[2] = bit_cursor;"));
-        assert!(SHADER.contains("status[3] = params.token_end;"));
+        assert!(SHADER_TEMPLATE.contains("status[0] = STATUS_OK;"));
+        assert!(SHADER_TEMPLATE.contains("status[1] = decoded;"));
+        assert!(SHADER_TEMPLATE.contains("status[2] = bit_cursor;"));
+        assert!(SHADER_TEMPLATE.contains("status[3] = params.token_end;"));
         assert_eq!(stream_allocation_size(4).unwrap(), 8);
         assert_eq!(stream_allocation_size(5).unwrap(), 12);
     }
 
     #[test]
+    fn portable_and_native_f64_shader_sources_validate_with_exact_capabilities() {
+        let portable = shader_source(F64OutputPath::ExactF32Widening);
+        let native = shader_source(F64OutputPath::NativeArithmetic);
+        assert!(!portable.contains(F64_OUTPUT_MARKER));
+        assert!(!native.contains(F64_OUTPUT_MARKER));
+        assert!(!portable.contains(F64_BINDING_MARKER));
+        assert!(!native.contains(F64_BINDING_MARKER));
+        assert!(!portable.contains("f64(sample)"));
+        assert!(native.contains("f64(sample) / 255.0"));
+        assert!(native.contains("output_f64: array<f64>"));
+
+        let native_without_capability = naga::front::wgsl::parse_str(&native)
+            .expect("native F64 WGSL syntax must parse before capability validation");
+        let error = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&native_without_capability)
+        .expect_err("native F64 WGSL must be rejected without Naga FLOAT64 capability");
+        assert!(format!("{error:?}").contains("FLOAT64"));
+
+        for (name, source, capabilities) in [
+            ("portable", portable, naga::valid::Capabilities::empty()),
+            ("native-f64", native, naga::valid::Capabilities::FLOAT64),
+        ] {
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{name} WGSL did not parse: {error}"));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("{name} WGSL did not validate: {error}"));
+        }
+    }
+
+    #[test]
     fn aggregate_memory_reservations_are_bounded_and_released() {
-        let budget = Arc::new(EngineMemoryBudget {
-            limit: 10,
-            reserved: Mutex::new(0),
-        });
-        let first = budget.reserve(6).unwrap();
-        assert_eq!(budget.reserved(), 6);
-        assert!(matches!(budget.reserve(5), Err(Error::Backend(_))));
-        assert_eq!(budget.reserved(), 6);
+        let budget = MemoryBudget::new(NonZeroU64::new(10).unwrap());
+        let first = budget.try_reserve(6).unwrap();
+        assert_eq!(budget.snapshot().reserved_bytes, 6);
+        assert!(matches!(
+            budget.try_reserve(5),
+            Err(jxl_wgpu::MemoryBudgetError::Exhausted { .. })
+        ));
+        assert_eq!(budget.snapshot().reserved_bytes, 6);
         drop(first);
-        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
     }
 }

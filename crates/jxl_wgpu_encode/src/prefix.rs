@@ -1,7 +1,6 @@
 // The prefix-code construction in this module is derived from the permissively
-// licensed zune-jpegxl 0.5.2 fast lossless encoder. See `THIRD_PARTY.md`,
-// `LICENSES/zune-jpegxl-MIT.txt`, and the architecture document for the exact
-// source revision and attribution.
+// licensed zune-jpegxl 0.5.2 fast lossless encoder. See this crate's
+// `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt` for attribution.
 
 use std::cmp::{max, min};
 
@@ -22,7 +21,7 @@ const BASE_LZ77_COUNTS: [u64; LZ77_SYMBOLS] = [
 ];
 const MIN_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [0; RAW_SYMBOLS + 1];
 const MAX_RAW_LENGTH: [u8; RAW_SYMBOLS + 1] = [
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 10, 255, 255, 255, 255, 255, 255, 255, 255,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 10, 15, 15, 15, 15, 15, 15, 15, 15,
 ];
 
 #[derive(Clone, Debug)]
@@ -37,7 +36,14 @@ impl PrefixCode {
     pub(crate) fn from_gpu_counts(
         raw_gpu: &[u32; RAW_SYMBOLS],
         lz77_gpu: &[u32; LZ77_SYMBOLS],
-    ) -> Self {
+    ) -> Result<Self, EncodeError> {
+        if raw_gpu[10..].iter().any(|&count| count != 0)
+            || lz77_gpu[28..].iter().any(|&count| count != 0)
+        {
+            return Err(EncodeError::Backend(
+                "GPU histogram contains an impossible token".into(),
+            ));
+        }
         let mut raw_counts = [0u64; RAW_SYMBOLS];
         let mut lz77_counts = [0u64; LZ77_SYMBOLS];
         for (index, count) in raw_counts.iter_mut().enumerate() {
@@ -46,7 +52,7 @@ impl PrefixCode {
         for (index, count) in lz77_counts.iter_mut().enumerate() {
             *count = (u64::from(lz77_gpu[index]) << 8) + BASE_LZ77_COUNTS[index];
         }
-        Self::new(&raw_counts, &lz77_counts)
+        Ok(Self::new(&raw_counts, &lz77_counts))
     }
 
     pub(crate) fn fixed_unused_channel() -> Self {
@@ -192,7 +198,11 @@ impl PrefixCode {
     ) -> Result<(), EncodeError> {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU raw token overflow".into()))?;
-        if token >= RAW_SYMBOLS || nbits > 31 || (nbits != 0 && bits >= 1u32 << nbits) {
+        let expected_nbits = token.saturating_sub(1);
+        if token > 9
+            || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
+            || !extra_bits_are_canonical(nbits, bits)
+        {
             return Err(EncodeError::Backend(
                 "GPU emitted an invalid raw token".into(),
             ));
@@ -211,7 +221,11 @@ impl PrefixCode {
     ) -> Result<(), EncodeError> {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU LZ77 token overflow".into()))?;
-        if token >= LZ77_SYMBOLS || nbits > 31 || (nbits != 0 && bits >= 1u32 << nbits) {
+        let expected_nbits = if token < 16 { 0 } else { token - 12 };
+        if token > 27
+            || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
+            || !extra_bits_are_canonical(nbits, bits)
+        {
             return Err(EncodeError::Backend(
                 "GPU emitted an invalid LZ77 token".into(),
             ));
@@ -220,6 +234,14 @@ impl PrefixCode {
         writer.write_bits(u64::from(self.lz77_bits[token]), self.lz77_nbits[token])?;
         writer.write_bits(u64::from(bits), nbits as u8)?;
         Ok(())
+    }
+}
+
+fn extra_bits_are_canonical(nbits: u32, bits: u32) -> bool {
+    match nbits {
+        0 => bits == 0,
+        1..=31 => bits < (1u32 << nbits),
+        _ => false,
     }
 }
 

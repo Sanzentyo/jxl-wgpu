@@ -34,10 +34,12 @@ impl BitFragment {
         Ok(Self { bytes, bit_len })
     }
 
-    #[must_use]
-    pub fn byte_aligned(bytes: Vec<u8>) -> Self {
-        let bit_len = bytes.len().saturating_mul(8);
-        Self { bytes, bit_len }
+    pub fn byte_aligned(bytes: Vec<u8>) -> Result<Self, PacketError> {
+        let bit_len = bytes
+            .len()
+            .checked_mul(8)
+            .ok_or(PacketError::SizeOverflow)?;
+        Ok(Self { bytes, bit_len })
     }
 
     #[must_use]
@@ -70,7 +72,7 @@ impl FrameGroupLayout {
         if dc_groups == 0 || ac_groups == 0 || passes == 0 {
             return Err(PacketError::EmptyLayout);
         }
-        let fused_single_group = ac_groups == 1 && passes == 1;
+        let fused_single_group = dc_groups == 1 && ac_groups == 1 && passes == 1;
         let entries = if fused_single_group {
             1u64
         } else {
@@ -396,5 +398,20 @@ mod tests {
             [GroupPacket::new(GroupPacketKind::Single, vec![1, 2, 3])],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn multiple_dc_groups_cannot_use_the_fused_layout() {
+        let layout = FrameGroupLayout::new(2, 1, 1).unwrap();
+        assert!(!layout.is_fused_single_group());
+        assert_eq!(layout.toc_entries(), 5);
+        assert_eq!(layout.kind_at(0), GroupPacketKind::DcGlobal);
+        assert_eq!(layout.kind_at(1), GroupPacketKind::DcGroup(0));
+        assert_eq!(layout.kind_at(2), GroupPacketKind::DcGroup(1));
+        assert_eq!(layout.kind_at(3), GroupPacketKind::AcGlobal);
+        assert_eq!(
+            layout.kind_at(4),
+            GroupPacketKind::AcGroup { pass: 0, group: 0 }
+        );
     }
 }

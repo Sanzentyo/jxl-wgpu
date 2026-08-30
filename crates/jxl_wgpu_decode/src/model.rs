@@ -1,12 +1,15 @@
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use jxl_gpu_bitstream::Gray8AccelerationIndex;
-use jxl_gpu_formats::PixelFormat;
+use jxl_gpu_formats::{PixelFormat, PixelFormatClass, classify_pixel_format};
 use jxl_gpu_protocol::Extent2d;
 
-/// The first end-to-end GPU decode target.
+use crate::{Error, Result};
+
+/// A GPU decode profile negotiated before any frame is submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeProfile {
     /// One-group, lossless Modular data reconstructed by a fixed predictor GPU kernel.
@@ -19,7 +22,7 @@ pub enum DecodeProfile {
 
 impl DecodeProfile {
     #[must_use]
-    pub const fn prototype_8bit(predictor: FixedModularPredictor) -> Self {
+    pub const fn modular_lossless_8bit(predictor: FixedModularPredictor) -> Self {
         Self::ModularLossless {
             bits_per_sample: 8,
             predictor,
@@ -28,7 +31,7 @@ impl DecodeProfile {
     }
 
     #[must_use]
-    pub const fn prototype_16bit(predictor: FixedModularPredictor) -> Self {
+    pub const fn modular_lossless_16bit(predictor: FixedModularPredictor) -> Self {
         Self::ModularLossless {
             bits_per_sample: 16,
             predictor,
@@ -37,7 +40,7 @@ impl DecodeProfile {
     }
 }
 
-/// Fixed JPEG XL Modular predictor selected for every sample in the prototype profile.
+/// Fixed JPEG XL Modular predictor selected for every sample in the negotiated profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FixedModularPredictor(u8);
 
@@ -54,7 +57,7 @@ impl FixedModularPredictor {
     }
 }
 
-/// Grouping supported by the prototype GPU entropy/group frontend.
+/// Grouping supported by the fixed-predictor GPU entropy/group frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModularGrouping {
     SingleGroup,
@@ -63,19 +66,22 @@ pub enum ModularGrouping {
 /// Validated contiguous codestream handed to a GPU-only frontend.
 #[derive(Clone, Debug)]
 pub struct GpuCodestream {
-    bytes: Arc<[u8]>,
+    storage: Arc<[u8]>,
+    byte_range: Range<usize>,
     container: bool,
     acceleration_index: Option<Gray8AccelerationIndex>,
 }
 
 impl GpuCodestream {
-    pub(crate) const fn new(
-        bytes: Arc<[u8]>,
+    pub(crate) fn new(
+        storage: Arc<[u8]>,
+        byte_range: Range<usize>,
         container: bool,
         acceleration_index: Option<Gray8AccelerationIndex>,
     ) -> Self {
         Self {
-            bytes,
+            storage,
+            byte_range,
             container,
             acceleration_index,
         }
@@ -83,12 +89,17 @@ impl GpuCodestream {
 
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.storage[self.byte_range.clone()]
     }
 
     #[must_use]
-    pub fn shared_bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
+    pub fn shared_storage(&self) -> Arc<[u8]> {
+        Arc::clone(&self.storage)
+    }
+
+    #[must_use]
+    pub fn storage_range(&self) -> Range<usize> {
+        self.byte_range.clone()
     }
 
     #[must_use]
@@ -159,6 +170,13 @@ impl FrameDuration {
 pub struct FrameMetadata {
     pub index: usize,
     pub duration: FrameDuration,
+    /// Presentation start time in stream timebase ticks, accumulated from preceding durations.
+    /// Still images use zero.
+    pub presentation_ticks: u64,
+    /// Exact JPEG XL frame timecode when the animation header enables timecodes.
+    ///
+    /// This is the bitstream value, not a timestamp derived from preceding frame durations.
+    pub timecode: Option<u32>,
     pub is_last: bool,
     pub is_keyframe: bool,
     pub name: String,
@@ -210,25 +228,124 @@ impl AnimationMetadata {
     }
 }
 
+/// Numeric interpretation applied while converting the decoded Gray8 code into a non-color
+/// output sample.
+///
+/// This mapping is explicit because a [`PixelFormat`] with `ColorModel::NonColor` carries storage
+/// shape, not normalization semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericSampleMapping {
+    /// Maps the decoded integer code `gray` in `[0, 255]` across the destination's nonnegative
+    /// range. Unsigned integers use `[0, MAX]`; signed integers use `[0, MAX]` (never negative);
+    /// floating-point values use the normalized `f32` value `gray / 255`. Two-component formats
+    /// receive the same value in both components.
+    ///
+    /// F64 uses a separate policy-bearing variant so precision cannot silently depend on the
+    /// selected adapter.
+    NormalizedGray8,
+    /// The same normalized mapping for an F64 destination, with an explicit precision policy.
+    NormalizedGray8F64(F64OutputPolicy),
+}
+
+/// Precision policy for normalized F64 output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum F64OutputPolicy {
+    /// Require device-enabled `wgpu::Features::SHADER_F64` and evaluate `f64(gray) / 255.0` in the
+    /// shader. The request is rejected when native arithmetic is unavailable.
+    NativeRequired,
+    /// Use native shader f64 when enabled; otherwise use the explicitly permitted compatibility
+    /// path described by [`F64OutputPolicy::ExactF32Widening`].
+    NativeOrExactF32Widening,
+    /// Produce the exact IEEE-754 binary64 widening of the correctly-rounded f32 value
+    /// `gray / 255`. This is deterministic binary64 storage, but it is not native f64 arithmetic
+    /// and does not preserve the additional precision of evaluating the division in f64.
+    ExactF32Widening,
+}
+
+/// Semantic side of a [`GpuOutputRequest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GpuOutputMapping {
+    /// The format's explicit color specification determines conversion and packing.
+    Color,
+    /// A non-color numeric image uses the supplied, explicit sample mapping.
+    Numeric(NumericSampleMapping),
+}
+
 /// Generic GPU output request. No CPU-readable fallback representation exists.
+///
+/// Construction is deliberately split between [`GpuOutputRequest::color`] and
+/// [`GpuOutputRequest::numeric`]. There is no implicit numeric interpretation and no compatibility
+/// constructor which guesses one from the pixel format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuOutputRequest {
-    pub format: PixelFormat,
-    pub max_in_flight: NonZeroUsize,
+    format: PixelFormat,
+    mapping: GpuOutputMapping,
+    max_frame_slots: NonZeroUsize,
 }
 
 impl GpuOutputRequest {
-    #[must_use]
-    pub fn new(format: PixelFormat) -> Self {
+    /// Creates a color-bearing output request after semantic classification.
+    pub fn color(format: PixelFormat) -> Result<Self> {
+        match classify_pixel_format(&format)
+            .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
+        {
+            PixelFormatClass::Color(_) => Ok(Self::from_parts(format, GpuOutputMapping::Color)),
+            PixelFormatClass::Numeric(_) => Err(Error::NumericMappingRequired),
+        }
+    }
+
+    /// Creates a non-color output request with an explicit sample mapping.
+    pub fn numeric(format: PixelFormat, mapping: NumericSampleMapping) -> Result<Self> {
+        match classify_pixel_format(&format)
+            .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
+        {
+            PixelFormatClass::Numeric(numeric) => {
+                let is_f64 = numeric.sample_kind == jxl_gpu_formats::SampleKind::Float
+                    && numeric.bits_per_component == 64;
+                match (is_f64, mapping) {
+                    (true, NumericSampleMapping::NormalizedGray8) => {
+                        return Err(Error::F64OutputPolicyRequired);
+                    }
+                    (false, NumericSampleMapping::NormalizedGray8F64(_)) => {
+                        return Err(Error::F64OutputPolicyForNonF64);
+                    }
+                    _ => {}
+                }
+                Ok(Self::from_parts(format, GpuOutputMapping::Numeric(mapping)))
+            }
+            PixelFormatClass::Color(_) => Err(Error::NumericMappingForColorOutput),
+        }
+    }
+
+    fn from_parts(format: PixelFormat, mapping: GpuOutputMapping) -> Self {
         Self {
             format,
-            max_in_flight: NonZeroUsize::new(2).expect("two is nonzero"),
+            mapping,
+            max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
         }
     }
 
     #[must_use]
-    pub const fn with_max_in_flight(mut self, max_in_flight: NonZeroUsize) -> Self {
-        self.max_in_flight = max_in_flight;
+    pub const fn format(&self) -> &PixelFormat {
+        &self.format
+    }
+
+    #[must_use]
+    pub const fn mapping(&self) -> GpuOutputMapping {
+        self.mapping
+    }
+
+    /// Maximum number of slots jointly occupied by queued submissions and caller-held frame
+    /// leases. This count is independent from the byte-weighted GPU memory budget.
+    #[must_use]
+    pub const fn max_frame_slots(&self) -> NonZeroUsize {
+        self.max_frame_slots
+    }
+
+    /// Sets the maximum number of queued-or-caller-held frame slots.
+    #[must_use]
+    pub const fn with_max_frame_slots(mut self, max_frame_slots: NonZeroUsize) -> Self {
+        self.max_frame_slots = max_frame_slots;
         self
     }
 }

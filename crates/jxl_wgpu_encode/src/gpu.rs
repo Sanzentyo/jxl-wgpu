@@ -1,7 +1,9 @@
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use jxl_gpu_formats::{ImageLayout, PixelFormat};
+use jxl_wgpu::{MemoryBudget, MemoryBudgetSnapshot, SubmissionPoller, WgpuBackend};
 
 use crate::{
     EncodeError, EncodeSession, EncoderCapabilities, FrameEncodeRequest, FrameSubmission,
@@ -12,12 +14,55 @@ use crate::{
 pub struct WgpuContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    poller: SubmissionPoller,
+    memory_budget: MemoryBudget,
 }
 
+const DEFAULT_ENCODER_IN_FLIGHT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
 impl WgpuContext {
+    /// Creates an encoder context with one bounded native completion worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error if the native worker thread cannot be created.
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Result<Self, EncodeError> {
+        Self::with_memory_budget(
+            device,
+            queue,
+            NonZeroU64::new(DEFAULT_ENCODER_IN_FLIGHT_MEMORY_BYTES)
+                .expect("the default encoder memory budget is non-zero"),
+        )
+    }
+
+    /// Creates a context with an application-selected aggregate in-flight byte limit.
+    pub fn with_memory_budget(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        memory_budget_bytes: NonZeroU64,
+    ) -> Result<Self, EncodeError> {
+        let poller = SubmissionPoller::new(device.as_ref().clone()).map_err(|error| {
+            EncodeError::Backend(format!(
+                "could not start the bounded GPU poll worker: {error}"
+            ))
+        })?;
+        Ok(Self {
+            device,
+            queue,
+            poller,
+            memory_budget: MemoryBudget::new(memory_budget_bytes),
+        })
+    }
+
+    /// Shares the device, queue, and bounded completion worker of an existing render backend.
     #[must_use]
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
-        Self { device, queue }
+    pub fn from_backend(backend: &WgpuBackend) -> Self {
+        Self {
+            device: Arc::new(backend.device().clone()),
+            queue: Arc::new(backend.queue().clone()),
+            poller: backend.submission_poller().clone(),
+            memory_budget: backend.transient_memory_budget().clone(),
+        }
     }
 
     #[must_use]
@@ -28,6 +73,20 @@ impl WgpuContext {
     #[must_use]
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    pub(crate) const fn submission_poller(&self) -> &SubmissionPoller {
+        &self.poller
+    }
+
+    pub(crate) const fn memory_budget(&self) -> &MemoryBudget {
+        &self.memory_budget
+    }
+
+    /// Reports bytes reserved by all live encoder jobs sharing this context.
+    #[must_use]
+    pub fn memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.memory_budget.snapshot()
     }
 }
 
@@ -142,7 +201,26 @@ pub trait GpuEncodeJob: Unpin + 'static {
 /// quantization, tokenization, and histogram work through the supplied `wgpu`
 /// context. The returned CPU-visible artifacts are already entropy-ready group
 /// packets and serialized frame-header fields.
+#[cfg(not(target_arch = "wasm32"))]
 pub trait GpuEncodeBackend: Send + Sync + 'static {
+    type Job: GpuEncodeJob;
+
+    fn capabilities(&self) -> &EncoderCapabilities;
+
+    fn supports_input(&self, source: &GpuFrameSource) -> bool;
+
+    fn submit(
+        &self,
+        context: &WgpuContext,
+        source: GpuFrameSource,
+        request: &FrameEncodeRequest,
+    ) -> Result<Self::Job, EncodeError>;
+}
+
+/// Browser WebGPU resources are main-thread-local, so a browser backend is not
+/// required to implement native thread-transfer traits.
+#[cfg(target_arch = "wasm32")]
+pub trait GpuEncodeBackend: 'static {
     type Job: GpuEncodeJob;
 
     fn capabilities(&self) -> &EncoderCapabilities;
@@ -183,6 +261,12 @@ impl<B: GpuEncodeBackend> GpuEncoder<B> {
     #[must_use]
     pub fn capabilities(&self) -> &EncoderCapabilities {
         self.backend.capabilities()
+    }
+
+    /// Reports aggregate byte-weighted memory admission for live jobs from this context.
+    #[must_use]
+    pub fn memory_stats(&self) -> MemoryBudgetSnapshot {
+        self.context.memory_stats()
     }
 
     /// Returns the concrete backend so profile-specific limits and memory

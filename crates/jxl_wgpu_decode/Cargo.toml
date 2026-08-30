@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck.workspace = true
 jxl_gpu_bitstream.workspace = true
 jxl_gpu_formats.workspace = true
 jxl_gpu_protocol.workspace = true
@@ -16,6 +16,8 @@ thiserror = "2.0.20"
 wgpu = "30.0.1"
 
 [dev-dependencies]
+jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = "1.0.1"
 
 [lints]

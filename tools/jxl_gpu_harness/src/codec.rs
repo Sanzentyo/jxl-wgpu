@@ -12,15 +12,17 @@ use std::time::Instant;
 
 use clap::ValueEnum;
 use jxl_gpu_formats::{
-    Channel, ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageLayout,
-    Packed422Order, PixelFormat, RgbChannelOrder, SampleKind,
+    ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageLayout, Packed422Order,
+    PixelFormat, RgbChannelOrder, vpi::VpiPitchLinearFormat as Vpi,
 };
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     DisplayPipeline, DisplayTextureDescriptor, ImageReadbackPipeline, WgpuBackend,
     WgpuBackendConfig,
 };
-use jxl_wgpu_decode::{Error as DecodeError, GpuDecoder, GpuOutputRequest};
+use jxl_wgpu_decode::{
+    Error as DecodeError, F64OutputPolicy, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
+};
 use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessGray8Encoder, WgpuContext};
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
@@ -55,7 +57,8 @@ impl CodecOperation {
 pub enum WorkloadKind {
     SingleLatency,
     WarmSequential,
-    Batch,
+    /// Barrier-synchronized host-thread fan-out. This does not coalesce GPU work into a batch.
+    ConcurrentBurst,
     Concurrent,
     Animation,
 }
@@ -66,6 +69,23 @@ pub enum OutputTarget {
     GpuResident,
     DisplayTexture,
     CpuReadback,
+}
+
+/// How measured operations are launched by the harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadExecutionModel {
+    Sequential,
+    BarrierSynchronizedHostFanout,
+    PersistentHostWorkers,
+    AnimationSession,
+}
+
+/// Explicit host-transfer path used for decoded images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuReadbackMode {
+    StagedCopy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -81,7 +101,20 @@ pub enum SizeClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum GpuPixelFormat {
-    Gray8,
+    U8,
+    S8,
+    U16,
+    U32,
+    S32,
+    S16,
+    #[serde(rename = "2s16")]
+    #[value(name = "2s16")]
+    TwoS16,
+    F32,
+    F64,
+    #[serde(rename = "2f32")]
+    #[value(name = "2f32")]
+    TwoF32,
     Y8,
     Y16,
     I420,
@@ -112,7 +145,16 @@ impl GpuPixelFormat {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Gray8 => "gray8",
+            Self::U8 => "u8",
+            Self::S8 => "s8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::S32 => "s32",
+            Self::S16 => "s16",
+            Self::TwoS16 => "2s16",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::TwoF32 => "2f32",
             Self::Y8 => "y8",
             Self::Y16 => "y16",
             Self::I420 => "i420",
@@ -149,7 +191,16 @@ impl GpuPixelFormat {
         let rgb =
             ColorSpecification::Defined(ColorSpec::bt709(ColorRange::Full, ChromaLocation2d::BOTH));
         match self {
-            Self::Gray8 => PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+            Self::U8 => Vpi::U8.pixel_format(),
+            Self::S8 => Vpi::S8.pixel_format(),
+            Self::U16 => Vpi::U16.pixel_format(),
+            Self::U32 => Vpi::U32.pixel_format(),
+            Self::S32 => Vpi::S32.pixel_format(),
+            Self::S16 => Vpi::S16.pixel_format(),
+            Self::TwoS16 => Vpi::TwoS16.pixel_format(),
+            Self::F32 => Vpi::F32.pixel_format(),
+            Self::F64 => Vpi::F64.pixel_format(),
+            Self::TwoF32 => Vpi::TwoF32.pixel_format(),
             Self::Y8 => PixelFormat::luma(8, yuv),
             Self::Y16 => PixelFormat::luma(16, yuv),
             Self::I420 => PixelFormat::i420(8, 8, yuv).expect("I420 descriptor is valid"),
@@ -176,6 +227,31 @@ impl GpuPixelFormat {
             Self::Bgra8Planar => PixelFormat::rgb8(RgbChannelOrder::Bgra, true, rgb),
         }
     }
+
+    fn output_request(self) -> std::result::Result<GpuOutputRequest, DecodeError> {
+        let format = self.pixel_format();
+        if self == Self::F64 {
+            GpuOutputRequest::numeric(
+                format,
+                NumericSampleMapping::NormalizedGray8F64(F64OutputPolicy::NativeOrExactF32Widening),
+            )
+        } else if matches!(
+            self,
+            Self::U8
+                | Self::S8
+                | Self::U16
+                | Self::U32
+                | Self::S32
+                | Self::S16
+                | Self::TwoS16
+                | Self::F32
+                | Self::TwoF32
+        ) {
+            GpuOutputRequest::numeric(format, NumericSampleMapping::NormalizedGray8)
+        } else {
+            GpuOutputRequest::color(format)
+        }
+    }
 }
 
 impl fmt::Display for GpuPixelFormat {
@@ -189,9 +265,9 @@ pub struct WorkloadSpec {
     pub kind: WorkloadKind,
     pub warmup: u32,
     pub iterations: u32,
-    pub batch_size: u32,
+    pub burst_size: u32,
     pub concurrency: u32,
-    pub max_in_flight: u32,
+    pub max_frame_slots: u32,
 }
 
 impl Default for WorkloadSpec {
@@ -200,9 +276,9 @@ impl Default for WorkloadSpec {
             kind: WorkloadKind::SingleLatency,
             warmup: 0,
             iterations: 1,
-            batch_size: 1,
+            burst_size: 1,
             concurrency: 1,
-            max_in_flight: 2,
+            max_frame_slots: 2,
         }
     }
 }
@@ -210,19 +286,19 @@ impl Default for WorkloadSpec {
 impl WorkloadSpec {
     pub fn validate(self) -> Result<Self> {
         if self.iterations == 0
-            || self.batch_size == 0
+            || self.burst_size == 0
             || self.concurrency == 0
-            || self.max_in_flight == 0
+            || self.max_frame_slots == 0
         {
             return Err(Error::InvalidConfig(
-                "iterations, batch-size, concurrency, and max-in-flight must be nonzero".into(),
+                "iterations, burst-size, concurrency, and max-frame-slots must be nonzero".into(),
             ));
         }
         if self.iterations > 1_000_000
             || self.warmup > 1_000_000
-            || self.batch_size > 1_024
+            || self.burst_size > 1_024
             || self.concurrency > 1_024
-            || self.max_in_flight > 1_024
+            || self.max_frame_slots > 1_024
         {
             return Err(Error::InvalidConfig(
                 "codec workload dimensions are unreasonably large".into(),
@@ -235,9 +311,21 @@ impl WorkloadSpec {
     #[must_use]
     pub const fn parallelism(self) -> u32 {
         match self.kind {
-            WorkloadKind::Batch => self.batch_size,
+            WorkloadKind::ConcurrentBurst => self.burst_size,
             WorkloadKind::Concurrent => self.concurrency,
             _ => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn execution_model(self) -> WorkloadExecutionModel {
+        match self.kind {
+            WorkloadKind::ConcurrentBurst => WorkloadExecutionModel::BarrierSynchronizedHostFanout,
+            WorkloadKind::Concurrent => WorkloadExecutionModel::PersistentHostWorkers,
+            WorkloadKind::Animation => WorkloadExecutionModel::AnimationSession,
+            WorkloadKind::SingleLatency | WorkloadKind::WarmSequential => {
+                WorkloadExecutionModel::Sequential
+            }
         }
     }
 
@@ -391,9 +479,17 @@ pub fn run_codec_case(
             report.adapter = backend.map(|value| value.adapter_info().name.clone());
             report.frame_count = execution.frame_count;
             report.output_bytes = execution.output_bytes;
+            report.gpu_output_logical_bytes = execution.gpu_output_logical_bytes;
             report.codec_submissions = execution.codec_submissions;
+            report.codec_completion_waits = execution.codec_completion_waits;
             report.display_submissions = execution.display_submissions;
+            report.display_completion_waits = execution.display_completion_waits;
             report.readback_submissions = execution.readback_submissions;
+            report.readback_completion_waits = execution.readback_completion_waits;
+            report.readback_logical_bytes = execution.readback_logical_bytes;
+            report.readback_staging_bytes = execution.readback_staging_bytes;
+            report.readback_mode =
+                (execution.readback_submissions != 0).then_some(CpuReadbackMode::StagedCopy);
             report.output_hash = execution.output_hash;
             report.timing = Some(execution.timing);
         }
@@ -433,11 +529,14 @@ fn run_decode(
         .then(|| DisplayPipeline::new(backend));
     let readback = (options.output_target == OutputTarget::CpuReadback)
         .then(|| ImageReadbackPipeline::new(backend));
-    let max_in_flight =
-        NonZeroUsize::new(usize::try_from(options.workload.max_in_flight).unwrap_or(usize::MAX))
-            .expect("validated max-in-flight is nonzero");
-    let request =
-        GpuOutputRequest::new(options.format.pixel_format()).with_max_in_flight(max_in_flight);
+    let max_frame_slots =
+        NonZeroUsize::new(usize::try_from(options.workload.max_frame_slots).unwrap_or(usize::MAX))
+            .expect("validated max-frame-slots is nonzero");
+    let request = options
+        .format
+        .output_request()
+        .map_err(decode_issue)?
+        .with_max_frame_slots(max_frame_slots);
     let require_animation = options.workload.kind == WorkloadKind::Animation;
 
     execute_workload(options.workload, || {
@@ -457,6 +556,14 @@ fn run_encode(
     backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<WorkloadExecution, CodecIssue> {
+    if options.workload.kind == WorkloadKind::Animation {
+        return Err(CodecIssue::new(
+            CodecIssueKind::Unsupported,
+            "gpu_encode_profile",
+            "animation",
+            "the executable GPU encoder does not support animation",
+        ));
+    }
     let prepared = prepare_gray8_encode(path, backend, options)?;
     execute_workload(options.workload, || {
         let encoded = prepared
@@ -466,9 +573,15 @@ fn run_encode(
         Ok(DecodeObservation {
             frame_count: 1,
             output_bytes: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            gpu_output_logical_bytes: 0,
             codec_submissions: 1,
+            codec_completion_waits: 1,
             display_submissions: 0,
+            display_completion_waits: 0,
             readback_submissions: 0,
+            readback_completion_waits: 0,
+            readback_logical_bytes: 0,
+            readback_staging_bytes: 0,
             output_hash: Some(blake3::hash(&encoded).to_hex().to_string()),
             hash_mismatch: false,
         })
@@ -487,12 +600,12 @@ fn prepare_gray8_encode(
     options: &CodecRunOptions,
 ) -> std::result::Result<PreparedGray8Encode, CodecIssue> {
     let backend = backend.ok_or_else(no_adapter_issue)?;
-    if options.format != GpuPixelFormat::Gray8 {
+    if options.format != GpuPixelFormat::U8 {
         return Err(CodecIssue::new(
             CodecIssueKind::Unsupported,
             "gpu_encode_input",
             "input_format",
-            "the executable encode profile currently accepts only gray8 non-color input",
+            "the executable encode profile currently accepts only VPI U8 non-color input",
         ));
     }
     let extent = options.extent.ok_or_else(|| {
@@ -558,10 +671,7 @@ fn prepare_gray8_encode(
             }),
     );
     let source = BufferImageSource::new(buffer, layout).map_err(encode_issue)?;
-    let context = WgpuContext::new(
-        Arc::new(backend.device().clone()),
-        Arc::new(backend.queue().clone()),
-    );
+    let context = WgpuContext::from_backend(backend);
     Ok(PreparedGray8Encode {
         encoder: LosslessGray8Encoder::new(context),
         source,
@@ -574,6 +684,14 @@ fn run_round_trip(
     backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<WorkloadExecution, CodecIssue> {
+    if options.workload.kind == WorkloadKind::Animation {
+        return Err(CodecIssue::new(
+            CodecIssueKind::Unsupported,
+            "round_trip_verification",
+            "animation",
+            "the executable GPU round-trip profile does not support animation",
+        ));
+    }
     let backend = backend.ok_or_else(no_adapter_issue)?;
     if options.output_target != OutputTarget::CpuReadback {
         return Err(CodecIssue::new(
@@ -585,7 +703,7 @@ fn run_round_trip(
     }
     let prepared = prepare_gray8_encode(path, Some(backend), options)?;
     let decoder = GpuDecoder::wgpu(backend.clone());
-    let request = GpuOutputRequest::new(options.format.pixel_format());
+    let request = options.format.output_request().map_err(decode_issue)?;
     let readback = ImageReadbackPipeline::new(backend);
     execute_workload(options.workload, || {
         let encoded = prepared
@@ -609,6 +727,7 @@ fn run_round_trip(
             ));
         }
         observation.codec_submissions = observation.codec_submissions.saturating_add(1);
+        observation.codec_completion_waits = observation.codec_completion_waits.saturating_add(1);
         Ok(observation)
     })
 }
@@ -639,21 +758,33 @@ fn decode_once(
     while let Some(frame) = session.next_frame().map_err(decode_issue)? {
         observation.frame_count = observation.frame_count.saturating_add(1);
         observation.codec_submissions = observation.codec_submissions.saturating_add(1);
+        observation.codec_completion_waits = observation.codec_completion_waits.saturating_add(1);
         if let Some(readback) = readback {
             let result = readback
                 .submit(frame.output())
                 .map_err(readback_issue)?
                 .wait()
                 .map_err(readback_issue)?;
+            observation.readback_logical_bytes = observation
+                .readback_logical_bytes
+                .saturating_add(result.stats.logical_bytes);
+            observation.readback_staging_bytes = observation
+                .readback_staging_bytes
+                .saturating_add(result.stats.staging_bytes);
             for output in result.frame.outputs {
                 readback_hash.update(&output.bytes);
                 readback_outputs = readback_outputs.saturating_add(1);
             }
             observation.readback_submissions = observation.readback_submissions.saturating_add(1);
+            observation.readback_completion_waits =
+                observation.readback_completion_waits.saturating_add(1);
         }
         for output in &frame.output().outputs {
             observation.output_bytes = observation
                 .output_bytes
+                .saturating_add(output.layout.logical_size);
+            observation.gpu_output_logical_bytes = observation
+                .gpu_output_logical_bytes
                 .saturating_add(output.layout.logical_size);
             if let Some(display) = display {
                 display
@@ -682,15 +813,22 @@ where
     }
 
     let wall_start = Instant::now();
-    let mut samples = Vec::new();
-    let mut aggregate = DecodeObservation::default();
-    for _ in 0..workload.measured_groups() {
-        for (observation, duration) in execute_group(parallelism, &operation)? {
-            aggregate.add_assign(observation);
-            samples.push(duration);
+    let measured = if workload.kind == WorkloadKind::Concurrent {
+        execute_worker_stream(parallelism, workload.measured_groups(), &operation)?
+    } else {
+        let mut measured = Vec::new();
+        for _ in 0..workload.measured_groups() {
+            measured.extend(execute_group(parallelism, &operation)?);
         }
-    }
+        measured
+    };
     let wall_ns = nanos(wall_start.elapsed().as_nanos());
+    let mut samples = Vec::with_capacity(measured.len());
+    let mut aggregate = DecodeObservation::default();
+    for (observation, duration) in measured {
+        aggregate.add_assign(observation);
+        samples.push(duration);
+    }
     let timing = summarize_timings(&samples).map_err(|error| {
         CodecIssue::new(
             CodecIssueKind::Backend,
@@ -716,15 +854,22 @@ where
     Ok(WorkloadExecution {
         frame_count: aggregate.frame_count,
         output_bytes: aggregate.output_bytes,
+        gpu_output_logical_bytes: aggregate.gpu_output_logical_bytes,
         codec_submissions: aggregate.codec_submissions,
+        codec_completion_waits: aggregate.codec_completion_waits,
         display_submissions: aggregate.display_submissions,
+        display_completion_waits: aggregate.display_completion_waits,
         readback_submissions: aggregate.readback_submissions,
+        readback_completion_waits: aggregate.readback_completion_waits,
+        readback_logical_bytes: aggregate.readback_logical_bytes,
+        readback_staging_bytes: aggregate.readback_staging_bytes,
         output_hash: aggregate.output_hash,
         timing: CodecTiming {
             operation_latency: timing,
             workload: WorkloadTiming {
                 operations,
                 parallelism,
+                execution_model: workload.execution_model(),
                 wall_ns,
                 operations_per_second,
             },
@@ -745,9 +890,14 @@ where
             .map(|observation| vec![(observation, nanos(started.elapsed().as_nanos()))]);
     }
     std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(
+            usize::try_from(parallelism).expect("validated parallelism fits usize"),
+        ));
         let handles = (0..parallelism)
             .map(|_| {
-                scope.spawn(|| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
                     let started = Instant::now();
                     operation()
                         .map(|observation| (observation, nanos(started.elapsed().as_nanos())))
@@ -767,6 +917,51 @@ where
                 })?
             })
             .collect()
+    })
+}
+
+fn execute_worker_stream<F>(
+    workers: u32,
+    operations_per_worker: u32,
+    operation: &F,
+) -> std::result::Result<Vec<(DecodeObservation, u64)>, CodecIssue>
+where
+    F: Fn() -> std::result::Result<DecodeObservation, CodecIssue> + Sync,
+{
+    std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(
+            usize::try_from(workers).expect("validated worker count fits usize"),
+        ));
+        let handles = (0..workers)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    (0..operations_per_worker)
+                        .map(|_| {
+                            let started = Instant::now();
+                            operation().map(|observation| {
+                                (observation, nanos(started.elapsed().as_nanos()))
+                            })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| {
+                    CodecIssue::new(
+                        CodecIssueKind::Backend,
+                        "harness",
+                        "worker_panic",
+                        "a persistent codec workload worker panicked",
+                    )
+                })?
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|per_worker| per_worker.into_iter().flatten().collect())
     })
 }
 
@@ -845,7 +1040,8 @@ fn readback_issue(error: jxl_wgpu::Error) -> CodecIssue {
             "platform",
             detail,
         ),
-        jxl_wgpu::Error::ImageReadbackEmpty
+        jxl_wgpu::Error::ImageReadbackNoFrames
+        | jxl_wgpu::Error::ImageReadbackFrameEmpty { .. }
         | jxl_wgpu::Error::ImageReadbackSourceUsage { .. }
         | jxl_wgpu::Error::ImageReadbackSourceSize { .. }
         | jxl_wgpu::Error::ImageLayout(_) => CodecIssue::new(
@@ -970,9 +1166,15 @@ const fn nanos(value: u128) -> u64 {
 struct DecodeObservation {
     frame_count: u32,
     output_bytes: u64,
+    gpu_output_logical_bytes: u64,
     codec_submissions: u64,
+    codec_completion_waits: u64,
     display_submissions: u64,
+    display_completion_waits: u64,
     readback_submissions: u64,
+    readback_completion_waits: u64,
+    readback_logical_bytes: u64,
+    readback_staging_bytes: u64,
     output_hash: Option<String>,
     hash_mismatch: bool,
 }
@@ -981,15 +1183,33 @@ impl DecodeObservation {
     fn add_assign(&mut self, other: Self) {
         self.frame_count = self.frame_count.saturating_add(other.frame_count);
         self.output_bytes = self.output_bytes.saturating_add(other.output_bytes);
+        self.gpu_output_logical_bytes = self
+            .gpu_output_logical_bytes
+            .saturating_add(other.gpu_output_logical_bytes);
         self.codec_submissions = self
             .codec_submissions
             .saturating_add(other.codec_submissions);
+        self.codec_completion_waits = self
+            .codec_completion_waits
+            .saturating_add(other.codec_completion_waits);
         self.display_submissions = self
             .display_submissions
             .saturating_add(other.display_submissions);
+        self.display_completion_waits = self
+            .display_completion_waits
+            .saturating_add(other.display_completion_waits);
         self.readback_submissions = self
             .readback_submissions
             .saturating_add(other.readback_submissions);
+        self.readback_completion_waits = self
+            .readback_completion_waits
+            .saturating_add(other.readback_completion_waits);
+        self.readback_logical_bytes = self
+            .readback_logical_bytes
+            .saturating_add(other.readback_logical_bytes);
+        self.readback_staging_bytes = self
+            .readback_staging_bytes
+            .saturating_add(other.readback_staging_bytes);
         self.hash_mismatch |= other.hash_mismatch;
         match (&self.output_hash, other.output_hash) {
             (Some(left), Some(right)) if left != &right => self.hash_mismatch = true,
@@ -1002,9 +1222,15 @@ impl DecodeObservation {
 struct WorkloadExecution {
     frame_count: u32,
     output_bytes: u64,
+    gpu_output_logical_bytes: u64,
     codec_submissions: u64,
+    codec_completion_waits: u64,
     display_submissions: u64,
+    display_completion_waits: u64,
     readback_submissions: u64,
+    readback_completion_waits: u64,
+    readback_logical_bytes: u64,
+    readback_staging_bytes: u64,
     output_hash: Option<String>,
     timing: CodecTiming,
 }
@@ -1016,8 +1242,17 @@ mod tests {
     #[test]
     fn generic_format_inventory_is_valid() {
         let formats = [
+            GpuPixelFormat::U8,
+            GpuPixelFormat::S8,
+            GpuPixelFormat::U16,
+            GpuPixelFormat::U32,
+            GpuPixelFormat::S32,
+            GpuPixelFormat::S16,
+            GpuPixelFormat::TwoS16,
+            GpuPixelFormat::F32,
+            GpuPixelFormat::F64,
+            GpuPixelFormat::TwoF32,
             GpuPixelFormat::Y8,
-            GpuPixelFormat::Gray8,
             GpuPixelFormat::Y16,
             GpuPixelFormat::I420,
             GpuPixelFormat::I422,
@@ -1044,20 +1279,25 @@ mod tests {
         ];
         for format in formats {
             format.pixel_format().validate().unwrap();
+            format.output_request().unwrap();
         }
     }
 
     #[test]
-    fn workload_shapes_cover_single_warm_batch_and_concurrent() {
+    fn workload_shapes_cover_single_warm_burst_and_concurrent() {
         let mut spec = WorkloadSpec::default();
         assert_eq!(spec.total_measured_operations().unwrap(), 1);
         spec.kind = WorkloadKind::WarmSequential;
         spec.iterations = 7;
         assert_eq!(spec.parallelism(), 1);
         assert_eq!(spec.total_measured_operations().unwrap(), 7);
-        spec.kind = WorkloadKind::Batch;
-        spec.batch_size = 3;
+        spec.kind = WorkloadKind::ConcurrentBurst;
+        spec.burst_size = 3;
         assert_eq!(spec.total_measured_operations().unwrap(), 21);
+        assert_eq!(
+            spec.execution_model(),
+            WorkloadExecutionModel::BarrierSynchronizedHostFanout
+        );
         spec.kind = WorkloadKind::Concurrent;
         spec.concurrency = 4;
         assert_eq!(spec.total_measured_operations().unwrap(), 28);
@@ -1076,9 +1316,15 @@ mod tests {
             Ok(DecodeObservation {
                 frame_count: 1,
                 output_bytes: 16,
+                gpu_output_logical_bytes: 16,
                 codec_submissions: 1,
+                codec_completion_waits: 1,
                 display_submissions: 0,
+                display_completion_waits: 0,
                 readback_submissions: 0,
+                readback_completion_waits: 0,
+                readback_logical_bytes: 0,
+                readback_staging_bytes: 0,
                 output_hash: None,
                 hash_mismatch: false,
             })
@@ -1088,6 +1334,41 @@ mod tests {
         assert_eq!(execution.timing.workload.parallelism, 4);
         assert_eq!(execution.frame_count, 12);
         assert_eq!(execution.output_bytes, 192);
+        assert_eq!(execution.gpu_output_logical_bytes, 192);
+        assert_eq!(execution.codec_submissions, 12);
+        assert_eq!(execution.codec_completion_waits, 12);
+        assert_eq!(
+            execution.timing.workload.execution_model,
+            WorkloadExecutionModel::PersistentHostWorkers
+        );
+    }
+
+    #[test]
+    fn concurrent_burst_reports_host_fanout_without_gpu_batching() {
+        let spec = WorkloadSpec {
+            kind: WorkloadKind::ConcurrentBurst,
+            iterations: 2,
+            burst_size: 3,
+            ..WorkloadSpec::default()
+        };
+        let execution = execute_workload(spec, || {
+            Ok(DecodeObservation {
+                frame_count: 1,
+                output_bytes: 4,
+                gpu_output_logical_bytes: 4,
+                codec_submissions: 1,
+                codec_completion_waits: 1,
+                ..DecodeObservation::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(execution.timing.workload.operations, 6);
+        assert_eq!(execution.codec_submissions, 6);
+        assert_eq!(execution.codec_completion_waits, 6);
+        assert_eq!(
+            execution.timing.workload.execution_model,
+            WorkloadExecutionModel::BarrierSynchronizedHostFanout
+        );
     }
 
     #[test]
@@ -1118,13 +1399,16 @@ mod tests {
             operation: CodecOperation::Encode,
             workload: WorkloadSpec::default(),
             output_target: OutputTarget::GpuResident,
-            format: GpuPixelFormat::Gray8,
+            format: GpuPixelFormat::U8,
             size_class: SizeClass::Auto,
             extent: None,
         };
         let report = run_codec_case(&case, Some(&backend), &options);
         assert_eq!(report.status, CaseStatus::Passed);
         assert_eq!(report.codec_submissions, 1);
+        assert_eq!(report.codec_completion_waits, 1);
+        assert_eq!(report.gpu_output_logical_bytes, 0);
+        assert!(!report.coalesced_gpu_batching);
         assert!(report.output_bytes > 0);
         assert!(report.output_hash.is_some());
     }
@@ -1148,14 +1432,21 @@ mod tests {
             operation: CodecOperation::RoundTrip,
             workload: WorkloadSpec::default(),
             output_target: OutputTarget::CpuReadback,
-            format: GpuPixelFormat::Gray8,
+            format: GpuPixelFormat::U8,
             size_class: SizeClass::Auto,
             extent: None,
         };
         let report = run_codec_case(&case, Some(&backend), &options);
         assert_eq!(report.status, CaseStatus::Passed, "{:?}", report.issue);
         assert_eq!(report.codec_submissions, 2);
+        assert_eq!(report.codec_completion_waits, 2);
         assert_eq!(report.readback_submissions, 1);
+        assert_eq!(report.readback_completion_waits, 1);
+        assert_eq!(report.gpu_output_logical_bytes, 65);
+        assert_eq!(report.readback_logical_bytes, 65);
+        assert_eq!(report.readback_staging_bytes, 68);
+        assert_eq!(report.readback_mode, Some(CpuReadbackMode::StagedCopy));
+        assert!(!report.coalesced_gpu_batching);
         assert_eq!(report.output_bytes, 65);
         assert!(report.output_hash.is_some());
     }
@@ -1170,7 +1461,7 @@ mod tests {
             operation: CodecOperation::Encode,
             workload: WorkloadSpec::default(),
             output_target: OutputTarget::GpuResident,
-            format: GpuPixelFormat::Gray8,
+            format: GpuPixelFormat::U8,
             size_class: SizeClass::Odd,
             extent: Some(DeclaredExtent {
                 width: 5,
@@ -1184,7 +1475,7 @@ mod tests {
         let observation = decode_once(
             &decoder,
             Arc::from(encoded),
-            GpuOutputRequest::new(GpuPixelFormat::Nv12.pixel_format()),
+            GpuPixelFormat::Nv12.output_request().unwrap(),
             Some(&display),
             None,
             false,

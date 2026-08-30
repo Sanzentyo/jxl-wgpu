@@ -1,6 +1,11 @@
+// The JPEG XL header and fast-lossless control-plane construction in this module is derived
+// from the permissively licensed zune-jpegxl 0.5.2 encoder. See `THIRD_PARTY.md` and
+// `LICENSES/zune-jpegxl-MIT.txt` in this crate.
+
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -9,15 +14,19 @@ use jxl_gpu_bitstream::{
     write_container_with_boxes,
 };
 use jxl_gpu_formats::{Channel, PixelFormat, SampleKind};
+use jxl_wgpu::MemoryPermit;
+#[cfg(test)]
 use wgpu::util::DeviceExt;
 
+use crate::buffer_pool::EncoderBufferPool;
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{
-    AnimationHeader, BitFragment, Determinism, EncodeError, EncodeProfile, EncoderCapabilities,
-    FrameEncodeRequest, FrameGroupLayout, FrameIndex, FrameOptions, FramePacketSet,
-    FrameSubmission, GpuAccelerationArtifact, GpuEncodeBackend, GpuEncodeJob, GpuEncoder,
-    GpuFrameArtifacts, GpuFrameSource, GroupPacket, GroupPacketKind, KernelStage,
-    ProfileCapability, ProgressivePlan, UnsupportedFeature, WgpuContext, assemble_frame,
+    AnimationHeader, BitFragment, DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError,
+    EncodeProfile, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest,
+    FrameGroupLayout, FrameIndex, FrameOptions, FramePacketSet, FrameSubmission,
+    GpuAccelerationArtifact, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts,
+    GpuFrameSource, GroupPacket, GroupPacketKind, KernelStage, ProfileCapability, ProgressivePlan,
+    UnsupportedFeature, WgpuContext, assemble_frame,
 };
 
 const MAX_DIMENSION: u32 = 256;
@@ -138,6 +147,7 @@ struct Gray8DispatchPlan {
 /// residual tokens and histograms; the host only serializes those artifacts.
 pub struct LosslessGray8Backend {
     pipeline: Arc<wgpu::ComputePipeline>,
+    buffer_pool: Arc<EncoderBufferPool>,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     max_buffer_size: u64,
@@ -166,6 +176,7 @@ impl LosslessGray8Backend {
         let limits = context.device().limits();
         Self {
             pipeline,
+            buffer_pool: EncoderBufferPool::new(DEFAULT_ENCODER_BUFFER_POOL_BYTES),
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::ModularLossless {
                     min_bits_per_sample: 8,
@@ -202,6 +213,28 @@ impl LosslessGray8Backend {
         }
     }
 
+    /// Reports encoder-owned uniform, artifact, and readback buffers retained for reuse.
+    #[must_use]
+    pub fn buffer_pool_stats(&self) -> EncoderBufferPoolStats {
+        self.buffer_pool.stats()
+    }
+
+    /// Changes the maximum idle allocation bytes retained by this backend.
+    ///
+    /// A value of zero disables retention. Reducing the limit immediately evicts oldest idle
+    /// sets; resources already leased to GPU jobs follow the new limit when they complete.
+    pub fn set_buffer_pool_limit(&self, limit_bytes: u64) {
+        self.buffer_pool.set_limit(limit_bytes);
+    }
+
+    /// Drops all idle buffers and prevents currently leased sets from re-entering the pool.
+    ///
+    /// In-flight buffers remain exclusively owned by their submissions until their GPU mapping
+    /// callback finishes, then are discarded instead of being retained.
+    pub fn clear_buffer_pool(&self) {
+        self.buffer_pool.clear();
+    }
+
     fn dispatch_plan(
         &self,
         source: &crate::BufferImageSource,
@@ -225,8 +258,9 @@ impl LosslessGray8Backend {
             .layout
             .plane(0)
             .ok_or(EncodeError::InvalidSource("missing grayscale plane"))?;
-        let row_stride = u32::try_from(plane.row_stride)
-            .map_err(|_| EncodeError::InvalidSource("row stride exceeds the prototype limit"))?;
+        let row_stride = u32::try_from(plane.row_stride).map_err(|_| {
+            EncodeError::InvalidSource("row stride exceeds the Gray8 profile limit")
+        })?;
         if plane.row_stride < u64::from(extent.width) {
             return Err(EncodeError::InvalidSource(
                 "row stride is smaller than the grayscale row width",
@@ -407,13 +441,16 @@ impl GpuEncodeBackend for LosslessGray8Backend {
         }
         if request.options != FrameOptions::default() {
             return Err(EncodeError::InvalidConfiguration(
-                "the gray8 prototype only supports default still-frame options",
+                "the Gray8 profile only supports default still-frame options",
             ));
         }
         let GpuFrameSource::Buffer(source) = source else {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
+        let memory_permit = context
+            .memory_budget()
+            .try_reserve(plan.memory.owned_bytes_per_job)?;
 
         let params = Gray8Params {
             width: plan.width,
@@ -421,27 +458,15 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             row_stride: plan.row_stride,
             byte_offset: plan.shader_byte_offset,
         };
-        let params = context
-            .device()
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("jxl-wgpu lossless gray8 parameters"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let output = context.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("jxl-wgpu lossless gray8 GPU artifacts"),
-            size: plan.output_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging = Arc::new(context.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("jxl-wgpu lossless gray8 artifact readback"),
-            size: plan.output_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        }));
+        let buffer_lease = self.buffer_pool.checkout(
+            context.device(),
+            plan.memory.uniform_bytes,
+            plan.output_size,
+        );
+        let buffers = buffer_lease.buffers();
+        context
+            .queue()
+            .write_buffer(&buffers.uniform, 0, bytemuck::bytes_of(&params));
         let bind_group = context
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -458,11 +483,11 @@ impl GpuEncodeBackend for LosslessGray8Backend {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: output.as_entire_binding(),
+                        resource: buffers.artifact.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: params.as_entire_binding(),
+                        resource: buffers.uniform.as_entire_binding(),
                     },
                 ],
             });
@@ -472,7 +497,7 @@ impl GpuEncodeBackend for LosslessGray8Backend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu lossless gray8 encode"),
                 });
-        commands.clear_buffer(&output, 0, None);
+        commands.clear_buffer(&buffers.artifact, 0, None);
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jxl-wgpu lossless gray8 tokenization"),
@@ -482,33 +507,48 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        commands.copy_buffer_to_buffer(&output, 0, &staging, 0, plan.output_size);
+        commands.copy_buffer_to_buffer(
+            &buffers.artifact,
+            0,
+            &buffers.readback,
+            0,
+            plan.output_size,
+        );
 
         let completion = Arc::new(MapCompletion::default());
         let callback_completion = Arc::clone(&completion);
-        commands.map_buffer_on_submit(&staging, wgpu::MapMode::Read, .., move |result| {
-            callback_completion
-                .complete(result.map_err(|error| format!("GPU artifact mapping failed: {error}")));
+        let readback_for_map = Arc::clone(&buffers.readback);
+        let lifetime = Arc::new(EncodeJobLifetime {
+            buffer_lease,
+            _memory_permit: memory_permit,
+            mapped: AtomicBool::new(false),
         });
-        let submission_index = context.queue().submit([commands.finish()]);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let poll_context = context.clone();
-            let poll_completion = Arc::clone(&completion);
-            std::thread::spawn(move || {
-                if let Err(error) = poll_context.device().poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission_index),
-                    timeout: None,
-                }) {
-                    poll_completion.complete(Err(format!("GPU submission failed: {error}")));
+        let callback_lifetime = Arc::clone(&lifetime);
+        commands.map_buffer_on_submit(
+            &readback_for_map,
+            wgpu::MapMode::Read,
+            0..plan.output_size,
+            move |result| {
+                if result.is_ok() {
+                    callback_lifetime.mapped.store(true, Ordering::Release);
                 }
-            });
+                callback_completion.complete(
+                    result.map_err(|error| format!("GPU artifact mapping failed: {error}")),
+                );
+                drop(callback_lifetime);
+            },
+        );
+        let poll_permit = context.submission_poller().try_reserve()?;
+        let submission_index = context.queue().submit([commands.finish()]);
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission_index, move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!("GPU poll registration failed: {error}")));
         }
-        #[cfg(target_arch = "wasm32")]
-        let _ = submission_index;
 
         Ok(LosslessGray8Job {
-            staging: Some(staging),
+            lifetime: Some(lifetime),
             completion,
             output_size: plan.output_size,
             max_events: plan.max_events,
@@ -534,18 +574,28 @@ struct MapState {
 
 impl MapCompletion {
     fn complete(&self, result: Result<(), String>) {
-        let mut state = self.state.lock().expect("map completion mutex poisoned");
-        if state.result.is_none() {
-            state.result = Some(result);
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.result.is_some() {
+                return;
             }
-            self.condition.notify_all();
+            state.result = Some(result);
+            state.waker.take()
+        };
+        self.condition.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 
     fn poll(&self, cx: &Context<'_>) -> Option<Result<(), String>> {
-        let mut state = self.state.lock().expect("map completion mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.result.is_none() {
             state.waker = Some(cx.waker().clone());
         }
@@ -554,12 +604,15 @@ impl MapCompletion {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(&self) -> Result<(), String> {
-        let mut state = self.state.lock().expect("map completion mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while state.result.is_none() {
             state = self
                 .condition
                 .wait(state)
-                .expect("map completion mutex poisoned while waiting");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         state
             .result
@@ -570,7 +623,7 @@ impl MapCompletion {
 
 /// Runtime-neutral completion for the concrete GPU lossless profile.
 pub struct LosslessGray8Job {
-    staging: Option<Arc<wgpu::Buffer>>,
+    lifetime: Option<Arc<EncodeJobLifetime>>,
     completion: Arc<MapCompletion>,
     output_size: u64,
     max_events: usize,
@@ -580,16 +633,34 @@ pub struct LosslessGray8Job {
     is_last: bool,
 }
 
+struct EncodeJobLifetime {
+    buffer_lease: crate::buffer_pool::EncoderBufferLease,
+    _memory_permit: MemoryPermit,
+    mapped: AtomicBool,
+}
+
+impl Drop for EncodeJobLifetime {
+    fn drop(&mut self) {
+        if self.mapped.swap(false, Ordering::AcqRel) {
+            self.buffer_lease.buffers().readback.unmap();
+        }
+    }
+}
+
 impl LosslessGray8Job {
     fn finish(&mut self, mapping: Result<(), String>) -> Result<GpuFrameArtifacts, EncodeError> {
-        mapping.map_err(EncodeError::Backend)?;
-        let staging = self
-            .staging
+        let lifetime = self
+            .lifetime
             .take()
             .ok_or_else(|| EncodeError::Backend("GPU job was already consumed".into()))?;
-        let mapped = staging.slice(..).get_mapped_range().map_err(|error| {
-            EncodeError::Backend(format!("invalid mapped artifact range: {error}"))
-        })?;
+        mapping.map_err(EncodeError::Backend)?;
+        let readback = &lifetime.buffer_lease.buffers().readback;
+        let mapped = readback
+            .slice(0..self.output_size)
+            .get_mapped_range()
+            .map_err(|error| {
+                EncodeError::Backend(format!("invalid mapped artifact range: {error}"))
+            })?;
         let expected = usize::try_from(self.output_size)
             .map_err(|_| EncodeError::Backend("mapped artifact size overflow".into()))?;
         let bytes = mapped
@@ -597,7 +668,9 @@ impl LosslessGray8Job {
             .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?;
         let result = build_packets(self.width, self.height, self.max_events, bytes);
         drop(mapped);
-        staging.unmap();
+        readback.unmap();
+        lifetime.mapped.store(false, Ordering::Release);
+        drop(lifetime);
         let (packets, acceleration) = result?;
         Ok(GpuFrameArtifacts {
             frame_index: self.frame_index,
@@ -650,9 +723,28 @@ impl LosslessGray8Encoder {
         }
     }
 
+    /// Creates an encoder with an application-selected idle buffer retention limit.
+    ///
+    /// The limit is independent of the context's live-job [`jxl_wgpu::MemoryBudget`]. A value of
+    /// zero creates buffers on demand and drops them immediately after each mapping callback.
+    #[must_use]
+    pub fn with_buffer_pool_limit(context: WgpuContext, limit_bytes: u64) -> Self {
+        let backend = LosslessGray8Backend::new(&context);
+        backend.set_buffer_pool_limit(limit_bytes);
+        Self {
+            encoder: GpuEncoder::new(context, backend),
+        }
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> &EncoderCapabilities {
         self.encoder.capabilities()
+    }
+
+    /// Reports aggregate owned bytes retained by currently live encode jobs.
+    #[must_use]
+    pub fn in_flight_memory_stats(&self) -> jxl_wgpu::MemoryBudgetSnapshot {
+        self.encoder.memory_stats()
     }
 
     /// Computes all source, artifact, and readback bytes before submission.
@@ -666,6 +758,22 @@ impl LosslessGray8Encoder {
     #[must_use]
     pub fn memory_limits(&self) -> LosslessGray8MemoryLimits {
         self.encoder.backend().memory_limits()
+    }
+
+    /// Reports reusable encoder-owned GPU buffers and cumulative reuse counters.
+    #[must_use]
+    pub fn buffer_pool_stats(&self) -> EncoderBufferPoolStats {
+        self.encoder.backend().buffer_pool_stats()
+    }
+
+    /// Changes the maximum idle allocation bytes retained for later submissions.
+    pub fn set_buffer_pool_limit(&self, limit_bytes: u64) {
+        self.encoder.backend().set_buffer_pool_limit(limit_bytes);
+    }
+
+    /// Clears idle buffers; in-flight sets from before the clear are discarded on completion.
+    pub fn clear_buffer_pool(&self) {
+        self.encoder.backend().clear_buffer_pool();
     }
 
     pub fn submit(
@@ -856,7 +964,8 @@ fn build_packets(
     let events = bytemuck::try_cast_slice::<u8, Gray8Event>(events)
         .map_err(|_| EncodeError::Backend("GPU event stream has an invalid ABI layout".into()))?;
 
-    let primary = PrefixCode::from_gpu_counts(&header.raw_counts, &header.lz77_counts);
+    validate_gpu_artifacts(width, height, &header, events)?;
+    let primary = PrefixCode::from_gpu_counts(&header.raw_counts, &header.lz77_counts)?;
     let unused = PrefixCode::fixed_unused_channel();
     let codes = [primary.clone(), unused.clone(), unused.clone(), unused];
     let mut group = BitWriter::new();
@@ -910,9 +1019,103 @@ fn build_packets(
     Ok((packets, acceleration))
 }
 
+fn validate_gpu_artifacts(
+    width: u32,
+    height: u32,
+    header: &Gray8ArtifactHeader,
+    events: &[Gray8Event],
+) -> Result<(), EncodeError> {
+    let mut raw_counts = [0u32; RAW_SYMBOLS];
+    let mut lz77_counts = [0u32; LZ77_SYMBOLS];
+    let mut sample_count = 0u64;
+
+    for event in events {
+        match event.kind {
+            0 => {
+                let token = usize::try_from(event.token)
+                    .map_err(|_| invalid_gpu_artifact("raw token overflow"))?;
+                if token > 9 {
+                    return Err(invalid_gpu_artifact("impossible raw token"));
+                }
+                let expected_nbits = event.token.saturating_sub(1);
+                if event.extra_bit_count != expected_nbits
+                    || !canonical_extra_bits(event.extra_bit_count, event.extra_bits)
+                {
+                    return Err(invalid_gpu_artifact("non-canonical raw token"));
+                }
+                raw_counts[token] = raw_counts[token]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_gpu_artifact("raw histogram overflow"))?;
+                sample_count = sample_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_gpu_artifact("sample count overflow"))?;
+            }
+            1 => {
+                let token = usize::try_from(event.token)
+                    .map_err(|_| invalid_gpu_artifact("LZ77 token overflow"))?;
+                if token > 27 {
+                    return Err(invalid_gpu_artifact("impossible LZ77 token"));
+                }
+                let expected_nbits = if event.token < 16 {
+                    0
+                } else {
+                    event.token - 12
+                };
+                if event.extra_bit_count != expected_nbits
+                    || !canonical_extra_bits(event.extra_bit_count, event.extra_bits)
+                {
+                    return Err(invalid_gpu_artifact("non-canonical LZ77 token"));
+                }
+                raw_counts[0] = raw_counts[0]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_gpu_artifact("raw histogram overflow"))?;
+                lz77_counts[token] = lz77_counts[token]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_gpu_artifact("LZ77 histogram overflow"))?;
+                let encoded_value = if event.token < 16 {
+                    u64::from(event.token)
+                } else {
+                    (1u64 << event.extra_bit_count) + u64::from(event.extra_bits)
+                };
+                sample_count = sample_count
+                    .checked_add(encoded_value + 8)
+                    .ok_or_else(|| invalid_gpu_artifact("sample count overflow"))?;
+            }
+            _ => return Err(invalid_gpu_artifact("unknown token kind")),
+        }
+    }
+
+    if raw_counts != header.raw_counts || lz77_counts != header.lz77_counts {
+        return Err(invalid_gpu_artifact(
+            "token histograms do not match the event stream",
+        ));
+    }
+    let expected_samples = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| invalid_gpu_artifact("image sample count overflow"))?;
+    if sample_count != expected_samples {
+        return Err(invalid_gpu_artifact(
+            "event stream does not cover the image exactly",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_extra_bits(nbits: u32, bits: u32) -> bool {
+    match nbits {
+        0 => bits == 0,
+        1..=31 => bits < (1u32 << nbits),
+        _ => false,
+    }
+}
+
+fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
+    EncodeError::Backend(format!("invalid GPU artifact: {reason}"))
+}
+
 fn write_dc_global(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<(), EncodeError> {
-    // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See
-    // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt` at repository root.
+    // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
+    // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
     output.write_bits(1, 1)?;
     output.write_bits(1, 1)?;
     output.write_bits(0, 1)?;
@@ -996,7 +1199,7 @@ fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;
     output.align_to_byte()?;
-    Ok(BitFragment::byte_aligned(output.into_bytes()))
+    Ok(BitFragment::byte_aligned(output.into_bytes())?)
 }
 
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
@@ -1048,6 +1251,8 @@ fn frame_header() -> Result<BitFragment, EncodeError> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use jxl::api::{
         JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
@@ -1056,6 +1261,57 @@ mod tests {
     use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
     use jxl_gpu_protocol::Extent2d;
     use std::process::Command;
+
+    fn checked_in_gpu_gray8_lossless() -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid checked-in fixture hex digit"),
+            }
+        }
+
+        let digits = include_str!("../test-data/gpu_gray8_lossless.jxl.hex")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
+        digits
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
+    struct ReentrantWake {
+        completion: Arc<MapCompletion>,
+        observed_unlocked: Arc<AtomicBool>,
+    }
+
+    impl std::task::Wake for ReentrantWake {
+        fn wake(self: Arc<Self>) {
+            let _guard = self
+                .completion
+                .state
+                .try_lock()
+                .expect("completion mutex must be unlocked before invoking a waker");
+            self.observed_unlocked.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn completion_wakes_after_releasing_its_mutex() {
+        let completion = Arc::new(MapCompletion::default());
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(ReentrantWake {
+            completion: Arc::clone(&completion),
+            observed_unlocked: Arc::clone(&observed_unlocked),
+        }));
+        let context = Context::from_waker(&waker);
+        assert!(completion.poll(&context).is_none());
+        completion.complete(Ok(()));
+        assert!(observed_unlocked.load(Ordering::Acquire));
+    }
 
     #[test]
     fn gray8_params_abi_matches_wgsl_uniform() {
@@ -1104,6 +1360,86 @@ mod tests {
         assert!(SHADER.contains("// (kind, token, extra-bit count, extra bits)."));
         assert!(SHADER.contains("const OUTPUT_HEADER_WORDS: u32 = 53u;"));
         assert!(SHADER.contains("const EVENT_WORDS: u32 = 4u;"));
+    }
+
+    fn artifact_bytes(header: Gray8ArtifactHeader, events: &[Gray8Event]) -> Vec<u8> {
+        let mut bytes = bytemuck::bytes_of(&header).to_vec();
+        bytes.extend_from_slice(bytemuck::cast_slice(events));
+        bytes
+    }
+
+    #[test]
+    fn packet_builder_rejects_impossible_histogram_bins() {
+        let mut header = Gray8ArtifactHeader {
+            event_count: 1,
+            raw_counts: [0; RAW_SYMBOLS],
+            lz77_counts: [0; LZ77_SYMBOLS],
+        };
+        header.raw_counts[0] = 1;
+        header.raw_counts[12] = 1;
+        let bytes = artifact_bytes(
+            header,
+            &[Gray8Event {
+                kind: 0,
+                token: 0,
+                extra_bit_count: 0,
+                extra_bits: 0,
+            }],
+        );
+        assert!(build_packets(1, 1, 1, &bytes).is_err());
+    }
+
+    #[test]
+    fn packet_builder_rejects_noncanonical_events_and_histogram_mismatches() {
+        let mut header = Gray8ArtifactHeader {
+            event_count: 1,
+            raw_counts: [0; RAW_SYMBOLS],
+            lz77_counts: [0; LZ77_SYMBOLS],
+        };
+        header.raw_counts[2] = 1;
+        let malformed = artifact_bytes(
+            header,
+            &[Gray8Event {
+                kind: 0,
+                token: 2,
+                extra_bit_count: 0,
+                extra_bits: 0,
+            }],
+        );
+        assert!(build_packets(1, 1, 1, &malformed).is_err());
+
+        header.raw_counts = [0; RAW_SYMBOLS];
+        header.raw_counts[1] = 1;
+        let mismatched = artifact_bytes(
+            header,
+            &[Gray8Event {
+                kind: 0,
+                token: 0,
+                extra_bit_count: 0,
+                extra_bits: 0,
+            }],
+        );
+        assert!(build_packets(1, 1, 1, &mismatched).is_err());
+    }
+
+    #[test]
+    fn packet_builder_rejects_event_streams_with_the_wrong_sample_count() {
+        let mut header = Gray8ArtifactHeader {
+            event_count: 1,
+            raw_counts: [0; RAW_SYMBOLS],
+            lz77_counts: [0; LZ77_SYMBOLS],
+        };
+        header.raw_counts[0] = 1;
+        let bytes = artifact_bytes(
+            header,
+            &[Gray8Event {
+                kind: 0,
+                token: 0,
+                extra_bit_count: 0,
+                extra_bits: 0,
+            }],
+        );
+        assert!(build_packets(2, 1, 1, &bytes).is_err());
     }
 
     /// Mirrors only the event-admission control flow in `encode` WGSL. A
@@ -1155,7 +1491,7 @@ mod tests {
         }
 
         let pixels = usize::try_from(u64::from(MAX_DIMENSION) * u64::from(MAX_DIMENSION))
-            .expect("maximum prototype dimensions fit usize");
+            .expect("maximum Gray8 profile dimensions fit usize");
         let capacity = event_capacity(pixels).expect("maximum event capacity fits usize");
         for events in [
             simulated_shader_event_count(pixels, 1, |_| false),
@@ -1190,7 +1526,256 @@ mod tests {
             trace: wgpu::Trace::Off,
         }))
         .ok()?;
-        Some(WgpuContext::new(Arc::new(device), Arc::new(queue)))
+        WgpuContext::new(Arc::new(device), Arc::new(queue)).ok()
+    }
+
+    fn packed_test_source(
+        context: &WgpuContext,
+        width: u32,
+        height: u32,
+    ) -> crate::BufferImageSource {
+        let extent = Extent2d::new(width, height);
+        let layout = ImageLayout::packed(
+            extent,
+            PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        )
+        .unwrap();
+        let byte_count = usize::try_from(u64::from(width) * u64::from(height))
+            .expect("test source size fits usize");
+        let pixels = (0..byte_count)
+            .map(|index| ((index * 29 + index / 7) & 255) as u8)
+            .collect::<Vec<_>>();
+        let buffer = Arc::new(context.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu encoder pool test source"),
+                contents: &pixels,
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        ));
+        crate::BufferImageSource::new(buffer, layout).unwrap()
+    }
+
+    #[test]
+    fn pool_exclusively_leases_real_gpu_buffer_sets_and_clear_invalidates_live_returns() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU encoder pool lease test: no wgpu adapter");
+            return;
+        };
+        let pool = EncoderBufferPool::new(64 * 1024);
+        let first = pool.checkout(context.device(), 16, 1024);
+        let first_artifact = Arc::clone(&first.buffers().artifact);
+        let second = pool.checkout(context.device(), 16, 1024);
+        assert!(!Arc::ptr_eq(&first_artifact, &second.buffers().artifact));
+        assert_eq!(pool.stats().leased_buffer_sets, 2);
+        assert_eq!(pool.stats().allocation_misses, 2);
+
+        drop(first);
+        let third = pool.checkout(context.device(), 16, 1024);
+        assert!(Arc::ptr_eq(&first_artifact, &third.buffers().artifact));
+        assert_eq!(pool.stats().reuse_hits, 1);
+        assert_eq!(pool.stats().leased_buffer_sets, 2);
+
+        pool.clear();
+        drop(second);
+        drop(third);
+        let stats = pool.stats();
+        assert_eq!(stats.leased_buffer_sets, 0);
+        assert_eq!(stats.idle_buffer_sets, 0);
+        assert_eq!(stats.idle_buffers, 0);
+        assert_eq!(stats.evicted_buffer_sets, 2);
+        assert_eq!(stats.evicted_buffers, 6);
+    }
+
+    #[test]
+    fn sequential_gpu_jobs_reuse_exact_buffer_sets_and_enforce_the_idle_limit() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU encoder reuse test: no wgpu adapter");
+            return;
+        };
+        let source = packed_test_source(&context, 17, 13);
+        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(context, 8 * 1024 * 1024);
+        let allocation_bytes = encoder.memory_plan(&source).unwrap().owned_bytes_per_job;
+
+        encoder.submit(source.clone()).unwrap().wait().unwrap();
+        let first = encoder.buffer_pool_stats();
+        assert_eq!(first.allocation_misses, 1);
+        assert_eq!(first.reuse_hits, 0);
+        assert_eq!(first.idle_buffer_sets, 1);
+        assert_eq!(first.idle_buffers, 3);
+        assert_eq!(first.idle_bytes, allocation_bytes);
+
+        encoder.submit(source).unwrap().wait().unwrap();
+        let reused = encoder.buffer_pool_stats();
+        assert_eq!(reused.allocation_misses, 1);
+        assert_eq!(reused.reuse_hits, 1);
+        assert_eq!(reused.idle_buffer_sets, 1);
+
+        encoder.set_buffer_pool_limit(allocation_bytes - 1);
+        let evicted = encoder.buffer_pool_stats();
+        assert_eq!(evicted.limit_bytes, allocation_bytes - 1);
+        assert_eq!(evicted.idle_bytes, 0);
+        assert_eq!(evicted.idle_buffer_sets, 0);
+        assert_eq!(evicted.evicted_buffer_sets, 1);
+        assert_eq!(evicted.evicted_buffers, 3);
+        assert_eq!(evicted.evicted_bytes, allocation_bytes);
+    }
+
+    #[test]
+    fn abandoned_gpu_future_returns_buffers_and_live_memory_after_mapping() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping abandoned GPU encoder reuse test: no wgpu adapter");
+            return;
+        };
+        let source = packed_test_source(&context, 71, 121);
+        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(
+            context.clone(),
+            DEFAULT_ENCODER_BUFFER_POOL_BYTES,
+        );
+        let dropped = encoder.submit(source.clone()).unwrap();
+        assert_eq!(encoder.buffer_pool_stats().leased_buffer_sets, 1);
+        assert_eq!(encoder.buffer_pool_stats().idle_buffer_sets, 0);
+        assert!(encoder.in_flight_memory_stats().reserved_bytes > 0);
+        drop(dropped);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pool = encoder.buffer_pool_stats();
+            let memory = encoder.in_flight_memory_stats();
+            if pool.leased_buffer_sets == 0
+                && pool.idle_buffer_sets == 1
+                && memory.reserved_bytes == 0
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned submission did not release resources: pool={pool:?}, memory={memory:?}"
+            );
+            let _ = context.device().poll(wgpu::PollType::Poll);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        encoder.submit(source).unwrap().wait().unwrap();
+        let stats = encoder.buffer_pool_stats();
+        assert_eq!(stats.allocation_misses, 1);
+        assert_eq!(stats.reuse_hits, 1);
+        assert_eq!(stats.leased_buffer_sets, 0);
+    }
+
+    #[test]
+    fn concurrent_real_gpu_submissions_reuse_only_completed_buffer_sets() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping concurrent GPU encoder reuse test: no wgpu adapter");
+            return;
+        };
+        let source = packed_test_source(&context, 71, 121);
+        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(context, 32 * 1024 * 1024);
+        let per_job = encoder.memory_plan(&source).unwrap().owned_bytes_per_job;
+        let jobs = (0..8)
+            .map(|_| encoder.submit(source.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, per_job * 8);
+        let first_outputs = jobs
+            .into_iter()
+            .map(LosslessGray8Submission::wait)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(first_outputs.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+
+        let first_stats = encoder.buffer_pool_stats();
+        assert_eq!(first_stats.reuse_hits + first_stats.allocation_misses, 8);
+        assert_eq!(first_stats.leased_buffer_sets, 0);
+        assert!(first_stats.idle_buffer_sets >= 1);
+        let guaranteed_hits = first_stats.idle_buffer_sets;
+
+        let jobs = (0..8)
+            .map(|_| encoder.submit(source.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let second_outputs = jobs
+            .into_iter()
+            .map(LosslessGray8Submission::wait)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            second_outputs
+                .iter()
+                .all(|encoded| encoded == &first_outputs[0])
+        );
+        let second_stats = encoder.buffer_pool_stats();
+        assert!(second_stats.reuse_hits >= first_stats.reuse_hits + guaranteed_hits);
+        assert_eq!(second_stats.reuse_hits + second_stats.allocation_misses, 16);
+        assert_eq!(second_stats.leased_buffer_sets, 0);
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn poll_admission_failure_happens_before_submit_and_returns_the_pool_lease() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU encoder poll admission test: no wgpu adapter");
+            return;
+        };
+        let source = packed_test_source(&context, 17, 13);
+        let encoder = LosslessGray8Encoder::new(context.clone());
+        let permits = (0..jxl_wgpu::SUBMISSION_POLLER_CAPACITY)
+            .map(|_| context.submission_poller().try_reserve().unwrap())
+            .collect::<Vec<_>>();
+
+        let error = match encoder.submit(source.clone()) {
+            Ok(_) => panic!("saturated poll admission must reject before queue submission"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            EncodeError::PollBackpressure(jxl_wgpu::SubmissionPollerError::Full { .. })
+        ));
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        let rejected = encoder.buffer_pool_stats();
+        assert_eq!(rejected.leased_buffer_sets, 0);
+        assert_eq!(rejected.idle_buffer_sets, 1);
+        assert_eq!(rejected.allocation_misses, 1);
+
+        drop(permits);
+        encoder.submit(source).unwrap().wait().unwrap();
+        let recovered = encoder.buffer_pool_stats();
+        assert_eq!(recovered.reuse_hits, 1);
+        assert_eq!(recovered.leased_buffer_sets, 0);
+    }
+
+    #[test]
+    fn concurrent_encoder_jobs_use_owned_byte_backpressure() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU encoder backpressure test: no wgpu adapter");
+            return;
+        };
+        let source = packed_test_source(&context, 2, 2);
+        let plan = LosslessGray8Backend::new(&context)
+            .memory_plan(&source)
+            .unwrap();
+        let limited = WgpuContext::with_memory_budget(
+            Arc::new(context.device().clone()),
+            Arc::new(context.queue().clone()),
+            NonZeroU64::new(plan.owned_bytes_per_job).unwrap(),
+        )
+        .unwrap();
+        let encoder = LosslessGray8Encoder::new(limited);
+
+        let first = encoder.submit(source.clone()).unwrap();
+        assert_eq!(
+            encoder.in_flight_memory_stats().reserved_bytes,
+            plan.owned_bytes_per_job
+        );
+        assert!(matches!(
+            encoder.submit(source.clone()),
+            Err(EncodeError::MemoryBackpressure(
+                jxl_wgpu::MemoryBudgetError::Exhausted { .. }
+            ))
+        ));
+        first.wait().unwrap();
+        assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+        encoder.submit(source).unwrap().wait().unwrap();
     }
 
     fn decode_gray8(encoded: &[u8]) -> Result<((usize, usize), Vec<u8>), String> {
@@ -1475,10 +2060,7 @@ mod tests {
             .encode_container(source)
             .expect("second deterministic container encode succeeds");
         assert_eq!(container, second);
-        assert_eq!(
-            container,
-            include_bytes!("../../../fixtures/gpu_gray8_lossless.jxl")
-        );
+        assert_eq!(container, checked_in_gpu_gray8_lossless());
         if let Some(path) = std::env::var_os("JXL_WGPU_WRITE_FIXTURE") {
             std::fs::write(path, &container).expect("requested fixture path is writable");
         }

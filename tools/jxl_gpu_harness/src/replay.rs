@@ -25,7 +25,6 @@ use crate::report::{CaseReport, CaseStatus, TimingStatistics};
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum BackendKind {
-    #[value(alias = "cpu")]
     Reference,
     Wgpu,
 }
@@ -283,6 +282,7 @@ impl WgpuReplayJob {
                     channels: u8::try_from(input_shape.channels)
                         .map_err(|_| Error::LengthOverflow)?,
                     layout: OutputLayout::Planar,
+                    color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
                 }],
             },
             resources: epf_resource

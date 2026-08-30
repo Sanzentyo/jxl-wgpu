@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use jxl_gpu_formats::{ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, PixelFormat};
@@ -10,12 +11,14 @@ use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu_decode::{
     AnimationMetadata, DecodeProfile, Error, FixedModularPredictor, FrameDuration, FrameMetadata,
     FrameTimebase, FrontendIncomplete, FrontendStage, GpuCodestream, GpuDecoder, GpuOutputRequest,
-    GpuSubmissionEngine, GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame,
-    UnsupportedCodestreamFeature, UnsupportedProfile,
+    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, PrefetchBackpressure,
+    PreparedGpuSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
+    UnsupportedProfile,
 };
 
-const RAW_STILL: &[u8] = include_bytes!("../../../fixtures/basic.jxl");
-const FRAGMENTED_ANIMATION: &[u8] = include_bytes!("../../../fixtures/fragmented_animation.jxl");
+mod common;
+
+use common::{basic as raw_still, fragmented_animation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MockGpuFrame {
@@ -27,8 +30,9 @@ fn output_request(limit: usize) -> GpuOutputRequest {
         ColorRange::Limited,
         ChromaLocation2d::CENTER,
     ));
-    GpuOutputRequest::new(PixelFormat::nv12(color))
-        .with_max_in_flight(NonZeroUsize::new(limit).unwrap())
+    GpuOutputRequest::color(PixelFormat::nv12(color))
+        .unwrap()
+        .with_max_frame_slots(NonZeroUsize::new(limit).unwrap())
 }
 
 fn timebase() -> FrameTimebase {
@@ -43,6 +47,8 @@ fn frame(index: usize, is_last: bool) -> SubmittedGpuFrame<MockGpuFrame> {
         FrameMetadata {
             index,
             duration: FrameDuration::animation(20, timebase()),
+            presentation_ticks: u64::try_from(index).unwrap() * 20,
+            timecode: None,
             is_last,
             is_keyframe: index == 0,
             name: format!("frame-{index}"),
@@ -51,6 +57,32 @@ fn frame(index: usize, is_last: bool) -> SubmittedGpuFrame<MockGpuFrame> {
             resource_id: index as u64,
         },
     )
+}
+
+#[derive(Debug)]
+struct ReadyPending(Option<SubmittedGpuFrame<MockGpuFrame>>);
+
+impl ReadyPending {
+    fn take(&mut self) -> Result<SubmittedGpuFrame<MockGpuFrame>> {
+        self.0
+            .take()
+            .ok_or(Error::EngineContract("mock pending frame completed twice"))
+    }
+}
+
+impl GpuPendingFrame for ReadyPending {
+    type Frame = MockGpuFrame;
+
+    fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
+        self.take()
+    }
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
+        Poll::Ready(self.take())
+    }
 }
 
 #[derive(Debug)]
@@ -71,7 +103,7 @@ impl GpuSubmissionEngine for ReadyEngine {
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert!(codestream.bytes().starts_with(&[0xff, 0x0a]));
         Ok(PreparedGpuSession::new(
-            DecodeProfile::prototype_8bit(FixedModularPredictor::new(0).unwrap()),
+            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
             AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
             ReadySession {
                 frames: VecDeque::from([frame(0, false), frame(1, true)]),
@@ -82,26 +114,23 @@ impl GpuSubmissionEngine for ReadyEngine {
 
 impl GpuSubmissionSession for ReadySession {
     type Frame = MockGpuFrame;
+    type Pending = ReadyPending;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>> {
-        Ok(self.frames.pop_front())
-    }
-
-    fn poll_next_frame(
-        &mut self,
-        _context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>> {
-        Poll::Ready(self.next_frame())
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
+        Ok(self
+            .frames
+            .pop_front()
+            .map(|frame| ReadyPending(Some(frame))))
     }
 }
 
 #[test]
 fn sync_gpu_frames_are_bounded_and_keep_exact_timing() {
     let decoder = GpuDecoder::new(ReadyEngine);
-    let mut session = decoder.open(RAW_STILL, output_request(1)).unwrap();
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
     assert_eq!(
         session.profile(),
-        DecodeProfile::prototype_8bit(FixedModularPredictor::new(0).unwrap())
+        DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap())
     );
     assert_eq!(session.metadata().extent, Extent2d::new(8, 6));
 
@@ -109,6 +138,8 @@ fn sync_gpu_frames_are_bounded_and_keep_exact_timing() {
     assert_eq!(first.metadata.index, 0);
     assert_eq!(first.metadata.duration.ticks, 20);
     assert_eq!(first.metadata.duration.timebase, Some(timebase()));
+    assert_eq!(first.metadata.presentation_ticks, 0);
+    assert_eq!(first.metadata.timecode, None);
     assert_eq!(first.output().resource_id, 0);
     assert!(matches!(
         session.next_frame(),
@@ -118,24 +149,171 @@ fn sync_gpu_frames_are_bounded_and_keep_exact_timing() {
 
     let last = session.next_frame().unwrap().unwrap();
     assert!(last.metadata.is_last);
+    assert_eq!(last.metadata.presentation_ticks, 20);
     assert_eq!(last.output().resource_id, 1);
     // EOF does not require another output slot, even while the final lease remains live.
     assert!(session.next_frame().unwrap().is_none());
     assert_eq!(session.frames_submitted(), 2);
 }
 
+#[derive(Debug)]
+struct TimecodeEngine {
+    frame_timecode: Option<u32>,
+    presentation_ticks: u64,
+}
+
+#[derive(Debug)]
+struct TimecodeSession {
+    frame_timecode: Option<u32>,
+    presentation_ticks: u64,
+    emitted: bool,
+}
+
+impl GpuSubmissionEngine for TimecodeEngine {
+    type Session = TimecodeSession;
+
+    fn open(
+        &self,
+        _codestream: GpuCodestream,
+        _request: &GpuOutputRequest,
+    ) -> Result<PreparedGpuSession<Self::Session>> {
+        Ok(PreparedGpuSession::new(
+            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            AnimationMetadata::animation(Extent2d::new(4, 3), timebase(), 1, true, Some(1)),
+            TimecodeSession {
+                frame_timecode: self.frame_timecode,
+                presentation_ticks: self.presentation_ticks,
+                emitted: false,
+            },
+        ))
+    }
+}
+
+impl GpuSubmissionSession for TimecodeSession {
+    type Frame = MockGpuFrame;
+    type Pending = ReadyPending;
+
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        Ok(Some(ReadyPending(Some(SubmittedGpuFrame::new(
+            FrameMetadata {
+                index: 0,
+                duration: FrameDuration::animation(25, timebase()),
+                presentation_ticks: self.presentation_ticks,
+                timecode: self.frame_timecode,
+                is_last: true,
+                is_keyframe: true,
+                name: "timecoded".into(),
+            },
+            MockGpuFrame { resource_id: 99 },
+        )))))
+    }
+}
+
+#[test]
+fn animation_frame_preserves_exact_bitstream_timecode() {
+    let decoder = GpuDecoder::new(TimecodeEngine {
+        frame_timecode: Some(0x1020_3040),
+        presentation_ticks: 0,
+    });
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    assert_eq!(frame.metadata.timecode, Some(0x1020_3040));
+}
+
+#[test]
+fn frame_timecode_presence_must_match_animation_header() {
+    let decoder = GpuDecoder::new(TimecodeEngine {
+        frame_timecode: None,
+        presentation_ticks: 0,
+    });
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
+    assert!(matches!(
+        session.next_frame(),
+        Err(Error::FrameTimecodePresenceMismatch {
+            index: 0,
+            stream_has_timecodes: true,
+            frame_has_timecode: false,
+        })
+    ));
+}
+
+#[test]
+fn frame_presentation_ticks_must_equal_accumulated_durations() {
+    let decoder = GpuDecoder::new(TimecodeEngine {
+        frame_timecode: Some(7),
+        presentation_ticks: 1,
+    });
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
+    assert!(matches!(
+        session.next_frame(),
+        Err(Error::FramePresentationTicksMismatch {
+            index: 0,
+            expected: 0,
+            actual: 1,
+        })
+    ));
+}
+
 #[derive(Debug, Default)]
 struct PendingControl {
     ready: AtomicBool,
     waker: Mutex<Option<Waker>>,
+    wait_lock: Mutex<()>,
+    condition: Condvar,
 }
 
 impl PendingControl {
     fn complete(&self) {
         self.ready.store(true, Ordering::Release);
+        self.condition.notify_all();
         if let Some(waker) = self.waker.lock().unwrap().take() {
             waker.wake();
         }
+    }
+
+    fn wait(&self) {
+        let mut guard = self.wait_lock.lock().unwrap();
+        while !self.ready.load(Ordering::Acquire) {
+            guard = self.condition.wait(guard).unwrap();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControlledPending {
+    control: Arc<PendingControl>,
+    frame: Option<SubmittedGpuFrame<MockGpuFrame>>,
+}
+
+impl ControlledPending {
+    fn take(&mut self) -> Result<SubmittedGpuFrame<MockGpuFrame>> {
+        self.frame
+            .take()
+            .ok_or(Error::EngineContract("mock pending frame completed twice"))
+    }
+}
+
+impl GpuPendingFrame for ControlledPending {
+    type Frame = MockGpuFrame;
+
+    fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
+        self.control.wait();
+        self.take()
+    }
+
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
+        if !self.control.ready.load(Ordering::Acquire) {
+            *self.control.waker.lock().unwrap() = Some(context.waker().clone());
+            return Poll::Pending;
+        }
+        Poll::Ready(self.take())
     }
 }
 
@@ -158,7 +336,7 @@ impl GpuSubmissionEngine for PendingEngine {
         _request: &GpuOutputRequest,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
-            DecodeProfile::prototype_16bit(FixedModularPredictor::new(1).unwrap()),
+            DecodeProfile::modular_lossless_16bit(FixedModularPredictor::new(1).unwrap()),
             AnimationMetadata::still(Extent2d::new(2, 2)),
             PendingSession {
                 control: Arc::clone(&self.control),
@@ -170,33 +348,28 @@ impl GpuSubmissionEngine for PendingEngine {
 
 impl GpuSubmissionSession for PendingSession {
     type Frame = MockGpuFrame;
+    type Pending = ControlledPending;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>> {
-        Err(Error::backend("mock GPU callback is not ready"))
-    }
-
-    fn poll_next_frame(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>> {
-        if !self.control.ready.load(Ordering::Acquire) {
-            *self.control.waker.lock().unwrap() = Some(context.waker().clone());
-            return Poll::Pending;
-        }
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
         if self.emitted {
-            return Poll::Ready(Ok(None));
+            return Ok(None);
         }
         self.emitted = true;
-        Poll::Ready(Ok(Some(SubmittedGpuFrame::new(
-            FrameMetadata {
-                index: 0,
-                duration: FrameDuration::still(),
-                is_last: true,
-                is_keyframe: true,
-                name: String::new(),
-            },
-            MockGpuFrame { resource_id: 7 },
-        ))))
+        Ok(Some(ControlledPending {
+            control: Arc::clone(&self.control),
+            frame: Some(SubmittedGpuFrame::new(
+                FrameMetadata {
+                    index: 0,
+                    duration: FrameDuration::still(),
+                    presentation_ticks: 0,
+                    timecode: None,
+                    is_last: true,
+                    is_keyframe: true,
+                    name: String::new(),
+                },
+                MockGpuFrame { resource_id: 7 },
+            )),
+        }))
     }
 }
 
@@ -219,7 +392,7 @@ fn future_is_runtime_neutral_and_woken_by_gpu_completion() {
     let decoder = GpuDecoder::new(PendingEngine {
         control: Arc::clone(&control),
     });
-    let mut session = decoder.open(RAW_STILL, output_request(1)).unwrap();
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
     let counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(Arc::clone(&counter));
     let mut context = Context::from_waker(&waker);
@@ -233,6 +406,255 @@ fn future_is_runtime_neutral_and_woken_by_gpu_completion() {
         other => panic!("expected completed GPU frame, got {other:?}"),
     };
     assert_eq!(frame.output().resource_id, 7);
+}
+
+#[test]
+fn cancelled_async_wait_can_be_resumed_synchronously() {
+    let control = Arc::new(PendingControl::default());
+    let decoder = GpuDecoder::new(PendingEngine {
+        control: Arc::clone(&control),
+    });
+    let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(session.next_frame_async());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    drop(future);
+
+    control.complete();
+    let frame = session
+        .next_frame()
+        .expect("sync wait resumes the submitted async operation")
+        .expect("the resumed operation returns its frame");
+    assert_eq!(frame.output().resource_id, 7);
+}
+
+#[derive(Clone, Debug)]
+struct PrefetchAnimationEngine {
+    controls: Arc<Vec<Arc<PendingControl>>>,
+    submitted: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct PrefetchAnimationSession {
+    controls: VecDeque<Arc<PendingControl>>,
+    submitted: Arc<AtomicUsize>,
+    next_index: usize,
+    frame_count: usize,
+}
+
+impl PrefetchAnimationEngine {
+    fn new(frame_count: usize) -> Self {
+        Self {
+            controls: Arc::new(
+                (0..frame_count)
+                    .map(|_| Arc::new(PendingControl::default()))
+                    .collect(),
+            ),
+            submitted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl GpuSubmissionEngine for PrefetchAnimationEngine {
+    type Session = PrefetchAnimationSession;
+
+    fn open(
+        &self,
+        _codestream: GpuCodestream,
+        _request: &GpuOutputRequest,
+    ) -> Result<PreparedGpuSession<Self::Session>> {
+        Ok(PreparedGpuSession::new(
+            DecodeProfile::modular_lossless_8bit(FixedModularPredictor::new(0).unwrap()),
+            AnimationMetadata::animation(
+                Extent2d::new(8, 6),
+                timebase(),
+                2,
+                true,
+                Some(self.controls.len()),
+            ),
+            PrefetchAnimationSession {
+                controls: self.controls.iter().cloned().collect(),
+                submitted: Arc::clone(&self.submitted),
+                next_index: 0,
+                frame_count: self.controls.len(),
+            },
+        ))
+    }
+}
+
+impl GpuSubmissionSession for PrefetchAnimationSession {
+    type Frame = MockGpuFrame;
+    type Pending = ControlledPending;
+
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
+        let Some(control) = self.controls.pop_front() else {
+            return Ok(None);
+        };
+        let index = self.next_index;
+        self.next_index += 1;
+        self.submitted.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(ControlledPending {
+            control,
+            frame: Some(SubmittedGpuFrame::new(
+                FrameMetadata {
+                    index,
+                    duration: FrameDuration::animation(10, timebase()),
+                    presentation_ticks: u64::try_from(index).unwrap() * 10,
+                    timecode: Some(0x1000 + u32::try_from(index).unwrap()),
+                    is_last: index + 1 == self.frame_count,
+                    is_keyframe: index == 0,
+                    name: format!("prefetched-{index}"),
+                },
+                MockGpuFrame {
+                    resource_id: u64::try_from(index).unwrap(),
+                },
+            )),
+        }))
+    }
+}
+
+#[test]
+fn animation_prefetch_submits_before_completion_and_preserves_order_metadata_and_permits() {
+    let engine = PrefetchAnimationEngine::new(4);
+    let controls = Arc::clone(&engine.controls);
+    let submitted = Arc::clone(&engine.submitted);
+    let decoder = GpuDecoder::new(engine);
+    let mut session = decoder.open(raw_still(), output_request(4)).unwrap();
+
+    let progress = session.prefetch(NonZeroUsize::new(3).unwrap()).unwrap();
+    assert_eq!(progress.submitted, 3);
+    assert_eq!(progress.queued, 3);
+    assert!(!progress.end_reached);
+    assert_eq!(progress.backpressure, None);
+    assert_eq!(submitted.load(Ordering::SeqCst), 3);
+    assert_eq!(session.active_frame_slots(), 3);
+
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut context = Context::from_waker(&waker);
+    let mut first_future = Box::pin(session.next_frame_async());
+    assert!(matches!(
+        first_future.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    controls[2].complete();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        first_future.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    controls[0].complete();
+    let first = match first_future.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(Some(frame))) => frame,
+        other => panic!("expected ordered first frame, got {other:?}"),
+    };
+    drop(first_future);
+    assert_eq!(first.metadata.index, 0);
+    assert_eq!(first.metadata.presentation_ticks, 0);
+    assert_eq!(first.metadata.timecode, Some(0x1000));
+    assert_eq!(session.queued_frames(), 2);
+    assert_eq!(
+        session.active_frame_slots(),
+        3,
+        "two pending plus one returned lease"
+    );
+
+    let progress = session.prefetch(NonZeroUsize::new(3).unwrap()).unwrap();
+    assert_eq!(progress.submitted, 4);
+    assert_eq!(progress.queued, 3);
+    assert_eq!(session.active_frame_slots(), 4);
+    let blocked = session.prefetch(NonZeroUsize::new(4).unwrap()).unwrap();
+    assert_eq!(
+        blocked.backpressure,
+        Some(PrefetchBackpressure::FrameSlots { limit: 4 })
+    );
+    assert_eq!(blocked.queued, 3);
+
+    drop(first);
+    let end = session.prefetch(NonZeroUsize::new(4).unwrap()).unwrap();
+    assert!(end.end_reached);
+    assert_eq!(end.queued, 3);
+    assert_eq!(end.backpressure, None);
+
+    controls[1].complete();
+    controls[3].complete();
+    for expected in 1..4 {
+        let frame = session.next_frame().unwrap().unwrap();
+        assert_eq!(frame.metadata.index, expected);
+        assert_eq!(
+            frame.metadata.presentation_ticks,
+            u64::try_from(expected).unwrap() * 10
+        );
+        assert_eq!(
+            frame.metadata.timecode,
+            Some(0x1000 + u32::try_from(expected).unwrap())
+        );
+        drop(frame);
+    }
+    assert!(session.next_frame().unwrap().is_none());
+    assert_eq!(session.queued_frames(), 0);
+    assert_eq!(session.active_frame_slots(), 0);
+}
+
+#[test]
+fn prefetch_future_is_runtime_neutral_and_does_not_wait_for_frame_completion() {
+    let engine = PrefetchAnimationEngine::new(3);
+    let submitted = Arc::clone(&engine.submitted);
+    let decoder = GpuDecoder::new(engine);
+    let mut session = decoder.open(raw_still(), output_request(3)).unwrap();
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(session.prefetch_async(NonZeroUsize::new(3).unwrap()));
+    let progress = match future.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(progress)) => progress,
+        other => panic!("prefetch should only submit queue work, got {other:?}"),
+    };
+    assert_eq!(progress.submitted, 3);
+    assert_eq!(progress.queued, 3);
+    assert_eq!(submitted.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn abandoned_prefetch_future_keeps_partial_queue_and_sync_prefetch_resumes_it() {
+    let engine = PrefetchAnimationEngine::new(3);
+    let controls = Arc::clone(&engine.controls);
+    let decoder = GpuDecoder::new(engine);
+    let mut session = decoder.open(raw_still(), output_request(2)).unwrap();
+
+    session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    controls[0].complete();
+    let first = session.next_frame().unwrap().unwrap();
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(session.prefetch_async(NonZeroUsize::new(2).unwrap()));
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    drop(future);
+    assert_eq!(session.frames_submitted(), 2);
+    assert_eq!(session.queued_frames(), 1);
+
+    drop(first);
+    let resumed = session.prefetch(NonZeroUsize::new(2).unwrap()).unwrap();
+    assert_eq!(resumed.submitted, 3);
+    assert_eq!(resumed.queued, 2);
+    assert_eq!(resumed.backpressure, None);
+    controls[1].complete();
+    controls[2].complete();
+    assert_eq!(session.next_frame().unwrap().unwrap().metadata.index, 1);
+    assert_eq!(session.next_frame().unwrap().unwrap().metadata.index, 2);
+}
+
+#[test]
+fn prefetch_depth_cannot_exceed_frame_slot_limit() {
+    let decoder = GpuDecoder::new(ReadyEngine);
+    let mut session = decoder.open(raw_still(), output_request(2)).unwrap();
+    assert!(matches!(
+        session.prefetch(NonZeroUsize::new(3).unwrap()),
+        Err(Error::PrefetchDepthExceedsLimit {
+            requested: 3,
+            limit: 2,
+        })
+    ));
 }
 
 #[derive(Debug)]
@@ -257,7 +679,7 @@ impl GpuSubmissionEngine for TypedRejectEngine {
         if self.unsupported {
             return Err(UnsupportedProfile::new(
                 UnsupportedCodestreamFeature::VarDct,
-                "prototype accepts only single-group fixed-predictor lossless Modular",
+                "stock backend accepts only single-group fixed-predictor lossless Modular",
             )
             .into());
         }
@@ -271,15 +693,9 @@ impl GpuSubmissionEngine for TypedRejectEngine {
 
 impl GpuSubmissionSession for RejectSession {
     type Frame = MockGpuFrame;
+    type Pending = ReadyPending;
 
-    fn next_frame(&mut self) -> Result<Option<SubmittedGpuFrame<Self::Frame>>> {
-        unreachable!()
-    }
-
-    fn poll_next_frame(
-        &mut self,
-        _context: &mut Context<'_>,
-    ) -> Poll<Result<Option<SubmittedGpuFrame<Self::Frame>>>> {
+    fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
         unreachable!()
     }
 }
@@ -290,7 +706,7 @@ fn real_raw_fixture_reaches_typed_unsupported_profile_without_fallback() {
         expected_container: false,
         unsupported: true,
     });
-    let result = decoder.open(RAW_STILL, output_request(1));
+    let result = decoder.open(raw_still(), output_request(1));
     assert!(matches!(result, Err(Error::UnsupportedProfile(_))));
 }
 
@@ -300,7 +716,7 @@ fn real_fragmented_container_is_joined_before_typed_frontend_reject() {
         expected_container: true,
         unsupported: false,
     });
-    let result = decoder.open(FRAGMENTED_ANIMATION, output_request(1));
+    let result = decoder.open(fragmented_animation(), output_request(1));
     assert!(matches!(
         result,
         Err(Error::FrontendIncomplete(FrontendIncomplete {

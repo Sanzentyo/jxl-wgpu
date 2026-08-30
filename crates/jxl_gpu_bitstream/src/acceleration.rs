@@ -387,7 +387,7 @@ fn write_expected_group_prefix(
     index: &Gray8AccelerationIndex,
 ) -> Result<BitWriter, AccelerationIndexError> {
     let mut output = BitWriter::new();
-    // Fixed fast-lossless Modular metadata, adapted from zune-jpegxl 0.5.2. See the repository's
+    // Fixed fast-lossless Modular metadata, adapted from zune-jpegxl 0.5.2. See this crate's
     // THIRD_PARTY.md and LICENSES/zune-jpegxl-MIT.txt.
     write(&mut output, 1, 1)?;
     write(&mut output, 1, 1)?;
@@ -897,8 +897,8 @@ mod tests {
 
     #[test]
     fn checked_in_group_prefix_matches_the_standard_codestream_bits() {
-        let container = include_bytes!("../../../fixtures/gpu_gray8_lossless.jxl");
-        let parsed = crate::parse(container, crate::ParseLimits::default()).unwrap();
+        let container = crate::test_fixtures::gpu_gray8_lossless();
+        let parsed = crate::parse(&container, crate::ParseLimits::default()).unwrap();
         let payload = parsed
             .boxes_of_type(ACCELERATION_INDEX_BOX_TYPE)
             .next()

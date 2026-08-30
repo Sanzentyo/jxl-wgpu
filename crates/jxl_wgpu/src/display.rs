@@ -5,12 +5,12 @@
 
 //! Non-blocking conversion of decoder-owned GPU buffers into display textures.
 //!
-//! [`DisplayPipeline::encode_rgb`] and [`DisplayPipeline::encode_image`] only append work to a
-//! caller-owned command encoder. [`DisplayPipeline::submit_rgb`] and
-//! [`DisplayPipeline::submit_image`] submit that work to the exact queue from which the pipeline was
-//! constructed. Neither path waits for the host. A decoder output submitted earlier to the same
-//! queue is therefore a valid input immediately, and the returned texture can be sampled, rendered,
-//! or copied by later commands on that queue.
+//! [`DisplayPipeline::encode_rgb`], [`DisplayPipeline::encode_image`], and
+//! [`DisplayPipeline::encode_unvalidated_image`] only append work to a caller-owned command
+//! encoder. Their `submit_*` counterparts submit that work to the exact queue from which the
+//! pipeline was constructed. None of these display paths waits for the host. Once a caller owns a
+//! source buffer lease, queue ordering makes an earlier producer submission a valid dependency, and
+//! the returned texture can be sampled, rendered, or copied by later commands on that queue.
 //!
 //! This module consumes portable pitch-linear storage buffers. Native multi-plane textures and
 //! platform-specific external-memory layouts are deliberately outside this API contract.
@@ -24,14 +24,14 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
     ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
     NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
-    WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
+    TransferFunction, WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputLayout, SampleType};
 use wgpu::util::DeviceExt;
 
 use crate::context::WgpuBackend;
 use crate::session::GpuOutputBuffer;
-use crate::video::GpuImageOutput;
+use crate::video::{GpuImageOutput, UnvalidatedGpuImageOutput};
 use crate::{Error, Result};
 
 const WORKGROUP_SIZE: u32 = 16;
@@ -57,6 +57,13 @@ impl Default for DisplayTextureDescriptor {
     }
 }
 
+/// Color encoding of a texture returned by [`DisplayPipeline`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisplayColorEncoding {
+    /// Full-range linear-light RGB using BT.709/sRGB primaries.
+    LinearBt709,
+}
+
 /// A GPU-resident texture ready for sampling, rendering, or copying.
 ///
 /// The handles are `Arc`-owned, so this value can outlive both the frame session and the
@@ -67,6 +74,8 @@ pub struct DisplayTexture {
     pub extent: Extent2d,
     pub format: wgpu::TextureFormat,
     pub usage: wgpu::TextureUsages,
+    /// The explicit interpretation of the normalized RGB texels.
+    pub color_encoding: DisplayColorEncoding,
     texture: Arc<wgpu::Texture>,
     view: Arc<wgpu::TextureView>,
 }
@@ -145,8 +154,9 @@ impl DisplayPipeline {
 
     /// Creates a display pipeline for an application-owned device and its queue.
     ///
-    /// Inputs passed to this pipeline must originate from `device`. To depend on a decoder
-    /// submission without a host wait, `queue` must be the same queue used for that submission.
+    /// Inputs passed to this pipeline must originate from `device`. To depend on an already
+    /// exposed producer submission without an additional host wait, `queue` must be the same
+    /// queue used for that submission.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         Self {
             inner: Arc::new(DisplayPipelineInner {
@@ -180,7 +190,7 @@ impl DisplayPipeline {
     /// Encodes RGB or RGBA buffer conversion into a sampleable/renderable RGBA texture.
     ///
     /// F32, F16, U16, and U8 samples are accepted in planar or interleaved form. Floating-point
-    /// values are interpreted as normalized nonlinear display RGB and clamped by `Rgba8Unorm`.
+    /// values are interpreted as normalized linear-light BT.709 RGB and clamped by `Rgba8Unorm`.
     /// Integer samples are normalized over their complete unsigned range. Three-channel input gets
     /// opaque alpha. Signed I32 output has no bit-depth/range contract and returns
     /// [`Error::Unsupported`].
@@ -193,7 +203,7 @@ impl DisplayPipeline {
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), source.extent)?;
         require_buffer_usage(
-            &source.buffer,
+            source.buffer.as_wgpu_buffer(),
             wgpu::BufferUsages::STORAGE,
             "RGB display source",
         )?;
@@ -224,7 +234,7 @@ impl DisplayPipeline {
         self.record_dispatch(
             encoder,
             &pipeline,
-            &source.buffer,
+            source.buffer.as_wgpu_buffer(),
             validated.binding_size,
             texture.view(),
             &params,
@@ -245,45 +255,85 @@ impl DisplayPipeline {
         })
     }
 
-    /// Encodes a pitch-linear I444, I422, I420, or NV12 buffer into an RGBA display texture.
+    /// Encodes a pitch-linear color buffer into a linear-light BT.709 RGBA display texture.
     ///
-    /// Matrix, range, chroma siting, and pixel format are taken from `source.layout.format`. The
-    /// compiled pipeline cache is keyed by that complete format contract. Rows may be tightly
-    /// packed; unlike a buffer-to-texture copy, this compute path has no 256-byte row-pitch rule.
+    /// Matrix, transfer, range, chroma siting, and pixel format are taken from
+    /// `source.layout.format`. The source must use BT.709/sRGB primaries and a supported transfer;
+    /// unsupported HDR/wide-gamut contracts reject instead of being silently mis-presented. Rows
+    /// may be tightly packed; unlike a buffer-to-texture copy, this compute path has no 256-byte
+    /// row-pitch rule.
     pub fn encode_image(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &GpuImageOutput,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
-        validate_display_descriptor(descriptor)?;
-        validate_extent(self.device(), source.layout.extent)?;
-        require_buffer_usage(
+        self.encode_image_source(
+            encoder,
+            &source.layout,
             &source.buffer,
+            descriptor,
+            "jxl-wgpu image display",
+        )
+    }
+
+    /// Encodes an explicitly unvalidated image output without waiting for codec validation.
+    ///
+    /// The pipeline must use the same device and queue as the producer. Queue ordering then makes
+    /// the decode submission a dependency of this display dispatch. A later validation failure
+    /// cannot retract the dispatch or its texture; applications must discard every derived result
+    /// when validation fails.
+    pub fn encode_unvalidated_image(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &UnvalidatedGpuImageOutput,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplayTexture> {
+        self.encode_image_source(
+            encoder,
+            &source.layout,
+            &source.buffer,
+            descriptor,
+            "jxl-wgpu unvalidated image display",
+        )
+    }
+
+    fn encode_image_source(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layout: &ImageLayout,
+        buffer: &crate::GpuBufferLease,
+        descriptor: DisplayTextureDescriptor,
+        label: &str,
+    ) -> Result<DisplayTexture> {
+        validate_display_descriptor(descriptor)?;
+        validate_extent(self.device(), layout.extent)?;
+        require_buffer_usage(
+            buffer.as_wgpu_buffer(),
             wgpu::BufferUsages::STORAGE,
             "image display source",
         )?;
-        let validated = validate_image(&source.layout, source.buffer.size())?;
+        let validated = validate_image(layout, buffer.size())?;
         validate_storage_binding(self.device(), validated.binding_size)?;
 
-        let texture = self.create_texture(source.layout.extent, descriptor, "jxl-wgpu YUV display");
+        let texture = self.create_texture(layout.extent, descriptor, label);
         let pipeline = self.compute_pipeline(
             DisplayPipelineKey::Image {
                 format: validated.format,
                 destination: descriptor.format,
             },
-            "jxl-wgpu YUV display",
+            label,
             wgpu::include_wgsl!("../shaders/display_image.wgsl"),
         );
         let params = validated.params;
         self.record_dispatch(
             encoder,
             &pipeline,
-            &source.buffer,
+            buffer.as_wgpu_buffer(),
             validated.binding_size,
             texture.view(),
             &params,
-            source.layout.extent,
+            layout.extent,
             "jxl-wgpu YUV display bindings",
         );
         Ok(texture)
@@ -300,7 +350,18 @@ impl DisplayPipeline {
         })
     }
 
-    /// Encodes a direct buffer-to-texture copy for tightly packed interleaved RGBA8 input.
+    /// Submits [`Self::encode_unvalidated_image`] without waiting for codec validation.
+    pub fn submit_unvalidated_image(
+        &self,
+        source: &UnvalidatedGpuImageOutput,
+        descriptor: DisplayTextureDescriptor,
+    ) -> Result<DisplaySubmission> {
+        self.submit_encoded("jxl-wgpu unvalidated image display submission", |encoder| {
+            self.encode_unvalidated_image(encoder, source, descriptor)
+        })
+    }
+
+    /// Encodes a direct buffer-to-texture copy for tightly packed linear BT.709 RGBA8 input.
     ///
     /// This avoids a compute dispatch. Multi-row copies require `width * 4` to be a multiple of
     /// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`]. Use [`Self::encode_rgb`] when a tightly packed row is
@@ -314,7 +375,7 @@ impl DisplayPipeline {
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), source.extent)?;
         require_buffer_usage(
-            &source.buffer,
+            source.buffer.as_wgpu_buffer(),
             wgpu::BufferUsages::COPY_SRC,
             "RGBA8 copy source",
         )?;
@@ -334,7 +395,7 @@ impl DisplayPipeline {
         let texture = self.create_texture(source.extent, descriptor, "jxl-wgpu RGBA8 copy");
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
-                buffer: &source.buffer,
+                buffer: source.buffer.as_wgpu_buffer(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: (source.extent.height > 1).then_some(bytes_per_row),
@@ -406,6 +467,7 @@ impl DisplayPipeline {
             extent,
             format: descriptor.format,
             usage,
+            color_encoding: DisplayColorEncoding::LinearBt709,
             texture,
             view,
         }
@@ -598,6 +660,7 @@ struct DisplayImageFormat {
     subsample_y: u8,
     bits: u8,
     storage_bits: u8,
+    transfer: u8,
 }
 
 fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedImage> {
@@ -620,6 +683,30 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         ));
     }
     let class = classify_display_format(&layout.format)?;
+    let color = match layout.format.color_spec {
+        ColorSpecification::Defined(color) => color,
+        ColorSpecification::Default | ColorSpecification::Undefined => {
+            return Err(Error::Unsupported(
+                "display conversion requires an explicit color specification".into(),
+            ));
+        }
+    };
+    if color.space != jxl_gpu_formats::ColorSpace::Bt709 {
+        return Err(Error::Unsupported(format!(
+            "display conversion to linear BT.709 does not implement {:?} primaries",
+            color.space
+        )));
+    }
+    let transfer = match color.transfer {
+        TransferFunction::Linear => 0,
+        TransferFunction::Srgb | TransferFunction::Sycc => 1,
+        TransferFunction::Bt709 => 2,
+        unsupported => {
+            return Err(Error::Unsupported(format!(
+                "display transfer {unsupported:?} is unsupported"
+            )));
+        }
+    };
     let (subsample_x, subsample_y) = layout
         .format
         .chroma_subsampling
@@ -645,14 +732,6 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             (kind, channels, order, 8, 8, 1, 0, 1, 1)
         }
         color_class => {
-            let color = match layout.format.color_spec {
-                ColorSpecification::Defined(color) => color,
-                ColorSpecification::Default | ColorSpecification::Undefined => {
-                    return Err(Error::Unsupported(
-                        "display YCbCr conversion requires an explicit matrix and range".into(),
-                    ));
-                }
-            };
             let matrix = match color.encoding {
                 YcbcrEncoding::Bt601 => 0,
                 YcbcrEncoding::Bt709 => 1,
@@ -740,6 +819,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         subsample_y,
         bits,
         storage_bits,
+        transfer,
     };
     for (index, plane) in layout.planes.iter().enumerate() {
         if plane.plane_index != index {
@@ -793,7 +873,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             plane3_stride: strides[3],
             chroma_width: chroma_extent.width,
             chroma_height: chroma_extent.height,
-            _padding: 0,
+            transfer: u32::from(transfer),
         },
         binding_size,
     })
@@ -997,7 +1077,7 @@ struct DisplayImageParams {
     plane3_stride: u32,
     chroma_width: u32,
     chroma_height: u32,
-    _padding: u32,
+    transfer: u32,
 }
 
 const _: () = {
@@ -1010,6 +1090,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+
+    use jxl_gpu_formats::ColorSpec;
 
     use super::*;
 
@@ -1124,7 +1206,7 @@ mod tests {
             plane3_stride: 21,
             chroma_width: 22,
             chroma_height: 23,
-            _padding: 24,
+            transfer: 24,
         };
         let expected = (1..=24).collect::<Vec<_>>();
         assert_eq!(abi_words(&image), expected);
@@ -1155,7 +1237,7 @@ mod tests {
                 "plane3_stride",
                 "chroma_width",
                 "chroma_height",
-                "_padding0",
+                "transfer",
             ],
         );
     }
@@ -1175,6 +1257,7 @@ mod tests {
             subsample_y: 2,
             bits: 8,
             storage_bits: 8,
+            transfer: 2,
         };
         let base = DisplayPipelineKey::Image {
             format,
@@ -1195,9 +1278,17 @@ mod tests {
             format: DisplayImageFormat { kind: 4, ..format },
             destination: wgpu::TextureFormat::Rgba8Unorm,
         };
+        let transfer = DisplayPipelineKey::Image {
+            format: DisplayImageFormat {
+                transfer: 1,
+                ..format
+            },
+            destination: wgpu::TextureFormat::Rgba8Unorm,
+        };
         assert_ne!(base, matrix);
         assert_ne!(base, range);
         assert_ne!(base, planar);
+        assert_ne!(base, transfer);
     }
 
     #[test]
@@ -1242,6 +1333,40 @@ mod tests {
         let row = 63 * 4;
         assert_ne!(row % COPY_BYTES_PER_ROW_ALIGNMENT, 0);
         assert_eq!((64 * 4) % COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn display_rejects_unimplemented_primaries_and_hdr_transfer() {
+        let extent = Extent2d::new(2, 2);
+        let unsupported = [
+            ColorSpec {
+                space: jxl_gpu_formats::ColorSpace::Bt2020,
+                encoding: YcbcrEncoding::Bt709,
+                transfer: TransferFunction::Bt709,
+                range: ColorRange::Full,
+                chroma_location: jxl_gpu_formats::ChromaLocation2d::CENTER,
+            },
+            ColorSpec {
+                space: jxl_gpu_formats::ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Bt709,
+                transfer: TransferFunction::Pq,
+                range: ColorRange::Full,
+                chroma_location: jxl_gpu_formats::ChromaLocation2d::CENTER,
+            },
+        ];
+        for color in unsupported {
+            let format = PixelFormat::rgb8(
+                RgbChannelOrder::Rgba,
+                false,
+                ColorSpecification::Defined(color),
+            );
+            let layout = ImageLayout::packed(extent, format).unwrap();
+            let buffer_size = align_to_word(layout.logical_size).unwrap();
+            assert!(matches!(
+                validate_image(&layout, buffer_size),
+                Err(Error::Unsupported(_))
+            ));
+        }
     }
 
     #[test]

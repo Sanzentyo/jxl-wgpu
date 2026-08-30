@@ -350,14 +350,12 @@ impl CodestreamAssembler {
     }
 
     pub fn insert(&mut self, artifacts: GpuFrameArtifacts) -> Result<(), PacketError> {
-        let frame = assemble_frame(artifacts.packets)?;
-        if self
-            .frames
-            .insert(artifacts.frame_index, (artifacts.is_last, frame))
-            .is_some()
-        {
+        if self.frames.contains_key(&artifacts.frame_index) {
             return Err(PacketError::DuplicateFrame(artifacts.frame_index.get()));
         }
+        let frame = assemble_frame(artifacts.packets)?;
+        self.frames
+            .insert(artifacts.frame_index, (artifacts.is_last, frame));
         Ok(())
     }
 
@@ -416,7 +414,7 @@ mod tests {
     #[test]
     fn assembler_orders_concurrently_completed_frames() {
         let mut assembler =
-            CodestreamAssembler::new(BitFragment::byte_aligned(vec![0xff, 0x0a])).unwrap();
+            CodestreamAssembler::new(BitFragment::byte_aligned(vec![0xff, 0x0a]).unwrap()).unwrap();
         assembler.insert(artifacts(1, true, 2)).unwrap();
         assembler.insert(artifacts(0, false, 1)).unwrap();
         let raw = assembler.finish_raw().unwrap();
@@ -427,12 +425,25 @@ mod tests {
     #[test]
     fn assembler_rejects_early_final_frame() {
         let mut assembler =
-            CodestreamAssembler::new(BitFragment::byte_aligned(vec![0xff, 0x0a])).unwrap();
+            CodestreamAssembler::new(BitFragment::byte_aligned(vec![0xff, 0x0a]).unwrap()).unwrap();
         assembler.insert(artifacts(0, true, 1)).unwrap();
         assembler.insert(artifacts(1, false, 2)).unwrap();
         assert_eq!(
             assembler.finish_raw().unwrap_err(),
             PacketError::InvalidFinalFrame
         );
+    }
+
+    #[test]
+    fn duplicate_frame_error_preserves_the_original_frame() {
+        let mut assembler =
+            CodestreamAssembler::new(BitFragment::byte_aligned(vec![0xff, 0x0a]).unwrap()).unwrap();
+        assembler.insert(artifacts(0, true, 17)).unwrap();
+        assert_eq!(
+            assembler.insert(artifacts(0, true, 99)).unwrap_err(),
+            PacketError::DuplicateFrame(0)
+        );
+        let raw = assembler.finish_raw().unwrap();
+        assert_eq!(*raw.last().unwrap(), 17);
     }
 }

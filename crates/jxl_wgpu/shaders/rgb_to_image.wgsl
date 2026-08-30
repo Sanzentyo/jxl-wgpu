@@ -28,9 +28,9 @@ struct Params {
     logical_size: u32,
     dispatch_width: u32,
     orientation: u32,
-    _padding0: u32,
-    _padding1: u32,
-    _padding2: u32,
+    source_transfer: u32,
+    target_transfer: u32,
+    _padding: u32,
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -54,7 +54,7 @@ fn source_coordinate(destination: vec2<u32>) -> vec2<u32> {
     }
 }
 
-fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+fn source_rgb_at(x: u32, y: u32) -> vec3<f32> {
     let coordinate = source_coordinate(vec2<u32>(min(x, params.width - 1u), min(y, params.height - 1u)));
     return vec3<f32>(
         bitcast<f32>(source_r[coordinate.y * params.r_stride + coordinate.x]),
@@ -63,11 +63,49 @@ fn rgb_at(x: u32, y: u32) -> vec3<f32> {
     );
 }
 
+fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
+    if transfer == 1u {
+        if value <= 0.04045 { return value / 12.92; }
+        return pow((value + 0.055) / 1.055, 2.4);
+    }
+    if transfer == 2u {
+        if value < 0.081 { return value / 4.5; }
+        return pow((value + 0.099) / 1.099, 1.0 / 0.45);
+    }
+    return value;
+}
+
+fn transfer_from_linear(value: f32, transfer: u32) -> f32 {
+    if transfer == 1u {
+        if value <= 0.0031308 { return 12.92 * value; }
+        return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+    }
+    if transfer == 2u {
+        if value < 0.018 { return 4.5 * value; }
+        return 1.099 * pow(value, 0.45) - 0.099;
+    }
+    return value;
+}
+
+fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+    let source = source_rgb_at(x, y);
+    let linear = vec3<f32>(
+        transfer_to_linear(source.r, params.source_transfer),
+        transfer_to_linear(source.g, params.source_transfer),
+        transfer_to_linear(source.b, params.source_transfer),
+    );
+    return vec3<f32>(
+        transfer_from_linear(linear.r, params.target_transfer),
+        transfer_from_linear(linear.g, params.target_transfer),
+        transfer_from_linear(linear.b, params.target_transfer),
+    );
+}
+
 fn coefficients() -> vec2<f32> {
     switch params.matrix {
         case 0u: { return vec2<f32>(0.299, 0.114); }
         case 1u: { return vec2<f32>(0.2126, 0.0722); }
-        default: { return vec2<f32>(0.2627, 0.0593); }
+        default: { return vec2<f32>(0.2126, 0.0722); }
     }
 }
 

@@ -1,13 +1,13 @@
 [package]
 name = "jxl_wgpu"
-description = "Portable wgpu acceleration backend for the jxl JPEG XL decoder"
+description = "Portable wgpu execution, image output, display, and readback for GPU JPEG XL codecs"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
 rust-version.workspace = true
 
 [dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck.workspace = true
 jxl_gpu_protocol.workspace = true
 jxl_gpu_formats.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
@@ -17,7 +17,6 @@ tracing = "0.1.41"
 wgpu = "30.0.1"
 
 [dev-dependencies]
-jxl.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_transforms.workspace = true
 pollster = "1.0.1"

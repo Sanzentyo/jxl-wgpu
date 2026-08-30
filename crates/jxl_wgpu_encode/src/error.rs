@@ -81,6 +81,10 @@ pub enum EncodeError {
     InvalidSource(&'static str),
     #[error("GPU encoder job failed: {0}")]
     Backend(String),
+    #[error("GPU encoder memory backpressure: {0}")]
+    MemoryBackpressure(#[from] jxl_wgpu::MemoryBudgetError),
+    #[error("GPU encoder submission-poll backpressure: {0}")]
+    PollBackpressure(#[from] jxl_wgpu::SubmissionPollerError),
     #[error("the encode session is already closed")]
     SessionClosed,
     #[error("the encode session must be closed with a final frame")]

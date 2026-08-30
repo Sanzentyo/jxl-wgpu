@@ -4,17 +4,25 @@ struct Params {
     width: u32,
     height: u32,
     sample_count: u32,
-    output_mode: u32,
+    output_kind: u32,
     transfer: u32,
     limited_range: u32,
+    channels: u32,
+    order: u32,
+    bits: u32,
+    storage_bits: u32,
     plane0_offset: u32,
     plane0_stride: u32,
     plane1_offset: u32,
     plane1_stride: u32,
     plane2_offset: u32,
     plane2_stride: u32,
+    plane3_offset: u32,
+    plane3_stride: u32,
     chroma_width: u32,
     chroma_height: u32,
+    logical_size: u32,
+    numeric_mapping: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -23,6 +31,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
 @group(0) @binding(4) var<storage, read_write> status: array<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
+/*__JXL_F64_BINDING__*/
 
 var<private> bit_cursor: u32;
 var<private> decode_error: u32;
@@ -34,6 +43,8 @@ const ERROR_RAW_TOKEN: u32 = 4u;
 const ERROR_LZ77_STATE: u32 = 5u;
 const ERROR_LZ77_LENGTH: u32 = 6u;
 const ERROR_TRAILING_BITS: u32 = 7u;
+const ERROR_OUTPUT_BOUNDS: u32 = 8u;
+const ERROR_OUTPUT_MAPPING: u32 = 9u;
 
 fn bit_mask(count: u32) -> u32 {
     if count == 0u {
@@ -122,10 +133,155 @@ fn unpack_signed(value: u32) -> i32 {
 }
 
 fn write_byte(offset: u32, value: u32) {
+    if offset >= params.logical_size {
+        decode_error = ERROR_OUTPUT_BOUNDS;
+        return;
+    }
     let word_index = offset >> 2u;
     let shift = (offset & 3u) << 3u;
     let mask = 0xffu << shift;
     output_words[word_index] = (output_words[word_index] & ~mask) | ((value & 0xffu) << shift);
+}
+
+fn write_word(offset: u32, value: u32) {
+    if (offset & 3u) != 0u || offset > params.logical_size {
+        decode_error = ERROR_OUTPUT_BOUNDS;
+        return;
+    }
+    if params.logical_size - offset < 4u {
+        decode_error = ERROR_OUTPUT_BOUNDS;
+        return;
+    }
+    output_words[offset >> 2u] = value;
+}
+
+fn write_stored_code(offset: u32, code: u32) {
+    let stored = code << (params.storage_bits - params.bits);
+    if params.storage_bits == 8u {
+        write_byte(offset, stored);
+    } else if params.storage_bits == 16u {
+        write_byte(offset, stored);
+        write_byte(offset + 1u, stored >> 8u);
+    } else {
+        decode_error = ERROR_OUTPUT_BOUNDS;
+    }
+}
+
+fn normalized_unsigned(sample: u32, bits: u32) -> u32 {
+    if bits == 8u {
+        return sample;
+    }
+    if bits == 16u {
+        return sample * 257u;
+    }
+    if bits == 32u {
+        return sample * 16843009u;
+    }
+    decode_error = ERROR_OUTPUT_MAPPING;
+    return 0u;
+}
+
+fn normalized_signed_nonnegative(sample: u32, bits: u32) -> u32 {
+    // MAX = quotient * 255 + 127 for each supported signed destination. Splitting the
+    // multiplication this way avoids u32 overflow for the S32 full-range endpoint.
+    let remainder = (sample * 127u + 127u) / 255u;
+    if bits == 8u {
+        return remainder;
+    }
+    if bits == 16u {
+        return sample * 128u + remainder;
+    }
+    if bits == 32u {
+        return sample * 8421504u + remainder;
+    }
+    decode_error = ERROR_OUTPUT_MAPPING;
+    return 0u;
+}
+
+fn normalized_gray8_f32_bits(sample: u32) -> u32 {
+    if sample == 0u {
+        return 0u;
+    }
+    if sample == 255u {
+        return 0x3f800000u;
+    }
+    var leading_bit = 0u;
+    var remaining = sample;
+    while remaining > 1u {
+        remaining = remaining >> 1u;
+        leading_bit += 1u;
+    }
+    // For sample in [1, 254], floor(log2(sample / 255)) is leading_bit - 8. Form the
+    // 24-bit significand with integer division, rounded to nearest; the odd denominator means
+    // there can be no exact halfway case. This avoids backend-dependent relaxed f32 division.
+    let numerator = sample << (31u - leading_bit);
+    let significand = (numerator + 127u) / 255u;
+    let biased_exponent = leading_bit + 119u;
+    return (biased_exponent << 23u) | (significand & 0x007fffffu);
+}
+
+fn widen_normalized_f32_to_f64_words(bits: u32) -> vec2<u32> {
+    // Normalized Gray8 values are either +0 or finite, positive, normal f32 values. Widening a
+    // normal f32 into binary64 is exact: rebias the exponent and move the 23 fraction bits to the
+    // most-significant end of binary64's 52-bit fraction. The returned order is little-endian.
+    if bits == 0u {
+        return vec2<u32>(0u, 0u);
+    }
+    let exponent = (bits >> 23u) & 0xffu;
+    let fraction = bits & 0x007fffffu;
+    let low = (fraction & 0x7u) << 29u;
+    let high = ((exponent + 896u) << 20u) | (fraction >> 3u);
+    return vec2<u32>(low, high);
+}
+
+fn write_numeric_sample(x: u32, y: u32, sample: u32) {
+    if params.numeric_mapping == 0u {
+        decode_error = ERROR_OUTPUT_MAPPING;
+        return;
+    }
+    let bytes_per_component = params.bits / 8u;
+    let pixel_offset = params.plane0_offset
+        + y * params.plane0_stride
+        + x * params.channels * bytes_per_component;
+    for (var component = 0u; component < params.channels; component += 1u) {
+        let offset = pixel_offset + component * bytes_per_component;
+        if params.output_kind == 0u {
+            let value = normalized_unsigned(sample, params.bits);
+            if params.bits == 8u {
+                write_byte(offset, value);
+            } else if params.bits == 16u {
+                write_byte(offset, value);
+                write_byte(offset + 1u, value >> 8u);
+            } else if params.bits == 32u {
+                write_word(offset, value);
+            } else {
+                decode_error = ERROR_OUTPUT_MAPPING;
+            }
+        } else if params.output_kind == 7u {
+            let value = normalized_signed_nonnegative(sample, params.bits);
+            if params.bits == 8u {
+                write_byte(offset, value);
+            } else if params.bits == 16u {
+                write_byte(offset, value);
+                write_byte(offset + 1u, value >> 8u);
+            } else if params.bits == 32u {
+                write_word(offset, value);
+            } else {
+                decode_error = ERROR_OUTPUT_MAPPING;
+            }
+        } else if params.output_kind == 8u {
+            let normalized_bits = normalized_gray8_f32_bits(sample);
+            if params.bits == 32u {
+                write_word(offset, normalized_bits);
+            } else if params.bits == 64u {
+                /*__JXL_F64_OUTPUT__*/
+            } else {
+                decode_error = ERROR_OUTPUT_MAPPING;
+            }
+        } else {
+            decode_error = ERROR_OUTPUT_MAPPING;
+        }
+    }
 }
 
 fn srgb_to_linear(value: f32) -> f32 {
@@ -150,12 +306,72 @@ fn target_nonlinear(value: u32) -> f32 {
     return 1.099 * pow(linear, 0.45) - 0.099;
 }
 
-fn luma_code(value: u32) -> u32 {
+fn color_code(value: u32) -> u32 {
     let nonlinear = clamp(target_nonlinear(value), 0.0, 1.0);
+    let maximum = f32((1u << params.bits) - 1u);
+    var code = maximum * nonlinear;
     if params.limited_range != 0u {
-        return u32(round(16.0 + 219.0 * nonlinear));
+        let scale = f32(1u << (params.bits - 8u));
+        code = scale * (16.0 + 219.0 * nonlinear);
     }
-    return u32(round(255.0 * nonlinear));
+    return u32(clamp(round(code), 0.0, maximum));
+}
+
+fn neutral_chroma_code() -> u32 {
+    return 1u << (params.bits - 1u);
+}
+
+fn rgb_code(value: u32) -> u32 {
+    return u32(clamp(round(255.0 * target_nonlinear(value)), 0.0, 255.0));
+}
+
+fn stored_rgb_code(position: u32, gray: u32) -> u32 {
+    var canonical = position;
+    if (params.order == 1u || params.order == 3u) && position < 3u {
+        canonical = 2u - position;
+    }
+    if canonical == 3u {
+        return 255u;
+    }
+    return gray;
+}
+
+fn write_output_sample(x: u32, y: u32, sample: u32) {
+    if params.output_kind == 0u || params.output_kind == 7u || params.output_kind == 8u {
+        write_numeric_sample(x, y, sample);
+        return;
+    }
+    if params.output_kind == 1u || params.output_kind == 2u || params.output_kind == 3u {
+        let bytes_per_sample = params.storage_bits / 8u;
+        let offset = params.plane0_offset + y * params.plane0_stride + x * bytes_per_sample;
+        write_stored_code(offset, color_code(sample));
+        return;
+    }
+    if params.output_kind == 5u {
+        let gray = rgb_code(sample);
+        let offset = params.plane0_offset + y * params.plane0_stride + x * params.channels;
+        if params.channels == 4u {
+            let packed = stored_rgb_code(0u, gray)
+                | (stored_rgb_code(1u, gray) << 8u)
+                | (stored_rgb_code(2u, gray) << 16u)
+                | (stored_rgb_code(3u, gray) << 24u);
+            write_word(offset, packed);
+        } else {
+            for (var position = 0u; position < params.channels; position += 1u) {
+                write_byte(offset + position, stored_rgb_code(position, gray));
+            }
+        }
+        return;
+    }
+    if params.output_kind == 6u {
+        let gray = rgb_code(sample);
+        write_byte(params.plane0_offset + y * params.plane0_stride + x, stored_rgb_code(0u, gray));
+        write_byte(params.plane1_offset + y * params.plane1_stride + x, stored_rgb_code(1u, gray));
+        write_byte(params.plane2_offset + y * params.plane2_stride + x, stored_rgb_code(2u, gray));
+        if params.channels == 4u {
+            write_byte(params.plane3_offset + y * params.plane3_stride + x, stored_rgb_code(3u, gray));
+        }
+    }
 }
 
 fn emit_token(index: u32, packed: u32) {
@@ -185,28 +401,49 @@ fn emit_token(index: u32, packed: u32) {
     let sample = u32(prediction + unpack_signed(packed)) & 255u;
     reconstructed[index] = sample;
 
-    let output_offset = params.plane0_offset + y * params.plane0_stride + x;
-    if params.output_mode == 0u {
-        write_byte(output_offset, sample);
-    } else {
-        write_byte(output_offset, luma_code(sample));
-    }
+    write_output_sample(x, y, sample);
 }
 
-fn fill_chroma() {
-    if params.output_mode == 2u {
+fn finalize_output() {
+    if params.output_kind == 2u {
+        let bytes_per_sample = params.storage_bits / 8u;
+        let neutral = neutral_chroma_code();
         for (var y = 0u; y < params.chroma_height; y = y + 1u) {
             for (var x = 0u; x < params.chroma_width; x = x + 1u) {
-                let offset = params.plane1_offset + y * params.plane1_stride + x * 2u;
-                write_byte(offset, 128u);
-                write_byte(offset + 1u, 128u);
+                let offset = params.plane1_offset + y * params.plane1_stride + x * 2u * bytes_per_sample;
+                write_stored_code(offset, neutral);
+                write_stored_code(offset + bytes_per_sample, neutral);
             }
         }
-    } else if params.output_mode == 3u {
+    } else if params.output_kind == 3u {
+        let bytes_per_sample = params.storage_bits / 8u;
+        let neutral = neutral_chroma_code();
         for (var y = 0u; y < params.chroma_height; y = y + 1u) {
             for (var x = 0u; x < params.chroma_width; x = x + 1u) {
-                write_byte(params.plane1_offset + y * params.plane1_stride + x, 128u);
-                write_byte(params.plane2_offset + y * params.plane2_stride + x, 128u);
+                write_stored_code(
+                    params.plane1_offset + y * params.plane1_stride + x * bytes_per_sample,
+                    neutral,
+                );
+                write_stored_code(
+                    params.plane2_offset + y * params.plane2_stride + x * bytes_per_sample,
+                    neutral,
+                );
+            }
+        }
+    } else if params.output_kind == 4u {
+        let neutral = neutral_chroma_code();
+        let pair_count = (params.width + 1u) / 2u;
+        for (var y = 0u; y < params.height; y += 1u) {
+            for (var pair = 0u; pair < pair_count; pair += 1u) {
+                let x0 = pair * 2u;
+                let x1 = min(x0 + 1u, params.width - 1u);
+                let y0 = color_code(reconstructed[y * params.width + x0]);
+                let y1 = color_code(reconstructed[y * params.width + x1]);
+                var packed = y0 | (neutral << 8u) | (y1 << 16u) | (neutral << 24u);
+                if params.order == 1u {
+                    packed = neutral | (y0 << 8u) | (neutral << 16u) | (y1 << 24u);
+                }
+                write_word(params.plane0_offset + y * params.plane0_stride + pair * 4u, packed);
             }
         }
     }
@@ -273,7 +510,9 @@ fn decode() {
         decode_error = ERROR_TRAILING_BITS;
     }
     if decode_error == 0u {
-        fill_chroma();
+        finalize_output();
+    }
+    if decode_error == 0u {
         status[0] = STATUS_OK;
     } else {
         status[0] = decode_error;

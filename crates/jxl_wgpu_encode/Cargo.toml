@@ -7,9 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck.workspace = true
 jxl_gpu_bitstream = { path = "../jxl_gpu_bitstream", version = "=0.1.0" }
 jxl_gpu_formats = { path = "../jxl_gpu_formats", version = "=0.1.0" }
+jxl_wgpu.workspace = true
 thiserror = "2.0.20"
 wgpu = "30.0.1"
 

@@ -611,7 +611,6 @@ name = "jxl_wgpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "jxl",
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
  "jxl_transforms",
@@ -632,6 +631,7 @@ dependencies = [
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
  "jxl_wgpu",
+ "naga",
  "pollster",
  "thiserror",
  "wgpu",
@@ -646,6 +646,7 @@ dependencies = [
  "jxl_gpu_bitstream",
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
+ "jxl_wgpu",
  "pollster",
  "thiserror",
  "wgpu",

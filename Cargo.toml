@@ -16,6 +16,7 @@ license = "BSD-3-Clause"
 rust-version = "1.89.0"
 
 [workspace.dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 jxl = { version = "=0.6.0", default-features = false }
 jxl_gpu_bitstream = { path = "crates/jxl_gpu_bitstream", version = "=0.1.0" }
 jxl_gpu_formats = { path = "crates/jxl_gpu_formats", version = "=0.1.0" }
