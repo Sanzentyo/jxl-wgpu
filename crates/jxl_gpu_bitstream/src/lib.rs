@@ -65,15 +65,19 @@ mod test_fixtures {
     pub(crate) fn has_permutation() -> Vec<u8> {
         decode_hex(include_str!("../test-data/has_permutation.jxl.hex"))
     }
+
+    pub(crate) fn with_icc() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/with_icc.jxl.hex"))
+    }
 }
 
 pub use acceleration::{
     ACCELERATION_INDEX_BOX_TYPE, AccelerationIndexError, Gray8AccelerationIndex, PrefixCodeEntry,
 };
 pub use inventory::{
-    AnimationInventory, BitRange, ByteRange, CodestreamInventory, FrameEncoding, FrameInventory,
-    FrameSection, FrameSectionKind, FrameType, ImageHeaderInventory, InventoryError,
-    InventoryLimits, SampleBitDepth, UnsupportedCodestreamGrammar,
+    AnimationInventory, BitRange, ByteRange, CodestreamInventory, EmbeddedIccInventory,
+    FrameEncoding, FrameInventory, FrameSection, FrameSectionKind, FrameType, ImageHeaderInventory,
+    InventoryError, InventoryLimits, SampleBitDepth,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).

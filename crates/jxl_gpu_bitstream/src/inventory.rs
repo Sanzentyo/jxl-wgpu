@@ -21,6 +21,10 @@ const MAX_TOC_ENTRIES: u64 = 65_536;
 pub struct InventoryLimits {
     /// Maximum bytes exposed to the header-only image-header parser.
     pub max_image_header_bytes: u64,
+    /// Maximum entropy-decoded transformed ICC bytes retained while reconstructing a profile.
+    pub max_encoded_icc_bytes: u64,
+    /// Maximum reconstructed embedded ICC profile bytes retained in the inventory.
+    pub max_decoded_icc_bytes: u64,
     /// Maximum preview and main frames retained in one inventory.
     pub max_frames: usize,
     /// Maximum TOC entries in an individual frame.
@@ -41,6 +45,8 @@ impl Default for InventoryLimits {
     fn default() -> Self {
         Self {
             max_image_header_bytes: 1 << 20,
+            max_encoded_icc_bytes: 1 << 28,
+            max_decoded_icc_bytes: 1 << 28,
             max_frames: 16_384,
             max_toc_entries_per_frame: 65_536,
             max_total_toc_entries: 1 << 20,
@@ -108,6 +114,17 @@ pub struct AnimationInventory {
     pub have_timecodes: bool,
 }
 
+/// Reconstructed embedded ICC profile and its compressed codestream range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedIccInventory {
+    /// Entropy-coded ICC payload immediately following the base image header.
+    pub bit_range: BitRange,
+    /// Size of the intermediate transformed ICC byte stream.
+    pub encoded_byte_count: u64,
+    /// Original ICC profile bytes reconstructed from the transformed stream.
+    pub profile: Vec<u8>,
+}
+
 /// Bounded, owned subset of the standard JPEG XL image header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageHeaderInventory {
@@ -122,7 +139,7 @@ pub struct ImageHeaderInventory {
     pub extra_channel_count: u32,
     pub xyb_encoded: bool,
     pub grayscale: bool,
-    pub has_embedded_icc_profile: bool,
+    pub embedded_icc: Option<EmbeddedIccInventory>,
     pub animation: Option<AnimationInventory>,
 }
 
@@ -212,13 +229,6 @@ pub struct CodestreamInventory {
     pub frames: Vec<FrameInventory>,
 }
 
-/// Grammar that deliberately remains outside the no-entropy production boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnsupportedCodestreamGrammar {
-    /// Locating the first frame requires decoding the embedded ICC entropy stream.
-    EmbeddedIccProfile,
-}
-
 /// Failure while constructing a bounded standard codestream inventory.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum InventoryError {
@@ -232,8 +242,8 @@ pub enum InventoryError {
     InvalidEnum { name: &'static str, value: u32 },
     #[error("invalid frame header: {0}")]
     InvalidFrame(&'static str),
-    #[error("unsupported standard codestream grammar: {0:?}")]
-    UnsupportedGrammar(UnsupportedCodestreamGrammar),
+    #[error("embedded ICC profile is invalid: {0}")]
+    InvalidIcc(String),
     #[error("inventory resource limit exceeded for {0}")]
     ResourceLimit(&'static str),
     #[error("allocation failed while building {0}")]
@@ -246,7 +256,7 @@ pub enum InventoryError {
 
 struct ParsedImageHeader {
     inventory: ImageHeaderInventory,
-    header_bits: u64,
+    frame_start_bits: u64,
     context: ImageContext,
 }
 
@@ -268,15 +278,9 @@ pub(crate) fn parse_codestream_inventory(
     let codestream_bytes =
         u64::try_from(codestream.len()).map_err(|_| InventoryError::SizeOverflow)?;
     let parsed_image = parse_image_header(codestream, limits)?;
-    if parsed_image.inventory.has_embedded_icc_profile {
-        return Err(InventoryError::UnsupportedGrammar(
-            UnsupportedCodestreamGrammar::EmbeddedIccProfile,
-        ));
-    }
-
     let mut reader = BitReader::new(codestream);
     reader
-        .skip_bits(parsed_image.header_bits)
+        .skip_bits(parsed_image.frame_start_bits)
         .map_err(|error| map_reader_error(error, reader.bit_offset()))?;
     zero_pad(&mut reader)?;
 
@@ -498,6 +502,16 @@ fn parse_image_header(
         .as_ref()
         .map(|preview| (preview.width, preview.height));
 
+    let embedded_icc = if metadata.colour_encoding.want_icc() {
+        Some(parse_embedded_icc(codestream, header_bits, limits)?)
+    } else {
+        None
+    };
+    let frame_start_bits = embedded_icc
+        .as_ref()
+        .and_then(|icc| icc.bit_range.end())
+        .unwrap_or(header_bits);
+
     let inventory = ImageHeaderInventory {
         bit_range: BitRange {
             offset: 0,
@@ -516,12 +530,12 @@ fn parse_image_header(
         extra_channel_count,
         xyb_encoded: metadata.xyb_encoded,
         grayscale: metadata.grayscale(),
-        has_embedded_icc_profile: metadata.colour_encoding.want_icc(),
+        embedded_icc,
         animation,
     };
     Ok(ParsedImageHeader {
         inventory,
-        header_bits,
+        frame_start_bits,
         context: ImageContext {
             width: image.size.width,
             height: image.size.height,
@@ -532,6 +546,99 @@ fn parse_image_header(
             have_timecodes: animation.is_some_and(|animation| animation.have_timecodes),
         },
     })
+}
+
+fn parse_embedded_icc(
+    codestream: &[u8],
+    header_bits: u64,
+    limits: InventoryLimits,
+) -> Result<EmbeddedIccInventory, InventoryError> {
+    let header_bits_usize =
+        usize::try_from(header_bits).map_err(|_| InventoryError::SizeOverflow)?;
+    let mut bitstream = ImageBitstream::new(codestream);
+    if let Err(error) = bitstream.skip_bits(header_bits_usize) {
+        return Err(map_metadata_bitstream_error(
+            error,
+            bitstream.num_read_bits(),
+        ));
+    }
+
+    let mut size_probe = bitstream.clone();
+    let encoded_byte_count = match size_probe.read_u64() {
+        Ok(size) => size,
+        Err(error) => {
+            return Err(map_metadata_bitstream_error(
+                error,
+                size_probe.num_read_bits(),
+            ));
+        }
+    };
+    if encoded_byte_count > limits.max_encoded_icc_bytes {
+        return Err(InventoryError::ResourceLimit("encoded ICC profile bytes"));
+    }
+
+    let encoded = match jxl_color::icc::read_icc(&mut bitstream) {
+        Ok(encoded) => encoded,
+        Err(error) if error.unexpected_eof() => {
+            return Err(InventoryError::UnexpectedEndOfBits {
+                bit_offset: u64::try_from(bitstream.num_read_bits()).unwrap_or(u64::MAX),
+            });
+        }
+        Err(error) => return Err(InventoryError::InvalidIcc(error.to_string())),
+    };
+    let actual_encoded_bytes =
+        u64::try_from(encoded.len()).map_err(|_| InventoryError::SizeOverflow)?;
+    if actual_encoded_bytes != encoded_byte_count {
+        return Err(InventoryError::InvalidIcc(
+            "encoded ICC size does not match its declaration".into(),
+        ));
+    }
+    let decoded_size = transformed_icc_output_size(&encoded)?;
+    if decoded_size > limits.max_decoded_icc_bytes {
+        return Err(InventoryError::ResourceLimit("decoded ICC profile bytes"));
+    }
+    let profile = jxl_color::icc::decode_icc(&encoded)
+        .map_err(|error| InventoryError::InvalidIcc(error.to_string()))?;
+    let actual_decoded_bytes =
+        u64::try_from(profile.len()).map_err(|_| InventoryError::SizeOverflow)?;
+    if actual_decoded_bytes != decoded_size {
+        return Err(InventoryError::InvalidIcc(
+            "decoded ICC size does not match its declaration".into(),
+        ));
+    }
+    let icc_end =
+        u64::try_from(bitstream.num_read_bits()).map_err(|_| InventoryError::SizeOverflow)?;
+    Ok(EmbeddedIccInventory {
+        bit_range: BitRange::between(header_bits, icc_end)?,
+        encoded_byte_count,
+        profile,
+    })
+}
+
+fn transformed_icc_output_size(encoded: &[u8]) -> Result<u64, InventoryError> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for &byte in encoded.iter().take(10) {
+        let payload = u64::from(byte & 0x7f);
+        if shift == 63 && payload > 1 {
+            return Err(InventoryError::InvalidIcc(
+                "decoded ICC size varint overflows u64".into(),
+            ));
+        }
+        value |= payload
+            .checked_shl(shift)
+            .ok_or(InventoryError::SizeOverflow)?;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift = shift.checked_add(7).ok_or(InventoryError::SizeOverflow)?;
+        if shift >= 64 {
+            break;
+        }
+    }
+    Err(InventoryError::InvalidIcc(
+        "decoded ICC size varint is truncated".into(),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1268,6 +1375,7 @@ fn div_ceil(value: u64, divisor: u64) -> Result<u64, InventoryError> {
 mod tests {
     use super::*;
     use crate::{FragmentedContainerWriter, ParseLimits, parse, write_container};
+    use sha2::{Digest, Sha256};
 
     fn inventory(input: &[u8]) -> CodestreamInventory {
         parse(input, ParseLimits::default())
@@ -1457,6 +1565,53 @@ mod tests {
     }
 
     #[test]
+    fn embedded_icc_is_bounded_reconstructed_and_frame_aligned() {
+        let bytes = crate::test_fixtures::with_icc();
+        let inventory = inventory(&bytes);
+        assert_eq!(inventory.codestream_bytes, 358);
+        let icc = inventory
+            .image_header
+            .embedded_icc
+            .as_ref()
+            .expect("fixture declares an embedded ICC profile");
+        assert!(icc.bit_range.length > 0);
+        assert!(icc.encoded_byte_count > 0);
+        assert_eq!(icc.profile.len(), 544);
+        assert_eq!(&icc.profile[36..40], b"acsp");
+        let profile_hash = Sha256::digest(&icc.profile);
+        assert_eq!(
+            profile_hash[..],
+            [
+                0x92, 0xaa, 0xee, 0x40, 0x52, 0x1d, 0x76, 0x71, 0xdb, 0xc9, 0x01, 0xdf, 0xc8, 0x8c,
+                0xc3, 0x6c, 0xb8, 0x3d, 0x41, 0x76, 0x6b, 0x2c, 0x46, 0x6f, 0xf9, 0x72, 0x68, 0xee,
+                0x5a, 0xb0, 0xc5, 0x77,
+            ]
+        );
+        assert_eq!(
+            icc.bit_range.end().unwrap().div_ceil(8) * 8,
+            inventory.frames[0].header_bits.offset
+        );
+
+        let parsed = parse(&bytes, ParseLimits::default()).unwrap();
+        let encoded_limit = InventoryLimits {
+            max_encoded_icc_bytes: icc.encoded_byte_count - 1,
+            ..InventoryLimits::default()
+        };
+        assert_eq!(
+            parsed.codestream_inventory(encoded_limit).unwrap_err(),
+            InventoryError::ResourceLimit("encoded ICC profile bytes")
+        );
+        let decoded_limit = InventoryLimits {
+            max_decoded_icc_bytes: u64::try_from(icc.profile.len()).unwrap() - 1,
+            ..InventoryLimits::default()
+        };
+        assert_eq!(
+            parsed.codestream_inventory(decoded_limit).unwrap_err(),
+            InventoryError::ResourceLimit("decoded ICC profile bytes")
+        );
+    }
+
+    #[test]
     fn libjxl_animation_and_fragmented_animation_metadata_match_the_oracle() {
         let spline = inventory(&crate::test_fixtures::animation_spline());
         assert_eq!(
@@ -1591,6 +1746,7 @@ mod tests {
             crate::test_fixtures::animation_spline(),
             crate::test_fixtures::fragmented_animation(),
             crate::test_fixtures::has_permutation(),
+            crate::test_fixtures::with_icc(),
         ];
         for fixture in fixtures {
             let expected = inventory(&fixture);
