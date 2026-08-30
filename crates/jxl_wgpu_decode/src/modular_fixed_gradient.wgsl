@@ -39,17 +39,26 @@ fn decode_adaptive_channel() -> u32 {
     var decoded = 0u;
     for (var y = 0u; y < params.height && decode_error == 0u; y += 1u) {
         let row_base = y * params.width;
+        var reconstruction_row_base = row_base;
+        if params.fixed_output_mode == FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8 {
+            reconstruction_row_base = (y & 1u) * params.width;
+        }
         var west = 0i;
         for (var x = 0u; x < params.width && decode_error == 0u; x += 1u) {
             let index = row_base + x;
+            let reconstruction_index = reconstruction_row_base + x;
             var north = west;
             var north_west = west;
             if y != 0u {
-                north = bitcast<i32>(reconstruction_load(channel_base + index - params.width));
+                var north_index = index - params.width;
+                if params.fixed_output_mode == FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8 {
+                    north_index = ((y - 1u) & 1u) * params.width + x;
+                }
+                north = bitcast<i32>(reconstruction_load(channel_base + north_index));
                 north_west = north;
                 if x != 0u {
                     north_west = bitcast<i32>(
-                        reconstruction_load(channel_base + index - params.width - 1u)
+                        reconstruction_load(channel_base + north_index - 1u)
                     );
                 }
             }
@@ -68,7 +77,16 @@ fn decode_adaptive_channel() -> u32 {
                 decode_error = ERROR_RAW_TOKEN;
                 break;
             }
-            reconstruction_store(channel_base + index, bitcast<u32>(sample));
+            reconstruction_store(channel_base + reconstruction_index, bitcast<u32>(sample));
+            if params.fixed_output_mode != 0u {
+                write_byte(
+                    params.plane0_offset
+                        + (params.origin_y + y) * params.plane0_stride
+                        + params.origin_x
+                        + x,
+                    bitcast<u32>(sample),
+                );
+            }
             west = sample;
             decoded += 1u;
         }

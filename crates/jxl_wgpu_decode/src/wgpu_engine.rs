@@ -110,6 +110,13 @@ pub struct WgpuDecodeMemoryStats {
     pub reconstruction_scratch_bytes: u64,
     /// Byte stride of one reconstruction lane.
     pub reconstruction_lane_stride_bytes: u64,
+    /// Largest decoded sample count represented by one logical group stream.
+    pub max_logical_reconstruction_sample_words: u32,
+    /// Largest sample workspace physically retained by one reconstruction lane.
+    ///
+    /// Fixed-Gradient normalized Gray8 groups with invocation-private LZ history retain two rows;
+    /// every other accepted stream retains its complete logical sample workspace.
+    pub max_physical_reconstruction_sample_words: u32,
     /// Largest descriptor-derived LZ history ring used by one group lane.
     pub max_lz77_window_words: u32,
     /// Largest physical LZ history ring stored in one reconstruction lane.
@@ -128,6 +135,8 @@ pub struct WgpuDecodeMemoryStats {
     pub max_dispatch_workgroups: u32,
     /// Output write implementation selected after proving the complete group/plane layout.
     pub output_write_path: OutputWritePath,
+    /// Output traversal selected after proving the source, output, and MA-tree contracts.
+    pub output_specialization: ModularOutputSpecialization,
     /// Reconstruction kernel selected from the fully validated MA-tree IR.
     pub reconstruction_specialization: ModularReconstructionSpecialization,
 }
@@ -139,6 +148,19 @@ pub enum OutputWritePath {
     AtomicBytes,
     /// Every plane row and internal group boundary is word-aligned, allowing ordinary RMW/store.
     WordAligned,
+}
+
+/// Typed Modular output traversal selected for one decoded frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularOutputSpecialization {
+    /// Reconstruct the complete group before converting it into the requested output layout.
+    FinalizePass,
+    /// Emit proven normalized U8 Gray8 samples from the fixed-Gradient reconstruction loop.
+    ///
+    /// Groups with invocation-private LZ history additionally retain only the current and previous
+    /// reconstruction rows; the logical and physical workspace fields in
+    /// [`WgpuDecodeMemoryStats`] report whether that compaction was selected.
+    DirectNormalizedGray8,
 }
 
 /// Typed Modular reconstruction specialization selected for one decoded frame.
@@ -217,6 +239,7 @@ struct ShaderParams {
     fixed_leaf_cluster1: u32,
     fixed_leaf_cluster2: u32,
     fixed_leaf_cluster3: u32,
+    fixed_output_mode: u32,
     wp_p1: u32,
     wp_p2: u32,
     wp_p3a: u32,
@@ -253,7 +276,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 208);
+    assert!(std::mem::size_of::<ShaderParams>() == 212);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
@@ -1046,6 +1069,8 @@ struct DecodeMemoryPermits {
 #[derive(Clone, Debug)]
 struct GroupDispatchLayout {
     reconstruction_lane_stride: u64,
+    max_logical_reconstruction_sample_words: u32,
+    max_physical_reconstruction_sample_words: u32,
     max_lz77_window_words: u32,
     max_lz77_scratch_words: u32,
     parallel_group_lanes: usize,
@@ -1058,7 +1083,16 @@ struct GroupDispatchLayout {
     params_stride: u64,
     params_bytes: u64,
     output_write_path: OutputWritePath,
+    output_specialization: ModularOutputSpecialization,
     reconstruction_specialization: ModularReconstructionSpecialization,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixedGradientOutputMode {
+    FinalizePass = 0,
+    DirectNormalizedGray8 = 1,
+    CompactNormalizedGray8 = 2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1091,16 +1125,48 @@ impl GroupDispatchLayout {
             )));
         }
         let mut reconstruction_lane_stride = 0u64;
+        let mut max_logical_reconstruction_sample_words = 0u32;
+        let mut max_physical_reconstruction_sample_words = 0u32;
         let mut max_lz77_window_words = 0u32;
         let mut max_lz77_scratch_words = 0u32;
+        let output_mode = fixed_gradient_output_mode(
+            profile.channels.count(),
+            profile.bits_per_sample,
+            output,
+            reconstruction_specialization,
+        );
+        let output_specialization = match output_mode {
+            FixedGradientOutputMode::FinalizePass => ModularOutputSpecialization::FinalizePass,
+            FixedGradientOutputMode::DirectNormalizedGray8
+            | FixedGradientOutputMode::CompactNormalizedGray8 => {
+                ModularOutputSpecialization::DirectNormalizedGray8
+            }
+        };
         for group in &profile.groups {
             let decoded_symbol_count = group_decoded_symbol_count(profile, *group)?;
             let lz77_window_words = group_lz77_window_words(profile, *group, decoded_symbol_count)?;
+            let physical_lz77_words = lz77_scratch_words(lz77_window_words);
+            let group_output_mode =
+                refine_fixed_gradient_output_mode(output_mode, lz77_window_words);
+            let physical_sample_words =
+                if group_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
+                    compact_gray8_sample_words(*group)?
+                } else {
+                    decoded_symbol_count
+                };
+            max_logical_reconstruction_sample_words =
+                max_logical_reconstruction_sample_words.max(decoded_symbol_count);
+            max_physical_reconstruction_sample_words =
+                max_physical_reconstruction_sample_words.max(physical_sample_words);
             max_lz77_window_words = max_lz77_window_words.max(lz77_window_words);
-            max_lz77_scratch_words =
-                max_lz77_scratch_words.max(lz77_scratch_words(lz77_window_words));
-            reconstruction_lane_stride = reconstruction_lane_stride
-                .max(align4(group_reconstructed_bytes(profile, *group)?)?);
+            max_lz77_scratch_words = max_lz77_scratch_words.max(physical_lz77_words);
+            reconstruction_lane_stride =
+                reconstruction_lane_stride.max(align4(group_reconstructed_bytes(
+                    profile,
+                    *group,
+                    decoded_symbol_count,
+                    physical_sample_words,
+                )?)?);
         }
         if reconstruction_lane_stride == 0 {
             return Err(Error::backend("Modular reconstruction lane is empty"));
@@ -1189,6 +1255,8 @@ impl GroupDispatchLayout {
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
         Ok(Self {
             reconstruction_lane_stride,
+            max_logical_reconstruction_sample_words,
+            max_physical_reconstruction_sample_words,
             max_lz77_window_words,
             max_lz77_scratch_words,
             parallel_group_lanes,
@@ -1201,6 +1269,7 @@ impl GroupDispatchLayout {
             params_stride,
             params_bytes,
             output_write_path,
+            output_specialization,
             reconstruction_specialization,
         })
     }
@@ -1347,8 +1416,19 @@ fn select_parallel_group_layout(
     Ok(None)
 }
 
-fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGroup) -> Result<u64> {
-    let sample_words = group_decoded_symbol_count(profile, group)?;
+fn compact_gray8_sample_words(group: ModularGroup) -> Result<u32> {
+    group
+        .width
+        .checked_mul(group.height.min(2))
+        .ok_or_else(|| Error::backend("two-row normalized Gray8 workspace size overflow"))
+}
+
+fn group_reconstructed_bytes(
+    profile: &StandardModularProfile,
+    group: ModularGroup,
+    decoded_symbol_count: u32,
+    physical_sample_words: u32,
+) -> Result<u64> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
         u64::from(group.width)
             .checked_mul(5)
@@ -1359,13 +1439,56 @@ fn group_reconstructed_bytes(profile: &StandardModularProfile, group: ModularGro
     let entropy_words = u64::from(lz77_scratch_words(group_lz77_window_words(
         profile,
         group,
-        sample_words,
+        decoded_symbol_count,
     )?));
-    u64::from(sample_words)
+    u64::from(physical_sample_words)
         .checked_add(predictor_words)
         .and_then(|words| words.checked_add(entropy_words))
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))
+}
+
+fn fixed_gradient_output_mode(
+    source_channels: u32,
+    source_bits: u8,
+    output: &OutputPlan,
+    specialization: ModularReconstructionSpecialization,
+) -> FixedGradientOutputMode {
+    if source_channels == 1
+        && source_bits == 8
+        && output.kind == OutputKind::NumericUnsigned
+        && output.numeric_mapping == 1
+        && output.channels == 1
+        && output.bits == 8
+        && output.storage_bits == 8
+        && matches!(
+            specialization,
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                offset: 0,
+                multiplier: 1,
+                channel_count: 1,
+                ..
+            }
+        )
+    {
+        FixedGradientOutputMode::DirectNormalizedGray8
+    } else {
+        FixedGradientOutputMode::FinalizePass
+    }
+}
+
+fn refine_fixed_gradient_output_mode(
+    output_mode: FixedGradientOutputMode,
+    lz77_window_words: u32,
+) -> FixedGradientOutputMode {
+    if output_mode == FixedGradientOutputMode::DirectNormalizedGray8
+        && lz77_scratch_words(lz77_window_words) == 0
+    {
+        FixedGradientOutputMode::CompactNormalizedGray8
+    } else {
+        output_mode
+    }
 }
 
 fn group_decoded_symbol_count(
@@ -1932,6 +2055,8 @@ fn validate_device_limits(
         stream_window_bytes: dispatch.stream_bytes,
         reconstruction_scratch_bytes: dispatch.reconstructed_bytes,
         reconstruction_lane_stride_bytes: dispatch.reconstruction_lane_stride,
+        max_logical_reconstruction_sample_words: dispatch.max_logical_reconstruction_sample_words,
+        max_physical_reconstruction_sample_words: dispatch.max_physical_reconstruction_sample_words,
         max_lz77_window_words: dispatch.max_lz77_window_words,
         max_lz77_scratch_words: dispatch.max_lz77_scratch_words,
         stream_batch_count: dispatch.stream_batches.len(),
@@ -1940,6 +2065,7 @@ fn validate_device_limits(
         group_workgroup_size: MODULAR_GROUP_WORKGROUP_SIZE,
         max_dispatch_workgroups,
         output_write_path: dispatch.output_write_path,
+        output_specialization: dispatch.output_specialization,
         reconstruction_specialization: dispatch.reconstruction_specialization,
     })
 }
@@ -2051,11 +2177,11 @@ fn submit_decode(
             .map_err(|_| Error::backend("group status index exceeds WGSL u32"))?;
         let params = build_params(
             group,
-            window.token_start,
-            window.token_end,
+            *window,
             status_index,
             &source.profile,
             &source.output,
+            source.dispatch_layout.reconstruction_specialization,
             index == 0,
         )?;
         let offset = u64::try_from(index)
@@ -2278,11 +2404,11 @@ fn submit_decode(
 
 fn build_params(
     group: ModularGroup,
-    token_start: u32,
-    token_end: u32,
+    stream_window: GroupStreamWindow,
     status_index: u32,
     profile: &StandardModularProfile,
     output: &OutputPlan,
+    reconstruction_specialization: ModularReconstructionSpecialization,
     initialize_chroma: bool,
 ) -> Result<ShaderParams> {
     let to_u32 = |value: u64, name: &'static str| {
@@ -2302,7 +2428,7 @@ fn build_params(
     let (plane3_offset, plane3_stride) = plane(3)?;
     let chroma = output.layout.plane(1);
     let (fixed_leaf_predictor, fixed_leaf_offset, fixed_leaf_multiplier, fixed_leaf_clusters) =
-        match reconstruction_specialization(profile) {
+        match reconstruction_specialization {
             ModularReconstructionSpecialization::ChannelFixed {
                 predictor,
                 offset,
@@ -2317,9 +2443,20 @@ fn build_params(
             ),
             ModularReconstructionSpecialization::GenericMetaAdaptive => (0, 0, 0, [0; 4]),
         };
+    let decoded_symbol_count = group_decoded_symbol_count(profile, group)?;
+    let lz77_window_words = group_lz77_window_words(profile, group, decoded_symbol_count)?;
+    let fixed_output_mode = refine_fixed_gradient_output_mode(
+        fixed_gradient_output_mode(
+            profile.channels.count(),
+            profile.bits_per_sample,
+            output,
+            reconstruction_specialization,
+        ),
+        lz77_window_words,
+    );
     Ok(ShaderParams {
-        token_start,
-        token_end,
+        token_start: stream_window.token_start,
+        token_end: stream_window.token_end,
         width: group.width,
         height: group.height,
         origin_x: group.x,
@@ -2330,12 +2467,7 @@ fn build_params(
         source_bits: u32::from(profile.bits_per_sample),
         source_mask: (1u32 << profile.bits_per_sample) - 1,
         needs_self_correcting: u32::from(profile.ma_config.needs_self_correcting()),
-        lz77_window_mask: group_lz77_window_words(
-            profile,
-            group,
-            group_decoded_symbol_count(profile, group)?,
-        )?
-        .saturating_sub(1),
+        lz77_window_mask: lz77_window_words.saturating_sub(1),
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -2364,6 +2496,7 @@ fn build_params(
         fixed_leaf_cluster1: fixed_leaf_clusters[1],
         fixed_leaf_cluster2: fixed_leaf_clusters[2],
         fixed_leaf_cluster3: fixed_leaf_clusters[3],
+        fixed_output_mode: fixed_output_mode as u32,
         wp_p1: profile.wp_header.p1,
         wp_p2: profile.wp_header.p2,
         wp_p3a: profile.wp_header.p3a,
@@ -2782,6 +2915,121 @@ mod tests {
     }
 
     #[test]
+    fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
+        let request = GpuOutputRequest::numeric(
+            Vpi::U8.pixel_format(),
+            NumericSampleMapping::NormalizedGray8,
+        )
+        .unwrap();
+        let normalized_u8 = OutputPlan::new(
+            Extent2d::new(17, 13),
+            &request,
+            crate::ModularChannels::Gray,
+            8,
+            PORTABLE_CAPABILITIES,
+        )
+        .unwrap();
+        let fixed_gray = ModularReconstructionSpecialization::ChannelFixed {
+            predictor: ModularPredictor::Gradient,
+            offset: 0,
+            multiplier: 1,
+            channel_count: 1,
+            clusters: [1, 2, 3, 4],
+        };
+        assert_eq!(
+            fixed_gradient_output_mode(1, 8, &normalized_u8, fixed_gray),
+            FixedGradientOutputMode::DirectNormalizedGray8
+        );
+        assert_eq!(
+            refine_fixed_gradient_output_mode(FixedGradientOutputMode::DirectNormalizedGray8, 1),
+            FixedGradientOutputMode::CompactNormalizedGray8
+        );
+        assert_eq!(
+            refine_fixed_gradient_output_mode(FixedGradientOutputMode::DirectNormalizedGray8, 2),
+            FixedGradientOutputMode::DirectNormalizedGray8
+        );
+        assert_eq!(
+            refine_fixed_gradient_output_mode(FixedGradientOutputMode::FinalizePass, 1),
+            FixedGradientOutputMode::FinalizePass
+        );
+        assert_eq!(
+            fixed_gradient_output_mode(
+                1,
+                8,
+                &normalized_u8,
+                ModularReconstructionSpecialization::GenericMetaAdaptive,
+            ),
+            FixedGradientOutputMode::FinalizePass
+        );
+        assert_eq!(
+            fixed_gradient_output_mode(3, 8, &normalized_u8, fixed_gray),
+            FixedGradientOutputMode::FinalizePass
+        );
+
+        let native_request = GpuOutputRequest::numeric(
+            LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+            NumericSampleMapping::NativeUnsigned,
+        )
+        .unwrap();
+        let native = OutputPlan::new(
+            Extent2d::new(17, 13),
+            &native_request,
+            crate::ModularChannels::Gray,
+            8,
+            PORTABLE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(
+            fixed_gradient_output_mode(1, 8, &native, fixed_gray),
+            FixedGradientOutputMode::FinalizePass
+        );
+
+        let signed_request = GpuOutputRequest::numeric(
+            Vpi::S8.pixel_format(),
+            NumericSampleMapping::NormalizedGray8,
+        )
+        .unwrap();
+        let signed = OutputPlan::new(
+            Extent2d::new(17, 13),
+            &signed_request,
+            crate::ModularChannels::Gray,
+            8,
+            PORTABLE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(
+            fixed_gradient_output_mode(1, 8, &signed, fixed_gray),
+            FixedGradientOutputMode::FinalizePass
+        );
+
+        for width in [1, 3, 256, 257] {
+            for height in [1, 2, 3, 257] {
+                let group = ModularGroup {
+                    token_bit_offset: 0,
+                    token_bit_end: 1,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    stream_index: 0,
+                };
+                let physical_words = compact_gray8_sample_words(group).unwrap();
+                let logical_words = group.sample_count().unwrap();
+                assert_eq!(physical_words, width * height.min(2));
+                assert!(physical_words <= logical_words);
+                for y in 0..height {
+                    for x in 0..width {
+                        assert!((y & 1) * width + x < physical_words);
+                        if y != 0 {
+                            assert!(((y - 1) & 1) * width + x < physical_words);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn output_negotiation_rejects_rgb_without_explicit_transfer_and_range() {
         let format = PixelFormat::rgb8(
             jxl_gpu_formats::RgbChannelOrder::Rgb,
@@ -3026,7 +3274,7 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 208);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 212);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -3070,24 +3318,25 @@ mod tests {
             fixed_leaf_cluster1: 39,
             fixed_leaf_cluster2: 40,
             fixed_leaf_cluster3: 41,
-            wp_p1: 42,
-            wp_p2: 43,
-            wp_p3a: 44,
-            wp_p3b: 45,
-            wp_p3c: 46,
-            wp_p3d: 47,
-            wp_p3e: 48,
-            wp_w0: 49,
-            wp_w1: 50,
-            wp_w2: 51,
-            wp_w3: 52,
+            fixed_output_mode: 42,
+            wp_p1: 43,
+            wp_p2: 44,
+            wp_p3a: 45,
+            wp_p3b: 46,
+            wp_p3c: 47,
+            wp_p3d: 48,
+            wp_p3e: 49,
+            wp_w0: 50,
+            wp_w1: 51,
+            wp_w2: 52,
+            wp_w3: 53,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 52]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 53]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45, 46, 47, 48, 49, 50, 51, 52,
+                45, 46, 47, 48, 49, 50, 51, 52, 53,
             ]
         );
         assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));

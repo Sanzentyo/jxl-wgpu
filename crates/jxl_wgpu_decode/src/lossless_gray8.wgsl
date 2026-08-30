@@ -40,6 +40,7 @@ struct Params {
     fixed_leaf_cluster1: u32,
     fixed_leaf_cluster2: u32,
     fixed_leaf_cluster3: u32,
+    fixed_output_mode: u32,
     wp_p1: u32,
     wp_p2: u32,
     wp_p3a: u32,
@@ -88,6 +89,9 @@ const ERROR_ANS_STATE: u32 = 10u;
 const ERROR_ENTROPY_CLUSTER: u32 = 11u;
 const ERROR_MA_TREE: u32 = 12u;
 const ERROR_PREDICTOR: u32 = 13u;
+
+const FIXED_OUTPUT_DIRECT_NORMALIZED_GRAY8: u32 = 1u;
+const FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8: u32 = 2u;
 
 fn reconstruction_load(index: u32) -> u32 {
     return reconstructed[reconstruction_base + index];
@@ -533,7 +537,7 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
             bit_cursor = params.token_end;
         }
     }
-    if decode_error == 0u {
+    if decode_error == 0u && params.fixed_output_mode == 0u {
         finalize_output();
     }
     let status_base = params.status_index * 4u;
