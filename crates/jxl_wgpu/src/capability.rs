@@ -5,16 +5,12 @@
 
 use std::collections::BTreeSet;
 
-use jxl_gpu_protocol::{AcceleratorCapabilities, RenderOpKind};
+use jxl_gpu_protocol::{BackendCapabilities, RenderOpKind};
 
-pub(crate) fn capabilities(
-    device: &wgpu::Device,
-    info: &wgpu::AdapterInfo,
-    minimum_frame_pixels: Option<u64>,
-) -> AcceleratorCapabilities {
+pub(crate) fn capabilities(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> BackendCapabilities {
     let features = device.features();
     let limits = device.limits();
-    AcceleratorCapabilities {
+    BackendCapabilities {
         name: format!("{} ({:?})", info.name, info.backend),
         supported_ops: [
             RenderOpKind::Copy,
@@ -31,7 +27,6 @@ pub(crate) fn capabilities(
         ]
         .into_iter()
         .collect::<BTreeSet<_>>(),
-        minimum_frame_pixels,
         max_buffer_bytes: limits.max_buffer_size,
         max_workgroup_storage_bytes: limits.max_compute_workgroup_storage_size,
         max_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,

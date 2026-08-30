@@ -7,22 +7,21 @@ use std::sync::Arc;
 
 use jxl_gpu_formats::convert_rgb_f32;
 use jxl_gpu_protocol::{
-    Border2d, Extent2d, FallbackGranularity, FrameSessionDesc, GroupId, GroupPayload, HostPlane,
-    MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole,
-    PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan, SaveParams,
-    Scale2d,
+    Border2d, Extent2d, FrameSessionDesc, GroupId, GroupPayload, HostPlane, MemoryMode, OutputDesc,
+    OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole, PrecisionContract,
+    PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan, SaveParams, Scale2d,
 };
 use jxl_wgpu::{
     ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, Error, ImageOutputRequest,
-    Packed422Order, PixelFormat, RgbChannelOrder, WgpuAccelerator, WgpuAcceleratorConfig,
+    Packed422Order, PixelFormat, RgbChannelOrder, WgpuBackend, WgpuBackendConfig,
 };
 
-fn accelerator() -> Option<WgpuAccelerator> {
-    match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
+fn backend() -> Option<WgpuBackend> {
+    match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
         enable_timestamps: false,
-        ..WgpuAcceleratorConfig::default()
+        ..WgpuBackendConfig::default()
     })) {
-        Ok(accelerator) => Some(accelerator),
+        Ok(backend) => Some(backend),
         Err(Error::NoAdapter) => {
             eprintln!("skipping GPU test: no wgpu adapter is available");
             None
@@ -40,7 +39,6 @@ fn frame_desc(extent: Extent2d) -> FrameSessionDesc {
         memory_mode: MemoryMode::Resident,
         max_resident_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
-        fallback: FallbackGranularity::WholeFrame,
     }
 }
 
@@ -124,7 +122,7 @@ fn color(range: ColorRange, location: ChromaLocation2d) -> ColorSpecification {
 
 #[test]
 fn canonical_pitch_linear_formats_match_scalar_oracle() {
-    let Some(accelerator) = accelerator() else {
+    let Some(backend) = backend() else {
         return;
     };
     let extent = Extent2d::new(5, 3);
@@ -156,7 +154,7 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
     ];
 
     for format in formats {
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), plan(extent))
             .expect("create generic image session");
         enqueue(&mut session, extent, &channels);
@@ -174,7 +172,7 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
 
 #[test]
 fn nv12_gpu_output_handles_degenerate_odd_edges_without_readback() {
-    let Some(accelerator) = accelerator() else {
+    let Some(backend) = backend() else {
         return;
     };
     let format = PixelFormat::nv12(color(ColorRange::Limited, ChromaLocation2d::CENTER));
@@ -184,7 +182,7 @@ fn nv12_gpu_output_handles_degenerate_odd_edges_without_readback() {
         Extent2d::new(3, 1),
     ] {
         let channels = rgb_planes(extent);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), plan(extent))
             .expect("create zero-copy NV12 session");
         enqueue(&mut session, extent, &channels);

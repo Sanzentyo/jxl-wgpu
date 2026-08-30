@@ -9,7 +9,7 @@
 // Send + Sync, making Clippy's generic Arc heuristic inapplicable on wasm32.
 #![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 
-//! A portable `wgpu` implementation of [`jxl_gpu_protocol::JxlAccelerator`].
+//! A portable `wgpu` implementation of [`jxl_gpu_protocol::RenderBackend`].
 
 mod arena;
 mod autotune;
@@ -32,7 +32,7 @@ mod video;
 pub use arena::{ArenaAllocation, ArenaPlan, ArenaPlanner};
 pub use autotune::{AdapterFingerprint, AutotuneProfile, KernelVariant, TunedKernel};
 pub use buffer_pool::WgpuBufferPoolStats;
-pub use context::{DirectReadbackPolicy, WgpuAccelerator, WgpuAcceleratorConfig, WgpuMemoryPolicy};
+pub use context::{DirectReadbackPolicy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy};
 pub use display::{
     DisplayPipeline, DisplayPipelineCacheStats, DisplaySubmission, DisplayTexture,
     DisplayTextureDescriptor,

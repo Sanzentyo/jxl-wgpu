@@ -6,16 +6,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+use jxl_gpu_protocol::{BackendError, FrameSession};
 use jxl_gpu_protocol::{
-    AcceleratedFrame, ChangedRegions, Extent2d, FrameSessionDesc, GroupId, GroupPayload, OutputId,
-    OutputLayout, Region, RenderIntent, RenderPlan, ResourceData, ResourceId, ResourceUpdate,
+    ChangedRegions, Extent2d, FrameSessionDesc, GroupId, GroupPayload, OutputId, OutputLayout,
+    Region, RenderIntent, RenderPlan, RenderedFrame, ResourceData, ResourceId, ResourceUpdate,
     SampleType, SubmissionToken,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use jxl_gpu_protocol::{AcceleratedFrameSession, AcceleratorError};
 
 use crate::buffer_pool::PooledBuffer;
-use crate::context::WgpuAccelerator;
+use crate::context::WgpuBackend;
 use crate::readback::{ReadbackRequest, resolve_outputs};
 use crate::scheduler::Scheduler;
 use crate::video::{
@@ -120,7 +120,7 @@ impl PendingSubmission {
 }
 
 pub struct WgpuFrameSession {
-    accelerator: WgpuAccelerator,
+    backend: WgpuBackend,
     frame: FrameSessionDesc,
     plan: Arc<RenderPlan>,
     execution: ExecutionPlan,
@@ -149,14 +149,14 @@ impl std::fmt::Debug for WgpuFrameSession {
 
 impl WgpuFrameSession {
     pub(crate) fn new(
-        accelerator: WgpuAccelerator,
+        backend: WgpuBackend,
         frame: FrameSessionDesc,
         plan: Arc<RenderPlan>,
         execution: ExecutionPlan,
     ) -> Result<Self> {
         Scheduler::validate(&plan)?;
         Ok(Self {
-            accelerator,
+            backend,
             frame,
             plan,
             execution,
@@ -263,7 +263,7 @@ impl WgpuFrameSession {
         self.validate_submission(intent)?;
 
         let encoded = Scheduler::encode(
-            &self.accelerator,
+            &self.backend,
             &self.plan,
             &self.execution,
             &self.groups,
@@ -279,7 +279,7 @@ impl WgpuFrameSession {
         };
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.accelerator.queue.submit([encoded.command_buffer]);
+        let submission = self.backend.queue.submit([encoded.command_buffer]);
         recycle_submitted(encoded.recycle_after_submit);
         self.last_submission_stats = Some(stats);
         let changed = self.changed_regions();
@@ -300,13 +300,13 @@ impl WgpuFrameSession {
     /// CPU readback buffer.
     ///
     /// This method does not wait for GPU completion. The returned buffers may be referenced by a
-    /// later command submitted to the accelerator's queue immediately; queue ordering guarantees
+    /// later command submitted to the backend's queue immediately; queue ordering guarantees
     /// that the save kernels complete before the dependent command executes.
     pub fn submit_gpu(&mut self, intent: RenderIntent) -> Result<GpuFrame> {
         self.validate_submission(intent)?;
 
         let encoded = Scheduler::encode_gpu(
-            &self.accelerator,
+            &self.backend,
             &self.plan,
             &self.execution,
             &self.groups,
@@ -335,7 +335,7 @@ impl WgpuFrameSession {
             .collect();
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.accelerator.queue.submit([encoded.command_buffer]);
+        let submission = self.backend.queue.submit([encoded.command_buffer]);
         recycle_submitted(encoded.recycle_after_submit);
         debug_assert!(encoded.recycle_after_wait.is_empty());
         self.last_submission_stats = Some(stats);
@@ -364,7 +364,7 @@ impl WgpuFrameSession {
     ) -> Result<SubmissionToken> {
         self.validate_submission(intent)?;
         let encoded = Scheduler::encode_image(
-            &self.accelerator,
+            &self.backend,
             &self.plan,
             &self.execution,
             &self.groups,
@@ -381,7 +381,7 @@ impl WgpuFrameSession {
         };
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.accelerator.queue.submit([encoded.command_buffer]);
+        let submission = self.backend.queue.submit([encoded.command_buffer]);
         recycle_submitted(encoded.recycle_after_submit);
         self.last_submission_stats = Some(stats);
         let changed = self.changed_regions();
@@ -401,7 +401,7 @@ impl WgpuFrameSession {
     /// Submits a generic pitch-linear image conversion and returns its GPU allocation.
     ///
     /// The returned buffer is tightly strided according to each output's descriptor. Commands on
-    /// the accelerator's queue may consume it immediately because WebGPU preserves queue order.
+    /// the backend's queue may consume it immediately because WebGPU preserves queue order.
     pub fn submit_gpu_image(
         &mut self,
         intent: RenderIntent,
@@ -409,7 +409,7 @@ impl WgpuFrameSession {
     ) -> Result<GpuImageFrame> {
         self.validate_submission(intent)?;
         let encoded = Scheduler::encode_gpu_image(
-            &self.accelerator,
+            &self.backend,
             &self.plan,
             &self.execution,
             &self.groups,
@@ -435,7 +435,7 @@ impl WgpuFrameSession {
             .collect();
         let token = self.allocate_token()?;
         self.reserve_pending_transient(encoded.transient_bytes)?;
-        let submission = self.accelerator.queue.submit([encoded.command_buffer]);
+        let submission = self.backend.queue.submit([encoded.command_buffer]);
         recycle_submitted(encoded.recycle_after_submit);
         debug_assert!(encoded.recycle_after_wait.is_empty());
         self.last_submission_stats = Some(stats);
@@ -518,7 +518,7 @@ impl WgpuFrameSession {
         }
     }
 
-    pub fn wait(&mut self, token: SubmissionToken) -> Result<AcceleratedFrame> {
+    pub fn wait(&mut self, token: SubmissionToken) -> Result<RenderedFrame> {
         let pending = self
             .pending
             .get(&token)
@@ -545,9 +545,9 @@ impl WgpuFrameSession {
         else {
             unreachable!("submission mode was checked before removal")
         };
-        let outputs = resolve_outputs(&self.accelerator.device, submission, readbacks)?;
+        let outputs = resolve_outputs(&self.backend.device, submission, readbacks)?;
         recycle_unmapped(recycle_after_wait);
-        Ok(AcceleratedFrame {
+        Ok(RenderedFrame {
             token,
             outputs,
             changed,
@@ -582,7 +582,7 @@ impl WgpuFrameSession {
         else {
             unreachable!("submission mode was checked before removal")
         };
-        let outputs = resolve_image_outputs(&self.accelerator.device, submission, readbacks)?;
+        let outputs = resolve_image_outputs(&self.backend.device, submission, readbacks)?;
         recycle_unmapped(recycle_after_wait);
         Ok(CpuImageFrame {
             token,
@@ -628,7 +628,7 @@ impl WgpuFrameSession {
             else {
                 unreachable!("submission mode was checked before removal")
             };
-            self.accelerator.device.poll(wgpu::PollType::Wait {
+            self.backend.device.poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
                 timeout: None,
             })?;
@@ -638,7 +638,7 @@ impl WgpuFrameSession {
 }
 
 /// Returning these buffers immediately after queue submission is safe: every acquisition belongs
-/// to this accelerator and all subsequent commands enter the same totally ordered WebGPU queue.
+/// to this backend and all subsequent commands enter the same totally ordered WebGPU queue.
 fn recycle_submitted(buffers: Vec<PooledBuffer>) {
     for buffer in buffers {
         let _ = buffer.recycle();
@@ -663,29 +663,23 @@ fn browser_wait_error() -> Error {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl AcceleratedFrameSession for WgpuFrameSession {
-    fn update_resource(
-        &mut self,
-        update: ResourceUpdate,
-    ) -> std::result::Result<(), AcceleratorError> {
+impl FrameSession for WgpuFrameSession {
+    fn update_resource(&mut self, update: ResourceUpdate) -> std::result::Result<(), BackendError> {
         WgpuFrameSession::update_resource(self, update).map_err(Into::into)
     }
 
-    fn enqueue(&mut self, payload: GroupPayload) -> std::result::Result<(), AcceleratorError> {
+    fn enqueue(&mut self, payload: GroupPayload) -> std::result::Result<(), BackendError> {
         WgpuFrameSession::enqueue(self, payload).map_err(Into::into)
     }
 
     fn submit(
         &mut self,
         intent: RenderIntent,
-    ) -> std::result::Result<SubmissionToken, AcceleratorError> {
+    ) -> std::result::Result<SubmissionToken, BackendError> {
         WgpuFrameSession::submit(self, intent).map_err(Into::into)
     }
 
-    fn wait(
-        &mut self,
-        token: SubmissionToken,
-    ) -> std::result::Result<AcceleratedFrame, AcceleratorError> {
+    fn wait(&mut self, token: SubmissionToken) -> std::result::Result<RenderedFrame, BackendError> {
         WgpuFrameSession::wait(self, token).map_err(Into::into)
     }
 }
@@ -698,22 +692,21 @@ mod tests {
         ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageOutputRequest,
         PixelFormat,
     };
-    use crate::{WgpuAcceleratorConfig, WgpuMemoryPolicy};
+    use crate::{WgpuBackendConfig, WgpuMemoryPolicy};
     #[cfg(not(target_arch = "wasm32"))]
     use jxl_gpu_protocol::OutputOrientation;
     use jxl_gpu_protocol::{
-        Border2d, ChromaAxis, FallbackGranularity, GaborishParams, HostPlane, MemoryMode,
-        OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole,
-        PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, SaveParams, Scale2d,
-        UpsampleParams,
+        Border2d, ChromaAxis, GaborishParams, HostPlane, MemoryMode, OutputDesc, OutputId,
+        OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy,
+        RenderNode, RenderOp, SaveParams, Scale2d, UpsampleParams,
     };
 
-    fn test_accelerator() -> Option<WgpuAccelerator> {
-        match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
+    fn test_backend() -> Option<WgpuBackend> {
+        match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
             enable_timestamps: false,
-            ..WgpuAcceleratorConfig::default()
+            ..WgpuBackendConfig::default()
         })) {
-            Ok(accelerator) => Some(accelerator),
+            Ok(backend) => Some(backend),
             Err(Error::NoAdapter) => {
                 eprintln!("skipping GPU test: no wgpu adapter is available");
                 None
@@ -731,7 +724,6 @@ mod tests {
             memory_mode: MemoryMode::Resident,
             max_resident_bytes: 16 * 1024 * 1024,
             max_scratch_bytes: 16 * 1024 * 1024,
-            fallback: FallbackGranularity::WholeFrame,
         }
     }
 
@@ -849,31 +841,31 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn copy_gpu_output_to_host(accelerator: &WgpuAccelerator, output: &GpuOutputBuffer) -> Vec<u8> {
+    fn copy_gpu_output_to_host(backend: &WgpuBackend, output: &GpuOutputBuffer) -> Vec<u8> {
         use std::sync::mpsc;
 
         let copy_size = output.buffer.size();
-        let staging = accelerator.device().create_buffer(&wgpu::BufferDescriptor {
+        let staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu zero-copy consumer test staging"),
             size: copy_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder =
-            accelerator
+            backend
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu zero-copy consumer test"),
                 });
         encoder.copy_buffer_to_buffer(&output.buffer, 0, &staging, 0, copy_size);
-        let submission = accelerator.queue().submit([encoder.finish()]);
+        let submission = backend.queue().submit([encoder.finish()]);
         let (sender, receiver) = mpsc::sync_channel(1);
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
-        accelerator
+        backend
             .device()
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
@@ -905,7 +897,7 @@ mod tests {
 
     #[test]
     fn modular_kernel_executes_and_reads_back() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
 
@@ -970,7 +962,7 @@ mod tests {
             }],
         });
         let frame = frame_desc(extent);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame, plan)
             .expect("create GPU frame session");
         session
@@ -1008,7 +1000,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn save_applies_all_eight_output_orientations_on_gpu() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let source_extent = Extent2d::new(3, 2);
@@ -1079,7 +1071,7 @@ mod tests {
                     layout: OutputLayout::Planar,
                 }],
             });
-            let mut session = accelerator
+            let mut session = backend
                 .create_session(&frame_desc(source_extent), plan)
                 .expect("create oriented Save session");
             enqueue_copy_source(&mut session, source_extent, source.clone());
@@ -1098,7 +1090,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_yuv_applies_orientation_before_subsampling_and_packing() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let source_extent = Extent2d::new(3, 2);
@@ -1185,7 +1177,7 @@ mod tests {
                     layout: OutputLayout::Interleaved,
                 }],
             });
-            let mut session = accelerator
+            let mut session = backend
                 .create_session(&frame_desc(source_extent), plan)
                 .expect("create oriented native YUV session");
             session
@@ -1230,12 +1222,12 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_output_is_packed_queue_ordered_and_outlives_session() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let extent = Extent2d::new(3, 2);
         let expected = vec![-3.0, 0.25, 1.5, 7.0, -0.0, 22.25];
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create zero-copy session");
         enqueue_copy_source(&mut session, extent, expected.clone());
@@ -1275,18 +1267,18 @@ mod tests {
         // This dependent copy is submitted without waiting for the frame submission. Waiting only
         // for this later command proves same-queue ordering and that the Arc-owned output survives
         // destruction of its frame session.
-        let actual = f32_values(&copy_gpu_output_to_host(&accelerator, &output));
+        let actual = f32_values(&copy_gpu_output_to_host(&backend, &output));
         assert_eq!(actual, expected);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn pending_transient_accounting_accumulates_and_releases() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let extent = Extent2d::new(3, 2);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create pending-memory session");
         enqueue_copy_source(&mut session, extent, vec![0.5; 6]);
@@ -1315,14 +1307,14 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn internal_buffers_are_reused_across_sessions_but_public_gpu_output_is_not_pooled() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
-        accelerator.clear_buffer_pool();
+        backend.clear_buffer_pool();
         let extent = Extent2d::new(7, 5);
         let plan = copy_chain_plan(extent);
 
-        let mut first = accelerator
+        let mut first = backend
             .create_session(&frame_desc(extent), Arc::clone(&plan))
             .expect("create first pooled CPU session");
         let resident_slots = first
@@ -1338,11 +1330,11 @@ mod tests {
             .submit(RenderIntent::Final)
             .expect("submit first pooled CPU frame");
         first.wait(token).expect("wait first pooled CPU frame");
-        let after_first = accelerator.buffer_pool_stats();
+        let after_first = backend.buffer_pool_stats();
         assert_eq!(after_first.misses, resident_slots + 1);
         assert_eq!(after_first.cached_buffers, resident_slots + 1);
 
-        let mut second = accelerator
+        let mut second = backend
             .create_session(&frame_desc(extent), Arc::clone(&plan))
             .expect("create second pooled CPU session");
         enqueue_copy_source(&mut second, extent, vec![-9.0; 35]);
@@ -1354,12 +1346,12 @@ mod tests {
             panic!("expected pooled F32 output");
         };
         assert!(values.iter().all(|&value| value == -9.0));
-        let after_second = accelerator.buffer_pool_stats();
+        let after_second = backend.buffer_pool_stats();
         assert_eq!(after_second.hits - after_first.hits, resident_slots + 1);
 
-        accelerator.clear_buffer_pool();
-        let before_gpu = accelerator.buffer_pool_stats();
-        let mut gpu = accelerator
+        backend.clear_buffer_pool();
+        let before_gpu = backend.buffer_pool_stats();
+        let mut gpu = backend
             .create_session(&frame_desc(extent), plan)
             .expect("create GPU-only pool-boundary session");
         enqueue_copy_source(&mut gpu, extent, vec![11.0; 35]);
@@ -1369,16 +1361,13 @@ mod tests {
         gpu.wait_gpu(gpu_frame.token)
             .expect("wait GPU-only pool-boundary frame");
         assert_eq!(gpu.pending_transient_bytes(), 0);
-        let after_gpu = accelerator.buffer_pool_stats();
+        let after_gpu = backend.buffer_pool_stats();
         assert_eq!(after_gpu.misses - before_gpu.misses, resident_slots);
         assert_eq!(after_gpu.cached_buffers, resident_slots);
 
         // Clearing all internal buffers cannot invalidate the caller-owned packed output.
-        accelerator.clear_buffer_pool();
-        let actual = f32_values(&copy_gpu_output_to_host(
-            &accelerator,
-            &gpu_frame.outputs[0],
-        ));
+        backend.clear_buffer_pool();
+        let actual = f32_values(&copy_gpu_output_to_host(&backend, &gpu_frame.outputs[0]));
         assert!(actual.iter().all(|&value| value == 11.0));
     }
 
@@ -1387,16 +1376,16 @@ mod tests {
     #[ignore = "manual release-mode allocation benchmark"]
     fn repeated_cpu_decode_pool_release_benchmark() {
         fn run(max_cached_buffer_bytes: u64) -> Option<(std::time::Duration, u64)> {
-            let config = WgpuAcceleratorConfig {
+            let config = WgpuBackendConfig {
                 enable_timestamps: false,
                 memory: WgpuMemoryPolicy {
                     max_cached_buffer_bytes,
                     ..WgpuMemoryPolicy::default()
                 },
-                ..WgpuAcceleratorConfig::default()
+                ..WgpuBackendConfig::default()
             };
-            let accelerator = match pollster::block_on(WgpuAccelerator::request_default(config)) {
-                Ok(accelerator) => accelerator,
+            let backend = match pollster::block_on(WgpuBackend::request_default(config)) {
+                Ok(backend) => backend,
                 Err(Error::NoAdapter) => return None,
                 Err(error) => panic!("request benchmark adapter: {error}"),
             };
@@ -1405,7 +1394,7 @@ mod tests {
             let source = vec![0.25; extent.area().expect("benchmark extent")];
 
             // Compile pipelines before measuring allocation reuse.
-            let mut warm = accelerator
+            let mut warm = backend
                 .create_session(&frame_desc(extent), Arc::clone(&plan))
                 .expect("create benchmark warmup session");
             enqueue_copy_source(&mut warm, extent, source.clone());
@@ -1413,11 +1402,11 @@ mod tests {
                 .submit(RenderIntent::Final)
                 .expect("submit benchmark warmup");
             warm.wait(token).expect("wait benchmark warmup");
-            accelerator.clear_buffer_pool();
+            backend.clear_buffer_pool();
 
             let started = std::time::Instant::now();
             for _ in 0..20 {
-                let mut session = accelerator
+                let mut session = backend
                     .create_session(&frame_desc(extent), Arc::clone(&plan))
                     .expect("create repeated benchmark session");
                 enqueue_copy_source(&mut session, extent, source.clone());
@@ -1426,7 +1415,7 @@ mod tests {
                     .expect("submit repeated benchmark frame");
                 session.wait(token).expect("wait repeated benchmark frame");
             }
-            Some((started.elapsed(), accelerator.buffer_pool_stats().hits))
+            Some((started.elapsed(), backend.buffer_pool_stats().hits))
         }
 
         let Some((uncached, uncached_hits)) = run(0) else {
@@ -1448,12 +1437,12 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn cpu_and_gpu_submission_tokens_reject_the_wrong_wait_mode() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let extent = Extent2d::new(1, 1);
 
-        let mut cpu = accelerator
+        let mut cpu = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create CPU-readback token session");
         enqueue_copy_source(&mut cpu, extent, vec![4.0]);
@@ -1471,7 +1460,7 @@ mod tests {
         cpu.wait(cpu_token)
             .expect("mode mismatch must leave CPU token pending");
 
-        let mut gpu = accelerator
+        let mut gpu = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create GPU-only token session");
         enqueue_copy_source(&mut gpu, extent, vec![8.0]);
@@ -1492,11 +1481,11 @@ mod tests {
 
     #[test]
     fn disjoint_lifetimes_reuse_physical_slots_on_gpu() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let extent = Extent2d::new(19, 11);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create aliased copy chain session");
         let offset = |plane| {
@@ -1541,11 +1530,11 @@ mod tests {
 
     #[test]
     fn simultaneously_live_slot_alias_returns_typed_error_before_gpu_validation() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let extent = Extent2d::new(3, 3);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create copy chain session");
         let source_offset = session
@@ -1588,16 +1577,16 @@ mod tests {
     fn gpu_only_budget_counts_one_packed_buffer_and_no_readback() {
         // Three copy uniforms (48), one save uniform (32), and one 36-byte packed output fit 116
         // bytes exactly. CPU mode additionally needs a 36-byte readback and must fail at 152.
-        let config = WgpuAcceleratorConfig {
+        let config = WgpuBackendConfig {
             enable_timestamps: false,
             memory: WgpuMemoryPolicy {
                 max_transient_bytes: 116,
                 ..WgpuMemoryPolicy::default()
             },
-            ..WgpuAcceleratorConfig::default()
+            ..WgpuBackendConfig::default()
         };
-        let accelerator = match pollster::block_on(WgpuAccelerator::request_default(config)) {
-            Ok(accelerator) => accelerator,
+        let backend = match pollster::block_on(WgpuBackend::request_default(config)) {
+            Ok(backend) => backend,
             Err(Error::NoAdapter) => {
                 eprintln!("skipping GPU test: no wgpu adapter is available");
                 return;
@@ -1605,7 +1594,7 @@ mod tests {
             Err(error) => panic!("failed to initialize GPU test device: {error}"),
         };
         let extent = Extent2d::new(3, 3);
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(extent), copy_chain_plan(extent))
             .expect("create transient-budget session");
         session
@@ -1624,7 +1613,7 @@ mod tests {
             })
             .expect("enqueue transient-budget source");
 
-        if accelerator.direct_readback_enabled() {
+        if backend.direct_readback_enabled() {
             let token = session
                 .submit(RenderIntent::Final)
                 .expect("direct readback fits without staging");
@@ -1665,7 +1654,7 @@ mod tests {
 
     #[test]
     fn every_portable_shader_executes_in_one_submission() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         let one = Extent2d::new(1, 1);
@@ -1797,7 +1786,7 @@ mod tests {
                 layout: OutputLayout::Interleaved,
             }],
         });
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(two), plan)
             .expect("create portable shader session");
         session
@@ -1856,7 +1845,7 @@ mod tests {
 
     #[test]
     fn upsample_2x_4x_and_8x_execute_on_gpu() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         for factor in [2_u8, 4, 8] {
@@ -1912,7 +1901,7 @@ mod tests {
                     layout: OutputLayout::Planar,
                 }],
             });
-            let mut session = accelerator
+            let mut session = backend
                 .create_session(&frame_desc(output_extent), plan)
                 .expect("create upsample session");
             session
@@ -1943,7 +1932,7 @@ mod tests {
     }
 
     fn execute_chroma_case(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         axis: ChromaAxis,
         input_extent: Extent2d,
         output_extent: Extent2d,
@@ -1995,7 +1984,7 @@ mod tests {
                 layout: OutputLayout::Planar,
             }],
         });
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame_desc(output_extent), plan)
             .expect("create chroma upsample session");
         session
@@ -2025,12 +2014,12 @@ mod tests {
 
     #[test]
     fn chroma_upsample_matches_codec_edges_on_gpu() {
-        let Some(accelerator) = test_accelerator() else {
+        let Some(backend) = test_backend() else {
             return;
         };
         assert_eq!(
             execute_chroma_case(
-                &accelerator,
+                &backend,
                 ChromaAxis::Horizontal,
                 Extent2d::new(3, 1),
                 Extent2d::new(5, 1),
@@ -2040,7 +2029,7 @@ mod tests {
         );
         assert_eq!(
             execute_chroma_case(
-                &accelerator,
+                &backend,
                 ChromaAxis::Horizontal,
                 Extent2d::new(2, 1),
                 Extent2d::new(4, 1),
@@ -2050,7 +2039,7 @@ mod tests {
         );
         assert_eq!(
             execute_chroma_case(
-                &accelerator,
+                &backend,
                 ChromaAxis::Horizontal,
                 Extent2d::new(1, 1),
                 Extent2d::new(2, 1),
@@ -2060,7 +2049,7 @@ mod tests {
         );
         assert_eq!(
             execute_chroma_case(
-                &accelerator,
+                &backend,
                 ChromaAxis::Vertical,
                 Extent2d::new(1, 3),
                 Extent2d::new(1, 5),

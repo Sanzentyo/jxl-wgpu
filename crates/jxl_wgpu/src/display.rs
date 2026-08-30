@@ -28,7 +28,7 @@ use jxl_gpu_formats::{
 use jxl_gpu_protocol::{Extent2d, OutputLayout, SampleType};
 use wgpu::util::DeviceExt;
 
-use crate::context::WgpuAccelerator;
+use crate::context::WgpuBackend;
 use crate::session::GpuOutputBuffer;
 use crate::video::GpuImageOutput;
 use crate::{Error, Result};
@@ -121,7 +121,7 @@ struct DisplayPipelineInner {
     pipelines: Mutex<HashMap<DisplayPipelineKey, Arc<wgpu::ComputePipeline>>>,
 }
 
-/// Reusable display conversion state associated with one accelerator device and queue.
+/// Reusable display conversion state associated with one backend device and queue.
 #[derive(Clone)]
 pub struct DisplayPipeline {
     inner: Arc<DisplayPipelineInner>,
@@ -137,9 +137,9 @@ impl fmt::Debug for DisplayPipeline {
 }
 
 impl DisplayPipeline {
-    /// Creates a display pipeline that submits convenience operations to `accelerator.queue()`.
-    pub fn new(accelerator: &WgpuAccelerator) -> Self {
-        Self::from_device_queue(accelerator.device().clone(), accelerator.queue().clone())
+    /// Creates a display pipeline that submits convenience operations to `backend.queue()`.
+    pub fn new(backend: &WgpuBackend) -> Self {
+        Self::from_device_queue(backend.device().clone(), backend.queue().clone())
     }
 
     /// Creates a display pipeline for an application-owned device and its queue.

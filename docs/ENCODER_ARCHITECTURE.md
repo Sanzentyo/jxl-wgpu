@@ -1,9 +1,8 @@
 # GPU-only JPEG XL encoder architecture
 
-Status: executable prototype plus production-facing orchestration API. The only profile currently
+Status: executable profile plus production-facing orchestration API. The only profile currently
 advertised by a concrete backend is the deliberately narrow lossless grayscale profile described
-below. Everything else is rejected through a typed capability error; there is no CPU encoder and
-no CPU fallback.
+below. Everything else is rejected through a typed capability error.
 
 ## Non-negotiable boundary
 
@@ -19,8 +18,8 @@ serializes standard JPEG XL metadata, prefix trees, TOC, and group bytes. A GPU 
 failure is an encode failure.
 
 The repository does not vendor or retain `libjxl` as an upstream source tree. The production crates
-use ordinary Cargo dependencies. A pinned clone exists only in the task's `work/` directory for
-read-only specification/implementation audit.
+use ordinary Cargo dependencies; official source is consulted only for specification and
+implementation audits.
 
 ## Implemented profile
 
@@ -127,8 +126,8 @@ LosslessGray8Encoder::encode / encode_container
 
 On native `wgpu`, a small poll helper wakes the runtime-neutral future when mapping completes. A
 browser cannot block `Device::poll`; its synchronous wait returns an error and callers must await.
-This is API-correct but the per-submission native poll helper is a prototype cost to replace with a
-shared device completion pump.
+This is API-correct but the per-submission native poll helper is an implementation cost to replace
+with a shared device completion pump.
 
 `EncoderCapabilities::negotiate` is authoritative. A backend must only list profiles and stages it
 executes. The generic API models animation and progressive plans so these can be implemented without
@@ -160,8 +159,8 @@ codestream bits so the project's GPU
 decoder need not first implement a fully generic JPEG XL entropy parser. Unknown-box-aware decoders,
 including `djxl`, ignore it. It never stores pixels or residuals.
 
-The agreed v1 payload is fixed-width and little-endian. Bit offsets are measured from bit zero of
-the raw codestream's first byte and bits within a byte are LSB-first:
+The acceleration-index payload is fixed-width and little-endian. Bit offsets are measured from bit
+zero of the raw codestream's first byte and bits within a byte are LSB-first:
 
 ```text
 "JWGP"                         [4]
@@ -193,8 +192,8 @@ private data structures without removing the need for GPU token kernels or encod
 TOC decisions.
 
 This project therefore uses focused ordinary dependencies (`jxl_gpu_formats`,
-`jxl_gpu_bitstream`, and `wgpu`) and treats decoder crates as conformance oracles in tests. No source
-fork is required to add the encoder.
+`jxl_gpu_bitstream`, and `wgpu`) and treats decoder crates as conformance oracles in tests. Encoder
+execution remains independent of decoder implementation internals.
 
 ## Official `libjxl` audit
 
@@ -261,7 +260,7 @@ patterns, and proves the last possible four-word event write remains inside the 
 The deterministic integration fixture is `fixtures/gpu_gray8_lossless.jxl` (609 bytes, SHA-256
 `414eb08c62c34d2dd17d0b9f51c3fa1f3c5d750c50fd48d79b76e31f40092ef0`). The test compares newly
 encoded bytes directly with this fixture. Set `JXL_WGPU_WRITE_FIXTURE` to an explicit path when an
-intentional bitstream-version change requires regeneration.
+intentional bitstream-format change requires regeneration.
 
 Run:
 
@@ -289,5 +288,5 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
    quality metrics. CPU readback, continuous decode/encode, and concurrent jobs are distinct benchmark
    scenarios.
 
-Until a slice is implemented and validated, capability negotiation must reject it. A benchmark,
-wrapper, or CPU oracle is not a production fallback.
+Until a slice is implemented and validated, capability negotiation must reject it. Benchmarks,
+wrappers, and CPU oracles do not expand the advertised production capability.

@@ -20,7 +20,7 @@ use wgpu::util::DeviceExt;
 
 use crate::autotune::KernelVariant;
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::context::WgpuAccelerator;
+use crate::context::WgpuBackend;
 use crate::pipeline_cache::{PipelineCache, PipelineKey};
 use crate::planner::{ExecutionPlan, FusedKernel, PlannedDispatch};
 use crate::readback::{ReadbackRequest, stage_output};
@@ -92,7 +92,7 @@ pub(crate) struct EncodedSubmission {
     /// for this submission. Pipeline/driver-private allocations are excluded.
     pub transient_bytes: u64,
     /// Internal buffers that are safe to reuse immediately after this command buffer is submitted
-    /// to the accelerator's queue.
+    /// to the backend's queue.
     pub recycle_after_submit: Vec<PooledBuffer>,
     /// Directly mapped CPU outputs that become reusable only after `wait` has unmapped them.
     pub recycle_after_wait: Vec<PooledBuffer>,
@@ -155,14 +155,14 @@ impl Scheduler {
     }
 
     pub(crate) fn encode(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         plan: &RenderPlan,
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
-            accelerator,
+            backend,
             plan,
             execution,
             groups,
@@ -173,14 +173,14 @@ impl Scheduler {
     }
 
     pub(crate) fn encode_gpu(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         plan: &RenderPlan,
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
-            accelerator,
+            backend,
             plan,
             execution,
             groups,
@@ -191,7 +191,7 @@ impl Scheduler {
     }
 
     pub(crate) fn encode_image(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         plan: &RenderPlan,
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
@@ -199,7 +199,7 @@ impl Scheduler {
         request: &ImageOutputRequest,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
-            accelerator,
+            backend,
             plan,
             execution,
             groups,
@@ -210,7 +210,7 @@ impl Scheduler {
     }
 
     pub(crate) fn encode_gpu_image(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         plan: &RenderPlan,
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
@@ -218,7 +218,7 @@ impl Scheduler {
         request: &ImageOutputRequest,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
-            accelerator,
+            backend,
             plan,
             execution,
             groups,
@@ -229,7 +229,7 @@ impl Scheduler {
     }
 
     fn encode_with_mode(
-        accelerator: &WgpuAccelerator,
+        backend: &WgpuBackend,
         plan: &RenderPlan,
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
@@ -239,27 +239,21 @@ impl Scheduler {
     ) -> Result<EncodedSubmission> {
         Self::validate(plan)?;
         validate_resources(plan, resources)?;
-        let device = &accelerator.device;
+        let device = &backend.device;
         let direct_readback =
-            output_mode == OutputMode::CpuReadback && accelerator.direct_readback_enabled();
+            output_mode == OutputMode::CpuReadback && backend.direct_readback_enabled();
         let output_target = OutputTarget {
             mode: output_mode,
             encoding: output_encoding,
             direct_readback,
         };
         validate_execution(device, plan, execution)?;
-        let transient_bytes = validate_transient_budget(
-            accelerator,
-            plan,
-            execution,
-            groups,
-            resources,
-            output_target,
-        )?;
+        let transient_bytes =
+            validate_transient_budget(backend, plan, execution, groups, resources, output_target)?;
         let factory = PipelineFactory {
             device,
-            cache: &accelerator.pipelines,
-            buffers: &accelerator.buffers,
+            cache: &backend.pipelines,
+            buffers: &backend.buffers,
         };
         let alignment = resident_alignment(device);
         let slot_sizes = resident_slot_sizes(execution, alignment)?;
@@ -272,9 +266,9 @@ impl Scheduler {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST;
                 let lease = if zero_required_slots.contains(&offset) {
-                    accelerator.buffers.acquire_zeroed(&label, size, usage)
+                    backend.buffers.acquire_zeroed(&label, size, usage)
                 } else {
-                    accelerator.buffers.acquire(&label, size, usage)
+                    backend.buffers.acquire(&label, size, usage)
                 };
                 (offset, lease)
             })
@@ -311,14 +305,7 @@ impl Scheduler {
                     ResourceData::Plane(plane) if plane.id == desc.id => Some(plane),
                     _ => None,
                 }));
-                upload_plane_to_slot(
-                    &accelerator.queue,
-                    desc,
-                    fragments,
-                    slot,
-                    slot_size,
-                    allocation,
-                )?
+                upload_plane_to_slot(&backend.queue, desc, fragments, slot, slot_size, allocation)?
             } else {
                 plane_in_slot(desc, slot, slot_size, allocation)?
             };
@@ -389,7 +376,7 @@ impl Scheduler {
                             1
                         }
                         RenderOp::VarDct { .. } => vardct::encode(
-                            accelerator,
+                            backend,
                             &mut encoder,
                             plan,
                             node,
@@ -551,11 +538,11 @@ impl Scheduler {
             }
         }
 
-        // VarDCT can leave unsupported/preview regions untouched, so its output slots require a
-        // known-zero initial state. Only those cache candidates are cleared after every Save has
-        // consumed them. Full-frame kernels and zero-filled source uploads overwrite their complete
-        // bound regions and can reuse dirty allocations without this bandwidth cost. The next queue
-        // write and submission are ordered after the tail clear.
+        // VarDCT writes only the declared DCT8 task rectangles, so pixels outside those rectangles
+        // require a known-zero initial state. Only those cache candidates are cleared after every
+        // Save has consumed them. Full-frame kernels and zero-filled source uploads overwrite their
+        // complete bound regions and can reuse dirty allocations without this bandwidth cost. The
+        // next queue write and submission are ordered after the tail clear.
         for (&offset, lease) in &mut slot_leases {
             if zero_required_slots.contains(&offset) && lease.cacheable() {
                 encoder.clear_buffer(lease.buffer(), 0, None);
@@ -614,7 +601,7 @@ fn validate_resources(
 }
 
 fn validate_transient_budget(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     plan: &RenderPlan,
     execution: &ExecutionPlan,
     groups: &BTreeMap<GroupId, GroupPayload>,
@@ -622,7 +609,7 @@ fn validate_transient_budget(
     output_target: OutputTarget<'_>,
 ) -> Result<u64> {
     let required = transient_bytes(plan, execution, groups, resources, output_target)?;
-    let budget = accelerator.config.memory.max_transient_bytes;
+    let budget = backend.config.memory.max_transient_bytes;
     if required > budget {
         return Err(Error::ResourceLimit(format!(
             "submission needs {required} bytes of explicit transient GPU buffers, exceeding the configured limit of {budget} bytes"
@@ -2518,7 +2505,7 @@ fn allocate_output_buffer(
         (buffer, Some(pooled))
     } else {
         // Public GPU outputs can outlive the frame session. They must never enter a cache whose
-        // reuse lifetime is controlled by the accelerator rather than by the public Arc owner.
+        // reuse lifetime is controlled by the backend rather than by the public Arc owner.
         let buffer = Arc::new(factory.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
@@ -2954,8 +2941,8 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     use jxl_gpu_protocol::{
-        Border2d, Extent2d, FallbackGranularity, OutputDesc, OutputId, PlaneRole,
-        PrecisionContract, RenderNode, SaveParams, Scale2d,
+        Border2d, Extent2d, OutputDesc, OutputId, PlaneRole, PrecisionContract, RenderNode,
+        SaveParams, Scale2d,
     };
 
     use crate::arena::{ArenaAllocation, ArenaPlan};
@@ -3010,7 +2997,6 @@ mod tests {
     fn execution(allocations: Vec<ArenaAllocation>, size_bytes: u64) -> ExecutionPlan {
         ExecutionPlan {
             memory_mode: MemoryMode::Resident,
-            fallback: FallbackGranularity::WholeFrame,
             dispatches: Vec::new(),
             arena: ArenaPlan {
                 size_bytes,

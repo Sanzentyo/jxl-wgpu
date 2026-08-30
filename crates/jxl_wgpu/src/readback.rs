@@ -103,7 +103,7 @@ pub(crate) fn resolve_outputs(
     _requests: Vec<ReadbackRequest>,
 ) -> Result<Vec<RenderedOutput>> {
     Err(Error::Unsupported(
-        "the synchronous AcceleratedFrameSession::wait API cannot block browser WebGPU".into(),
+        "the synchronous FrameSession::wait API cannot block browser WebGPU".into(),
     ))
 }
 
@@ -235,14 +235,14 @@ impl std::fmt::Debug for ImageReadbackPipeline {
 }
 
 impl ImageReadbackPipeline {
-    /// Uses the accelerator's transient-memory policy and exact device/queue pair.
+    /// Uses the backend's transient-memory policy and exact device/queue pair.
     #[must_use]
-    pub fn new(accelerator: &crate::WgpuAccelerator) -> Self {
+    pub fn new(backend: &crate::WgpuBackend) -> Self {
         Self::from_device_queue(
-            accelerator.device().clone(),
-            accelerator.queue().clone(),
+            backend.device().clone(),
+            backend.queue().clone(),
             ImageReadbackLimits {
-                max_transient_bytes: accelerator.config.memory.max_transient_bytes,
+                max_transient_bytes: backend.config.memory.max_transient_bytes,
             },
         )
     }
@@ -587,23 +587,21 @@ mod batch_tests {
     use wgpu::util::DeviceExt;
 
     use super::*;
-    use crate::{GpuImageOutput, WgpuAcceleratorConfig};
+    use crate::{GpuImageOutput, WgpuBackendConfig};
 
-    fn accelerator() -> Option<crate::WgpuAccelerator> {
-        match pollster::block_on(crate::WgpuAccelerator::request_default(
-            WgpuAcceleratorConfig {
-                enable_timestamps: false,
-                ..WgpuAcceleratorConfig::default()
-            },
-        )) {
-            Ok(accelerator) => Some(accelerator),
+    fn backend() -> Option<crate::WgpuBackend> {
+        match pollster::block_on(crate::WgpuBackend::request_default(WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        })) {
+            Ok(backend) => Some(backend),
             Err(Error::NoAdapter) => None,
             Err(error) => panic!("failed to create test adapter: {error}"),
         }
     }
 
     fn output(
-        accelerator: &crate::WgpuAccelerator,
+        backend: &crate::WgpuBackend,
         id: u32,
         extent: Extent2d,
         logical_bytes: &[u8],
@@ -617,7 +615,7 @@ mod batch_tests {
         assert_eq!(layout.logical_size as usize, logical_bytes.len());
         let mut bytes = logical_bytes.to_vec();
         bytes.resize(bytes.len().div_ceil(4) * 4, 0);
-        let buffer = Arc::new(accelerator.device().create_buffer_init(
+        let buffer = Arc::new(backend.device().create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("jxl-wgpu batch readback test source"),
                 contents: &bytes,
@@ -641,30 +639,28 @@ mod batch_tests {
 
     #[test]
     fn aggregate_wait_preserves_output_order_and_padding_stats() {
-        let Some(accelerator) = accelerator() else {
+        let Some(backend) = backend() else {
             return;
         };
         let first = (0..9).collect::<Vec<u8>>();
         let second = vec![90, 91, 92, 93];
         let frame = frame(vec![
             output(
-                &accelerator,
+                &backend,
                 1,
                 Extent2d::new(3, 3),
                 &first,
                 wgpu::BufferUsages::COPY_SRC,
             ),
             output(
-                &accelerator,
+                &backend,
                 2,
                 Extent2d::new(2, 2),
                 &second,
                 wgpu::BufferUsages::COPY_SRC,
             ),
         ]);
-        let submission = ImageReadbackPipeline::new(&accelerator)
-            .submit(&frame)
-            .unwrap();
+        let submission = ImageReadbackPipeline::new(&backend).submit(&frame).unwrap();
         assert_eq!(
             submission.stats(),
             ImageReadbackStats {
@@ -682,20 +678,18 @@ mod batch_tests {
 
     #[test]
     fn aggregate_submission_is_a_runtime_neutral_future() {
-        let Some(accelerator) = accelerator() else {
+        let Some(backend) = backend() else {
             return;
         };
         let expected = vec![1, 3, 5, 7, 9, 11];
         let frame = frame(vec![output(
-            &accelerator,
+            &backend,
             3,
             Extent2d::new(3, 2),
             &expected,
             wgpu::BufferUsages::COPY_SRC,
         )]);
-        let submission = ImageReadbackPipeline::new(&accelerator)
-            .submit(&frame)
-            .unwrap();
+        let submission = ImageReadbackPipeline::new(&backend).submit(&frame).unwrap();
         let result = pollster::block_on(submission).unwrap();
         assert_eq!(result.frame.outputs[0].bytes, expected);
         assert_eq!(result.stats.staging_bytes, 8);
@@ -703,19 +697,19 @@ mod batch_tests {
 
     #[test]
     fn aggregate_plan_typed_rejects_limits_usage_and_empty_frames() {
-        let Some(accelerator) = accelerator() else {
+        let Some(backend) = backend() else {
             return;
         };
         let valid = frame(vec![output(
-            &accelerator,
+            &backend,
             4,
             Extent2d::new(3, 3),
             &[0; 9],
             wgpu::BufferUsages::COPY_SRC,
         )]);
         let limited = ImageReadbackPipeline::from_device_queue(
-            accelerator.device().clone(),
-            accelerator.queue().clone(),
+            backend.device().clone(),
+            backend.queue().clone(),
             ImageReadbackLimits {
                 max_transient_bytes: 11,
             },
@@ -729,18 +723,18 @@ mod batch_tests {
         ));
 
         let wrong_usage = frame(vec![output(
-            &accelerator,
+            &backend,
             5,
             Extent2d::new(2, 2),
             &[1; 4],
             wgpu::BufferUsages::STORAGE,
         )]);
         assert!(matches!(
-            ImageReadbackPipeline::new(&accelerator).submit(&wrong_usage),
+            ImageReadbackPipeline::new(&backend).submit(&wrong_usage),
             Err(Error::ImageReadbackSourceUsage { output: 0 })
         ));
         assert!(matches!(
-            ImageReadbackPipeline::new(&accelerator).submit(&frame(Vec::new())),
+            ImageReadbackPipeline::new(&backend).submit(&frame(Vec::new())),
             Err(Error::ImageReadbackEmpty)
         ));
     }

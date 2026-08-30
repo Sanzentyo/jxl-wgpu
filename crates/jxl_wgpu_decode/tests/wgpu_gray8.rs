@@ -7,12 +7,12 @@ use jxl_gpu_formats::{
     Channel, ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, PixelFormat, SampleKind,
     TransferFunction,
 };
-use jxl_wgpu::{WgpuAccelerator, WgpuAcceleratorConfig};
+use jxl_wgpu::{DirectReadbackPolicy, WgpuBackend, WgpuBackendConfig};
 use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, WgpuSubmissionEngine};
 
 const INDEXED_GRAY8: &[u8] = include_bytes!("../../../fixtures/gpu_gray8_lossless.jxl");
 
-fn accelerator() -> Option<WgpuAccelerator> {
+fn backend() -> Option<WgpuBackend> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::None,
@@ -31,34 +31,33 @@ fn accelerator() -> Option<WgpuAccelerator> {
         trace: wgpu::Trace::Off,
     }))
     .ok()?;
-    let config = WgpuAcceleratorConfig {
+    let config = WgpuBackendConfig {
         enable_timestamps: false,
-        enable_direct_readback: false,
-        ..WgpuAcceleratorConfig::default()
+        direct_readback_policy: DirectReadbackPolicy::Disabled,
+        ..WgpuBackendConfig::default()
     };
-    WgpuAccelerator::from_device(device, queue, info, config).ok()
+    WgpuBackend::from_device(device, queue, info, config).ok()
 }
 
-fn read_output(accelerator: &WgpuAccelerator, output: &jxl_wgpu::GpuImageOutput) -> Vec<u8> {
-    let staging = accelerator.device().create_buffer(&wgpu::BufferDescriptor {
+fn read_output(backend: &WgpuBackend, output: &jxl_wgpu::GpuImageOutput) -> Vec<u8> {
+    let staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("indexed Gray8 test output readback"),
         size: output.buffer.size(),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut commands =
-        accelerator
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("indexed Gray8 test readback commands"),
-            });
+    let mut commands = backend
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("indexed Gray8 test readback commands"),
+        });
     commands.copy_buffer_to_buffer(&output.buffer, 0, &staging, 0, output.buffer.size());
     let (sender, receiver) = mpsc::sync_channel(1);
     commands.map_buffer_on_submit(&staging, wgpu::MapMode::Read, .., move |result| {
         let _ = sender.send(result);
     });
-    let submission = accelerator.queue().submit([commands.finish()]);
-    accelerator
+    let submission = backend.queue().submit([commands.finish()]);
+    backend
         .device()
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
@@ -95,11 +94,11 @@ fn expected_pixels() -> Vec<u8> {
 
 #[test]
 fn indexed_jxl_entropy_and_gradient_reconstruct_exact_gray8_on_gpu() {
-    let Some(accelerator) = accelerator() else {
+    let Some(backend) = backend() else {
         eprintln!("skipping indexed Gray8 decode test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(accelerator.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone());
     let request = GpuOutputRequest::new(PixelFormat::non_color(
         SampleKind::Unsigned,
         8,
@@ -117,12 +116,12 @@ fn indexed_jxl_entropy_and_gradient_reconstruct_exact_gray8_on_gpu() {
         (output.layout.extent.width, output.layout.extent.height),
         (17, 13)
     );
-    assert_eq!(read_output(&accelerator, output), expected_pixels());
+    assert_eq!(read_output(&backend, output), expected_pixels());
 }
 
 #[test]
 fn indexed_gray8_writes_native_limited_nv12_without_rgb_readback() {
-    let Some(accelerator) = accelerator() else {
+    let Some(backend) = backend() else {
         eprintln!("skipping indexed Gray8 NV12 test: no wgpu adapter");
         return;
     };
@@ -131,7 +130,7 @@ fn indexed_gray8_writes_native_limited_nv12_without_rgb_readback() {
     // packing/range conversion from transfer-function conversion.
     spec.transfer = TransferFunction::Srgb;
     let format = PixelFormat::nv12(ColorSpecification::Defined(spec));
-    let decoder = GpuDecoder::wgpu(accelerator.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone());
     let mut session = decoder
         .open(INDEXED_GRAY8, GpuOutputRequest::new(format))
         .expect("native NV12 request is supported");
@@ -140,7 +139,7 @@ fn indexed_gray8_writes_native_limited_nv12_without_rgb_readback() {
         .expect("GPU NV12 decode succeeds")
         .expect("one frame is returned");
     let output = &frame.output().outputs[0];
-    let bytes = read_output(&accelerator, output);
+    let bytes = read_output(&backend, output);
     let y_plane = &output.layout.planes[0];
     for (index, sample) in expected_pixels().into_iter().enumerate() {
         let expected = (16.0 + 219.0 * f32::from(sample) / 255.0).round() as u8;
@@ -154,12 +153,12 @@ fn indexed_gray8_writes_native_limited_nv12_without_rgb_readback() {
 
 #[test]
 fn indexed_gpu_future_reports_and_releases_bounded_memory() {
-    let Some(accelerator) = accelerator() else {
+    let Some(backend) = backend() else {
         eprintln!("skipping indexed Gray8 async test: no wgpu adapter");
         return;
     };
     let engine = WgpuSubmissionEngine::with_memory_budget(
-        accelerator.clone(),
+        backend.clone(),
         NonZeroU64::new(1024 * 1024).unwrap(),
     );
     let decoder = GpuDecoder::new(engine);
@@ -182,7 +181,7 @@ fn indexed_gpu_future_reports_and_releases_bounded_memory() {
         .expect("runtime-neutral GPU future succeeds")
         .expect("one frame is returned");
     assert_eq!(
-        read_output(&accelerator, &frame.output().outputs[0]),
+        read_output(&backend, &frame.output().outputs[0]),
         expected_pixels()
     );
     drop(frame);

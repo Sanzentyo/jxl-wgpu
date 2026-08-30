@@ -17,8 +17,8 @@ use jxl_gpu_formats::{
 };
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
-    DisplayPipeline, DisplayTextureDescriptor, ImageReadbackPipeline, WgpuAccelerator,
-    WgpuAcceleratorConfig,
+    DisplayPipeline, DisplayTextureDescriptor, ImageReadbackPipeline, WgpuBackend,
+    WgpuBackendConfig,
 };
 use jxl_wgpu_decode::{Error as DecodeError, GpuDecoder, GpuOutputRequest};
 use jxl_wgpu_encode::{BufferImageSource, EncodeError, LosslessGray8Encoder, WgpuContext};
@@ -346,11 +346,9 @@ impl CodecRunOptions {
     }
 }
 
-pub fn request_accelerator() -> Result<Option<WgpuAccelerator>> {
-    match pollster::block_on(WgpuAccelerator::request_default(
-        WgpuAcceleratorConfig::default(),
-    )) {
-        Ok(accelerator) => Ok(Some(accelerator)),
+pub fn request_backend() -> Result<Option<WgpuBackend>> {
+    match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig::default())) {
+        Ok(backend) => Ok(Some(backend)),
         Err(jxl_wgpu::Error::NoAdapter) => Ok(None),
         Err(error) => Err(Error::BackendUnavailable(error.to_string())),
     }
@@ -358,7 +356,7 @@ pub fn request_accelerator() -> Result<Option<WgpuAccelerator>> {
 
 pub fn run_codec_case(
     case: &CodecCorpusCase,
-    accelerator: Option<&WgpuAccelerator>,
+    backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> CodecCaseReport {
     let encoded_bytes = std::fs::metadata(&case.path).map_or(0, |metadata| metadata.len());
@@ -383,14 +381,14 @@ pub fn run_codec_case(
     effective_options.extent = extent;
 
     let execution = match effective_options.operation {
-        CodecOperation::Decode => run_decode(&case.path, accelerator, &effective_options),
-        CodecOperation::Encode => run_encode(&case.path, accelerator, &effective_options),
-        CodecOperation::RoundTrip => run_round_trip(&case.path, accelerator, &effective_options),
+        CodecOperation::Decode => run_decode(&case.path, backend, &effective_options),
+        CodecOperation::Encode => run_encode(&case.path, backend, &effective_options),
+        CodecOperation::RoundTrip => run_round_trip(&case.path, backend, &effective_options),
     };
     match execution {
         Ok(execution) => {
             report.status = CaseStatus::Passed;
-            report.adapter = accelerator.map(|value| value.adapter_info().name.clone());
+            report.adapter = backend.map(|value| value.adapter_info().name.clone());
             report.frame_count = execution.frame_count;
             report.output_bytes = execution.output_bytes;
             report.codec_submissions = execution.codec_submissions;
@@ -402,7 +400,7 @@ pub fn run_codec_case(
         Err(issue) => {
             report.status = issue.status();
             report.issue = Some(issue);
-            report.adapter = accelerator.map(|value| value.adapter_info().name.clone());
+            report.adapter = backend.map(|value| value.adapter_info().name.clone());
         }
     }
     report
@@ -410,11 +408,11 @@ pub fn run_codec_case(
 
 fn run_decode(
     path: &Path,
-    accelerator: Option<&WgpuAccelerator>,
+    backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<WorkloadExecution, CodecIssue> {
     validate_decode_path(path)?;
-    let accelerator = accelerator.ok_or_else(|| {
+    let backend = backend.ok_or_else(|| {
         CodecIssue::new(
             CodecIssueKind::Unavailable,
             "wgpu_adapter",
@@ -430,11 +428,11 @@ fn run_decode(
             error.to_string(),
         )
     })?);
-    let decoder = GpuDecoder::wgpu(accelerator.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone());
     let display = (options.output_target == OutputTarget::DisplayTexture)
-        .then(|| DisplayPipeline::new(accelerator));
+        .then(|| DisplayPipeline::new(backend));
     let readback = (options.output_target == OutputTarget::CpuReadback)
-        .then(|| ImageReadbackPipeline::new(accelerator));
+        .then(|| ImageReadbackPipeline::new(backend));
     let max_in_flight =
         NonZeroUsize::new(usize::try_from(options.workload.max_in_flight).unwrap_or(usize::MAX))
             .expect("validated max-in-flight is nonzero");
@@ -456,10 +454,10 @@ fn run_decode(
 
 fn run_encode(
     path: &Path,
-    accelerator: Option<&WgpuAccelerator>,
+    backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<WorkloadExecution, CodecIssue> {
-    let prepared = prepare_gray8_encode(path, accelerator, options)?;
+    let prepared = prepare_gray8_encode(path, backend, options)?;
     execute_workload(options.workload, || {
         let encoded = prepared
             .encoder
@@ -485,10 +483,10 @@ struct PreparedGray8Encode {
 
 fn prepare_gray8_encode(
     path: &Path,
-    accelerator: Option<&WgpuAccelerator>,
+    backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<PreparedGray8Encode, CodecIssue> {
-    let accelerator = accelerator.ok_or_else(no_adapter_issue)?;
+    let backend = backend.ok_or_else(no_adapter_issue)?;
     if options.format != GpuPixelFormat::Gray8 {
         return Err(CodecIssue::new(
             CodecIssueKind::Unsupported,
@@ -550,17 +548,19 @@ fn prepare_gray8_encode(
     })?;
     let padded_len = bytes.len().div_ceil(4) * 4;
     bytes.resize(padded_len, 0);
-    let buffer = Arc::new(accelerator.device().create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-gpu-harness gray8 source"),
-            contents: &bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        },
-    ));
+    let buffer = Arc::new(
+        backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-gpu-harness gray8 source"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    );
     let source = BufferImageSource::new(buffer, layout).map_err(encode_issue)?;
     let context = WgpuContext::new(
-        Arc::new(accelerator.device().clone()),
-        Arc::new(accelerator.queue().clone()),
+        Arc::new(backend.device().clone()),
+        Arc::new(backend.queue().clone()),
     );
     Ok(PreparedGray8Encode {
         encoder: LosslessGray8Encoder::new(context),
@@ -571,10 +571,10 @@ fn prepare_gray8_encode(
 
 fn run_round_trip(
     path: &Path,
-    accelerator: Option<&WgpuAccelerator>,
+    backend: Option<&WgpuBackend>,
     options: &CodecRunOptions,
 ) -> std::result::Result<WorkloadExecution, CodecIssue> {
-    let accelerator = accelerator.ok_or_else(no_adapter_issue)?;
+    let backend = backend.ok_or_else(no_adapter_issue)?;
     if options.output_target != OutputTarget::CpuReadback {
         return Err(CodecIssue::new(
             CodecIssueKind::Unsupported,
@@ -583,10 +583,10 @@ fn run_round_trip(
             "exact round-trip verification currently requires --output-target cpu-readback",
         ));
     }
-    let prepared = prepare_gray8_encode(path, Some(accelerator), options)?;
-    let decoder = GpuDecoder::wgpu(accelerator.clone());
+    let prepared = prepare_gray8_encode(path, Some(backend), options)?;
+    let decoder = GpuDecoder::wgpu(backend.clone());
     let request = GpuOutputRequest::new(options.format.pixel_format());
-    let readback = ImageReadbackPipeline::new(accelerator);
+    let readback = ImageReadbackPipeline::new(backend);
     execute_workload(options.workload, || {
         let encoded = prepared
             .encoder
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn actual_gray8_encode_workload_runs_when_an_adapter_exists() {
-        let Some(accelerator) = request_accelerator().unwrap() else {
+        let Some(backend) = request_backend().unwrap() else {
             return;
         };
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic.jxl");
@@ -1122,7 +1122,7 @@ mod tests {
             size_class: SizeClass::Auto,
             extent: None,
         };
-        let report = run_codec_case(&case, Some(&accelerator), &options);
+        let report = run_codec_case(&case, Some(&backend), &options);
         assert_eq!(report.status, CaseStatus::Passed);
         assert_eq!(report.codec_submissions, 1);
         assert!(report.output_bytes > 0);
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn actual_gray8_encode_decode_round_trip_is_exact_when_an_adapter_exists() {
-        let Some(accelerator) = request_accelerator().unwrap() else {
+        let Some(backend) = request_backend().unwrap() else {
             return;
         };
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic.jxl");
@@ -1152,7 +1152,7 @@ mod tests {
             size_class: SizeClass::Auto,
             extent: None,
         };
-        let report = run_codec_case(&case, Some(&accelerator), &options);
+        let report = run_codec_case(&case, Some(&backend), &options);
         assert_eq!(report.status, CaseStatus::Passed, "{:?}", report.issue);
         assert_eq!(report.codec_submissions, 2);
         assert_eq!(report.readback_submissions, 1);
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn actual_gray8_decode_submits_native_nv12_display_without_host_readback() {
-        let Some(accelerator) = request_accelerator().unwrap() else {
+        let Some(backend) = request_backend().unwrap() else {
             return;
         };
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic.jxl");
@@ -1177,10 +1177,10 @@ mod tests {
                 height: 13,
             }),
         };
-        let prepared = prepare_gray8_encode(&path, Some(&accelerator), &encode_options).unwrap();
+        let prepared = prepare_gray8_encode(&path, Some(&backend), &encode_options).unwrap();
         let encoded = prepared.encoder.encode_container(prepared.source).unwrap();
-        let decoder = GpuDecoder::wgpu(accelerator.clone());
-        let display = DisplayPipeline::new(&accelerator);
+        let decoder = GpuDecoder::wgpu(backend.clone());
+        let display = DisplayPipeline::new(&backend);
         let observation = decode_once(
             &decoder,
             Arc::from(encoded),

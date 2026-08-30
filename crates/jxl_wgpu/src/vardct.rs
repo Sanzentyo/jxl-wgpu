@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Bounded VarDCT packet validation, DCT8 execution, and CPU fallback compositing.
+//! Bounded VarDCT packet validation and DCT8 execution.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -17,7 +17,7 @@ use jxl_gpu_protocol::{
 use wgpu::util::DeviceExt;
 
 use crate::autotune::KernelVariant;
-use crate::context::WgpuAccelerator;
+use crate::context::WgpuBackend;
 use crate::pipeline_cache::PipelineKey;
 use crate::upload::UploadedPlane;
 use crate::{Error, Result};
@@ -52,20 +52,6 @@ impl Rect {
         })
     }
 
-    fn from_fallback(region: jxl_gpu_protocol::Region) -> Result<Self> {
-        if region.x < 0 || region.y < 0 || region.width == 0 || region.height == 0 {
-            return Err(Error::InvalidPayload(format!(
-                "CPU fallback region {region:?} is not a non-empty positive rectangle"
-            )));
-        }
-        Ok(Self {
-            x: region.x as u32,
-            y: region.y as u32,
-            width: region.width,
-            height: region.height,
-        })
-    }
-
     fn right(self) -> Option<u32> {
         self.x.checked_add(self.width)
     }
@@ -77,24 +63,6 @@ impl Rect {
     fn is_within(self, width: u32, height: u32) -> bool {
         self.right().is_some_and(|right| right <= width)
             && self.bottom().is_some_and(|bottom| bottom <= height)
-    }
-
-    fn area(self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
-    }
-
-    fn intersection_area(self, other: Self) -> u64 {
-        let x0 = self.x.max(other.x);
-        let y0 = self.y.max(other.y);
-        let x1 = self
-            .right()
-            .unwrap_or(u32::MAX)
-            .min(other.right().unwrap_or(u32::MAX));
-        let y1 = self
-            .bottom()
-            .unwrap_or(u32::MAX)
-            .min(other.bottom().unwrap_or(u32::MAX));
-        u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
     }
 }
 
@@ -160,15 +128,6 @@ struct GpuTask {
     lf_index: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct FallbackPixel {
-    position: u32,
-    value_x: f32,
-    value_y: f32,
-    value_b: f32,
-}
-
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct Dct8Uniform {
@@ -186,17 +145,6 @@ struct Dct8Uniform {
     quant_biases: [f32; 4],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct FallbackUniform {
-    pixel_count: u32,
-    output_width: u32,
-    output_stride_x: u32,
-    output_stride_y: u32,
-    output_stride_b: u32,
-    _padding: [u32; 3],
-}
-
 struct PreparedVarDct {
     coefficients: Vec<i32>,
     tasks: Vec<GpuTask>,
@@ -206,7 +154,6 @@ struct PreparedVarDct {
     correlation_offset: u32,
     lf_offset: u32,
     quant_biases: [f32; 4],
-    fallback_pixels: Vec<FallbackPixel>,
 }
 
 pub(crate) fn has_node(plan: &RenderPlan) -> bool {
@@ -270,11 +217,34 @@ fn validate_node(plan: &RenderPlan, node: &RenderNode) -> Result<()> {
 }
 
 pub(crate) fn validate_packet(packet: &VarDctPacket) -> Result<()> {
+    for bucket in &packet.buckets {
+        if bucket.transform != TransformKind::Dct8 {
+            return Err(Error::Unsupported(format!(
+                "VarDCT transform {:?} is unsupported; the portable backend executes only DCT8",
+                bucket.transform
+            )));
+        }
+        for task in &bucket.tasks {
+            if task.hshift != 0 || task.vshift != 0 {
+                return Err(Error::Unsupported(format!(
+                    "shifted DCT8 task ({}, {}) is unsupported by the portable backend",
+                    task.hshift, task.vshift
+                )));
+            }
+        }
+    }
+
     let coefficient_len = coefficient_len(&packet.coefficients)?;
     validate_packed_overflow(&packet.coefficients, coefficient_len)?;
     for bucket in &packet.buckets {
         for task in &bucket.tasks {
             let _ = Rect::from_task(task)?;
+            if task.block_width != 8 || task.block_height != 8 {
+                return Err(Error::InvalidPayload(format!(
+                    "DCT8 task declares {}x{} pixels instead of 8x8",
+                    task.block_width, task.block_height
+                )));
+            }
             let start =
                 usize::try_from(task.coefficient_offset).map_err(|_| Error::BufferSizeOverflow)?;
             let count =
@@ -285,26 +255,6 @@ pub(crate) fn validate_packet(packet: &VarDctPacket) -> Result<()> {
                     "VarDCT coefficient range {start}..{end} exceeds packet length {coefficient_len}"
                 )));
             }
-        }
-    }
-    for tile in &packet.cpu_fallback_tiles {
-        let rect = Rect::from_fallback(tile.region)?;
-        let area = usize::try_from(rect.area()).map_err(|_| Error::BufferSizeOverflow)?;
-        if tile.channels.iter().any(|channel| channel.len() != area) {
-            return Err(Error::InvalidPayload(format!(
-                "CPU fallback tile {:?} does not contain exactly {area} samples per channel",
-                tile.region
-            )));
-        }
-        if tile
-            .channels
-            .iter()
-            .flatten()
-            .any(|sample| !sample.is_finite())
-        {
-            return Err(Error::InvalidPayload(
-                "CPU fallback tile contains a non-finite sample".into(),
-            ));
         }
     }
     Ok(())
@@ -467,9 +417,7 @@ fn prepare(
     let output_height = output.extent.height;
     let mut coefficients = Vec::new();
     let mut tasks = Vec::new();
-    let mut all_task_rects = Vec::new();
-    let mut supported_rects = Vec::new();
-    let mut unsupported = Vec::new();
+    let mut task_rects = Vec::new();
 
     for (group_id, group) in groups {
         let Some(packet) = &group.vardct else {
@@ -485,23 +433,7 @@ fn prepare(
                         "VarDCT task in group {group_id:?} writes {rect:?} outside {output_width}x{output_height}"
                     )));
                 }
-                all_task_rects.push(rect);
-
-                let dct8_shape = task.block_width == 8 && task.block_height == 8;
-                let supported = bucket.transform == TransformKind::Dct8
-                    && dct8_shape
-                    && task.hshift == 0
-                    && task.vshift == 0;
-                if bucket.transform == TransformKind::Dct8 && !dct8_shape {
-                    return Err(Error::InvalidPayload(format!(
-                        "DCT8 task declares {}x{} pixels instead of 8x8",
-                        task.block_width, task.block_height
-                    )));
-                }
-                if !supported {
-                    unsupported.push((bucket.transform, rect));
-                    continue;
-                }
+                task_rects.push(rect);
                 if usize::try_from(task.coefficient_count).ok() != Some(DCT8_COEFFICIENTS_PER_TASK)
                 {
                     return Err(Error::InvalidPayload(format!(
@@ -536,99 +468,15 @@ fn prepare(
                     correlation_index: u32::from(task.correlation_index),
                     lf_index: task.lf_index,
                 });
-                supported_rects.push(rect);
             }
         }
     }
 
-    if let Some((first, second)) = find_rect_overlap(&all_task_rects)? {
-        let rect = all_task_rects[first.max(second)];
+    if let Some((first, second)) = find_rect_overlap(&task_rects)? {
+        let rect = task_rects[first.max(second)];
         return Err(Error::InvalidPayload(format!(
             "VarDCT task destination {rect:?} overlaps another task"
         )));
-    }
-
-    let mut fallback_rects = Vec::new();
-    let mut fallback_tiles = Vec::new();
-    for group in groups.values() {
-        let Some(packet) = &group.vardct else {
-            continue;
-        };
-        for tile in &packet.cpu_fallback_tiles {
-            let rect = Rect::from_fallback(tile.region)?;
-            if !rect.is_within(output_width, output_height) {
-                return Err(Error::InvalidPayload(format!(
-                    "CPU fallback tile {rect:?} exceeds {output_width}x{output_height}"
-                )));
-            }
-            fallback_rects.push(rect);
-            fallback_tiles.push((tile, rect));
-        }
-    }
-
-    let mut output_rects = supported_rects.clone();
-    output_rects.extend_from_slice(&fallback_rects);
-    if let Some((first, second)) = find_rect_overlap(&output_rects)? {
-        let fallback_start = supported_rects.len();
-        let fallback_index = if first >= fallback_start {
-            first
-        } else {
-            second
-        };
-        let rect = output_rects[fallback_index];
-        return Err(Error::InvalidPayload(format!(
-            "CPU fallback tile {rect:?} overlaps another fallback or GPU DCT8 task"
-        )));
-    }
-
-    let mut fallback_pixels = Vec::new();
-    for (tile, rect) in fallback_tiles {
-        let width = rect.width as usize;
-        for row in 0..rect.height as usize {
-            for column in 0..width {
-                let source = row
-                    .checked_mul(width)
-                    .and_then(|offset| offset.checked_add(column))
-                    .ok_or(Error::BufferSizeOverflow)?;
-                let x = rect
-                    .x
-                    .checked_add(column as u32)
-                    .ok_or(Error::BufferSizeOverflow)?;
-                let y = rect
-                    .y
-                    .checked_add(row as u32)
-                    .ok_or(Error::BufferSizeOverflow)?;
-                let position = y
-                    .checked_mul(output_width)
-                    .and_then(|offset| offset.checked_add(x))
-                    .ok_or(Error::BufferSizeOverflow)?;
-                fallback_pixels.push(FallbackPixel {
-                    position,
-                    value_x: tile.channels[0][source],
-                    value_y: tile.channels[1][source],
-                    value_b: tile.channels[2][source],
-                });
-            }
-        }
-    }
-
-    let exact_fallbacks = fallback_rects
-        .iter()
-        .map(|rect| (rect.x, rect.y, rect.width, rect.height))
-        .collect::<BTreeSet<_>>();
-    for (kind, rect) in unsupported {
-        if exact_fallbacks.contains(&(rect.x, rect.y, rect.width, rect.height)) {
-            continue;
-        }
-        let covered = fallback_rects
-            .iter()
-            .map(|fallback| rect.intersection_area(*fallback))
-            .sum::<u64>();
-        if covered != rect.area() {
-            return Err(Error::Unsupported(format!(
-                "VarDCT {kind:?} region {rect:?} has no complete CPU fallback tile"
-            )));
-        }
     }
 
     let (resource_vectors, quant_offset, matrix_offset, correlation_offset, lf_offset) =
@@ -642,7 +490,6 @@ fn prepare(
         correlation_offset,
         lf_offset,
         quant_biases: resource.quant_biases,
-        fallback_pixels,
     })
 }
 
@@ -670,22 +517,11 @@ fn prepared_transient_bytes(prepared: &PreparedVarDct) -> Result<u64> {
                 .ok_or(Error::BufferSizeOverflow)?;
         }
     }
-    if !prepared.fallback_pixels.is_empty() {
-        for allocation in [
-            buffer_bytes(&prepared.fallback_pixels)?,
-            u64::try_from(std::mem::size_of::<FallbackUniform>())
-                .map_err(|_| Error::BufferSizeOverflow)?,
-        ] {
-            bytes = bytes
-                .checked_add(allocation)
-                .ok_or(Error::BufferSizeOverflow)?;
-        }
-    }
     Ok(bytes)
 }
 
 pub(crate) fn encode(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     encoder: &mut wgpu::CommandEncoder,
     plan: &RenderPlan,
     node: &RenderNode,
@@ -699,25 +535,20 @@ pub(crate) fn encode(
         .iter()
         .map(|id| planes.get(id).ok_or(Error::MissingPlane(*id)))
         .collect::<Result<Vec<_>>>()?;
-    let mut dispatches = 0u32;
-    if !prepared.tasks.is_empty() {
-        encode_dct8(accelerator, encoder, &outputs, &prepared)?;
-        dispatches += 1;
+    if prepared.tasks.is_empty() {
+        return Ok(0);
     }
-    if !prepared.fallback_pixels.is_empty() {
-        encode_fallback(accelerator, encoder, &outputs, &prepared.fallback_pixels)?;
-        dispatches += 1;
-    }
-    Ok(dispatches)
+    encode_dct8(backend, encoder, &outputs, &prepared)?;
+    Ok(1)
 }
 
 fn encode_dct8(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     encoder: &mut wgpu::CommandEncoder,
     outputs: &[&UploadedPlane],
     prepared: &PreparedVarDct,
 ) -> Result<()> {
-    let device = &accelerator.device;
+    let device = &backend.device;
     let task_count = u32::try_from(prepared.tasks.len()).map_err(|_| Error::BufferSizeOverflow)?;
     if task_count > device.limits().max_compute_workgroups_per_dimension {
         return Err(Error::ResourceLimit(format!(
@@ -769,7 +600,7 @@ fn encode_dct8(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let pipeline = pipeline(
-        accelerator,
+        backend,
         "jxl-wgpu vardct-dct8",
         KernelVariant::Tile8x8,
         wgpu::include_wgsl!("../shaders/vardct_dct8.wgsl"),
@@ -819,82 +650,6 @@ fn encode_dct8(
     Ok(())
 }
 
-fn encode_fallback(
-    accelerator: &WgpuAccelerator,
-    encoder: &mut wgpu::CommandEncoder,
-    outputs: &[&UploadedPlane],
-    pixels: &[FallbackPixel],
-) -> Result<()> {
-    let device = &accelerator.device;
-    ensure_upload_fits(device, pixels)?;
-    let pixel_count = u32::try_from(pixels.len()).map_err(|_| Error::BufferSizeOverflow)?;
-    let workgroups = pixel_count.div_ceil(64);
-    if workgroups > device.limits().max_compute_workgroups_per_dimension {
-        return Err(Error::ResourceLimit(format!(
-            "VarDCT fallback needs {workgroups} workgroups, exceeding the device limit"
-        )));
-    }
-    let pixels = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT fallback pixels"),
-        contents: bytemuck::cast_slice(pixels),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let uniform = FallbackUniform {
-        pixel_count,
-        output_width: outputs[0].desc.extent.width,
-        output_stride_x: stride(&outputs[0].desc),
-        output_stride_y: stride(&outputs[1].desc),
-        output_stride_b: stride(&outputs[2].desc),
-        _padding: [0; 3],
-    };
-    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT fallback params"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let pipeline = pipeline(
-        accelerator,
-        "jxl-wgpu vardct-fallback",
-        KernelVariant::Tile8x8,
-        wgpu::include_wgsl!("../shaders/vardct_fallback.wgsl"),
-    );
-    let layout = pipeline.get_bind_group_layout(0);
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("jxl-wgpu VarDCT fallback bindings"),
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: pixels.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: outputs[0].binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: outputs[1].binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: outputs[2].binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: uniform.as_entire_binding(),
-            },
-        ],
-    });
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("jxl-wgpu VarDCT fallback"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(&pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(workgroups, 1, 1);
-    Ok(())
-}
-
 fn ensure_upload_fits<T>(device: &wgpu::Device, values: &[T]) -> Result<()> {
     let bytes = buffer_bytes(values)?;
     let limits = device.limits();
@@ -926,18 +681,18 @@ fn stride(desc: &jxl_gpu_protocol::PlaneDesc) -> u32 {
 }
 
 fn pipeline(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     label: &str,
     variant: KernelVariant,
     descriptor: wgpu::ShaderModuleDescriptor<'static>,
 ) -> Arc<wgpu::ComputePipeline> {
     let key = PipelineKey::new(label, "main", variant, 0);
-    if let Some(pipeline) = accelerator.pipelines.get(&key) {
+    if let Some(pipeline) = backend.pipelines.get(&key) {
         return pipeline;
     }
-    match accelerator.pipelines.get_or_insert_with(key, || {
-        let module = accelerator.device.create_shader_module(descriptor);
-        Ok::<_, std::convert::Infallible>(accelerator.device.create_compute_pipeline(
+    match backend.pipelines.get_or_insert_with(key, || {
+        let module = backend.device.create_shader_module(descriptor);
+        Ok::<_, std::convert::Infallible>(backend.device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: None,
@@ -1057,23 +812,20 @@ mod tests {
     #[test]
     fn vardct_gpu_abi_sizes_are_explicit_and_aligned() {
         assert_eq!(size_of::<GpuTask>(), 28);
-        assert_eq!(size_of::<FallbackPixel>(), 16);
         assert_eq!(size_of::<Dct8Uniform>(), 64);
-        assert_eq!(size_of::<FallbackUniform>(), 32);
         assert_eq!(size_of::<Dct8Uniform>() % 16, 0);
         assert_eq!(std::mem::align_of::<Dct8Uniform>(), 16);
         assert_eq!(DCT8_WORKGROUP_STORAGE_BYTES, 1536);
-        assert_eq!(size_of::<FallbackUniform>() % 16, 0);
     }
     use jxl_gpu_protocol::{
-        Border2d, CoefficientOverflow, CpuRenderedTile, Extent2d, FallbackGranularity,
-        FrameSessionDesc, GroupPayload, MemoryMode, OutputDesc, OutputId, OutputLayout,
-        PackedCoefficients, PlaneData, PlaneDesc, PlaneRole, PrecisionContract, PrecisionPolicy,
-        Region, RenderIntent, RenderNode, RenderOp, RenderPlan, ResourceUpdate, SaveParams,
-        Scale2d, TransformBucket, TransformTask, VarDctDct8DequantMatrix, VarDctPacket,
+        Border2d, CoefficientOverflow, Extent2d, FrameSessionDesc, GroupPayload, MemoryMode,
+        OutputDesc, OutputId, OutputLayout, PackedCoefficients, PlaneData, PlaneDesc, PlaneRole,
+        PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan,
+        ResourceUpdate, SaveParams, Scale2d, TransformBucket, TransformTask,
+        VarDctDct8DequantMatrix, VarDctPacket,
     };
 
-    use crate::{WgpuAccelerator, WgpuAcceleratorConfig};
+    use crate::{WgpuBackend, WgpuBackendConfig};
 
     fn resource() -> VarDctDct8Resource {
         VarDctDct8Resource {
@@ -1166,7 +918,20 @@ mod tests {
             memory_mode: MemoryMode::Resident,
             max_resident_bytes: 16 * 1024 * 1024,
             max_scratch_bytes: 16 * 1024 * 1024,
-            fallback: FallbackGranularity::TransformTile,
+        }
+    }
+
+    fn test_backend() -> Option<WgpuBackend> {
+        match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        })) {
+            Ok(backend) => Some(backend),
+            Err(Error::NoAdapter) => {
+                eprintln!("skipping GPU test: no wgpu adapter is available");
+                None
+            }
+            Err(error) => panic!("failed to initialize GPU test device: {error}"),
         }
     }
 
@@ -1381,14 +1146,11 @@ mod tests {
             correlation_offset: 0,
             lf_offset: 0,
             quant_biases: [0.0; 4],
-            fallback_pixels: vec![FallbackPixel::zeroed(); 5],
         };
         let expected = 192 * std::mem::size_of::<i32>()
             + std::mem::size_of::<GpuTask>()
             + 3 * std::mem::size_of::<[f32; 4]>()
-            + std::mem::size_of::<Dct8Uniform>()
-            + 5 * std::mem::size_of::<FallbackPixel>()
-            + std::mem::size_of::<FallbackUniform>();
+            + std::mem::size_of::<Dct8Uniform>();
         assert_eq!(
             prepared_transient_bytes(&prepared).unwrap(),
             expected as u64
@@ -1448,61 +1210,110 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_transform_without_fallback_is_typed_unsupported() {
-        let extent = Extent2d::new(8, 8);
-        let plan = plan(extent);
-        let node = &plan.nodes[0];
-        let packet = VarDctPacket {
+    fn non_dct8_buckets_and_shifted_dct8_are_typed_unsupported() {
+        let non_dct8 = |tasks| VarDctPacket {
             revision: 0,
             last_pass: 0,
             coefficients: PackedCoefficients::DenseI32(Vec::new()),
             buckets: vec![TransformBucket {
                 transform: TransformKind::Dct4,
-                tasks: vec![TransformTask {
-                    coefficient_offset: 0,
-                    coefficient_count: 0,
-                    destination_x: 0,
-                    destination_y: 0,
-                    block_width: 4,
-                    block_height: 4,
-                    quant_index: 0,
-                    dequant_matrix_index: 0,
-                    correlation_index: 0,
-                    lf_index: 0,
-                    lf_x: 0,
-                    lf_y: 0,
-                    hshift: 0,
-                    vshift: 0,
-                }],
+                tasks,
             }],
-            cpu_fallback_tiles: Vec::new(),
         };
-        let groups = BTreeMap::from([(
-            GroupId(0),
-            GroupPayload {
-                group: GroupId(0),
-                revision: 0,
-                complete: true,
-                planes: Vec::new(),
-                vardct: Some(packet),
-            },
-        )]);
-        let resources = BTreeMap::from([(
-            ResourceId(0),
-            ResourceUpdate {
-                id: ResourceId(0),
-                revision: 0,
-                data: ResourceData::VarDctDct8(resource()),
-            },
-        )]);
+
         assert!(matches!(
-            prepare(&plan, node, &groups, &resources),
-            Err(Error::Unsupported(_))
+            validate_packet(&non_dct8(Vec::new())),
+            Err(Error::Unsupported(message)) if message.contains("Dct4")
+        ));
+        assert!(matches!(
+            validate_packet(&non_dct8(vec![TransformTask {
+                coefficient_offset: 0,
+                coefficient_count: 0,
+                destination_x: 0,
+                destination_y: 0,
+                block_width: 4,
+                block_height: 4,
+                quant_index: 0,
+                dequant_matrix_index: 0,
+                correlation_index: 0,
+                lf_index: 0,
+                lf_x: 0,
+                lf_y: 0,
+                hshift: 0,
+                vshift: 0,
+            }])),
+            Err(Error::Unsupported(message)) if message.contains("Dct4")
+        ));
+
+        let mut shifted = dct8_task(0, 0, 0);
+        shifted.hshift = 1;
+        let shifted_packet = VarDctPacket {
+            revision: 0,
+            last_pass: 0,
+            coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
+            buckets: vec![TransformBucket {
+                transform: TransformKind::Dct8,
+                tasks: vec![shifted],
+            }],
+        };
+        assert!(matches!(
+            validate_packet(&shifted_packet),
+            Err(Error::Unsupported(message)) if message.contains("shifted DCT8")
         ));
     }
 
     #[test]
-    fn prepare_preserves_typed_task_and_fallback_overlap_errors() {
+    fn enqueue_rejects_all_non_dct8_buckets_and_shifted_tasks() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let extent = Extent2d::new(8, 8);
+        let mut session = backend
+            .create_session(&frame(extent), Arc::new(plan(extent)))
+            .expect("create VarDCT session");
+        let payload = |packet| GroupPayload {
+            group: GroupId(0),
+            revision: 0,
+            complete: true,
+            planes: Vec::new(),
+            vardct: Some(packet),
+        };
+        let non_dct8 = |tasks| VarDctPacket {
+            revision: 0,
+            last_pass: 0,
+            coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
+            buckets: vec![TransformBucket {
+                transform: TransformKind::Dct4,
+                tasks,
+            }],
+        };
+
+        for packet in [non_dct8(Vec::new()), non_dct8(vec![dct8_task(0, 0, 0)])] {
+            assert!(matches!(
+                session.enqueue(payload(packet)),
+                Err(Error::Unsupported(message)) if message.contains("Dct4")
+            ));
+        }
+
+        let mut shifted = dct8_task(0, 0, 0);
+        shifted.vshift = 1;
+        let shifted = VarDctPacket {
+            revision: 0,
+            last_pass: 0,
+            coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
+            buckets: vec![TransformBucket {
+                transform: TransformKind::Dct8,
+                tasks: vec![shifted],
+            }],
+        };
+        assert!(matches!(
+            session.enqueue(payload(shifted)),
+            Err(Error::Unsupported(message)) if message.contains("shifted DCT8")
+        ));
+    }
+
+    #[test]
+    fn prepare_preserves_typed_task_overlap_errors() {
         let extent = Extent2d::new(16, 8);
         let plan = plan(extent);
         let node = &plan.nodes[0];
@@ -1535,75 +1346,25 @@ mod tests {
                 transform: TransformKind::Dct8,
                 tasks: vec![dct8_task(0, 0, 0), dct8_task(192, 4, 0)],
             }],
-            cpu_fallback_tiles: Vec::new(),
         };
         assert!(matches!(
             prepare(&plan, node, &payload(overlapping_tasks), &resources),
             Err(Error::InvalidPayload(message))
                 if message == "VarDCT task destination Rect { x: 4, y: 0, width: 8, height: 8 } overlaps another task"
         ));
-
-        let fallback_over_supported = VarDctPacket {
-            revision: 0,
-            last_pass: 0,
-            coefficients: PackedCoefficients::DenseI32(vec![0; 192]),
-            buckets: vec![TransformBucket {
-                transform: TransformKind::Dct8,
-                tasks: vec![dct8_task(0, 0, 0)],
-            }],
-            cpu_fallback_tiles: vec![CpuRenderedTile {
-                region: Region::new(4, 0, 8, 8),
-                channels: std::array::from_fn(|_| vec![0.0; 64]),
-            }],
-        };
-        assert!(matches!(
-            prepare(
-                &plan,
-                node,
-                &payload(fallback_over_supported),
-                &resources
-            ),
-            Err(Error::InvalidPayload(message))
-                if message == "CPU fallback tile Rect { x: 4, y: 0, width: 8, height: 8 } overlaps another fallback or GPU DCT8 task"
-        ));
     }
 
     #[test]
-    fn gpu_dct8_matches_codec_reference_at_odd_tail_and_composites_fallback() {
-        let accelerator =
-            match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
-                enable_timestamps: false,
-                ..WgpuAcceleratorConfig::default()
-            })) {
-                Ok(accelerator) => accelerator,
-                Err(Error::NoAdapter) => {
-                    eprintln!("skipping GPU test: no wgpu adapter is available");
-                    return;
-                }
-                Err(error) => panic!("failed to initialize GPU test device: {error}"),
-            };
-        eprintln!("running VarDCT test on {:?}", accelerator.adapter_info());
+    fn gpu_dct8_matches_codec_reference_at_odd_tail() {
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        eprintln!("running VarDCT test on {:?}", backend.adapter_info());
 
         let extent = Extent2d::new(19, 11);
         let resource = resource();
         let first = dct8_task(0, 1, 1);
         let second = dct8_task(192, 11, 3);
-        let unsupported = TransformTask {
-            coefficient_offset: 384,
-            coefficient_count: 0,
-            destination_x: 0,
-            destination_y: 9,
-            block_width: 3,
-            block_height: 2,
-            quant_index: 0,
-            dequant_matrix_index: 0,
-            correlation_index: 0,
-            lf_index: 0,
-            lf_x: 0,
-            lf_y: 0,
-            hshift: 0,
-            vshift: 0,
-        };
         let mut coefficients = vec![0; 384];
         coefficients[0] = 40_000;
         coefficients[1] = 3;
@@ -1615,29 +1376,14 @@ mod tests {
         coefficients[192 + 64] = 4;
         coefficients[192 + 64 + 24] = -3;
         coefficients[192 + 128] = 1;
-        let fallback = CpuRenderedTile {
-            region: Region::new(0, 9, 3, 2),
-            channels: [
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
-                vec![0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
-            ],
-        };
         let packet = VarDctPacket {
             revision: 0,
             last_pass: 0,
             coefficients: pack_i16(&coefficients),
-            buckets: vec![
-                TransformBucket {
-                    transform: TransformKind::Dct8,
-                    tasks: vec![first, second],
-                },
-                TransformBucket {
-                    transform: TransformKind::Dct4,
-                    tasks: vec![unsupported],
-                },
-            ],
-            cpu_fallback_tiles: vec![fallback.clone()],
+            buckets: vec![TransformBucket {
+                transform: TransformKind::Dct8,
+                tasks: vec![first, second],
+            }],
         };
 
         let mut expected = [vec![0.0; 19 * 11], vec![0.0; 19 * 11], vec![0.0; 19 * 11]];
@@ -1649,16 +1395,9 @@ mod tests {
             &coefficients[192..384],
             &resource,
         );
-        for (channel, expected_channel) in expected.iter_mut().enumerate() {
-            for y in 0..2 {
-                for x in 0..3 {
-                    expected_channel[(9 + y) * 19 + x] = fallback.channels[channel][y * 3 + x];
-                }
-            }
-        }
 
         let plan = Arc::new(plan(extent));
-        let mut session = accelerator
+        let mut session = backend
             .create_session(&frame(extent), plan)
             .expect("create VarDCT session");
         session
@@ -1697,7 +1436,7 @@ mod tests {
             }
         }
         assert!((actual[10 * 19 + 18] - expected[0][10 * 19 + 18]).abs() < 1.0e-4);
-        assert_eq!(actual[9 * 19], 1.0);
-        assert_eq!(actual[19 * 11 + 9 * 19], -1.0);
+        assert_eq!(actual[9 * 19], 0.0);
+        assert_eq!(actual[19 * 11 + 9 * 19], 0.0);
     }
 }

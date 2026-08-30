@@ -1,124 +1,96 @@
 # jxl_wgpu
 
-`jxl_wgpu` is the optional portable GPU backend for this `jxl-rs` fork. It implements
-`jxl::accelerator::JxlAccelerator` on top of `wgpu` 30 while keeping `jxl` itself free of graphics
-dependencies.
+`jxl_wgpu` is the portable, GPU-required render backend for this standalone JPEG XL workspace. It
+implements `jxl_gpu_protocol::RenderBackend` with `wgpu` 30 and exposes its concrete
+`WgpuBackend`/`WgpuFrameSession` APIs for GPU-resident image output, same-queue presentation, and
+explicit mapped readback.
 
-The forked decoder needs a narrow backend-neutral hook because the stock public API exposes only
-the already-rendered CPU image; attaching at that point cannot accelerate IDCT, restoration, or
-upsampling. `wgpu` resources and native YUV/NV12 conversion remain entirely in this crate. See the
-architecture document for the exact minimal boundary and fallback contract.
+Host code validates plans and packets, records command buffers, and resolves completion. Supported
+pixel, coefficient, restoration, color, packing, and display work executes in WGSL. Unsupported
+operations, layouts, precision contracts, and device limits return typed errors before an output
+is authoritative.
+
+## Backend creation
+
+Request a device owned by the backend:
 
 ```rust,no_run
-use std::sync::Arc;
+use jxl_wgpu::{WgpuBackend, WgpuBackendConfig};
 
-use jxl::api::{JxlDecoder, JxlDecoderOptions, states};
-use jxl_wgpu::{WgpuAccelerator, WgpuAcceleratorConfig};
-
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let gpu = Arc::new(
-    WgpuAccelerator::request_default(WgpuAcceleratorConfig {
-        minimum_frame_pixels: Some(0),
-        ..WgpuAcceleratorConfig::default()
-    })
-    .await?,
-);
-let decoder = JxlDecoder::<states::Initialized>::builder(JxlDecoderOptions::default())
-    .accelerator(gpu)
-    .build();
-# let _ = decoder;
+# async fn create() -> Result<(), Box<dyn std::error::Error>> {
+let backend = WgpuBackend::request_default(WgpuBackendConfig::default()).await?;
+let device = backend.device();
+let queue = backend.queue();
+# let _ = (device, queue);
 # Ok(())
 # }
 ```
 
-Applications with an existing renderer can use `WgpuAccelerator::from_device` to share a
-`wgpu::Device` and `wgpu::Queue`.
+An application that already owns a renderer can construct `WgpuBackend::from_device` with its
+`wgpu::Device`, `wgpu::Queue`, `wgpu::AdapterInfo`, and `WgpuBackendConfig`. Decode, conversion,
+display, and later renderer work can then share one queue and use queue ordering instead of a host
+wait.
 
-Automatic decoder integration is disabled by default (`minimum_frame_pixels: None`) because the
-CPU-readback path has not yet demonstrated a crossover on the checked-in Apple M5 baseline. Set it
-to `Some(0)` to force GPU planning (useful for validation), or to a measured pixel threshold for the
-target adapter and workload. Attaching a default backend therefore preserves the decoder's original
-low-memory CPU pipeline rather than silently regressing it.
+On native targets, `WgpuBackend` implements the canonical
+`jxl_gpu_protocol::RenderBackend` factory and returns `Box<dyn FrameSession>`. The concrete
+`WgpuBackend::create_session` method returns `WgpuFrameSession` and is also available when callers
+need GPU-buffer, generic-format, display, or concrete instrumentation APIs.
 
-## Zero-copy output
+## Render-plan execution
 
-The concrete `WgpuFrameSession` also exposes a GPU-only path for renderers that do not need the
-backend-neutral CPU `RenderedOutput`:
+A frontend supplies a validated `RenderPlan` and `FrameSessionDesc`, then streams revisioned
+resources and decoded group packets into a frame session:
 
 ```rust,ignore
-use jxl::accelerator::RenderIntent;
+use std::sync::Arc;
 
-let gpu_frame = session.submit_gpu(RenderIntent::Final)?;
-let rgba = &gpu_frame.outputs[0];
+use jxl_gpu_protocol::{FrameSession, RenderBackend, RenderIntent};
 
-// `rgba.buffer` is an Arc<wgpu::Buffer> with STORAGE | COPY_SRC usage. It can be bound or copied
-// by a command submitted to `gpu.queue()` immediately; queue ordering waits on the save kernel on
-// the GPU without blocking the CPU.
-consumer_encoder.copy_buffer_to_buffer(
-    &rgba.buffer,
-    0,
-    &renderer_buffer,
-    0,
-    rgba.logical_size,
-);
-gpu.queue().submit([consumer_encoder.finish()]);
-
-// Native callers may optionally confirm host-visible completion. This is not needed for a
-// dependent command on the same queue.
-session.wait_gpu(gpu_frame.token)?;
+let mut session = backend.create_frame_session(&frame_desc, Arc::new(plan))?;
+session.update_resource(resource)?;
+session.enqueue(group)?;
+let token = session.submit(RenderIntent::Final)?;
+let frame = session.wait(token)?;
 ```
 
-Each `GpuOutputBuffer` carries its `OutputId`, extent, sample type, channel count, layout, and
-meaningful byte length. Its `Arc<wgpu::Buffer>` remains valid after the session is dropped. GPU-only
-submissions allocate one packed buffer per output and do not create a readback buffer, record a
-GPU-to-readback copy, or map memory. The existing `AcceleratedFrameSession::submit`/`wait` behavior
-is unchanged.
-
-On native unified-memory adapters that expose `MAPPABLE_PRIMARY_BUFFERS`, CPU submissions write
-into a `STORAGE | MAP_READ` allocation and map that allocation directly. This removes the
-full-size GPU-to-staging copy and second output allocation. The default
-`DirectReadbackPolicy::Auto` enables this only for integrated/CPU adapters; discrete adapters use
-staging even if they expose the feature. `DirectReadbackPolicy::Force` is an explicit opt-in for a
-measured discrete target and returns a typed error if the feature is unavailable.
-`enable_direct_readback: false` remains the compatibility master switch for forcing the portable
-path, and `WgpuSubmissionStats::direct_readback` reports which path a submission used.
-
-## Bounded internal buffer reuse
-
-One `WgpuAccelerator` owns a thread-safe, exact-size-and-usage buffer pool shared by all of its
-frame sessions. Repeated and concurrent CPU decodes reuse resident arena slots and the packed CPU
-output allocation. Portable readback staging remains independently owned by the pending map, and
-GPU-only `Arc<wgpu::Buffer>` outputs are never pooled, so they stay valid until the caller drops
-them.
-
-Reuse follows queue ownership boundaries: resident slots and portable packed outputs return only
-after their command buffer is submitted to the same queue; directly mapped outputs return only
-after successful readback and `unmap`. VarDCT slots that may be only partially written use a
-known-zero pool class and are cleared at the end of the preceding submission. Full-frame kernels
-and zero-filled source uploads reuse dirty allocations without paying that clear bandwidth.
-
-`WgpuMemoryPolicy::max_cached_buffer_bytes` bounds idle allocations (128 MiB by default and zero to
-disable). This cache limit is separate from per-submission resident/transient budgets. Use
-`WgpuAccelerator::buffer_pool_stats()` to inspect hits, misses, evictions, rejected aliases, and
-idle bytes, or `clear_buffer_pool()` to release all idle buffers without affecting in-flight work
-or public GPU outputs.
-
-The ignored release microbenchmark
-`session::tests::repeated_cpu_decode_pool_release_benchmark` measures 20 repeated 512x512 CPU
-readbacks after pipeline warmup. One Apple M5/Metal 4 reference run improved from 21.25 ms with the
-pool disabled to 18.55 ms enabled (0.873x elapsed); this is an allocation-churn indicator, not a
-portable crossover claim.
-
-## Generic pitch-linear image output
-
-The concrete session can lower its final three normalized, nonlinear R'G'B' F32 planes directly
-to a canonical `jxl_gpu_formats::PixelFormat`. Supported GPU output includes Y8/Y16,
-planar/semi-planar 4:4:4, 4:2:2, and 4:2:0 at 8/10/12/16 bits (including NV12/NV21,
-NV24/NV42, P010/P012/P016), YUYV/UYVY, and planar/interleaved RGB/BGR/RGBA/BGRA8.
-No intermediate CPU codec or RGB(A) readback is involved:
+`FrameSession::submit` records and submits GPU work without completing a mapped output on the
+calling thread. `FrameSession::wait` resolves that submission into protocol-owned bytes. The
+concrete session adds GPU-resident terminal paths:
 
 ```rust,ignore
-use jxl::accelerator::RenderIntent;
+let frame = session.submit_gpu(RenderIntent::Final)?;
+let output = &frame.outputs[0];
+
+// A dependent command on backend.queue() can use output.buffer immediately.
+consumer.copy_buffer_to_buffer(
+    &output.buffer,
+    0,
+    &destination,
+    0,
+    output.logical_size,
+);
+backend.queue().submit([consumer.finish()]);
+```
+
+Each `GpuOutputBuffer` carries its output ID, extent, sample type, channel count, layout, meaningful
+byte length, and an `Arc<wgpu::Buffer>`. The handle remains valid after the frame session is
+dropped. `wait_gpu` is only needed when native host code explicitly requires completion; dependent
+commands on the same queue do not need it.
+
+## Generic pitch-linear formats
+
+`WgpuFrameSession::submit_gpu_image` converts the final nonlinear R'G'B' planes directly into a
+checked `jxl_gpu_formats::PixelFormat`. `submit_image` plus `wait_image` provides the corresponding
+mapped transport. Supported layout families include:
+
+- unsigned luma at 8 or 16 storage bits;
+- planar and semiplanar YCbCr 4:4:4, 4:2:2, and 4:2:0 at 8/10/12/16 bits, including NV12, NV21,
+  NV16, NV61, NV24, NV42, P010, P012, and P016;
+- packed YUYV and UYVY 4:2:2; and
+- planar or interleaved RGB, BGR, RGBA, and BGRA8.
+
+```rust,ignore
+use jxl_gpu_protocol::RenderIntent;
 use jxl_wgpu::{
     ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageOutputRequest, PixelFormat,
 };
@@ -128,70 +100,121 @@ let color = ColorSpecification::Defined(ColorSpec::bt709(
     ChromaLocation2d::CENTER,
 ));
 let request = ImageOutputRequest::new(PixelFormat::nv12(color));
-
-// CPU-visible bytes and explicit per-plane offsets, strides, and extents:
-let token = session.submit_image(RenderIntent::Final, request.clone())?;
-let nv12 = session.wait_image(token)?.outputs.remove(0);
-
-// Or a same-queue, zero-copy GPU buffer with the same layout descriptor:
-let gpu_nv12 = session.submit_gpu_image(RenderIntent::Final, request)?;
+let nv12 = session.submit_gpu_image(RenderIntent::Final, request)?;
 ```
 
-Centered chroma means a box average of the valid subsampling footprint, including cropped odd
-edges; even/cosited chroma uses the top-left luma location. The matrix is applied directly to the
-supplied R'G'B' values and does not add a transfer-function conversion. Unsupported or ambiguous
-numeric/color descriptors return `Error::Unsupported` rather than guessing display semantics.
+Every output has an `ImageLayout` with explicit plane offsets, row strides, extents, sampling, and
+logical byte size. Odd chroma extents use checked ceil division. Centered siting averages the valid
+subsampling footprint; cosited output uses the top-left luma position. Numeric representation,
+matrix, range, and siting are never inferred from an ambiguous descriptor.
 
-This is currently a `WgpuFrameSession` API. CPU image readback is an output transport and must not
-be confused with a CPU codec fallback: decoding and image conversion remain GPU operations.
+These contracts describe portable pitch-linear buffers. Vendor block-linear memory and native
+multi-plane texture handles are outside WebGPU's portable buffer model.
 
-## Display textures without a host wait
+## Same-queue display
 
-`DisplayPipeline` converts a `GpuOutputBuffer` or generic `GpuImageOutput` into an
-`Rgba8Unorm` texture carrying `TEXTURE_BINDING`, `RENDER_ATTACHMENT`, and copy usages. The
-conversion and every later render/copy can be submitted to the accelerator's same queue without
-waiting on the host:
+`DisplayPipeline` turns a `GpuOutputBuffer` or `GpuImageOutput` into an `Rgba8Unorm` storage texture
+with texture-binding, render-attachment, and copy usages. The convenience submission uses the
+backend's queue and returns without a host wait:
 
 ```rust,ignore
 use jxl_wgpu::{DisplayPipeline, DisplayTextureDescriptor};
 
-let display = DisplayPipeline::new(&gpu);
-let image_frame = session.submit_gpu_image(RenderIntent::Final, request)?;
-let display_submission = display.submit_image(
-    &image_frame.outputs[0],
+let display = DisplayPipeline::new(&backend);
+let submitted = display.submit_image(
+    &nv12.outputs[0],
     DisplayTextureDescriptor::default(),
 )?;
-renderer.sample(display_submission.texture.view());
+renderer.sample(submitted.texture.view());
 ```
 
-The format/matrix/range/siting combination keys a thread-safe compiled-pipeline cache. Arbitrary
-tight pitch-linear rows are accepted by the compute path. The explicit RGBA8 buffer-to-texture
-copy path validates WebGPU's 256-byte multi-row pitch requirement and returns
-`Error::TextureCopyRowAlignment` when it is not met. Native multi-plane handles and vendor-specific
-block-linear memory are outside this portable pitch-linear contract.
+The source buffer and returned texture are retained by their GPU handles while commands are in
+flight. The pipeline cache is keyed by the complete source-format and color-conversion contract.
+The compute path accepts arbitrary valid pitch-linear row strides. The direct RGBA8 copy path
+enforces WebGPU's 256-byte multi-row pitch requirement.
 
-`WgpuFrameSession::last_submission_stats()` exposes the most recent `WgpuSubmissionStats` for
-instrumentation. `planned_dispatches` is the number of dispatch groups in the `ExecutionPlan`,
-`compute_dispatches` counts actual compute-pass `dispatch_workgroups` calls (including multi-pass
-Save, YCbCr, and VarDCT work), and `fused_dispatches` counts dispatches emitted by a fused encoder
-instead of a single-node kernel.
+Callers that already own a command encoder can use `encode_rgb`, `encode_image`, or
+`encode_rgba8_copy`, then submit all work as one application-defined batch.
 
-On WebAssembly, `submit_gpu` remains non-blocking and same-queue consumers work normally.
-`wait_gpu` returns `Error::Unsupported`, because browser WebGPU cannot implement a synchronous host
-wait; applications should rely on queue ordering or an asynchronous queue-completion callback.
-Browser WebGPU handles are not `Send + Sync`, so wasm callers use the concrete
-`WgpuAccelerator::create_session` / `WgpuFrameSession` API. The `JxlAccelerator` and
-`AcceleratedFrameSession` trait implementations remain native-only because those backend-neutral
-traits intentionally require `Send + Sync` / `Send`.
+## Aggregate CPU readback
 
-The backend implements typed planning, budget-checked resident execution, lifetime-based slot
-reuse, revisioned frame sessions, real Chroma2d/GaborishRgb dispatch fusion, pipeline caching,
-batched submission, checked upload and readback, accuracy metrics, and adapter-specific autotuning
-profiles. Explicit streaming requests
-are rejected until the tiled scheduler is connected, so the backend never silently exceeds the
-declared memory model. The decoder automatically falls back to its CPU stages if a plan segment is
-unsupported or GPU execution fails.
+`ImageReadbackPipeline` copies every output in one `GpuImageFrame` into one bounded staging buffer.
+Each source region and staging offset is independently padded to WebGPU's four-byte buffer-copy
+alignment; returned vectors contain only each layout's logical bytes.
 
-See [`docs/GPU_ARCHITECTURE.md`](../docs/GPU_ARCHITECTURE.md),
-[`docs/GPU_BENCHMARKS.md`](../docs/GPU_BENCHMARKS.md), and the `jxl_gpu_harness` crate for the
-protocol, current performance boundary, and validation workflow.
+```rust,ignore
+use jxl_wgpu::ImageReadbackPipeline;
+
+let pending = ImageReadbackPipeline::new(&backend).submit(&nv12)?;
+let planned = pending.stats();
+
+// Runtime-neutral asynchronous completion:
+let result = pending.await?;
+# let _ = (planned, result);
+```
+
+`ImageReadbackSubmission` implements `std::future::Future` directly and has no executor-specific
+dependency. Native callers may use `pending.wait()` instead. Browser WebGPU uses the future path.
+`ImageReadbackStats` reports output count, logical bytes, and the exact padded staging allocation;
+`ImageReadbackLimits` sets the per-submission staging limit.
+
+For protocol `submit`/`wait`, `DirectReadbackPolicy` selects automatic direct mapping on eligible
+unified-memory adapters, an explicit storage-to-staging copy, or required direct mapping. Requiring
+direct mapping returns a typed error when `MAPPABLE_PRIMARY_BUFFERS` is unavailable.
+
+## Memory policy and instrumentation
+
+`WgpuBackendConfig::memory` contains four independent checked limits:
+
+- `max_resident_bytes` for physical plane slots;
+- `max_scratch_bytes` for simultaneously live intermediate planes;
+- `max_transient_bytes` for one submission's uniforms, uploads, packed outputs, and staging; and
+- `max_cached_buffer_bytes` for idle reusable buffers.
+
+The planner computes plane lifetimes, reuses physical slots only across disjoint live ranges, and
+validates both device buffer and storage-binding limits. The shared buffer pool leases by exact size
+and usage, never returns one allocation to two live submissions, and exposes hits, misses,
+evictions, rejected leases, and idle bytes through `buffer_pool_stats()`.
+
+`WgpuSubmissionStats` reports planned, actual, and fused dispatch counts plus resident and transient
+bytes. `WgpuFrameSession::pending_transient_bytes()` reports the checked sum associated with tokens
+that have not been waited. Public GPU outputs remain caller-owned and are not recycled through the
+internal pool.
+
+All copy sizes are four-byte aligned, all offsets/strides/allocation sums use checked arithmetic,
+and values consumed as WGSL indices must fit `u32`. Rust uniform/storage records use `#[repr(C)]`
+plus `bytemuck::Pod`; tests pin their field order, size, alignment, and structured-array stride.
+VarDCT DCT8 additionally checks its 1,536-byte workgroup-memory requirement. The complete table is
+in [`docs/WGSL_MEMORY.md`](../../docs/WGSL_MEMORY.md).
+
+## Implemented render operations
+
+The current planner and scheduler execute these protocol stages:
+
+- copy and integer-Modular-to-F32 conversion;
+- horizontal/vertical chroma reconstruction and fused 2-D chroma reconstruction;
+- per-plane and fused three-plane Gaborish;
+- EPF passes 0, 1, and 2 with constant or supplied sigma;
+- 2x, 4x, and 8x image upsampling with validated weights;
+- DCT8 VarDCT dequantization, color correlation, inverse transform, and LF composition;
+- YCbCr-to-RGB components, alpha premultiplication, sample conversion, orientation, Save packing,
+  and generic image packing; and
+- direct generic-image and RGBA display conversion.
+
+The backend validates precision contracts, node arity, plane types/extents/strides, resource
+revisions, transform coverage, dispatch dimensions, shader-visible addresses, and device limits
+before submission. Unsupported render operations, unsupported VarDCT transform buckets, explicit
+streaming execution, invalid color semantics, and unavailable device features return
+`Error::Unsupported` or another specific resource/payload error.
+
+## Platform notes
+
+Native builds expose both trait-object and concrete frame-session paths. Browser WebGPU resources
+are single-threaded, so callers use `WgpuBackend::create_session` and the concrete session API.
+GPU-resident output and same-queue display remain non-blocking there; host mapping uses
+`ImageReadbackSubmission` as a future.
+
+For architecture, performance methodology, and ABI details, see
+[`GPU_ARCHITECTURE.md`](../../docs/GPU_ARCHITECTURE.md),
+[`GPU_BENCHMARKS.md`](../../docs/GPU_BENCHMARKS.md), and
+[`WGSL_MEMORY.md`](../../docs/WGSL_MEMORY.md).

@@ -1,13 +1,13 @@
 # jxl_wgpu_decode
 
-GPU-required JPEG XL decode orchestration. Production code has no CPU pixel decoder, CPU entropy
-decoder, RGB upload fallback, or dependency on the published `jxl` decoder.
+GPU-required JPEG XL decode orchestration. Production execution uses the stock WGSL submission
+engine and has no dependency on the published `jxl` decoder.
 
 ## Executable profile
 
 The stock `WgpuSubmissionEngine` implements one deliberately narrow end-to-end profile:
 
-- a standard, reference-decodable JPEG XL container with one `jwgp` v1 acceleration-index box;
+- a standard, reference-decodable JPEG XL container with one `jwgp` acceleration-index box;
 - one final still frame, 8-bit grayscale lossless Modular, one group (at most 256x256), one pass,
   fixed Gradient predictor, prefix entropy, and the profile's distance-one zero-run coding;
 - no transforms, restoration filters, extra channels, or animation references.
@@ -25,9 +25,9 @@ and performs Gradient reconstruction. A mapped four-word status buffer is checke
 is reported as successful. No reconstructed sample is produced on the CPU.
 
 Containers without a valid `jwgp` index and raw/generic JPEG XL codestreams return typed
-`UnsupportedProfile`/`AccelerationIndex` errors. They never fall back to CPU decode. VarDCT,
-adaptive predictors, multiple groups/passes, extra channels, patches, splines, noise, and
-reference-frame animation remain typed unsupported profiles.
+`UnsupportedProfile`/`AccelerationIndex` errors. VarDCT, adaptive predictors, multiple
+groups/passes, extra channels, patches, splines, noise, and reference-frame animation remain typed
+unsupported profiles.
 
 ## GPU output formats
 
@@ -48,7 +48,7 @@ performed unless the application explicitly stages one.
 
 ## Public flow and bounds
 
-1. Construct `GpuDecoder::wgpu` around an application's existing `WgpuAccelerator`.
+1. Construct `GpuDecoder::wgpu` around an application's existing `WgpuBackend`.
 2. Call `open` with encoded bytes and a `GpuOutputRequest`.
 3. Consume `GpuDecodeSession::next_frame` synchronously or use
    `next_frame_async`/`poll_next_frame` through `std::future::Future`.

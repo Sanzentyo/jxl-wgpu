@@ -7,9 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-use jxl_gpu_protocol::{
-    AcceleratedFrameSession, AcceleratorCapabilities, AcceleratorError, JxlAccelerator,
-};
+use jxl_gpu_protocol::{BackendCapabilities, BackendError, FrameSession, RenderBackend};
 use jxl_gpu_protocol::{FrameSessionDesc, RenderPlan};
 
 use crate::buffer_pool::{BufferPool, WgpuBufferPoolStats};
@@ -30,7 +28,7 @@ pub struct WgpuMemoryPolicy {
     /// Maximum bytes allocated by one submission for explicit transient GPU buffers, including
     /// VarDCT packet uploads, immutable kernel tables, packed outputs, and readback staging.
     pub max_transient_bytes: u64,
-    /// Maximum idle bytes retained by the accelerator-wide internal buffer pool. This is separate
+    /// Maximum idle bytes retained by the backend-wide internal buffer pool. This is separate
     /// from the live resident and transient submission budgets; set it to zero to disable reuse.
     pub max_cached_buffer_bytes: u64,
     /// Reserved for the future tiled scheduler. `Auto` still selects resident execution today;
@@ -63,35 +61,22 @@ pub enum DirectReadbackPolicy {
 }
 
 #[derive(Clone, Debug)]
-pub struct WgpuAcceleratorConfig {
+pub struct WgpuBackendConfig {
     pub label: String,
     pub power_preference: wgpu::PowerPreference,
     pub memory: WgpuMemoryPolicy,
-    /// Automatic `JxlDecoder` integration keeps its low-memory CPU pipeline when this is `None`
-    /// or for frames smaller than the configured pixel count. Use `Some(0)` in validation tools
-    /// or when GPU execution is explicitly preferred.
-    pub minimum_frame_pixels: Option<u64>,
-    /// Map the final storage buffer directly when the native adapter supports mappable primary
-    /// buffers. This compatibility switch is a master enable: `false` disables direct readback;
-    /// `true` delegates to [`Self::direct_readback_policy`].
-    pub enable_direct_readback: bool,
-    /// Chooses whether the compatibility switch uses safe automatic UMA detection or explicitly
-    /// disables/forces mappable primary buffers.
+    /// Chooses safe automatic UMA mapping, portable staging, or explicitly forced direct mapping.
     pub direct_readback_policy: DirectReadbackPolicy,
     pub enable_timestamps: bool,
     pub strict_features: bool,
 }
 
-impl Default for WgpuAcceleratorConfig {
+impl Default for WgpuBackendConfig {
     fn default() -> Self {
         Self {
             label: "jxl-wgpu".into(),
             power_preference: wgpu::PowerPreference::HighPerformance,
             memory: WgpuMemoryPolicy::default(),
-            // CPU-readback crossover points are adapter- and workload-specific. Until a target
-            // has been tuned, attaching the backend must not silently make decoding slower.
-            minimum_frame_pixels: None,
-            enable_direct_readback: true,
             direct_readback_policy: DirectReadbackPolicy::Auto,
             enable_timestamps: true,
             strict_features: false,
@@ -100,19 +85,19 @@ impl Default for WgpuAcceleratorConfig {
 }
 
 #[derive(Clone)]
-pub struct WgpuAccelerator {
+pub struct WgpuBackend {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) info: wgpu::AdapterInfo,
-    pub(crate) config: WgpuAcceleratorConfig,
+    pub(crate) config: WgpuBackendConfig,
     pub(crate) pipelines: Arc<PipelineCache>,
     pub(crate) buffers: Arc<BufferPool>,
 }
 
-impl fmt::Debug for WgpuAccelerator {
+impl fmt::Debug for WgpuBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("WgpuAccelerator")
+            .debug_struct("WgpuBackend")
             .field("adapter", &self.info)
             .field("config", &self.config)
             .field("pipeline_cache_empty", &self.pipelines.is_empty())
@@ -121,12 +106,12 @@ impl fmt::Debug for WgpuAccelerator {
     }
 }
 
-impl WgpuAccelerator {
+impl WgpuBackend {
     pub fn from_device(
         device: wgpu::Device,
         queue: wgpu::Queue,
         info: wgpu::AdapterInfo,
-        config: WgpuAcceleratorConfig,
+        config: WgpuBackendConfig,
     ) -> Result<Self> {
         if config.enable_timestamps
             && config.strict_features
@@ -149,9 +134,7 @@ impl WgpuAccelerator {
             ));
         }
         #[cfg(target_arch = "wasm32")]
-        if config.enable_direct_readback
-            && config.direct_readback_policy == DirectReadbackPolicy::Force
-        {
+        if config.direct_readback_policy == DirectReadbackPolicy::Force {
             return Err(Error::Unsupported(
                 "direct readback cannot be forced on browser WebGPU".into(),
             ));
@@ -167,7 +150,7 @@ impl WgpuAccelerator {
         })
     }
 
-    pub async fn request_default(config: WgpuAcceleratorConfig) -> Result<Self> {
+    pub async fn request_default(config: WgpuBackendConfig) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -189,7 +172,7 @@ impl WgpuAccelerator {
             ));
         }
         // Unified-memory native adapters can map the final storage buffer directly. This avoids a
-        // full output copy while preserving the portable staging fallback on other adapters.
+        // full output copy while preserving the portable staging path on other adapters.
         #[cfg(not(target_arch = "wasm32"))]
         if direct_readback_requested(&config, info.device_type) {
             if adapter_features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
@@ -271,13 +254,7 @@ impl WgpuAccelerator {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn direct_readback_requested(
-    config: &WgpuAcceleratorConfig,
-    device_type: wgpu::DeviceType,
-) -> bool {
-    if !config.enable_direct_readback {
-        return false;
-    }
+fn direct_readback_requested(config: &WgpuBackendConfig, device_type: wgpu::DeviceType) -> bool {
     match config.direct_readback_policy {
         DirectReadbackPolicy::Disabled => false,
         DirectReadbackPolicy::Force => true,
@@ -289,18 +266,18 @@ fn direct_readback_requested(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl JxlAccelerator for WgpuAccelerator {
-    fn capabilities(&self) -> AcceleratorCapabilities {
-        capabilities(&self.device, &self.info, self.config.minimum_frame_pixels)
+impl RenderBackend for WgpuBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        capabilities(&self.device, &self.info)
     }
 
     fn create_frame_session(
         &self,
         frame: &FrameSessionDesc,
         plan: Arc<RenderPlan>,
-    ) -> std::result::Result<Box<dyn AcceleratedFrameSession>, AcceleratorError> {
+    ) -> std::result::Result<Box<dyn FrameSession>, BackendError> {
         self.create_session(frame, plan)
-            .map(|session| Box::new(session) as Box<dyn AcceleratedFrameSession>)
+            .map(|session| Box::new(session) as Box<dyn FrameSession>)
             .map_err(Into::into)
     }
 }
@@ -309,14 +286,12 @@ impl JxlAccelerator for WgpuAccelerator {
 mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use super::direct_readback_requested;
-    use super::{DirectReadbackPolicy, WgpuAcceleratorConfig};
+    use super::{DirectReadbackPolicy, WgpuBackendConfig};
 
     #[test]
-    fn automatic_decoder_integration_is_disabled_by_default() {
-        assert_eq!(WgpuAcceleratorConfig::default().minimum_frame_pixels, None);
-        assert!(WgpuAcceleratorConfig::default().enable_direct_readback);
+    fn automatic_direct_readback_is_the_default_policy() {
         assert_eq!(
-            WgpuAcceleratorConfig::default().direct_readback_policy,
+            WgpuBackendConfig::default().direct_readback_policy,
             DirectReadbackPolicy::Auto
         );
     }
@@ -324,7 +299,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn automatic_direct_readback_is_limited_to_unified_memory_devices() {
-        let config = WgpuAcceleratorConfig::default();
+        let config = WgpuBackendConfig::default();
         assert!(direct_readback_requested(
             &config,
             wgpu::DeviceType::IntegratedGpu
@@ -335,7 +310,7 @@ mod tests {
             wgpu::DeviceType::DiscreteGpu
         ));
 
-        let forced = WgpuAcceleratorConfig {
+        let forced = WgpuBackendConfig {
             direct_readback_policy: DirectReadbackPolicy::Force,
             ..config
         };
@@ -344,8 +319,8 @@ mod tests {
             wgpu::DeviceType::DiscreteGpu
         ));
 
-        let disabled = WgpuAcceleratorConfig {
-            enable_direct_readback: false,
+        let disabled = WgpuBackendConfig {
+            direct_readback_policy: DirectReadbackPolicy::Disabled,
             ..forced
         };
         assert!(!direct_readback_requested(
@@ -385,13 +360,13 @@ mod tests {
             eprintln!("skipping supplied-device feature test: no adapter");
             return;
         };
-        let forced = WgpuAcceleratorConfig {
+        let forced = WgpuBackendConfig {
             enable_timestamps: false,
             direct_readback_policy: DirectReadbackPolicy::Force,
-            ..WgpuAcceleratorConfig::default()
+            ..WgpuBackendConfig::default()
         };
         assert!(matches!(
-            super::WgpuAccelerator::from_device(device, queue, info, forced),
+            super::WgpuBackend::from_device(device, queue, info, forced),
             Err(crate::Error::Unsupported(message))
                 if message.contains("MAPPABLE_PRIMARY_BUFFERS")
         ));
@@ -400,14 +375,14 @@ mod tests {
             eprintln!("skipping supplied-device feature test: no second adapter request");
             return;
         };
-        let strict_timestamps = WgpuAcceleratorConfig {
+        let strict_timestamps = WgpuBackendConfig {
             enable_timestamps: true,
             strict_features: true,
-            enable_direct_readback: false,
-            ..WgpuAcceleratorConfig::default()
+            direct_readback_policy: DirectReadbackPolicy::Disabled,
+            ..WgpuBackendConfig::default()
         };
         assert!(matches!(
-            super::WgpuAccelerator::from_device(device, queue, info, strict_timestamps),
+            super::WgpuBackend::from_device(device, queue, info, strict_timestamps),
             Err(crate::Error::Unsupported(message)) if message.contains("TIMESTAMP_QUERY")
         ));
     }

@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use jxl_gpu_protocol::{
-    ChromaAxis, EpfParams, Extent2d, FallbackGranularity, FrameSessionDesc, MemoryMode, PlaneId,
-    PlaneRole, PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, RenderOpKind, RenderPlan,
-    ResourceId, SampleType,
+    ChromaAxis, EpfParams, Extent2d, FrameSessionDesc, MemoryMode, PlaneId, PlaneRole,
+    PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, RenderOpKind, RenderPlan, ResourceId,
+    SampleType,
 };
 
 use crate::arena::{ArenaPlan, ArenaPlanner};
@@ -57,7 +57,6 @@ pub struct ExecutionPlan {
     /// Currently always `Resident`. Explicit streaming requests are rejected until tiled
     /// execution is connected to the scheduler.
     pub memory_mode: MemoryMode,
-    pub fallback: FallbackGranularity,
     pub dispatches: Vec<PlannedDispatch>,
     pub arena: ArenaPlan,
     /// Physical extent used for each logical plane. In resident mode these are full-frame extents.
@@ -181,7 +180,6 @@ impl Planner {
 
         Ok(ExecutionPlan {
             memory_mode: MemoryMode::Resident,
-            fallback: frame.fallback,
             dispatches,
             arena,
             tile_extents,
@@ -208,7 +206,7 @@ impl Planner {
         let planes: BTreeMap<_, _> = plan.planes.iter().map(|plane| (plane.id, plane)).collect();
         for (index, node) in plan.nodes.iter().enumerate() {
             let kind = node.op.kind();
-            if kind == RenderOpKind::CpuFallback || !self.supported_ops.contains(&kind) {
+            if !self.supported_ops.contains(&kind) {
                 return Err(Error::Unsupported(format!(
                     "node {index} '{}' uses unsupported operation {kind:?}",
                     node.name
@@ -589,9 +587,6 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
         RenderOp::Extend { image_extent, .. } if image_extent.is_empty() => Err(
             Error::InvalidPayload(format!("node {index} has an empty extend extent")),
         ),
-        RenderOp::CpuFallback { reason } => Err(Error::Unsupported(format!(
-            "node {index} is an explicit CPU boundary: {reason}"
-        ))),
         _ => Ok(()),
     }
 }
@@ -1037,7 +1032,6 @@ mod tests {
             memory_mode,
             max_resident_bytes: 0,
             max_scratch_bytes: 0,
-            fallback: FallbackGranularity::WholeFrame,
         }
     }
 
@@ -1508,7 +1502,6 @@ mod tests {
             memory_mode: MemoryMode::Streaming,
             max_resident_bytes: 0,
             max_scratch_bytes: 0,
-            fallback: FallbackGranularity::WholeFrame,
         };
         assert!(matches!(
             streaming_extents(&frame, &plan),
@@ -1517,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_streaming_estimate_remains_checked_for_future_tiled_execution() {
+    fn streaming_estimate_remains_checked_for_future_tiled_execution() {
         let plan = copy_plan();
         let frame = frame(MemoryMode::Auto);
         let extents = streaming_extents(&frame, &plan).unwrap();

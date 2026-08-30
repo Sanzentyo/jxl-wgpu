@@ -9,7 +9,7 @@ use jxl_gpu_formats::{
     TransferFunction,
 };
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
-use jxl_wgpu::{GpuImageFrame, GpuImageOutput, WgpuAccelerator};
+use jxl_wgpu::{GpuImageFrame, GpuImageOutput, WgpuBackend};
 use wgpu::util::DeviceExt;
 
 use crate::profile::validate_gray8_envelope;
@@ -113,7 +113,7 @@ impl Drop for EngineMemoryReservation {
 /// image layout. No CPU pixel or entropy fallback is present.
 #[derive(Clone)]
 pub struct WgpuSubmissionEngine {
-    accelerator: WgpuAccelerator,
+    backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
     memory: Arc<EngineMemoryBudget>,
 }
@@ -122,7 +122,7 @@ impl std::fmt::Debug for WgpuSubmissionEngine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("WgpuSubmissionEngine")
-            .field("accelerator", &self.accelerator)
+            .field("backend", &self.backend)
             .field("memory_budget_bytes", &self.memory.limit)
             .field("reserved_session_bytes", &self.memory.reserved())
             .finish_non_exhaustive()
@@ -131,9 +131,9 @@ impl std::fmt::Debug for WgpuSubmissionEngine {
 
 impl WgpuSubmissionEngine {
     #[must_use]
-    pub fn new(accelerator: WgpuAccelerator) -> Self {
+    pub fn new(backend: WgpuBackend) -> Self {
         Self::with_memory_budget(
-            accelerator,
+            backend,
             NonZeroU64::new(DEFAULT_CONCURRENT_MEMORY_BUDGET)
                 .expect("the default concurrent memory budget is non-zero"),
         )
@@ -142,14 +142,14 @@ impl WgpuSubmissionEngine {
     /// Constructs an engine with an explicit aggregate reservation bound across cloned engines
     /// and concurrently open decode sessions.
     #[must_use]
-    pub fn with_memory_budget(accelerator: WgpuAccelerator, memory_budget: NonZeroU64) -> Self {
-        let module = accelerator
+    pub fn with_memory_budget(backend: WgpuBackend, memory_budget: NonZeroU64) -> Self {
+        let module = backend
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("jxl-wgpu decode lossless gray8"),
                 source: wgpu::ShaderSource::Wgsl(SHADER.into()),
             });
-        let pipeline = Arc::new(accelerator.device().create_compute_pipeline(
+        let pipeline = Arc::new(backend.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some("jxl-wgpu decode lossless gray8 pipeline"),
                 layout: None,
@@ -160,7 +160,7 @@ impl WgpuSubmissionEngine {
             },
         ));
         Self {
-            accelerator,
+            backend,
             pipeline,
             memory: Arc::new(EngineMemoryBudget {
                 limit: memory_budget.get(),
@@ -170,8 +170,8 @@ impl WgpuSubmissionEngine {
     }
 
     #[must_use]
-    pub const fn accelerator(&self) -> &WgpuAccelerator {
-        &self.accelerator
+    pub const fn backend(&self) -> &WgpuBackend {
+        &self.backend
     }
 
     #[must_use]
@@ -210,7 +210,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         let extent = Extent2d::new(index.width(), index.height());
         let output = OutputPlan::new(extent, request.format.clone())?;
         let memory_stats = validate_device_limits(
-            self.accelerator.device(),
+            self.backend.device(),
             codestream.bytes(),
             &index,
             &output,
@@ -223,7 +223,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             DecodeProfile::prototype_8bit(predictor),
             AnimationMetadata::still(extent),
             WgpuDecodeSession {
-                accelerator: self.accelerator.clone(),
+                backend: self.backend.clone(),
                 pipeline: Arc::clone(&self.pipeline),
                 source: Some(DecodeSource {
                     codestream: codestream.shared_bytes(),
@@ -241,7 +241,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
 
 /// One-frame runtime-neutral GPU decode session for the indexed Gray8 profile.
 pub struct WgpuDecodeSession {
-    accelerator: WgpuAccelerator,
+    backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
     source: Option<DecodeSource>,
     pending: Option<PendingDecode>,
@@ -293,7 +293,7 @@ impl GpuSubmissionSession for WgpuDecodeSession {
         if let Err(error) = self.ensure_submitted() {
             return Poll::Ready(Err(error));
         }
-        if let Err(error) = self.accelerator.device().poll(wgpu::PollType::Poll) {
+        if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
             return Poll::Ready(Err(Error::backend(error)));
         }
         let completion = match self.pending_ref() {
@@ -326,7 +326,7 @@ impl WgpuDecodeSession {
         let source = self.source.take().ok_or(Error::EngineContract(
             "Gray8 decode source was consumed without a pending GPU job",
         ))?;
-        self.pending = Some(submit_decode(&self.accelerator, &self.pipeline, source)?);
+        self.pending = Some(submit_decode(&self.backend, &self.pipeline, source)?);
         Ok(())
     }
 
@@ -560,11 +560,11 @@ fn validate_device_limits(
 }
 
 fn submit_decode(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     pipeline: &wgpu::ComputePipeline,
     source: DecodeSource,
 ) -> Result<PendingDecode> {
-    let device = accelerator.device();
+    let device = backend.device();
     let mut codestream_bytes = source.codestream.to_vec();
     codestream_bytes.resize(
         usize::try_from(stream_allocation_size(codestream_bytes.len())?)
@@ -681,7 +681,7 @@ fn submit_decode(
         callback_completion
             .complete(result.map_err(|error| format!("GPU status mapping failed: {error}")));
     });
-    let submission = accelerator.queue().submit([commands.finish()]);
+    let submission = backend.queue().submit([commands.finish()]);
     #[cfg(not(target_arch = "wasm32"))]
     {
         let poll_device = device.clone();
@@ -862,10 +862,10 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl GpuDecoder<WgpuSubmissionEngine> {
-    /// Constructs the GPU-required facade around an application's existing wgpu accelerator.
+    /// Constructs the GPU-required facade around an application's existing wgpu backend.
     #[must_use]
-    pub fn wgpu(accelerator: WgpuAccelerator) -> Self {
-        Self::new(WgpuSubmissionEngine::new(accelerator))
+    pub fn wgpu(backend: WgpuBackend) -> Self {
+        Self::new(WgpuSubmissionEngine::new(backend))
     }
 }
 

@@ -9,7 +9,7 @@ use jxl_gpu_harness::benchmark::{BenchmarkOptions, benchmark_capture};
 use jxl_gpu_harness::capture::{CaptureFile, OperationKind, PrecisionMode};
 use jxl_gpu_harness::codec::{
     CodecCorpusCase, CodecCorpusConfig, CodecOperation, CodecRunOptions, DeclaredExtent,
-    GpuPixelFormat, OutputTarget, SizeClass, WorkloadKind, WorkloadSpec, request_accelerator,
+    GpuPixelFormat, OutputTarget, SizeClass, WorkloadKind, WorkloadSpec, request_backend,
     run_codec_case,
 };
 use jxl_gpu_harness::config::{CorpusConfig, SyntheticCaseConfig, ThresholdConfig};
@@ -301,11 +301,11 @@ fn run_codec(args: CodecArgs) -> Result<bool> {
     .validate()?;
     let mut report = RunReport::new("codec");
     report.adapters = enumerate_adapters();
-    let accelerator = request_accelerator()?;
+    let backend = request_backend()?;
     report.codec_cases.extend(
         inputs
             .iter()
-            .map(|case| run_codec_case(case, accelerator.as_ref(), &options)),
+            .map(|case| run_codec_case(case, backend.as_ref(), &options)),
     );
     let passed = report.passed();
     write_json(&report, args.output.output.as_deref())?;

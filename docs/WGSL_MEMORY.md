@@ -16,8 +16,8 @@ other driver-private allocations cannot be measured portably and are not include
   alignment 4; their total sizes are deliberately multiples of 16 for uniform bindings.
 - `Dct8Uniform` ends in `vec4<f32>`. Its WGSL natural alignment is therefore 16 and Rust uses
   `#[repr(C, align(16))]`.
-- Storage arrays use the same element stride on both sides: `GpuTask`/`Task` is 28 bytes,
-  `FallbackPixel`/`Pixel` is 16 bytes, and `[f32; 4]`/`vec4<f32>` is 16 bytes.
+- Storage arrays use the same element stride on both sides: `GpuTask`/`Task` is 28 bytes and
+  `[f32; 4]`/`vec4<f32>` is 16 bytes.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size
@@ -47,8 +47,6 @@ name shown in parentheses.
 | `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, _padding0` | 96 | 4 | uniform |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuTask` / `Task` | `coefficient_offset, destination_x, destination_y, quant_index, matrix_index, correlation_index, lf_index` | 28 | 4 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
-| `jxl_wgpu/vardct_fallback.wgsl` | `FallbackPixel` / `Pixel` | `position, value_x, value_y, value_b` | 16 | 4 | storage element |
-| `jxl_wgpu/vardct_fallback.wgsl` | `FallbackUniform` / `Params` | `pixel_count, output_width`, 3 output strides, 3 pads | 32 | 4 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | token range, dimensions/sample count, output mode/transfer/range, 3 plane offset/stride pairs, chroma dimensions | 64 | 4 | uniform |
 
@@ -76,8 +74,7 @@ the device and checks every dispatched dimension against `max_compute_workgroups
 | `display_rgb` | source RO, destination T, U | 16x16 | source must have `STORAGE`; logical samples and final source address fit the bound range/WGSL `u32` |
 | `display_image` | source RO, destination T, U | 16x16 | source must have `STORAGE`; each pitch-linear plane and its final address is bounded |
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
-| `vardct_fallback` | pixels RO, X/Y/B RW, U | 64x1 | `ceil(pixel_count/64)` is device-bounded; shader returns for excess lanes |
-| encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | prototype dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
+| encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | profile dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
 | decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, U | 1x1 | bounded `jwgp` index, aligned token words plus sentinel, prefix table, sample/output ranges and status allocation are prevalidated |
 
 Display source buffers are now also checked for the usage needed by the operation: `STORAGE` for
@@ -93,10 +90,9 @@ Only `vardct_dct8.wgsl` declares `var<workgroup>` memory:
 | `vardct_dct8` | two `array<f32, 192>` scratch arrays | 1,536 | reject when `max_compute_workgroup_storage_size < 1,536` |
 
 All other shaders use zero explicit workgroup-local bytes. The largest invocation count is 256
-(`16x16` kernels and `rgb_to_image`); VarDCT DCT8 uses 64, VarDCT fallback uses 64, and the Gray8
-encoder/decoder each use one. Planner capability checks cover the core kernels. The fixed VarDCT
-and Gray8 sizes are within WebGPU's portable baseline; VarDCT additionally checks its workgroup
-storage limit at submission.
+(`16x16` kernels and `rgb_to_image`); VarDCT DCT8 uses 64 and the Gray8 encoder/decoder each use one.
+Planner capability checks cover the core kernels. The fixed VarDCT and Gray8 sizes are within
+WebGPU's portable baseline; VarDCT additionally checks its workgroup storage limit at submission.
 
 ## Four-byte copy and mapping invariant
 
@@ -120,12 +116,12 @@ storage limit at submission.
 |---|---|---|---|
 | Core render session | `WgpuSubmissionStats` reports physical resident-plane bytes and exact explicit transient bytes: uniforms, uploads, packed outputs and staging. `max_transient_bytes` is enforced per submission. | `WgpuFrameSession::pending_transient_bytes()` checked-adds submitted jobs and checked-subtracts them on all wait paths. | The aggregate is observable, not a second admission limit. Queue-ordered reusable resident allocations make it conservative. Caller-owned GPU outputs can outlive `wait`, so the session cannot track them afterward. |
 | Core resident arena | Planner accounts physical slots once, respects simultaneous lifetimes, validates every slot against `max_buffer_size` and every bound plane against `max_storage_buffer_binding_size`. | Buffer pool has a configured hard byte limit and never leases one buffer concurrently. | Pipeline/driver memory excluded. |
-| VarDCT | Exact coefficient, task, resource, fallback-pixel and uniform upload bytes are included in the core transient total. Every upload is checked against `min(max_buffer_size, max_storage_buffer_binding_size)`. | Included in core pending total. | No extra hidden scratch buffer; 1,536-byte workgroup storage is not global buffer memory. |
+| VarDCT DCT8 | Exact coefficient, task, resource, and uniform upload bytes are included in the core transient total. Every upload is checked against `min(max_buffer_size, max_storage_buffer_binding_size)`. | Included in core pending total. | Non-DCT8 transform buckets return a typed rejection. There is no extra global scratch buffer; 1,536-byte workgroup storage is not global buffer memory. |
 | Gray8 encoder | `LosslessGray8MemoryPlan` reports source binding, 16-byte uniform, artifact storage, mapped readback, owned bytes/job and addressed bytes/job. | `for_in_flight(max_jobs)` checked-multiplies both totals and exposes the caller-selected ceiling. | API reports but does not internally semaphore caller concurrency; the application must enforce its selected ceiling. |
 | Gray8 decoder | `WgpuDecodeMemoryStats` reports complete per-frame explicit allocation and `reserved_bytes = per_frame_bytes * max_in_flight`. | A session holds a checked reservation (default 64 MiB/session) in an engine-wide checked budget (default 256 MiB); the in-flight limiter enforces its count. | Driver-private allocations excluded. |
 | Generic image readback | `ImageReadbackStats` reports logical bytes and exact aggregate staging bytes; `ImageReadbackLimits::max_transient_bytes` and device `max_buffer_size` are enforced per submission. | No aggregate admission counter across several independently live `ImageReadbackSubmission` values. | Applications requiring a global cap must limit live submissions; adding a shared reservation is future work. |
 | Display textures | Pitch-linear source buffers are fully range/usage bounded. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing and display-pipeline objects are intentionally excluded. |
-| Legacy video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic; retained for the current video API. |
+| Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
 
 ## Shader write bounds fixed by this audit
 
@@ -144,8 +140,8 @@ pass.
 ## Regression coverage
 
 The ABI tests pin every Rust size and natural alignment, including the 16-byte VarDCT alignment.
-GPU tests compile and execute every portable core shader, all display formats, VarDCT DCT8 plus
-fallback, the deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
+GPU tests compile and execute every portable core shader, all display formats, VarDCT DCT8, the
+deterministic encoder fixture, and the bounded decoder. Dedicated tests cover:
 
 - storage-binding device-limit selection;
 - checked resident aliasing and exact transient estimates;

@@ -10,42 +10,41 @@ use std::sync::{Arc, mpsc};
 use jxl_gpu_protocol::{Extent2d, OutputId, OutputLayout, SampleType};
 use jxl_wgpu::{
     ChromaLocation2d, ChromaOrder, ChromaSubsampling, ColorRange, ColorSpace, ColorSpec,
-    ColorSpecification, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor, GpuImageOutput,
-    GpuOutputBuffer, Packed422Order, PixelFormat, RgbChannelOrder, TransferFunction,
-    WgpuAccelerator, WgpuAcceleratorConfig, YcbcrEncoding,
+    ColorSpecification, DirectReadbackPolicy, DisplayPipeline, DisplayTexture,
+    DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer, Packed422Order, PixelFormat,
+    RgbChannelOrder, TransferFunction, WgpuBackend, WgpuBackendConfig, YcbcrEncoding,
 };
 use wgpu::util::DeviceExt;
 
-fn test_accelerator() -> Option<WgpuAccelerator> {
-    match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
+fn test_backend() -> Option<WgpuBackend> {
+    match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
         enable_timestamps: false,
-        enable_direct_readback: false,
-        ..WgpuAcceleratorConfig::default()
+        direct_readback_policy: DirectReadbackPolicy::Disabled,
+        ..WgpuBackendConfig::default()
     })) {
-        Ok(accelerator) => Some(accelerator),
+        Ok(backend) => Some(backend),
         Err(jxl_wgpu::Error::NoAdapter) => {
             eprintln!("skipping display test: no compatible adapter");
             None
         }
-        Err(error) => panic!("request display test accelerator: {error}"),
+        Err(error) => panic!("request display test backend: {error}"),
     }
 }
 
-fn read_texture(accelerator: &WgpuAccelerator, texture: &DisplayTexture) -> Vec<u8> {
+fn read_texture(backend: &WgpuBackend, texture: &DisplayTexture) -> Vec<u8> {
     let bytes_per_row = texture.extent.width.checked_mul(4).unwrap().div_ceil(256) * 256;
     let size = u64::from(bytes_per_row) * u64::from(texture.extent.height);
-    let staging = accelerator.device().create_buffer(&wgpu::BufferDescriptor {
+    let staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu display test readback"),
         size,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut encoder =
-        accelerator
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("jxl-wgpu display test dependent copy"),
-            });
+    let mut encoder = backend
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu display test dependent copy"),
+        });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: texture.texture(),
@@ -68,14 +67,14 @@ fn read_texture(accelerator: &WgpuAccelerator, texture: &DisplayTexture) -> Vec<
         },
     );
     // This is submitted after the non-blocking display conversion, without waiting for it first.
-    let submission = accelerator.queue().submit([encoder.finish()]);
+    let submission = backend.queue().submit([encoder.finish()]);
     let (sender, receiver) = mpsc::sync_channel(1);
     staging
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-    accelerator
+    backend
         .device()
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
@@ -105,14 +104,14 @@ fn read_texture(accelerator: &WgpuAccelerator, texture: &DisplayTexture) -> Vec<
 
 #[test]
 fn rgb_and_nv12_become_queue_ordered_display_textures() {
-    let Some(accelerator) = test_accelerator() else {
+    let Some(backend) = test_backend() else {
         return;
     };
-    let display = DisplayPipeline::new(&accelerator);
+    let display = DisplayPipeline::new(&backend);
 
     let extent = Extent2d::new(2, 1);
     let rgb = [1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.5];
-    let rgb_buffer = Arc::new(accelerator.device().create_buffer_init(
+    let rgb_buffer = Arc::new(backend.device().create_buffer_init(
         &wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu display RGB input"),
             contents: bytemuck::cast_slice(&rgb),
@@ -132,7 +131,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
         .submit_rgb(&rgb_output, DisplayTextureDescriptor::default())
         .expect("submit RGB display conversion");
     drop(rgb_output);
-    let rgba = read_texture(&accelerator, &submitted.texture);
+    let rgba = read_texture(&backend, &submitted.texture);
     assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
     assert_eq!(&rgba[4..], &[0, 255, 0, 128]);
     assert_eq!(display.cache_stats().pipelines, 1);
@@ -155,7 +154,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
     let mut yuv = converted.bytes;
     let padded_size = layout.logical_size.div_ceil(4) * 4;
     yuv.resize(usize::try_from(padded_size).unwrap(), 0);
-    let yuv_buffer = Arc::new(accelerator.device().create_buffer_init(
+    let yuv_buffer = Arc::new(backend.device().create_buffer_init(
         &wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu display NV12 input"),
             contents: &yuv,
@@ -171,7 +170,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
         .submit_image(&yuv_output, DisplayTextureDescriptor::default())
         .expect("submit NV12 display conversion");
     drop(yuv_output);
-    let rgba = read_texture(&accelerator, &submitted.texture);
+    let rgba = read_texture(&backend, &submitted.texture);
     for pixel in rgba.chunks_exact(4) {
         assert!(pixel[0].abs_diff(128) <= 2, "red channel: {pixel:?}");
         assert!(pixel[1].abs_diff(128) <= 2, "green channel: {pixel:?}");
@@ -183,21 +182,23 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
 
 #[test]
 fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
-    let Some(accelerator) = test_accelerator() else {
+    let Some(backend) = test_backend() else {
         return;
     };
-    let display = DisplayPipeline::new(&accelerator);
+    let display = DisplayPipeline::new(&backend);
     let extent = Extent2d::new(64, 2);
     let mut rgba = vec![0u8; extent.area().unwrap() * 4];
     rgba[..4].copy_from_slice(&[11, 22, 33, 44]);
     rgba[256..260].copy_from_slice(&[55, 66, 77, 88]);
-    let buffer = Arc::new(accelerator.device().create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu RGBA8 copy input"),
-            contents: &rgba,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        },
-    ));
+    let buffer = Arc::new(
+        backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu RGBA8 copy input"),
+                contents: &rgba,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            }),
+    );
     let output = GpuOutputBuffer {
         id: OutputId(2),
         extent,
@@ -210,19 +211,21 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
     let submitted = display
         .submit_rgba8_copy(&output, DisplayTextureDescriptor::default())
         .expect("submit aligned RGBA8 copy");
-    let copied = read_texture(&accelerator, &submitted.texture);
+    let copied = read_texture(&backend, &submitted.texture);
     assert_eq!(&copied[..4], &[11, 22, 33, 44]);
     assert_eq!(&copied[256..260], &[55, 66, 77, 88]);
 
     let unaligned_extent = Extent2d::new(3, 2);
     let unaligned = vec![0u8; unaligned_extent.area().unwrap() * 4];
-    let buffer = Arc::new(accelerator.device().create_buffer_init(
-        &wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu unaligned RGBA8 copy input"),
-            contents: &unaligned,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        },
-    ));
+    let buffer = Arc::new(
+        backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu unaligned RGBA8 copy input"),
+                contents: &unaligned,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            }),
+    );
     let output = GpuOutputBuffer {
         id: OutputId(3),
         extent: unaligned_extent,
@@ -243,10 +246,10 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
 
 #[test]
 fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
-    let Some(accelerator) = test_accelerator() else {
+    let Some(backend) = test_backend() else {
         return;
     };
-    let display = DisplayPipeline::new(&accelerator);
+    let display = DisplayPipeline::new(&backend);
     let extent = Extent2d::new(3, 3);
     let grey = vec![0.5f32; extent.area().unwrap()];
     let color = ColorSpecification::Defined(ColorSpec {
@@ -271,7 +274,7 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
             .expect("convert generic display input");
         let mut bytes = converted.bytes;
         bytes.resize(bytes.len().div_ceil(4) * 4, 0);
-        let buffer = Arc::new(accelerator.device().create_buffer_init(
+        let buffer = Arc::new(backend.device().create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("jxl-wgpu generic display input"),
                 contents: &bytes,
@@ -286,7 +289,7 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
         let submitted = display
             .submit_image(&output, DisplayTextureDescriptor::default())
             .expect("submit generic display conversion");
-        let rgba = read_texture(&accelerator, &submitted.texture);
+        let rgba = read_texture(&backend, &submitted.texture);
         for pixel in rgba.chunks_exact(4) {
             assert!(pixel[0].abs_diff(128) <= 2, "red {format:?}: {pixel:?}");
             assert!(pixel[1].abs_diff(128) <= 2, "green {format:?}: {pixel:?}");

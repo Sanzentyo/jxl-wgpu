@@ -5,7 +5,7 @@
 This repository is a standalone Cargo workspace. Production codec crates do not vendor, patch, or
 call an upstream CPU codec. Published `jxl` and reference `cjxl`/`djxl` binaries are dev-only
 correctness oracles.
-The backend-neutral protocol, portable image formats, `wgpu` execution, stable decode facade, and
+The backend-neutral protocol, portable image formats, `wgpu` execution, decode facade, and
 measurement harness can therefore be released independently.
 
 The dependency graph is intentionally one-way:
@@ -29,8 +29,8 @@ only by tests and the harness.
 
 ## GPU-required codec path
 
-Container/header parsing and packet ordering remain host orchestration. There is no host pixel
-codec and no production fallback to `jxl`, `cjxl`, or `djxl`:
+Container/header parsing and packet ordering remain host orchestration. Pixel and coefficient work
+for an accepted profile is submitted to the GPU:
 
 ```text
 JPEG XL bytes -> bounded container/header parse -> GPU group decode
@@ -49,10 +49,10 @@ profile; capabilities expand only with valid-bitstream round trips and conforman
 
 ## Protocol execution
 
-For capture/replay tests and a future decoder bridge, `jxl_gpu_protocol` describes planes,
-resources, decoded group payloads, VarDCT packets, operations, output descriptors, changed regions,
-and transactional frame sessions. `jxl_wgpu` validates and lowers this protocol into a bounded
-batch:
+For capture/replay tests and codec frontends, `jxl_gpu_protocol` describes planes, resources,
+decoded group payloads, VarDCT packets, operations, output descriptors, changed regions, and
+transactional frame sessions. `RenderBackend` creates a `FrameSession`; `WgpuBackend` validates and
+lowers the protocol into a bounded batch:
 
 ```text
 RenderPlan
@@ -63,8 +63,8 @@ RenderPlan
     -> GPU-resident output or explicit mapped readback
 ```
 
-Unsupported nodes reject before output becomes authoritative. Production codec sessions do not
-fall back to a CPU codec, and the backend never returns a partially valid frame as success.
+Unsupported nodes reject before output becomes authoritative, and the backend never returns a
+partially valid frame as success.
 
 ## Portable output formats
 

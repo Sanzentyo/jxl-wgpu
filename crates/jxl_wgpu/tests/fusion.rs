@@ -2,22 +2,22 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use jxl_gpu_protocol::{
-    Border2d, ChromaAxis, Extent2d, FallbackGranularity, FrameSessionDesc, GroupId, GroupPayload,
-    HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId,
-    PlaneRole, PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp,
-    RenderOpKind, RenderPlan, SampleType, SaveParams, Scale2d,
+    Border2d, ChromaAxis, Extent2d, FrameSessionDesc, GroupId, GroupPayload, HostPlane, MemoryMode,
+    OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole,
+    PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderOpKind,
+    RenderPlan, SampleType, SaveParams, Scale2d,
 };
 use jxl_wgpu::{
-    Error, FusedKernel, KernelVariant, Planner, Result, WgpuAccelerator, WgpuAcceleratorConfig,
+    Error, FusedKernel, KernelVariant, Planner, Result, WgpuBackend, WgpuBackendConfig,
     WgpuMemoryPolicy,
 };
 
-fn accelerator() -> Result<Option<WgpuAccelerator>> {
-    match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
+fn backend() -> Result<Option<WgpuBackend>> {
+    match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
         enable_timestamps: false,
-        ..WgpuAcceleratorConfig::default()
+        ..WgpuBackendConfig::default()
     })) {
-        Ok(accelerator) => Ok(Some(accelerator)),
+        Ok(backend) => Ok(Some(backend)),
         Err(Error::NoAdapter) => Ok(None),
         Err(error) => Err(error),
     }
@@ -32,7 +32,6 @@ fn frame(extent: Extent2d) -> FrameSessionDesc {
         memory_mode: MemoryMode::Resident,
         max_resident_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
-        fallback: FallbackGranularity::WholeFrame,
     }
 }
 
@@ -113,7 +112,7 @@ fn chroma_axis(
 
 #[test]
 fn fused_chroma_2d_matches_separable_scalar_on_odd_mirror_edges() -> Result<()> {
-    let Some(accelerator) = accelerator()? else {
+    let Some(backend) = backend()? else {
         eprintln!("skipping fusion test: no wgpu adapter is available");
         return Ok(());
     };
@@ -172,8 +171,8 @@ fn fused_chroma_2d_matches_separable_scalar_on_odd_mirror_edges() -> Result<()> 
         }],
     });
     let frame = frame(output_extent);
-    let execution = Planner::new(accelerator.device().limits(), WgpuMemoryPolicy::default())
-        .plan(&frame, &plan)?;
+    let execution =
+        Planner::new(backend.device().limits(), WgpuMemoryPolicy::default()).plan(&frame, &plan)?;
     assert_eq!(execution.dispatches.len(), 2);
     assert_eq!(execution.dispatches[0].kernel, FusedKernel::Chroma2d);
     assert_eq!(execution.dispatches[0].node_indices, [0, 1]);
@@ -210,7 +209,7 @@ fn fused_chroma_2d_matches_separable_scalar_on_odd_mirror_edges() -> Result<()> 
         ChromaAxis::Vertical,
     );
 
-    let mut session = accelerator.create_session(&frame, plan)?;
+    let mut session = backend.create_session(&frame, plan)?;
     session.enqueue(GroupPayload {
         group: GroupId(0),
         revision: 0,
@@ -237,7 +236,7 @@ fn fused_chroma_2d_matches_separable_scalar_on_odd_mirror_edges() -> Result<()> 
             2,
             2,
             1,
-            accelerator
+            backend
                 .device()
                 .features()
                 .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
@@ -284,7 +283,7 @@ fn gaborish_reference(input: &[f32], extent: Extent2d, weights: [f32; 3]) -> Vec
 
 #[test]
 fn fused_gaborish_rgb_matches_scalar_with_channel_specific_weights() -> Result<()> {
-    let Some(accelerator) = accelerator()? else {
+    let Some(backend) = backend()? else {
         eprintln!("skipping fusion test: no wgpu adapter is available");
         return Ok(());
     };
@@ -347,8 +346,8 @@ fn fused_gaborish_rgb_matches_scalar_with_channel_specific_weights() -> Result<(
         }],
     });
     let frame = frame(extent);
-    let execution = Planner::new(accelerator.device().limits(), WgpuMemoryPolicy::default())
-        .plan(&frame, &plan)?;
+    let execution =
+        Planner::new(backend.device().limits(), WgpuMemoryPolicy::default()).plan(&frame, &plan)?;
     assert_eq!(execution.dispatches.len(), 2);
     assert_eq!(execution.dispatches[0].kernel, FusedKernel::GaborishRgb);
     assert_eq!(execution.dispatches[0].node_indices, [0, 1, 2]);
@@ -376,7 +375,7 @@ fn fused_gaborish_rgb_matches_scalar_with_channel_specific_weights() -> Result<(
         .zip(weights)
         .flat_map(|(source, weights)| gaborish_reference(source, extent, weights))
         .collect::<Vec<_>>();
-    let mut session = accelerator.create_session(&frame, plan)?;
+    let mut session = backend.create_session(&frame, plan)?;
     session.enqueue(GroupPayload {
         group: GroupId(0),
         revision: 0,
@@ -407,7 +406,7 @@ fn fused_gaborish_rgb_matches_scalar_with_channel_specific_weights() -> Result<(
             2,
             4,
             1,
-            accelerator
+            backend
                 .device()
                 .features()
                 .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),

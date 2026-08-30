@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use jxl_gpu_protocol::{AcceleratorError, PlaneId};
+use jxl_gpu_protocol::{BackendError, PlaneId};
 
 use crate::session::SubmissionMode;
 
@@ -80,7 +80,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl From<Error> for AcceleratorError {
+impl From<Error> for BackendError {
     fn from(error: Error) -> Self {
         match error {
             Error::Unsupported(message) => Self::Unsupported(message),

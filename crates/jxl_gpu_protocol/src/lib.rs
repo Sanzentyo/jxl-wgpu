@@ -5,16 +5,13 @@
 
 //! Backend-neutral protocol for accelerating JPEG XL rendering.
 //!
-//! The decoder deliberately exposes no `wgpu` types here.  An accelerator can
+//! The decoder deliberately exposes no `wgpu` types here. A backend can
 //! therefore live in a separate crate, share an application's existing device,
 //! and be omitted entirely on builds that do not need GPU support.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-
-/// Wire/API version of the backend-neutral render protocol.
-pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -218,7 +215,6 @@ pub enum RenderOpKind {
     Convert,
     Extend,
     Save,
-    CpuFallback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,7 +302,7 @@ impl fmt::Debug for RenderResourceSpec {
 pub trait RenderResourceProvider: Send + Sync {
     /// Takes an owned snapshot for one frame submission. `plane` is present when the resource is
     /// addressable as a parameter plane in the render plan.
-    fn snapshot(&self, plane: Option<&PlaneDesc>) -> Result<ResourceData, AcceleratorError>;
+    fn snapshot(&self, plane: Option<&PlaneDesc>) -> Result<ResourceData, BackendError>;
 }
 
 #[derive(Clone, Debug)]
@@ -400,7 +396,7 @@ pub enum RenderOp {
     Epf(EpfParams),
     Upsample(UpsampleParams),
     /// VarDCT packet stage. `transform` is the maximum square DCT edge handled natively by the
-    /// backend; the baseline contract uses `8` and packet fallbacks cover other shapes.
+    /// backend. A backend must return a typed unsupported error for transforms it cannot execute.
     VarDct {
         transform: u16,
     },
@@ -423,10 +419,6 @@ pub enum RenderOp {
         origin: (i32, i32),
     },
     Save(SaveParams),
-    /// An explicit CPU boundary. Backends must never silently approximate it.
-    CpuFallback {
-        reason: Arc<str>,
-    },
 }
 
 impl RenderOp {
@@ -448,7 +440,6 @@ impl RenderOp {
             Self::Convert { .. } => RenderOpKind::Convert,
             Self::Extend { .. } => RenderOpKind::Extend,
             Self::Save(_) => RenderOpKind::Save,
-            Self::CpuFallback { .. } => RenderOpKind::CpuFallback,
         }
     }
 }
@@ -705,14 +696,6 @@ pub enum MemoryMode {
     Streaming,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FallbackGranularity {
-    #[default]
-    WholeFrame,
-    TransformTile,
-    CpuSuffix,
-}
-
 #[derive(Clone, Debug)]
 pub struct FrameSessionDesc {
     pub frame_extent: Extent2d,
@@ -722,17 +705,12 @@ pub struct FrameSessionDesc {
     pub memory_mode: MemoryMode,
     pub max_resident_bytes: u64,
     pub max_scratch_bytes: u64,
-    pub fallback: FallbackGranularity,
 }
 
 #[derive(Clone, Debug)]
-pub struct AcceleratorCapabilities {
+pub struct BackendCapabilities {
     pub name: String,
     pub supported_ops: BTreeSet<RenderOpKind>,
-    /// Whole-frame pixel count below which automatic decoder integration should keep the
-    /// low-memory CPU pipeline. `None` disables automatic integration, while `Some(0)` always
-    /// opts into acceleration.
-    pub minimum_frame_pixels: Option<u64>,
     pub max_buffer_bytes: u64,
     pub max_workgroup_storage_bytes: u32,
     pub max_invocations_per_workgroup: u32,
@@ -740,20 +718,11 @@ pub struct AcceleratorCapabilities {
     pub supports_f16: bool,
 }
 
-impl AcceleratorCapabilities {
+impl BackendCapabilities {
     pub fn supports_plan(&self, plan: &RenderPlan) -> bool {
         plan.nodes
             .iter()
             .all(|node| self.supported_ops.contains(&node.op.kind()))
-    }
-
-    pub fn prefers_frame_size(&self, size: (usize, usize)) -> bool {
-        let Some(minimum_frame_pixels) = self.minimum_frame_pixels else {
-            return false;
-        };
-        let width = u64::try_from(size.0).unwrap_or(u64::MAX);
-        let height = u64::try_from(size.1).unwrap_or(u64::MAX);
-        width.saturating_mul(height) >= minimum_frame_pixels
     }
 }
 
@@ -801,14 +770,14 @@ pub struct HostPlane {
 }
 
 impl HostPlane {
-    pub fn validate(&self) -> Result<(), AcceleratorError> {
+    pub fn validate(&self) -> Result<(), BackendError> {
         let stride = if self.stride == 0 {
             self.extent.width
         } else {
             self.stride
         };
         if stride < self.extent.width {
-            return Err(AcceleratorError::InvalidPayload(format!(
+            return Err(BackendError::InvalidPayload(format!(
                 "plane {:?} stride {stride} is shorter than width {}",
                 self.id, self.extent.width
             )));
@@ -816,9 +785,9 @@ impl HostPlane {
         let required = usize::try_from(stride)
             .ok()
             .and_then(|stride| stride.checked_mul(self.extent.height as usize))
-            .ok_or_else(|| AcceleratorError::InvalidPayload("plane size overflow".into()))?;
+            .ok_or_else(|| BackendError::InvalidPayload("plane size overflow".into()))?;
         if self.data.len() < required {
-            return Err(AcceleratorError::InvalidPayload(format!(
+            return Err(BackendError::InvalidPayload(format!(
                 "plane {:?} has {} samples, expected at least {required}",
                 self.id,
                 self.data.len()
@@ -909,12 +878,6 @@ pub struct TransformBucket {
     pub tasks: Vec<TransformTask>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CpuRenderedTile {
-    pub region: Region,
-    pub channels: [Vec<f32>; 3],
-}
-
 /// Owned group packet that can outlive entropy-decoder worker callbacks.
 #[derive(Clone, Debug)]
 pub struct VarDctPacket {
@@ -922,7 +885,6 @@ pub struct VarDctPacket {
     pub last_pass: u16,
     pub coefficients: PackedCoefficients,
     pub buckets: Vec<TransformBucket>,
-    pub cpu_fallback_tiles: Vec<CpuRenderedTile>,
 }
 
 /// Per-frequency dequantization multipliers for one DCT8 matrix.
@@ -999,58 +961,49 @@ pub struct ChangedRegions {
 }
 
 #[derive(Clone, Debug)]
-pub struct AcceleratedFrame {
+pub struct RenderedFrame {
     pub token: SubmissionToken,
     pub outputs: Vec<RenderedOutput>,
     pub changed: ChangedRegions,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum AcceleratorError {
+pub enum BackendError {
     #[error("render plan is unsupported: {0}")]
     Unsupported(String),
-    #[error("invalid accelerator payload: {0}")]
+    #[error("invalid backend payload: {0}")]
     InvalidPayload(String),
-    #[error("accelerator resource limit exceeded: {0}")]
+    #[error("backend resource limit exceeded: {0}")]
     ResourceLimit(String),
-    #[error("accelerator device was lost: {0}")]
+    #[error("backend device was lost: {0}")]
     DeviceLost(String),
-    #[error("accelerator execution failed: {0}")]
+    #[error("backend execution failed: {0}")]
     Execution(String),
 }
 
-/// Factory supplied by an optional acceleration crate.
-pub trait JxlAccelerator: Send + Sync + fmt::Debug {
-    fn capabilities(&self) -> AcceleratorCapabilities;
+/// Factory supplied by a render backend crate.
+pub trait RenderBackend: Send + Sync + fmt::Debug {
+    fn capabilities(&self) -> BackendCapabilities;
 
     fn create_frame_session(
         &self,
         frame: &FrameSessionDesc,
         plan: Arc<RenderPlan>,
-    ) -> Result<Box<dyn AcceleratedFrameSession>, AcceleratorError>;
+    ) -> Result<Box<dyn FrameSession>, BackendError>;
 }
 
 /// Per-frame state. Enqueue never waits for GPU completion; synchronization is explicit in
 /// [`submit`](Self::submit) and [`wait`](Self::wait).
-pub trait AcceleratedFrameSession: Send {
+pub trait FrameSession: Send {
     /// Updates a late-bound plan resource. Revisions must be monotonically increasing per ID.
-    fn update_resource(&mut self, update: ResourceUpdate) -> Result<(), AcceleratorError>;
+    fn update_resource(&mut self, update: ResourceUpdate) -> Result<(), BackendError>;
 
-    fn enqueue(&mut self, payload: GroupPayload) -> Result<(), AcceleratorError>;
+    fn enqueue(&mut self, payload: GroupPayload) -> Result<(), BackendError>;
 
-    fn submit(&mut self, intent: RenderIntent) -> Result<SubmissionToken, AcceleratorError>;
+    fn submit(&mut self, intent: RenderIntent) -> Result<SubmissionToken, BackendError>;
 
-    fn wait(&mut self, token: SubmissionToken) -> Result<AcceleratedFrame, AcceleratorError>;
+    fn wait(&mut self, token: SubmissionToken) -> Result<RenderedFrame, BackendError>;
 }
-
-/// Neutral names preferred by standalone producers and backends.
-///
-/// The original names remain available so the source-tree prototype can be adapted without a
-/// flag-day rename.
-pub use AcceleratedFrameSession as FrameSession;
-pub use AcceleratorCapabilities as BackendCapabilities;
-pub use AcceleratorError as BackendError;
-pub use JxlAccelerator as RenderBackend;
 
 #[cfg(test)]
 mod tests {
@@ -1179,25 +1132,20 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_cost_hint_handles_thresholds_and_overflow() {
-        let capabilities = AcceleratorCapabilities {
-            name: "cost model".into(),
-            supported_ops: BTreeSet::new(),
-            minimum_frame_pixels: Some(65_536),
+    fn capabilities_match_supported_operation_kinds() {
+        let capabilities = BackendCapabilities {
+            name: "operation set".into(),
+            supported_ops: BTreeSet::from([RenderOpKind::Upsample, RenderOpKind::Copy]),
             max_buffer_bytes: 0,
             max_workgroup_storage_bytes: 0,
             max_invocations_per_workgroup: 0,
             supports_timestamps: false,
             supports_f16: false,
         };
-        assert!(!capabilities.prefers_frame_size((255, 255)));
-        assert!(capabilities.prefers_frame_size((256, 256)));
-        assert!(capabilities.prefers_frame_size((usize::MAX, usize::MAX)));
+        assert!(capabilities.supports_plan(&test_plan()));
 
-        let disabled = AcceleratorCapabilities {
-            minimum_frame_pixels: None,
-            ..capabilities
-        };
-        assert!(!disabled.prefers_frame_size((usize::MAX, usize::MAX)));
+        let mut unsupported = test_plan();
+        unsupported.nodes[0].op = RenderOp::AddNoise { seed0: 1, seed1: 2 };
+        assert!(!capabilities.supports_plan(&unsupported));
     }
 }

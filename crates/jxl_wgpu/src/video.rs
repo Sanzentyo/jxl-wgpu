@@ -6,7 +6,7 @@
 //! Generic pitch-linear image output contracts for video and image consumers.
 //!
 //! These contracts are selected on a concrete [`crate::WgpuFrameSession`]. The backend-neutral
-//! `JxlAccelerator` trait currently asks for the `RenderPlan`'s ordinary output and therefore a
+//! `RenderBackend` trait currently asks for the `RenderPlan`'s ordinary output and therefore a
 //! stock `JxlDecoder` call cannot request NV12 directly. A decoder-facing wrapper must expose its
 //! concrete wgpu session (or the core trait must gain an output-request hook) before this API can
 //! provide end-to-end decoder zero-copy.

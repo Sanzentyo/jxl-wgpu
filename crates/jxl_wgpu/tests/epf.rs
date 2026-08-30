@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use jxl_gpu_protocol::{
-    Border2d, EpfParams, EpfPass, Extent2d, FallbackGranularity, FrameSessionDesc, GroupId,
-    GroupPayload, HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc,
-    PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp,
-    RenderPlan, ResourceData, ResourceId, ResourceUpdate, SampleType, SaveParams, Scale2d,
+    Border2d, EpfParams, EpfPass, Extent2d, FrameSessionDesc, GroupId, GroupPayload, HostPlane,
+    MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole,
+    PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp, RenderPlan,
+    ResourceData, ResourceId, ResourceUpdate, SampleType, SaveParams, Scale2d,
 };
-use jxl_wgpu::{Error, WgpuAccelerator, WgpuAcceleratorConfig};
+use jxl_wgpu::{Error, WgpuBackend, WgpuBackendConfig};
 
 const WIDTH: u32 = 19;
 const HEIGHT: u32 = 11;
@@ -20,12 +20,12 @@ enum SigmaMode {
     Variable,
 }
 
-fn test_accelerator() -> Option<WgpuAccelerator> {
-    match pollster::block_on(WgpuAccelerator::request_default(WgpuAcceleratorConfig {
+fn test_backend() -> Option<WgpuBackend> {
+    match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
         enable_timestamps: false,
-        ..WgpuAcceleratorConfig::default()
+        ..WgpuBackendConfig::default()
     })) {
-        Ok(accelerator) => Some(accelerator),
+        Ok(backend) => Some(backend),
         Err(Error::NoAdapter) => {
             eprintln!("skipping GPU test: no wgpu adapter is available");
             None
@@ -166,7 +166,6 @@ fn frame_desc() -> FrameSessionDesc {
         memory_mode: MemoryMode::Resident,
         max_resident_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
-        fallback: FallbackGranularity::WholeFrame,
     }
 }
 
@@ -225,12 +224,12 @@ fn sigma_update(mode: SigmaMode) -> ResourceUpdate {
 }
 
 fn run_gpu(
-    accelerator: &WgpuAccelerator,
+    backend: &WgpuBackend,
     pass: EpfPass,
     mode: SigmaMode,
     channels: &[Vec<f32>; 3],
 ) -> Result<[Vec<f32>; 3], Error> {
-    let mut session = accelerator.create_session(&frame_desc(), epf_plan(pass, mode))?;
+    let mut session = backend.create_session(&frame_desc(), epf_plan(pass, mode))?;
     session.update_resource(sigma_update(mode))?;
     session.enqueue(group_payload(channels))?;
     let token = session.submit(RenderIntent::Final)?;
@@ -393,16 +392,16 @@ fn reference_epf(channels: &[Vec<f32>; 3], pass: EpfPass, mode: SigmaMode) -> [V
 
 #[test]
 fn all_epf_passes_match_scalar_reference_for_constant_and_variable_sigma() {
-    let Some(accelerator) = test_accelerator() else {
+    let Some(backend) = test_backend() else {
         return;
     };
     #[cfg(target_os = "macos")]
-    assert_eq!(accelerator.adapter_info().backend, wgpu::Backend::Metal);
+    assert_eq!(backend.adapter_info().backend, wgpu::Backend::Metal);
     let channels = source_channels();
     for pass in [EpfPass::Pass0, EpfPass::Pass1, EpfPass::Pass2] {
         for mode in [SigmaMode::Constant(-0.58), SigmaMode::Variable] {
             let expected = reference_epf(&channels, pass, mode);
-            let actual = run_gpu(&accelerator, pass, mode, &channels)
+            let actual = run_gpu(&backend, pass, mode, &channels)
                 .unwrap_or_else(|error| panic!("{pass:?} GPU execution failed: {error}"));
             let mut maximum_error = 0.0f32;
             let mut squared_error = 0.0f64;
@@ -430,12 +429,12 @@ fn all_epf_passes_match_scalar_reference_for_constant_and_variable_sigma() {
 
 #[test]
 fn malformed_epf_resources_return_typed_errors() {
-    let Some(accelerator) = test_accelerator() else {
+    let Some(backend) = test_backend() else {
         return;
     };
     let channels = source_channels();
 
-    let mut missing = accelerator
+    let mut missing = backend
         .create_session(
             &frame_desc(),
             epf_plan(EpfPass::Pass2, SigmaMode::Constant(-0.5)),
@@ -449,7 +448,7 @@ fn malformed_epf_resources_return_typed_errors() {
         Err(Error::InvalidPayload(message)) if message.contains("missing")
     ));
 
-    let mut malformed = accelerator
+    let mut malformed = backend
         .create_session(
             &frame_desc(),
             epf_plan(EpfPass::Pass1, SigmaMode::Constant(-0.5)),
@@ -479,7 +478,7 @@ fn malformed_epf_resources_return_typed_errors() {
     sigma.extent = Extent2d::new(1, 1);
     sigma.stride = 1;
     assert!(matches!(
-        accelerator.create_session(&frame_desc(), Arc::new(undersized_plan)),
+        backend.create_session(&frame_desc(), Arc::new(undersized_plan)),
         Err(Error::InvalidPayload(message)) if message.contains("covering at least")
     ));
 }

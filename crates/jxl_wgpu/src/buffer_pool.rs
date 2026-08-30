@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-/// Snapshot of the accelerator-wide internal buffer pool.
+/// Snapshot of the backend-wide internal buffer pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WgpuBufferPoolStats {
     /// Acquisitions satisfied by an exactly matching cached allocation.
@@ -46,7 +46,7 @@ struct PoolState {
     cached_bytes: u64,
 }
 
-/// Accelerator-wide cache. A lease must be returned only at a proven GPU ownership boundary.
+/// Backend-wide cache. A lease must be returned only at a proven GPU ownership boundary.
 pub(crate) struct BufferPool {
     device: wgpu::Device,
     max_cached_bytes: u64,

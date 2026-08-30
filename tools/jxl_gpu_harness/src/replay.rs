@@ -5,11 +5,11 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use jxl_gpu_protocol::{
-    Border2d, ChromaAxis, EpfParams, EpfPass, Extent2d, FallbackGranularity, FrameSessionDesc,
-    GaborishParams, GroupId, GroupPayload, HostPlane, MemoryMode, OutputDesc, OutputId,
-    OutputLayout, PlaneData, PlaneDesc, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy,
-    RenderIntent, RenderNode, RenderOp, RenderPlan, ResourceData, ResourceId, ResourceUpdate,
-    SampleType, SaveParams, Scale2d, UpsampleParams,
+    Border2d, ChromaAxis, EpfParams, EpfPass, Extent2d, FrameSessionDesc, GaborishParams, GroupId,
+    GroupPayload, HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc,
+    PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp,
+    RenderPlan, ResourceData, ResourceId, ResourceUpdate, SampleType, SaveParams, Scale2d,
+    UpsampleParams,
 };
 
 use crate::capture::{
@@ -58,27 +58,27 @@ impl ReplayBackend for ReferenceBackend {
 }
 
 #[derive(Debug)]
-pub struct WgpuBackend {
-    accelerator: jxl_wgpu::WgpuAccelerator,
+pub struct WgpuReplayBackend {
+    backend: jxl_wgpu::WgpuBackend,
 }
 
-impl WgpuBackend {
+impl WgpuReplayBackend {
     pub fn request_default() -> Result<Self> {
-        let accelerator = pollster::block_on(jxl_wgpu::WgpuAccelerator::request_default(
-            jxl_wgpu::WgpuAcceleratorConfig {
+        let backend = pollster::block_on(jxl_wgpu::WgpuBackend::request_default(
+            jxl_wgpu::WgpuBackendConfig {
                 enable_timestamps: false,
-                ..jxl_wgpu::WgpuAcceleratorConfig::default()
+                ..jxl_wgpu::WgpuBackendConfig::default()
             },
         ))
         .map_err(|error| match error {
             jxl_wgpu::Error::NoAdapter => Error::BackendUnavailable(error.to_string()),
             other => Error::Verification(format!("failed to initialize wgpu: {other}")),
         })?;
-        Ok(Self { accelerator })
+        Ok(Self { backend })
     }
 }
 
-impl ReplayBackend for WgpuBackend {
+impl ReplayBackend for WgpuReplayBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Wgpu
     }
@@ -86,7 +86,7 @@ impl ReplayBackend for WgpuBackend {
     fn execute(&mut self, capture: &CaptureFile) -> Result<Vec<f32>> {
         let job = WgpuReplayJob::from_capture(capture)?;
         let mut session = self
-            .accelerator
+            .backend
             .create_session(&job.frame, Arc::new(job.plan))
             .map_err(map_wgpu_error)?;
         for update in job.resources {
@@ -272,7 +272,6 @@ impl WgpuReplayJob {
                 memory_mode: MemoryMode::Resident,
                 max_resident_bytes: 512 * 1024 * 1024,
                 max_scratch_bytes: 256 * 1024 * 1024,
-                fallback: FallbackGranularity::WholeFrame,
             },
             plan: RenderPlan {
                 planes,
@@ -737,7 +736,7 @@ fn map_wgpu_error(error: jxl_wgpu::Error) -> Error {
 pub fn create_backend(kind: BackendKind) -> Result<Box<dyn ReplayBackend>> {
     match kind {
         BackendKind::Reference => Ok(Box::<ReferenceBackend>::default()),
-        BackendKind::Wgpu => Ok(Box::new(WgpuBackend::request_default()?)),
+        BackendKind::Wgpu => Ok(Box::new(WgpuReplayBackend::request_default()?)),
     }
 }
 
@@ -884,7 +883,7 @@ mod tests {
 
     #[test]
     fn wgpu_replay_executes_every_supported_capture_operation() {
-        let mut backend = match WgpuBackend::request_default() {
+        let mut backend = match WgpuReplayBackend::request_default() {
             Ok(backend) => backend,
             Err(Error::BackendUnavailable(message)) => {
                 eprintln!("skipping wgpu integration test: {message}");

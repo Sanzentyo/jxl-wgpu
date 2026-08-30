@@ -5,12 +5,12 @@
 The production repository is standalone and consumes JPEG XL crates through Cargo. It does not
 carry `jxl-rs` as workspace members, a subtree, or a submodule.
 
-The currently published `jxl` API returns completed CPU output. That is too late for this
-GPU-required codec and is not used as a production fallback. If upstream integration is pursued in
-the future, a correct pre-IDCT backend would need four narrowly scoped capabilities:
+The currently published `jxl` API returns completed CPU output. That boundary is too late for this
+GPU-required codec. If upstream integration is pursued in the future, a correct pre-IDCT backend
+would need four narrowly scoped capabilities:
 
 1. optional backend injection before a frame render pipeline is constructed;
-2. an owned, versioned packet for decoded groups and borrowed pre-IDCT coefficient export;
+2. an owned, bounded packet for decoded groups and borrowed pre-IDCT coefficient export;
 3. coordinator-only submission after the parallel decode runner reaches its barrier; and
 4. terminal output negotiation so native YUV/NV12 can replace the final RGB Save without an RGB
    readback.
@@ -31,7 +31,7 @@ decoder, not an adapter.
 The helper crates do not close that gap: `jxl_transforms` and `jxl_simd` implement CPU math,
 `jxl_cms` handles color management, and `jxl_macros` supports the implementation. They remain
 normal transitive dependencies of `jxl`; the GPU backend should depend on them directly only for a
-specific scalar oracle or compatibility test.
+specific scalar oracle or conformance test.
 
 The audit was performed against the crates.io `0.6.0` family, all built from upstream commit
 `fbed310bda2496c97672f7f427ca7a2aebe035d4`:
@@ -56,12 +56,8 @@ larger and less stable design than one narrow upstream packet sink.
   tests.
 - **Reference oracle:** published `jxl` and `cjxl`/`djxl` may be dev dependencies or external
   harness processes only.
-- **Upstream adapter:** intentionally small and versioned separately when the required hooks exist.
-  Unsupported stages must reject before submission; no CPU RGB roundtrip may be described as native
-  decode.
-
-The source-tree prototype remains available only as Git history for developing and upstreaming that
-adapter.
+- **Upstream adapter:** implemented only when the required hooks exist. Unsupported stages must
+  reject before submission; no CPU RGB roundtrip may be described as native decode.
 
 ## Minimal upstream contract
 
@@ -80,7 +76,7 @@ trait DecodePacketSink {
 The VarDCT packet must contain transform coverage, quantized coefficients, progressive-pass
 completeness, LF/DC planes, quant/dequant information, color-correlation data, and EPF metadata.
 The decoder remains responsible for container, reference-frame, and dependency scheduling; the
-backend receives a versioned semantic packet at the point immediately before CPU dequant/IDCT.
+backend receives a validated semantic packet at the point immediately before CPU dequant/IDCT.
 
 Terminal output negotiation is separate. It lets the backend own the final pitch-linear buffer or
 display texture instead of forcing a CPU RGB buffer, while keeping all `wgpu` types outside
