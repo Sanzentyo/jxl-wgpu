@@ -175,7 +175,9 @@ normalization. The compatibility result is valid IEEE-754 F64 storage, but is no
 division. When `WgpuBackend::native_f64_enabled()` is true, the native path is lazily compiled and
 evaluates `f64(gray) / 255.0` in WGSL. `WgpuDecodeSession::f64_output_path` reports the resolved
 path. The returned `GpuImageFrame` owns pitch-linear GPU buffers. CPU readback occurs only when the
-application explicitly stages one.
+application explicitly requests one. On an eligible native UMA backend, the stock decoder marks
+its caller-visible output `MAP_READ`, allowing `ImageReadbackPipeline::submit` to map the sole
+output in place; portable and aggregate requests retain the explicit staging-copy path.
 
 ## Public flow and bounds
 

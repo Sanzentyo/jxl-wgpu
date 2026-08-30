@@ -76,6 +76,15 @@ fn backend() -> Option<WgpuBackend> {
     backend_with_config(config)
 }
 
+fn direct_readback_backend() -> Option<WgpuBackend> {
+    pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
+        enable_timestamps: false,
+        direct_readback_policy: DirectReadbackPolicy::Auto,
+        ..WgpuBackendConfig::default()
+    }))
+    .ok()
+}
+
 fn backend_with_config(config: WgpuBackendConfig) -> Option<WgpuBackend> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -661,6 +670,51 @@ fn indexed_jxl_entropy_and_gradient_reconstruct_exact_gray8_on_gpu() {
         (17, 13)
     );
     assert_eq!(read_output(&backend, output), expected_pixels());
+}
+
+#[test]
+fn indexed_gray8_direct_maps_the_tracked_output_on_supported_uma() {
+    let Some(backend) = direct_readback_backend() else {
+        eprintln!("skipping direct Gray8 readback test: no wgpu adapter");
+        return;
+    };
+    if !backend.direct_readback_enabled() {
+        eprintln!("skipping direct Gray8 readback test: direct mapping is unavailable");
+        return;
+    }
+
+    let decoder = GpuDecoder::wgpu(backend.clone());
+    let request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        NumericSampleMapping::NormalizedGray8,
+    )
+    .unwrap();
+    let mut session = decoder.open(indexed_gray8(), request).unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    let output = &frame.output().outputs[0];
+    assert!(output.buffer.usage().contains(wgpu::BufferUsages::MAP_READ));
+
+    let readback = ImageReadbackPipeline::new(&backend);
+    let abandoned = readback.submit(frame.output()).unwrap();
+    assert!(abandoned.stats().direct_mapped);
+    assert_eq!(abandoned.stats().staging_bytes, 0);
+    let abandoned_submission = abandoned.submission().clone();
+    drop(abandoned);
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(abandoned_submission),
+            timeout: None,
+        })
+        .unwrap();
+
+    let completed = readback.submit(frame.output()).unwrap();
+    assert!(completed.stats().direct_mapped);
+    assert_eq!(completed.stats().logical_bytes, 17 * 13);
+    assert_eq!(completed.stats().staging_bytes, 0);
+    assert_eq!(completed.stats().padding_bytes, 0);
+    let result = completed.wait().unwrap();
+    assert_eq!(result.frame.outputs[0].bytes, expected_pixels());
 }
 
 #[test]

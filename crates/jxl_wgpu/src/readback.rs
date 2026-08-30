@@ -7,6 +7,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -208,10 +209,14 @@ pub struct ImageReadbackStats {
     pub output_count: usize,
     /// Sum of the addressable bytes declared by all image layouts.
     pub logical_bytes: u64,
-    /// Size of the single aggregate staging buffer, including four-byte copy padding.
+    /// Size of the single aggregate staging buffer, including four-byte copy padding, or zero for
+    /// an in-place direct map.
     pub staging_bytes: u64,
     /// Bytes present only to satisfy four-byte buffer-copy alignment.
     pub padding_bytes: u64,
+    /// `true` when a single caller-visible output was mapped in place on a supported native
+    /// unified-memory backend instead of allocating and copying to staging memory.
+    pub direct_mapped: bool,
 }
 
 /// Completed explicit CPU readback of one decoder-owned GPU image frame.
@@ -250,7 +255,8 @@ struct ImageReadbackPipelineInner {
 /// Reusable aggregate readback state for generic pitch-linear decoder output.
 ///
 /// [`Self::submit_frames`] copies every output across every supplied [`GpuImageFrame`] into one
-/// aggregate `MAP_READ` buffer and records all copies in one command buffer. Source and destination
+/// aggregate `MAP_READ` buffer and records all copies in one command buffer. [`Self::submit`]
+/// instead maps a sole output in place when its producer supplied `MAP_READ` usage. Source and destination
 /// copy ranges are padded independently to four bytes, while returned byte vectors contain only
 /// each layout's `logical_size` bytes. This is an explicit host transfer of GPU decode results; it
 /// is not a CPU codec fallback or a claim that the codec submissions themselves were batched.
@@ -331,8 +337,80 @@ impl ImageReadbackPipeline {
     /// Use [`Self::submit_frames`] when multiple already-produced GPU frames should share one
     /// staging allocation, queue submission, mapping callback, and completion future.
     pub fn submit(&self, frame: &GpuImageFrame) -> Result<ImageReadbackSubmission> {
+        if frame.outputs.len() == 1
+            && frame.outputs[0]
+                .buffer
+                .usage()
+                .contains(wgpu::BufferUsages::MAP_READ)
+        {
+            return self
+                .submit_direct(frame)
+                .map(ImageReadbackSubmission::from_batch);
+        }
         self.submit_frames(std::slice::from_ref(frame))
             .map(ImageReadbackSubmission::from_batch)
+    }
+
+    fn submit_direct(&self, frame: &GpuImageFrame) -> Result<ImageReadbackBatchSubmission> {
+        let mut plan = ReadbackPlan::new(
+            &self.inner.device,
+            ImageReadbackLimits {
+                // The caller-visible allocation already passed the producer's device and memory
+                // admission checks. No readback staging allocation is created on this path.
+                max_transient_bytes: u64::MAX,
+                max_in_flight_bytes: self.inner.limits.max_in_flight_bytes,
+            },
+            std::slice::from_ref(frame),
+            false,
+        )?;
+        debug_assert_eq!(plan.entries.len(), 1);
+        plan.stats.staging_bytes = 0;
+        plan.stats.padding_bytes = 0;
+        plan.stats.direct_mapped = true;
+
+        let source_lease = frame.outputs[0].buffer.clone();
+        let mapped = source_lease.as_wgpu_buffer().clone();
+        let commands = self
+            .inner
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu direct image readback"),
+            });
+        let completion = Arc::new(BatchMapCompletion::default());
+        let callback_completion = Arc::clone(&completion);
+        let lifetime = Arc::new(ImageReadbackLifetime {
+            mapped,
+            source_leases: vec![source_lease],
+            memory_permit: None,
+            mapping_submitted: AtomicBool::new(false),
+        });
+        let callback_lifetime = Arc::clone(&lifetime);
+        commands.map_buffer_on_submit(&lifetime.mapped, wgpu::MapMode::Read, .., move |result| {
+            callback_completion
+                .complete(result.map_err(|error| format!("direct image mapping failed: {error}")));
+            drop(callback_lifetime);
+        });
+        let poll_permit = self.inner.poller.try_reserve()?;
+        let submission = self.inner.queue.submit([commands.finish()]);
+        lifetime.mapping_submitted.store(true, Ordering::Release);
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission.clone(), move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!(
+                "GPU direct-readback poll registration failed: {error}"
+            )));
+        }
+
+        Ok(ImageReadbackBatchSubmission {
+            device: self.inner.device.clone(),
+            submission,
+            lifetime: Some(lifetime),
+            completion,
+            entries: plan.entries,
+            frames: plan.frames,
+            stats: plan.stats,
+        })
     }
 
     /// Records one explicitly unvalidated frame for readback without waiting for codec validation.
@@ -370,17 +448,17 @@ impl ImageReadbackPipeline {
     /// explicit buffer-to-host transport; it does not coalesce the codec submissions that produced
     /// the frames.
     pub fn submit_frames(&self, frames: &[GpuImageFrame]) -> Result<ImageReadbackBatchSubmission> {
-        let plan = ReadbackPlan::new(&self.inner.device, self.inner.limits, frames)?;
+        let plan = ReadbackPlan::new(&self.inner.device, self.inner.limits, frames, true)?;
         let memory_permit = self
             .inner
             .memory_budget
             .try_reserve(plan.stats.staging_bytes)?;
-        let staging = Arc::new(self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = self.inner.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu aggregate image readback"),
             size: plan.stats.staging_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        }));
+        });
         let mut commands =
             self.inner
                 .device
@@ -404,16 +482,17 @@ impl ImageReadbackPipeline {
         let completion = Arc::new(BatchMapCompletion::default());
         let callback_completion = Arc::clone(&completion);
         let lifetime = Arc::new(ImageReadbackLifetime {
-            staging,
+            mapped: staging,
             source_leases: frames
                 .iter()
                 .flat_map(|frame| &frame.outputs)
                 .map(|output| output.buffer.clone())
                 .collect(),
-            memory_permit,
+            memory_permit: Some(memory_permit),
+            mapping_submitted: AtomicBool::new(false),
         });
         let callback_lifetime = Arc::clone(&lifetime);
-        commands.map_buffer_on_submit(&lifetime.staging, wgpu::MapMode::Read, .., move |result| {
+        commands.map_buffer_on_submit(&lifetime.mapped, wgpu::MapMode::Read, .., move |result| {
             callback_completion.complete(
                 result.map_err(|error| format!("aggregate image mapping failed: {error}")),
             );
@@ -421,6 +500,7 @@ impl ImageReadbackPipeline {
         });
         let poll_permit = self.inner.poller.try_reserve()?;
         let submission = self.inner.queue.submit([commands.finish()]);
+        lifetime.mapping_submitted.store(true, Ordering::Release);
         let poll_completion = Arc::clone(&completion);
         if let Err(error) = poll_permit.register(submission.clone(), move |error| {
             poll_completion.complete(Err(error));
@@ -468,6 +548,7 @@ impl ReadbackPlan {
         device: &wgpu::Device,
         limits: ImageReadbackLimits,
         source_frames: &[GpuImageFrame],
+        require_copy_source: bool,
     ) -> Result<Self> {
         if source_frames.is_empty() {
             return Err(Error::ImageReadbackNoFrames);
@@ -486,7 +567,9 @@ impl ReadbackPlan {
                     output.layout.format.clone(),
                     output.layout.planes.clone(),
                 )?;
-                if !output.buffer.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+                if require_copy_source
+                    && !output.buffer.usage().contains(wgpu::BufferUsages::COPY_SRC)
+                {
                     return Err(Error::ImageReadbackSourceUsage {
                         frame: frame_index,
                         output: output_index,
@@ -608,6 +691,7 @@ impl ReadbackPacking {
                 padding_bytes: staging_bytes
                     .checked_sub(logical_bytes)
                     .ok_or(Error::BufferSizeOverflow)?,
+                direct_mapped: false,
             },
         })
     }
@@ -706,18 +790,32 @@ pub struct UnvalidatedImageReadbackSubmission {
 }
 
 struct ImageReadbackLifetime {
-    staging: Arc<wgpu::Buffer>,
+    mapped: wgpu::Buffer,
     source_leases: Vec<GpuBufferLease>,
-    memory_permit: MemoryPermit,
+    memory_permit: Option<MemoryPermit>,
+    mapping_submitted: AtomicBool,
+}
+
+impl Drop for ImageReadbackLifetime {
+    fn drop(&mut self) {
+        // This also makes an abandoned direct-map future safe: after the callback releases its
+        // final lifetime owner, the caller-visible buffer is returned to the unmapped state.
+        if self.mapping_submitted.load(Ordering::Acquire) {
+            self.mapped.unmap();
+        }
+    }
 }
 
 impl std::fmt::Debug for ImageReadbackLifetime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ImageReadbackLifetime")
-            .field("staging_bytes", &self.staging.size())
+            .field("mapped_bytes", &self.mapped.size())
             .field("source_count", &self.source_leases.len())
-            .field("reserved_bytes", &self.memory_permit.bytes())
+            .field(
+                "reserved_bytes",
+                &self.memory_permit.as_ref().map_or(0, MemoryPermit::bytes),
+            )
             .finish()
     }
 }
@@ -789,7 +887,7 @@ impl ImageReadbackBatchSubmission {
             .ok_or_else(|| Error::Execution("batch image readback was already consumed".into()))?;
         mapping.map_err(Error::Execution)?;
         let mapped = lifetime
-            .staging
+            .mapped
             .slice(..)
             .get_mapped_range()
             .map_err(|error| Error::Execution(format!("mapped image range is invalid: {error}")))?;
@@ -834,7 +932,6 @@ impl ImageReadbackBatchSubmission {
             })
             .collect::<Result<Vec<_>>>();
         drop(mapped);
-        lifetime.staging.unmap();
         drop(lifetime);
         Ok(ImageReadbackBatchResult {
             frames: frames?,
@@ -1065,8 +1162,40 @@ mod batch_tests {
                 logical_bytes: 20,
                 staging_bytes: 28,
                 padding_bytes: 8,
+                direct_mapped: false,
             }
         );
+    }
+
+    #[test]
+    fn single_map_read_output_uses_no_staging_allocation_or_copy_source_usage() {
+        let Some(backend) = backend() else {
+            return;
+        };
+        let logical = [1, 2, 3, 4, 5, 6];
+        let source = frame(vec![output(
+            &backend,
+            90,
+            Extent2d::new(3, 2),
+            &logical,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        )]);
+        let pipeline = ImageReadbackPipeline::new(&backend);
+        let pending = pipeline.submit(&source).unwrap();
+        assert_eq!(
+            pending.stats(),
+            ImageReadbackStats {
+                frame_count: 1,
+                output_count: 1,
+                logical_bytes: 6,
+                staging_bytes: 0,
+                padding_bytes: 0,
+                direct_mapped: true,
+            }
+        );
+        let result = pending.wait().unwrap();
+        assert_eq!(result.frame.outputs[0].bytes, logical);
+        assert_eq!(pipeline.memory_stats().reserved_bytes, 0);
     }
 
     #[test]
@@ -1142,6 +1271,7 @@ mod batch_tests {
                 logical_bytes: 13,
                 staging_bytes: 16,
                 padding_bytes: 3,
+                direct_mapped: false,
             }
         );
         let result = submission.wait().unwrap();
@@ -1218,6 +1348,7 @@ mod batch_tests {
                 logical_bytes: 20,
                 staging_bytes: 28,
                 padding_bytes: 8,
+                direct_mapped: false,
             }
         );
         let result = pollster::block_on(pending).unwrap();

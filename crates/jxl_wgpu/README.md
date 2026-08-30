@@ -205,12 +205,17 @@ let result = pending.await?;
 executor-specific dependency. Native callers may use `pending.wait()` instead. Browser WebGPU uses
 the future path. `submit` remains the explicit single-frame convenience and returns an
 `ImageReadbackSubmission`/`ImageReadbackResult` instead of a one-element vector.
+On a native unified-memory backend with `MAPPABLE_PRIMARY_BUFFERS`, `submit` maps one sole
+producer-marked output allocation directly. It records no buffer copy or staging allocation and
+still preserves queue order, tracked source ownership, cancellation safety, and runtime-neutral
+completion. Multi-output or multi-frame requests continue to use the single aggregate staging map.
 `submit_unvalidated` is the corresponding explicit early-handoff path; its distinct result omits
 changed regions and remains non-authoritative even after transport completes, until codec
 validation separately succeeds.
 
 `ImageReadbackStats` reports frame count, output count, logical bytes, exact padded staging bytes,
-and padding bytes. `ImageReadbackLimits` sets both the per-submission staging limit and the
+padding bytes, and whether the allocation was directly mapped. Direct maps report zero staging and
+padding bytes. `ImageReadbackLimits` sets both the per-submission staging limit and the
 aggregate bytes admitted across concurrently live submissions. Admission reserves the entire
 single staging allocation atomically, is non-blocking, and returns a typed `MemoryBackpressure`
 error. Pipeline clones share one byte budget. An in-flight submission and its mapping callback

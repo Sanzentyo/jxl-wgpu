@@ -2117,12 +2117,15 @@ fn submit_decode(
         std::mem::align_of::<u32>() as u64,
     );
     let output_size = align4(source.output.layout.logical_size)?;
+    let mut output_usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    if backend.direct_readback_enabled() {
+        output_usage |= wgpu::BufferUsages::MAP_READ;
+    }
     let output = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu decoded image output"),
         size: output_size,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
+        usage: output_usage,
         mapped_at_creation: false,
     }));
     // The native shader declares the caller-visible allocation exactly once as `array<f64>`.
