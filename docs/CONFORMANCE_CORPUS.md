@@ -1,21 +1,23 @@
 # Encode/decode conformance corpus
 
 `tools/jxl_gpu_harness/conformance-corpus.toml` is the source of truth for multi-aspect-ratio and
-multi-resolution image coverage. It does not claim that every listed image can already be encoded
-or decoded by the stock GPU profile. Instead, every case has one of two explicit expectations:
+multi-resolution image coverage. Every case defines an explicit expectation supported by the schema:
 
 - `stock_gpu_round_trip`: executable today through the GPU encoder, GPU decoder, and exact CPU
-  readback comparison. The current boundary is pitch-linear Gray U8 with nonzero dimensions below
-  `2^30`, subject to the adapter and harness memory limits. Single- and multi-group streams use the
-  same path.
-- `future_gpu_profile`: deterministic generator and inventory coverage only. This currently
-  includes RGB, RGBA, and 10/12/16-bit decode. Their GPU encoder path already exists; they remain
-  future round-trip entries until the corresponding GPU decoder profiles land.
+  readback comparison. All 24 checked-in cases currently specify this expectation. The current
+  boundary spans unsigned Gray (u8, u16), RGB (u8, u10), and RGBA (u8, u12 with opaque,
+  checkerboard, and horizontal-ramp alpha) with nonzero dimensions below `2^30`, subject to adapter
+  and harness memory limits. Single- and multi-group streams use the same path.
+- `future_gpu_profile`: deterministic generator and inventory coverage only, representing profiles
+  planned for future GPU support. While supported by the schema, there are currently zero
+  `future_gpu_profile` entries in the corpus; all 24 inventory entries are active stock round-trip
+  cases. When future entries are present, they stay in reports when GPU round-trip mode is selected,
+  without fabricating execution results.
 
-The checked-in inventory includes 1x1, tiny, odd, square, portrait, landscape, panorama, tall,
-4097:1 and 1:4097 extremes, 255/256/257 group boundaries, HD 1280x720, FHD 1920x1080, and UHD 4K
-3840x2160 metadata. Future entries stay in reports when GPU round-trip mode is selected, but have
-no fabricated execution result.
+The checked-in inventory includes 1x1, tiny (2x2), odd (17x13, 19x11), square (64x64), portrait
+(37x101, 127x509), landscape (101x37), panorama (255x31, 4097x1, 16384x1), tall (31x255, 1x4097,
+1x16384), 255/256/257 group boundaries, HD 1280x720 (Gray8 and RGB8), FHD 1920x1080 (RGBA8), UHD 4K
+3840x2160 (RGB10), UHD 8K 7680x4320 (Gray8), and UHD 16K 15360x8640 (Gray8).
 
 ## Deterministic source contract
 

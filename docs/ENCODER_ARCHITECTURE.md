@@ -1,8 +1,8 @@
 # GPU-only JPEG XL encoder architecture
 
-Status: executable profile plus production-facing orchestration API. The only profile currently
-advertised by a concrete backend is the deliberately narrow lossless grayscale profile described
-below. Everything else is rejected through a typed capability error.
+Status: executable lossless Modular profile, experimental VarDCT profile, plus production-facing
+orchestration API. Concrete backends advertise only implemented profiles and stages; unsupported
+formats or features are rejected through typed capability errors.
 
 ## Non-negotiable boundary
 
@@ -11,11 +11,11 @@ ordering, and deterministic serialization. It may not use the host to normalize 
 samples, form residuals, transform or quantize coefficients, tokenize image data, build image-data
 histograms, or silently replace a failed GPU job.
 
-For the executable profile, `lossless_gray8.wgsl` reads the caller's `wgpu::Buffer` and performs
-the Gradient predictor, packed-signed residual mapping, zero-run formation, hybrid-uint
-tokenization, and histogram accumulation. Rust reads only the resulting entropy artifacts and
-serializes standard JPEG XL metadata, prefix trees, TOC, and group bytes. A GPU mapping or shader
-failure is an encode failure.
+For the executable profile, `lossless_modular.wgsl` reads the caller's `wgpu::Buffer` and performs
+reversible color transform, the Gradient predictor, packed-signed residual mapping, zero-run
+formation, hybrid-uint tokenization, and histogram accumulation. Rust reads only the resulting
+entropy artifacts and serializes standard JPEG XL metadata, prefix trees, TOC, and group bytes. A
+GPU mapping or shader failure is an encode failure.
 
 The repository does not vendor or retain `libjxl` as an upstream source tree. The production crates
 use ordinary Cargo dependencies; official source is consulted only for specification and
@@ -23,30 +23,36 @@ implementation audits.
 
 ## Implemented profile
 
-`LosslessGray8Backend` advertises exactly:
+`LosslessModularBackend` advertises exactly:
 
 | Property | Implemented value |
 |---|---|
 | Coding mode | Modular lossless |
-| Samples | one unsigned 8-bit grayscale plane |
-| Input | pitch-linear `wgpu::Buffer`, `PixelFormat::non_color(Unsigned, 8, [X])` |
-| Extent | `2..=256` in each dimension |
-| Frame/group layout | one still frame, one fused group, one pass, `is_last` |
+| Color models | Gray (one NonColor `X000` plane), RGB (`Rgb`/`XYZ1`), RGBA (`Rgb`/`XYZW`); RGBA alpha is one unassociated extra channel |
+| Sample depths | every integer `1..=16` (`1..=8` in `u8` words, `9..=16` in `u16` words) |
+| Input | pitch-linear `wgpu::Buffer`; single-plane, unsigned, native byte order, `ChromaSubsampling::None` |
+| Extent | `1..2^30` per axis, further bounded by device limits |
+| Frame/group layout | standard 256x256 PassGroups, multi-group, row-major TOC |
+| Animation | `true` (5 blend modes, signed crop, 4 reference slots, timecodes) |
+| Determinism | `CrossDevice` integer GPU artifacts and deterministic host assembly |
+| Progressive passes | `max_progressive_passes = 1` |
+| Implemented stages | `ColorTransform`, `ModularTransform`, `ModularPrediction`, `ModularResidualTokenization`, `HistogramReduction` |
 | Predictor | JPEG XL Gradient predictor |
 | Modular transforms | none |
-| Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS |
+| Entropy | JPEG XL prefix code with LZ77 distance 1, not ANS; fixed MA tree |
 | Filters | Gaborish off, EPF zero iterations |
-| Determinism | integer GPU artifacts and deterministic host assembly |
-| Output | raw codestream or standard `jxlc` container with a validated `jwgp` index |
+| Output | raw codestream or standard `jxlc` container; private `jwgp` index emitted only for single-group Gray8 containers |
 
-The backend rejects textures, RGB, alpha, YUV/NV12, multiple planes, depths other than eight,
-dimensions requiring multiple groups, animation, progressive passes, VarDCT, and non-default frame
-options. Those formats belong in later capabilities; their presence in `jxl_gpu_formats` is not a
-claim that this encoder profile already accepts them.
+The backend rejects textures, planar RGB, BGR/BGRA, non-native byte order, chroma subsampling,
+YUV/NV12, MSB-aligned sub-16-bit words, explicit non-sRGB color specifications, and progressive
+passes > 1. YUV/NV12 ingestion is not implemented.
 
 ### GPU artifact ABI
 
-The first kernel intentionally uses one invocation. This is a correctness milestone, not the
+The token kernel is still `@compute @workgroup_size(1)` (`lossless_modular.wgsl:162`).
+Parallelism comes only from the number of (PassGroup, channel) pairs in the dispatch; one
+invocation scans its whole group serially. Streamed multi-batch jobs use two submissions per batch
+(one histogram pass, one serialization pass). This remains a correctness milestone, not the
 eventual performance topology. Its readback buffer consists of little-endian `u32` words:
 
 ```text
@@ -59,30 +65,46 @@ word 53..    event_count records of:
 
 `kind == 0` is a raw residual token and `kind == 1` is a zero-run token. No source sample or residual
 plane is copied into a private container box. The ABI is bounded before allocation: at most
-`pixels + ceil(pixels / 8) + 1` events.
+`pixels + ceil(pixels / 8) + 1` events per group channel.
 
-The uniform ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure:
+The parameter ABI is one `#[repr(C)]`, `bytemuck::Pod` Rust value and the matching WGSL structure:
 
 ```text
-Gray8Params / Params = { width: u32, height: u32, row_stride: u32, byte_offset: u32 }
-size = 16 bytes, alignment = 4 bytes
+ModularParams / Params = {
+    width: u32,
+    height: u32,
+    row_stride: u32,
+    byte_offset: u32,
+    output_word_offset: u32,
+    channel: u32,
+    channels: u32,
+    bytes_per_sample: u32,
+    sample_mask: u32,
+    _padding: array<u32, 55>, // [u32; 55] in Rust
+}
+size = 256 bytes, alignment = 4 bytes
 ```
 
 A compile-time size assertion and a test for size, alignment, byte order, field order, and the WGSL
-declaration prevent accidental ABI drift. The source is never bound as an unchecked whole buffer.
-Admission computes the final sampled byte with checked `offset + (height - 1) * row_stride + width`,
-checks the full `offset + height * row_stride` arithmetic for overflow, rounds the final u32 load up
-to four bytes, and binds only the enclosing range. The binding base is rounded down to both the
-device's `min_storage_buffer_offset_alignment` and u32 word alignment; WGSL receives the resulting
-relative offset. Its final address must fit WGSL's u32 address space.
+declaration prevent accidental ABI drift. An explicit 256-byte array stride keeps every batch
+boundary valid for portable storage-buffer offset alignment. The source is never bound as an
+unchecked whole buffer. Admission computes the final sampled byte with checked
+`offset + (height - 1) * row_stride + width * channels * bytes_per_sample`, checks arithmetic for
+overflow, rounds the final u32 load up to four bytes, and binds only the enclosing range. The
+binding base is rounded down to both the device's `min_storage_buffer_offset_alignment` and u32 word
+alignment; WGSL receives the resulting relative offset. Its final address must fit WGSL's u32
+address space.
 
 Artifact and MAP_READ allocations use checked word/byte arithmetic, are four-byte copy aligned, and
 must fit both `max_storage_buffer_binding_size` and `max_buffer_size`. The public
-`LosslessGray8Encoder::memory_plan` reports source binding, uniform, artifact storage, readback,
-owned, and total addressed bytes per job. `for_in_flight(n)` reports checked aggregate bytes for a
-caller-selected concurrency ceiling, while `memory_limits` exposes the relevant device limits.
+`LosslessModularEncoder::memory_plan` reports valid bits, component storage bytes, channel count,
+format, group grid, full and peak source binding ranges, parameter storage, peak artifact storage,
+diagnostic total artifact bytes, readback bytes, batch count, exact GPU submission count, streaming
+mode, owned bytes per job, and addressed bytes per job. `for_in_flight(n)` reports checked aggregate
+bytes for a caller-selected concurrency ceiling, while `memory_limits` exposes the relevant device
+limits.
 
-The uniform, artifact, and mapped-readback allocations form one exclusive reusable buffer set.
+The parameter, artifact, and mapped-readback allocations form one exclusive reusable buffer set.
 Sets match the exact artifact size, remain leased through map completion and consumption, and are
 returned safely even when a Future is abandoned. Idle retention defaults to 32 MiB with a
 256-set object cap; `buffer_pool_stats`, `set_buffer_pool_limit`, and `clear_buffer_pool` expose
@@ -123,10 +145,10 @@ final frame, and produces raw or deterministic container output.
 The concrete convenience path is:
 
 ```text
-LosslessGray8Encoder::submit / submit_container
-    -> LosslessGray8Submission: Future<Output = Result<Vec<u8>, EncodeError>>
+LosslessModularEncoder::submit / submit_container
+    -> LosslessModularSubmission: Future<Output = Result<Vec<u8>, EncodeError>>
 
-LosslessGray8Encoder::encode / encode_container
+LosslessModularEncoder::encode / encode_container
     -> the same submission through its blocking wait path
 ```
 
@@ -137,8 +159,8 @@ reserved before queue submission and saturation is a typed retryable error. A br
 `Device::poll`; its synchronous wait returns an error and callers must await.
 
 `EncoderCapabilities::negotiate` is authoritative. A backend must only list profiles and stages it
-executes. The generic API models animation and progressive plans so these can be implemented without
-a later async-runtime lock-in, but `LosslessGray8Backend` reports `animation = false` and one pass.
+executes. `LosslessModularBackend` reports `animation = true` and `max_progressive_passes = 1`.
+Multi-frame animation sessions are orchestrated via `LosslessModularAnimationSession`.
 
 ## Deterministic packet assembly
 
@@ -154,17 +176,19 @@ normative buckets `(10, 14, 22, 30 bits)` with offsets `(0, 1024, 17408, 4211712
 raw/container validation, `jxlc` construction, and auxiliary-box framing come from
 `jxl_gpu_bitstream`; the encoder does not duplicate container assembly.
 
-The limited group packet contains the global Modular tree/context map, four prefix histograms (one
-active grayscale histogram and three fixed unused-context histograms), global Modular group header,
-zero transforms, then the active channel token stream. Group payload and TOC are byte aligned.
+LF global carries the shared Modular tree and entropy code (four prefix codes derived from combined
+channel histograms); LF groups and HF global are empty; each PassGroup carries its own group header
+and channel token streams inside standard row-major TOC groups. Group payload and TOC are byte
+aligned.
 
 ### `jwgp` acceleration index
 
 The standard `jxlc` remains the source of truth and must decode without private metadata.
-`encode_container` adds a `jwgp` box containing only a bounded, hash-bound index into those
-codestream bits so the project's GPU
-decoder need not first implement a fully generic JPEG XL entropy parser. Unknown-box-aware decoders,
-including `djxl`, ignore it. It never stores pixels or residuals.
+For single-group Gray8 containers, `encode_container` adds an optional private `jwgp` box containing
+only a bounded, hash-bound index into those codestream bits so the project's GPU decoder need not
+first implement a fully generic JPEG XL entropy parser. Multi-group, RGB(A), and other bit depths
+omit this box and remain standard interoperable containers. Unknown-box-aware decoders, including
+`djxl`, ignore it. It never stores pixels or residuals.
 
 The acceleration-index payload is fixed-width and little-endian. Bit offsets are measured from bit
 zero of the raw codestream's first byte and bits within a byte are LSB-first:
@@ -277,23 +301,38 @@ cargo test -p jxl_wgpu_encode gpu_tokens_form_a_reference_decodable_lossless_cod
 cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 ```
 
-## Next implementation slices
+## Implementation slices
 
-1. Replace the single invocation with row/tile predictor scans, parallel token compaction, and a
-   hierarchical histogram reduction while preserving the artifact contract.
-2. Add batched small-image and multi-session scheduling so dispatch/readback overhead is amortized;
-   measure isolated, sequential, concurrent, and animation workloads separately.
-3. Implement multi-group Modular with a global histogram barrier and out-of-order group completion.
-4. Add RGB/RGBA and native pitch-linear YUV/NV12-family ingestion through GPU color transforms.
-   CUDA-only/block-linear layouts remain outside portable `wgpu` scope.
-5. Implement VarDCT in GPU stages: linear-light/XYB conversion, strategy selection, forward
-   transforms, adaptive quantization, coefficient tokenization, progressive split, and entropy-ready
-   group packets.
-6. Add animation frame headers, reference slots, blending, and persistent reference surfaces to the
-   existing session API. Only then advertise animation capability.
-7. Extend the existing capture/replay and codec harness with GPU timestamps, queue latency, peak
-   driver allocations, and lossy quality metrics. It already separates CPU readback, continuous
-   decode/encode, concurrent host fan-out, encoded size, and exact `djxl` conformance.
+### Completed slices
+
+- **Multi-group Modular (Slice 3)**: Standard 256x256 PassGroups, multi-group row-major TOC layout,
+  two-pass streaming with global histogram aggregation, and out-of-order group completion.
+- **Lossless RGB and RGBA (Slice 4 half)**: Interleaved unsigned RGB and RGBA at depths `1..=16`
+  with GPU-side reversible color transform (YCoCg) and unassociated alpha extra-channel support.
+- **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
+  standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
+  alpha blending, and 4 reference slots with runtime-neutral in-flight futures.
+- **LF-only VarDCT baseline (Slice 5 partial)**: `VarDctEncoder` executes all 27 standard
+  strategies, and `TiledVarDctEncoder` supports multi-AC-group DCT8 grids up to 2048x2048; the GPU
+  executes sRGB linearization, XYB conversion, LF quantization, clamped-gradient DC prediction, and
+  prefix/histogram assembly in an LF-only fixed distance-25 profile that quantizes AC coefficients
+  to zero.
+
+### Remaining slices
+
+1. **Parallel token kernel (Slice 1)**: Replace the `@workgroup_size(1)` kernel with row/tile
+   predictor scans, parallel token compaction, and hierarchical histogram reduction while
+   preserving the artifact contract.
+2. **Batched multi-image scheduling (Slice 2)**: Add batched small-image scheduling so dispatch
+   and readback overhead is amortized across independent images; measure isolated, sequential,
+   concurrent, and animation workloads separately.
+3. **YUV/NV12 ingestion (Slice 4 half)**: Add native pitch-linear YUV/NV12-family ingestion through
+   GPU color transforms. CUDA-only and block-linear layouts remain outside portable `wgpu` scope.
+4. **General VarDCT quality and rate control (Slice 5 remainder)**: Extend VarDCT beyond the fixed
+   LF-only profile to include full AC quantization, adaptive rate control, progressive coefficient
+   splitting, and multi-LF-group frames (>2048 per axis).
+5. **Advanced performance profiling (Slice 7)**: Extend the harness with GPU timestamps, queue
+   latency tracking, peak driver allocation metrics, and lossy quality metrics.
 
 Until a slice is implemented and validated, capability negotiation must reject it. Benchmarks,
 wrappers, and CPU oracles do not expand the advertised production capability.
