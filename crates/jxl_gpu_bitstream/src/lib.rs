@@ -1,8 +1,9 @@
 //! Bounded JPEG XL container and bitstream orchestration.
 //!
 //! This crate deliberately does not decode or encode image samples. It validates the transport
-//! container, exposes the contiguous JPEG XL codestream to a GPU codec, and provides deterministic
-//! bit/box writers for final packet assembly.
+//! container, exposes the contiguous JPEG XL codestream to a GPU codec, inventories standard image
+//! and frame headers plus physical TOC section ranges, and provides deterministic bit/box writers
+//! for final packet assembly.
 
 #![deny(unsafe_code)]
 
@@ -12,6 +13,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 mod acceleration;
+mod inventory;
 
 #[cfg(test)]
 mod test_fixtures {
@@ -40,6 +42,22 @@ mod test_fixtures {
         decode_hex(include_str!("../test-data/fragmented_animation.jxl.hex"))
     }
 
+    pub(crate) fn basic() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/basic.jxl.hex"))
+    }
+
+    pub(crate) fn oddsize_ups() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/oddsize_ups.jxl.hex"))
+    }
+
+    pub(crate) fn green_queen_vardct() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/green_queen_vardct_e3.jxl.hex"))
+    }
+
+    pub(crate) fn animation_spline() -> Vec<u8> {
+        decode_hex(include_str!("../test-data/animation_spline.jxl.hex"))
+    }
+
     pub(crate) fn gpu_gray8_lossless() -> Vec<u8> {
         decode_hex(include_str!("../test-data/gpu_gray8_lossless.jxl.hex"))
     }
@@ -47,6 +65,11 @@ mod test_fixtures {
 
 pub use acceleration::{
     ACCELERATION_INDEX_BOX_TYPE, AccelerationIndexError, Gray8AccelerationIndex, PrefixCodeEntry,
+};
+pub use inventory::{
+    AnimationInventory, BitRange, ByteRange, CodestreamInventory, FrameEncoding, FrameInventory,
+    FrameSection, FrameSectionKind, FrameType, ImageHeaderInventory, InventoryError,
+    InventoryLimits, SampleBitDepth, UnsupportedCodestreamGrammar,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).
@@ -128,6 +151,18 @@ impl<'input> ParsedJxl<'input> {
             .iter()
             .copied()
             .filter(move |item| item.box_type == box_type)
+    }
+
+    /// Inventories standard image/frame headers and physical TOC section ranges.
+    ///
+    /// The returned offsets are relative to [`Self::codestream`], regardless of whether the input
+    /// was raw, a single `jxlc` box, or a reconstructed `jxlp` sequence. This operation parses only
+    /// bounded grammar; it does not decode pixels or frame entropy.
+    pub fn codestream_inventory(
+        &self,
+        limits: InventoryLimits,
+    ) -> Result<CodestreamInventory, InventoryError> {
+        inventory::parse_codestream_inventory(self.codestream(), limits)
     }
 }
 
@@ -461,6 +496,27 @@ impl<'input> BitReader<'input> {
         self.bit_offset = aligned;
         Ok(())
     }
+
+    /// Advances by `count` bits without inspecting their values.
+    pub fn skip_bits(&mut self, count: u64) -> Result<(), Error> {
+        if self.remaining_bits() < count {
+            return Err(Error::UnexpectedEndOfBits);
+        }
+        self.bit_offset = self
+            .bit_offset
+            .checked_add(count)
+            .ok_or(Error::SizeOverflow)?;
+        Ok(())
+    }
+
+    /// Consumes zero padding through the next byte boundary.
+    pub fn zero_pad_to_byte(&mut self) -> Result<(), Error> {
+        let count = (8 - (self.bit_offset & 7)) & 7;
+        if self.read_bits(count as u8)? != 0 {
+            return Err(Error::NonZeroPadding);
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic little-endian bit writer for header and packet assembly.
@@ -715,6 +771,8 @@ pub enum Error {
     BitValueOverflow { value: u64, count: u8 },
     #[error("unexpected end of bitstream")]
     UnexpectedEndOfBits,
+    #[error("byte-alignment padding contains non-zero bits")]
+    NonZeroPadding,
     #[error("fragmented container writer is already finished")]
     ContainerAlreadyFinished,
     #[error("auxiliary boxes must be written before the first codestream fragment")]
