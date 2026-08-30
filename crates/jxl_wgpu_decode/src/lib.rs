@@ -2,7 +2,8 @@
 //!
 //! This crate has no production CPU pixel/entropy decoder and no fallback policy. The stock
 //! [`WgpuSubmissionEngine`] inventories standard JPEG XL frame sections, parses only bounded
-//! Modular prefix metadata, and decodes single- or multi-group lossless Gray8 token bits in WGSL.
+//! Modular prefix metadata, and decodes single- or multi-group lossless 1-16-bit Gray/RGB/RGBA
+//! token streams in WGSL.
 //! It returns GPU-resident frames in the requested generic [`PixelFormat`]; no private sidecar box
 //! is required. Unsupported profiles and incomplete generic frontend stages are typed errors.
 //! Submission and completion are separate: sessions can prefetch an ordered bounded queue of
@@ -45,7 +46,7 @@ pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
     AnimationMetadata, DecodeProfile, F64OutputPolicy, FixedModularPredictor, FrameDuration,
     FrameMetadata, FrameTimebase, GpuCodestream, GpuOutputMapping, GpuOutputRequest,
-    ModularGrouping, NumericSampleMapping,
+    ModularChannels, ModularGrouping, NumericSampleMapping,
 };
 pub use session::{
     GpuDecodeSession, GpuDecoder, GpuFrameLease, GpuPendingFrame, GpuSubmissionEngine,

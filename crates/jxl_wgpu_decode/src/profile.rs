@@ -1,9 +1,9 @@
 use jxl_gpu_bitstream::{
-    BitReader, CodestreamInventory, FrameEncoding, FrameSectionKind, FrameType, PrefixCodeEntry,
-    SampleBitDepth,
+    BitReader, CodestreamInventory, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
+    ImageHeaderInventory, PrefixCodeEntry, SampleBitDepth,
 };
 
-use crate::{Result, UnsupportedCodestreamFeature, UnsupportedProfile};
+use crate::{ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile};
 
 const MAX_CODESTREAM_BYTES: usize = 16 * 1024 * 1024;
 const GROUP_DIMENSION: u32 = 256;
@@ -14,7 +14,7 @@ const LZ77_SYMBOL_OFFSET: usize = 224;
 const MAX_PREFIX_BITS: u8 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Gray8Group {
+pub(crate) struct ModularGroup {
     pub token_bit_offset: u64,
     pub token_bit_end: u64,
     pub x: u32,
@@ -23,23 +23,146 @@ pub(crate) struct Gray8Group {
     pub height: u32,
 }
 
-impl Gray8Group {
+impl ModularGroup {
     pub(crate) fn sample_count(self) -> Result<u32> {
         self.width
             .checked_mul(self.height)
-            .ok_or_else(|| unsupported_error("Gray8 group sample count overflow").into())
+            .ok_or_else(|| unsupported_error("Modular group sample count overflow").into())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StandardGray8Profile {
+pub(crate) struct StandardModularProfile {
     pub width: u32,
     pub height: u32,
+    pub bits_per_sample: u8,
+    pub channels: ModularChannels,
     pub group_columns: u32,
     pub group_rows: u32,
-    pub groups: Vec<Gray8Group>,
-    pub raw_prefix: [PrefixCodeEntry; RAW_SYMBOLS],
-    pub lz77_prefix: [PrefixCodeEntry; LZ77_SYMBOLS],
+    pub groups: Vec<ModularGroup>,
+    pub raw_prefix: [[PrefixCodeEntry; RAW_SYMBOLS]; 4],
+    pub lz77_prefix: [[PrefixCodeEntry; LZ77_SYMBOLS]; 4],
+}
+
+fn validate_image_header(
+    codestream: &[u8],
+    image: &ImageHeaderInventory,
+    channels: ModularChannels,
+    bits_per_sample: u8,
+) -> Result<()> {
+    if image.orientation != 1
+        || image.intrinsic_size.is_some()
+        || image.preview_size.is_some()
+        || image.embedded_icc.is_some()
+        || image.animation.is_some()
+        || image.modular_16bit_buffers != (bits_per_sample <= 14)
+    {
+        return unsupported(
+            "the lossless Modular GPU profile requires canonical still-image metadata",
+        );
+    }
+
+    let mut reader = BitReader::new(codestream);
+    expect(&mut reader, 16, 0x0aff, "JPEG XL codestream signature")?;
+    expect(&mut reader, 1, 0, "non-small image header")?;
+    let height = read_size(&mut reader, true)?;
+    let width = read_size(&mut reader, false)?;
+    if width != image.width || height != image.height {
+        return unsupported("standard image-header extent does not match its inventory");
+    }
+    expect(&mut reader, 1, 0, "non-default image metadata")?;
+    expect(&mut reader, 1, 0, "no extra metadata fields")?;
+    read_integer_bit_depth(&mut reader, bits_per_sample, "main image bit depth")?;
+    expect(
+        &mut reader,
+        1,
+        u64::from(bits_per_sample <= 14),
+        "canonical Modular buffer depth",
+    )?;
+
+    let has_alpha = channels == ModularChannels::Rgba;
+    expect(
+        &mut reader,
+        2,
+        u64::from(has_alpha),
+        "canonical extra-channel count",
+    )?;
+    if has_alpha {
+        if bits_per_sample == 8 {
+            expect(&mut reader, 1, 1, "default unassociated alpha metadata")?;
+        } else {
+            expect(&mut reader, 1, 0, "explicit alpha metadata")?;
+            expect(&mut reader, 2, 0, "alpha extra-channel type")?;
+            read_integer_bit_depth(&mut reader, bits_per_sample, "alpha bit depth")?;
+            expect(&mut reader, 2, 0, "full-resolution alpha")?;
+            expect(&mut reader, 2, 0, "empty alpha name")?;
+            expect(&mut reader, 1, 0, "unassociated alpha")?;
+        }
+    }
+
+    expect(&mut reader, 1, 0, "non-XYB image")?;
+    if channels == ModularChannels::Gray {
+        for (count, value, name) in [
+            (1, 0, "non-default grayscale color encoding"),
+            (1, 0, "no ICC profile"),
+            (2, 1, "grayscale color space"),
+            (2, 1, "D65 white point"),
+            (1, 0, "enumerated transfer function"),
+            (2, 0b10, "transfer-function selector"),
+            (4, 11, "sRGB transfer function"),
+            (2, 1, "relative rendering intent"),
+        ] {
+            expect(&mut reader, count, value, name)?;
+        }
+    } else {
+        expect(&mut reader, 1, 1, "default sRGB color encoding")?;
+    }
+    expect(&mut reader, 2, 0, "no image extensions")?;
+    expect(&mut reader, 1, 1, "default transform data")?;
+    let grammar_end = reader.bit_offset();
+    if image.bit_range.offset != 0 || image.bit_range.end() != Some(grammar_end) {
+        return unsupported(format!(
+            "canonical image-header length {} does not match inventory {:?}",
+            grammar_end,
+            image.bit_range.end()
+        ));
+    }
+    reader.align_to_byte()?;
+    Ok(())
+}
+
+fn read_integer_bit_depth(reader: &mut BitReader<'_>, expected: u8, field: &str) -> Result<()> {
+    expect(reader, 1, 0, field)?;
+    let actual = match reader.read_bits(2)? {
+        0 => 8,
+        1 => 10,
+        2 => 12,
+        3 => u8::try_from(reader.read_bits(6)?)
+            .map_err(|_| unsupported_error("integer bit depth exceeds u8"))?
+            .checked_add(1)
+            .ok_or_else(|| unsupported_error("integer bit depth overflow"))?,
+        _ => unreachable!(),
+    };
+    if actual != expected {
+        return unsupported(format!(
+            "the lossless Modular GPU profile requires {field} {expected}, received {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_size(reader: &mut BitReader<'_>, has_ratio: bool) -> Result<u32> {
+    let selector = usize::try_from(reader.read_bits(2)?)
+        .map_err(|_| unsupported_error("image extent selector overflow"))?;
+    let widths = [9, 13, 18, 30];
+    let value = u32::try_from(reader.read_bits(widths[selector])?)
+        .map_err(|_| unsupported_error("image extent overflows u32"))?
+        .checked_add(1)
+        .ok_or_else(|| unsupported_error("image extent overflows u32"))?;
+    if has_ratio {
+        expect(reader, 3, 0, "explicit width follows height")?;
+    }
+    Ok(value)
 }
 
 /// Recognizes the standards-compliant lossless Modular grammar emitted by `jxl_wgpu_encode`.
@@ -47,41 +170,54 @@ pub(crate) struct StandardGray8Profile {
 /// Only bounded image/frame metadata, the Modular DC-global prefix description, and fixed group
 /// headers are inspected here. Entropy symbols, residuals, predictors, and pixels are deliberately
 /// left unread for the GPU kernel.
-pub(crate) fn parse_standard_gray8_profile(
+pub(crate) fn parse_standard_modular_profile(
     codestream: &[u8],
     inventory: &CodestreamInventory,
-) -> Result<StandardGray8Profile> {
+) -> Result<StandardModularProfile> {
     if codestream.len() > MAX_CODESTREAM_BYTES {
-        return unsupported("the Gray8 GPU profile codestream exceeds 16 MiB");
+        return unsupported("the lossless Modular GPU profile codestream exceeds 16 MiB");
     }
     let image = &inventory.image_header;
     if image.width == 0 || image.height == 0 {
-        return unsupported("the Gray8 GPU profile requires a non-empty image");
+        return unsupported("the lossless Modular GPU profile requires a non-empty image");
     }
-    if image.bit_depth != (SampleBitDepth::Integer { bits_per_sample: 8 }) {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::ModularBitDepth(match image.bit_depth {
-                SampleBitDepth::Integer { bits_per_sample }
-                | SampleBitDepth::Float {
-                    bits_per_sample, ..
-                } => u8::try_from(bits_per_sample).unwrap_or(u8::MAX),
-            }),
-            "the stock Modular GPU frontend currently reconstructs 8-bit integer samples",
-        )
-        .into());
+    let bits_per_sample = match image.bit_depth {
+        SampleBitDepth::Integer {
+            bits_per_sample: bits @ 1..=16,
+        } => u8::try_from(bits).expect("1..=16 fits u8"),
+        _ => {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::ModularBitDepth(match image.bit_depth {
+                    SampleBitDepth::Integer { bits_per_sample }
+                    | SampleBitDepth::Float {
+                        bits_per_sample, ..
+                    } => u8::try_from(bits_per_sample).unwrap_or(u8::MAX),
+                }),
+                "the stock Modular GPU frontend reconstructs 1 through 16-bit integer samples",
+            )
+            .into());
+        }
+    };
+    let channels = match (image.grayscale, image.extra_channel_count) {
+        (true, 0) => ModularChannels::Gray,
+        (false, 0) => ModularChannels::Rgb,
+        (false, 1) => ModularChannels::Rgba,
+        _ => {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::ExtraChannels,
+                "the lossless Modular GPU profile supports Gray, RGB, or one RGBA alpha channel",
+            )
+            .into());
+        }
+    };
+    if image.xyb_encoded {
+        return unsupported("the lossless Modular GPU profile does not use XYB metadata");
     }
-    if !image.grayscale || image.xyb_encoded {
-        return unsupported("the Gray8 GPU profile requires non-XYB grayscale image metadata");
-    }
-    if image.extra_channel_count != 0 {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::ExtraChannels,
-            "the Gray8 GPU profile does not carry extra channels",
-        )
-        .into());
-    }
+    validate_image_header(codestream, image, channels, bits_per_sample)?;
     if image.animation.is_some() || image.preview_size.is_some() || inventory.frames.len() != 1 {
-        return unsupported("the Gray8 GPU profile requires exactly one still-image frame");
+        return unsupported(
+            "the lossless Modular GPU profile requires exactly one still-image frame",
+        );
     }
 
     let frame = &inventory.frames[0];
@@ -104,9 +240,12 @@ pub(crate) fn parse_standard_gray8_profile(
         || frame.save_as_reference != 0
         || frame.save_before_color_transform
         || !frame.name_bytes.is_empty()
+        || frame.color_blend != FrameBlendInfo::default()
+        || frame.extra_channel_blends
+            != vec![FrameBlendInfo::default(); usize::from(channels == ModularChannels::Rgba)]
     {
         return unsupported(
-            "the Gray8 GPU profile requires one final uncropped regular Modular frame with canonical grouping and no references",
+            "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references",
         );
     }
 
@@ -114,9 +253,9 @@ pub(crate) fn parse_standard_gray8_profile(
     let group_rows = image.height.div_ceil(GROUP_DIMENSION);
     let expected_group_count = u64::from(group_columns)
         .checked_mul(u64::from(group_rows))
-        .ok_or_else(|| unsupported_error("Gray8 group grid overflow"))?;
+        .ok_or_else(|| unsupported_error("Modular group grid overflow"))?;
     if frame.group_count != expected_group_count {
-        return unsupported("frame inventory group count does not match the Gray8 canvas");
+        return unsupported("frame inventory group count does not match the Modular canvas");
     }
 
     let dc_global = if expected_group_count == 1 {
@@ -130,10 +269,10 @@ pub(crate) fn parse_standard_gray8_profile(
             .iter()
             .find(|section| section.kind == FrameSectionKind::LowFrequencyGlobal)
     }
-    .ok_or_else(|| unsupported_error("the Gray8 frame is missing DC-global metadata"))?;
+    .ok_or_else(|| unsupported_error("the Modular frame is missing DC-global metadata"))?;
     let mut reader = BitReader::new(codestream);
     reader.skip_bits(dc_global.bits.offset)?;
-    let prefix = parse_dc_global(&mut reader)?;
+    let prefix = parse_dc_global(&mut reader, channels)?;
     let dc_end = dc_global
         .bits
         .end()
@@ -143,7 +282,7 @@ pub(crate) fn parse_standard_gray8_profile(
     }
 
     let groups = if expected_group_count == 1 {
-        vec![Gray8Group {
+        vec![ModularGroup {
             token_bit_offset: reader.bit_offset(),
             token_bit_end: dc_end,
             x: 0,
@@ -157,7 +296,7 @@ pub(crate) fn parse_standard_gray8_profile(
         }
         validate_empty_non_pass_sections(codestream, frame)?;
         let group_count = usize::try_from(expected_group_count)
-            .map_err(|_| unsupported_error("Gray8 group count exceeds host address space"))?;
+            .map_err(|_| unsupported_error("Modular group count exceeds host address space"))?;
         let mut groups = vec![None; group_count];
         for section in &frame.sections {
             let FrameSectionKind::PassGroup {
@@ -168,12 +307,12 @@ pub(crate) fn parse_standard_gray8_profile(
                 continue;
             };
             let index = usize::try_from(group_index)
-                .map_err(|_| unsupported_error("Gray8 group index exceeds host address space"))?;
+                .map_err(|_| unsupported_error("Modular group index exceeds host address space"))?;
             let slot = groups.get_mut(index).ok_or_else(|| {
-                unsupported_error("Gray8 pass-group index exceeds the frame grid")
+                unsupported_error("Modular pass-group index exceeds the frame grid")
             })?;
             if slot.is_some() {
-                return unsupported("the Gray8 frame contains a duplicate pass-group section");
+                return unsupported("the Modular frame contains a duplicate pass-group section");
             }
             let mut group_reader = BitReader::new(codestream);
             group_reader.skip_bits(section.bits.offset)?;
@@ -181,20 +320,20 @@ pub(crate) fn parse_standard_gray8_profile(
             expect(&mut group_reader, 1, 1, "default weighted predictor")?;
             expect(&mut group_reader, 2, 0, "no local Modular transforms")?;
             let column = u32::try_from(group_index % u64::from(group_columns))
-                .map_err(|_| unsupported_error("Gray8 group column overflow"))?;
+                .map_err(|_| unsupported_error("Modular group column overflow"))?;
             let row = u32::try_from(group_index / u64::from(group_columns))
-                .map_err(|_| unsupported_error("Gray8 group row overflow"))?;
+                .map_err(|_| unsupported_error("Modular group row overflow"))?;
             let x = column
                 .checked_mul(GROUP_DIMENSION)
-                .ok_or_else(|| unsupported_error("Gray8 group x origin overflow"))?;
+                .ok_or_else(|| unsupported_error("Modular group x origin overflow"))?;
             let y = row
                 .checked_mul(GROUP_DIMENSION)
-                .ok_or_else(|| unsupported_error("Gray8 group y origin overflow"))?;
+                .ok_or_else(|| unsupported_error("Modular group y origin overflow"))?;
             let token_bit_end = section
                 .bits
                 .end()
-                .ok_or_else(|| unsupported_error("Gray8 pass-group bit range overflow"))?;
-            *slot = Some(Gray8Group {
+                .ok_or_else(|| unsupported_error("Modular pass-group bit range overflow"))?;
+            *slot = Some(ModularGroup {
                 token_bit_offset: group_reader.bit_offset(),
                 token_bit_end,
                 x,
@@ -208,7 +347,7 @@ pub(crate) fn parse_standard_gray8_profile(
             .enumerate()
             .map(|(index, group)| {
                 group.ok_or_else(|| {
-                    unsupported_error(format!("the Gray8 frame is missing pass-group {index}"))
+                    unsupported_error(format!("the Modular frame is missing pass-group {index}"))
                         .into()
                 })
             })
@@ -225,19 +364,21 @@ pub(crate) fn parse_standard_gray8_profile(
             || group.token_bit_offset >= group.token_bit_end
             || group.token_bit_end > codestream_bits
         {
-            return unsupported("the Gray8 frame contains an invalid group token range");
+            return unsupported("the Modular frame contains an invalid group token range");
         }
         group.sample_count()?;
     }
 
-    Ok(StandardGray8Profile {
+    Ok(StandardModularProfile {
         width: image.width,
         height: image.height,
+        bits_per_sample,
+        channels,
         group_columns,
         group_rows,
         groups,
-        raw_prefix: prefix.raw,
-        lz77_prefix: prefix.lz77,
+        raw_prefix: prefix.map(|code| code.raw),
+        lz77_prefix: prefix.map(|code| code.lz77),
     })
 }
 
@@ -251,17 +392,17 @@ fn validate_empty_non_pass_sections(
                 let end = section
                     .bits
                     .end()
-                    .ok_or_else(|| unsupported_error("Gray8 section bit range overflow"))?;
+                    .ok_or_else(|| unsupported_error("Modular section bit range overflow"))?;
                 if !bits_are_zero(codestream, section.bits.offset, end) {
                     return unsupported(
-                        "the lossless Gray8 profile requires empty LF-group and HF-global sections",
+                        "the lossless Modular profile requires empty LF-group and HF-global sections",
                     );
                 }
             }
             FrameSectionKind::PassGroup { pass_index, .. } if pass_index != 0 => {
                 return Err(UnsupportedProfile::new(
                     UnsupportedCodestreamFeature::MultiplePasses,
-                    "the lossless Gray8 GPU frontend accepts exactly one pass",
+                    "the lossless Modular GPU frontend accepts exactly one pass",
                 )
                 .into());
             }
@@ -277,7 +418,10 @@ struct ParsedPrefix {
     lz77: [PrefixCodeEntry; LZ77_SYMBOLS],
 }
 
-fn parse_dc_global(reader: &mut BitReader<'_>) -> Result<ParsedPrefix> {
+fn parse_dc_global(
+    reader: &mut BitReader<'_>,
+    channels: ModularChannels,
+) -> Result<[ParsedPrefix; 4]> {
     for (count, value, name) in [
         (1, 1, "Modular global tree"),
         (1, 1, "Modular WP header"),
@@ -341,14 +485,23 @@ fn parse_dc_global(reader: &mut BitReader<'_>) -> Result<ParsedPrefix> {
     expect(reader, 2, 0, "Modular global entropy selector")?;
     expect(reader, 1, 1, "Modular global prefix histogram mode")?;
 
-    let first = parse_prefix_histogram(reader)?;
-    for _ in 1..4 {
-        parse_prefix_histogram(reader)?;
-    }
+    let prefixes = [
+        parse_prefix_histogram(reader)?,
+        parse_prefix_histogram(reader)?,
+        parse_prefix_histogram(reader)?,
+        parse_prefix_histogram(reader)?,
+    ];
     expect(reader, 1, 1, "Modular global distance multiplier")?;
     expect(reader, 1, 1, "Modular global predictor tree")?;
-    expect(reader, 2, 0, "Modular global transform count")?;
-    Ok(first)
+    if channels == ModularChannels::Gray {
+        expect(reader, 2, 0, "no Modular color transforms")?;
+    } else {
+        expect(reader, 2, 1, "one Modular color transform")?;
+        expect(reader, 2, 0, "reversible color transform")?;
+        expect(reader, 5, 0, "reversible color transform first channel")?;
+        expect(reader, 2, 0, "reversible YCoCg transform type")?;
+    }
+    Ok(prefixes)
 }
 
 fn parse_prefix_histogram(reader: &mut BitReader<'_>) -> Result<ParsedPrefix> {
@@ -579,7 +732,7 @@ fn expect(reader: &mut BitReader<'_>, count: u8, expected: u64, field: &str) -> 
     let actual = reader.read_bits(count)?;
     if actual != expected {
         return unsupported(format!(
-            "the Gray8 GPU profile requires {field} (expected {expected}, received {actual})"
+            "the lossless Modular GPU profile requires {field} (expected {expected}, received {actual})"
         ));
     }
     Ok(())
@@ -604,7 +757,7 @@ fn unsupported<T>(detail: impl Into<String>) -> Result<T> {
 
 fn unsupported_error(detail: impl Into<String>) -> UnsupportedProfile {
     UnsupportedProfile::new(
-        UnsupportedCodestreamFeature::Other("gray8-standard-profile".into()),
+        UnsupportedCodestreamFeature::Other("lossless-modular-standard-profile".into()),
         detail,
     )
 }

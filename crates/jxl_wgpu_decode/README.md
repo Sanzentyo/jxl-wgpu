@@ -9,32 +9,38 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
-- one final still frame, 8-bit grayscale lossless Modular, any bounded 256x256 pass-group grid,
-  one pass, fixed Gradient predictor, prefix entropy, and distance-one zero-run coding;
-- no transforms, restoration filters, extra channels, or animation references.
+- one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
+  bounded 256x256 pass-group grid, one pass, fixed Gradient predictor, prefix entropy, and
+  distance-one zero-run coding;
+- the standard reversible YCoCg transform for RGB(A), plus one full-resolution unassociated alpha
+  channel for RGBA; no other transforms, restoration filters, extra channels, or references.
 
 Before submission the decoder inventories the standard image header, frame header, and TOC with
-explicit limits. It parses the bounded DC-global/context-map/prefix metadata needed to build one
-shared GPU lookup table, then derives every pass-group token range and canvas origin directly from
-standard frame sections. It does not decode an entropy token, residual, predictor, or pixel on the
-CPU.
+explicit limits. It parses the bounded DC-global/context-map and four prefix histograms needed to
+build one lookup table per active Modular channel, then derives every pass-group token range and
+canvas origin directly from standard frame sections. It does not decode an entropy token,
+residual, predictor, color transform, or pixel on the CPU.
 
 The compute shader reads prefix/hybrid tokens from the actual codestream buffer, validates every
 bit and output bound, expands only the profile's constrained zero runs, unpacks signed residuals,
-and performs Gradient reconstruction. Groups are recorded as independent dispatches in one queue
-submission and write their exact canvas rectangles. One aggregate status staging buffer is mapped
-once; every four-word group status is checked before the frame is reported. No reconstructed
-sample is produced on the CPU.
+performs per-channel Gradient reconstruction, and reverses YCoCg for RGB(A). Groups are recorded
+as independent dispatches in one queue submission and write their exact canvas rectangles. One
+aggregate status staging buffer is mapped once; every four-word group status is checked before the
+frame is reported. No reconstructed sample is produced on the CPU.
 
-VarDCT, adaptive predictors, multiple passes, extra channels, patches, splines, noise, and
-reference-frame animation remain typed unsupported profiles.
+VarDCT, adaptive predictors, multiple passes, non-alpha extra channels, patches, splines, noise,
+and reference-frame animation remain typed unsupported profiles.
 
 ## GPU output formats
 
 `GpuOutputRequest` always carries a concrete `jxl_gpu_formats::PixelFormat`; the request is never
 ignored. Construction is intentionally breaking and explicit: `GpuOutputRequest::color` accepts
 only classified color formats, while `GpuOutputRequest::numeric` requires a
-`NumericSampleMapping`. The current Gray8 kernel supports:
+`NumericSampleMapping`. Canonical Gray/RGB/RGBA descriptors shared with
+`jxl_wgpu_encode::LosslessModularFormat` produce exact native unsigned output: 1-8 valid bits use
+one byte per component and 9-16 valid bits use a little-endian 16-bit component with the valid code
+in its low bits. Gray selects `NumericSampleMapping::NativeUnsigned`; RGB/RGBA use the color
+constructor. The 8-bit Gray conversion path additionally supports:
 
 - all 10 numeric VPI 4.1 pitch-linear formats: U8, S8, U16, U32, S32, S16, 2S16, F32, F64, and
   2F32;
@@ -50,7 +56,8 @@ chroma is the exact neutral code. Full/limited luma quantization, native 16-bit 
 four-byte YUYV/UYVY pairs, odd-width tail duplication, and all plane writes happen directly in the
 GPU output buffer. PQ and other unimplemented transfers return `UnsupportedOutputFormat`.
 
-`classify_pixel_format` is the sole storage classifier. `NormalizedGray8` maps code 0..255 across
+Generic outputs use `classify_pixel_format`; the exact native Modular descriptor is recognized
+separately because sub-8/sub-16 valid-bit padding is part of its contract. `NormalizedGray8` maps code 0..255 across
 the full unsigned range, the nonnegative half of a signed type (0..MAX), or float 0..1, and
 replicates the result for 2S16/2F32. Integer endpoints and rounding are computed without overflow;
 F32 bits are formed deterministically with integer arithmetic rather than backend-relaxed
@@ -102,13 +109,13 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 112-byte `repr(C)` POD. It carries the token
-range, local extent, canvas origin, chroma-initialization ownership, four plane offset/stride
-pairs, exact channel/order/depth/range/transfer codes, the resolved numeric mapping, and the
-shader-visible logical size. Codestream uploads are rounded to
+The CPU/WGSL per-group parameter ABI is a checked 128-byte `repr(C)` POD. It carries the token
+range, local extent, canvas origin, source channel/depth/mask, chroma-initialization ownership,
+four plane offset/stride pairs, exact output channel/order/depth/range/transfer codes, the resolved
+numeric mapping, and the shader-visible logical size. Codestream uploads are rounded to
 four bytes and include an additional zero sentinel word for the shader's bounded cross-word peek.
-Prefix lookup (128 KiB), aligned group reconstruction slices, aggregate status/readback,
-parameters, output, and codestream sizes
+Prefix lookup (128 KiB per active channel), aligned group/channel reconstruction slices,
+aggregate status/readback, parameters, output, and codestream sizes
 are checked with overflow detection against both storage-binding and device-buffer limits. The
 requested `max_frame_slots` multiplied by the complete per-frame allocation estimate must remain
 within a 64 MiB session exposure. `WgpuDecodeSession::memory_stats` reports the complete per-frame
@@ -131,7 +138,7 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for p
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while lookup and aligned 112-byte
+aligned spans directly from the shared input storage, while lookup and aligned 128-byte
 `ShaderParams` records use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.

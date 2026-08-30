@@ -7,6 +7,10 @@ struct Params {
     origin_y: u32,
     sample_count: u32,
     initialize_chroma: u32,
+    source_channels: u32,
+    source_bits: u32,
+    source_mask: u32,
+    _source_padding: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -39,6 +43,7 @@ struct Params {
 
 var<private> bit_cursor: u32;
 var<private> decode_error: u32;
+var<private> current_channel: u32;
 
 const STATUS_OK: u32 = 1u;
 const ERROR_TRUNCATED_BITS: u32 = 2u;
@@ -90,7 +95,8 @@ fn read_prefix_symbol() -> u32 {
     }
     let available = min(15u, params.token_end - bit_cursor);
     let lookup_index = peek_bits(available);
-    let entry = prefix_lookup[lookup_index];
+    let table_offset = current_channel << 15u;
+    let entry = prefix_lookup[table_offset + lookup_index];
     let bit_len = entry & 0xffu;
     if bit_len == 0u || bit_len > available {
         decode_error = ERROR_PREFIX;
@@ -109,12 +115,7 @@ fn decode_raw_hybrid(token: u32) -> u32 {
         return 0u;
     }
     let extra_count = token - 1u;
-    let value = (1u << extra_count) + read_bits(extra_count);
-    if value > 510u {
-        decode_error = ERROR_RAW_TOKEN;
-        return 0u;
-    }
-    return value;
+    return (1u << extra_count) + read_bits(extra_count);
 }
 
 fn decode_lz77_hybrid(token: u32) -> u32 {
@@ -168,6 +169,53 @@ fn write_stored_code(offset: u32, code: u32) {
         write_byte(offset + 1u, stored >> 8u);
     } else {
         decode_error = ERROR_OUTPUT_BOUNDS;
+    }
+}
+
+fn write_native_code(offset: u32, code: i32) {
+    if code < 0i || u32(code) > params.source_mask {
+        decode_error = ERROR_OUTPUT_MAPPING;
+        return;
+    }
+    let value = u32(code);
+    if params.storage_bits == 8u {
+        write_byte(offset, value);
+    } else if params.storage_bits == 16u {
+        write_byte(offset, value);
+        write_byte(offset + 1u, value >> 8u);
+    } else {
+        decode_error = ERROR_OUTPUT_MAPPING;
+    }
+}
+
+fn write_native_pixel(x: u32, y: u32, index: u32) {
+    if params.output_kind != 9u || params.channels != params.source_channels
+        || params.bits != params.source_bits {
+        decode_error = ERROR_OUTPUT_MAPPING;
+        return;
+    }
+    let bytes_per_component = params.storage_bits / 8u;
+    let pixel_offset = params.plane0_offset
+        + y * params.plane0_stride
+        + x * params.channels * bytes_per_component;
+    if params.source_channels == 1u {
+        write_native_code(pixel_offset, bitcast<i32>(reconstructed[index]));
+        return;
+    }
+
+    let y_value = bitcast<i32>(reconstructed[index]);
+    let co = bitcast<i32>(reconstructed[params.sample_count + index]);
+    let cg = bitcast<i32>(reconstructed[2u * params.sample_count + index]);
+    let temporary = y_value - (cg >> 1u);
+    let green = cg + temporary;
+    let blue = temporary - (co >> 1u);
+    let red = co + blue;
+    write_native_code(pixel_offset, red);
+    write_native_code(pixel_offset + bytes_per_component, green);
+    write_native_code(pixel_offset + 2u * bytes_per_component, blue);
+    if params.source_channels == 4u {
+        let alpha = bitcast<i32>(reconstructed[3u * params.sample_count + index]);
+        write_native_code(pixel_offset + 3u * bytes_per_component, alpha);
     }
 }
 
@@ -381,34 +429,63 @@ fn write_output_sample(x: u32, y: u32, sample: u32) {
 fn emit_token(index: u32, packed: u32) {
     let x = index % params.width;
     let y = index / params.width;
+    let channel_base = current_channel * params.sample_count;
     var left = 0i;
     var top = 0i;
     var top_left = 0i;
     if x > 0u {
-        left = i32(reconstructed[index - 1u]);
+        left = bitcast<i32>(reconstructed[channel_base + index - 1u]);
     } else if y > 0u {
-        left = i32(reconstructed[index - params.width]);
+        left = bitcast<i32>(reconstructed[channel_base + index - params.width]);
     }
     if y == 0u {
         top = left;
         top_left = left;
     } else {
-        top = i32(reconstructed[index - params.width]);
+        top = bitcast<i32>(reconstructed[channel_base + index - params.width]);
         if x == 0u {
             top_left = top;
         } else {
-            top_left = i32(reconstructed[index - params.width - 1u]);
+            top_left = bitcast<i32>(
+                reconstructed[channel_base + index - params.width - 1u]
+            );
         }
     }
     let gradient = left + top - top_left;
     let prediction = clamp(gradient, min(left, top), max(left, top));
-    let sample = u32(prediction + unpack_signed(packed)) & 255u;
-    reconstructed[index] = sample;
-
-    write_output_sample(params.origin_x + x, params.origin_y + y, sample);
+    let sample = prediction + unpack_signed(packed);
+    let maximum = i32(params.source_mask);
+    let signed_transform_channel = params.source_channels >= 3u
+        && (current_channel == 1u || current_channel == 2u);
+    if (!signed_transform_channel && (sample < 0i || sample > maximum))
+        || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
+        decode_error = ERROR_RAW_TOKEN;
+        return;
+    }
+    reconstructed[channel_base + index] = bitcast<u32>(sample);
 }
 
 fn finalize_output() {
+    if params.source_channels != 1u || params.output_kind == 9u {
+        if params.output_kind != 9u {
+            decode_error = ERROR_OUTPUT_MAPPING;
+            return;
+        }
+        for (var index = 0u; index < params.sample_count; index += 1u) {
+            let x = params.origin_x + index % params.width;
+            let y = params.origin_y + index / params.width;
+            write_native_pixel(x, y, index);
+        }
+        return;
+    }
+
+    if params.output_kind != 4u {
+        for (var index = 0u; index < params.sample_count; index += 1u) {
+            let x = params.origin_x + index % params.width;
+            let y = params.origin_y + index / params.width;
+            write_output_sample(x, y, reconstructed[index]);
+        }
+    }
     if params.output_kind == 2u && params.initialize_chroma != 0u {
         let bytes_per_sample = params.storage_bits / 8u;
         let neutral = neutral_chroma_code();
@@ -458,10 +535,7 @@ fn finalize_output() {
     }
 }
 
-@compute @workgroup_size(1)
-fn decode() {
-    bit_cursor = params.token_start;
-    decode_error = 0u;
+fn decode_channel() -> u32 {
     var decoded = 0u;
     // The profile's RLE code may begin the stream. Its implicit distance-one history is zero.
     var last_token = 0u;
@@ -513,6 +587,20 @@ fn decode() {
         } else {
             decode_error = ERROR_PREFIX;
         }
+    }
+    return decoded;
+}
+
+@compute @workgroup_size(1)
+fn decode() {
+    bit_cursor = params.token_start;
+    decode_error = 0u;
+    current_channel = 0u;
+    var decoded = 0u;
+
+    while current_channel < params.source_channels && decode_error == 0u {
+        decoded += decode_channel();
+        current_channel += 1u;
     }
 
     if decode_error == 0u && bit_cursor != params.token_end {

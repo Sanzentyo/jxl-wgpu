@@ -5,13 +5,13 @@ use std::process::Command;
 use std::sync::{Arc, mpsc};
 
 use jxl::api::{
-    JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat,
-    ProcessingResult, states,
+    Endianness, JxlBitDepth, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions,
+    JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
 use jxl_gpu_formats::{
-    Channel, ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageLayout, PixelFormat,
-    SampleKind, TransferFunction, classify_pixel_format, convert_rgb_f32,
-    vpi::VpiPitchLinearFormat as Vpi,
+    Channel, ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, ImageLayout,
+    PitchLinearPlaneLayout, PixelFormat, SampleKind, TransferFunction, classify_pixel_format,
+    convert_rgb_f32, vpi::VpiPitchLinearFormat as Vpi,
 };
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, SubmissionToken};
 use jxl_wgpu::{
@@ -20,10 +20,12 @@ use jxl_wgpu::{
     ShaderF64Policy, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::{
-    F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
-    PrefetchBackpressure, WgpuSubmissionEngine,
+    F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels,
+    NumericSampleMapping, PrefetchBackpressure, WgpuSubmissionEngine,
 };
-use jxl_wgpu_encode::{BufferImageSource, LosslessModularEncoder, WgpuContext};
+use jxl_wgpu_encode::{
+    BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
+};
 use wgpu::util::DeviceExt;
 
 mod common;
@@ -223,6 +225,210 @@ fn encode_standard_gray8(
     } else {
         encoder.encode(source).unwrap()
     }
+}
+
+fn patterned_modular_samples(
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    width: u32,
+    height: u32,
+) -> Vec<u16> {
+    let channels = usize::try_from(format.channel_count()).unwrap();
+    let mask = (1u32 << bits_per_sample) - 1;
+    let mut samples = Vec::with_capacity(width as usize * height as usize * channels);
+    for y in 0..height {
+        for x in 0..width {
+            for channel in 0..channels {
+                let channel = channel as u32;
+                let mut value = x
+                    .wrapping_mul(257 + channel * 19)
+                    .wrapping_add(y.wrapping_mul(509 + channel * 31))
+                    .wrapping_add((x ^ y).wrapping_mul(17 + channel * 13))
+                    .wrapping_add(channel * 997)
+                    & mask;
+                if (x + y * 3 + channel * 5).is_multiple_of(97) {
+                    value = mask;
+                } else if (x * 7 + y + channel * 11).is_multiple_of(89) {
+                    value = 0;
+                }
+                samples.push(value as u16);
+            }
+        }
+    }
+    samples
+}
+
+fn packed_modular_bytes(samples: &[u16], bits_per_sample: u8) -> Vec<u8> {
+    if bits_per_sample <= 8 {
+        samples.iter().map(|&sample| sample as u8).collect()
+    } else {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+}
+
+fn encode_standard_modular_with_odd_stride(
+    backend: &WgpuBackend,
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    width: u32,
+    height: u32,
+    samples: &[u16],
+    container: bool,
+) -> Vec<u8> {
+    let pixel_format = format.pixel_format(bits_per_sample).unwrap();
+    let channels = u64::from(format.channel_count());
+    let bytes_per_sample = u64::from(if bits_per_sample <= 8 { 1u8 } else { 2u8 });
+    let row_bytes = u64::from(width) * channels * bytes_per_sample;
+    let row_stride = row_bytes + if row_bytes.is_multiple_of(2) { 1 } else { 2 };
+    assert!(!row_stride.is_multiple_of(2));
+    let offset = 3u64;
+    let layout = ImageLayout::from_planes(
+        Extent2d::new(width, height),
+        pixel_format,
+        vec![PitchLinearPlaneLayout {
+            plane_index: 0,
+            offset,
+            row_stride,
+            sample_extent: Extent2d::new(width, height),
+            row_bytes,
+        }],
+    )
+    .unwrap();
+    let mut source_bytes = vec![0xa5; layout.logical_size.div_ceil(4) as usize * 4];
+    let channels = usize::try_from(channels).unwrap();
+    let bytes_per_sample = usize::try_from(bytes_per_sample).unwrap();
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            for channel in 0..channels {
+                let sample = samples[(y * width as usize + x) * channels + channel];
+                let start = offset as usize
+                    + y * row_stride as usize
+                    + (x * channels + channel) * bytes_per_sample;
+                if bytes_per_sample == 1 {
+                    source_bytes[start] = sample as u8;
+                } else {
+                    source_bytes[start..start + 2].copy_from_slice(&sample.to_le_bytes());
+                }
+            }
+        }
+    }
+    let buffer = Arc::new(
+        backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("standard Modular odd-stride decode conformance source"),
+                contents: &source_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    );
+    let source = BufferImageSource::new(buffer, layout).unwrap();
+    let encoder = LosslessModularEncoder::new(WgpuContext::from_backend(backend));
+    if container {
+        encoder.encode_container(source).unwrap()
+    } else {
+        encoder.encode(source).unwrap()
+    }
+}
+
+fn rust_jxl_decode_integer(
+    encoded: &[u8],
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+) -> Result<((usize, usize), Vec<u16>), String> {
+    let mut input = encoded;
+    let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let mut decoder = loop {
+        match decoder
+            .process(&mut input, None)
+            .map_err(|error| error.to_string())?
+        {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err("Rust jxl oracle needed more input before image info".into());
+                }
+                decoder = fallback;
+            }
+        }
+    };
+    let basic_info = decoder.basic_info();
+    if basic_info.bit_depth
+        != (JxlBitDepth::Int {
+            bits_per_sample: u32::from(bits_per_sample),
+        })
+    {
+        return Err(format!(
+            "Rust jxl oracle depth {:?} does not match {bits_per_sample}",
+            basic_info.bit_depth
+        ));
+    }
+    let size = basic_info.size;
+    let data_format = if bits_per_sample <= 8 {
+        JxlDataFormat::U8 {
+            bit_depth: bits_per_sample,
+        }
+    } else {
+        JxlDataFormat::U16 {
+            endianness: Endianness::LittleEndian,
+            bit_depth: bits_per_sample,
+        }
+    };
+    decoder.set_pixel_format(JxlPixelFormat {
+        color_type: match format {
+            LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::Rgb => JxlColorType::Rgb,
+            LosslessModularFormat::Rgba => JxlColorType::Rgba,
+        },
+        color_data_format: Some(data_format),
+        extra_channel_format: vec![None; usize::from(format.has_alpha())],
+    });
+    let mut frame = loop {
+        match decoder
+            .process(&mut input, None)
+            .map_err(|error| error.to_string())?
+        {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                if input.is_empty() {
+                    return Err("Rust jxl oracle needed more input before frame info".into());
+                }
+                decoder = fallback;
+            }
+        }
+    };
+    let channels = usize::try_from(format.channel_count()).unwrap();
+    let bytes_per_sample = data_format.bytes_per_sample();
+    let row_bytes = size.0 * channels * bytes_per_sample;
+    let mut bytes = vec![0u8; row_bytes * size.1];
+    {
+        let mut buffers = [JxlOutputBuffer::new(&mut bytes, size.1, row_bytes)];
+        loop {
+            match frame
+                .process(&mut input, &mut buffers, None)
+                .map_err(|error| error.to_string())?
+            {
+                ProcessingResult::Complete { .. } => break,
+                ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                    if input.is_empty() {
+                        return Err("Rust jxl oracle needed more input while rendering".into());
+                    }
+                    frame = fallback;
+                }
+            }
+        }
+    }
+    let samples = if bytes_per_sample == 1 {
+        bytes.into_iter().map(u16::from).collect()
+    } else {
+        bytes
+            .chunks_exact(2)
+            .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+            .collect()
+    };
+    Ok((size, samples))
 }
 
 fn rust_jxl_decode_gray8(encoded: &[u8]) -> Result<((usize, usize), Vec<u8>), String> {
@@ -504,6 +710,123 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             read_output(&backend, output),
             expected,
             "{width}x{height} container={container}"
+        );
+    }
+}
+
+#[test]
+fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping standard Modular native matrix: no wgpu adapter");
+        return;
+    };
+    let decoder = GpuDecoder::wgpu(backend.clone());
+    let (width, height) = (257, 3);
+    let formats = [
+        (LosslessModularFormat::Gray, ModularChannels::Gray),
+        (LosslessModularFormat::Rgb, ModularChannels::Rgb),
+        (LosslessModularFormat::Rgba, ModularChannels::Rgba),
+    ];
+    let depths = [8u8, 10, 12, 16];
+    for (case_index, ((format, expected_channels), bits_per_sample)) in formats
+        .iter()
+        .flat_map(|format| depths.iter().map(move |&bits| (*format, bits)))
+        .enumerate()
+    {
+        let samples = patterned_modular_samples(format, bits_per_sample, width, height);
+        let container = case_index % 2 != 0;
+        let encoded = encode_standard_modular_with_odd_stride(
+            &backend,
+            format,
+            bits_per_sample,
+            width,
+            height,
+            &samples,
+            container,
+        );
+        let (oracle_extent, oracle) =
+            rust_jxl_decode_integer(&encoded, format, bits_per_sample).unwrap_or_else(|error| {
+                panic!(
+                    "{format:?} {bits_per_sample}-bit container={container} Rust oracle failed: {error}"
+                )
+            });
+        assert_eq!(oracle_extent, (width as usize, height as usize));
+        assert_eq!(
+            oracle, samples,
+            "{format:?} {bits_per_sample}-bit Rust oracle"
+        );
+
+        let pixel_format = format.pixel_format(bits_per_sample).unwrap();
+        let request = if format == LosslessModularFormat::Gray {
+            GpuOutputRequest::numeric(pixel_format, NumericSampleMapping::NativeUnsigned).unwrap()
+        } else {
+            GpuOutputRequest::color(pixel_format).unwrap()
+        };
+        let mut session = decoder.open(&encoded, request).unwrap_or_else(|error| {
+            panic!("{format:?} {bits_per_sample}-bit container={container} did not open: {error}")
+        });
+        assert!(matches!(
+            session.profile(),
+            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+                bits_per_sample: actual_bits,
+                channels: actual_channels,
+                grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
+                ..
+            } if actual_bits == bits_per_sample && actual_channels == expected_channels
+        ));
+        let frame = session
+            .next_frame()
+            .unwrap_or_else(|error| {
+                panic!("{format:?} {bits_per_sample}-bit container={container} failed: {error}")
+            })
+            .expect("one native Modular frame is returned");
+        let output = &frame.output().outputs[0];
+        assert_eq!(output.layout.extent, Extent2d::new(width, height));
+        assert_eq!(
+            read_output(&backend, output),
+            packed_modular_bytes(&samples, bits_per_sample),
+            "{format:?} {bits_per_sample}-bit container={container} GPU output"
+        );
+    }
+}
+
+#[test]
+fn standard_modular_fused_rgb_and_rgba_groups_are_exact_on_gpu() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping fused standard Modular color test: no wgpu adapter");
+        return;
+    };
+    let decoder = GpuDecoder::wgpu(backend.clone());
+    let (width, height) = (17, 13);
+    for (format, bits_per_sample, container) in [
+        (LosslessModularFormat::Rgb, 10, false),
+        (LosslessModularFormat::Rgba, 16, true),
+    ] {
+        let samples = patterned_modular_samples(format, bits_per_sample, width, height);
+        let encoded = encode_standard_modular_with_odd_stride(
+            &backend,
+            format,
+            bits_per_sample,
+            width,
+            height,
+            &samples,
+            container,
+        );
+        let request =
+            GpuOutputRequest::color(format.pixel_format(bits_per_sample).unwrap()).unwrap();
+        let mut session = decoder.open(&encoded, request).unwrap();
+        assert!(matches!(
+            session.profile(),
+            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+                grouping: jxl_wgpu_decode::ModularGrouping::SingleGroup,
+                ..
+            }
+        ));
+        let frame = session.next_frame().unwrap().unwrap();
+        assert_eq!(
+            read_output(&backend, &frame.output().outputs[0]),
+            packed_modular_bytes(&samples, bits_per_sample),
+            "fused {format:?} {bits_per_sample}-bit"
         );
     }
 }

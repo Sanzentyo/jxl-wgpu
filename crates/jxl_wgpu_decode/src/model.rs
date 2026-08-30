@@ -3,7 +3,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jxl_gpu_formats::{PixelFormat, PixelFormatClass, classify_pixel_format};
+use jxl_gpu_formats::{
+    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingFieldKind,
+    PixelFormat, PixelFormatClass, PlaneSampling, SampleKind, Swizzle, classify_pixel_format,
+};
 use jxl_gpu_protocol::Extent2d;
 
 use crate::{Error, Result};
@@ -14,6 +17,7 @@ pub enum DecodeProfile {
     /// Lossless Modular data reconstructed by a fixed-predictor GPU kernel.
     ModularLossless {
         bits_per_sample: u8,
+        channels: ModularChannels,
         predictor: FixedModularPredictor,
         grouping: ModularGrouping,
     },
@@ -24,6 +28,7 @@ impl DecodeProfile {
     pub const fn modular_lossless_8bit(predictor: FixedModularPredictor) -> Self {
         Self::ModularLossless {
             bits_per_sample: 8,
+            channels: ModularChannels::Gray,
             predictor,
             grouping: ModularGrouping::SingleGroup,
         }
@@ -33,8 +38,28 @@ impl DecodeProfile {
     pub const fn modular_lossless_16bit(predictor: FixedModularPredictor) -> Self {
         Self::ModularLossless {
             bits_per_sample: 16,
+            channels: ModularChannels::Gray,
             predictor,
             grouping: ModularGrouping::SingleGroup,
+        }
+    }
+}
+
+/// Logical channels reconstructed by a lossless Modular profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularChannels {
+    Gray,
+    Rgb,
+    Rgba,
+}
+
+impl ModularChannels {
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::Gray => 1,
+            Self::Rgb => 3,
+            Self::Rgba => 4,
         }
     }
 }
@@ -219,13 +244,16 @@ impl AnimationMetadata {
     }
 }
 
-/// Numeric interpretation applied while converting the decoded Gray8 code into a non-color
-/// output sample.
+/// Numeric interpretation applied while writing a decoded non-color Modular sample.
 ///
 /// This mapping is explicit because a [`PixelFormat`] with `ColorModel::NonColor` carries storage
 /// shape, not normalization semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NumericSampleMapping {
+    /// Preserve the decoded unsigned integer code exactly in the low valid bits of the canonical
+    /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
+    /// codestream depth must match.
+    NativeUnsigned,
     /// Maps the decoded integer code `gray` in `[0, 255]` across the destination's nonnegative
     /// range. Unsigned integers use `[0, MAX]`; signed integers use `[0, MAX]` (never negative);
     /// floating-point values use the normalized `f32` value `gray / 255`. Two-component formats
@@ -275,8 +303,17 @@ pub struct GpuOutputRequest {
 }
 
 impl GpuOutputRequest {
-    /// Creates a color-bearing output request after semantic classification.
+    /// Creates a color-bearing output request after semantic classification or recognition of the
+    /// canonical valid-bit-padded RGB/RGBA lossless-Modular descriptor.
     pub fn color(format: PixelFormat) -> Result<Self> {
+        if native_modular_format(&format).is_some_and(|native| {
+            matches!(
+                native.channels,
+                ModularChannels::Rgb | ModularChannels::Rgba
+            )
+        }) {
+            return Ok(Self::from_parts(format, GpuOutputMapping::Color));
+        }
         match classify_pixel_format(&format)
             .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
         {
@@ -285,8 +322,22 @@ impl GpuOutputRequest {
         }
     }
 
-    /// Creates a non-color output request with an explicit sample mapping.
+    /// Creates a non-color output request with an explicit sample mapping. `NativeUnsigned`
+    /// recognizes the canonical valid-bit-padded Gray lossless-Modular descriptor directly.
     pub fn numeric(format: PixelFormat, mapping: NumericSampleMapping) -> Result<Self> {
+        if mapping == NumericSampleMapping::NativeUnsigned {
+            return match native_modular_format(&format) {
+                Some(NativeModularFormat {
+                    channels: ModularChannels::Gray,
+                    ..
+                }) => Ok(Self::from_parts(format, GpuOutputMapping::Numeric(mapping))),
+                Some(_) => Err(Error::NumericMappingForColorOutput),
+                None => Err(Error::UnsupportedOutputFormat(
+                    "native lossless-Modular output requires the canonical unsigned Gray descriptor"
+                        .into(),
+                )),
+            };
+        }
         match classify_pixel_format(&format)
             .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
         {
@@ -294,6 +345,9 @@ impl GpuOutputRequest {
                 let is_f64 = numeric.sample_kind == jxl_gpu_formats::SampleKind::Float
                     && numeric.bits_per_component == 64;
                 match (is_f64, mapping) {
+                    (_, NumericSampleMapping::NativeUnsigned) => unreachable!(
+                        "native unsigned requests return before generic numeric classification"
+                    ),
                     (true, NumericSampleMapping::NormalizedGray8) => {
                         return Err(Error::F64OutputPolicyRequired);
                     }
@@ -339,4 +393,85 @@ impl GpuOutputRequest {
         self.max_frame_slots = max_frame_slots;
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeModularFormat {
+    pub channels: ModularChannels,
+    pub bits_per_sample: u8,
+    pub storage_bits: u8,
+}
+
+/// Recognizes the exact pitch-linear descriptor shared with the GPU lossless Modular encoder.
+pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModularFormat> {
+    if format.validate().is_err()
+        || format.sample_kind != SampleKind::Unsigned
+        || format.byte_order != ByteOrder::Native
+        || format.chroma_subsampling != ChromaSubsampling::None
+        || format.planes.len() != 1
+    {
+        return None;
+    }
+    let channels = match (format.model, format.swizzle, format.color_spec) {
+        (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
+            ModularChannels::Gray
+        }
+        (
+            ColorModel::Rgb,
+            Swizzle::XYZ1,
+            ColorSpecification::Default | ColorSpecification::Undefined,
+        ) => ModularChannels::Rgb,
+        (
+            ColorModel::Rgb,
+            Swizzle::XYZW,
+            ColorSpecification::Default | ColorSpecification::Undefined,
+        ) => ModularChannels::Rgba,
+        _ => return None,
+    };
+    let plane = &format.planes[0];
+    if plane.sampling != PlaneSampling::FULL
+        || plane.pixels_per_element != 1
+        || plane.words.len() != channels.count() as usize
+    {
+        return None;
+    }
+    let expected_channels = [Channel::X, Channel::Y, Channel::Z, Channel::W];
+    let mut bits_per_sample = None;
+    let mut storage_bits = None;
+    for (word, expected_channel) in plane
+        .words
+        .iter()
+        .zip(&expected_channels[..plane.words.len()])
+    {
+        let (padding, bits, channel) = match word.fields.as_slice() {
+            [sample] => match sample.kind {
+                PackingFieldKind::Channel(channel) => (0, sample.bits, channel),
+                PackingFieldKind::Padding => return None,
+            },
+            [padding, sample] => match (padding.kind, sample.kind) {
+                (PackingFieldKind::Padding, PackingFieldKind::Channel(channel)) => {
+                    (padding.bits, sample.bits, channel)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let word_bits = padding.checked_add(bits)?;
+        let expected_storage_bits = if bits <= 8 { 8 } else { 16 };
+        if channel != *expected_channel
+            || !(1..=16).contains(&bits)
+            || word_bits != expected_storage_bits
+            || bits_per_sample.is_some_and(|value| value != bits)
+            || storage_bits.is_some_and(|value| value != word_bits)
+        {
+            return None;
+        }
+        bits_per_sample = Some(bits);
+        storage_bits = Some(word_bits);
+    }
+    Some(NativeModularFormat {
+        channels,
+        bits_per_sample: bits_per_sample?,
+        storage_bits: storage_bits?,
+    })
 }

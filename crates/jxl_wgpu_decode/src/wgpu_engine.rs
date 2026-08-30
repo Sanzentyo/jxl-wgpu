@@ -21,7 +21,8 @@ use jxl_wgpu::{
 use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
-use crate::profile::{Gray8Group, StandardGray8Profile, parse_standard_gray8_profile};
+use crate::model::native_modular_format;
+use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FixedModularPredictor, FrameDuration,
     FrameMetadata, GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
@@ -103,6 +104,10 @@ struct ShaderParams {
     origin_y: u32,
     sample_count: u32,
     initialize_chroma: u32,
+    source_channels: u32,
+    source_bits: u32,
+    source_mask: u32,
+    _source_padding: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -138,13 +143,13 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 112);
+    assert!(std::mem::size_of::<ShaderParams>() == 128);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
 };
 
-/// Stock GPU-only decoder for the standard lossless Modular Gray8 profile.
+/// Stock GPU-only decoder for the standard lossless 1-16-bit Gray/RGB/RGBA Modular profile.
 ///
 /// The frontend inventories standard frame sections and parses only bounded prefix metadata. The
 /// shader reads entropy tokens from the actual `jxlc` bytes, expands distance-one zero runs,
@@ -186,7 +191,7 @@ impl WgpuSubmissionEngine {
     pub fn with_memory_budget(backend: WgpuBackend, memory_budget: MemoryBudget) -> Self {
         let pipeline = Arc::new(create_decode_pipeline(
             &backend,
-            "jxl-wgpu decode lossless gray8",
+            "jxl-wgpu decode lossless modular",
             &shader_source(F64OutputPath::ExactF32Widening),
         ));
         // Native f64 compilation is intentionally lazy: adapters that enable SHADER_F64 but
@@ -318,10 +323,16 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 ..InventoryLimits::default()
             })
             .map_err(Error::CodestreamInventory)?;
-        let profile = parse_standard_gray8_profile(codestream.bytes(), &inventory)?;
+        let profile = parse_standard_modular_profile(codestream.bytes(), &inventory)?;
         let prefix_lookup: Arc<[u32]> = build_prefix_lookup(&profile)?.into();
         let extent = Extent2d::new(profile.width, profile.height);
-        let output = OutputPlan::new(extent, request, self.capabilities())?;
+        let output = OutputPlan::new(
+            extent,
+            request,
+            profile.channels,
+            profile.bits_per_sample,
+            self.capabilities(),
+        )?;
         let pipeline = match output.f64_output_path {
             Some(F64OutputPath::NativeArithmetic) => self
                 .native_f64_pipeline
@@ -330,7 +341,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 .get_or_init(|| {
                     Arc::new(create_decode_pipeline(
                         &self.backend,
-                        "jxl-wgpu decode lossless gray8 native f64",
+                        "jxl-wgpu decode lossless modular native f64",
                         &shader_source(F64OutputPath::NativeArithmetic),
                     ))
                 })
@@ -348,10 +359,11 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             request.max_frame_slots().get(),
         )?;
         let predictor = FixedModularPredictor::new(5)
-            .expect("the standard Gray8 profile uses the valid Gradient predictor index");
+            .expect("the standard Modular profile uses the valid Gradient predictor index");
         Ok(PreparedGpuSession::new(
             DecodeProfile::ModularLossless {
-                bits_per_sample: 8,
+                bits_per_sample: profile.bits_per_sample,
+                channels: profile.channels,
                 predictor,
                 grouping: if profile.groups.len() == 1 {
                     crate::ModularGrouping::SingleGroup
@@ -383,7 +395,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
     }
 }
 
-/// One-frame runtime-neutral GPU decode session for the standard Gray8 profile.
+/// One-frame runtime-neutral GPU decode session for the standard lossless Modular profile.
 pub struct WgpuDecodeSession {
     backend: WgpuBackend,
     pipeline: Arc<wgpu::ComputePipeline>,
@@ -466,7 +478,7 @@ impl WgpuDecodeSession {
     }
 }
 
-/// One submitted stock Gray8 frame. Queue submission has completed, while mapped validation may
+/// One submitted stock Modular frame. Queue submission has completed, while mapped validation may
 /// still be pending.
 pub struct WgpuPendingFrame {
     device: wgpu::Device,
@@ -503,7 +515,7 @@ impl WgpuPendingFrame {
     /// permit. Keep that lease alive instead of cloning its raw wgpu buffer handle.
     pub fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
         let lifetime = self.lifetime.as_ref().ok_or(Error::EngineContract(
-            "Gray8 GPU pending frame was already consumed",
+            "Modular GPU pending frame was already consumed",
         ))?;
         Ok(UnvalidatedGpuImageFrame {
             token: self.token,
@@ -524,7 +536,7 @@ impl WgpuPendingFrame {
     ) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
         mapping.map_err(Error::backend)?;
         let lifetime = self.lifetime.take().ok_or(Error::EngineContract(
-            "Gray8 GPU completion was consumed more than once",
+            "Modular GPU completion was consumed more than once",
         ))?;
         let mapped = lifetime
             .status_staging
@@ -564,7 +576,7 @@ impl WgpuPendingFrame {
                 || status.cursor != status.expected_cursor
             {
                 return Err(Error::backend(format!(
-                    "Gray8 GPU group {group_index} rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
+                    "Modular GPU group {group_index} rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
                     status.code,
                     status.decoded_samples,
                     expected_samples,
@@ -655,7 +667,7 @@ impl GpuPendingFrame for WgpuPendingFrame {
 struct DecodeSource {
     codestream_storage: Arc<[u8]>,
     codestream_range: std::ops::Range<usize>,
-    profile: StandardGray8Profile,
+    profile: StandardModularProfile,
     dispatch_layout: GroupDispatchLayout,
     // Immutable within the session. All independently decoded groups share the standard
     // DC-global prefix set without sharing mutable GPU transient allocations.
@@ -703,7 +715,7 @@ struct GroupDispatchLayout {
 }
 
 impl GroupDispatchLayout {
-    fn new(device: &wgpu::Device, profile: &StandardGray8Profile) -> Result<Self> {
+    fn new(device: &wgpu::Device, profile: &StandardModularProfile) -> Result<Self> {
         let limits = device.limits();
         let storage_alignment = u64::from(limits.min_storage_buffer_offset_alignment.max(4));
         let uniform_alignment = u64::from(limits.min_uniform_buffer_offset_alignment.max(16));
@@ -712,16 +724,20 @@ impl GroupDispatchLayout {
         for group in &profile.groups {
             reconstructed_bytes = align_to(reconstructed_bytes, storage_alignment)?;
             reconstructed_offsets.push(reconstructed_bytes);
-            reconstructed_bytes =
-                reconstructed_bytes
-                    .checked_add(u64::from(group.sample_count()?).checked_mul(4).ok_or_else(
-                        || Error::backend("group reconstruction buffer size overflow"),
-                    )?)
-                    .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
+            reconstructed_bytes = reconstructed_bytes
+                .checked_add(
+                    u64::from(group.sample_count()?)
+                        .checked_mul(u64::from(profile.channels.count()))
+                        .and_then(|samples| samples.checked_mul(4))
+                        .ok_or_else(|| {
+                            Error::backend("group reconstruction buffer size overflow")
+                        })?,
+                )
+                .ok_or_else(|| Error::backend("reconstruction buffer size overflow"))?;
         }
         reconstructed_bytes = align4(reconstructed_bytes)?;
         let group_count = u64::try_from(profile.groups.len())
-            .map_err(|_| Error::backend("Gray8 group count exceeds u64"))?;
+            .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
         let status_stride = align_to(STATUS_BYTES, storage_alignment)?;
         let status_bytes = status_stride
             .checked_mul(group_count.saturating_sub(1))
@@ -760,6 +776,7 @@ enum OutputKind {
     RgbPlanar = 6,
     NumericSigned = 7,
     NumericFloat = 8,
+    NativeModular = 9,
 }
 
 struct OutputPlan {
@@ -779,9 +796,51 @@ impl OutputPlan {
     fn new(
         extent: Extent2d,
         request: &GpuOutputRequest,
+        source_channels: crate::ModularChannels,
+        source_bits: u8,
         capabilities: WgpuDecodeCapabilities,
     ) -> Result<Self> {
         let format = request.format().clone();
+        if let Some(native) = native_modular_format(&format) {
+            let native_mapping = matches!(
+                (native.channels, request.mapping()),
+                (
+                    crate::ModularChannels::Gray,
+                    GpuOutputMapping::Numeric(NumericSampleMapping::NativeUnsigned)
+                ) | (
+                    crate::ModularChannels::Rgb | crate::ModularChannels::Rgba,
+                    GpuOutputMapping::Color
+                )
+            );
+            if native_mapping {
+                if native.channels != source_channels || native.bits_per_sample != source_bits {
+                    return Err(Error::UnsupportedOutputFormat(format!(
+                        "native Modular output {native:?} does not match {:?} {}-bit source",
+                        source_channels, source_bits
+                    )));
+                }
+                let output = Self {
+                    layout: ImageLayout::packed(extent, format)?,
+                    kind: OutputKind::NativeModular,
+                    transfer: 0,
+                    limited_range: false,
+                    channels: native.channels.count(),
+                    order: 0,
+                    bits: u32::from(native.bits_per_sample),
+                    storage_bits: u32::from(native.storage_bits),
+                    numeric_mapping: 3,
+                    f64_output_path: None,
+                };
+                output.validate_shader_layout()?;
+                return Ok(output);
+            }
+        }
+        if source_channels != crate::ModularChannels::Gray || source_bits != 8 {
+            return Err(Error::UnsupportedOutputFormat(
+                "RGB/RGBA and non-8-bit Modular sources currently require their exact canonical native output descriptor"
+                    .into(),
+            ));
+        }
         let class = classify_pixel_format(&format)
             .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?;
         let (
@@ -848,6 +907,14 @@ impl OutputPlan {
             (PixelFormatClass::Numeric(_), GpuOutputMapping::Color) => {
                 return Err(Error::NumericMappingRequired);
             }
+            (
+                PixelFormatClass::Numeric(_),
+                GpuOutputMapping::Numeric(NumericSampleMapping::NativeUnsigned),
+            ) => {
+                return Err(Error::UnsupportedOutputFormat(
+                    "native unsigned output descriptor does not match the Modular source".into(),
+                ));
+            }
             (PixelFormatClass::Color(_), GpuOutputMapping::Numeric(_)) => {
                 return Err(Error::NumericMappingForColorOutput);
             }
@@ -911,7 +978,7 @@ impl OutputPlan {
                     ),
                     unsupported => {
                         return Err(Error::UnsupportedOutputFormat(format!(
-                            "the Gray8 GPU decoder does not implement color storage {unsupported:?}"
+                            "the 8-bit Gray GPU conversion path does not implement color storage {unsupported:?}"
                         )));
                     }
                 };
@@ -951,7 +1018,8 @@ impl OutputPlan {
             | OutputKind::NumericFloat
             | OutputKind::Luma
             | OutputKind::Yuv422Packed
-            | OutputKind::RgbInterleaved => 1,
+            | OutputKind::RgbInterleaved
+            | OutputKind::NativeModular => 1,
             OutputKind::YuvSemiplanar => 2,
             OutputKind::YuvPlanar => 3,
             OutputKind::RgbPlanar => usize::try_from(self.channels)
@@ -1054,7 +1122,7 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
         TransferFunction::Linear => 2,
         transfer => {
             return Err(Error::UnsupportedOutputFormat(format!(
-                "the Gray8 GPU kernel does not implement {transfer:?} output transfer"
+                "the 8-bit Gray GPU conversion path does not implement {transfer:?} output transfer"
             )));
         }
     };
@@ -1064,7 +1132,7 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
 fn validate_device_limits(
     device: &wgpu::Device,
     codestream: &[u8],
-    profile: &StandardGray8Profile,
+    profile: &StandardModularProfile,
     dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
     max_frame_slots: usize,
@@ -1081,8 +1149,11 @@ fn validate_device_limits(
     let storage_limit = device.limits().max_storage_buffer_binding_size;
     let buffer_limit = device.limits().max_buffer_size;
     let codestream_bytes = stream_allocation_size(codestream.len())?;
-    let lookup_bytes = u64::try_from(LOOKUP_SIZE * 4)
-        .map_err(|_| Error::backend("prefix lookup size overflow"))?;
+    let lookup_bytes = u64::try_from(LOOKUP_SIZE)
+        .ok()
+        .and_then(|entries| entries.checked_mul(u64::from(profile.channels.count())))
+        .and_then(|entries| entries.checked_mul(4))
+        .ok_or_else(|| Error::backend("prefix lookup size overflow"))?;
     let output_bytes = align4(output.layout.logical_size)?;
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
@@ -1104,11 +1175,12 @@ fn validate_device_limits(
     if profile.groups.iter().any(|group| {
         u64::from(group.width)
             .checked_mul(u64::from(group.height))
+            .and_then(|samples| samples.checked_mul(u64::from(profile.channels.count())))
             .and_then(|samples| samples.checked_mul(4))
             .is_none_or(|bytes| bytes > storage_limit)
     }) {
         return Err(Error::backend(
-            "a Gray8 group reconstruction binding exceeds the device storage-binding limit",
+            "a Modular group reconstruction binding exceeds the device storage-binding limit",
         ));
     }
     for (name, required) in [
@@ -1135,7 +1207,7 @@ fn validate_device_limits(
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
-    .ok_or_else(|| Error::backend("Gray8 GPU memory budget overflow"))?;
+    .ok_or_else(|| Error::backend("Modular GPU memory budget overflow"))?;
     let max_frame_window_bytes = per_frame
         .checked_mul(
             u64::try_from(max_frame_slots)
@@ -1144,13 +1216,13 @@ fn validate_device_limits(
         .ok_or_else(|| Error::backend("bounded in-flight GPU memory budget overflow"))?;
     if max_frame_window_bytes > MAX_SESSION_IN_FLIGHT_BYTES {
         return Err(Error::backend(format!(
-            "bounded Gray8 session exposes {max_frame_window_bytes} bytes ({per_frame} per frame), exceeding the {}-byte session limit",
+            "bounded Modular session exposes {max_frame_window_bytes} bytes ({per_frame} per frame), exceeding the {}-byte session limit",
             MAX_SESSION_IN_FLIGHT_BYTES
         )));
     }
     let transient_bytes = per_frame
         .checked_sub(output_bytes)
-        .ok_or_else(|| Error::backend("Gray8 transient memory accounting underflow"))?;
+        .ok_or_else(|| Error::backend("Modular transient memory accounting underflow"))?;
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
         output_lease_bytes: output_bytes,
@@ -1184,8 +1256,10 @@ fn submit_decode(
     });
     upload_codestream(backend.queue(), &stream, codestream)?;
 
-    let lookup_bytes = u64::try_from(LOOKUP_SIZE * std::mem::size_of::<u32>())
-        .map_err(|_| Error::backend("prefix lookup size overflow"))?;
+    let lookup_bytes = u64::try_from(source.prefix_lookup.len())
+        .ok()
+        .and_then(|entries| entries.checked_mul(u64::try_from(std::mem::size_of::<u32>()).ok()?))
+        .ok_or_else(|| Error::backend("prefix lookup size overflow"))?;
     let lookup_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     let lookup_buffer = buffers.checkout(
         "jxl-wgpu decode prefix lookup",
@@ -1201,7 +1275,7 @@ fn submit_decode(
 
     let reconstructed_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     let reconstructed = buffers.checkout(
-        "jxl-wgpu decoded Gray8 samples",
+        "jxl-wgpu decoded Modular samples",
         source.dispatch_layout.reconstructed_bytes,
         reconstructed_usage,
         std::mem::align_of::<u32>() as u64,
@@ -1245,7 +1319,7 @@ fn submit_decode(
 
     let params_usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST;
     let params_buffer = buffers.checkout(
-        "jxl-wgpu decode Gray8 parameters",
+        "jxl-wgpu decode Modular parameters",
         source.dispatch_layout.params_bytes,
         params_usage,
         16,
@@ -1257,7 +1331,13 @@ fn submit_decode(
         )?
     ];
     for (index, &group) in source.profile.groups.iter().enumerate() {
-        let params = build_params(group, &source.output, index == 0)?;
+        let params = build_params(
+            group,
+            source.profile.channels,
+            source.profile.bits_per_sample,
+            &source.output,
+            index == 0,
+        )?;
         let offset = u64::try_from(index)
             .ok()
             .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
@@ -1290,7 +1370,8 @@ fn submit_decode(
             .get(group_index)
             .ok_or_else(|| Error::backend("missing group reconstruction offset"))?;
         let reconstructed_size = u64::from(group.sample_count()?)
-            .checked_mul(4)
+            .checked_mul(u64::from(source.profile.channels.count()))
+            .and_then(|samples| samples.checked_mul(4))
             .and_then(NonZeroU64::new)
             .ok_or_else(|| Error::backend("invalid group reconstruction binding size"))?;
         let status_offset = index
@@ -1347,13 +1428,13 @@ fn submit_decode(
             });
         }
         bindings.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu decode Gray8 group bindings"),
+            label: Some("jxl-wgpu decode Modular group bindings"),
             layout: &bind_group_layout,
             entries: &entries,
         }));
     }
     let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("jxl-wgpu decode Gray8 submission"),
+        label: Some("jxl-wgpu decode Modular submission"),
     });
     commands.clear_buffer(reconstructed.buffer(), 0, None);
     commands.clear_buffer(&output, 0, None);
@@ -1432,31 +1513,49 @@ fn submit_decode(
             .groups
             .iter()
             .copied()
-            .map(Gray8Group::sample_count)
+            .map(ModularGroup::sample_count)
+            .map(|samples| {
+                samples.and_then(|samples| {
+                    samples
+                        .checked_mul(source.profile.channels.count())
+                        .ok_or_else(|| Error::backend("group decoded sample count overflow"))
+                })
+            })
             .collect::<Result<Vec<_>>>()?
             .into(),
         status_stride: source.dispatch_layout.status_stride,
     })
 }
 
-fn build_prefix_lookup(profile: &StandardGray8Profile) -> Result<Vec<u32>> {
-    let mut lookup = vec![0u32; LOOKUP_SIZE];
-    for (symbol, entry) in profile
-        .raw_prefix
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(symbol, entry)| (symbol as u32, entry))
-        .chain(
-            profile
-                .lz77_prefix
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(symbol, entry)| (224 + symbol as u32, entry)),
-        )
-    {
-        insert_prefix(&mut lookup, symbol, entry)?;
+fn build_prefix_lookup(profile: &StandardModularProfile) -> Result<Vec<u32>> {
+    let channel_count = usize::try_from(profile.channels.count())
+        .map_err(|_| Error::backend("Modular channel count exceeds usize"))?;
+    let mut lookup = vec![0u32; LOOKUP_SIZE * channel_count];
+    for channel in 0..channel_count {
+        let table_start = channel
+            .checked_mul(LOOKUP_SIZE)
+            .ok_or_else(|| Error::backend("prefix lookup channel offset overflow"))?;
+        let table_end = table_start
+            .checked_add(LOOKUP_SIZE)
+            .ok_or_else(|| Error::backend("prefix lookup channel range overflow"))?;
+        let table = lookup
+            .get_mut(table_start..table_end)
+            .ok_or_else(|| Error::backend("prefix lookup channel range is truncated"))?;
+        for (symbol, entry) in profile.raw_prefix[channel]
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(symbol, entry)| (symbol as u32, entry))
+            .chain(
+                profile.lz77_prefix[channel]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(symbol, entry)| (224 + symbol as u32, entry)),
+            )
+        {
+            insert_prefix(table, symbol, entry)?;
+        }
     }
     Ok(lookup)
 }
@@ -1485,7 +1584,9 @@ fn insert_prefix(lookup: &mut [u32], symbol: u32, entry: PrefixCodeEntry) -> Res
 }
 
 fn build_params(
-    group: Gray8Group,
+    group: ModularGroup,
+    source_channels: crate::ModularChannels,
+    source_bits: u8,
     output: &OutputPlan,
     initialize_chroma: bool,
 ) -> Result<ShaderParams> {
@@ -1514,6 +1615,10 @@ fn build_params(
         origin_y: group.y,
         sample_count: group.sample_count()?,
         initialize_chroma: u32::from(initialize_chroma),
+        source_channels: source_channels.count(),
+        source_bits: u32::from(source_bits),
+        source_mask: (1u32 << source_bits) - 1,
+        _source_padding: 0,
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -1699,7 +1804,13 @@ mod tests {
         );
         let request = GpuOutputRequest::color(format).unwrap();
         assert!(matches!(
-            OutputPlan::new(Extent2d::new(2, 2), &request, PORTABLE_CAPABILITIES),
+            OutputPlan::new(
+                Extent2d::new(2, 2),
+                &request,
+                crate::ModularChannels::Gray,
+                8,
+                PORTABLE_CAPABILITIES,
+            ),
             Err(Error::UnsupportedOutputFormat(_))
         ));
     }
@@ -1708,7 +1819,13 @@ mod tests {
     fn output_negotiation_rejects_shader_address_overflow() {
         let request = GpuOutputRequest::color(Vpi::Rgba8.pixel_format()).unwrap();
         assert!(matches!(
-            OutputPlan::new(Extent2d::new(u32::MAX, 1), &request, PORTABLE_CAPABILITIES,),
+            OutputPlan::new(
+                Extent2d::new(u32::MAX, 1),
+                &request,
+                crate::ModularChannels::Gray,
+                8,
+                PORTABLE_CAPABILITIES,
+            ),
             Err(Error::Backend(_))
         ));
     }
@@ -1763,8 +1880,14 @@ mod tests {
                 Ok(PixelFormatClass::Color(_))
             ));
             let request = GpuOutputRequest::color(pixel_format).unwrap();
-            let output = OutputPlan::new(Extent2d::new(5, 3), &request, PORTABLE_CAPABILITIES)
-                .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
+            let output = OutputPlan::new(
+                Extent2d::new(5, 3),
+                &request,
+                crate::ModularChannels::Gray,
+                8,
+                PORTABLE_CAPABILITIES,
+            )
+            .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
             assert_eq!(output.kind, kind, "{} kind", format.name());
             assert_eq!(output.channels, channels, "{} channels", format.name());
             assert_eq!(output.order, order, "{} order", format.name());
@@ -1801,8 +1924,14 @@ mod tests {
                 NumericSampleMapping::NormalizedGray8
             };
             let request = GpuOutputRequest::numeric(format.pixel_format(), mapping).unwrap();
-            let output = OutputPlan::new(Extent2d::new(5, 3), &request, PORTABLE_CAPABILITIES)
-                .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
+            let output = OutputPlan::new(
+                Extent2d::new(5, 3),
+                &request,
+                crate::ModularChannels::Gray,
+                8,
+                PORTABLE_CAPABILITIES,
+            )
+            .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
             let numeric = classify_pixel_format(request.format())
                 .unwrap()
                 .numeric()
@@ -1939,7 +2068,7 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 112);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 128);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             token_start: 1,
@@ -1950,36 +2079,40 @@ mod tests {
             origin_y: 6,
             sample_count: 7,
             initialize_chroma: 8,
-            output_kind: 9,
-            transfer: 10,
-            limited_range: 11,
-            channels: 12,
-            order: 13,
-            bits: 14,
-            storage_bits: 15,
-            plane0_offset: 16,
-            plane0_stride: 17,
-            plane1_offset: 18,
-            plane1_stride: 19,
-            plane2_offset: 20,
-            plane2_stride: 21,
-            plane3_offset: 22,
-            plane3_stride: 23,
-            chroma_width: 24,
-            chroma_height: 25,
-            logical_size: 26,
-            numeric_mapping: 27,
-            _padding: 28,
+            source_channels: 9,
+            source_bits: 10,
+            source_mask: 11,
+            _source_padding: 12,
+            output_kind: 13,
+            transfer: 14,
+            limited_range: 15,
+            channels: 16,
+            order: 17,
+            bits: 18,
+            storage_bits: 19,
+            plane0_offset: 20,
+            plane0_stride: 21,
+            plane1_offset: 22,
+            plane1_stride: 23,
+            plane2_offset: 24,
+            plane2_stride: 25,
+            plane3_offset: 26,
+            plane3_stride: 27,
+            chroma_width: 28,
+            chroma_height: 29,
+            logical_size: 30,
+            numeric_mapping: 31,
+            _padding: 32,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 28]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 32]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ]
         );
         assert!(SHADER_TEMPLATE.contains(
-            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    origin_x: u32,\n    origin_y: u32,\n    sample_count: u32,\n    initialize_chroma: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n    _padding: u32,\n};"
+            "struct Params {\n    token_start: u32,\n    token_end: u32,\n    width: u32,\n    height: u32,\n    origin_x: u32,\n    origin_y: u32,\n    sample_count: u32,\n    initialize_chroma: u32,\n    source_channels: u32,\n    source_bits: u32,\n    source_mask: u32,\n    _source_padding: u32,\n    output_kind: u32,\n    transfer: u32,\n    limited_range: u32,\n    channels: u32,\n    order: u32,\n    bits: u32,\n    storage_bits: u32,\n    plane0_offset: u32,\n    plane0_stride: u32,\n    plane1_offset: u32,\n    plane1_stride: u32,\n    plane2_offset: u32,\n    plane2_stride: u32,\n    plane3_offset: u32,\n    plane3_stride: u32,\n    chroma_width: u32,\n    chroma_height: u32,\n    logical_size: u32,\n    numeric_mapping: u32,\n    _padding: u32,\n};"
         ));
 
         assert_eq!(std::mem::size_of::<DecodeStatus>(), 16);

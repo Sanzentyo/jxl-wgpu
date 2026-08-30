@@ -818,11 +818,11 @@ fn validate_stream_metadata(metadata: &AnimationMetadata) -> Result<()> {
 fn validate_profile(profile: DecodeProfile) -> Result<()> {
     match profile {
         DecodeProfile::ModularLossless {
-            bits_per_sample: 8 | 16,
+            bits_per_sample: 1..=16,
             ..
         } => Ok(()),
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
-            "fixed-predictor Modular profile must use 8 or 16 bits per sample",
+            "fixed-predictor Modular profile must use 1 through 16 bits per sample",
         )),
     }
 }
