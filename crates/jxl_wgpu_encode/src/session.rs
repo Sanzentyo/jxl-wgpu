@@ -72,7 +72,7 @@ pub enum BlendMode {
     Multiply,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceSlot(u8);
 
 impl ReferenceSlot {
@@ -93,12 +93,72 @@ impl ReferenceSlot {
     }
 }
 
+/// A non-empty frame rectangle positioned in the animation canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameCrop {
+    x: i32,
+    y: i32,
+    width: NonZeroU32,
+    height: NonZeroU32,
+}
+
+impl FrameCrop {
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Result<Self, EncodeError> {
+        let width = NonZeroU32::new(width).ok_or(EncodeError::InvalidConfiguration(
+            "animation frame crop width must be non-zero",
+        ))?;
+        let height = NonZeroU32::new(height).ok_or(EncodeError::InvalidConfiguration(
+            "animation frame crop height must be non-zero",
+        ))?;
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    #[must_use]
+    pub const fn x(self) -> i32 {
+        self.x
+    }
+
+    #[must_use]
+    pub const fn y(self) -> i32 {
+        self.y
+    }
+
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width.get()
+    }
+
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height.get()
+    }
+}
+
+/// One standard JPEG XL blending contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameBlend {
+    pub mode: BlendMode,
+    pub source_reference: ReferenceSlot,
+    pub clamp: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameOptions {
     pub timing: FrameTiming,
-    pub blend_mode: BlendMode,
-    pub source_reference: Option<ReferenceSlot>,
-    pub save_as_reference: Option<ReferenceSlot>,
+    pub crop: Option<FrameCrop>,
+    pub color_blend: FrameBlend,
+    /// One entry per image-header extra channel. An empty vector requests default Replace
+    /// contracts for every extra channel.
+    pub extra_channel_blends: Vec<FrameBlend>,
+    /// Standard two-bit destination slot. Slot zero means no persistent reference for a visible
+    /// frame, while a zero-duration frame is referenceable even when it selects slot zero.
+    pub save_as_reference: ReferenceSlot,
+    pub save_before_color_transform: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,16 +167,20 @@ pub struct SessionDescriptor {
     pub progressive: ProgressivePlan,
     pub minimum_determinism: Determinism,
     pub animation: AnimationHeader,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
 }
 
 impl SessionDescriptor {
     #[must_use]
-    pub fn still(profile: EncodeProfile) -> Self {
+    pub fn still(profile: EncodeProfile, width: u32, height: u32) -> Self {
         Self {
             profile,
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::Assembly,
             animation: AnimationHeader::Still,
+            canvas_width: width,
+            canvas_height: height,
         }
     }
 }
@@ -129,6 +193,8 @@ pub struct FrameEncodeRequest {
     pub progressive: ProgressivePlan,
     pub minimum_determinism: Determinism,
     pub animation: AnimationHeader,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
     pub options: FrameOptions,
 }
 
@@ -280,7 +346,7 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
         if self.closed {
             return Err(EncodeError::SessionClosed);
         }
-        validate_frame_options(self.descriptor.animation, options)?;
+        validate_frame_options(self.descriptor.animation, &options)?;
         let frame_index = FrameIndex(self.next_frame);
         let request = FrameEncodeRequest {
             frame_index,
@@ -289,6 +355,8 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
             progressive: self.descriptor.progressive.clone(),
             minimum_determinism: self.descriptor.minimum_determinism,
             animation: self.descriptor.animation,
+            canvas_width: self.descriptor.canvas_width,
+            canvas_height: self.descriptor.canvas_height,
             options,
         };
         let submission = self.encoder.submit_frame(source, request)?;
@@ -304,7 +372,7 @@ impl<B: GpuEncodeBackend> EncodeSession<B> {
 
 fn validate_frame_options(
     animation: AnimationHeader,
-    options: FrameOptions,
+    options: &FrameOptions,
 ) -> Result<(), EncodeError> {
     if !animation.is_animation()
         && (options.timing.duration_ticks != 0 || options.timing.timecode.is_some())
@@ -316,11 +384,6 @@ fn validate_frame_options(
     if options.timing.timecode.is_some() != animation.has_timecodes() {
         return Err(EncodeError::InvalidConfiguration(
             "frame timecode presence must match the animation header",
-        ));
-    }
-    if options.blend_mode != BlendMode::Replace && options.source_reference.is_none() {
-        return Err(EncodeError::InvalidConfiguration(
-            "non-replace blend modes require a source reference slot",
         ));
     }
     Ok(())

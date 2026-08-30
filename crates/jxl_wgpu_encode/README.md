@@ -76,3 +76,73 @@ span, so other depths, RGB(A), and multi-group containers intentionally omit tha
 remain ordinary interoperable JPEG XL containers. Conformance tests cover every depth `1..=16`,
 the 1/255/256/257 group boundaries, and extreme aspect ratios with exact logical-sample comparison
 using both the published Rust `jxl` decoder and reference `djxl`.
+
+## Animation sessions
+
+`LosslessModularEncoder::begin_animation` writes one standard stream-wide animation header and
+keeps a reusable GPU session open for multiple frames. The descriptor fixes the canvas, format,
+integer depth, tick rate, loop count, and timecode presence. Each frame supplies an exact duration,
+optional timecode, optional signed crop rectangle, color blend contract, one contract per extra
+channel, and the two-bit source/destination reference slots. RGBA animation continues to carry
+alpha as the standard unassociated extra channel; alpha-weighted `Blend` and `MultiplyAdd` name
+that extra channel instead of treating alpha as a fourth color component.
+
+Frame submissions own their GPU work and therefore do not borrow the session. Callers may keep
+multiple frames in flight, complete each with blocking `wait` or await the same runtime-neutral
+`Future`, and insert completed artifacts in any order. Final assembly restores normative frame
+order and rejects duplicates, gaps, or an invalid final-frame flag. All live frame jobs share the
+same byte-weighted `MemoryBudget` and buffer pool as still encoding.
+
+```rust,no_run
+# use std::num::NonZeroU32;
+# use jxl_wgpu_encode::{
+#     AnimationHeader, BufferImageSource, FrameBlend, FrameCrop, FrameOptions, FrameTiming,
+#     LosslessModularAnimationDescriptor, LosslessModularEncoder, LosslessModularFormat,
+#     ReferenceSlot, WgpuContext,
+# };
+# fn encode_animation(
+#     context: WgpuContext,
+#     full_frame: BufferImageSource,
+#     crop_pixels: BufferImageSource,
+# ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
+let encoder = LosslessModularEncoder::new(context);
+let timing = AnimationHeader::Animation {
+    ticks_per_second_numerator: NonZeroU32::new(100).unwrap(),
+    ticks_per_second_denominator: NonZeroU32::new(1).unwrap(),
+    num_loops: 0,
+    have_timecodes: false,
+};
+let mut animation = encoder.begin_animation(LosslessModularAnimationDescriptor::new(
+    1920,
+    1080,
+    LosslessModularFormat::Rgba,
+    10,
+    timing,
+)?)?;
+let reference = ReferenceSlot::new(1)?;
+let first = animation.submit_frame(
+    full_frame,
+    FrameOptions {
+        timing: FrameTiming { duration_ticks: 4, timecode: None },
+        save_as_reference: reference,
+        ..FrameOptions::default()
+    },
+)?;
+let crop = animation.submit_last_frame(
+    crop_pixels,
+    FrameOptions {
+        timing: FrameTiming { duration_ticks: 4, timecode: None },
+        crop: Some(FrameCrop::new(320, 180, 640, 360)?),
+        color_blend: FrameBlend { source_reference: reference, ..FrameBlend::default() },
+        ..FrameOptions::default()
+    },
+)?;
+animation.insert(first.wait()?)?;
+animation.insert(crop.wait()?)?;
+animation.finish_container()
+# }
+```
+
+The conformance suite exercises full-frame Replace, cropped Add, reference-slot persistence, RGBA
+alpha-weighted Blend, mixed blocking/Future completion, and out-of-order completion. Every
+displayed frame is compared exactly with both published Rust `jxl` and reference `djxl`.

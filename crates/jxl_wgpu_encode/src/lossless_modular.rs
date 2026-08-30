@@ -26,11 +26,12 @@ use wgpu::util::DeviceExt;
 use crate::buffer_pool::EncoderBufferPool;
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{
-    AnimationHeader, BitFragment, DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError,
-    EncodeProfile, EncoderBufferPoolStats, EncoderCapabilities, FrameEncodeRequest,
-    FrameGroupLayout, FrameIndex, FrameOptions, FramePacketSet, FrameSubmission,
-    GpuAccelerationArtifact, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts,
-    GpuFrameSource, GroupPacket, GroupPacketKind, KernelStage, ProfileCapability, ProgressivePlan,
+    AnimationHeader, BackendError, BitFragment, BlendMode, CodestreamAssembler,
+    DEFAULT_ENCODER_BUFFER_POOL_BYTES, Determinism, EncodeError, EncodeProfile, EncodeSession,
+    EncoderBufferPoolStats, EncoderCapabilities, FrameBlend, FrameEncodeRequest, FrameGroupLayout,
+    FrameIndex, FrameOptions, FramePacketSet, FrameSubmission, GpuAccelerationArtifact,
+    GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameArtifacts, GpuFrameSource, GroupPacket,
+    GroupPacketKind, KernelStage, ProfileCapability, ProgressivePlan, SessionDescriptor,
     UnsupportedFeature, WgpuContext, assemble_frame,
 };
 
@@ -475,7 +476,7 @@ impl LosslessModularBackend {
                     max_bits_per_sample: 16,
                 }],
                 max_progressive_passes: 1,
-                animation: false,
+                animation: true,
                 determinism: Determinism::CrossDevice,
                 implemented_stages: vec![
                     KernelStage::ColorTransform,
@@ -810,6 +811,142 @@ fn event_capacity(pixel_count: usize) -> Result<usize, EncodeError> {
         .ok_or(EncodeError::InvalidSource("event buffer size overflow"))
 }
 
+fn validate_modular_frame_request(
+    request: &FrameEncodeRequest,
+    plan: &ModularDispatchPlan,
+) -> Result<(), EncodeError> {
+    if request.canvas_width == 0 || request.canvas_height == 0 {
+        return Err(EncodeError::InvalidConfiguration(
+            "the JPEG XL animation canvas must be non-empty",
+        ));
+    }
+    match request.animation {
+        AnimationHeader::Still => {
+            if request.frame_index != FrameIndex::new(0)
+                || !request.is_last
+                || request.options != FrameOptions::default()
+                || request.canvas_width != plan.width
+                || request.canvas_height != plan.height
+            {
+                return Err(EncodeError::InvalidConfiguration(
+                    "a still lossless Modular request must be one full-canvas final frame",
+                ));
+            }
+        }
+        AnimationHeader::Animation { have_timecodes, .. } => {
+            write_animation_header(&mut BitWriter::new(), request.animation)?;
+            if request.options.timing.timecode.is_some() != have_timecodes {
+                return Err(EncodeError::InvalidConfiguration(
+                    "frame timecode presence must match the animation header",
+                ));
+            }
+            let (frame_width, frame_height) = request
+                .options
+                .crop
+                .map_or((request.canvas_width, request.canvas_height), |crop| {
+                    (crop.width(), crop.height())
+                });
+            if let Some(crop) = request.options.crop {
+                for value in [
+                    pack_signed(crop.x()),
+                    pack_signed(crop.y()),
+                    crop.width(),
+                    crop.height(),
+                ] {
+                    if value >= 18_688 + (1 << 30) {
+                        return Err(EncodeError::InvalidConfiguration(
+                            "animation frame crop coordinate exceeds the JPEG XL limit",
+                        ));
+                    }
+                }
+            }
+            if frame_width != plan.width || frame_height != plan.height {
+                return Err(EncodeError::InvalidConfiguration(
+                    "the GPU source extent must match the animation frame crop",
+                ));
+            }
+            let extra_channels = usize::from(plan.format.has_alpha());
+            if !request.options.extra_channel_blends.is_empty()
+                && request.options.extra_channel_blends.len() != extra_channels
+            {
+                return Err(EncodeError::InvalidConfiguration(
+                    "animation extra-channel blend count does not match the source format",
+                ));
+            }
+            if !plan.format.has_alpha()
+                && matches!(
+                    request.options.color_blend.mode,
+                    crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
+                )
+            {
+                return Err(EncodeError::InvalidConfiguration(
+                    "alpha-weighted animation blending requires an RGBA source",
+                ));
+            }
+            let color_uses_clamp = request.options.color_blend.mode == crate::BlendMode::Multiply
+                || (plan.format.has_alpha()
+                    && matches!(
+                        request.options.color_blend.mode,
+                        crate::BlendMode::Blend | crate::BlendMode::MultiplyAdd
+                    ));
+            if request.options.color_blend.clamp && !color_uses_clamp {
+                return Err(EncodeError::InvalidConfiguration(
+                    "the selected JPEG XL color blend mode has no clamp field",
+                ));
+            }
+            if request.options.extra_channel_blends.iter().any(|blend| {
+                blend.clamp
+                    && !matches!(
+                        blend.mode,
+                        crate::BlendMode::Blend
+                            | crate::BlendMode::MultiplyAdd
+                            | crate::BlendMode::Multiply
+                    )
+            }) {
+                return Err(EncodeError::InvalidConfiguration(
+                    "the selected JPEG XL extra-channel blend mode has no clamp field",
+                ));
+            }
+            if request.is_last && request.options.save_as_reference != Default::default() {
+                return Err(EncodeError::InvalidConfiguration(
+                    "the final JPEG XL frame cannot be saved as a reference",
+                ));
+            }
+            let full_frame = frame_covers_canvas(
+                request.options.crop,
+                request.canvas_width,
+                request.canvas_height,
+            );
+            let resets_canvas =
+                request.options.color_blend.mode == crate::BlendMode::Replace && full_frame;
+            let can_be_referenced = !request.is_last
+                && (request.options.timing.duration_ticks == 0
+                    || request.options.save_as_reference.get() != 0);
+            let writes_save_before = resets_canvas && can_be_referenced;
+            if request.options.save_before_color_transform && !writes_save_before {
+                return Err(EncodeError::InvalidConfiguration(
+                    "save-before-color-transform is not present for this frame contract",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn frame_covers_canvas(
+    crop: Option<crate::FrameCrop>,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> bool {
+    let Some(crop) = crop else {
+        return true;
+    };
+    i64::from(crop.x()) <= 0
+        && i64::from(crop.y()) <= 0
+        && i64::from(crop.x()) + i64::from(crop.width()) >= i64::from(canvas_width)
+        && i64::from(crop.y()) + i64::from(crop.height()) >= i64::from(canvas_height)
+}
+
 impl GpuEncodeBackend for LosslessModularBackend {
     type Job = LosslessModularJob;
 
@@ -830,21 +967,11 @@ impl GpuEncodeBackend for LosslessModularBackend {
         source: GpuFrameSource,
         request: &FrameEncodeRequest,
     ) -> Result<Self::Job, EncodeError> {
-        if request.animation != AnimationHeader::Still
-            || request.frame_index != FrameIndex::new(0)
-            || !request.is_last
-        {
-            return Err(UnsupportedFeature::Animation.into());
-        }
-        if request.options != FrameOptions::default() {
-            return Err(EncodeError::InvalidConfiguration(
-                "the lossless Modular profile only supports default still-frame options",
-            ));
-        }
         let GpuFrameSource::Buffer(source) = source else {
             return Err(UnsupportedFeature::InputFormat.into());
         };
         let plan = self.dispatch_plan(&source)?;
+        validate_modular_frame_request(request, &plan)?;
         if request.profile
             != (EncodeProfile::ModularLossless {
                 bits_per_sample: plan.bits_per_sample,
@@ -934,9 +1061,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 if result.is_ok() {
                     callback_lifetime.mapped.store(true, Ordering::Release);
                 }
-                callback_completion.complete(
-                    result.map_err(|error| format!("GPU artifact mapping failed: {error}")),
-                );
+                callback_completion.complete(result.map_err(BackendError::ArtifactMapping));
                 drop(callback_lifetime);
             },
         );
@@ -944,9 +1069,9 @@ impl GpuEncodeBackend for LosslessModularBackend {
         let submission_index = context.queue().submit([commands.finish()]);
         let poll_completion = Arc::clone(&completion);
         if let Err(error) = poll_permit.register(submission_index, move |error| {
-            poll_completion.complete(Err(error));
+            poll_completion.complete(Err(BackendError::PollWorker(error)));
         }) {
-            completion.complete(Err(format!("GPU poll registration failed: {error}")));
+            completion.complete(Err(BackendError::PollRegistration(error)));
         }
 
         Ok(LosslessModularJob {
@@ -961,6 +1086,13 @@ impl GpuEncodeBackend for LosslessModularBackend {
             height: plan.height,
             frame_index: request.frame_index,
             is_last: request.is_last,
+            header: ModularFrameHeader {
+                animation: request.animation,
+                canvas_width: request.canvas_width,
+                canvas_height: request.canvas_height,
+                options: request.options.clone(),
+                is_last: request.is_last,
+            },
         })
     }
 }
@@ -973,12 +1105,12 @@ struct MapCompletion {
 
 #[derive(Default)]
 struct MapState {
-    result: Option<Result<(), String>>,
+    result: Option<Result<(), BackendError>>,
     waker: Option<Waker>,
 }
 
 impl MapCompletion {
-    fn complete(&self, result: Result<(), String>) {
+    fn complete(&self, result: Result<(), BackendError>) {
         let waker = {
             let mut state = self
                 .state
@@ -996,7 +1128,7 @@ impl MapCompletion {
         }
     }
 
-    fn poll(&self, cx: &Context<'_>) -> Option<Result<(), String>> {
+    fn poll(&self, cx: &Context<'_>) -> Option<Result<(), BackendError>> {
         let mut state = self
             .state
             .lock()
@@ -1008,7 +1140,7 @@ impl MapCompletion {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait(&self) -> Result<(), String> {
+    fn wait(&self) -> Result<(), BackendError> {
         let mut state = self
             .state
             .lock()
@@ -1039,6 +1171,16 @@ pub struct LosslessModularJob {
     height: u32,
     frame_index: FrameIndex,
     is_last: bool,
+    header: ModularFrameHeader,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModularFrameHeader {
+    animation: AnimationHeader,
+    canvas_width: u32,
+    canvas_height: u32,
+    options: FrameOptions,
+    is_last: bool,
 }
 
 struct EncodeJobLifetime {
@@ -1056,33 +1198,35 @@ impl Drop for EncodeJobLifetime {
 }
 
 impl LosslessModularJob {
-    fn finish(&mut self, mapping: Result<(), String>) -> Result<GpuFrameArtifacts, EncodeError> {
+    fn finish(
+        &mut self,
+        mapping: Result<(), BackendError>,
+    ) -> Result<GpuFrameArtifacts, EncodeError> {
         let lifetime = self
             .lifetime
             .take()
             .ok_or_else(|| EncodeError::Backend("GPU job was already consumed".into()))?;
-        mapping.map_err(EncodeError::Backend)?;
+        mapping?;
         let readback = &lifetime.buffer_lease.buffers().readback;
         let mapped = readback
             .slice(0..self.output_size)
             .get_mapped_range()
-            .map_err(|error| {
-                EncodeError::Backend(format!("invalid mapped artifact range: {error}"))
-            })?;
+            .map_err(BackendError::ArtifactRange)?;
         let expected = usize::try_from(self.output_size)
             .map_err(|_| EncodeError::Backend("mapped artifact size overflow".into()))?;
         let bytes = mapped
             .get(..expected)
             .ok_or_else(|| EncodeError::Backend("mapped artifact buffer was truncated".into()))?;
-        let result = build_packets(
-            self.width,
-            self.height,
-            self.group_grid,
-            self.format,
-            self.bits_per_sample,
-            &self.groups,
+        let result = build_packets(PacketBuildInput {
+            width: self.width,
+            height: self.height,
+            group_grid: self.group_grid,
+            format: self.format,
+            bits_per_sample: self.bits_per_sample,
+            frame: &self.header,
+            group_plans: &self.groups,
             bytes,
-        );
+        });
         drop(mapped);
         readback.unmap();
         lifetime.mapped.store(false, Ordering::Release);
@@ -1219,6 +1363,39 @@ impl LosslessModularEncoder {
         self.submit_container(source)?.wait()
     }
 
+    /// Starts a reusable multi-frame animation session.
+    ///
+    /// Every returned frame submission supports both [`Future`] and blocking
+    /// [`FrameSubmission::wait`]. Submissions do not borrow this session, so multiple GPU frames
+    /// can remain in flight and their completed artifacts may be inserted in any order.
+    pub fn begin_animation(
+        &self,
+        descriptor: LosslessModularAnimationDescriptor,
+    ) -> Result<LosslessModularAnimationSession, EncodeError> {
+        let codestream_header = image_header(
+            descriptor.canvas_width,
+            descriptor.canvas_height,
+            descriptor.format,
+            descriptor.bits_per_sample,
+            descriptor.animation,
+        )?;
+        let session = self.encoder.begin_session(SessionDescriptor {
+            profile: EncodeProfile::ModularLossless {
+                bits_per_sample: descriptor.bits_per_sample,
+            },
+            progressive: ProgressivePlan::single(),
+            minimum_determinism: Determinism::CrossDevice,
+            animation: descriptor.animation,
+            canvas_width: descriptor.canvas_width,
+            canvas_height: descriptor.canvas_height,
+        })?;
+        Ok(LosslessModularAnimationSession {
+            session,
+            assembler: CodestreamAssembler::new(codestream_header)?,
+            descriptor,
+        })
+    }
+
     fn submit_inner(
         &self,
         source: crate::BufferImageSource,
@@ -1241,6 +1418,8 @@ impl LosslessModularEncoder {
             progressive: ProgressivePlan::single(),
             minimum_determinism: Determinism::CrossDevice,
             animation: AnimationHeader::Still,
+            canvas_width: width,
+            canvas_height: height,
             options: FrameOptions::default(),
         };
         let frame = self
@@ -1248,12 +1427,151 @@ impl LosslessModularEncoder {
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
         Ok(LosslessModularSubmission {
             frame: Some(frame),
-            codestream_header: image_header(width, height, format, source_spec.bits_per_sample)?,
+            codestream_header: image_header(
+                width,
+                height,
+                format,
+                source_spec.bits_per_sample,
+                AnimationHeader::Still,
+            )?,
             container,
             group_grid,
             format,
             bits_per_sample: source_spec.bits_per_sample,
         })
+    }
+}
+
+/// Stream-wide contract for one lossless Modular animation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LosslessModularAnimationDescriptor {
+    canvas_width: u32,
+    canvas_height: u32,
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    animation: AnimationHeader,
+}
+
+impl LosslessModularAnimationDescriptor {
+    pub fn new(
+        canvas_width: u32,
+        canvas_height: u32,
+        format: LosslessModularFormat,
+        bits_per_sample: u8,
+        animation: AnimationHeader,
+    ) -> Result<Self, EncodeError> {
+        if !animation.is_animation() {
+            return Err(EncodeError::InvalidConfiguration(
+                "a Modular animation descriptor requires an animation timebase",
+            ));
+        }
+        format.pixel_format(bits_per_sample)?;
+        image_header(
+            canvas_width,
+            canvas_height,
+            format,
+            bits_per_sample,
+            animation,
+        )?;
+        Ok(Self {
+            canvas_width,
+            canvas_height,
+            format,
+            bits_per_sample,
+            animation,
+        })
+    }
+
+    #[must_use]
+    pub const fn canvas_width(self) -> u32 {
+        self.canvas_width
+    }
+
+    #[must_use]
+    pub const fn canvas_height(self) -> u32 {
+        self.canvas_height
+    }
+
+    #[must_use]
+    pub const fn format(self) -> LosslessModularFormat {
+        self.format
+    }
+
+    #[must_use]
+    pub const fn bits_per_sample(self) -> u8 {
+        self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn animation(self) -> AnimationHeader {
+        self.animation
+    }
+}
+
+/// Multi-frame assembly state for a standard lossless Modular animation.
+pub struct LosslessModularAnimationSession {
+    session: EncodeSession<LosslessModularBackend>,
+    assembler: CodestreamAssembler,
+    descriptor: LosslessModularAnimationDescriptor,
+}
+
+impl LosslessModularAnimationSession {
+    #[must_use]
+    pub const fn descriptor(&self) -> LosslessModularAnimationDescriptor {
+        self.descriptor
+    }
+
+    #[must_use]
+    pub const fn next_frame_index(&self) -> FrameIndex {
+        self.session.next_frame_index()
+    }
+
+    pub fn submit_frame(
+        &mut self,
+        source: crate::BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<FrameSubmission<LosslessModularJob>, EncodeError> {
+        self.validate_source(&source)?;
+        self.session
+            .submit_frame(GpuFrameSource::Buffer(source), options)
+    }
+
+    pub fn submit_last_frame(
+        &mut self,
+        source: crate::BufferImageSource,
+        options: FrameOptions,
+    ) -> Result<FrameSubmission<LosslessModularJob>, EncodeError> {
+        self.validate_source(&source)?;
+        self.session
+            .submit_last_frame(GpuFrameSource::Buffer(source), options)
+    }
+
+    /// Inserts one completed GPU frame. Completion order need not match frame order.
+    pub fn insert(&mut self, frame: GpuFrameArtifacts) -> Result<(), EncodeError> {
+        self.assembler.insert(frame)?;
+        Ok(())
+    }
+
+    pub fn finish_raw(self) -> Result<Vec<u8>, EncodeError> {
+        self.session.ensure_closed()?;
+        Ok(self.assembler.finish_raw()?)
+    }
+
+    pub fn finish_container(self) -> Result<Vec<u8>, EncodeError> {
+        self.session.ensure_closed()?;
+        self.assembler.finish_container()
+    }
+
+    fn validate_source(&self, source: &crate::BufferImageSource) -> Result<(), EncodeError> {
+        let spec = lossless_modular_source_spec(&source.layout.format)?;
+        if spec.format != self.descriptor.format
+            || spec.bits_per_sample != self.descriptor.bits_per_sample
+        {
+            return Err(EncodeError::InvalidConfiguration(
+                "every animation frame must match the stream format and integer depth",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1393,15 +1711,30 @@ impl Future for LosslessModularSubmission {
     }
 }
 
-fn build_packets(
+struct PacketBuildInput<'a> {
     width: u32,
     height: u32,
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
-    group_plans: &[ModularGroupPlan],
-    bytes: &[u8],
+    frame: &'a ModularFrameHeader,
+    group_plans: &'a [ModularGroupPlan],
+    bytes: &'a [u8],
+}
+
+fn build_packets(
+    input: PacketBuildInput<'_>,
 ) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
+    let PacketBuildInput {
+        width,
+        height,
+        group_grid,
+        format,
+        bits_per_sample,
+        frame,
+        group_plans,
+        bytes,
+    } = input;
     let channels = usize::try_from(format.channel_count())
         .map_err(|_| EncodeError::Backend("Modular channel count overflow".into()))?;
     let expected_artifacts = usize::try_from(group_grid.groups)
@@ -1491,7 +1824,7 @@ fn build_packets(
             .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
         group.align_to_byte()?;
         let packets = FramePacketSet::new(
-            frame_header(format)?,
+            frame_header(format, frame)?,
             FrameGroupLayout::new(1, 1, 1)?,
             [GroupPacket::new(
                 GroupPacketKind::Single,
@@ -1552,7 +1885,7 @@ fn build_packets(
         ));
     }
     Ok((
-        FramePacketSet::new(frame_header(format)?, layout, packets)?,
+        FramePacketSet::new(frame_header(format, frame)?, layout, packets)?,
         None,
     ))
 }
@@ -1710,7 +2043,7 @@ fn canonical_extra_bits(nbits: u32, bits: u32) -> bool {
 }
 
 fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
-    EncodeError::Backend(format!("invalid GPU artifact: {reason}"))
+    BackendError::InvalidArtifact(reason).into()
 }
 
 fn write_dc_global(
@@ -1791,6 +2124,7 @@ fn image_header(
     height: u32,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    animation: AnimationHeader,
 ) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0x0aff, 16)?;
@@ -1798,7 +2132,14 @@ fn image_header(
     write_size(&mut output, height, true)?;
     write_size(&mut output, width, false)?;
     output.write_bits(0, 1)?;
-    output.write_bits(0, 1)?;
+    output.write_bits(u64::from(animation.is_animation()), 1)?;
+    if animation.is_animation() {
+        output.write_bits(0, 3)?; // identity orientation minus one
+        output.write_bits(0, 1)?; // no intrinsic size
+        output.write_bits(0, 1)?; // no preview
+        output.write_bits(1, 1)?; // animation metadata follows
+        write_animation_header(&mut output, animation)?;
+    }
     write_integer_bit_depth(&mut output, bits_per_sample)?;
     output.write_bits(u64::from(bits_per_sample <= 14), 1)?;
     if format.has_alpha() {
@@ -1829,10 +2170,83 @@ fn image_header(
         output.write_bits(11, 4)?;
         output.write_bits(1, 2)?;
     }
+    if animation.is_animation() {
+        output.write_bits(1, 1)?; // all-default SDR tone mapping
+    }
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;
     output.align_to_byte()?;
     Ok(BitFragment::byte_aligned(output.into_bytes())?)
+}
+
+fn write_animation_header(
+    output: &mut BitWriter,
+    animation: AnimationHeader,
+) -> Result<(), EncodeError> {
+    let AnimationHeader::Animation {
+        ticks_per_second_numerator,
+        ticks_per_second_denominator,
+        num_loops,
+        have_timecodes,
+    } = animation
+    else {
+        return Err(EncodeError::InvalidConfiguration(
+            "animation metadata requires an animation header",
+        ));
+    };
+    let numerator = ticks_per_second_numerator.get();
+    match numerator {
+        100 => output.write_bits(0, 2)?,
+        1000 => output.write_bits(1, 2)?,
+        1..=1024 => {
+            output.write_bits(2, 2)?;
+            output.write_bits(u64::from(numerator - 1), 10)?;
+        }
+        1025..=1_073_741_824 => {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(numerator - 1), 30)?;
+        }
+        _ => {
+            return Err(EncodeError::InvalidConfiguration(
+                "animation ticks-per-second numerator exceeds the JPEG XL limit",
+            ));
+        }
+    }
+    let denominator = ticks_per_second_denominator.get();
+    match denominator {
+        1 => output.write_bits(0, 2)?,
+        1001 => output.write_bits(1, 2)?,
+        2..=256 => {
+            output.write_bits(2, 2)?;
+            output.write_bits(u64::from(denominator - 1), 8)?;
+        }
+        257..=1024 => {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(denominator - 1), 10)?;
+        }
+        _ => {
+            return Err(EncodeError::InvalidConfiguration(
+                "animation ticks-per-second denominator exceeds the JPEG XL limit",
+            ));
+        }
+    }
+    match num_loops {
+        0 => output.write_bits(0, 2)?,
+        1..=7 => {
+            output.write_bits(1, 2)?;
+            output.write_bits(u64::from(num_loops), 3)?;
+        }
+        8..=65_535 => {
+            output.write_bits(2, 2)?;
+            output.write_bits(u64::from(num_loops), 16)?;
+        }
+        _ => {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(num_loops), 32)?;
+        }
+    }
+    output.write_bits(u64::from(have_timecodes), 1)?;
+    Ok(())
 }
 
 fn write_integer_bit_depth(output: &mut BitWriter, bits_per_sample: u8) -> Result<(), EncodeError> {
@@ -1878,37 +2292,175 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
     Ok(())
 }
 
-fn frame_header(format: LosslessModularFormat) -> Result<BitFragment, EncodeError> {
+fn frame_header(
+    format: LosslessModularFormat,
+    frame: &ModularFrameHeader,
+) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 2)?;
+    output.write_bits(0, 1)?; // non-default frame header
+    output.write_bits(0, 2)?; // regular frame
+    output.write_bits(1, 1)?; // Modular encoding
+    output.write_bits(0, 2)?; // zero frame flags
+    output.write_bits(0, 1)?; // no YCbCr transform
+    output.write_bits(0, 2)?; // color upsampling factor one
     if format.has_alpha() {
-        output.write_bits(0, 2)?;
+        output.write_bits(0, 2)?; // alpha upsampling factor one
     }
-    output.write_bits(1, 2)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 2)?;
+    output.write_bits(1, 2)?; // 256x256 Modular groups
+    output.write_bits(0, 2)?; // one pass
+
+    let have_crop = frame.options.crop.is_some();
+    output.write_bits(u64::from(have_crop), 1)?;
+    if let Some(crop) = frame.options.crop {
+        write_frame_dimension(&mut output, pack_signed(crop.x()))?;
+        write_frame_dimension(&mut output, pack_signed(crop.y()))?;
+        write_frame_dimension(&mut output, crop.width())?;
+        write_frame_dimension(&mut output, crop.height())?;
+    }
+
+    let full_frame =
+        frame_covers_canvas(frame.options.crop, frame.canvas_width, frame.canvas_height);
+    write_blending_info(
+        &mut output,
+        frame.options.color_blend,
+        format.has_alpha(),
+        frame.options.color_blend.mode == BlendMode::Replace && full_frame,
+    )?;
     if format.has_alpha() {
-        output.write_bits(0, 2)?;
+        let alpha_blend = frame
+            .options
+            .extra_channel_blends
+            .first()
+            .copied()
+            .unwrap_or_default();
+        write_blending_info(
+            &mut output,
+            alpha_blend,
+            true,
+            frame.options.color_blend.mode == BlendMode::Replace && full_frame,
+        )?;
     }
-    output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0, 2)?;
-    output.write_bits(0, 2)?;
+
+    if let AnimationHeader::Animation { have_timecodes, .. } = frame.animation {
+        write_frame_duration(&mut output, frame.options.timing.duration_ticks)?;
+        if have_timecodes {
+            output.write_bits(
+                u64::from(frame.options.timing.timecode.ok_or(
+                    EncodeError::InvalidConfiguration(
+                        "animated frame is missing its declared timecode",
+                    ),
+                )?),
+                32,
+            )?;
+        }
+    }
+    output.write_bits(u64::from(frame.is_last), 1)?;
+    if !frame.is_last {
+        output.write_bits(u64::from(frame.options.save_as_reference.get()), 2)?;
+        let can_be_referenced =
+            frame.options.timing.duration_ticks == 0 || frame.options.save_as_reference.get() != 0;
+        if frame.options.color_blend.mode == BlendMode::Replace && full_frame && can_be_referenced {
+            output.write_bits(u64::from(frame.options.save_before_color_transform), 1)?;
+        }
+    }
+
+    output.write_bits(0, 2)?; // empty frame name
+    output.write_bits(0, 1)?; // non-default restoration filter
+    output.write_bits(0, 1)?; // no Gaborish
+    output.write_bits(0, 2)?; // no EPF iterations
+    output.write_bits(0, 2)?; // no restoration-filter extensions
+    output.write_bits(0, 2)?; // no frame extensions
     let bit_len = output.bit_len();
     BitFragment::new(output.into_bytes(), bit_len).map_err(Into::into)
 }
 
+fn write_blending_info(
+    output: &mut BitWriter,
+    blend: FrameBlend,
+    has_alpha: bool,
+    resets_canvas: bool,
+) -> Result<(), EncodeError> {
+    write_blend_mode(output, blend.mode)?;
+    let uses_alpha = matches!(blend.mode, BlendMode::Blend | BlendMode::MultiplyAdd);
+    if has_alpha && uses_alpha {
+        output.write_bits(0, 2)?; // alpha extra-channel index zero
+    }
+    if (has_alpha && uses_alpha) || blend.mode == BlendMode::Multiply {
+        output.write_bits(u64::from(blend.clamp), 1)?;
+    } else if blend.clamp {
+        return Err(EncodeError::InvalidConfiguration(
+            "the selected JPEG XL blend mode has no clamp field",
+        ));
+    }
+    if !resets_canvas {
+        output.write_bits(u64::from(blend.source_reference.get()), 2)?;
+    }
+    Ok(())
+}
+
+fn write_blend_mode(output: &mut BitWriter, mode: BlendMode) -> Result<(), EncodeError> {
+    match mode {
+        BlendMode::Replace => output.write_bits(0, 2)?,
+        BlendMode::Add => output.write_bits(1, 2)?,
+        BlendMode::Blend => output.write_bits(2, 2)?,
+        BlendMode::MultiplyAdd => {
+            output.write_bits(3, 2)?;
+            output.write_bits(0, 2)?;
+        }
+        BlendMode::Multiply => {
+            output.write_bits(3, 2)?;
+            output.write_bits(1, 2)?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_signed(value: i32) -> u32 {
+    if value >= 0 {
+        (value as u32) << 1
+    } else {
+        (u32::try_from(-i64::from(value)).expect("an i32 magnitude fits u32") << 1).wrapping_sub(1)
+    }
+}
+
+fn write_frame_dimension(output: &mut BitWriter, value: u32) -> Result<(), EncodeError> {
+    let (selector, offset, bits) = if value < 256 {
+        (0, 0, 8)
+    } else if value < 2_304 {
+        (1, 256, 11)
+    } else if value < 18_688 {
+        (2, 2_304, 14)
+    } else if value < 18_688 + (1 << 30) {
+        (3, 18_688, 30)
+    } else {
+        return Err(EncodeError::InvalidConfiguration(
+            "animation frame crop coordinate exceeds the JPEG XL limit",
+        ));
+    };
+    output.write_bits(selector, 2)?;
+    output.write_bits(u64::from(value - offset), bits)?;
+    Ok(())
+}
+
+fn write_frame_duration(output: &mut BitWriter, duration: u32) -> Result<(), EncodeError> {
+    match duration {
+        0 => output.write_bits(0, 2)?,
+        1 => output.write_bits(1, 2)?,
+        2..=255 => {
+            output.write_bits(2, 2)?;
+            output.write_bits(u64::from(duration), 8)?;
+        }
+        _ => {
+            output.write_bits(3, 2)?;
+            output.write_bits(u64::from(duration), 32)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::*;
@@ -2072,6 +2624,112 @@ mod tests {
             lossless_modular_source_spec(&PixelFormat::rgb8(RgbChannelOrder::Rgb, false, defined,))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn animation_metadata_and_frame_contracts_are_standard_inventory() {
+        let animation = AnimationHeader::Animation {
+            ticks_per_second_numerator: NonZeroU32::new(24_000).unwrap(),
+            ticks_per_second_denominator: NonZeroU32::new(1_001).unwrap(),
+            num_loops: 7,
+            have_timecodes: true,
+        };
+        let header = image_header(4, 3, LosslessModularFormat::Rgba, 12, animation).unwrap();
+        let mut assembler = CodestreamAssembler::new(header).unwrap();
+        let slot_one = crate::ReferenceSlot::new(1).unwrap();
+        let first = ModularFrameHeader {
+            animation,
+            canvas_width: 4,
+            canvas_height: 3,
+            options: FrameOptions {
+                timing: crate::FrameTiming {
+                    duration_ticks: 2,
+                    timecode: Some(0x1122_3344),
+                },
+                save_as_reference: slot_one,
+                ..FrameOptions::default()
+            },
+            is_last: false,
+        };
+        let second = ModularFrameHeader {
+            animation,
+            canvas_width: 4,
+            canvas_height: 3,
+            options: FrameOptions {
+                timing: crate::FrameTiming {
+                    duration_ticks: 257,
+                    timecode: Some(0xaabb_ccdd),
+                },
+                crop: Some(crate::FrameCrop::new(-1, 1, 3, 2).unwrap()),
+                color_blend: FrameBlend {
+                    mode: BlendMode::Add,
+                    source_reference: slot_one,
+                    clamp: false,
+                },
+                extra_channel_blends: vec![FrameBlend {
+                    mode: BlendMode::Multiply,
+                    source_reference: slot_one,
+                    clamp: true,
+                }],
+                ..FrameOptions::default()
+            },
+            is_last: true,
+        };
+        for (index, frame) in [(0, first), (1, second)] {
+            let packets = FramePacketSet::new(
+                frame_header(LosslessModularFormat::Rgba, &frame).unwrap(),
+                FrameGroupLayout::new(1, 1, 1).unwrap(),
+                [GroupPacket::new(GroupPacketKind::Single, Vec::new())],
+            )
+            .unwrap();
+            assembler
+                .insert(GpuFrameArtifacts {
+                    frame_index: FrameIndex::new(index),
+                    is_last: frame.is_last,
+                    packets,
+                    acceleration: None,
+                })
+                .unwrap();
+        }
+        let encoded = assembler.finish_raw().unwrap();
+        let parsed =
+            jxl_gpu_bitstream::parse(&encoded, jxl_gpu_bitstream::ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+            .unwrap();
+        assert_eq!(
+            inventory.image_header.animation,
+            Some(jxl_gpu_bitstream::AnimationInventory {
+                ticks_per_second_numerator: 24_000,
+                ticks_per_second_denominator: 1_001,
+                num_loops: 7,
+                have_timecodes: true,
+            })
+        );
+        assert_eq!(inventory.frames.len(), 2);
+        assert_eq!(inventory.frames[0].duration_ticks, 2);
+        assert_eq!(inventory.frames[0].timecode, Some(0x1122_3344));
+        assert_eq!(inventory.frames[0].save_as_reference, 1);
+        assert!(!inventory.frames[0].is_last);
+        assert_eq!((inventory.frames[1].x0, inventory.frames[1].y0), (-1, 1));
+        assert_eq!(
+            (inventory.frames[1].width, inventory.frames[1].height),
+            (3, 2)
+        );
+        assert_eq!(inventory.frames[1].duration_ticks, 257);
+        assert_eq!(inventory.frames[1].timecode, Some(0xaabb_ccdd));
+        assert_eq!(
+            inventory.frames[1].color_blend.mode,
+            jxl_gpu_bitstream::FrameBlendMode::Add
+        );
+        assert_eq!(inventory.frames[1].color_blend.source, 1);
+        assert_eq!(
+            inventory.frames[1].extra_channel_blends[0].mode,
+            jxl_gpu_bitstream::FrameBlendMode::Multiply
+        );
+        assert!(inventory.frames[1].extra_channel_blends[0].clamp);
+        assert_eq!(inventory.frames[1].extra_channel_blends[0].source, 1);
+        assert!(inventory.frames[1].is_last);
     }
 
     #[test]
@@ -2294,16 +2952,46 @@ mod tests {
         width: u32,
         height: u32,
     ) -> crate::BufferImageSource {
+        packed_gray8_source(context, width, height, packed_test_pixels(width, height))
+    }
+
+    fn packed_gray8_source(
+        context: &WgpuContext,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) -> crate::BufferImageSource {
+        assert_eq!(pixels.len(), (width * height) as usize);
         let extent = Extent2d::new(width, height);
         let layout = ImageLayout::packed(
             extent,
             PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         )
         .unwrap();
-        let pixels = packed_test_pixels(width, height);
         let buffer = Arc::new(context.device().create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("jxl-wgpu encoder pool test source"),
+                contents: &pixels,
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        ));
+        crate::BufferImageSource::new(buffer, layout).unwrap()
+    }
+
+    fn packed_rgba8_source(
+        context: &WgpuContext,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) -> crate::BufferImageSource {
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        let extent = Extent2d::new(width, height);
+        let layout =
+            ImageLayout::packed(extent, LosslessModularFormat::Rgba.pixel_format(8).unwrap())
+                .unwrap();
+        let buffer = Arc::new(context.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu RGBA animation source"),
                 contents: &pixels,
                 usage: wgpu::BufferUsages::STORAGE,
             },
@@ -2740,6 +3428,90 @@ mod tests {
         Ok((size, pixels))
     }
 
+    type DecodedAnimation8 = (jxl::api::JxlAnimation, Vec<(Option<f64>, Vec<u8>)>);
+
+    fn decode_animation8(
+        encoded: &[u8],
+        format: LosslessModularFormat,
+    ) -> Result<DecodedAnimation8, String> {
+        let mut input = encoded;
+        let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+        let mut decoder = loop {
+            match decoder
+                .process(&mut input, None)
+                .map_err(|error| error.to_string())?
+            {
+                ProcessingResult::Complete { result } => break result,
+                ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                    if input.is_empty() {
+                        return Err("decoder needed more input before animation info".into());
+                    }
+                    decoder = fallback;
+                }
+            }
+        };
+        let size = decoder.basic_info().size;
+        let animation =
+            decoder.basic_info().animation.clone().ok_or_else(|| {
+                "Rust jxl decoded a still image instead of an animation".to_string()
+            })?;
+        let pixel_format = match format {
+            LosslessModularFormat::Gray => JxlPixelFormat {
+                color_type: JxlColorType::Grayscale,
+                color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+                extra_channel_format: Vec::new(),
+            },
+            LosslessModularFormat::Rgb => JxlPixelFormat::rgb8(0),
+            LosslessModularFormat::Rgba => JxlPixelFormat::rgba8(1),
+        };
+        decoder.set_pixel_format(pixel_format);
+        let channels = usize::try_from(format.channel_count())
+            .map_err(|_| "animation channel count overflow".to_string())?;
+        let mut decoded = Vec::new();
+        loop {
+            let mut frame = loop {
+                match decoder
+                    .process(&mut input, None)
+                    .map_err(|error| error.to_string())?
+                {
+                    ProcessingResult::Complete { result } => break result,
+                    ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                        if input.is_empty() {
+                            return Err("decoder needed more input before animation frame".into());
+                        }
+                        decoder = fallback;
+                    }
+                }
+            };
+            let duration = frame.frame_header().duration;
+            let mut pixels = vec![0u8; size.0 * size.1 * channels];
+            {
+                let mut buffers = [JxlOutputBuffer::new(&mut pixels, size.1, size.0 * channels)];
+                decoder = loop {
+                    match frame
+                        .process(&mut input, &mut buffers, None)
+                        .map_err(|error| error.to_string())?
+                    {
+                        ProcessingResult::Complete { result } => break result,
+                        ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                            if input.is_empty() {
+                                return Err(
+                                    "decoder needed more input while rendering animation".into()
+                                );
+                            }
+                            frame = fallback;
+                        }
+                    }
+                };
+            }
+            decoded.push((duration, pixels));
+            if !decoder.has_more_frames() {
+                break;
+            }
+        }
+        Ok((animation, decoded))
+    }
+
     fn decode_color8(
         encoded: &[u8],
         format: LosslessModularFormat,
@@ -3055,6 +3827,71 @@ mod tests {
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
         let _ = std::fs::remove_dir(directory);
+        Some(result)
+    }
+
+    fn decode_animation_with_djxl_if_available(
+        encoded: &[u8],
+        format: LosslessModularFormat,
+    ) -> Option<Result<Vec<Vec<u8>>, String>> {
+        static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+        let djxl = "/opt/homebrew/bin/djxl";
+        if Command::new(djxl).arg("-V").output().is_err() {
+            return None;
+        }
+        let id = DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("jxl-wgpu-animation-{}-{id}", std::process::id()));
+        if let Err(error) = std::fs::create_dir(&directory) {
+            return Some(Err(format!(
+                "could not create djxl animation directory: {error}"
+            )));
+        }
+        let input = directory.join("gpu.jxl");
+        let extension = if format == LosslessModularFormat::Gray {
+            "pgm"
+        } else {
+            "pam"
+        };
+        let output = directory.join(format!("frame.{extension}"));
+        let result = (|| {
+            std::fs::write(&input, encoded)
+                .map_err(|error| format!("could not write djxl animation input: {error}"))?;
+            let command = Command::new(djxl)
+                .arg(&input)
+                .arg(&output)
+                .arg("--quiet")
+                .arg("--output_frames")
+                .arg("--bits_per_sample=8")
+                .output()
+                .map_err(|error| format!("could not execute djxl animation decode: {error}"))?;
+            if !command.status.success() {
+                return Err(format!(
+                    "djxl rejected GPU animation: {}",
+                    String::from_utf8_lossy(&command.stderr)
+                ));
+            }
+            let mut frames = std::fs::read_dir(&directory)
+                .map_err(|error| format!("could not list djxl animation output: {error}"))?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|actual| actual == extension))
+                .collect::<Vec<_>>();
+            frames.sort();
+            frames
+                .into_iter()
+                .map(|path| {
+                    let pgm = std::fs::read(&path)
+                        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+                    if format == LosslessModularFormat::Gray {
+                        parse_pgm(&pgm)
+                    } else {
+                        parse_pam(&pgm, format)
+                    }
+                })
+                .collect()
+        })();
+        let _ = std::fs::remove_dir_all(directory);
         Some(result)
     }
 
@@ -3388,6 +4225,257 @@ mod tests {
                     assert_eq!(async_encoded, encoded);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn animation_session_composites_crop_and_reference_with_both_decoders() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU animation encode test: no wgpu adapter");
+            return;
+        };
+        let canvas_width = 4;
+        let canvas_height = 3;
+        let first_pixels = (0..canvas_width * canvas_height)
+            .map(|index| 20 + index as u8)
+            .collect::<Vec<_>>();
+        let patch_pixels = vec![1, 2, 3, 4];
+        let last_pixels = (0..canvas_width * canvas_height)
+            .map(|index| 100 + index as u8)
+            .collect::<Vec<_>>();
+        let mut expected_patch = first_pixels.clone();
+        for (index, value) in [(5usize, 1u8), (6, 2), (9, 3), (10, 4)] {
+            expected_patch[index] += value;
+        }
+
+        let animation = AnimationHeader::Animation {
+            ticks_per_second_numerator: NonZeroU32::new(100).unwrap(),
+            ticks_per_second_denominator: NonZeroU32::new(1).unwrap(),
+            num_loops: 2,
+            have_timecodes: true,
+        };
+        let descriptor = LosslessModularAnimationDescriptor::new(
+            canvas_width,
+            canvas_height,
+            LosslessModularFormat::Gray,
+            8,
+            animation,
+        )
+        .unwrap();
+        let encoder = LosslessModularEncoder::new(context.clone());
+        assert!(encoder.capabilities().animation);
+        let mut session = encoder.begin_animation(descriptor).unwrap();
+        let slot_one = crate::ReferenceSlot::new(1).unwrap();
+        let slot_two = crate::ReferenceSlot::new(2).unwrap();
+        let first = session
+            .submit_frame(
+                packed_gray8_source(&context, canvas_width, canvas_height, first_pixels.clone()),
+                FrameOptions {
+                    timing: crate::FrameTiming {
+                        duration_ticks: 2,
+                        timecode: Some(100),
+                    },
+                    save_as_reference: slot_one,
+                    ..FrameOptions::default()
+                },
+            )
+            .unwrap();
+        let second = session
+            .submit_frame(
+                packed_gray8_source(&context, 2, 2, patch_pixels),
+                FrameOptions {
+                    timing: crate::FrameTiming {
+                        duration_ticks: 3,
+                        timecode: Some(101),
+                    },
+                    crop: Some(crate::FrameCrop::new(1, 1, 2, 2).unwrap()),
+                    color_blend: FrameBlend {
+                        mode: BlendMode::Add,
+                        source_reference: slot_one,
+                        clamp: false,
+                    },
+                    save_as_reference: slot_two,
+                    ..FrameOptions::default()
+                },
+            )
+            .unwrap();
+        let last = session
+            .submit_last_frame(
+                packed_gray8_source(&context, canvas_width, canvas_height, last_pixels.clone()),
+                FrameOptions {
+                    timing: crate::FrameTiming {
+                        duration_ticks: 4,
+                        timecode: Some(102),
+                    },
+                    ..FrameOptions::default()
+                },
+            )
+            .unwrap();
+
+        let last = pollster::block_on(last).expect("runtime-neutral Future completes");
+        let first = first.wait().expect("blocking animation wait completes");
+        let second = pollster::block_on(second).expect("second Future completes");
+        session.insert(last).unwrap();
+        session.insert(second).unwrap();
+        session.insert(first).unwrap();
+        let container = session.finish_container().unwrap();
+
+        let parsed =
+            jxl_gpu_bitstream::parse(&container, jxl_gpu_bitstream::ParseLimits::default())
+                .unwrap();
+        let inventory = parsed
+            .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+            .unwrap();
+        assert_eq!(inventory.frames.len(), 3);
+        assert_eq!(inventory.frames[0].duration_ticks, 2);
+        assert_eq!(inventory.frames[0].timecode, Some(100));
+        assert_eq!(inventory.frames[0].save_as_reference, 1);
+        assert_eq!((inventory.frames[1].x0, inventory.frames[1].y0), (1, 1));
+        assert_eq!(
+            (inventory.frames[1].width, inventory.frames[1].height),
+            (2, 2)
+        );
+        assert_eq!(
+            inventory.frames[1].color_blend.mode,
+            jxl_gpu_bitstream::FrameBlendMode::Add
+        );
+        assert_eq!(inventory.frames[1].color_blend.source, 1);
+        assert_eq!(inventory.frames[1].save_as_reference, 2);
+        assert!(inventory.frames[2].is_last);
+
+        let (decoded_animation, decoded_frames) =
+            decode_animation8(&container, LosslessModularFormat::Gray)
+                .unwrap_or_else(|error| panic!("Rust jxl rejected GPU animation: {error}"));
+        assert_eq!(decoded_animation.tps_numerator, 100);
+        assert_eq!(decoded_animation.tps_denominator, 1);
+        assert_eq!(decoded_animation.num_loops, 2);
+        assert!(decoded_animation.have_timecodes);
+        assert_eq!(decoded_frames.len(), 3);
+        assert_eq!(decoded_frames[0].1, first_pixels);
+        assert_eq!(decoded_frames[1].1, expected_patch);
+        assert_eq!(decoded_frames[2].1, last_pixels);
+        for (actual, expected) in decoded_frames
+            .iter()
+            .map(|frame| frame.0)
+            .zip([20.0, 30.0, 40.0])
+        {
+            assert_eq!(actual, Some(expected));
+        }
+        if let Some(decoded) =
+            decode_animation_with_djxl_if_available(&container, LosslessModularFormat::Gray)
+        {
+            assert_eq!(
+                decoded.unwrap_or_else(|error| panic!("djxl rejected GPU animation: {error}")),
+                vec![first_pixels, expected_patch, last_pixels]
+            );
+        }
+    }
+
+    #[test]
+    fn rgba_animation_uses_standard_alpha_weighted_blending() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU RGBA animation encode test: no wgpu adapter");
+            return;
+        };
+        let width = 3;
+        let height = 2;
+        let mut first_pixels = Vec::new();
+        for index in 0..width * height {
+            first_pixels.extend_from_slice(&[
+                10 + index as u8,
+                20 + index as u8,
+                30 + index as u8,
+                255,
+            ]);
+        }
+        let patch_pixels = vec![200, 1, 2, 255, 3, 201, 4, 255];
+        let mut expected = first_pixels.clone();
+        expected[4..12].copy_from_slice(&patch_pixels);
+        let animation = AnimationHeader::Animation {
+            ticks_per_second_numerator: NonZeroU32::new(60).unwrap(),
+            ticks_per_second_denominator: NonZeroU32::new(1).unwrap(),
+            num_loops: 0,
+            have_timecodes: false,
+        };
+        let encoder = LosslessModularEncoder::new(context.clone());
+        let mut session = encoder
+            .begin_animation(
+                LosslessModularAnimationDescriptor::new(
+                    width,
+                    height,
+                    LosslessModularFormat::Rgba,
+                    8,
+                    animation,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let reference = crate::ReferenceSlot::new(1).unwrap();
+        let first = session
+            .submit_frame(
+                packed_rgba8_source(&context, width, height, first_pixels.clone()),
+                FrameOptions {
+                    timing: crate::FrameTiming {
+                        duration_ticks: 1,
+                        timecode: None,
+                    },
+                    save_as_reference: reference,
+                    ..FrameOptions::default()
+                },
+            )
+            .unwrap();
+        let alpha_blend = FrameBlend {
+            mode: BlendMode::Blend,
+            source_reference: reference,
+            clamp: false,
+        };
+        let last = session
+            .submit_last_frame(
+                packed_rgba8_source(&context, 2, 1, patch_pixels),
+                FrameOptions {
+                    timing: crate::FrameTiming {
+                        duration_ticks: 2,
+                        timecode: None,
+                    },
+                    crop: Some(crate::FrameCrop::new(1, 0, 2, 1).unwrap()),
+                    color_blend: alpha_blend,
+                    extra_channel_blends: vec![alpha_blend],
+                    ..FrameOptions::default()
+                },
+            )
+            .unwrap();
+        session.insert(first.wait().unwrap()).unwrap();
+        session.insert(pollster::block_on(last).unwrap()).unwrap();
+        let raw = session.finish_raw().unwrap();
+
+        let parsed =
+            jxl_gpu_bitstream::parse(&raw, jxl_gpu_bitstream::ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+            .unwrap();
+        assert_eq!(inventory.image_header.extra_channel_count, 1);
+        assert_eq!(
+            inventory.frames[1].color_blend.mode,
+            jxl_gpu_bitstream::FrameBlendMode::Blend
+        );
+        assert_eq!(inventory.frames[1].color_blend.alpha_channel, Some(0));
+        assert_eq!(
+            inventory.frames[1].extra_channel_blends[0].alpha_channel,
+            Some(0)
+        );
+
+        let (_, decoded) = decode_animation8(&raw, LosslessModularFormat::Rgba)
+            .unwrap_or_else(|error| panic!("Rust jxl rejected RGBA animation: {error}"));
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].1, first_pixels);
+        assert_eq!(decoded[1].1, expected);
+        if let Some(decoded) =
+            decode_animation_with_djxl_if_available(&raw, LosslessModularFormat::Rgba)
+        {
+            assert_eq!(
+                decoded.unwrap_or_else(|error| panic!("djxl rejected RGBA animation: {error}")),
+                vec![first_pixels, expected]
+            );
         }
     }
 

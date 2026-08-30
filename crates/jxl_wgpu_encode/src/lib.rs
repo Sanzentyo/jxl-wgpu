@@ -9,6 +9,10 @@
 //! for every unsigned integer depth in `1..=16`. Samples remain GPU-resident through reversible
 //! color transform, prediction, residual tokenization, and histogram collection. The generic
 //! [`GpuEncoder`] advertises only profiles implemented by its backend.
+//! [`LosslessModularAnimationSession`] adds standard timebases, exact frame durations and
+//! timecodes, signed crop rectangles, all five blend modes, alpha extra-channel blending, and four
+//! reference slots. Its independent frame submissions support both blocking waits and a
+//! runtime-neutral [`Future`], so a caller can keep multiple frames in flight.
 //!
 //! Fixed CPU/WGSL ABI records use `#[repr(C)]` plus `bytemuck::Pod`. WGSL defines
 //! host-shareable numeric values as little-endian, so this crate rejects big-endian targets at
@@ -40,13 +44,14 @@ pub use capability::{
     Determinism, EncodeProfile, EncoderCapabilities, KernelStage, PerceptualDistance,
     ProfileCapability, ProgressivePass, ProgressivePlan,
 };
-pub use error::{EncodeError, PacketError, UnsupportedFeature};
+pub use error::{BackendError, EncodeError, PacketError, UnsupportedFeature};
 pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
 };
 pub use lossless_modular::{
-    LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularBackend, LosslessModularEncoder,
+    LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
+    LosslessModularAnimationSession, LosslessModularBackend, LosslessModularEncoder,
     LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
     LosslessModularInFlightMemory, LosslessModularJob, LosslessModularMemoryLimits,
     LosslessModularMemoryPlan, LosslessModularSubmission,
@@ -56,7 +61,7 @@ pub use packet::{
     assemble_frame,
 };
 pub use session::{
-    AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameEncodeRequest, FrameIndex,
-    FrameOptions, FrameSubmission, FrameTiming, GpuAccelerationArtifact, GpuFrameArtifacts,
-    ReferenceSlot, SessionDescriptor,
+    AnimationHeader, BlendMode, CodestreamAssembler, EncodeSession, FrameBlend, FrameCrop,
+    FrameEncodeRequest, FrameIndex, FrameOptions, FrameSubmission, FrameTiming,
+    GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };

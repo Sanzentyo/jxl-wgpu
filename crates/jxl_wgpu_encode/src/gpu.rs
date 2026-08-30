@@ -6,8 +6,8 @@ use jxl_gpu_formats::{ImageLayout, PixelFormat};
 use jxl_wgpu::{MemoryBudget, MemoryBudgetSnapshot, SubmissionPoller, WgpuBackend};
 
 use crate::{
-    EncodeError, EncodeSession, EncoderCapabilities, FrameEncodeRequest, FrameSubmission,
-    GpuFrameArtifacts, SessionDescriptor, UnsupportedFeature,
+    BackendError, EncodeError, EncodeSession, EncoderCapabilities, FrameEncodeRequest,
+    FrameSubmission, GpuFrameArtifacts, SessionDescriptor, UnsupportedFeature,
 };
 
 #[derive(Clone)]
@@ -41,11 +41,8 @@ impl WgpuContext {
         queue: Arc<wgpu::Queue>,
         memory_budget_bytes: NonZeroU64,
     ) -> Result<Self, EncodeError> {
-        let poller = SubmissionPoller::new(device.as_ref().clone()).map_err(|error| {
-            EncodeError::Backend(format!(
-                "could not start the bounded GPU poll worker: {error}"
-            ))
-        })?;
+        let poller = SubmissionPoller::new(device.as_ref().clone())
+            .map_err(BackendError::PollWorkerStart)?;
         Ok(Self {
             device,
             queue,
@@ -295,6 +292,11 @@ impl<B: GpuEncodeBackend> GpuEncoder<B> {
         &self,
         descriptor: SessionDescriptor,
     ) -> Result<EncodeSession<B>, EncodeError> {
+        if descriptor.canvas_width == 0 || descriptor.canvas_height == 0 {
+            return Err(EncodeError::InvalidConfiguration(
+                "the JPEG XL session canvas must be non-empty",
+            ));
+        }
         if descriptor.animation.is_animation() && !self.capabilities().animation {
             return Err(UnsupportedFeature::Animation.into());
         }

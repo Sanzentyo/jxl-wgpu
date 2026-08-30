@@ -2,6 +2,36 @@ use thiserror::Error;
 
 use crate::{EncodeProfile, KernelStage};
 
+/// Failures reported by the concrete GPU encoder implementation.
+///
+/// Typed errors from `wgpu`, the operating system, and the shared submission
+/// poller are retained as sources so callers can inspect the complete error
+/// chain. [`Self::PollWorker`] carries a message because the shared poller
+/// deliberately erases backend-specific poll errors at its callback boundary.
+#[derive(Debug, Error)]
+pub enum BackendError {
+    #[error("GPU encoder backend invariant failed: {0}")]
+    Invariant(&'static str),
+    #[error("invalid GPU artifact: {0}")]
+    InvalidArtifact(&'static str),
+    #[error("GPU artifact mapping failed")]
+    ArtifactMapping(#[source] wgpu::BufferAsyncError),
+    #[error("the mapped GPU artifact range is invalid")]
+    ArtifactRange(#[source] wgpu::MapRangeError),
+    #[error("GPU submission polling failed: {0}")]
+    PollWorker(String),
+    #[error("GPU submission poll registration failed")]
+    PollRegistration(#[source] jxl_wgpu::SubmissionPollerError),
+    #[error("could not start the bounded GPU poll worker")]
+    PollWorkerStart(#[source] std::io::Error),
+}
+
+impl From<&'static str> for BackendError {
+    fn from(message: &'static str) -> Self {
+        Self::Invariant(message)
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum UnsupportedFeature {
     #[error("the backend does not implement profile {0:?}")]
@@ -79,8 +109,8 @@ pub enum EncodeError {
     InvalidConfiguration(&'static str),
     #[error("invalid GPU frame source: {0}")]
     InvalidSource(&'static str),
-    #[error("GPU encoder job failed: {0}")]
-    Backend(String),
+    #[error(transparent)]
+    Backend(#[from] BackendError),
     #[error("GPU encoder memory backpressure: {0}")]
     MemoryBackpressure(#[from] jxl_wgpu::MemoryBudgetError),
     #[error("GPU encoder submission-poll backpressure: {0}")]

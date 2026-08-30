@@ -235,6 +235,8 @@ mod tests {
                 num_loops: 0,
                 have_timecodes: false,
             },
+            canvas_width: 1,
+            canvas_height: 1,
             options: FrameOptions::default(),
         };
         assert_eq!(
