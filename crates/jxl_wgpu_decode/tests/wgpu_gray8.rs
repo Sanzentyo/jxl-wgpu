@@ -715,6 +715,13 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert!(stats.parallel_group_lanes <= 64);
             assert_eq!(stats.max_lz77_window_words, 1);
             assert_eq!(stats.max_lz77_scratch_words, 0);
+            assert_eq!(stats.max_logical_reconstruction_sample_words, 256 * 256);
+            assert_eq!(stats.max_physical_reconstruction_sample_words, 256 * 2);
+            assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4);
+            assert_eq!(
+                stats.output_specialization,
+                jxl_wgpu_decode::ModularOutputSpecialization::DirectNormalizedGray8
+            );
             assert_eq!(
                 stats.reconstruction_specialization,
                 ModularReconstructionSpecialization::ChannelFixed {
@@ -823,6 +830,19 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         let stats = session.submission_session().memory_stats();
         assert_eq!(stats.max_lz77_window_words, 1);
         assert_eq!(stats.max_lz77_scratch_words, 0);
+        let logical_sample_words = 256 * height * format.channel_count();
+        assert_eq!(
+            stats.max_logical_reconstruction_sample_words,
+            logical_sample_words
+        );
+        assert_eq!(
+            stats.max_physical_reconstruction_sample_words, logical_sample_words,
+            "native {format:?} must retain the generic full-group layout"
+        );
+        assert_eq!(
+            stats.output_specialization,
+            jxl_wgpu_decode::ModularOutputSpecialization::FinalizePass
+        );
         assert_eq!(
             stats.reconstruction_specialization,
             ModularReconstructionSpecialization::ChannelFixed {
