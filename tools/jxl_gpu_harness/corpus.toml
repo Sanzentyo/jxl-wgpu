@@ -1,0 +1,218 @@
+version = 1
+
+[[cases]]
+name = "copy_1x1"
+operation = "copy"
+width = 1
+height = 1
+channels = 1
+seed = 1
+precision = "exact"
+
+[[cases]]
+name = "copy_tail_17x19"
+operation = "copy"
+width = 17
+height = 19
+channels = 3
+seed = 2
+precision = "exact"
+
+[[cases]]
+name = "affine_tail_31x9"
+operation = "affine"
+width = 31
+height = 9
+channels = 3
+seed = 3
+precision = "f32"
+
+[cases.parameters]
+scale = 0.75
+bias = 0.125
+
+[[cases]]
+name = "gaborish_edge_17x19"
+operation = "gaborish"
+width = 17
+height = 19
+channels = 3
+seed = 4
+precision = "f32"
+
+[cases.parameters]
+weight1 = 0.115169525
+weight2 = 0.061248592
+
+[[cases]]
+name = "epf0_constant_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 13
+precision = "f32"
+
+[cases.parameters]
+pass = 0.0
+sigma = -0.58
+
+[[cases]]
+name = "epf0_variable_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 14
+precision = "f32"
+
+[cases.parameters]
+pass = 0.0
+variable_sigma = 1.0
+
+[[cases]]
+name = "epf1_constant_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 15
+precision = "f32"
+
+[cases.parameters]
+pass = 1.0
+sigma = -0.58
+
+[[cases]]
+name = "epf1_variable_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 16
+precision = "f32"
+
+[cases.parameters]
+pass = 1.0
+variable_sigma = 1.0
+
+[[cases]]
+name = "epf2_constant_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 17
+precision = "f32"
+
+[cases.parameters]
+pass = 2.0
+sigma = -0.58
+
+[[cases]]
+name = "epf2_variable_odd_19x11"
+operation = "epf"
+width = 19
+height = 11
+channels = 3
+seed = 18
+precision = "f32"
+
+[cases.parameters]
+pass = 2.0
+variable_sigma = 1.0
+
+[[cases]]
+name = "upsample_2x_odd"
+operation = "upsample"
+width = 7
+height = 5
+channels = 3
+seed = 5
+precision = "f32"
+
+[cases.parameters]
+factor = 2.0
+
+[[cases]]
+name = "upsample_4x_small"
+operation = "upsample"
+width = 3
+height = 2
+channels = 1
+seed = 6
+precision = "f32"
+
+[cases.parameters]
+factor = 4.0
+
+[[cases]]
+name = "chroma_horizontal_width1"
+operation = "chroma_upsample"
+width = 1
+height = 3
+channels = 1
+seed = 9
+precision = "f32"
+
+[cases.parameters]
+axis = 0.0
+
+[[cases]]
+name = "chroma_horizontal_width2"
+operation = "chroma_upsample"
+width = 2
+height = 3
+channels = 1
+seed = 10
+precision = "f32"
+
+[cases.parameters]
+axis = 0.0
+
+[[cases]]
+name = "chroma_horizontal_odd_crop"
+operation = "chroma_upsample"
+width = 3
+height = 3
+channels = 2
+seed = 11
+precision = "f32"
+
+[cases.parameters]
+axis = 0.0
+output_width = 5.0
+
+[[cases]]
+name = "chroma_vertical_odd_crop"
+operation = "chroma_upsample"
+width = 3
+height = 3
+channels = 2
+seed = 12
+precision = "f32"
+
+[cases.parameters]
+axis = 1.0
+output_height = 5.0
+
+[[cases]]
+name = "ycbcr_tail_13x11"
+operation = "ycbcr_to_rgb"
+width = 13
+height = 11
+channels = 3
+seed = 7
+precision = "f32"
+
+[[cases]]
+name = "premultiply_tail_15x9"
+operation = "premultiply_alpha"
+width = 15
+height = 9
+channels = 4
+seed = 8
+precision = "f32"
+
+[cases.parameters]
+alpha_channel = 3.0

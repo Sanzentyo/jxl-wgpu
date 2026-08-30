@@ -1,0 +1,18 @@
+[package]
+name = "jxl_gpu_formats"
+description = "Portable pixel-format, pitch-linear image-layout, and scalar conversion contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+cpu-reference = []
+
+[dependencies]
+jxl_gpu_protocol.workspace = true
+thiserror = "2.0.20"
+
+[lints]
+workspace = true

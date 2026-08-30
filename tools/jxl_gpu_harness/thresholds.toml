@@ -1,0 +1,90 @@
+version = 1
+
+[default]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 32
+max_p99_ulp = 8
+min_psnr_db = 90.0
+require_exact = false
+
+[operations.copy]
+max_abs = 0.0
+max_rel = 0.0
+max_rmse = 0.0
+max_ulp = 0
+max_p99_ulp = 0
+require_exact = true
+
+[operations.affine]
+max_abs = 2.0e-6
+max_rel = 2.0e-6
+max_rmse = 2.0e-7
+max_ulp = 8
+max_p99_ulp = 4
+min_psnr_db = 110.0
+require_exact = false
+
+[operations.gaborish]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 32
+max_p99_ulp = 8
+min_psnr_db = 90.0
+require_exact = false
+
+[operations.epf]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 256
+max_p99_ulp = 32
+min_psnr_db = 90.0
+require_exact = false
+
+[operations.upsample]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 32
+max_p99_ulp = 8
+min_psnr_db = 90.0
+require_exact = false
+
+[operations.chroma_upsample]
+max_abs = 1.0e-6
+max_rel = 2.0e-6
+max_rmse = 2.0e-7
+max_ulp = 8
+max_p99_ulp = 4
+min_psnr_db = 110.0
+require_exact = false
+
+[operations.ycbcr_to_rgb]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 32
+max_p99_ulp = 8
+min_psnr_db = 90.0
+require_exact = false
+
+[operations.premultiply_alpha]
+max_abs = 2.0e-6
+max_rel = 2.0e-6
+max_rmse = 2.0e-7
+max_ulp = 8
+max_p99_ulp = 4
+min_psnr_db = 110.0
+require_exact = false
+
+[operations.decode]
+max_abs = 2.0e-5
+max_rel = 2.0e-5
+max_rmse = 2.0e-6
+max_ulp = 32
+max_p99_ulp = 8
+min_psnr_db = 90.0
+require_exact = false

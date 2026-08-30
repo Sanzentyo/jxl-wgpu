@@ -1,0 +1,14 @@
+[package]
+name = "jxl_gpu_bitstream"
+description = "Bounded JPEG XL container and bitstream orchestration for GPU codecs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror = "2.0.20"
+
+[lints]
+workspace = true

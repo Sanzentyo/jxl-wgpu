@@ -1,0 +1,22 @@
+version = 1
+
+[[cases]]
+name = "basic_small"
+path = "../../fixtures/basic.jxl"
+size_class = "small"
+
+[[cases]]
+name = "oddsize_upsampling"
+path = "../../fixtures/oddsize_ups.jxl"
+size_class = "odd"
+
+[[cases]]
+name = "vardct_large"
+path = "../../fixtures/green_queen_vardct_e3.jxl"
+size_class = "large"
+extent = { width = 438, height = 589 }
+
+[[cases]]
+name = "animation_spline"
+path = "../../fixtures/animation_spline.jxl"
+size_class = "small"

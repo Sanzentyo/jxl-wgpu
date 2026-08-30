@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/libjxl/jxl-rs/jxl_gpu_harness/schemas/run.schema.json",
+  "title": "jxl_gpu_harness run report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "generated_unix_ms", "package_version", "target_os", "target_arch", "adapters", "cases"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "command": { "type": "string", "minLength": 1 },
+    "generated_unix_ms": { "type": "integer", "minimum": 0 },
+    "package_version": { "type": "string", "minLength": 1 },
+    "target_os": { "type": "string", "minLength": 1 },
+    "target_arch": { "type": "string", "minLength": 1 },
+    "adapters": { "type": "array", "items": { "$ref": "#/$defs/adapter" } },
+    "cases": { "type": "array", "items": { "$ref": "#/$defs/case" } },
+    "codec_cases": { "type": "array", "items": { "$ref": "#/$defs/codec_case" } }
+  },
+  "$defs": {
+    "status": {
+      "enum": ["passed", "failed", "unsupported", "incomplete", "unavailable", "error"]
+    },
+    "adapter": {
+      "type": "object",
+      "required": ["name", "vendor", "device", "backend", "features"],
+      "properties": {
+        "name": { "type": "string" },
+        "vendor": { "type": "integer", "minimum": 0 },
+        "device": { "type": "integer", "minimum": 0 },
+        "backend": { "type": "string" },
+        "features": { "type": "string" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "operation", "backend", "status", "output_hash", "metrics", "threshold", "timing", "message"],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "output_hash": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }] },
+        "metrics": { "type": ["object", "null"] },
+        "threshold": { "type": ["object", "null"] },
+        "timing": { "type": ["object", "null"] },
+        "message": { "type": ["string", "null"] }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "warmup", "iterations", "batch_size", "concurrency", "max_in_flight"],
+      "properties": {
+        "kind": { "enum": ["single_latency", "warm_sequential", "batch", "concurrent", "animation"] },
+        "warmup": { "type": "integer", "minimum": 0 },
+        "iterations": { "type": "integer", "minimum": 1 },
+        "batch_size": { "type": "integer", "minimum": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "max_in_flight": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "component", "code", "detail"],
+      "properties": {
+        "kind": { "enum": ["unsupported", "incomplete", "unavailable", "invalid_input", "verification", "backend"] },
+        "component": { "type": "string", "minLength": 1 },
+        "code": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string", "minLength": 1 }
+      }
+    },
+    "timing_statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["samples", "minimum_ns", "median_ns", "p95_ns", "mean_ns", "standard_deviation_ns"],
+      "properties": {
+        "samples": { "type": "integer", "minimum": 1 },
+        "minimum_ns": { "type": "integer", "minimum": 0 },
+        "median_ns": { "type": "integer", "minimum": 0 },
+        "p95_ns": { "type": "integer", "minimum": 0 },
+        "mean_ns": { "type": "number", "minimum": 0 },
+        "standard_deviation_ns": { "type": "number", "minimum": 0 }
+      }
+    },
+    "codec_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_latency", "workload"],
+      "properties": {
+        "operation_latency": { "$ref": "#/$defs/timing_statistics" },
+        "workload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operations", "parallelism", "wall_ns", "operations_per_second"],
+          "properties": {
+            "operations": { "type": "integer", "minimum": 1 },
+            "parallelism": { "type": "integer", "minimum": 1 },
+            "wall_ns": { "type": "integer", "minimum": 0 },
+            "operations_per_second": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "codec_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "path", "operation", "workload", "output_target", "status", "adapter", "pixel_format", "size_class", "declared_extent", "input_bytes", "output_bytes", "frame_count", "codec_submissions", "display_submissions", "readback_submissions", "output_hash", "timing", "issue"],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "operation": { "enum": ["decode", "encode", "round_trip"] },
+        "workload": { "$ref": "#/$defs/workload" },
+        "output_target": { "enum": ["gpu_resident", "display_texture", "cpu_readback"] },
+        "status": { "$ref": "#/$defs/status" },
+        "adapter": { "type": ["string", "null"] },
+        "pixel_format": {
+          "enum": ["gray8", "y8", "y16", "i420", "i422", "i444", "nv12", "nv21", "nv16", "nv61", "nv24", "nv42", "p010", "p012", "p016", "yuyv", "uyvy", "rgb8", "bgr8", "rgba8", "bgra8", "rgb8_planar", "bgr8_planar", "rgba8_planar", "bgra8_planar"]
+        },
+        "size_class": { "enum": ["auto", "small", "odd", "large"] },
+        "declared_extent": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/extent" }] },
+        "input_bytes": { "type": "integer", "minimum": 0 },
+        "output_bytes": { "type": "integer", "minimum": 0 },
+        "frame_count": { "type": "integer", "minimum": 0 },
+        "codec_submissions": { "type": "integer", "minimum": 0 },
+        "display_submissions": { "type": "integer", "minimum": 0 },
+        "readback_submissions": { "type": "integer", "minimum": 0 },
+        "output_hash": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{64}$" }] },
+        "timing": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/codec_timing" }] },
+        "issue": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/issue" }] }
+      }
+    }
+  }
+}

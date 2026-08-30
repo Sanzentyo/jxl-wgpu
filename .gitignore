@@ -1,0 +1,6 @@
+/target
+*.swp
+perf.data
+perf.data.old
+/*.jxl
+/*.png
