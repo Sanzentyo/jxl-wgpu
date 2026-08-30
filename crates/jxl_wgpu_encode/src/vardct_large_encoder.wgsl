@@ -29,7 +29,8 @@ struct Params {
     fragment_offset: u32,
     fragment_word_capacity: u32,
     artifact_words: u32,
-    padding: array<u32, 10>,
+    topology: u32,
+    padding: array<u32, 9>,
 }
 
 @group(0) @binding(0)
@@ -46,7 +47,7 @@ var<storage, read_write> artifact_words: array<u32>;
 var<workgroup> block_xyb: array<vec3<f32>, 64>;
 
 const ARTIFACT_READY: u32 = 0x56444354u;
-const HEADER_HISTOGRAM_OFFSET: u32 = 21u;
+const HEADER_HISTOGRAM_OFFSET: u32 = 22u;
 const OPSIN_BIAS: f32 = 0.0037930732552754493;
 const NEG_OPSIN_BIAS_CBRT: f32 = -0.15595420054924863;
 
@@ -142,8 +143,11 @@ fn quantize_blocks(
     let block_y = block / params.blocks_x;
     let local_x = local_index & 7u;
     let local_y = local_index >> 3u;
-    let pixel_x = block_x * 8u + local_x;
-    let pixel_y = block_y * 8u + local_y;
+    // JPEG XL pads a partial edge block by replicating the final source row
+    // or column. Keeping the clamped coordinates in the GPU kernel avoids a
+    // CPU-side staging/padding fallback for odd and asymmetric dimensions.
+    let pixel_x = min(block_x * 8u + local_x, params.width - 1u);
+    let pixel_y = min(block_y * 8u + local_y, params.height - 1u);
     let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
     let encoded = vec3<f32>(
         f32(load_u8(pixel_address)) / 255.0,
@@ -181,8 +185,9 @@ fn serialize_control() {
     var bit_offset = 0u;
 
     for (var block = 0u; block < block_count; block += 1u) {
+        let is_first = block == 0u || params.topology == 1u;
         artifact_words[params.strategy_offset + block] =
-            params.strategy | select(0u, 1u << 8u, block == 0u);
+            params.strategy | select(0u, 1u << 8u, is_first);
     }
     for (var channel = 0u; channel < 3u; channel += 1u) {
         let base = channel * block_count;
@@ -242,5 +247,6 @@ fn serialize_control() {
     artifact_words[18] = params.height;
     artifact_words[19] = params.blocks_x;
     artifact_words[20] = params.blocks_y;
+    artifact_words[21] = params.topology;
     artifact_words[0] = ARTIFACT_READY;
 }

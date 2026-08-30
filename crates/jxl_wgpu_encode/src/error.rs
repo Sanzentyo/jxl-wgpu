@@ -54,6 +54,22 @@ pub enum UnsupportedFeature {
         required: u64,
         available: u64,
     },
+    #[error(
+        "tiled VarDCT currently supports one LF group: {width}x{height} exceeds {max_dimension}px on one or both axes"
+    )]
+    TiledVarDctLfGroups {
+        width: u32,
+        height: u32,
+        max_dimension: u32,
+    },
+    #[error(
+        "tiled VarDCT requires at least two AC groups so its section topology is unambiguous; {width}x{height} fits one {group_dimension}px group"
+    )]
+    TiledVarDctSingleAcGroup {
+        width: u32,
+        height: u32,
+        group_dimension: u32,
+    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

@@ -110,7 +110,23 @@ histogram, tokens, strategy map, and zero padding, before serializing control me
 distance-25 profile deliberately quantizes every AC coefficient to zero, so it is interoperable but
 is not yet a general quality or rate-control implementation.
 
-`VarDctMemoryPlan::kernel_layout` distinguishes the fixed and scalable artifacts. Fixed submissions
+`TiledVarDctEncoder` extends that same honest LF-only contract to a grid of independent regular
+DCT8 transforms. Width and height may reach 2,048, with at least one axis above 256; partial edge
+blocks are padded by GPU-side edge replication. The current bound is deliberately one standard
+LF/DC group and at least two AC groups. A one-AC-group frame has a normatively fused one-packet
+layout that cannot identify this tiled subset, so it returns typed
+`UnsupportedFeature::TiledVarDctSingleAcGroup` instead of emitting an ambiguous stream.
+Within it, the codestream uses the full `ceil(width / 256) * ceil(height / 256)` AC/pass-group grid,
+so 257-pixel and larger axes exercise real multi-packet TOC topology rather than pretending that
+the image is one transform. Each 8×8 block is marked as a first DCT8 transform. GPU workgroups
+produce the block DC values, one LF-group-local Gradient residual stream, prefix bits, histogram,
+and strategy map; the CPU validates and packetizes those artifacts but does not pad pixels,
+transform, quantize, predict, or entropy-code them. Multiple LF groups (an axis above 2,048) return
+the typed `UnsupportedFeature::TiledVarDctLfGroups` error. The block-product dispatch and all
+storage allocations remain independently bounded by the selected device limits.
+
+`VarDctMemoryPlan::kernel_layout` distinguishes fixed, scalable single-transform, and tiled-DCT8
+artifacts. Fixed submissions
 reserve exactly 51,456 encoder-owned bytes: one 256-byte parameter record, one 25,600-byte artifact,
 and one equal-size readback. Scalable artifacts are computed from the live block/sample count and
 the maximum fragment bits derived from the actual prefix entries; they range from 2,560 bytes for
@@ -136,6 +152,29 @@ assert_eq!(encoder.strategy().block_extent(), (16, 8));
 encoder.encode(source_16_by_8)
 # }
 ```
+
+The tiled API has the same blocking, container, and executor-neutral `Future` completion forms:
+
+```rust,no_run
+# use jxl_wgpu_encode::{BufferImageSource, TiledVarDctEncoder, WgpuContext};
+# fn encode_tiled(
+#     context: WgpuContext,
+#     source_768_by_513: BufferImageSource,
+# ) -> Result<Vec<u8>, jxl_wgpu_encode::EncodeError> {
+let encoder = TiledVarDctEncoder::new(context)?;
+let plan = encoder.memory_plan(&source_768_by_513)?;
+let grid = encoder.grid(&source_768_by_513)?;
+assert_eq!(plan.kernel_layout, jxl_wgpu_encode::VarDctKernelLayout::TiledDct8);
+assert_eq!(grid.ac_group_count()?, 3 * 3);
+encoder.encode(source_768_by_513)
+# }
+```
+
+Actual-GPU conformance covers odd 257×17, asymmetric 513×259, and larger 768×513 inputs. Black is
+exact, solid colors and LF gradients have explicit PSNR floors, and both Rust `jxl` and `djxl`
+decode the emitted multi-group streams with at most one byte of mutual output disagreement.
+`cjxl` provides a separately decoded distance-25 development-quality reference for the same edge
+and larger fixtures.
 
 ## Animation sessions
 

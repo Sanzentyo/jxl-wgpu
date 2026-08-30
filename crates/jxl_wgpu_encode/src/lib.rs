@@ -73,6 +73,6 @@ pub use session::{
     GpuAccelerationArtifact, GpuFrameArtifacts, ReferenceSlot, SessionDescriptor,
 };
 pub use vardct_encoder::{
-    VarDctBackend, VarDctColorEncoding, VarDctEncoder, VarDctJob, VarDctKernelLayout,
-    VarDctMemoryPlan, VarDctStrategy, VarDctSubmission,
+    TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctEncoder,
+    VarDctJob, VarDctKernelLayout, VarDctMemoryPlan, VarDctStrategy, VarDctSubmission,
 };
