@@ -37,19 +37,39 @@ impl PrefixCode {
         raw_gpu: &[u64; RAW_SYMBOLS],
         lz77_gpu: &[u64; LZ77_SYMBOLS],
     ) -> Result<Self, EncodeError> {
-        if raw_gpu[10..].iter().any(|&count| count != 0)
+        Self::from_aggregated_counts_with_max_token(raw_gpu, lz77_gpu, 9)
+    }
+
+    pub(crate) fn from_aggregated_ycocg_counts(
+        raw_gpu: &[u64; RAW_SYMBOLS],
+        lz77_gpu: &[u64; LZ77_SYMBOLS],
+    ) -> Result<Self, EncodeError> {
+        Self::from_aggregated_counts_with_max_token(raw_gpu, lz77_gpu, 10)
+    }
+
+    fn from_aggregated_counts_with_max_token(
+        raw_gpu: &[u64; RAW_SYMBOLS],
+        lz77_gpu: &[u64; LZ77_SYMBOLS],
+        max_raw_token: usize,
+    ) -> Result<Self, EncodeError> {
+        if raw_gpu[max_raw_token + 1..].iter().any(|&count| count != 0)
             || lz77_gpu[28..].iter().any(|&count| count != 0)
         {
             return Err(EncodeError::Backend(
                 "GPU histogram contains an impossible token".into(),
             ));
         }
+        let mut base_raw_counts = BASE_RAW_COUNTS;
+        if max_raw_token == 10 {
+            // Reversible YCoCg can require one more hybrid-uint symbol than a direct 8-bit plane.
+            base_raw_counts[10] = 5;
+        }
         let mut raw_counts = [0u64; RAW_SYMBOLS];
         let mut lz77_counts = [0u64; LZ77_SYMBOLS];
         for (index, count) in raw_counts.iter_mut().enumerate() {
             *count = raw_gpu[index]
                 .checked_shl(8)
-                .and_then(|value| value.checked_add(BASE_RAW_COUNTS[index]))
+                .and_then(|value| value.checked_add(base_raw_counts[index]))
                 .ok_or_else(|| {
                     EncodeError::Backend("aggregate raw histogram scaling overflow".into())
                 })?;
@@ -209,7 +229,7 @@ impl PrefixCode {
         let token = usize::try_from(token)
             .map_err(|_| EncodeError::Backend("GPU raw token overflow".into()))?;
         let expected_nbits = token.saturating_sub(1);
-        if token > 9
+        if token > 10
             || nbits != u32::try_from(expected_nbits).unwrap_or(u32::MAX)
             || !extra_bits_are_canonical(nbits, bits)
         {

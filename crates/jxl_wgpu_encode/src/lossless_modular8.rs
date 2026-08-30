@@ -13,7 +13,10 @@ use jxl_gpu_bitstream::{
     ACCELERATION_INDEX_BOX_TYPE, BitWriter, ContainerBox, Gray8AccelerationIndex,
     write_container_with_boxes,
 };
-use jxl_gpu_formats::{Channel, PixelFormat, SampleKind};
+use jxl_gpu_formats::{
+    Channel, ColorFormatClass, ColorSpecification, PixelFormat, PixelFormatClass, RgbChannelOrder,
+    RgbStorage, SampleKind, classify_pixel_format,
+};
 use jxl_wgpu::MemoryPermit;
 #[cfg(test)]
 use wgpu::util::DeviceExt;
@@ -30,54 +33,105 @@ use crate::{
 };
 
 /// JPEG XL's default Modular pass-group edge length.
-pub const LOSSLESS_GRAY8_GROUP_DIMENSION: u32 = 256;
-const LOSSLESS_GRAY8_LF_GROUP_DIMENSION: u32 = LOSSLESS_GRAY8_GROUP_DIMENSION * 8;
-const SHADER: &str = include_str!("lossless_gray8.wgsl");
+pub const LOSSLESS_MODULAR8_GROUP_DIMENSION: u32 = 256;
+const LOSSLESS_MODULAR8_LF_GROUP_DIMENSION: u32 = LOSSLESS_MODULAR8_GROUP_DIMENSION * 8;
+const SHADER: &str = include_str!("lossless_modular8.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Gray8Params {
+struct Modular8Params {
     width: u32,
     height: u32,
     row_stride: u32,
     byte_offset: u32,
     output_word_offset: u32,
+    channel: u32,
+    channels: u32,
 }
 
-/// Fixed storage-buffer header written by `lossless_gray8.wgsl`.
+/// Fixed storage-buffer header written by `lossless_modular8.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Gray8ArtifactHeader {
+struct Modular8ArtifactHeader {
     event_count: u32,
     raw_counts: [u32; RAW_SYMBOLS],
     lz77_counts: [u32; LZ77_SYMBOLS],
 }
 
-/// Fixed storage-buffer event written after [`Gray8ArtifactHeader`].
+/// Fixed storage-buffer event written after [`Modular8ArtifactHeader`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Gray8Event {
+struct Modular8Event {
     kind: u32,
     token: u32,
     extra_bit_count: u32,
     extra_bits: u32,
 }
 
-const OUTPUT_HEADER_WORDS: usize = std::mem::size_of::<Gray8ArtifactHeader>() / 4;
-const EVENT_WORDS: usize = std::mem::size_of::<Gray8Event>() / 4;
+const OUTPUT_HEADER_WORDS: usize = std::mem::size_of::<Modular8ArtifactHeader>() / 4;
+const EVENT_WORDS: usize = std::mem::size_of::<Modular8Event>() / 4;
 
 const _: () = {
-    assert!(std::mem::size_of::<Gray8Params>() == 20);
-    assert!(std::mem::align_of::<Gray8Params>() == 4);
-    assert!(std::mem::size_of::<Gray8ArtifactHeader>() == 53 * 4);
-    assert!(std::mem::align_of::<Gray8ArtifactHeader>() == 4);
-    assert!(std::mem::size_of::<Gray8Event>() == 16);
-    assert!(std::mem::align_of::<Gray8Event>() == 4);
+    assert!(std::mem::size_of::<Modular8Params>() == 28);
+    assert!(std::mem::align_of::<Modular8Params>() == 4);
+    assert!(std::mem::size_of::<Modular8ArtifactHeader>() == 53 * 4);
+    assert!(std::mem::align_of::<Modular8ArtifactHeader>() == 4);
+    assert!(std::mem::size_of::<Modular8Event>() == 16);
+    assert!(std::mem::align_of::<Modular8Event>() == 4);
 };
 
-/// Row-major JPEG XL pass-group grid used by one Gray8 frame.
+/// Standard lossless Modular input profile selected from a pitch-linear source descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LosslessGray8GroupGrid {
+pub enum LosslessModular8Format {
+    Gray,
+    Rgb,
+    Rgba,
+}
+
+impl LosslessModular8Format {
+    #[must_use]
+    pub const fn channel_count(self) -> u32 {
+        match self {
+            Self::Gray => 1,
+            Self::Rgb => 3,
+            Self::Rgba => 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_alpha(self) -> bool {
+        matches!(self, Self::Rgba)
+    }
+}
+
+fn lossless_modular8_format(format: &PixelFormat) -> Result<LosslessModular8Format, EncodeError> {
+    if *format == PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]) {
+        return Ok(LosslessModular8Format::Gray);
+    }
+    if !matches!(
+        format.color_spec,
+        ColorSpecification::Default | ColorSpecification::Undefined
+    ) {
+        // The compact standard header below signals sRGB. Requiring an absent/default source
+        // interpretation prevents silently relabeling an explicitly different color space.
+        return Err(UnsupportedFeature::InputFormat.into());
+    }
+    match classify_pixel_format(format) {
+        Ok(PixelFormatClass::Color(ColorFormatClass::Rgb8 {
+            storage: RgbStorage::Interleaved,
+            order: RgbChannelOrder::Rgb,
+        })) => Ok(LosslessModular8Format::Rgb),
+        Ok(PixelFormatClass::Color(ColorFormatClass::Rgb8 {
+            storage: RgbStorage::Interleaved,
+            order: RgbChannelOrder::Rgba,
+        })) => Ok(LosslessModular8Format::Rgba),
+        _ => Err(UnsupportedFeature::InputFormat.into()),
+    }
+}
+
+/// Row-major JPEG XL pass-group grid used by one Modular8 frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LosslessModular8GroupGrid {
     pub width: u32,
     pub height: u32,
     pub columns: u32,
@@ -88,23 +142,25 @@ pub struct LosslessGray8GroupGrid {
     pub lf_groups: u32,
 }
 
-impl LosslessGray8GroupGrid {
+impl LosslessModular8GroupGrid {
     fn for_extent(width: u32, height: u32) -> Result<Self, EncodeError> {
         if width == 0 || height == 0 || width >= (1 << 30) || height >= (1 << 30) {
             return Err(EncodeError::InvalidConfiguration(
-                "gray8 dimensions must be in 1..2^30",
+                "Modular8 dimensions must be in 1..2^30",
             ));
         }
-        let columns = width.div_ceil(LOSSLESS_GRAY8_GROUP_DIMENSION);
-        let rows = height.div_ceil(LOSSLESS_GRAY8_GROUP_DIMENSION);
+        let columns = width.div_ceil(LOSSLESS_MODULAR8_GROUP_DIMENSION);
+        let rows = height.div_ceil(LOSSLESS_MODULAR8_GROUP_DIMENSION);
         let groups = columns
             .checked_mul(rows)
-            .ok_or(EncodeError::InvalidSource("Gray8 group count overflow"))?;
-        let lf_columns = width.div_ceil(LOSSLESS_GRAY8_LF_GROUP_DIMENSION);
-        let lf_rows = height.div_ceil(LOSSLESS_GRAY8_LF_GROUP_DIMENSION);
+            .ok_or(EncodeError::InvalidSource("Modular8 group count overflow"))?;
+        let lf_columns = width.div_ceil(LOSSLESS_MODULAR8_LF_GROUP_DIMENSION);
+        let lf_rows = height.div_ceil(LOSSLESS_MODULAR8_LF_GROUP_DIMENSION);
         let lf_groups = lf_columns
             .checked_mul(lf_rows)
-            .ok_or(EncodeError::InvalidSource("Gray8 LF group count overflow"))?;
+            .ok_or(EncodeError::InvalidSource(
+                "Modular8 LF group count overflow",
+            ))?;
         // FrameGroupLayout performs the normative TOC-entry bound as well. Do it here so an
         // impossible grid is rejected before any driver allocation or queue interaction.
         FrameGroupLayout::new(lf_groups, groups, 1)?;
@@ -122,27 +178,27 @@ impl LosslessGray8GroupGrid {
 
     /// Resolves a canonical row-major pass-group index to its exact pixel rectangle.
     #[must_use]
-    pub fn group(self, index: u32) -> Option<LosslessGray8Group> {
+    pub fn group(self, index: u32) -> Option<LosslessModular8Group> {
         if index >= self.groups {
             return None;
         }
         let column = index % self.columns;
         let row = index / self.columns;
-        let x = column.checked_mul(LOSSLESS_GRAY8_GROUP_DIMENSION)?;
-        let y = row.checked_mul(LOSSLESS_GRAY8_GROUP_DIMENSION)?;
-        Some(LosslessGray8Group {
+        let x = column.checked_mul(LOSSLESS_MODULAR8_GROUP_DIMENSION)?;
+        let y = row.checked_mul(LOSSLESS_MODULAR8_GROUP_DIMENSION)?;
+        Some(LosslessModular8Group {
             index,
             column,
             row,
             x,
             y,
-            width: (self.width - x).min(LOSSLESS_GRAY8_GROUP_DIMENSION),
-            height: (self.height - y).min(LOSSLESS_GRAY8_GROUP_DIMENSION),
+            width: (self.width - x).min(LOSSLESS_MODULAR8_GROUP_DIMENSION),
+            height: (self.height - y).min(LOSSLESS_MODULAR8_GROUP_DIMENSION),
         })
     }
 
     /// Iterates the standard JPEG XL TOC PassGroup order.
-    pub fn ordered_groups(self) -> impl ExactSizeIterator<Item = LosslessGray8Group> {
+    pub fn ordered_groups(self) -> impl ExactSizeIterator<Item = LosslessModular8Group> {
         (0..self.groups).map(move |index| {
             self.group(index)
                 .expect("an index from the checked group range is valid")
@@ -152,7 +208,7 @@ impl LosslessGray8GroupGrid {
 
 /// One GPU workgroup and its standard row-major JPEG XL PassGroup destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LosslessGray8Group {
+pub struct LosslessModular8Group {
     pub index: u32,
     pub column: u32,
     pub row: u32,
@@ -162,10 +218,13 @@ pub struct LosslessGray8Group {
     pub height: u32,
 }
 
-/// Checked memory accounting for one concrete Gray8 submission.
+/// Checked memory accounting for one concrete Modular8 submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LosslessGray8MemoryPlan {
-    pub group_grid: LosslessGray8GroupGrid,
+pub struct LosslessModular8MemoryPlan {
+    pub group_grid: LosslessModular8GroupGrid,
+    pub format: LosslessModular8Format,
+    /// Number of independently tokenized Modular channels (1, 3, or 4).
+    pub channel_count: u32,
     pub source_binding_bytes: u64,
     pub parameter_storage_bytes: u64,
     pub artifact_storage_bytes: u64,
@@ -176,26 +235,26 @@ pub struct LosslessGray8MemoryPlan {
 
 /// Total memory exposure for a caller-selected maximum number of in-flight jobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LosslessGray8InFlightMemory {
+pub struct LosslessModular8InFlightMemory {
     pub max_in_flight_jobs: u32,
     pub total_owned_bytes: u64,
     pub total_addressed_bytes: u64,
 }
 
-/// Device limits that bound concrete Gray8 source and artifact bindings.
+/// Device limits that bound concrete Modular8 source and artifact bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LosslessGray8MemoryLimits {
+pub struct LosslessModular8MemoryLimits {
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
     pub max_compute_workgroups_per_dimension: u32,
 }
 
-impl LosslessGray8MemoryPlan {
+impl LosslessModular8MemoryPlan {
     pub fn for_in_flight(
         self,
         max_in_flight_jobs: u32,
-    ) -> Result<LosslessGray8InFlightMemory, EncodeError> {
+    ) -> Result<LosslessModular8InFlightMemory, EncodeError> {
         if max_in_flight_jobs == 0 {
             return Err(EncodeError::InvalidConfiguration(
                 "max in-flight job count must be non-zero",
@@ -211,7 +270,7 @@ impl LosslessGray8MemoryPlan {
         let total_addressed_bytes = self.addressed_bytes_per_job.checked_mul(jobs).ok_or(
             EncodeError::InvalidConfiguration("in-flight encoder memory size overflow"),
         )?;
-        Ok(LosslessGray8InFlightMemory {
+        Ok(LosslessModular8InFlightMemory {
             max_in_flight_jobs,
             total_owned_bytes,
             total_addressed_bytes,
@@ -220,33 +279,36 @@ impl LosslessGray8MemoryPlan {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Gray8GroupPlan {
+struct Modular8GroupPlan {
     width: u32,
     height: u32,
+    channel: u32,
     artifact_byte_offset: u64,
     output_size: u64,
     max_events: usize,
 }
 
 #[derive(Clone, Debug)]
-struct Gray8DispatchPlan {
+struct Modular8DispatchPlan {
     width: u32,
     height: u32,
-    group_grid: LosslessGray8GroupGrid,
-    parameters: Vec<Gray8Params>,
-    groups: Vec<Gray8GroupPlan>,
+    group_grid: LosslessModular8GroupGrid,
+    format: LosslessModular8Format,
+    parameters: Vec<Modular8Params>,
+    groups: Vec<Modular8GroupPlan>,
     source_binding_offset: u64,
     source_binding_size: NonZeroU64,
     output_size: u64,
-    memory: LosslessGray8MemoryPlan,
+    memory: LosslessModular8MemoryPlan,
 }
 
-/// GPU lossless 8-bit grayscale Modular encoding with row-major 256x256 pass groups.
+/// GPU lossless 8-bit Modular encoding with row-major 256x256 pass groups.
 ///
-/// It never reads source pixels on the CPU. The source buffer must contain one
-/// `PixelFormat::non_color(Unsigned, 8, &[X])` plane. The GPU emits predictor
+/// It never reads source pixels on the CPU. The source buffer may contain Gray8,
+/// packed RGB8, or packed RGBA8. RGB samples are converted to the normative
+/// reversible YCoCg transform in WGSL before prediction. The GPU emits predictor
 /// residual tokens and histograms; the host only serializes those artifacts.
-pub struct LosslessGray8Backend {
+pub struct LosslessModular8Backend {
     pipeline: Arc<wgpu::ComputePipeline>,
     buffer_pool: Arc<EncoderBufferPool>,
     capabilities: EncoderCapabilities,
@@ -256,18 +318,18 @@ pub struct LosslessGray8Backend {
     max_compute_workgroups_per_dimension: u32,
 }
 
-impl LosslessGray8Backend {
+impl LosslessModular8Backend {
     #[must_use]
     pub fn new(context: &WgpuContext) -> Self {
         let module = context
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("jxl-wgpu lossless gray8 token kernel"),
+                label: Some("jxl-wgpu lossless modular8 token kernel"),
                 source: wgpu::ShaderSource::Wgsl(SHADER.into()),
             });
         let pipeline = Arc::new(context.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
-                label: Some("jxl-wgpu lossless gray8 token pipeline"),
+                label: Some("jxl-wgpu lossless modular8 token pipeline"),
                 layout: None,
                 module: &module,
                 entry_point: Some("encode"),
@@ -288,6 +350,8 @@ impl LosslessGray8Backend {
                 animation: false,
                 determinism: Determinism::CrossDevice,
                 implemented_stages: vec![
+                    KernelStage::ColorTransform,
+                    KernelStage::ModularTransform,
                     KernelStage::ModularPrediction,
                     KernelStage::ModularResidualTokenization,
                     KernelStage::HistogramReduction,
@@ -303,13 +367,13 @@ impl LosslessGray8Backend {
     pub fn memory_plan(
         &self,
         source: &crate::BufferImageSource,
-    ) -> Result<LosslessGray8MemoryPlan, EncodeError> {
+    ) -> Result<LosslessModular8MemoryPlan, EncodeError> {
         Ok(self.dispatch_plan(source)?.memory)
     }
 
     #[must_use]
-    pub fn memory_limits(&self) -> LosslessGray8MemoryLimits {
-        LosslessGray8MemoryLimits {
+    pub fn memory_limits(&self) -> LosslessModular8MemoryLimits {
+        LosslessModular8MemoryLimits {
             max_storage_buffer_binding_size: self.max_storage_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.storage_offset_alignment,
@@ -342,19 +406,27 @@ impl LosslessGray8Backend {
     fn dispatch_plan(
         &self,
         source: &crate::BufferImageSource,
-    ) -> Result<Gray8DispatchPlan, EncodeError> {
+    ) -> Result<Modular8DispatchPlan, EncodeError> {
         let extent = source.layout.extent;
-        let group_grid = LosslessGray8GroupGrid::for_extent(extent.width, extent.height)?;
-        if group_grid.groups > self.max_compute_workgroups_per_dimension {
+        let group_grid = LosslessModular8GroupGrid::for_extent(extent.width, extent.height)?;
+        let format = lossless_modular8_format(&source.layout.format)?;
+        let channels = format.channel_count();
+        let dispatches =
+            group_grid
+                .groups
+                .checked_mul(channels)
+                .ok_or(EncodeError::InvalidSource(
+                    "Modular8 dispatch count overflow",
+                ))?;
+        if dispatches > self.max_compute_workgroups_per_dimension {
             return Err(UnsupportedFeature::DeviceLimit {
                 name: "max_compute_workgroups_per_dimension",
-                required: u64::from(group_grid.groups),
+                required: u64::from(dispatches),
                 available: u64::from(self.max_compute_workgroups_per_dimension),
             }
             .into());
         }
-        if source.layout.format != PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X])
-            || source.layout.planes.len() != 1
+        if source.layout.planes.len() != 1
             || !source.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
             || !source.buffer.size().is_multiple_of(4)
         {
@@ -363,13 +435,16 @@ impl LosslessGray8Backend {
         let plane = source
             .layout
             .plane(0)
-            .ok_or(EncodeError::InvalidSource("missing grayscale plane"))?;
+            .ok_or(EncodeError::InvalidSource("missing Modular8 plane"))?;
         let row_stride = u32::try_from(plane.row_stride).map_err(|_| {
-            EncodeError::InvalidSource("row stride exceeds the Gray8 profile limit")
+            EncodeError::InvalidSource("row stride exceeds the Modular8 profile limit")
         })?;
-        if plane.row_stride < u64::from(extent.width) {
+        let row_bytes = u64::from(extent.width)
+            .checked_mul(u64::from(channels))
+            .ok_or(EncodeError::InvalidSource("source row size overflow"))?;
+        if plane.row_stride < row_bytes {
             return Err(EncodeError::InvalidSource(
-                "row stride is smaller than the grayscale row width",
+                "row stride is smaller than the packed Modular8 row width",
             ));
         }
         let preceding_rows = plane
@@ -381,7 +456,7 @@ impl LosslessGray8Backend {
         let sample_end = plane
             .offset
             .checked_add(preceding_rows)
-            .and_then(|value| value.checked_add(u64::from(extent.width)))
+            .and_then(|value| value.checked_add(row_bytes))
             .ok_or(EncodeError::InvalidSource(
                 "source address arithmetic overflow",
             ))?;
@@ -436,10 +511,10 @@ impl LosslessGray8Backend {
             EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
         })?;
 
-        let group_count = usize::try_from(group_grid.groups)
-            .map_err(|_| EncodeError::InvalidSource("Gray8 group count overflow"))?;
-        let mut parameters = Vec::with_capacity(group_count);
-        let mut groups = Vec::with_capacity(group_count);
+        let dispatch_count = usize::try_from(dispatches)
+            .map_err(|_| EncodeError::InvalidSource("Modular8 dispatch count overflow"))?;
+        let mut parameters = Vec::with_capacity(dispatch_count);
+        let mut groups = Vec::with_capacity(dispatch_count);
         let mut output_size = 0u64;
         for group in group_grid.ordered_groups() {
             let x = group.x;
@@ -460,15 +535,16 @@ impl LosslessGray8Backend {
                 .ok()
                 .and_then(|words| words.checked_mul(4))
                 .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
-            let output_word_offset = u32::try_from(output_size / 4).map_err(|_| {
-                EncodeError::InvalidSource("artifact buffer exceeds WGSL u32 indexing")
-            })?;
             let tile_byte_offset = plane
                 .offset
                 .checked_add(plane.row_stride.checked_mul(u64::from(y)).ok_or(
                     EncodeError::InvalidSource("source address arithmetic overflow"),
                 )?)
-                .and_then(|value| value.checked_add(u64::from(x)))
+                .and_then(|value| {
+                    u64::from(x)
+                        .checked_mul(u64::from(channels))
+                        .and_then(|x_offset| value.checked_add(x_offset))
+                })
                 .and_then(|value| value.checked_sub(source_binding_offset))
                 .ok_or(EncodeError::InvalidSource(
                     "source address arithmetic overflow",
@@ -476,23 +552,31 @@ impl LosslessGray8Backend {
             let byte_offset = u32::try_from(tile_byte_offset).map_err(|_| {
                 EncodeError::InvalidSource("source address exceeds the WGSL u32 address space")
             })?;
-            parameters.push(Gray8Params {
-                width,
-                height,
-                row_stride,
-                byte_offset,
-                output_word_offset,
-            });
-            groups.push(Gray8GroupPlan {
-                width,
-                height,
-                artifact_byte_offset: output_size,
-                output_size: group_output_size,
-                max_events,
-            });
-            output_size = output_size
-                .checked_add(group_output_size)
-                .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            for channel in 0..channels {
+                let output_word_offset = u32::try_from(output_size / 4).map_err(|_| {
+                    EncodeError::InvalidSource("artifact buffer exceeds WGSL u32 indexing")
+                })?;
+                parameters.push(Modular8Params {
+                    width,
+                    height,
+                    row_stride,
+                    byte_offset,
+                    output_word_offset,
+                    channel,
+                    channels,
+                });
+                groups.push(Modular8GroupPlan {
+                    width,
+                    height,
+                    channel,
+                    artifact_byte_offset: output_size,
+                    output_size: group_output_size,
+                    max_events,
+                });
+                output_size = output_size
+                    .checked_add(group_output_size)
+                    .ok_or(EncodeError::InvalidSource("event buffer size overflow"))?;
+            }
         }
         let output_words = output_size / 4;
         if output_words > u64::from(u32::MAX) + 1 {
@@ -519,7 +603,7 @@ impl LosslessGray8Backend {
         let parameter_storage_bytes = u64::try_from(parameters.len())
             .ok()
             .and_then(|count| {
-                count.checked_mul(u64::try_from(std::mem::size_of::<Gray8Params>()).ok()?)
+                count.checked_mul(u64::try_from(std::mem::size_of::<Modular8Params>()).ok()?)
             })
             .ok_or(EncodeError::InvalidSource(
                 "group parameter storage size overflow",
@@ -547,8 +631,10 @@ impl LosslessGray8Backend {
         let addressed_bytes_per_job = owned_bytes_per_job
             .checked_add(source_binding_bytes)
             .ok_or(EncodeError::InvalidSource("per-job memory size overflow"))?;
-        let memory = LosslessGray8MemoryPlan {
+        let memory = LosslessModular8MemoryPlan {
             group_grid,
+            format,
+            channel_count: channels,
             source_binding_bytes,
             parameter_storage_bytes,
             artifact_storage_bytes: output_size,
@@ -556,10 +642,11 @@ impl LosslessGray8Backend {
             owned_bytes_per_job,
             addressed_bytes_per_job,
         };
-        Ok(Gray8DispatchPlan {
+        Ok(Modular8DispatchPlan {
             width: extent.width,
             height: extent.height,
             group_grid,
+            format,
             parameters,
             groups,
             source_binding_offset,
@@ -585,8 +672,8 @@ fn event_capacity(pixel_count: usize) -> Result<usize, EncodeError> {
         .ok_or(EncodeError::InvalidSource("event buffer size overflow"))
 }
 
-impl GpuEncodeBackend for LosslessGray8Backend {
-    type Job = LosslessGray8Job;
+impl GpuEncodeBackend for LosslessModular8Backend {
+    type Job = LosslessModular8Job;
 
     fn capabilities(&self) -> &EncoderCapabilities {
         &self.capabilities
@@ -613,7 +700,7 @@ impl GpuEncodeBackend for LosslessGray8Backend {
         }
         if request.options != FrameOptions::default() {
             return Err(EncodeError::InvalidConfiguration(
-                "the Gray8 profile only supports default still-frame options",
+                "the lossless Modular8 profile only supports default still-frame options",
             ));
         }
         let GpuFrameSource::Buffer(source) = source else {
@@ -638,7 +725,7 @@ impl GpuEncodeBackend for LosslessGray8Backend {
         let bind_group = context
             .device()
             .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("jxl-wgpu lossless gray8 bindings"),
+                label: Some("jxl-wgpu lossless modular8 bindings"),
                 layout: &self.pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -663,17 +750,17 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             context
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu lossless gray8 encode"),
+                    label: Some("jxl-wgpu lossless modular8 encode"),
                 });
         commands.clear_buffer(&buffers.artifact, 0, None);
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jxl-wgpu lossless gray8 tokenization"),
+                label: Some("jxl-wgpu lossless modular8 tokenization"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(plan.group_grid.groups, 1, 1);
+            pass.dispatch_workgroups(plan.group_grid.groups * plan.format.channel_count(), 1, 1);
         }
         commands.copy_buffer_to_buffer(
             &buffers.artifact,
@@ -715,12 +802,13 @@ impl GpuEncodeBackend for LosslessGray8Backend {
             completion.complete(Err(format!("GPU poll registration failed: {error}")));
         }
 
-        Ok(LosslessGray8Job {
+        Ok(LosslessModular8Job {
             lifetime: Some(lifetime),
             completion,
             output_size: plan.output_size,
             group_grid: plan.group_grid,
             groups: plan.groups,
+            format: plan.format,
             width: plan.width,
             height: plan.height,
             frame_index: request.frame_index,
@@ -791,12 +879,13 @@ impl MapCompletion {
 }
 
 /// Runtime-neutral completion for the concrete GPU lossless profile.
-pub struct LosslessGray8Job {
+pub struct LosslessModular8Job {
     lifetime: Option<Arc<EncodeJobLifetime>>,
     completion: Arc<MapCompletion>,
     output_size: u64,
-    group_grid: LosslessGray8GroupGrid,
-    groups: Vec<Gray8GroupPlan>,
+    group_grid: LosslessModular8GroupGrid,
+    groups: Vec<Modular8GroupPlan>,
+    format: LosslessModular8Format,
     width: u32,
     height: u32,
     frame_index: FrameIndex,
@@ -817,7 +906,7 @@ impl Drop for EncodeJobLifetime {
     }
 }
 
-impl LosslessGray8Job {
+impl LosslessModular8Job {
     fn finish(&mut self, mapping: Result<(), String>) -> Result<GpuFrameArtifacts, EncodeError> {
         let lifetime = self
             .lifetime
@@ -840,6 +929,7 @@ impl LosslessGray8Job {
             self.width,
             self.height,
             self.group_grid,
+            self.format,
             &self.groups,
             bytes,
         );
@@ -857,7 +947,7 @@ impl LosslessGray8Job {
     }
 }
 
-impl GpuEncodeJob for LosslessGray8Job {
+impl GpuEncodeJob for LosslessModular8Job {
     fn poll_complete(
         &mut self,
         cx: &mut Context<'_>,
@@ -886,14 +976,14 @@ impl GpuEncodeJob for LosslessGray8Job {
 
 /// Convenience API that produces a complete raw codestream or deterministic
 /// `jxlc` container from a GPU-resident grayscale buffer.
-pub struct LosslessGray8Encoder {
-    encoder: GpuEncoder<LosslessGray8Backend>,
+pub struct LosslessModular8Encoder {
+    encoder: GpuEncoder<LosslessModular8Backend>,
 }
 
-impl LosslessGray8Encoder {
+impl LosslessModular8Encoder {
     #[must_use]
     pub fn new(context: WgpuContext) -> Self {
-        let backend = LosslessGray8Backend::new(&context);
+        let backend = LosslessModular8Backend::new(&context);
         Self {
             encoder: GpuEncoder::new(context, backend),
         }
@@ -905,7 +995,7 @@ impl LosslessGray8Encoder {
     /// zero creates buffers on demand and drops them immediately after each mapping callback.
     #[must_use]
     pub fn with_buffer_pool_limit(context: WgpuContext, limit_bytes: u64) -> Self {
-        let backend = LosslessGray8Backend::new(&context);
+        let backend = LosslessModular8Backend::new(&context);
         backend.set_buffer_pool_limit(limit_bytes);
         Self {
             encoder: GpuEncoder::new(context, backend),
@@ -927,12 +1017,12 @@ impl LosslessGray8Encoder {
     pub fn memory_plan(
         &self,
         source: &crate::BufferImageSource,
-    ) -> Result<LosslessGray8MemoryPlan, EncodeError> {
+    ) -> Result<LosslessModular8MemoryPlan, EncodeError> {
         self.encoder.backend().memory_plan(source)
     }
 
     #[must_use]
-    pub fn memory_limits(&self) -> LosslessGray8MemoryLimits {
+    pub fn memory_limits(&self) -> LosslessModular8MemoryLimits {
         self.encoder.backend().memory_limits()
     }
 
@@ -955,14 +1045,16 @@ impl LosslessGray8Encoder {
     pub fn submit(
         &self,
         source: crate::BufferImageSource,
-    ) -> Result<LosslessGray8Submission, EncodeError> {
+    ) -> Result<LosslessModular8Submission, EncodeError> {
+        self.memory_plan(&source)?;
         self.submit_inner(source, false)
     }
 
     pub fn submit_container(
         &self,
         source: crate::BufferImageSource,
-    ) -> Result<LosslessGray8Submission, EncodeError> {
+    ) -> Result<LosslessModular8Submission, EncodeError> {
+        self.memory_plan(&source)?;
         self.submit_inner(source, true)
     }
 
@@ -981,13 +1073,14 @@ impl LosslessGray8Encoder {
         &self,
         source: crate::BufferImageSource,
         container: bool,
-    ) -> Result<LosslessGray8Submission, EncodeError> {
+    ) -> Result<LosslessModular8Submission, EncodeError> {
         // Preserve typed address/device-limit failures before the generic
         // backend admission predicate maps unsupported inputs to InputFormat.
-        self.memory_plan(&source)?;
+        self.encoder.backend().memory_plan(&source)?;
         let width = source.layout.extent.width;
         let height = source.layout.extent.height;
-        let group_grid = LosslessGray8GroupGrid::for_extent(width, height)?;
+        let format = lossless_modular8_format(&source.layout.format)?;
+        let group_grid = LosslessModular8GroupGrid::for_extent(width, height)?;
         let request = FrameEncodeRequest {
             frame_index: FrameIndex::new(0),
             is_last: true,
@@ -1000,32 +1093,38 @@ impl LosslessGray8Encoder {
         let frame = self
             .encoder
             .submit_frame(GpuFrameSource::Buffer(source), request)?;
-        Ok(LosslessGray8Submission {
+        Ok(LosslessModular8Submission {
             frame: Some(frame),
-            codestream_header: image_header(width, height)?,
+            codestream_header: image_header(width, height, format)?,
             container,
             group_grid,
+            format,
         })
     }
 }
 
 /// A `Future` with an executor-independent blocking counterpart.
-pub struct LosslessGray8Submission {
-    frame: Option<FrameSubmission<LosslessGray8Job>>,
+pub struct LosslessModular8Submission {
+    frame: Option<FrameSubmission<LosslessModular8Job>>,
     codestream_header: BitFragment,
     container: bool,
-    group_grid: LosslessGray8GroupGrid,
+    group_grid: LosslessModular8GroupGrid,
+    format: LosslessModular8Format,
 }
 
-impl LosslessGray8Submission {
+impl LosslessModular8Submission {
+    #[must_use]
+    pub const fn format(&self) -> LosslessModular8Format {
+        self.format
+    }
     /// Exact row-major group grid dispatched by this submission.
     #[must_use]
-    pub const fn group_grid(&self) -> LosslessGray8GroupGrid {
+    pub const fn group_grid(&self) -> LosslessModular8GroupGrid {
         self.group_grid
     }
 
     /// Canonical descriptors for the independently executed GPU workgroups.
-    pub fn ordered_groups(&self) -> impl ExactSizeIterator<Item = LosslessGray8Group> {
+    pub fn ordered_groups(&self) -> impl ExactSizeIterator<Item = LosslessModular8Group> {
         self.group_grid.ordered_groups()
     }
 
@@ -1114,7 +1213,7 @@ impl LosslessGray8Submission {
     }
 }
 
-impl Future for LosslessGray8Submission {
+impl Future for LosslessModular8Submission {
     type Output = Result<Vec<u8>, EncodeError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1136,19 +1235,32 @@ impl Future for LosslessGray8Submission {
 fn build_packets(
     width: u32,
     height: u32,
-    group_grid: LosslessGray8GroupGrid,
-    group_plans: &[Gray8GroupPlan],
+    group_grid: LosslessModular8GroupGrid,
+    format: LosslessModular8Format,
+    group_plans: &[Modular8GroupPlan],
     bytes: &[u8],
 ) -> Result<(FramePacketSet, Option<GpuAccelerationArtifact>), EncodeError> {
-    if group_plans.len() != group_grid.groups as usize {
+    let channels = usize::try_from(format.channel_count())
+        .map_err(|_| EncodeError::Backend("Modular8 channel count overflow".into()))?;
+    let expected_artifacts = usize::try_from(group_grid.groups)
+        .ok()
+        .and_then(|groups| groups.checked_mul(channels))
+        .ok_or_else(|| EncodeError::Backend("GPU group plan count overflow".into()))?;
+    if group_plans.len() != expected_artifacts {
         return Err(EncodeError::Backend(
             "GPU group plan does not match the frame grid".into(),
         ));
     }
     let mut artifacts = Vec::with_capacity(group_plans.len());
-    let mut aggregate_raw = [0u64; RAW_SYMBOLS];
-    let mut aggregate_lz77 = [0u64; LZ77_SYMBOLS];
-    for plan in group_plans {
+    let mut aggregate_raw = [[0u64; RAW_SYMBOLS]; 4];
+    let mut aggregate_lz77 = [[0u64; LZ77_SYMBOLS]; 4];
+    for (artifact_index, plan) in group_plans.iter().enumerate() {
+        let channel = artifact_index % channels;
+        if plan.channel != channel as u32 {
+            return Err(EncodeError::Backend(
+                "GPU group plan channel order is not canonical".into(),
+            ));
+        }
         let start = usize::try_from(plan.artifact_byte_offset)
             .map_err(|_| EncodeError::Backend("GPU artifact offset overflow".into()))?;
         let end = plan
@@ -1161,12 +1273,18 @@ fn build_packets(
             .ok_or_else(|| EncodeError::Backend("GPU group artifact is truncated".into()))?;
         let artifact =
             parse_group_artifact(plan.width, plan.height, plan.max_events, artifact_bytes)?;
-        for (total, count) in aggregate_raw.iter_mut().zip(artifact.header.raw_counts) {
+        for (total, count) in aggregate_raw[channel]
+            .iter_mut()
+            .zip(artifact.header.raw_counts)
+        {
             *total = total
                 .checked_add(u64::from(count))
                 .ok_or_else(|| invalid_gpu_artifact("aggregate raw histogram overflow"))?;
         }
-        for (total, count) in aggregate_lz77.iter_mut().zip(artifact.header.lz77_counts) {
+        for (total, count) in aggregate_lz77[channel]
+            .iter_mut()
+            .zip(artifact.header.lz77_counts)
+        {
             *total = total
                 .checked_add(u64::from(count))
                 .ok_or_else(|| invalid_gpu_artifact("aggregate LZ77 histogram overflow"))?;
@@ -1174,15 +1292,26 @@ fn build_packets(
         artifacts.push(artifact);
     }
 
-    let primary = PrefixCode::from_aggregated_counts(&aggregate_raw, &aggregate_lz77)?;
     let unused = PrefixCode::fixed_unused_channel();
-    let codes = [primary.clone(), unused.clone(), unused.clone(), unused];
+    let mut codes = [unused.clone(), unused.clone(), unused.clone(), unused];
+    for channel in 0..channels {
+        codes[channel] = if format == LosslessModular8Format::Gray {
+            PrefixCode::from_aggregated_counts(&aggregate_raw[channel], &aggregate_lz77[channel])?
+        } else {
+            PrefixCode::from_aggregated_ycocg_counts(
+                &aggregate_raw[channel],
+                &aggregate_lz77[channel],
+            )?
+        };
+    }
     if group_grid.groups == 1 {
         let mut group = BitWriter::new();
-        write_dc_global(&mut group, &codes)?;
+        write_dc_global(&mut group, &codes, format)?;
         let token_bit_offset_in_group = u64::try_from(group.bit_len())
             .map_err(|_| EncodeError::Backend("gray8 token offset overflow".into()))?;
-        write_events(&mut group, &codes[0], artifacts[0].events)?;
+        for channel in 0..channels {
+            write_events(&mut group, &codes[channel], artifacts[channel].events)?;
+        }
         let token_bit_end = u64::try_from(group.bit_len())
             .map_err(|_| EncodeError::Backend("gray8 token length overflow".into()))?;
         let token_bit_len = token_bit_end
@@ -1190,28 +1319,30 @@ fn build_packets(
             .ok_or_else(|| EncodeError::Backend("gray8 token length underflow".into()))?;
         group.align_to_byte()?;
         let packets = FramePacketSet::new(
-            frame_header()?,
+            frame_header(format)?,
             FrameGroupLayout::new(1, 1, 1)?,
             [GroupPacket::new(
                 GroupPacketKind::Single,
                 group.into_bytes(),
             )],
         )?;
-        let acceleration = GpuAccelerationArtifact::Gray8Prefix {
-            width,
-            height,
-            token_bit_offset_in_group,
-            token_bit_len,
-            raw_prefix: codes[0].raw_entries(),
-            lz77_prefix: codes[0].lz77_entries(),
-        };
-        return Ok((packets, Some(acceleration)));
+        let acceleration = (format == LosslessModular8Format::Gray).then(|| {
+            GpuAccelerationArtifact::Gray8Prefix {
+                width,
+                height,
+                token_bit_offset_in_group,
+                token_bit_len,
+                raw_prefix: codes[0].raw_entries(),
+                lz77_prefix: codes[0].lz77_entries(),
+            }
+        });
+        return Ok((packets, acceleration));
     }
 
     let layout = FrameGroupLayout::new(group_grid.lf_groups, group_grid.groups, 1)?;
     let mut packets = Vec::with_capacity(layout.toc_entries());
     let mut dc_global = BitWriter::new();
-    write_dc_global(&mut dc_global, &codes)?;
+    write_dc_global(&mut dc_global, &codes, format)?;
     dc_global.align_to_byte()?;
     packets.push(GroupPacket::new(
         GroupPacketKind::DcGlobal,
@@ -1225,30 +1356,38 @@ fn build_packets(
     }
     // Lossless Modular has no VarDCT HF-global payload.
     packets.push(GroupPacket::new(GroupPacketKind::AcGlobal, Vec::new()));
-    for (group, artifact) in artifacts.iter().enumerate() {
+    for group in 0..usize::try_from(group_grid.groups)
+        .map_err(|_| EncodeError::Backend("Modular8 group index overflow".into()))?
+    {
         let mut pass_group = BitWriter::new();
         // GroupHeader: use the LF-global tree, default weighted predictor, no transforms.
         pass_group.write_bits(1, 1)?;
         pass_group.write_bits(1, 1)?;
         pass_group.write_bits(0, 2)?;
-        write_events(&mut pass_group, &codes[0], artifact.events)?;
+        for channel in 0..channels {
+            let artifact = &artifacts[group * channels + channel];
+            write_events(&mut pass_group, &codes[channel], artifact.events)?;
+        }
         pass_group.align_to_byte()?;
         packets.push(GroupPacket::new(
             GroupPacketKind::AcGroup {
                 pass: 0,
                 group: u32::try_from(group)
-                    .map_err(|_| EncodeError::Backend("Gray8 group index overflow".into()))?,
+                    .map_err(|_| EncodeError::Backend("Modular8 group index overflow".into()))?,
             },
             pass_group.into_bytes(),
         ));
     }
-    Ok((FramePacketSet::new(frame_header()?, layout, packets)?, None))
+    Ok((
+        FramePacketSet::new(frame_header(format)?, layout, packets)?,
+        None,
+    ))
 }
 
 #[derive(Clone, Copy)]
-struct ValidatedGray8Artifact<'a> {
-    header: Gray8ArtifactHeader,
-    events: &'a [Gray8Event],
+struct ValidatedModular8Artifact<'a> {
+    header: Modular8ArtifactHeader,
+    events: &'a [Modular8Event],
 }
 
 fn parse_group_artifact<'a>(
@@ -1256,11 +1395,11 @@ fn parse_group_artifact<'a>(
     height: u32,
     max_events: usize,
     bytes: &'a [u8],
-) -> Result<ValidatedGray8Artifact<'a>, EncodeError> {
+) -> Result<ValidatedModular8Artifact<'a>, EncodeError> {
     let header_bytes = bytes
-        .get(..std::mem::size_of::<Gray8ArtifactHeader>())
+        .get(..std::mem::size_of::<Modular8ArtifactHeader>())
         .ok_or_else(|| EncodeError::Backend("GPU artifact header is truncated".into()))?;
-    let header = bytemuck::try_cast_slice::<u8, Gray8ArtifactHeader>(header_bytes)
+    let header = bytemuck::try_cast_slice::<u8, Modular8ArtifactHeader>(header_bytes)
         .map_err(|_| EncodeError::Backend("GPU artifact header has an invalid ABI layout".into()))?
         .first()
         .copied()
@@ -1273,25 +1412,25 @@ fn parse_group_artifact<'a>(
         ));
     }
     let event_bytes = event_count
-        .checked_mul(std::mem::size_of::<Gray8Event>())
+        .checked_mul(std::mem::size_of::<Modular8Event>())
         .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
-    let required_bytes = std::mem::size_of::<Gray8ArtifactHeader>()
+    let required_bytes = std::mem::size_of::<Modular8ArtifactHeader>()
         .checked_add(event_bytes)
         .ok_or_else(|| EncodeError::Backend("GPU event count overflow".into()))?;
     let events = bytes
-        .get(std::mem::size_of::<Gray8ArtifactHeader>()..required_bytes)
+        .get(std::mem::size_of::<Modular8ArtifactHeader>()..required_bytes)
         .ok_or_else(|| EncodeError::Backend("GPU event stream is truncated".into()))?;
-    let events = bytemuck::try_cast_slice::<u8, Gray8Event>(events)
+    let events = bytemuck::try_cast_slice::<u8, Modular8Event>(events)
         .map_err(|_| EncodeError::Backend("GPU event stream has an invalid ABI layout".into()))?;
 
     validate_gpu_artifacts(width, height, &header, events)?;
-    Ok(ValidatedGray8Artifact { header, events })
+    Ok(ValidatedModular8Artifact { header, events })
 }
 
 fn write_events(
     output: &mut BitWriter,
     code: &PrefixCode,
-    events: &[Gray8Event],
+    events: &[Modular8Event],
 ) -> Result<(), EncodeError> {
     for event in events {
         match event.kind {
@@ -1310,8 +1449,8 @@ fn write_events(
 fn validate_gpu_artifacts(
     width: u32,
     height: u32,
-    header: &Gray8ArtifactHeader,
-    events: &[Gray8Event],
+    header: &Modular8ArtifactHeader,
+    events: &[Modular8Event],
 ) -> Result<(), EncodeError> {
     let mut raw_counts = [0u32; RAW_SYMBOLS];
     let mut lz77_counts = [0u32; LZ77_SYMBOLS];
@@ -1322,7 +1461,7 @@ fn validate_gpu_artifacts(
             0 => {
                 let token = usize::try_from(event.token)
                     .map_err(|_| invalid_gpu_artifact("raw token overflow"))?;
-                if token > 9 {
+                if token > 10 {
                     return Err(invalid_gpu_artifact("impossible raw token"));
                 }
                 let expected_nbits = event.token.saturating_sub(1);
@@ -1401,7 +1540,11 @@ fn invalid_gpu_artifact(reason: &'static str) -> EncodeError {
     EncodeError::Backend(format!("invalid GPU artifact: {reason}"))
 }
 
-fn write_dc_global(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<(), EncodeError> {
+fn write_dc_global(
+    output: &mut BitWriter,
+    codes: &[PrefixCode; 4],
+    format: LosslessModular8Format,
+) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
     output.write_bits(1, 1)?;
@@ -1459,11 +1602,22 @@ fn write_dc_global(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<()
     }
     output.write_bits(1, 1)?;
     output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
+    if format.channel_count() > 2 {
+        output.write_bits(1, 2)?; // one transform
+        output.write_bits(0, 2)?; // reversible color transform
+        output.write_bits(0, 5)?; // begin channel 0
+        output.write_bits(0, 2)?; // YCoCg transform type 0
+    } else {
+        output.write_bits(0, 2)?; // no transforms
+    }
     Ok(())
 }
 
-fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
+fn image_header(
+    width: u32,
+    height: u32,
+    format: LosslessModular8Format,
+) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0x0aff, 16)?;
     output.write_bits(0, 1)?;
@@ -1474,16 +1628,25 @@ fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
     output.write_bits(0, 1)?;
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;
-    output.write_bits(0, 2)?;
+    if format.has_alpha() {
+        output.write_bits(1, 2)?; // one alpha extra channel
+        output.write_bits(1, 1)?; // default 8-bit, unassociated alpha metadata
+    } else {
+        output.write_bits(0, 2)?;
+    }
     output.write_bits(0, 1)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(1, 2)?;
-    output.write_bits(1, 2)?;
-    output.write_bits(0, 1)?;
-    output.write_bits(0b10, 2)?;
-    output.write_bits(11, 4)?;
-    output.write_bits(1, 2)?;
+    if format.channel_count() > 2 {
+        output.write_bits(1, 1)?; // default sRGB color encoding
+    } else {
+        output.write_bits(0, 1)?;
+        output.write_bits(0, 1)?;
+        output.write_bits(1, 2)?;
+        output.write_bits(1, 2)?;
+        output.write_bits(0, 1)?;
+        output.write_bits(0b10, 2)?;
+        output.write_bits(11, 4)?;
+        output.write_bits(1, 2)?;
+    }
     output.write_bits(0, 2)?;
     output.write_bits(1, 1)?;
     output.align_to_byte()?;
@@ -1493,7 +1656,7 @@ fn image_header(width: u32, height: u32) -> Result<BitFragment, EncodeError> {
 fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), EncodeError> {
     if !(1..(1 << 30)).contains(&size) {
         return Err(EncodeError::InvalidConfiguration(
-            "gray8 dimensions must be in 1..2^30",
+            "Modular8 dimensions must be in 1..2^30",
         ));
     }
     let value = size - 1;
@@ -1514,7 +1677,7 @@ fn write_size(output: &mut BitWriter, size: u32, ratio: bool) -> Result<(), Enco
     Ok(())
 }
 
-fn frame_header() -> Result<BitFragment, EncodeError> {
+fn frame_header(format: LosslessModular8Format) -> Result<BitFragment, EncodeError> {
     let mut output = BitWriter::new();
     output.write_bits(0, 1)?;
     output.write_bits(0, 2)?;
@@ -1522,10 +1685,16 @@ fn frame_header() -> Result<BitFragment, EncodeError> {
     output.write_bits(0, 2)?;
     output.write_bits(0, 1)?;
     output.write_bits(0, 2)?;
+    if format.has_alpha() {
+        output.write_bits(0, 2)?;
+    }
     output.write_bits(1, 2)?;
     output.write_bits(0, 2)?;
     output.write_bits(0, 1)?;
     output.write_bits(0, 2)?;
+    if format.has_alpha() {
+        output.write_bits(0, 2)?;
+    }
     output.write_bits(1, 1)?;
     output.write_bits(0, 2)?;
     output.write_bits(0, 1)?;
@@ -1602,50 +1771,55 @@ mod tests {
     }
 
     #[test]
-    fn gray8_params_abi_matches_wgsl_storage_array() {
-        assert_eq!(std::mem::size_of::<Gray8Params>(), 20);
-        assert_eq!(std::mem::align_of::<Gray8Params>(), 4);
-        let params = Gray8Params {
+    fn modular8_params_abi_matches_wgsl_storage_array() {
+        assert_eq!(std::mem::size_of::<Modular8Params>(), 28);
+        assert_eq!(std::mem::align_of::<Modular8Params>(), 4);
+        let params = Modular8Params {
             width: 1,
             height: 2,
             row_stride: 3,
             byte_offset: 4,
             output_word_offset: 5,
+            channel: 6,
+            channels: 7,
         };
         assert_eq!(
-            bytemuck::cast::<Gray8Params, [u32; 5]>(params),
-            [1, 2, 3, 4, 5]
+            bytemuck::cast::<Modular8Params, [u32; 7]>(params),
+            [1, 2, 3, 4, 5, 6, 7]
         );
         assert!(SHADER.contains(
-            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n    output_word_offset: u32,\n}"
+            "struct Params {\n    width: u32,\n    height: u32,\n    row_stride: u32,\n    byte_offset: u32,\n    output_word_offset: u32,\n    channel: u32,\n    channels: u32,\n}"
         ));
         assert!(SHADER.contains("var<storage, read> group_params: array<Params>;"));
     }
 
     #[test]
-    fn gray8_artifact_abi_matches_wgsl_word_schema() {
-        assert_eq!(std::mem::size_of::<Gray8ArtifactHeader>(), 53 * 4);
-        assert_eq!(std::mem::align_of::<Gray8ArtifactHeader>(), 4);
-        assert_eq!(std::mem::size_of::<Gray8Event>(), 4 * 4);
-        assert_eq!(std::mem::align_of::<Gray8Event>(), 4);
+    fn modular8_artifact_abi_matches_wgsl_word_schema() {
+        assert_eq!(std::mem::size_of::<Modular8ArtifactHeader>(), 53 * 4);
+        assert_eq!(std::mem::align_of::<Modular8ArtifactHeader>(), 4);
+        assert_eq!(std::mem::size_of::<Modular8Event>(), 4 * 4);
+        assert_eq!(std::mem::align_of::<Modular8Event>(), 4);
 
-        let header = Gray8ArtifactHeader {
+        let header = Modular8ArtifactHeader {
             event_count: 7,
             raw_counts: std::array::from_fn(|index| 100 + index as u32),
             lz77_counts: std::array::from_fn(|index| 200 + index as u32),
         };
-        let words = bytemuck::cast::<Gray8ArtifactHeader, [u32; 53]>(header);
+        let words = bytemuck::cast::<Modular8ArtifactHeader, [u32; 53]>(header);
         assert_eq!(words[0], 7);
         assert_eq!(words[1..20], header.raw_counts);
         assert_eq!(words[20..53], header.lz77_counts);
 
-        let event = Gray8Event {
+        let event = Modular8Event {
             kind: 1,
             token: 2,
             extra_bit_count: 3,
             extra_bits: 4,
         };
-        assert_eq!(bytemuck::cast::<Gray8Event, [u32; 4]>(event), [1, 2, 3, 4]);
+        assert_eq!(
+            bytemuck::cast::<Modular8Event, [u32; 4]>(event),
+            [1, 2, 3, 4]
+        );
         assert!(SHADER.contains("Word 0 is the event count, words 1..20 are raw-token counts"));
         assert!(SHADER.contains("// (kind, token, extra-bit count, extra bits)."));
         assert!(SHADER.contains("const OUTPUT_HEADER_WORDS: u32 = 53u;"));
@@ -1653,11 +1827,46 @@ mod tests {
     }
 
     #[test]
+    fn modular8_input_contract_is_explicit_and_does_not_relabel_defined_color() {
+        let undefined = ColorSpecification::Undefined;
+        assert_eq!(
+            lossless_modular8_format(&PixelFormat::non_color(
+                SampleKind::Unsigned,
+                8,
+                &[Channel::X],
+            ))
+            .unwrap(),
+            LosslessModular8Format::Gray
+        );
+        for (order, expected) in [
+            (RgbChannelOrder::Rgb, LosslessModular8Format::Rgb),
+            (RgbChannelOrder::Rgba, LosslessModular8Format::Rgba),
+        ] {
+            assert_eq!(
+                lossless_modular8_format(&PixelFormat::rgb8(order, false, undefined)).unwrap(),
+                expected
+            );
+            assert!(lossless_modular8_format(&PixelFormat::rgb8(order, true, undefined)).is_err());
+        }
+        for order in [RgbChannelOrder::Bgr, RgbChannelOrder::Bgra] {
+            assert!(lossless_modular8_format(&PixelFormat::rgb8(order, false, undefined)).is_err());
+        }
+        let defined = ColorSpecification::Defined(jxl_gpu_formats::ColorSpec::bt709(
+            jxl_gpu_formats::ColorRange::Full,
+            jxl_gpu_formats::ChromaLocation2d::CENTER,
+        ));
+        assert!(
+            lossless_modular8_format(&PixelFormat::rgb8(RgbChannelOrder::Rgb, false, defined,))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn group_grid_is_row_major_and_covers_edge_tiles_exactly() {
-        let grid = LosslessGray8GroupGrid::for_extent(513, 257).unwrap();
+        let grid = LosslessModular8GroupGrid::for_extent(513, 257).unwrap();
         assert_eq!(
             grid,
-            LosslessGray8GroupGrid {
+            LosslessModular8GroupGrid {
                 width: 513,
                 height: 257,
                 columns: 3,
@@ -1672,7 +1881,7 @@ mod tests {
         assert_eq!(groups.len(), 6);
         assert_eq!(
             groups[0],
-            LosslessGray8Group {
+            LosslessModular8Group {
                 index: 0,
                 column: 0,
                 row: 0,
@@ -1689,12 +1898,15 @@ mod tests {
         assert_eq!((groups[5].x, groups[5].y), (512, 256));
         assert!(grid.group(6).is_none());
 
-        assert_eq!(LosslessGray8GroupGrid::for_extent(1, 1).unwrap().groups, 1);
-        assert!(LosslessGray8GroupGrid::for_extent(0, 1).is_err());
-        assert!(LosslessGray8GroupGrid::for_extent(1, 0).is_err());
+        assert_eq!(
+            LosslessModular8GroupGrid::for_extent(1, 1).unwrap().groups,
+            1
+        );
+        assert!(LosslessModular8GroupGrid::for_extent(0, 1).is_err());
+        assert!(LosslessModular8GroupGrid::for_extent(1, 0).is_err());
     }
 
-    fn artifact_bytes(header: Gray8ArtifactHeader, events: &[Gray8Event]) -> Vec<u8> {
+    fn artifact_bytes(header: Modular8ArtifactHeader, events: &[Modular8Event]) -> Vec<u8> {
         let mut bytes = bytemuck::bytes_of(&header).to_vec();
         bytes.extend_from_slice(bytemuck::cast_slice(events));
         bytes
@@ -1702,7 +1914,7 @@ mod tests {
 
     #[test]
     fn packet_builder_rejects_impossible_histogram_bins() {
-        let mut header = Gray8ArtifactHeader {
+        let mut header = Modular8ArtifactHeader {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
@@ -1711,7 +1923,7 @@ mod tests {
         header.raw_counts[12] = 1;
         let bytes = artifact_bytes(
             header,
-            &[Gray8Event {
+            &[Modular8Event {
                 kind: 0,
                 token: 0,
                 extra_bit_count: 0,
@@ -1723,7 +1935,7 @@ mod tests {
 
     #[test]
     fn packet_builder_rejects_noncanonical_events_and_histogram_mismatches() {
-        let mut header = Gray8ArtifactHeader {
+        let mut header = Modular8ArtifactHeader {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
@@ -1731,7 +1943,7 @@ mod tests {
         header.raw_counts[2] = 1;
         let malformed = artifact_bytes(
             header,
-            &[Gray8Event {
+            &[Modular8Event {
                 kind: 0,
                 token: 2,
                 extra_bit_count: 0,
@@ -1744,7 +1956,7 @@ mod tests {
         header.raw_counts[1] = 1;
         let mismatched = artifact_bytes(
             header,
-            &[Gray8Event {
+            &[Modular8Event {
                 kind: 0,
                 token: 0,
                 extra_bit_count: 0,
@@ -1756,7 +1968,7 @@ mod tests {
 
     #[test]
     fn packet_builder_rejects_event_streams_with_the_wrong_sample_count() {
-        let mut header = Gray8ArtifactHeader {
+        let mut header = Modular8ArtifactHeader {
             event_count: 1,
             raw_counts: [0; RAW_SYMBOLS],
             lz77_counts: [0; LZ77_SYMBOLS],
@@ -1764,7 +1976,7 @@ mod tests {
         header.raw_counts[0] = 1;
         let bytes = artifact_bytes(
             header,
-            &[Gray8Event {
+            &[Modular8Event {
                 kind: 0,
                 token: 0,
                 extra_bit_count: 0,
@@ -1823,9 +2035,10 @@ mod tests {
         }
 
         let pixels = usize::try_from(
-            u64::from(LOSSLESS_GRAY8_GROUP_DIMENSION) * u64::from(LOSSLESS_GRAY8_GROUP_DIMENSION),
+            u64::from(LOSSLESS_MODULAR8_GROUP_DIMENSION)
+                * u64::from(LOSSLESS_MODULAR8_GROUP_DIMENSION),
         )
-        .expect("maximum Gray8 profile dimensions fit usize");
+        .expect("maximum Modular8 profile dimensions fit usize");
         let capacity = event_capacity(pixels).expect("maximum event capacity fits usize");
         for events in [
             simulated_shader_event_count(pixels, 1, |_| false),
@@ -1893,8 +2106,66 @@ mod tests {
             .collect()
     }
 
+    fn packed_color_test_source(
+        context: &WgpuContext,
+        width: u32,
+        height: u32,
+        format: LosslessModular8Format,
+    ) -> (crate::BufferImageSource, Vec<u8>) {
+        let channels = format.channel_count();
+        assert!(matches!(channels, 3 | 4));
+        let extent = Extent2d::new(width, height);
+        let row_bytes = u64::from(width) * u64::from(channels);
+        let row_stride = row_bytes + 5;
+        let offset = 4u64;
+        let allocation_size = align_up(offset + row_stride * u64::from(height), 4).unwrap();
+        let mut allocation = vec![0xa5; allocation_size as usize];
+        let mut expected = Vec::with_capacity((width * height * channels) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                for channel in 0..channels {
+                    let value = ((x * 37 + y * 71 + channel * 53 + (x * y + channel * y) % 251)
+                        & 255) as u8;
+                    let address =
+                        offset + u64::from(y) * row_stride + u64::from(x * channels + channel);
+                    allocation[address as usize] = value;
+                    expected.push(value);
+                }
+            }
+        }
+        let order = match format {
+            LosslessModular8Format::Rgb => RgbChannelOrder::Rgb,
+            LosslessModular8Format::Rgba => RgbChannelOrder::Rgba,
+            LosslessModular8Format::Gray => unreachable!(),
+        };
+        let pixel_format = PixelFormat::rgb8(order, false, ColorSpecification::Undefined);
+        let layout = ImageLayout::from_planes(
+            extent,
+            pixel_format,
+            vec![PitchLinearPlaneLayout {
+                plane_index: 0,
+                offset,
+                row_stride,
+                sample_extent: extent,
+                row_bytes,
+            }],
+        )
+        .unwrap();
+        let buffer = Arc::new(context.device().create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu packed color test source"),
+                contents: &allocation,
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        ));
+        (
+            crate::BufferImageSource::new(buffer, layout).unwrap(),
+            expected,
+        )
+    }
+
     fn expected_artifact_storage_bytes(width: u32, height: u32) -> u64 {
-        LosslessGray8GroupGrid::for_extent(width, height)
+        LosslessModular8GroupGrid::for_extent(width, height)
             .unwrap()
             .ordered_groups()
             .map(|group| {
@@ -1944,7 +2215,7 @@ mod tests {
             return;
         };
         let source = packed_test_source(&context, 17, 13);
-        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(context, 8 * 1024 * 1024);
+        let encoder = LosslessModular8Encoder::with_buffer_pool_limit(context, 8 * 1024 * 1024);
         let allocation_bytes = encoder.memory_plan(&source).unwrap().owned_bytes_per_job;
 
         encoder.submit(source.clone()).unwrap().wait().unwrap();
@@ -1978,7 +2249,7 @@ mod tests {
             return;
         };
         let source = packed_test_source(&context, 71, 121);
-        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(
+        let encoder = LosslessModular8Encoder::with_buffer_pool_limit(
             context.clone(),
             DEFAULT_ENCODER_BUFFER_POOL_BYTES,
         );
@@ -2020,7 +2291,7 @@ mod tests {
             return;
         };
         let source = packed_test_source(&context, 71, 121);
-        let encoder = LosslessGray8Encoder::with_buffer_pool_limit(context, 32 * 1024 * 1024);
+        let encoder = LosslessModular8Encoder::with_buffer_pool_limit(context, 32 * 1024 * 1024);
         let per_job = encoder.memory_plan(&source).unwrap().owned_bytes_per_job;
         let jobs = (0..8)
             .map(|_| encoder.submit(source.clone()))
@@ -2029,7 +2300,7 @@ mod tests {
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, per_job * 8);
         let first_outputs = jobs
             .into_iter()
-            .map(LosslessGray8Submission::wait)
+            .map(LosslessModular8Submission::wait)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(first_outputs.windows(2).all(|pair| pair[0] == pair[1]));
@@ -2047,7 +2318,7 @@ mod tests {
             .unwrap();
         let second_outputs = jobs
             .into_iter()
-            .map(LosslessGray8Submission::wait)
+            .map(LosslessModular8Submission::wait)
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(
@@ -2069,7 +2340,7 @@ mod tests {
             return;
         };
         let source = packed_test_source(&context, 17, 13);
-        let encoder = LosslessGray8Encoder::new(context.clone());
+        let encoder = LosslessModular8Encoder::new(context.clone());
         let permits = (0..jxl_wgpu::SUBMISSION_POLLER_CAPACITY)
             .map(|_| context.submission_poller().try_reserve().unwrap())
             .collect::<Vec<_>>();
@@ -2102,7 +2373,7 @@ mod tests {
             return;
         };
         let source = packed_test_source(&context, 2, 2);
-        let plan = LosslessGray8Backend::new(&context)
+        let plan = LosslessModular8Backend::new(&context)
             .memory_plan(&source)
             .unwrap();
         let limited = WgpuContext::with_memory_budget(
@@ -2111,7 +2382,7 @@ mod tests {
             NonZeroU64::new(plan.owned_bytes_per_job).unwrap(),
         )
         .unwrap();
-        let encoder = LosslessGray8Encoder::new(limited);
+        let encoder = LosslessModular8Encoder::new(limited);
 
         let first = encoder.submit(source.clone()).unwrap();
         assert_eq!(
@@ -2187,6 +2458,72 @@ mod tests {
         Ok((size, pixels))
     }
 
+    fn decode_color8(
+        encoded: &[u8],
+        format: LosslessModular8Format,
+    ) -> Result<((usize, usize), Vec<u8>), String> {
+        let mut input = encoded;
+        let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+        let mut decoder = loop {
+            match decoder
+                .process(&mut input, None)
+                .map_err(|error| error.to_string())?
+            {
+                ProcessingResult::Complete { result } => break result,
+                ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                    if input.is_empty() {
+                        return Err("decoder needed more input before image info".into());
+                    }
+                    decoder = fallback;
+                }
+            }
+        };
+        let size = decoder.basic_info().size;
+        let pixel_format = match format {
+            LosslessModular8Format::Rgb => JxlPixelFormat::rgb8(0),
+            LosslessModular8Format::Rgba => JxlPixelFormat::rgba8(1),
+            LosslessModular8Format::Gray => {
+                return Err("color decoder helper requires RGB or RGBA".into());
+            }
+        };
+        decoder.set_pixel_format(pixel_format);
+        let mut frame = loop {
+            match decoder
+                .process(&mut input, None)
+                .map_err(|error| error.to_string())?
+            {
+                ProcessingResult::Complete { result } => break result,
+                ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                    if input.is_empty() {
+                        return Err("decoder needed more input before frame info".into());
+                    }
+                    decoder = fallback;
+                }
+            }
+        };
+        let channels = usize::try_from(format.channel_count())
+            .map_err(|_| "channel count overflow".to_string())?;
+        let mut pixels = vec![0u8; size.0 * size.1 * channels];
+        {
+            let mut buffers = [JxlOutputBuffer::new(&mut pixels, size.1, size.0 * channels)];
+            loop {
+                match frame
+                    .process(&mut input, &mut buffers, None)
+                    .map_err(|error| error.to_string())?
+                {
+                    ProcessingResult::Complete { .. } => break,
+                    ProcessingResult::NeedsMoreInput { fallback, .. } => {
+                        if input.is_empty() {
+                            return Err("decoder needed more input while rendering".into());
+                        }
+                        frame = fallback;
+                    }
+                }
+            }
+        }
+        Ok((size, pixels))
+    }
+
     fn decode_with_djxl_if_available(encoded: &[u8]) -> Option<Result<Vec<u8>, String>> {
         static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
         if Command::new("djxl").arg("-V").output().is_err() {
@@ -2225,6 +2562,97 @@ mod tests {
         let _ = std::fs::remove_file(output);
         let _ = std::fs::remove_dir(directory);
         Some(result)
+    }
+
+    fn decode_color_with_djxl_if_available(
+        encoded: &[u8],
+        format: LosslessModular8Format,
+    ) -> Option<Result<Vec<u8>, String>> {
+        static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+        if Command::new("djxl").arg("-V").output().is_err() {
+            return None;
+        }
+        let id = DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("jxl-wgpu-color8-{}-{id}", std::process::id()));
+        if let Err(error) = std::fs::create_dir(&directory) {
+            return Some(Err(format!(
+                "could not create djxl test directory: {error}"
+            )));
+        }
+        let input = directory.join("gpu.jxl");
+        let output = directory.join("gpu.pam");
+        let result = (|| {
+            std::fs::write(&input, encoded)
+                .map_err(|error| format!("could not write djxl input: {error}"))?;
+            let command = Command::new("djxl")
+                .arg(&input)
+                .arg(&output)
+                .arg("--quiet")
+                .output()
+                .map_err(|error| format!("could not execute djxl: {error}"))?;
+            if !command.status.success() {
+                return Err(format!(
+                    "djxl rejected GPU color codestream: {}",
+                    String::from_utf8_lossy(&command.stderr)
+                ));
+            }
+            let pam = std::fs::read(&output)
+                .map_err(|error| format!("could not read djxl PAM: {error}"))?;
+            parse_pam(&pam, format)
+        })();
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+        let _ = std::fs::remove_dir(directory);
+        Some(result)
+    }
+
+    fn parse_pam(bytes: &[u8], format: LosslessModular8Format) -> Result<Vec<u8>, String> {
+        let marker = b"ENDHDR\n";
+        let header_end = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .map(|position| position + marker.len())
+            .ok_or_else(|| "djxl PAM is missing ENDHDR".to_string())?;
+        let header = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| format!("djxl PAM header is not UTF-8: {error}"))?;
+        if !header.starts_with("P7\n") {
+            return Err("djxl did not emit a PAM P7 image".into());
+        }
+        let value = |key: &str| -> Result<usize, String> {
+            header
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .ok_or_else(|| format!("djxl PAM is missing {key}"))?
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| format!("invalid djxl PAM {key}: {error}"))
+        };
+        let width = value("WIDTH")?;
+        let height = value("HEIGHT")?;
+        let depth = value("DEPTH")?;
+        let max_value = value("MAXVAL")?;
+        let expected_depth = usize::try_from(format.channel_count())
+            .map_err(|_| "PAM channel count overflow".to_string())?;
+        if depth != expected_depth || max_value != 255 {
+            return Err(format!(
+                "djxl PAM has depth/maxval {depth}/{max_value}, expected {expected_depth}/255"
+            ));
+        }
+        let pixels = bytes
+            .get(header_end..)
+            .ok_or_else(|| "djxl PAM pixels are truncated".to_string())?;
+        let expected_bytes = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(depth))
+            .ok_or_else(|| "djxl PAM dimensions overflow".to_string())?;
+        if pixels.len() != expected_bytes {
+            return Err(format!(
+                "djxl PAM has {} bytes, expected {expected_bytes}",
+                pixels.len()
+            ));
+        }
+        Ok(pixels.to_vec())
     }
 
     fn parse_pgm(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -2290,7 +2718,7 @@ mod tests {
             eprintln!("skipping GPU multi-group lossless encode test: no wgpu adapter");
             return;
         };
-        let encoder = LosslessGray8Encoder::new(context.clone());
+        let encoder = LosslessModular8Encoder::new(context.clone());
         let extents = [
             (1, 1),
             (17, 13),
@@ -2309,7 +2737,7 @@ mod tests {
             let memory = encoder.memory_plan(&source).unwrap();
             assert_eq!(
                 memory.parameter_storage_bytes,
-                u64::from(memory.group_grid.groups) * 20
+                u64::from(memory.group_grid.groups) * std::mem::size_of::<Modular8Params>() as u64
             );
             assert_eq!(
                 memory.artifact_storage_bytes,
@@ -2357,6 +2785,59 @@ mod tests {
     }
 
     #[test]
+    fn packed_rgb8_and_rgba8_roundtrip_across_aspect_ratios_with_both_decoders() {
+        let Some(context) = test_context() else {
+            eprintln!("skipping GPU color encode test: no wgpu adapter");
+            return;
+        };
+        let encoder = LosslessModular8Encoder::new(context.clone());
+        assert!(
+            encoder
+                .capabilities()
+                .has_stage(KernelStage::ColorTransform)
+        );
+        assert!(
+            encoder
+                .capabilities()
+                .has_stage(KernelStage::ModularTransform)
+        );
+        for format in [LosslessModular8Format::Rgb, LosslessModular8Format::Rgba] {
+            for (width, height) in [(1, 513), (513, 1), (257, 3), (17, 13)] {
+                let (source, expected) = packed_color_test_source(&context, width, height, format);
+                let memory = encoder.memory_plan(&source).unwrap();
+                assert_eq!(memory.format, format);
+                assert_eq!(memory.channel_count, format.channel_count());
+                assert_eq!(
+                    memory.parameter_storage_bytes,
+                    u64::from(memory.group_grid.groups)
+                        * u64::from(format.channel_count())
+                        * std::mem::size_of::<Modular8Params>() as u64
+                );
+                let encoded = encoder.encode(source.clone()).unwrap();
+                let (size, decoded) = decode_color8(&encoded, format).unwrap_or_else(|error| {
+                    panic!("Rust decoder rejected {format:?} {width}x{height}: {error}")
+                });
+                assert_eq!(size, (width as usize, height as usize));
+                assert_eq!(decoded, expected, "{format:?} {width}x{height}");
+                if let Some(decoded) = decode_color_with_djxl_if_available(&encoded, format) {
+                    assert_eq!(
+                        decoded.unwrap_or_else(|error| {
+                            panic!("djxl rejected {format:?} {width}x{height}: {error}")
+                        }),
+                        expected,
+                        "{format:?} {width}x{height}"
+                    );
+                }
+                if (width, height) == (17, 13) {
+                    let async_encoded = pollster::block_on(encoder.submit(source).unwrap())
+                        .expect("runtime-neutral color submission succeeds");
+                    assert_eq!(async_encoded, encoded);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn multi_group_container_and_runtime_neutral_future_are_deterministic() {
         let Some(context) = test_context() else {
             eprintln!("skipping GPU multi-group container test: no wgpu adapter");
@@ -2366,7 +2847,7 @@ mod tests {
         let height = 257;
         let expected = packed_test_pixels(width, height);
         let source = packed_test_source(&context, width, height);
-        let encoder = LosslessGray8Encoder::new(context);
+        let encoder = LosslessModular8Encoder::new(context);
         let raw = encoder.encode(source.clone()).unwrap();
         let async_raw = pollster::block_on(encoder.submit(source.clone()).unwrap()).unwrap();
         assert_eq!(async_raw, raw);
@@ -2444,7 +2925,7 @@ mod tests {
         )
         .expect("test image layout is valid");
         let source = crate::BufferImageSource::new(buffer, layout).expect("test source is valid");
-        let encoder = LosslessGray8Encoder::new(context);
+        let encoder = LosslessModular8Encoder::new(context);
         let memory = encoder
             .memory_plan(&source)
             .expect("test source has a checked memory plan");
@@ -2454,10 +2935,14 @@ mod tests {
         let expected_output_bytes =
             u64::try_from(expected_output_words * 4).expect("test artifact size fits u64");
         assert_eq!(memory.group_grid.groups, 1);
-        assert_eq!(memory.parameter_storage_bytes, 20);
+        let parameter_bytes = std::mem::size_of::<Modular8Params>() as u64;
+        assert_eq!(memory.parameter_storage_bytes, parameter_bytes);
         assert_eq!(memory.artifact_storage_bytes, expected_output_bytes);
         assert_eq!(memory.readback_bytes, expected_output_bytes);
-        assert_eq!(memory.owned_bytes_per_job, 20 + expected_output_bytes * 2);
+        assert_eq!(
+            memory.owned_bytes_per_job,
+            parameter_bytes + expected_output_bytes * 2
+        );
         assert_eq!(
             memory.addressed_bytes_per_job,
             memory.owned_bytes_per_job + memory.source_binding_bytes

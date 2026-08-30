@@ -4,6 +4,8 @@ struct Params {
     row_stride: u32,
     byte_offset: u32,
     output_word_offset: u32,
+    channel: u32,
+    channels: u32,
 }
 
 @group(0) @binding(0)
@@ -22,11 +24,36 @@ const OUTPUT_HEADER_WORDS: u32 = 53u;
 const EVENT_WORDS: u32 = 4u;
 const EVENT_OVERFLOW: u32 = 0xffffffffu;
 
-fn sample_at(params: Params, x: u32, y: u32) -> i32 {
-    let byte_index = params.byte_offset + y * params.row_stride + x;
+fn source_component(params: Params, x: u32, y: u32, component: u32) -> i32 {
+    let byte_index = params.byte_offset + y * params.row_stride + x * params.channels + component;
     let word = source_words[byte_index >> 2u];
     let shift = (byte_index & 3u) * 8u;
     return i32((word >> shift) & 255u);
+}
+
+// JPEG XL's reversible color transform type 0 maps RGB to YCoCg. Computing it
+// in the token kernel avoids both an intermediate image and a CPU color path.
+fn sample_at(params: Params, x: u32, y: u32) -> i32 {
+    if params.channels == 1u {
+        return source_component(params, x, y, 0u);
+    }
+    if params.channel == 3u {
+        return source_component(params, x, y, 3u);
+    }
+    let red = source_component(params, x, y, 0u);
+    let green = source_component(params, x, y, 1u);
+    let blue = source_component(params, x, y, 2u);
+    let co = red - blue;
+    let temporary = blue + (co >> 1u);
+    let cg = green - temporary;
+    let luma = temporary + (cg >> 1u);
+    if params.channel == 0u {
+        return luma;
+    }
+    if params.channel == 1u {
+        return co;
+    }
+    return cg;
 }
 
 fn append_event(params: Params, kind: u32, token: u32, nbits: u32, bits: u32) {

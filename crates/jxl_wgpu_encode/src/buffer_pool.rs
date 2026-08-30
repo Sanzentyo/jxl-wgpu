@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Default upper bound for idle Gray8 encoder buffers retained for reuse.
+/// Default upper bound for idle Modular8 encoder buffers retained for reuse.
 pub const DEFAULT_ENCODER_BUFFER_POOL_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Secondary object-count bound for tiny-buffer workloads.
@@ -55,13 +55,13 @@ impl EncoderBufferSet {
             .expect("checked dispatch plan bounds total pooled bytes");
         Self {
             parameters: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless gray8 pooled group parameters"),
+                label: Some("jxl-wgpu lossless modular8 pooled group parameters"),
                 size: parameter_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })),
             artifact: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless gray8 pooled GPU artifacts"),
+                label: Some("jxl-wgpu lossless modular8 pooled GPU artifacts"),
                 size: artifact_bytes,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
@@ -69,7 +69,7 @@ impl EncoderBufferSet {
                 mapped_at_creation: false,
             })),
             readback: Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("jxl-wgpu lossless gray8 pooled artifact readback"),
+                label: Some("jxl-wgpu lossless modular8 pooled artifact readback"),
                 size: artifact_bytes,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
