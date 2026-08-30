@@ -1,13 +1,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-#[path = "../src/vardct_artifact.rs"]
-mod vardct_artifact;
-
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
-use vardct_artifact::{
+use jxl_wgpu_decode::vardct::artifact::{
     BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID, GpuDispatchIndirectArgs, GpuGeneralVarDctTask,
     GpuHfTaskMetadata, GpuVarDctArtifactStatus, GpuVarDctBucket, HF_COEFFICIENT_SINK_SHADER,
     HfCoefficientSinkParams, HfDispatchStage, HfMetadataArtifactConfig, HfMetadataLoweringBuffers,

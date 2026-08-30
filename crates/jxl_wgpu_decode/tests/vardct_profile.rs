@@ -1,8 +1,5 @@
-#[path = "../src/vardct_frontend.rs"]
-mod vardct_frontend;
-
 use jxl_gpu_bitstream::{BitRange, FrameSectionKind, InventoryLimits, parse};
-use vardct_frontend::{
+use jxl_wgpu_decode::vardct::frontend::{
     HfGlobalPrefix, HfMetadataPrefix, LfGlobalPrefix, LfGroupPrefix, ModularChannelPlan,
     StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError, VarDctPacketError,
     VarDctSectionLayout,
@@ -66,7 +63,7 @@ fn accepts_green_queen_physical_group_packets() {
     assert_eq!(profile.hf_metadata_stream_index(0).unwrap(), 3);
     assert_eq!(
         profile.low_frequency_group_rect(0).unwrap(),
-        vardct_frontend::VarDctGroupRect {
+        jxl_wgpu_decode::vardct::frontend::VarDctGroupRect {
             x: 0,
             y: 0,
             width: 438,
@@ -75,7 +72,7 @@ fn accepts_green_queen_physical_group_packets() {
     );
     assert_eq!(
         profile.pass_group_rect(5).unwrap(),
-        vardct_frontend::VarDctGroupRect {
+        jxl_wgpu_decode::vardct::frontend::VarDctGroupRect {
             x: 256,
             y: 512,
             width: 182,

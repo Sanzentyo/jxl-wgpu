@@ -30,7 +30,11 @@ mod model;
 mod modular_tree;
 mod profile;
 mod session;
+mod vardct_artifact;
+mod vardct_frontend;
 mod wgpu_engine;
+
+pub mod vardct;
 
 pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BUFFERS, DEFAULT_DECODE_BUFFER_POOL_BUFFERS_PER_KEY,
