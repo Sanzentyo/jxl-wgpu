@@ -62,21 +62,23 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 ### Bounded standard VarDCT engine
 
-The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two
-deliberately narrow standard VarDCT packet topologies. A one-entry zero-AC TOC retains the original single regular
-8x8, 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC may instead
-cover one LF group with one independent DCT8 first block per padded 8x8 image block and at least two
-256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients with the
-natural DCT8 order or the standard entropy-coded custom DCT8 order. Scanline and entropy-coded
-center-first TOC order are both accepted: inventory retains physical section ranges and the
-frontend normalizes them to logical group order before assigning pixel rectangles and per-group
-scratch. The explicit section topology removes
-the ambiguity with a one-entry single-transform packet. This tiled form supports odd and asymmetric
-pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
-forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
-adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default dequantization metadata,
-disabled, default, or custom Gaborish and disabled/default/custom one-to-three-iteration EPF, zero chroma correlation, an order mask containing only the DCT8 bit,
-arbitrary valid HF block-context maps with stream-defined quant-field and signed X/Y/B LF thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
+The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two bounded
+standard packet topologies. A one-entry zero-AC TOC retains the original single regular 8x8,
+16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC covers one LF
+group with a GPU-decoded mixed map of any of JPEG XL's 27 regular and special strategies across
+one or more 256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients
+using any of the 13 natural or entropy-coded custom coefficient-order families. Scanline and
+entropy-coded center-first TOC order are both accepted: inventory retains physical section ranges
+and the frontend normalizes them to logical group order before assigning pixel rectangles and
+per-group scratch. The explicit section topology removes the ambiguity with a one-entry
+single-transform packet. The sectioned form supports odd and asymmetric pixel extents through
+2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage.
+Both forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract
+additionally requires adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default
+dequantization metadata, disabled/default/custom Gaborish, disabled/default/custom
+one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spectral pass.
+`global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
+per-frequency-cell HF chroma correlation, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
@@ -89,12 +91,16 @@ The host inventories bounded scalar headers, packs the MA-tree and coefficient e
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF
 image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
-each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and custom-order
-coefficient sink. Block-context selection reads the resident quantized LF planes and each task's
-`hf_mul`; its variable tables share the entropy bundle, while per-group LZ history occupies a
-disjoint tail slice of the same reconstruction buffer so the pass remains within eight portable
-storage bindings. The submission then runs the existing resident regular
-VarDCT renderer, optionally applies the signaled Gaborish weights, constructs the signaled
+each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and all-order coefficient
+sink. The HF metadata channels retain their logical dimensions while addressing capacity-strided
+storage, so the `hf_mul` row cannot alias the packed strategy row when the actual first-block count
+is below the allocation capacity. Block-context selection reads the resident quantized LF planes
+and each task's `hf_mul`; its variable tables share the entropy bundle, while per-group LZ history
+occupies a disjoint tail slice of the same reconstruction buffer so the pass remains within eight
+portable storage bindings. The artifact creates 27 compact strategy buckets and indirect dispatch
+records. The submission executes every populated bucket through the resident regular or special
+VarDCT renderer using the normative default matrix for that strategy and an explicit regular/wide/
+special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
 and writes tightly packed RGB8 in the same GPU
@@ -118,8 +124,9 @@ carries authoritative metadata and changed regions. Native blocking and runtime-
 poll/future completion use the common decoder session API, and the engine compiles for browser
 WebGPU without a Tokio or async-std dependency.
 
-The actual-adapter matrix covers all nine accepted single regular transform extents plus tiled,
-odd/asymmetric multi-task and multi-pass-group frames. It GPU-encodes each
+The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
+odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27
+inverse transforms, including AFV and 64/128/256-scale strategies. It GPU-encodes each
 standard packet, executes the complete resident decode, reads the result back explicitly, and,
 when `djxl` is installed, compares it with that independent decoder (at most one RGB8 code of
 rounding difference for the covered solid-image cases). The Dct8 case also exercises the
@@ -131,6 +138,11 @@ continues to own the exact output bytes. A separate 438x589 libjxl fixture exerc
 pass groups, 4,070 DCT8 tasks, a custom three-channel coefficient order, nonzero AC coefficients,
 and a self-correcting MA tree; GPU RGB8 output differs from both Rust `jxl` and `djxl` by at most
 one code.
+A checked-in 257x257 libjxl effort-5 fixture exercises a mixed strategy map, LF extra precision,
+three HF block clusters, custom orders 0 and 1, and a first-block count smaller than the
+capacity-strided metadata allocation. The actual-adapter test executes its single-pass AC and every
+populated regular/special bucket through the stock decoder, then permits at most one RGB8 code of
+difference from Rust `jxl` and optional `djxl`.
 A separate deterministic 438x589 fixture stores the same bounded one-pass DCT8 topology in libjxl's
 center-first entropy-coded TOC order. Its physical pass-group order differs from row-major order;
 the frontend test proves each logical group retains the matching physical bit range, and the
@@ -155,8 +167,8 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Multiple LF groups, mixed or non-DCT8 transform strategies,
-special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom quantization matrices,
+This is not full VarDCT coverage. Multiple LF groups, multiple spectral/refinement passes, custom
+quantization matrices, non-default LF channel-correlation metadata, Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, cross-LF-group restoration,
 crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported

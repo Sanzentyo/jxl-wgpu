@@ -40,12 +40,17 @@ struct Params {
     transform_kind: u32,
     correlation_width: u32,
     correlation_height: u32,
-    _padding: vec2<u32>,
+    task_word_offset: u32,
+    bucket_word_offset: u32,
+    lf_stride: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
     quant_biases: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> coefficients: array<i32>;
-@group(0) @binding(1) var<storage, read> tasks: array<Task>;
+@group(0) @binding(1) var<storage, read> task_words: array<u32>;
 @group(0) @binding(2) var<storage, read> resources: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> output_x: array<f32>;
 @group(0) @binding(6) var<storage, read_write> output_y: array<f32>;
@@ -58,12 +63,42 @@ var<workgroup> auxiliary: array<f32, 192>;
 
 const PI: f32 = 3.14159265358979323846;
 const SQRT_2: f32 = 1.41421356237309504880;
-const HORNUSS: u32 = 0u;
-const DCT2X2: u32 = 1u;
-const DCT4X4: u32 = 2u;
-const DCT4X8: u32 = 3u;
-const DCT8X4: u32 = 4u;
-const AFV0: u32 = 5u;
+const HORNUSS: u32 = 1u;
+const DCT2X2: u32 = 2u;
+const DCT4X4: u32 = 3u;
+const DCT4X8: u32 = 12u;
+const DCT8X4: u32 = 13u;
+const AFV0: u32 = 14u;
+
+fn load_task(index: u32) -> Task {
+    let base = params.task_word_offset + index * 16u;
+    return Task(
+        task_words[base],
+        task_words[base + 1u],
+        task_words[base + 2u],
+        task_words[base + 3u],
+        task_words[base + 4u],
+        task_words[base + 5u],
+        task_words[base + 6u],
+        task_words[base + 7u],
+        task_words[base + 8u],
+        task_words[base + 9u],
+        task_words[base + 10u],
+        task_words[base + 11u],
+        task_words[base + 12u],
+        task_words[base + 13u],
+        task_words[base + 14u],
+        task_words[base + 15u],
+    );
+}
+
+fn task_for_workgroup(workgroup_y: u32) -> Task {
+    var task_base = params.task_base;
+    if (params.bucket_word_offset != 0xffffffffu) {
+        task_base = task_words[params.bucket_word_offset + params.transform_kind * 4u + 1u];
+    }
+    return load_task(task_base + workgroup_y);
+}
 
 fn idct_basis(position: u32, frequency: u32, length: u32) -> f32 {
     if (frequency == 0u) {
@@ -345,7 +380,7 @@ fn main(
     if (workgroup_id.y >= params.task_count) {
         return;
     }
-    let task = tasks[params.task_base + workgroup_id.y];
+    let task = task_for_workgroup(workgroup_id.y);
     let matrix = resources[task.matrix_offset + lane].xyz;
     let quant = resources[params.quant_offset + task.quant_index].xyz;
     let x_value = adjust_quantized(

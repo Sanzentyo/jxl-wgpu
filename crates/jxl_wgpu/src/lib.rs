@@ -92,6 +92,7 @@ pub use resident_vardct::{
 pub use session::{
     GpuFrame, GpuOutputBuffer, SubmissionMode, WgpuFrameSession, WgpuSubmissionStats,
 };
+pub use vardct_general::VAR_DCT_AFV_BASIS;
 pub use video::{
     CpuImageFrame, CpuImageOutput, GpuBufferLease, GpuBufferSubmissionGuard, GpuImageFrame,
     GpuImageOutput, ImageOutputRequest, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,

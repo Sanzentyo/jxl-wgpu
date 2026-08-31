@@ -108,6 +108,8 @@ pub struct HfMetadataArtifactConfig {
     pub afv_basis_offset: u32,
     /// Vec4 offset where one quantization scale per lowered task is written.
     pub quant_offset: u32,
+    /// Vec4 offset where GPU-decoded per-frequency-cell X/B chroma correlation is written.
+    pub correlation_offset: u32,
     /// LF-global quantization scale denominator component.
     pub global_scale: u32,
     /// Resource-vector offsets for the dequant matrix selected by each wire strategy.
@@ -493,7 +495,8 @@ pub struct GpuVarDctArtifactStatus {
     pub covered_blocks: u32,
     pub consumed_block_info_entries: u32,
     pub backend_requirements: u32,
-    pub _reserved: [u32; 7],
+    pub strategy_mask: u32,
+    pub _reserved: [u32; 6],
 }
 
 impl GpuVarDctArtifactStatus {
@@ -676,7 +679,7 @@ impl HfMetadataLoweringParams {
                 layout.task_metadata_offset_words,
                 layout.block_task_map_offset_words,
                 config.quant_offset,
-                0,
+                config.correlation_offset,
             ],
             source_offsets: [
                 config.strategy_offset_words,

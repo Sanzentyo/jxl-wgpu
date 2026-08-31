@@ -1,4 +1,4 @@
-//! GPU entropy frontend for the bounded standard regular-VarDCT packet profiles.
+//! GPU entropy frontend for the bounded standard VarDCT packet profile.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
@@ -24,16 +24,14 @@ const RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 
 const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
 
-/// A standard feature excluded from the deliberately bounded regular-VarDCT packet profile.
+/// A standard feature excluded from the deliberately bounded VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnsupportedVarDctPacketFeature {
     #[error("the bounded tiled-VarDCT decoder requires exactly one LF group")]
     MultipleLfGroups,
-    #[error("the DCT8 coefficient executor cannot use coefficient-order mask {used_orders:#x}")]
-    CustomCoefficientOrders { used_orders: u16 },
-    #[error("the bounded regular-VarDCT decoder currently accepts 8-bit samples")]
+    #[error("the bounded VarDCT decoder currently accepts 8-bit samples")]
     BitDepth,
-    #[error("the one-entry packet extent is not one implemented regular VarDCT transform")]
+    #[error("the one-entry packet extent is not one implemented VarDCT transform")]
     TransformExtent,
     #[error("the standard packet requests skip-adaptive-LF smoothing")]
     SkipAdaptiveLfSmoothing,
@@ -52,7 +50,7 @@ pub enum BoundedVarDctPacketError {
     Packet(#[from] VarDctPacketError),
     #[error(transparent)]
     Unsupported(#[from] UnsupportedVarDctPacketFeature),
-    #[error("failed to position the bounded MA-tree parser: {0}")]
+    #[error("failed to read bounded VarDCT metadata: {0}")]
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error("failed to parse the bounded MA-tree descriptor: {0}")]
     ModularTree(String),
@@ -81,8 +79,6 @@ pub enum GpuVarDctPacketError {
     FirstBlock,
     #[error("GPU VarDCT packet has invalid HF metadata local header")]
     HfHeader,
-    #[error("GPU VarDCT packet uses nonzero HF chroma correlation {value}")]
-    Correlation { value: u32 },
     #[error("GPU VarDCT packet selects strategy {actual}, expected {expected}")]
     Strategy { actual: u32, expected: u32 },
     #[error("GPU VarDCT packet selects invalid EPF sharpness {value}")]
@@ -97,10 +93,12 @@ pub enum GpuVarDctPacketError {
 #[derive(Clone, Debug)]
 pub struct BoundedVarDctPacketPlan {
     pub profile: StandardVarDctProfile,
-    /// Regular transform shared by every first block in this bounded packet.
-    pub transform: TransformKind,
-    /// Number of non-overlapping first blocks reconstructed from HF metadata.
-    pub task_count: u32,
+    /// A transform enforced for the single-entry packet form. Sectioned packets carry a
+    /// GPU-decoded mixed-strategy topology and therefore have no host-assumed transform.
+    pub uniform_transform: Option<TransformKind>,
+    /// Maximum number of non-overlapping first blocks reconstructed from HF metadata. The actual
+    /// count is decoded and reported by the GPU packet frontend.
+    pub task_capacity: u32,
     coefficient_words: u32,
     /// LF-global packet containing the scalar quantizer fields and global MA descriptor.
     pub lf_global: BitRange,
@@ -119,6 +117,7 @@ pub struct BoundedVarDctPacketPlan {
     pub needs_self_correcting: bool,
     pub global_scale: u32,
     pub quant_lf: u32,
+    pub extra_precision: u8,
     /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
     /// packets and are never expanded on the host.
     pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
@@ -139,7 +138,9 @@ pub struct HfCoefficientEntropyPlan {
     pub qf_thresholds: Vec<u32>,
     /// Quantized LF thresholds in X, Y, B channel order.
     pub lf_thresholds: [Vec<i32>; 3],
-    /// Three DCT8 order descriptors followed by their packed `(x, y)` coordinate tables.
+    /// Thirty-nine channel/order descriptors followed by packed `(x, y)` coordinate tables.
+    /// Natural orders share one table across their three channels; custom orders retain one table
+    /// per channel.
     pub order_words: Vec<u32>,
     pub order_coordinate_offset_words: u32,
     pub pass_groups: Vec<BitRange>,
@@ -163,11 +164,13 @@ impl BoundedVarDctPacketPlan {
         if !profile.adaptive_lf_smoothing {
             return Err(UnsupportedVarDctPacketFeature::SkipAdaptiveLfSmoothing.into());
         }
-        let (transform, task_count, lf_global_packet, lf_group, hf_global, pass_groups) =
+        let (uniform_transform, task_capacity, lf_global_packet, lf_group, hf_global, pass_groups) =
             match &profile.sections {
                 VarDctSectionLayout::Single { packet } => (
-                    transform_for_extent(profile.width, profile.height)
-                        .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                    Some(
+                        transform_for_extent(profile.width, profile.height)
+                            .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                    ),
                     1,
                     *packet,
                     *packet,
@@ -191,7 +194,7 @@ impl BoundedVarDctPacketPlan {
                             field: "tiled DCT8 task count",
                         })?;
                     (
-                        TransformKind::Dct8,
+                        None,
                         blocks,
                         *lf_global,
                         lf_group,
@@ -239,6 +242,14 @@ impl BoundedVarDctPacketPlan {
                 field: "entropy bit offset",
             }
         })?;
+        let lf_entropy_bit_offset = if hf_global.is_some() {
+            lf_group.offset
+        } else {
+            descriptor_end
+        };
+        let mut lf_header = BitReader::new(codestream);
+        lf_header.skip_bits(lf_entropy_bit_offset)?;
+        let extra_precision = lf_header.read_bits(2)? as u8;
         let blocks_x = profile.width.div_ceil(8);
         let blocks_y = profile.height.div_ceil(8);
         let block_count =
@@ -262,7 +273,7 @@ impl BoundedVarDctPacketPlan {
         let decoded_symbol_limit = block_count
             .checked_mul(4)
             .and_then(|samples| {
-                task_count
+                task_capacity
                     .checked_mul(2)
                     .and_then(|tasks| samples.checked_add(tasks))
             })
@@ -310,8 +321,8 @@ impl BoundedVarDctPacketPlan {
             lf_stream_index: profile.lf_quant_stream_index(0)?,
             hf_stream_index: profile.hf_metadata_stream_index(0)?,
             profile,
-            transform,
-            task_count,
+            uniform_transform,
+            task_capacity,
             coefficient_words,
             lf_global: lf_global_packet,
             lf_group,
@@ -322,6 +333,7 @@ impl BoundedVarDctPacketPlan {
             needs_self_correcting: ma_config.needs_self_correcting(),
             global_scale: lf_global.global_scale,
             quant_lf: lf_global.quant_lf,
+            extra_precision,
             hf_coefficients,
         })
     }
@@ -350,7 +362,7 @@ impl BoundedVarDctPacketPlan {
                 })?;
         let correlations = self.correlation_samples()?;
         let hf_samples = self
-            .task_count
+            .task_capacity
             .checked_mul(2)
             .and_then(|tasks| blocks.checked_add(tasks))
             .and_then(|samples| {
@@ -429,12 +441,12 @@ impl BoundedVarDctPacketPlan {
                 field: "strategy offset",
             },
         )?;
-        let hf_mul_offset = strategy_offset.checked_add(self.task_count).ok_or(
+        let hf_mul_offset = strategy_offset.checked_add(self.task_capacity).ok_or(
             BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "HF multiplier offset",
             },
         )?;
-        let sharpness_offset = hf_mul_offset.checked_add(self.task_count).ok_or(
+        let sharpness_offset = hf_mul_offset.checked_add(self.task_capacity).ok_or(
             BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "sharpness offset",
             },
@@ -457,15 +469,20 @@ impl BoundedVarDctPacketPlan {
                         field: "first-block field width",
                     })?
                     .trailing_zeros(),
-                self.task_count,
+                self.task_capacity,
             ],
             expected: [
-                transform_id(self.transform),
-                0,
+                self.uniform_transform.map_or(0, transform_id),
+                u32::from(self.uniform_transform.is_some()),
                 ZERO_AC_HF_GLOBAL,
                 sharpness_offset,
             ],
-            quantization: [self.global_scale, self.quant_lf, 0, 0],
+            quantization: [
+                self.global_scale,
+                self.quant_lf,
+                u32::from(self.extra_precision),
+                0,
+            ],
             streams: [
                 self.lf_stream_index,
                 self.hf_stream_index,
@@ -483,7 +500,7 @@ impl BoundedVarDctPacketPlan {
     fn predictor_width_capacity(&self) -> Result<u32, BoundedVarDctPacketError> {
         let [blocks_x, _] = self.block_extent();
         Ok(blocks_x
-            .max(self.task_count)
+            .max(self.task_capacity)
             .max(self.profile.width.div_ceil(64)))
     }
 
@@ -510,14 +527,8 @@ impl HfCoefficientEntropyPlan {
         decoded_symbol_limit: u32,
     ) -> Result<Self, BoundedVarDctPacketError> {
         let prefix = HfGlobalPrefix::parse(codestream, packet, group_count)?;
-        if prefix.used_orders & !1 != 0 {
-            return Err(UnsupportedVarDctPacketFeature::CustomCoefficientOrders {
-                used_orders: prefix.used_orders,
-            }
-            .into());
-        }
         let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
-            parse_dct8_coefficient_orders(codestream, prefix)?;
+            parse_coefficient_orders(codestream, prefix)?;
         let lf_context_count = block_context
             .lf_thresholds
             .iter()
@@ -611,22 +622,15 @@ impl HfCoefficientEntropyPlan {
     }
 }
 
-fn parse_dct8_coefficient_orders(
+fn parse_coefficient_orders(
     codestream: &[u8],
     prefix: HfGlobalPrefix,
 ) -> Result<(u64, Vec<u32>, u32), BoundedVarDctPacketError> {
-    use crate::vardct_artifact::NaturalDct8OrderTable;
+    use crate::vardct_artifact::{
+        GpuHfOrderDescriptor, HF_ORDER_CHANNELS, HF_ORDER_COUNT, HF_ORDER_EXTENTS,
+    };
 
-    const DESCRIPTOR_WORDS: u32 = 3 * 4;
-
-    let natural = NaturalDct8OrderTable::new();
-    if prefix.used_orders == 0 {
-        return Ok((
-            prefix.order_entropy_bit_offset,
-            natural.packed_words(),
-            DESCRIPTOR_WORDS,
-        ));
-    }
+    const DESCRIPTOR_WORDS: u32 = (HF_ORDER_COUNT * HF_ORDER_CHANNELS * 4) as u32;
 
     let mut bitstream = jxl_bitstream::Bitstream::new(codestream);
     bitstream
@@ -638,17 +642,64 @@ fn parse_dct8_coefficient_orders(
             })?,
         )
         .map_err(BoundedVarDctPacketError::CoefficientOrderBitstream)?;
-    let mut decoder = jxl_coding::Decoder::parse(&mut bitstream, 8)
+    let mut decoder = (prefix.used_orders != 0)
+        .then(|| jxl_coding::Decoder::parse(&mut bitstream, 8))
+        .transpose()
         .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
-    let permutations = (0..3)
-        .map(|_| {
-            jxl_coding::read_permutation(&mut bitstream, &mut decoder, 64, 1)
-                .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    decoder
-        .finalize()
-        .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+
+    let mut descriptors = [GpuHfOrderDescriptor::zeroed(); HF_ORDER_COUNT * HF_ORDER_CHANNELS];
+    let mut coordinates = Vec::new();
+    for (order_id, [width, height]) in HF_ORDER_EXTENTS.into_iter().enumerate() {
+        let natural = natural_coefficient_order(width, height)?;
+        let len = u32::try_from(natural.len()).map_err(|_| {
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF order length",
+            }
+        })?;
+        if prefix.used_orders & (1 << order_id) == 0 {
+            let offset = u32::try_from(coordinates.len()).map_err(|_| {
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF order coordinate offset",
+                }
+            })?;
+            coordinates.extend_from_slice(&natural);
+            let descriptor = GpuHfOrderDescriptor {
+                offset,
+                len,
+                width,
+                height,
+            };
+            descriptors[order_id * HF_ORDER_CHANNELS..(order_id + 1) * HF_ORDER_CHANNELS]
+                .fill(descriptor);
+            continue;
+        }
+
+        let decoder = decoder
+            .as_mut()
+            .ok_or(BoundedVarDctPacketError::PackedMetadata)?;
+        let skip = len / 64;
+        for channel in 0..HF_ORDER_CHANNELS {
+            let permutation = jxl_coding::read_permutation(&mut bitstream, decoder, len, skip)
+                .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+            let offset = u32::try_from(coordinates.len()).map_err(|_| {
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF order coordinate offset",
+                }
+            })?;
+            coordinates.extend(permutation.into_iter().map(|index| natural[index]));
+            descriptors[order_id * HF_ORDER_CHANNELS + channel] = GpuHfOrderDescriptor {
+                offset,
+                len,
+                width,
+                height,
+            };
+        }
+    }
+    if let Some(decoder) = &mut decoder {
+        decoder
+            .finalize()
+            .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+    }
     let coefficient_entropy_bit_offset =
         u64::try_from(bitstream.num_read_bits()).map_err(|_| {
             BoundedVarDctPacketError::ArithmeticOverflow {
@@ -656,22 +707,55 @@ fn parse_dct8_coefficient_orders(
             }
         })?;
 
-    let mut order_words = Vec::with_capacity(DESCRIPTOR_WORDS as usize + 3 * 64);
-    for channel in 0..3u32 {
-        order_words.extend_from_slice(&[channel * 64, 64, 8, 8]);
-    }
-    for permutation in permutations {
-        order_words.extend(
-            permutation
-                .into_iter()
-                .map(|index| natural.coordinates[index]),
-        );
-    }
+    let descriptor_words = bytemuck::cast_slice::<GpuHfOrderDescriptor, u32>(&descriptors);
+    let mut order_words = Vec::with_capacity(descriptor_words.len() + coordinates.len());
+    order_words.extend_from_slice(descriptor_words);
+    order_words.extend_from_slice(&coordinates);
     Ok((
         coefficient_entropy_bit_offset,
         order_words,
         DESCRIPTOR_WORDS,
     ))
+}
+
+fn natural_coefficient_order(
+    width: u32,
+    height: u32,
+) -> Result<Vec<u32>, BoundedVarDctPacketError> {
+    let area = width
+        .checked_mul(height)
+        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+            field: "natural HF order area",
+        })?;
+    let capacity =
+        usize::try_from(area).map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+            field: "natural HF order capacity",
+        })?;
+    let y_scale = width / height;
+    let low_width = width / 8;
+    let low_height = height / 8;
+    let mut coordinates = Vec::with_capacity(capacity);
+    for index in 0..low_width * low_height {
+        coordinates.push((index % low_width) | ((index / low_width) << 16));
+    }
+    for distance in 1..2 * width {
+        let margin = distance.saturating_sub(width);
+        for order in margin..distance - margin {
+            let (x, y) = if distance & 1 == 1 {
+                (order, distance - 1 - order)
+            } else {
+                (distance - 1 - order, order)
+            };
+            if x < low_width && y < low_width || y % y_scale != 0 {
+                continue;
+            }
+            coordinates.push(x | ((y / y_scale) << 16));
+        }
+    }
+    if coordinates.len() != capacity {
+        return Err(BoundedVarDctPacketError::PackedMetadata);
+    }
+    Ok(coordinates)
 }
 
 /// Exact 128-byte uniform consumed by `vardct_packet.wgsl`.
@@ -745,28 +829,63 @@ pub struct GpuVarDctPacketStatus {
     pub detail: u32,
     pub global_scale: u32,
     pub quant_lf: u32,
-    pub _reserved: [u32; 5],
+    pub first_blocks: u32,
+    pub extra_precision: u32,
+    pub _reserved: [u32; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedVarDctPacket {
+    pub first_blocks: u32,
+}
+
+/// Host-known values used to validate the authoritative GPU packet status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VarDctPacketValidation {
+    pub expected_strategy: Option<TransformKind>,
+    pub expected_lf_samples: u32,
+    pub block_count: u32,
+    pub correlation_samples: u32,
+    pub task_capacity: u32,
+    pub expected_global_scale: u32,
+    pub expected_quant_lf: u32,
+    pub expected_extra_precision: u8,
 }
 
 impl GpuVarDctPacketStatus {
     pub fn validate(
         self,
-        expected_strategy: TransformKind,
-        expected_lf_samples: u32,
-        expected_hf_samples: u32,
-        expected_global_scale: u32,
-        expected_quant_lf: u32,
-    ) -> Result<(), GpuVarDctPacketError> {
+        expected: VarDctPacketValidation,
+    ) -> Result<ValidatedVarDctPacket, GpuVarDctPacketError> {
+        let expected_hf_samples = self
+            .first_blocks
+            .checked_mul(2)
+            .and_then(|tasks| expected.block_count.checked_add(tasks))
+            .and_then(|samples| {
+                expected
+                    .correlation_samples
+                    .checked_mul(2)
+                    .and_then(|cfl| samples.checked_add(cfl))
+            });
+        let strategy_matches = expected
+            .expected_strategy
+            .map(|strategy| self.strategy == transform_id(strategy))
+            .unwrap_or(true);
         match self.code {
             1 if self.cursor == self.expected_end
-                && self.lf_decoded == expected_lf_samples
-                && self.hf_decoded == expected_hf_samples
-                && self.strategy == transform_id(expected_strategy)
+                && self.lf_decoded == expected.expected_lf_samples
+                && Some(self.hf_decoded) == expected_hf_samples
+                && self.first_blocks != 0
+                && self.first_blocks <= expected.task_capacity
+                && strategy_matches
                 && self.hf_mul > 0
-                && self.global_scale == expected_global_scale
-                && self.quant_lf == expected_quant_lf =>
+                && self.global_scale == expected.expected_global_scale
+                && self.quant_lf == expected.expected_quant_lf
+                && self.extra_precision == u32::from(expected.expected_extra_precision) =>
             {
-                Ok(())
+                Ok(ValidatedVarDctPacket {
+                    first_blocks: self.first_blocks,
+                })
             }
             1 => Err(GpuVarDctPacketError::Entropy {
                 code: self.code,
@@ -776,10 +895,9 @@ impl GpuVarDctPacketStatus {
             20 => Err(GpuVarDctPacketError::LfHeader),
             21 => Err(GpuVarDctPacketError::FirstBlock),
             22 => Err(GpuVarDctPacketError::HfHeader),
-            23 => Err(GpuVarDctPacketError::Correlation { value: self.detail }),
             24 => Err(GpuVarDctPacketError::Strategy {
                 actual: self.detail,
-                expected: transform_id(expected_strategy),
+                expected: expected.expected_strategy.map_or(u32::MAX, transform_id),
             }),
             25 => Err(GpuVarDctPacketError::Sharpness { value: self.detail }),
             27 => Err(GpuVarDctPacketError::HfGlobal),
@@ -966,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn coefficient_entropy_plan_expands_dct8_custom_orders_before_coefficient_symbols() {
+    fn coefficient_entropy_plan_expands_all_custom_orders_before_coefficient_symbols() {
         let codestream = decode_hex(include_str!(
             "../../jxl_gpu_bitstream/test-data/green_queen_vardct_e3.jxl.hex"
         ));
@@ -991,12 +1109,43 @@ mod tests {
             32 * 32 * 3 * 64,
         )
         .unwrap();
-        assert_eq!(plan.order_coordinate_offset_words, 12);
-        assert_eq!(plan.order_words.len(), 12 + 3 * 64);
-        assert_eq!(
-            &plan.order_words[..12],
-            &[0, 64, 8, 8, 64, 64, 8, 8, 128, 64, 8, 8]
+        assert_eq!(plan.order_coordinate_offset_words, 13 * 3 * 4);
+        let descriptors = bytemuck::cast_slice::<u32, crate::vardct_artifact::GpuHfOrderDescriptor>(
+            &plan.order_words[..plan.order_coordinate_offset_words as usize],
         );
+        assert_eq!(descriptors.len(), 13 * 3);
+        assert_eq!(descriptors[0].len, 64);
+        assert_eq!([descriptors[0].width, descriptors[0].height], [8, 8]);
+        assert_ne!(descriptors[0].offset, descriptors[1].offset);
+        assert_ne!(descriptors[1].offset, descriptors[2].offset);
+        assert_eq!(descriptors[3].offset, descriptors[4].offset);
+        assert_eq!(descriptors[4].offset, descriptors[5].offset);
+        assert_eq!(
+            plan.order_words.len(),
+            plan.order_coordinate_offset_words as usize
+                + crate::vardct_artifact::HF_ORDER_EXTENTS
+                    .iter()
+                    .map(|[width, height]| (width * height) as usize)
+                    .sum::<usize>()
+                + 2 * 64
+        );
+    }
+
+    #[test]
+    fn natural_orders_cover_each_transform_extent_once() {
+        for [width, height] in crate::vardct_artifact::HF_ORDER_EXTENTS {
+            let order = natural_coefficient_order(width, height).unwrap();
+            let mut sorted = order
+                .iter()
+                .map(|packed| (packed & 0xffff, packed >> 16))
+                .collect::<Vec<_>>();
+            sorted.sort_unstable();
+            let mut expected = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            assert_eq!(sorted, expected, "{width}x{height}");
+        }
     }
 
     #[test]

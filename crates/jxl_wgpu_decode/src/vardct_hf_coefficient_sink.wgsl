@@ -100,10 +100,11 @@ fn hf_store_quantized_coefficient(
         hf_sink_fail(HF_SINK_ERROR_COORDINATE);
         return false;
     }
+    let special = (flags & 2u) != 0u;
     let packed_index = select(
         frequency_x * height + frequency_y,
         frequency_y * width + frequency_x,
-        height < width,
+        special || height < width,
     );
     let destination = coefficient_offset + channel * area + packed_index;
     if (destination >= hf_sink_params.coefficient_words

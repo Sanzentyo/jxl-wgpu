@@ -21,6 +21,8 @@ const STATUS_COEFFICIENT_WORDS: u32 = 5u;
 const STATUS_COVERED_BLOCKS: u32 = 6u;
 const STATUS_CONSUMED_ENTRIES: u32 = 7u;
 const STATUS_BACKEND_REQUIREMENTS: u32 = 8u;
+const STATUS_STRATEGY_MASK: u32 = 9u;
+const HF_CORRELATION_BASE: f32 = 84.0;
 const BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID: u32 = 1u;
 const ERROR_INVALID_STRATEGY: u32 = 1u;
 const ERROR_NON_POSITIVE_HF_MUL: u32 = 2u;
@@ -241,6 +243,15 @@ fn write_task(
 @compute @workgroup_size(1, 1, 1)
 fn lower_hf_metadata() {
     clear_workspace();
+    let correlation_count = params.capacities.w * ((params.dimensions.y + 7u) / 8u);
+    for (var index = 0u; index < correlation_count; index += 1u) {
+        resources[params.metadata_offsets.w + index] = vec4<f32>(
+            f32(raw_metadata[index]) / HF_CORRELATION_BASE,
+            1.0 + f32(raw_metadata[correlation_count + index]) / HF_CORRELATION_BASE,
+            0.0,
+            0.0,
+        );
+    }
     var counts: array<u32, 27>;
     var consumed = 0u;
     var covered = 0u;
@@ -298,10 +309,14 @@ fn lower_hf_metadata() {
     }
 
     var bucket_cursor = 0u;
+    var strategy_mask = 0u;
     var bucket_offsets: array<u32, 27>;
     for (var strategy = 0u; strategy < STRATEGY_COUNT; strategy = strategy + 1u) {
         bucket_offsets[strategy] = bucket_cursor;
         write_bucket(strategy, bucket_cursor, counts[strategy]);
+        if (counts[strategy] != 0u) {
+            strategy_mask |= 1u << strategy;
+        }
         bucket_cursor = bucket_cursor + counts[strategy];
     }
 
@@ -345,4 +360,5 @@ fn lower_hf_metadata() {
     artifact[status_offset() + STATUS_COVERED_BLOCKS] = covered;
     artifact[status_offset() + STATUS_CONSUMED_ENTRIES] = consumed;
     artifact[status_offset() + STATUS_BACKEND_REQUIREMENTS] = backend_requirements;
+    artifact[status_offset() + STATUS_STRATEGY_MASK] = strategy_mask;
 }

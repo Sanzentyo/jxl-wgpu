@@ -24,7 +24,7 @@ const PORTABLE_WORKGROUPS_PER_DIMENSION: usize = 65_535;
 // Normative inverse AFV basis from jxl_transforms 0.6.0, which in turn follows
 // the JPEG XL specification. Stored as vec4-aligned GPU resource data below.
 #[allow(clippy::excessive_precision)]
-const AFV_BASIS: [f32; 256] = [
+pub const VAR_DCT_AFV_BASIS: [f32; 256] = [
     0.25,
     0.25,
     0.25,
@@ -333,7 +333,12 @@ struct GeneralUniform {
     transform_kind: u32,
     correlation_width: u32,
     correlation_height: u32,
-    _padding: [u32; 2],
+    task_word_offset: u32,
+    bucket_word_offset: u32,
+    lf_stride: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
     quant_biases: [f32; 4],
 }
 
@@ -342,7 +347,7 @@ const _: () = {
     assert!(std::mem::align_of::<GpuTask>() == 4);
     assert!(std::mem::size_of::<GpuResourceVector>() == 16);
     assert!(std::mem::align_of::<GpuResourceVector>() == 16);
-    assert!(std::mem::size_of::<GeneralUniform>() == 112);
+    assert!(std::mem::size_of::<GeneralUniform>() == 128);
     assert!(std::mem::align_of::<GeneralUniform>() == 16);
 };
 
@@ -795,7 +800,7 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
     }
     let afv_basis_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
-        AFV_BASIS
+        VAR_DCT_AFV_BASIS
             .chunks_exact(4)
             .map(|values| GpuResourceVector([values[0], values[1], values[2], values[3]])),
     );
@@ -937,14 +942,15 @@ fn encode_prepared(
                 output_width_b: outputs[2].desc.extent.width,
                 output_height_b: outputs[2].desc.extent.height,
                 output_stride_b: stride(&outputs[2].desc),
-                transform_kind: if bucket.transform.is_special() {
-                    special_transform_code(bucket.transform)?
-                } else {
-                    0
-                },
+                transform_kind: transform_index(bucket.transform)?,
                 correlation_width: prepared.correlation_width,
                 correlation_height: prepared.correlation_height,
-                _padding: [0; 2],
+                task_word_offset: 0,
+                bucket_word_offset: u32::MAX,
+                lf_stride: 0,
+                _padding0: 0,
+                _padding1: 0,
+                _padding2: 0,
                 quant_biases: prepared.quant_biases,
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1138,21 +1144,12 @@ fn special_pipeline(backend: &WgpuBackend) -> Arc<wgpu::ComputePipeline> {
     }
 }
 
-fn special_transform_code(transform: TransformKind) -> Result<u32> {
-    match transform {
-        TransformKind::Hornuss => Ok(0),
-        TransformKind::Dct2x2 => Ok(1),
-        TransformKind::Dct4x4 => Ok(2),
-        TransformKind::Dct4x8 => Ok(3),
-        TransformKind::Dct8x4 => Ok(4),
-        TransformKind::Afv0 => Ok(5),
-        TransformKind::Afv1 => Ok(6),
-        TransformKind::Afv2 => Ok(7),
-        TransformKind::Afv3 => Ok(8),
-        _ => Err(Error::InvalidPayload(format!(
-            "regular transform {transform:?} was routed to the special VarDCT kernel"
-        ))),
-    }
+fn transform_index(transform: TransformKind) -> Result<u32> {
+    TransformKind::ALL
+        .iter()
+        .position(|&candidate| candidate == transform)
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| Error::InvalidPayload(format!("unknown VarDCT transform {transform:?}")))
 }
 
 fn coefficient_len(coefficients: &PackedCoefficients) -> Result<usize> {
@@ -1326,15 +1323,20 @@ mod tests {
             transform_kind: 20,
             correlation_width: 21,
             correlation_height: 22,
-            _padding: [23, 24],
+            task_word_offset: 23,
+            bucket_word_offset: 24,
+            lf_stride: 25,
+            _padding0: 26,
+            _padding1: 27,
+            _padding2: 28,
             quant_biases: [
-                f32::from_bits(25),
-                f32::from_bits(26),
-                f32::from_bits(27),
-                f32::from_bits(28),
+                f32::from_bits(29),
+                f32::from_bits(30),
+                f32::from_bits(31),
+                f32::from_bits(32),
             ],
         };
-        assert_eq!(abi_words(&params), &(1..=28).collect::<Vec<_>>());
+        assert_eq!(abi_words(&params), &(1..=32).collect::<Vec<_>>());
 
         let task_fields = [
             "coefficient_offset",
@@ -1377,7 +1379,12 @@ mod tests {
             "transform_kind",
             "correlation_width",
             "correlation_height",
-            "_padding",
+            "task_word_offset",
+            "bucket_word_offset",
+            "lf_stride",
+            "_padding0",
+            "_padding1",
+            "_padding2",
             "quant_biases",
         ];
         for shader in [

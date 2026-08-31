@@ -64,6 +64,7 @@ fn config(raw_metadata_words: u64) -> HfMetadataArtifactConfig {
         destination_origin: [8, 16],
         afv_basis_offset: 9_999,
         quant_offset: 0,
+        correlation_offset: 0,
         global_scale: 8_813,
         matrix_offsets: std::array::from_fn(|strategy| 1_000 + strategy as u32 * 64),
     }
@@ -109,6 +110,7 @@ fn lower_topology(
         destination_origin: [0, 0],
         afv_basis_offset: 0,
         quant_offset: 0,
+        correlation_offset: 0,
         global_scale: 8_813,
         matrix_offsets: [0; VAR_DCT_STRATEGY_COUNT],
     };
@@ -746,7 +748,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     );
     assert_eq!(coefficients[63], 13);
     assert_eq!(coefficients[192 + 128 + 127], 19);
-    // Square/tall transform buffers are frequency-X-major, so coordinate (5, 0) is slot 40.
-    assert_eq!(coefficients[576 + 2 * 64 + 40], -7);
+    // Special-transform coefficient buffers use raster order, so coordinate (5, 0) is slot 5.
+    assert_eq!(coefficients[576 + 2 * 64 + 5], -7);
     assert_eq!(coefficients.iter().filter(|&&value| value != 0).count(), 3);
 }

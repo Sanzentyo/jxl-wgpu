@@ -519,7 +519,8 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         .unwrap();
     let packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
     let entropy_bit = usize::try_from(packet.entropy_bit_offset).unwrap();
-    corrupted[entropy_bit / 8] ^= 1 << (entropy_bit % 8);
+    let modular_header_bit = entropy_bit + 2;
+    corrupted[modular_header_bit / 8] ^= 1 << (modular_header_bit % 8);
 
     let mut rejected = decoder
         .open(
@@ -584,8 +585,8 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .unwrap();
         let plan = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
         let blocks = extent.width.div_ceil(8) * extent.height.div_ceil(8);
-        assert_eq!(plan.transform, jxl_gpu_protocol::TransformKind::Dct8);
-        assert_eq!(plan.task_count, blocks);
+        assert_eq!(plan.uniform_transform, None);
+        assert_eq!(plan.task_capacity, blocks);
         assert!(plan.hf_global.is_some());
         assert!(plan.profile.group_count >= 2);
         let hf_coefficients = plan
@@ -628,7 +629,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         );
         assert_eq!(
             memory.resident_transient_bytes,
-            2 * u64::from(blocks * 8 * 8 * 3) * std::mem::size_of::<f32>() as u64 + 112,
+            2 * u64::from(blocks * 8 * 8 * 3) * std::mem::size_of::<f32>() as u64 + 27 * 128,
         );
         let frame = if extent.width == 257 {
             pollster::block_on(session.next_frame_async())
@@ -702,12 +703,14 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
     assert!(plan.needs_self_correcting);
     let hf = plan.hf_coefficients.as_ref().unwrap();
     assert_eq!(hf.pass_groups.len(), 6);
-    assert_eq!(hf.order_coordinate_offset_words, 12);
-    assert_eq!(hf.order_words.len(), 12 + 3 * 64);
-    assert_eq!(
-        &hf.order_words[..12],
-        &[0, 64, 8, 8, 64, 64, 8, 8, 128, 64, 8, 8]
-    );
+    assert_eq!(hf.order_coordinate_offset_words, 13 * 3 * 4);
+    let descriptors = bytemuck::cast_slice::<
+        u32,
+        jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor,
+    >(&hf.order_words[..hf.order_coordinate_offset_words as usize]);
+    assert_eq!(descriptors.len(), 13 * 3);
+    assert_eq!([descriptors[0].width, descriptors[0].height], [8, 8]);
+    assert_ne!(descriptors[0].offset, descriptors[1].offset);
 
     let mut session = decoder
         .open(
@@ -798,6 +801,72 @@ fn libjxl_center_first_permuted_toc_matches_reference_on_gpu() {
         assert!(
             djxl_error <= 1,
             "center-first GPU output diverges from djxl by {djxl_error}",
+        );
+    }
+}
+
+#[test]
+fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let encoded = common::green_queen_vardct_mixed();
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+    let extent = Extent2d::new(plan.profile.width, plan.profile.height);
+    assert_eq!(extent, Extent2d::new(257, 257));
+    assert_eq!(plan.uniform_transform, None);
+    assert_eq!(plan.extra_precision, 1);
+    assert_eq!(plan.task_capacity, 33 * 33);
+    let hf = plan.hf_coefficients.as_ref().unwrap();
+    assert_eq!(hf.num_block_clusters, 3);
+    let descriptors = bytemuck::cast_slice::<
+        u32,
+        jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor,
+    >(&hf.order_words[..hf.order_coordinate_offset_words as usize]);
+    let custom_orders = (0..13)
+        .filter(|&order| descriptors[order * 3].offset != descriptors[order * 3 + 1].offset)
+        .collect::<Vec<_>>();
+    assert_eq!(custom_orders, [0, 1]);
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    let rust_error = maximum_error(actual, &rust);
+    assert!(
+        rust_error <= 1,
+        "mixed-strategy GPU output diverges from Rust jxl by {rust_error}",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        let djxl_error = maximum_error(actual, &djxl);
+        assert!(
+            djxl_error <= 1,
+            "mixed-strategy GPU output diverges from djxl by {djxl_error}",
         );
     }
 }

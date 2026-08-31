@@ -174,18 +174,22 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
                 + params.block_origin_x + x;
             let task_plus_one = hf_artifact[params.block_task_map_offset_words + raster];
             if task_plus_one == 0u {
-                fail(ERROR_BLOCK_TASK);
                 continue;
             }
             let task_index = task_plus_one - 1u;
             let task_metadata = hf_sink_params.task_metadata_offset_words + task_index * 12u;
-            if hf_artifact[task_metadata] != 0u || hf_artifact[task_metadata + 2u] != params.block_origin_x + x
+            if hf_artifact[task_metadata + 2u] != params.block_origin_x + x
                 || hf_artifact[task_metadata + 3u] != params.block_origin_y + y
-                || hf_artifact[task_metadata + 4u] != 1u || hf_artifact[task_metadata + 5u] != 1u
+                || hf_artifact[task_metadata + 4u] == 0u
+                || hf_artifact[task_metadata + 5u] == 0u
                 || hf_artifact[task_metadata + 7u] != lane {
                 fail(ERROR_TASK_SHAPE);
                 continue;
             }
+            let task_block_width = hf_artifact[task_metadata + 4u];
+            let task_block_height = hf_artifact[task_metadata + 5u];
+            let num_blocks = task_block_width * task_block_height;
+            let num_blocks_log = countTrailingZeros(num_blocks);
 
             for (var order_channel = 0u; order_channel < 3u && decode_error == 0u;
                 order_channel += 1u) {
@@ -223,22 +227,31 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
                 var remaining_nonzero = entropy_read_varint(
                     context_cluster(nonzero_context), 0u
                 );
-                if remaining_nonzero > 63u {
+                if remaining_nonzero > 63u * num_blocks {
                     fail(ERROR_NONZERO_COUNT);
                     continue;
                 }
-                nonzero_grid[grid_index] = remaining_nonzero;
+                let normalized_nonzero = (remaining_nonzero + num_blocks - 1u) >> num_blocks_log;
+                for (var dx = 0u; dx < task_block_width; dx += 1u) {
+                    nonzero_grid[grid_index + dx] = normalized_nonzero;
+                }
                 if remaining_nonzero == 0u { continue; }
 
-                var previous_nonzero = select(0u, 1u, remaining_nonzero <= 4u);
+                var previous_nonzero = select(
+                    0u,
+                    1u,
+                    remaining_nonzero <= num_blocks * 4u,
+                );
                 let coefficient_context_base = preset_context_base + block_context * 458u
                     + 37u * params.num_block_clusters;
-                for (var order_index = 1u; order_index < 64u && decode_error == 0u;
+                for (var order_index = num_blocks;
+                    order_index < 64u * num_blocks && decode_error == 0u;
                     order_index += 1u) {
-                    let remaining_context = remaining_nonzero - 1u;
+                    let remaining_context = (remaining_nonzero - 1u) >> num_blocks_log;
+                    let frequency_context = (order_index - num_blocks) >> num_blocks_log;
                     let coefficient_context = (
                         COEFF_NUM_NONZERO_CONTEXT[remaining_context]
-                        + COEFF_FREQ_CONTEXT[order_index - 1u]
+                        + COEFF_FREQ_CONTEXT[frequency_context]
                     ) * 2u + previous_nonzero;
                     let packed = entropy_read_varint(
                         context_cluster(coefficient_context_base + coefficient_context), 0u

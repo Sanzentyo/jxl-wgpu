@@ -1,13 +1,12 @@
 //! Runtime-neutral GPU submission engine for the bounded standard VarDCT profile.
 //!
 //! The accepted codestream profile is intentionally bounded and authoritative: one still XYB
-//! frame, either one image-sized regular zero-AC transform or one LF group of tiled DCT8 tasks,
-//! stream-provided quantization, GPU-decoded LF/HF metadata, and GPU-decoded single-pass DCT8 AC
-//! coefficients. No pixel, coefficient, transform, quantization, residual, or entropy fallback
-//! runs on the CPU.
+//! frame, one LF group, GPU-decoded mixed strategy/quantization/correlation metadata, and
+//! GPU-decoded single-pass AC coefficients for every JPEG XL VarDCT strategy. No pixel,
+//! coefficient, transform, quantization, residual, or entropy fallback runs on the CPU.
 
 use std::collections::BTreeMap;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,9 +40,9 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 use crate::vardct_artifact::{
-    GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfDispatchStage, HfMetadataArtifactConfig,
+    GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfMetadataArtifactConfig,
     HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
-    VAR_DCT_STRATEGY_COUNT, VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
+    VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
 };
 use crate::vardct_epf::{EpfSigmaConfig, EpfSigmaError, EpfSigmaMemoryPlan, EpfSigmaPipeline};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams, AdaptiveLfPipeline};
@@ -54,6 +53,7 @@ use crate::vardct_output::{
 use crate::vardct_packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
     VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline,
+    VarDctPacketValidation,
 };
 use crate::vardct_pass_group::{
     GpuHfCoefficientError, GpuHfCoefficientStatus, HfCoefficientBuffers,
@@ -535,10 +535,7 @@ impl VarDctSubmissionEngine {
             self.pipelines.output_variant,
         )?;
         let extent = source.layout.extent;
-        let profile = DecodeProfile::VarDctRegular {
-            bits_per_sample: 8,
-            transform: source.packet.transform,
-        };
+        let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
         Ok(PreparedGpuSession::new(
             profile,
             AnimationMetadata::still(extent),
@@ -581,7 +578,6 @@ struct VarDctSource {
     inverse_opsin: VarDctInverseOpsin,
     quant_biases: [f32; 4],
     frame_name: String,
-    transform_index: usize,
     memory: VarDctDecodeMemoryStats,
 }
 
@@ -721,24 +717,14 @@ fn prepare_source(
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
     let control = packet.packet_control()?;
     let [blocks_x, blocks_y] = packet.block_extent();
-    let transform_extent = packet.transform.pixel_extent();
-    let transform_area = transform_extent
-        .width
-        .checked_mul(transform_extent.height)
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "transform area",
-        })?;
-    let resource_layout =
-        VarDctResourceLayout::new(blocks_x, blocks_y, transform_area, packet.task_count)?;
-    let resource_params =
-        VarDctResourceParams::new(blocks_x, blocks_y, packet.global_scale, packet.quant_lf)?;
-    let transform_index = TransformKind::ALL
-        .iter()
-        .position(|&candidate| candidate == packet.transform)
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "regular transform index",
-        })?;
-    let matrix_offsets = [resource_layout.matrix_offset; VAR_DCT_STRATEGY_COUNT];
+    let resource_layout = VarDctResourceLayout::new(blocks_x, blocks_y, packet.task_capacity)?;
+    let resource_params = VarDctResourceParams::new(
+        blocks_x,
+        blocks_y,
+        packet.global_scale,
+        packet.quant_lf,
+        packet.extra_precision,
+    )?;
     let correlation_width = packet.profile.width.div_ceil(64);
     let correlation_height = packet.profile.height.div_ceil(64);
     let pass_group_dim_blocks = packet.profile.group_dimension.checked_div(8).ok_or(
@@ -749,7 +735,7 @@ fn prepare_source(
     let artifact_config = HfMetadataArtifactConfig {
         blocks_width: blocks_x,
         blocks_height: blocks_y,
-        block_info_entries: packet.task_count,
+        block_info_entries: packet.task_capacity,
         strategy_offset_words: control.offsets[2],
         hf_mul_offset_words: control.offsets[3],
         raw_metadata_words: u64::from(control.capacities[1]),
@@ -758,10 +744,11 @@ fn prepare_source(
         correlation_width,
         correlation_height,
         destination_origin: [0, 0],
-        afv_basis_offset: resource_layout.matrix_offset,
+        afv_basis_offset: resource_layout.afv_basis_offset,
         quant_offset: resource_layout.quant_offset,
+        correlation_offset: resource_layout.correlation_offset,
         global_scale: packet.global_scale,
-        matrix_offsets,
+        matrix_offsets: resource_layout.matrix_offsets,
     };
     let artifact_layout = VarDctArtifactLayout::plan(
         &artifact_config,
@@ -772,7 +759,7 @@ fn prepare_source(
         header.plan(
             blocks_x,
             blocks_y,
-            packet.task_count,
+            packet.task_capacity,
             control.expected[3],
             artifact_layout,
             packet.global_scale,
@@ -815,12 +802,7 @@ fn prepare_source(
         opsin.quant_bias[2].to_f32(),
         opsin.quant_bias_numerator.to_f32(),
     ];
-    let scratch_scalars = transform_area
-        .checked_mul(packet.task_count)
-        .and_then(|area| area.checked_mul(3))
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "resident transform scratch scalars",
-        })?;
+    let scratch_scalars = packet.coefficient_words();
     let resident_memory = ResidentVarDctMemoryPlan::new(scratch_scalars)?;
     let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
         codestream_len: codestream.bytes().len(),
@@ -855,7 +837,6 @@ fn prepare_source(
         inverse_opsin,
         quant_biases,
         frame_name,
-        transform_index,
         memory,
     })
 }
@@ -1196,16 +1177,17 @@ pub struct VarDctPendingFrame {
     completion: Arc<MapCompletion>,
     token: SubmissionToken,
     layout: ImageLayout,
-    transform: TransformKind,
+    uniform_transform: Option<TransformKind>,
     frame_name: String,
     expected_lf_samples: u32,
-    expected_hf_samples: u32,
     expected_coefficients: u32,
     expected_blocks: u32,
-    expected_tasks: u32,
+    correlation_samples: u32,
+    task_capacity: u32,
     expected_hf_groups: u32,
     expected_global_scale: u32,
     expected_quant_lf: u32,
+    expected_extra_precision: u8,
 }
 
 impl std::fmt::Debug for VarDctPendingFrame {
@@ -1214,7 +1196,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
             .debug_struct("VarDctPendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
-            .field("transform", &self.transform)
+            .field("uniform_transform", &self.uniform_transform)
             .finish_non_exhaustive()
     }
 }
@@ -1250,7 +1232,7 @@ impl VarDctPendingFrame {
             .slice(..)
             .get_mapped_range()
             .map_err(DecodeError::backend)?;
-        let packet: GpuVarDctPacketStatus = mapped
+        let packet_status: GpuVarDctPacketStatus = mapped
             .get(..PACKET_STATUS_BYTES as usize)
             .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
             .ok_or(VarDctDecodeError::StatusAbi { status: "packet" })?;
@@ -1258,20 +1240,23 @@ impl VarDctPendingFrame {
             .get(PACKET_STATUS_BYTES as usize..BASE_VALIDATION_STAGING_BYTES as usize)
             .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
             .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
-        packet
-            .validate(
-                self.transform,
-                self.expected_lf_samples,
-                self.expected_hf_samples,
-                self.expected_global_scale,
-                self.expected_quant_lf,
-            )
+        let packet = packet_status
+            .validate(VarDctPacketValidation {
+                expected_strategy: self.uniform_transform,
+                expected_lf_samples: self.expected_lf_samples,
+                block_count: self.expected_blocks,
+                correlation_samples: self.correlation_samples,
+                task_capacity: self.task_capacity,
+                expected_global_scale: self.expected_global_scale,
+                expected_quant_lf: self.expected_quant_lf,
+                expected_extra_precision: self.expected_extra_precision,
+            })
             .map_err(VarDctDecodeError::from)?;
-        if packet.coefficient_words != self.expected_coefficients {
+        if packet_status.coefficient_words != self.expected_coefficients {
             return Err(VarDctDecodeError::ArtifactStatus {
                 field: "packet coefficient_words",
                 expected: self.expected_coefficients,
-                actual: packet.coefficient_words,
+                actual: packet_status.coefficient_words,
             }
             .into());
         }
@@ -1298,7 +1283,7 @@ impl VarDctPendingFrame {
         }
         drop(mapped);
         for (field, expected, actual) in [
-            ("task_count", self.expected_tasks, artifact.task_count),
+            ("task_count", packet.first_blocks, artifact.task_count),
             (
                 "coefficient_words",
                 self.expected_coefficients,
@@ -1311,7 +1296,7 @@ impl VarDctPendingFrame {
             ),
             (
                 "consumed_block_info_entries",
-                self.expected_tasks,
+                packet.first_blocks,
                 artifact.consumed_block_info_entries,
             ),
             ("backend_requirements", 0, artifact.backend_requirements),
@@ -1519,7 +1504,7 @@ fn submit_vardct(
         source.memory.lf_temporary_bytes,
         wgpu::BufferUsages::COPY_DST,
     );
-    let resource_values = source.resource_layout.initial_values();
+    let resource_values = source.resource_layout.initial_values()?;
     let resources = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu VarDCT resource vectors"),
         contents: bytemuck::cast_slice(&resource_values),
@@ -1721,44 +1706,8 @@ fn submit_vardct(
             })?,
         );
     }
-
-    let (tasks_offset, tasks_size) = source.artifact_layout.task_binding();
-    let tasks = ResidentStorageBinding {
-        buffer: &artifact,
-        offset: tasks_offset,
-        size: NonZeroU64::new(tasks_size)
-            .ok_or(ResidentVarDctError::EmptyBinding { role: "task" })?,
-    };
-    let extent = source.packet.transform.pixel_extent();
     let blocks = source.resource_layout.block_count;
-    let scratch_scalars = extent
-        .width
-        .checked_mul(extent.height)
-        .and_then(|area| area.checked_mul(source.packet.task_count))
-        .and_then(|area| area.checked_mul(3))
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "resident scratch scalars",
-        })?;
-    let indirect_offsets = [
-        source
-            .artifact_layout
-            .indirect_offset(source.transform_index, HfDispatchStage::Dequantize)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "dequantize indirect offset",
-            })?,
-        source
-            .artifact_layout
-            .indirect_offset(source.transform_index, HfDispatchStage::Horizontal)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "horizontal indirect offset",
-            })?,
-        source
-            .artifact_layout
-            .indirect_offset(source.transform_index, HfDispatchStage::Vertical)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "vertical indirect offset",
-            })?,
-    ];
+    let scratch_scalars = source.packet.coefficient_words();
     let padded_width =
         source.control.geometry[2]
             .checked_mul(8)
@@ -1785,19 +1734,20 @@ fn submit_vardct(
         &mut commands,
         ResidentVarDctInputs {
             coefficients: resident_binding(&coefficients)?,
-            tasks,
+            artifact: resident_binding(&artifact)?,
             resources: resident_binding(&resources)?,
             outputs: [output_x?, output_y?, output_b?],
             indirect: &artifact,
-            indirect_offsets,
+            indirect_base_offset: u64::from(source.artifact_layout.indirect_offset_words) * 4,
             config: ResidentVarDctRenderConfig {
-                transform: source.packet.transform,
-                task_base: 0,
-                task_capacity: source.packet.task_count,
+                task_capacity: source.packet.task_capacity,
                 scratch_scalars,
+                task_word_offset: source.artifact_layout.tasks_offset_words,
+                bucket_word_offset: source.artifact_layout.buckets_offset_words,
                 quant_offset: source.resource_layout.quant_offset,
                 correlation_offset: source.resource_layout.correlation_offset,
                 lf_offset: source.resource_layout.lf_offset,
+                lf_stride: source.control.geometry[2],
                 correlation_width: source.packet.profile.width.div_ceil(64),
                 correlation_height: source.packet.profile.height.div_ceil(64),
                 quant_biases: source.quant_biases,
@@ -1991,32 +1941,19 @@ fn submit_vardct(
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "correlation samples",
         })?;
-    let expected_hf_samples = source
-        .packet
-        .task_count
-        .checked_mul(2)
-        .and_then(|tasks| blocks.checked_add(tasks))
-        .and_then(|samples| {
-            correlations
-                .checked_mul(2)
-                .and_then(|cfl| samples.checked_add(cfl))
-        })
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "HF metadata sample count",
-        })?;
     Ok(VarDctPendingFrame {
         device: device.clone(),
         lifetime: Some(lifetime),
         completion,
         token: SubmissionToken(1),
         layout: source.layout.clone(),
-        transform: source.packet.transform,
+        uniform_transform: source.packet.uniform_transform,
         frame_name: source.frame_name.clone(),
         expected_lf_samples: blocks * 3,
-        expected_hf_samples,
         expected_coefficients: source.packet.coefficient_words(),
         expected_blocks: blocks,
-        expected_tasks: source.packet.task_count,
+        correlation_samples: correlations,
+        task_capacity: source.packet.task_capacity,
         expected_hf_groups: source
             .hf_coefficients
             .as_ref()
@@ -2024,6 +1961,7 @@ fn submit_vardct(
             .unwrap_or(0),
         expected_global_scale: source.packet.global_scale,
         expected_quant_lf: source.packet.quant_lf,
+        expected_extra_precision: source.packet.extra_precision,
     })
 }
 

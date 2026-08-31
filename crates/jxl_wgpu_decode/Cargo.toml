@@ -10,6 +10,9 @@ rust-version.workspace = true
 bytemuck.workspace = true
 jxl-bitstream.workspace = true
 jxl-coding.workspace = true
+jxl-oxide-common.workspace = true
+jxl-threadpool.workspace = true
+jxl-vardct.workspace = true
 jxl_gpu_bitstream.workspace = true
 jxl_gpu_formats.workspace = true
 jxl_gpu_protocol.workspace = true
@@ -23,9 +26,6 @@ jxl-frame.workspace = true
 jxl-grid.workspace = true
 jxl-image.workspace = true
 jxl-modular.workspace = true
-jxl-oxide-common.workspace = true
-jxl-threadpool.workspace = true
-jxl-vardct.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_wgpu_encode.workspace = true
 naga = { version = "30.0.1", features = ["wgsl-in"] }

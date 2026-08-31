@@ -5,7 +5,8 @@ use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
 use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus, VarDctModularParams,
-    VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline, vardct_packet_shader_source,
+    VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline, VarDctPacketValidation,
+    vardct_packet_shader_source,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, VarDctColorEncoding, VarDctEncoder, VarDctStrategy, WgpuContext,
@@ -179,13 +180,16 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     staging.unmap();
     let block_count = control.geometry[2] * control.geometry[3];
     status
-        .validate(
-            plan.transform,
-            block_count * 3,
-            block_count + 4,
-            plan.global_scale,
-            plan.quant_lf,
-        )
+        .validate(VarDctPacketValidation {
+            expected_strategy: plan.uniform_transform,
+            expected_lf_samples: block_count * 3,
+            block_count,
+            correlation_samples: plan.profile.width.div_ceil(64) * plan.profile.height.div_ceil(64),
+            task_capacity: plan.task_capacity,
+            expected_global_scale: plan.global_scale,
+            expected_quant_lf: plan.quant_lf,
+            expected_extra_precision: plan.extra_precision,
+        })
         .unwrap();
     assert_eq!(status.coefficient_words, plan.coefficient_words());
 }
@@ -292,7 +296,10 @@ fn gpu_sharpness_validation_rejects_out_of_range_metadata() {
     let mapped = staging.slice(..).get_mapped_range().unwrap();
     let status = *bytemuck::from_bytes::<GpuVarDctPacketStatus>(&mapped);
     assert_eq!(
-        status.validate(TransformKind::Dct8, 0, 0, 0, 0),
+        status.validate(VarDctPacketValidation {
+            expected_strategy: Some(TransformKind::Dct8),
+            ..VarDctPacketValidation::default()
+        }),
         Err(GpuVarDctPacketError::Sharpness { value: 8 })
     );
 }

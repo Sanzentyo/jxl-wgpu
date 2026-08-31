@@ -15,6 +15,7 @@ use wgpu::util::DeviceExt;
 const WORKGROUP_SIZE: u32 = 64;
 const GENERAL_TASK_BYTES: u64 = 64;
 const INDIRECT_ARGUMENT_BYTES: u64 = 12;
+const INDIRECT_STAGES: u64 = 3;
 
 /// A checked subrange used as one WGSL storage binding.
 #[derive(Clone, Copy, Debug)]
@@ -74,16 +75,20 @@ impl ResidentF32Plane<'_> {
 /// Host-known fields that accompany GPU-produced tasks and coefficients.
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentVarDctRenderConfig {
-    pub transform: TransformKind,
-    /// First task relative to the bound task subrange.
-    pub task_base: u32,
-    /// Maximum task count. The indirect Y dimension may select any smaller live count.
+    /// Maximum task count across all compact strategy buckets. Each indirect Y dimension selects
+    /// the exact live count for its bucket.
     pub task_capacity: u32,
     /// F32 scalar capacity of each transform scratch allocation.
     pub scratch_scalars: u32,
+    /// Word offset of the first compact 64-byte task in `artifact`.
+    pub task_word_offset: u32,
+    /// Word offset of the first 16-byte strategy bucket in `artifact`.
+    pub bucket_word_offset: u32,
     pub quant_offset: u32,
     pub correlation_offset: u32,
     pub lf_offset: u32,
+    /// Row stride of the image-wide LF tuple grid.
+    pub lf_stride: u32,
     pub correlation_width: u32,
     pub correlation_height: u32,
     pub quant_biases: [f32; 4],
@@ -93,12 +98,13 @@ pub struct ResidentVarDctRenderConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentVarDctInputs<'a> {
     pub coefficients: ResidentStorageBinding<'a>,
-    pub tasks: ResidentStorageBinding<'a>,
+    /// Complete GPU-produced artifact containing bucket descriptors and compact tasks.
+    pub artifact: ResidentStorageBinding<'a>,
     pub resources: ResidentStorageBinding<'a>,
     pub outputs: [ResidentF32Plane<'a>; 3],
     pub indirect: &'a wgpu::Buffer,
-    /// Byte offsets of dequantize, horizontal, and vertical `DispatchIndirectArgs` records.
-    pub indirect_offsets: [u64; 3],
+    /// Byte offset of the first strategy's three `DispatchIndirectArgs` records.
+    pub indirect_base_offset: u64,
     pub config: ResidentVarDctRenderConfig,
 }
 
@@ -111,7 +117,7 @@ pub struct ResidentVarDctMemoryPlan {
 }
 
 impl ResidentVarDctMemoryPlan {
-    /// Computes the two F32 scratch buffers plus the fixed uniform record.
+    /// Computes the two F32 scratch buffers plus one fixed uniform record per strategy.
     ///
     /// # Errors
     ///
@@ -123,7 +129,11 @@ impl ResidentVarDctMemoryPlan {
             .ok_or(ResidentVarDctError::ArithmeticOverflow {
                 field: "scratch buffer bytes",
             })?;
-        let uniform_bytes = std::mem::size_of::<ResidentVarDctParams>() as u64;
+        let uniform_bytes = (TransformKind::ALL.len() as u64)
+            .checked_mul(std::mem::size_of::<ResidentVarDctParams>() as u64)
+            .ok_or(ResidentVarDctError::ArithmeticOverflow {
+                field: "resident VarDCT uniform bytes",
+            })?;
         let total_bytes = scratch_buffer_bytes
             .checked_mul(2)
             .and_then(|bytes| bytes.checked_add(uniform_bytes))
@@ -149,10 +159,6 @@ pub struct ResidentVarDctScratch {
 /// Typed validation failures for the GPU-resident VarDCT renderer seam.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ResidentVarDctError {
-    #[error(
-        "resident VarDCT does not route special transform {transform:?} through the regular kernel"
-    )]
-    SpecialTransform { transform: TransformKind },
     #[error("resident VarDCT task capacity must be nonzero")]
     ZeroTaskCapacity,
     #[error("resident VarDCT {role} binding is empty")]
@@ -181,8 +187,14 @@ pub enum ResidentVarDctError {
         required: u64,
         available: u64,
     },
-    #[error("resident VarDCT task binding has {available} tasks, needs {required}")]
-    TaskBindingCapacity { required: u64, available: u64 },
+    #[error(
+        "resident VarDCT artifact {role} range ends at word {required}, binding has {available} words"
+    )]
+    ArtifactWordRange {
+        role: &'static str,
+        required: u64,
+        available: u64,
+    },
     #[error("resident VarDCT output plane {plane} has invalid {width}x{height} stride {stride}")]
     OutputGeometry {
         plane: usize,
@@ -221,6 +233,7 @@ pub struct ResidentVarDctRenderer {
     dequantize: wgpu::ComputePipeline,
     horizontal: wgpu::ComputePipeline,
     vertical: wgpu::ComputePipeline,
+    special: wgpu::ComputePipeline,
 }
 
 impl ResidentVarDctRenderer {
@@ -228,6 +241,8 @@ impl ResidentVarDctRenderer {
     pub fn new(device: &wgpu::Device) -> Self {
         let module =
             device.create_shader_module(wgpu::include_wgsl!("../shaders/vardct_general.wgsl"));
+        let special_module =
+            device.create_shader_module(wgpu::include_wgsl!("../shaders/vardct_special.wgsl"));
         let pipeline = |label: &'static str, entry_point: &'static str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
@@ -242,10 +257,18 @@ impl ResidentVarDctRenderer {
             dequantize: pipeline("jxl-wgpu resident VarDCT dequantize", "dequantize"),
             horizontal: pipeline("jxl-wgpu resident VarDCT horizontal", "horizontal_idct"),
             vertical: pipeline("jxl-wgpu resident VarDCT vertical", "vertical_idct"),
+            special: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("jxl-wgpu resident VarDCT special"),
+                layout: None,
+                module: &special_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            }),
         }
     }
 
-    /// Validates all resident ranges and records three indirect dispatches.
+    /// Validates all resident ranges and records every regular and special strategy bucket.
     ///
     /// No coefficient, task, or resource bytes cross the host. The returned
     /// scratch handles make transient lifetime and byte accounting explicit.
@@ -255,7 +278,7 @@ impl ResidentVarDctRenderer {
         encoder: &mut wgpu::CommandEncoder,
         inputs: ResidentVarDctInputs<'_>,
     ) -> Result<ResidentVarDctScratch, ResidentVarDctError> {
-        let params = validate_inputs(device, inputs)?;
+        validate_inputs(device, inputs)?;
         let memory = ResidentVarDctMemoryPlan::new(inputs.config.scratch_scalars)?;
         let maximum = device.limits().max_buffer_size;
         if memory.scratch_buffer_bytes > maximum {
@@ -276,72 +299,106 @@ impl ResidentVarDctRenderer {
             label: Some("jxl-wgpu resident VarDCT horizontal scratch"),
             ..scratch_descriptor
         });
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu resident VarDCT params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let dequantize_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu resident VarDCT dequantize bindings"),
-            layout: &self.dequantize.get_bind_group_layout(0),
-            entries: &[
-                storage_entry(0, inputs.coefficients),
-                storage_entry(1, inputs.tasks),
-                storage_entry(2, inputs.resources),
-                entire_entry(3, &dequantized),
-                entire_entry(8, &uniform),
-            ],
-        });
-        let horizontal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu resident VarDCT horizontal bindings"),
-            layout: &self.horizontal.get_bind_group_layout(0),
-            entries: &[
-                storage_entry(1, inputs.tasks),
-                entire_entry(3, &dequantized),
-                entire_entry(4, &horizontal),
-                entire_entry(8, &uniform),
-            ],
-        });
-        let vertical_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu resident VarDCT vertical bindings"),
-            layout: &self.vertical.get_bind_group_layout(0),
-            entries: &[
-                storage_entry(1, inputs.tasks),
-                entire_entry(4, &horizontal),
-                storage_entry(5, inputs.outputs[0].storage),
-                storage_entry(6, inputs.outputs[1].storage),
-                storage_entry(7, inputs.outputs[2].storage),
-                entire_entry(8, &uniform),
-            ],
-        });
-        for (label, pipeline, bind_group, offset) in [
-            (
-                "jxl-wgpu resident VarDCT dequantize",
-                &self.dequantize,
-                &dequantize_bind_group,
-                inputs.indirect_offsets[0],
-            ),
-            (
-                "jxl-wgpu resident VarDCT horizontal",
-                &self.horizontal,
-                &horizontal_bind_group,
-                inputs.indirect_offsets[1],
-            ),
-            (
-                "jxl-wgpu resident VarDCT vertical",
-                &self.vertical,
-                &vertical_bind_group,
-                inputs.indirect_offsets[2],
-            ),
-        ] {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: None,
+        for (strategy, transform) in TransformKind::ALL.into_iter().enumerate() {
+            let params = resident_params(inputs, transform, strategy as u32)?;
+            let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu resident VarDCT strategy params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            pass.dispatch_workgroups_indirect(inputs.indirect, offset);
+            let indirect = inputs
+                .indirect_base_offset
+                .checked_add(strategy as u64 * INDIRECT_STAGES * INDIRECT_ARGUMENT_BYTES)
+                .ok_or(ResidentVarDctError::ArithmeticOverflow {
+                    field: "strategy indirect offset",
+                })?;
+            if transform.is_special() {
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("jxl-wgpu resident special VarDCT bindings"),
+                    layout: &self.special.get_bind_group_layout(0),
+                    entries: &[
+                        storage_entry(0, inputs.coefficients),
+                        storage_entry(1, inputs.artifact),
+                        storage_entry(2, inputs.resources),
+                        storage_entry(5, inputs.outputs[0].storage),
+                        storage_entry(6, inputs.outputs[1].storage),
+                        storage_entry(7, inputs.outputs[2].storage),
+                        entire_entry(8, &uniform),
+                    ],
+                });
+                dispatch_indirect(
+                    encoder,
+                    "jxl-wgpu resident special VarDCT",
+                    &self.special,
+                    &bind_group,
+                    inputs.indirect,
+                    indirect,
+                );
+                continue;
+            }
+
+            let dequantize_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jxl-wgpu resident VarDCT dequantize bindings"),
+                layout: &self.dequantize.get_bind_group_layout(0),
+                entries: &[
+                    storage_entry(0, inputs.coefficients),
+                    storage_entry(1, inputs.artifact),
+                    storage_entry(2, inputs.resources),
+                    entire_entry(3, &dequantized),
+                    entire_entry(8, &uniform),
+                ],
+            });
+            let horizontal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jxl-wgpu resident VarDCT horizontal bindings"),
+                layout: &self.horizontal.get_bind_group_layout(0),
+                entries: &[
+                    storage_entry(1, inputs.artifact),
+                    entire_entry(3, &dequantized),
+                    entire_entry(4, &horizontal),
+                    entire_entry(8, &uniform),
+                ],
+            });
+            let vertical_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jxl-wgpu resident VarDCT vertical bindings"),
+                layout: &self.vertical.get_bind_group_layout(0),
+                entries: &[
+                    storage_entry(1, inputs.artifact),
+                    entire_entry(4, &horizontal),
+                    storage_entry(5, inputs.outputs[0].storage),
+                    storage_entry(6, inputs.outputs[1].storage),
+                    storage_entry(7, inputs.outputs[2].storage),
+                    entire_entry(8, &uniform),
+                ],
+            });
+            for (label, pipeline, bind_group, offset) in [
+                (
+                    "jxl-wgpu resident VarDCT dequantize",
+                    &self.dequantize,
+                    &dequantize_bind_group,
+                    indirect,
+                ),
+                (
+                    "jxl-wgpu resident VarDCT horizontal",
+                    &self.horizontal,
+                    &horizontal_bind_group,
+                    indirect + INDIRECT_ARGUMENT_BYTES,
+                ),
+                (
+                    "jxl-wgpu resident VarDCT vertical",
+                    &self.vertical,
+                    &vertical_bind_group,
+                    indirect + 2 * INDIRECT_ARGUMENT_BYTES,
+                ),
+            ] {
+                dispatch_indirect(
+                    encoder,
+                    label,
+                    pipeline,
+                    bind_group,
+                    inputs.indirect,
+                    offset,
+                );
+            }
         }
         Ok(ResidentVarDctScratch {
             dequantized,
@@ -349,6 +406,23 @@ impl ResidentVarDctRenderer {
             memory,
         })
     }
+}
+
+fn dispatch_indirect(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &'static str,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    indirect: &wgpu::Buffer,
+    offset: u64,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups_indirect(indirect, offset);
 }
 
 #[repr(C, align(16))]
@@ -376,25 +450,25 @@ struct ResidentVarDctParams {
     transform_kind: u32,
     correlation_width: u32,
     correlation_height: u32,
-    _padding: [u32; 2],
+    task_word_offset: u32,
+    bucket_word_offset: u32,
+    lf_stride: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
     quant_biases: [f32; 4],
 }
 
 fn validate_inputs(
     device: &wgpu::Device,
     inputs: ResidentVarDctInputs<'_>,
-) -> Result<ResidentVarDctParams, ResidentVarDctError> {
-    if inputs.config.transform.is_special() {
-        return Err(ResidentVarDctError::SpecialTransform {
-            transform: inputs.config.transform,
-        });
-    }
+) -> Result<(), ResidentVarDctError> {
     if inputs.config.task_capacity == 0 {
         return Err(ResidentVarDctError::ZeroTaskCapacity);
     }
     for (role, binding, writable) in [
         ("coefficient", inputs.coefficients, false),
-        ("task", inputs.tasks, false),
+        ("artifact", inputs.artifact, false),
         ("resource", inputs.resources, false),
         ("X output", inputs.outputs[0].storage, true),
         ("Y output", inputs.outputs[1].storage, true),
@@ -402,36 +476,32 @@ fn validate_inputs(
     ] {
         validate_storage_binding(device, role, binding, writable)?;
     }
-    let task_end = u64::from(inputs.config.task_base)
-        .checked_add(u64::from(inputs.config.task_capacity))
+    let available_words = inputs.artifact.size.get() / 4;
+    let task_end = u64::from(inputs.config.task_word_offset)
+        .checked_add(u64::from(inputs.config.task_capacity) * (GENERAL_TASK_BYTES / 4))
         .ok_or(ResidentVarDctError::ArithmeticOverflow {
-            field: "task range",
+            field: "artifact task range",
         })?;
-    let available_tasks = inputs.tasks.size.get() / GENERAL_TASK_BYTES;
-    if task_end > available_tasks {
-        return Err(ResidentVarDctError::TaskBindingCapacity {
+    if task_end > available_words {
+        return Err(ResidentVarDctError::ArtifactWordRange {
+            role: "task",
             required: task_end,
-            available: available_tasks,
+            available: available_words,
         });
     }
-    let extent = inputs.config.transform.pixel_extent();
-    let lf_extent = inputs.config.transform.lf_extent();
-    let area = u64::try_from(
-        extent
-            .area()
-            .ok_or(ResidentVarDctError::ArithmeticOverflow {
-                field: "transform area",
-            })?,
-    )
-    .map_err(|_| ResidentVarDctError::ArithmeticOverflow {
-        field: "transform area",
-    })?;
-    let required_scratch = task_end
-        .checked_mul(area)
-        .and_then(|value| value.checked_mul(3))
+    let bucket_end = u64::from(inputs.config.bucket_word_offset)
+        .checked_add(TransformKind::ALL.len() as u64 * 4)
         .ok_or(ResidentVarDctError::ArithmeticOverflow {
-            field: "scratch scalar capacity",
+            field: "artifact bucket range",
         })?;
+    if bucket_end > available_words {
+        return Err(ResidentVarDctError::ArtifactWordRange {
+            role: "bucket",
+            required: bucket_end,
+            available: available_words,
+        });
+    }
+    let required_scratch = inputs.coefficients.size.get().div_ceil(4);
     if required_scratch > u64::from(inputs.config.scratch_scalars) {
         return Err(ResidentVarDctError::ScratchCapacity {
             required: required_scratch,
@@ -473,33 +543,48 @@ fn validate_inputs(
             required: wgpu::BufferUsages::INDIRECT,
         });
     }
-    for &offset in &inputs.indirect_offsets {
-        if !offset.is_multiple_of(4) {
-            return Err(ResidentVarDctError::IndirectAlignment { offset });
-        }
-        let end = offset.checked_add(INDIRECT_ARGUMENT_BYTES).ok_or(
-            ResidentVarDctError::ArithmeticOverflow {
-                field: "indirect range",
-            },
-        )?;
-        if end > inputs.indirect.size() {
-            return Err(ResidentVarDctError::IndirectRange {
-                offset,
-                end,
-                available: inputs.indirect.size(),
-            });
-        }
+    if !inputs.indirect_base_offset.is_multiple_of(4) {
+        return Err(ResidentVarDctError::IndirectAlignment {
+            offset: inputs.indirect_base_offset,
+        });
     }
+    let indirect_bytes =
+        TransformKind::ALL.len() as u64 * INDIRECT_STAGES * INDIRECT_ARGUMENT_BYTES;
+    let indirect_end = inputs
+        .indirect_base_offset
+        .checked_add(indirect_bytes)
+        .ok_or(ResidentVarDctError::ArithmeticOverflow {
+            field: "indirect range",
+        })?;
+    if indirect_end > inputs.indirect.size() {
+        return Err(ResidentVarDctError::IndirectRange {
+            offset: inputs.indirect_base_offset,
+            end: indirect_end,
+            available: inputs.indirect.size(),
+        });
+    }
+    Ok(())
+}
+
+fn resident_params(
+    inputs: ResidentVarDctInputs<'_>,
+    transform: TransformKind,
+    strategy: u32,
+) -> Result<ResidentVarDctParams, ResidentVarDctError> {
+    let extent = transform.pixel_extent();
+    let lf_extent = transform.lf_extent();
+    let area = extent
+        .area()
+        .and_then(|area| u32::try_from(area).ok())
+        .ok_or(ResidentVarDctError::ArithmeticOverflow {
+            field: "transform area",
+        })?;
     Ok(ResidentVarDctParams {
-        task_base: inputs.config.task_base,
+        task_base: 0,
         task_count: inputs.config.task_capacity,
         transform_width: extent.width,
         transform_height: extent.height,
-        transform_area: u32::try_from(area).map_err(|_| {
-            ResidentVarDctError::ArithmeticOverflow {
-                field: "transform area",
-            }
-        })?,
+        transform_area: area,
         lf_width: lf_extent.width,
         lf_height: lf_extent.height,
         quant_offset: inputs.config.quant_offset,
@@ -514,10 +599,15 @@ fn validate_inputs(
         output_width_b: inputs.outputs[2].width,
         output_height_b: inputs.outputs[2].height,
         output_stride_b: inputs.outputs[2].effective_stride(),
-        transform_kind: 0,
+        transform_kind: strategy,
         correlation_width: inputs.config.correlation_width,
         correlation_height: inputs.config.correlation_height,
-        _padding: [0; 2],
+        task_word_offset: inputs.config.task_word_offset,
+        bucket_word_offset: inputs.config.bucket_word_offset,
+        lf_stride: inputs.config.lf_stride,
+        _padding0: 0,
+        _padding1: 0,
+        _padding2: 0,
         quant_biases: inputs.config.quant_biases,
     })
 }
@@ -581,7 +671,7 @@ fn entire_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ResidentVarDctParams>() == 112);
+    assert!(std::mem::size_of::<ResidentVarDctParams>() == 128);
     assert!(std::mem::align_of::<ResidentVarDctParams>() == 16);
 };
 
@@ -593,30 +683,36 @@ mod tests {
     fn uniform_and_task_contract_match_the_shared_shader() {
         fn assert_pod<T: Pod>() {}
         assert_pod::<ResidentVarDctParams>();
-        assert_eq!(std::mem::size_of::<ResidentVarDctParams>(), 112);
+        assert_eq!(std::mem::size_of::<ResidentVarDctParams>(), 128);
         assert_eq!(GENERAL_TASK_BYTES, 64);
-        naga::front::wgsl::parse_str(include_str!("../shaders/vardct_general.wgsl"))
-            .expect("resident VarDCT shader parses");
+        for shader in [
+            include_str!("../shaders/vardct_general.wgsl"),
+            include_str!("../shaders/vardct_special.wgsl"),
+        ] {
+            let module = naga::front::wgsl::parse_str(shader).expect("resident shader parses");
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .expect("resident shader validates");
+        }
     }
 
     #[test]
     fn memory_plan_counts_both_scratch_allocations_and_uniform() {
         let plan = ResidentVarDctMemoryPlan::new(3 * 32 * 32).unwrap();
         assert_eq!(plan.scratch_buffer_bytes, 12_288);
-        assert_eq!(plan.uniform_bytes, 112);
-        assert_eq!(plan.total_bytes, 24_688);
+        assert_eq!(plan.uniform_bytes, 3_456);
+        assert_eq!(plan.total_bytes, 28_032);
     }
 
     #[test]
-    fn zero_tasks_and_special_transforms_have_typed_errors() {
+    fn zero_tasks_have_a_typed_error() {
         assert_eq!(
             ResidentVarDctError::ZeroTaskCapacity.to_string(),
             "resident VarDCT task capacity must be nonzero"
         );
-        let error = ResidentVarDctError::SpecialTransform {
-            transform: TransformKind::Hornuss,
-        };
-        assert!(error.to_string().contains("Hornuss"));
     }
 
     #[test]

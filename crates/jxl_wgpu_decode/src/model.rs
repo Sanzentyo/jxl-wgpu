@@ -7,7 +7,7 @@ use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingFieldKind,
     PixelFormat, PixelFormatClass, PlaneSampling, SampleKind, Swizzle, classify_pixel_format,
 };
-use jxl_gpu_protocol::{Extent2d, TransformKind};
+use jxl_gpu_protocol::Extent2d;
 
 use crate::{Error, Result};
 
@@ -21,15 +21,9 @@ pub enum DecodeProfile {
         prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
     },
-    /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer.
-    ///
-    /// `transform` is shared by every first block in the negotiated bounded profile. A single-entry
-    /// packet has one image-sized regular task; the tiled profile has one DCT8 task per padded 8x8
-    /// block and may span several pass groups carrying single-pass AC coefficients.
-    VarDctRegular {
-        bits_per_sample: u8,
-        transform: TransformKind,
-    },
+    /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer. Transform strategy is
+    /// selected independently for every first block and remains GPU-resident.
+    VarDct { bits_per_sample: u8 },
 }
 
 /// Logical channels reconstructed by a lossless Modular profile.

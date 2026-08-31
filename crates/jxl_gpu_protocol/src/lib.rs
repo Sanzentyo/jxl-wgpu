@@ -1038,6 +1038,12 @@ impl TransformKind {
                 | Self::Afv3
         )
     }
+
+    /// Whether coefficient coordinates and the canonical dequantization matrix are transposed for
+    /// this wire strategy.
+    pub const fn needs_transpose(self) -> bool {
+        !self.is_special() && self.pixel_extent().height >= self.pixel_extent().width
+    }
 }
 
 #[derive(Clone, Debug)]

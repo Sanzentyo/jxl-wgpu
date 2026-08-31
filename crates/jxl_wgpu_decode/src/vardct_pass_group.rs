@@ -4,7 +4,9 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
-use crate::vardct_artifact::{HfCoefficientSinkParams, VarDctArtifactLayout};
+use crate::vardct_artifact::{
+    HF_ORDER_CHANNELS, HF_ORDER_COUNT, HfCoefficientSinkParams, VarDctArtifactLayout,
+};
 use crate::vardct_packet::{BoundedVarDctPacketPlan, HfCoefficientEntropyPlan};
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_pass_group.wgsl");
@@ -218,9 +220,9 @@ impl HfCoefficientExecutionPlan {
             params,
             sink_params: HfCoefficientSinkParams {
                 task_metadata_offset_words: artifact.task_metadata_offset_words,
-                task_count: packet.task_count,
+                task_count: packet.task_capacity,
                 coefficient_words: packet.coefficient_words(),
-                order_descriptor_count: 3,
+                order_descriptor_count: (HF_ORDER_COUNT * HF_ORDER_CHANNELS) as u32,
                 order_coordinate_offset_words: entropy.order_coordinate_offset_words,
                 _reserved: [0; 3],
             },

@@ -42,6 +42,24 @@ cjxl /tmp/green_queen.png green_queen_vardct_nonzero_ac.jxl -d 2 -e 1 -m 0 \
   --resampling=1 --gaborish=0 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
 ```
 
+`crates/jxl_wgpu_decode/test-data/green_queen_vardct_mixed.jxl.hex` is a deterministic
+257x257 libjxl effort-5 crop fixture. Its binary SHA-256 is
+`7c9d1e134708f01842ecbf90dd1d553f792e382bc9ee3d4c77a6ef08e25eedad`. It declares LF extra
+precision 1, three HF block clusters, custom coefficient orders 0 and 1, and a mixed transform
+map whose actual first-block count is smaller than the 33x33 allocation capacity. The
+actual-adapter test therefore covers the physical row stride of the GPU block-info channel in
+addition to mixed regular/special inverse transforms. GPU RGB8 must differ from Rust `jxl` and
+optional `djxl` by at most one code per channel.
+
+It is reproduced with libjxl 0.12.0 and ffmpeg as follows:
+
+```text
+djxl fixtures/green_queen_vardct_e3.jxl /tmp/green_queen.ppm --quiet
+ffmpeg -i /tmp/green_queen.ppm -vf crop=257:257:0:0 -frames:v 1 /tmp/green_queen_crop.ppm
+cjxl /tmp/green_queen_crop.ppm green_queen_vardct_mixed.jxl -d 1 -e 5 \
+  --epf=0 --gaborish=0 -x color_space=RGB_D65_SRG_Rel_SRG
+```
+
 `crates/jxl_wgpu_decode/test-data/green_queen_vardct_permuted.jxl.hex` is a deterministic
 libjxl 0.12.0 center-first re-encode of that decoded 438x589 image. Its binary SHA-256 is
 `8c3a5dd8c8b1a5d9b4934810325cb87b65a5985b322a95ecb92303ab6a529a2e`. Six pass groups are stored

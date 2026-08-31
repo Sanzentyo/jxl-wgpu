@@ -40,12 +40,17 @@ struct Params {
     transform_kind: u32,
     correlation_width: u32,
     correlation_height: u32,
-    _padding: vec2<u32>,
+    task_word_offset: u32,
+    bucket_word_offset: u32,
+    lf_stride: u32,
+    _padding0: u32,
+    _padding1: u32,
+    _padding2: u32,
     quant_biases: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> coefficients: array<i32>;
-@group(0) @binding(1) var<storage, read> tasks: array<Task>;
+@group(0) @binding(1) var<storage, read> task_words: array<u32>;
 @group(0) @binding(2) var<storage, read> resources: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> dequantized: array<f32>;
 @group(0) @binding(4) var<storage, read_write> horizontal: array<f32>;
@@ -95,12 +100,13 @@ fn hf_correlation(task: Task, frequency_x: u32, frequency_y: u32) -> vec2<f32> {
 
 fn lf_coefficient(task: Task, frequency_x: u32, frequency_y: u32) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
+    let lf_stride = select(params.lf_width, params.lf_stride, params.lf_stride != 0u);
     for (var spatial_y = 0u; spatial_y < params.lf_height; spatial_y = spatial_y + 1u) {
         let basis_y = idct_basis(spatial_y, frequency_y, params.lf_height);
         for (var spatial_x = 0u; spatial_x < params.lf_width; spatial_x = spatial_x + 1u) {
             let basis_x = idct_basis(spatial_x, frequency_x, params.lf_width);
             let lf = resources[
-                params.lf_offset + task.lf_offset + spatial_y * params.lf_width + spatial_x
+                params.lf_offset + task.lf_offset + spatial_y * lf_stride + spatial_x
             ].xyz;
             sum = fma(lf, vec3<f32>(basis_x * basis_y), sum);
         }
@@ -111,8 +117,34 @@ fn lf_coefficient(task: Task, frequency_x: u32, frequency_y: u32) -> vec3<f32> {
     );
 }
 
+fn load_task(index: u32) -> Task {
+    let base = params.task_word_offset + index * 16u;
+    return Task(
+        task_words[base],
+        task_words[base + 1u],
+        task_words[base + 2u],
+        task_words[base + 3u],
+        task_words[base + 4u],
+        task_words[base + 5u],
+        task_words[base + 6u],
+        task_words[base + 7u],
+        task_words[base + 8u],
+        task_words[base + 9u],
+        task_words[base + 10u],
+        task_words[base + 11u],
+        task_words[base + 12u],
+        task_words[base + 13u],
+        task_words[base + 14u],
+        task_words[base + 15u],
+    );
+}
+
 fn task_for_workgroup(workgroup_y: u32) -> Task {
-    return tasks[params.task_base + workgroup_y];
+    var task_base = params.task_base;
+    if (params.bucket_word_offset != 0xffffffffu) {
+        task_base = task_words[params.bucket_word_offset + params.transform_kind * 4u + 1u];
+    }
+    return load_task(task_base + workgroup_y);
 }
 
 @compute @workgroup_size(64, 1, 1)

@@ -1,7 +1,10 @@
 //! Default resource table and LF dequantization for the bounded VarDCT profile.
 
 use bytemuck::{Pod, Zeroable};
-use jxl_wgpu::KernelVariant;
+use jxl_gpu_protocol::TransformKind;
+use jxl_oxide_common::Bundle;
+use jxl_vardct::{DequantMatrixSet, DequantMatrixSetParams, TransformType};
+use jxl_wgpu::{KernelVariant, VAR_DCT_AFV_BASIS};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -14,18 +17,17 @@ pub struct VarDctResourceLayout {
     pub quant_count: u32,
     pub correlation_offset: u32,
     pub lf_offset: u32,
-    pub matrix_offset: u32,
+    pub matrix_offsets: [u32; TransformKind::ALL.len()],
+    pub afv_basis_offset: u32,
     pub vector_count: u32,
     pub block_count: u32,
     pub correlation_count: u32,
-    pub transform_area: u32,
 }
 
 impl VarDctResourceLayout {
     pub fn new(
         blocks_x: u32,
         blocks_y: u32,
-        transform_area: u32,
         quant_count: u32,
     ) -> Result<Self, VarDctResourceError> {
         let block_count =
@@ -50,13 +52,39 @@ impl VarDctResourceLayout {
                 field: "LF resource offset",
             },
         )?;
-        let matrix_offset =
+        let mut cursor =
             lf_offset
                 .checked_add(block_count)
                 .ok_or(VarDctResourceError::ArithmeticOverflow {
                     field: "matrix offset",
                 })?;
-        let vector_count = matrix_offset.checked_add(transform_area).ok_or(
+        let mut matrix_offsets = [0; TransformKind::ALL.len()];
+        for (index, transform) in TransformKind::ALL.into_iter().enumerate() {
+            matrix_offsets[index] = cursor;
+            let area =
+                transform
+                    .pixel_extent()
+                    .area()
+                    .ok_or(VarDctResourceError::ArithmeticOverflow {
+                        field: "dequant matrix area",
+                    })?;
+            cursor = cursor
+                .checked_add(u32::try_from(area).map_err(|_| {
+                    VarDctResourceError::ArithmeticOverflow {
+                        field: "dequant matrix area",
+                    }
+                })?)
+                .ok_or(VarDctResourceError::ArithmeticOverflow {
+                    field: "dequant matrix end",
+                })?;
+        }
+        let afv_basis_offset = cursor;
+        let basis_vectors = u32::try_from(VAR_DCT_AFV_BASIS.len() / 4).map_err(|_| {
+            VarDctResourceError::ArithmeticOverflow {
+                field: "AFV basis vectors",
+            }
+        })?;
+        let vector_count = afv_basis_offset.checked_add(basis_vectors).ok_or(
             VarDctResourceError::ArithmeticOverflow {
                 field: "resource vector count",
             },
@@ -66,11 +94,11 @@ impl VarDctResourceLayout {
             quant_count,
             correlation_offset,
             lf_offset,
-            matrix_offset,
+            matrix_offsets,
+            afv_basis_offset,
             vector_count,
             block_count,
             correlation_count,
-            transform_area,
         })
     }
 
@@ -79,19 +107,27 @@ impl VarDctResourceLayout {
         self.vector_count as u64 * 16
     }
 
-    /// Builds the immutable correlation defaults and normative default DCT8 dequantization matrix.
-    /// Per-task quantization scales are populated by GPU artifact lowering from decoded `hf_mul`.
-    #[must_use]
-    pub fn initial_values(self) -> Vec<[f32; 4]> {
+    /// Builds immutable correlation defaults, all normative default dequantization matrices, and
+    /// the AFV basis. Per-task quantization scales are populated by GPU artifact lowering from
+    /// decoded `hf_mul`.
+    pub fn initial_values(self) -> Result<Vec<[f32; 4]>, VarDctResourceError> {
         let mut values = vec![[0.0; 4]; self.vector_count as usize];
         let correlation_end = self.correlation_offset + self.correlation_count;
         values[self.correlation_offset as usize..correlation_end as usize]
             .fill([0.0, 1.0, 0.0, 0.0]);
-        values[self.matrix_offset as usize..].fill([1.0, 1.0, 1.0, 0.0]);
-        if self.transform_area == 64 {
-            values[self.matrix_offset as usize..].copy_from_slice(&default_dct8_dequant_matrix());
+        let matrices = default_dequant_matrices()?;
+        for (strategy, transform) in TransformKind::ALL.into_iter().enumerate() {
+            let matrix_offset = self.matrix_offsets[strategy] as usize;
+            let matrix = matrices.matrix(transform);
+            values[matrix_offset..matrix_offset + matrix.len()].copy_from_slice(&matrix);
         }
-        values
+        for (destination, basis) in values[self.afv_basis_offset as usize..]
+            .iter_mut()
+            .zip(VAR_DCT_AFV_BASIS.chunks_exact(4))
+        {
+            destination.copy_from_slice(basis);
+        }
+        Ok(values)
     }
 }
 
@@ -101,6 +137,8 @@ pub enum VarDctResourceError {
     ArithmeticOverflow { field: &'static str },
     #[error("VarDCT resource preparation requires at least one quantization entry")]
     ZeroQuantizationEntries,
+    #[error("failed to construct the normative default VarDCT dequantization matrices")]
+    DefaultDequantMatrices,
     #[error("VarDCT resource preparation requires a linear workgroup, got {variant:?}")]
     WorkgroupShape { variant: KernelVariant },
     #[error("VarDCT resource workgroup variant {variant:?} exceeds device limits")]
@@ -123,6 +161,7 @@ impl VarDctResourceParams {
         blocks_y: u32,
         global_scale: u32,
         quant_lf: u32,
+        extra_precision: u8,
     ) -> Result<Self, VarDctResourceError> {
         let blocks =
             blocks_x
@@ -131,16 +170,17 @@ impl VarDctResourceParams {
                     field: "LF preparation block count",
                 })?;
         let denominator = global_scale as f32 * quant_lf as f32;
+        let precision_divisor = (1u32 << extra_precision) as f32;
         Ok(Self {
             geometry: [blocks_x, blocks_y, blocks, 0],
             offsets: [0, blocks, 2 * blocks, 0],
             scales: [
-                16.0 / denominator,
-                128.0 / denominator,
-                256.0 / denominator,
+                16.0 / denominator / precision_divisor,
+                128.0 / denominator / precision_divisor,
+                256.0 / denominator / precision_divisor,
                 1.0,
             ],
-            _reserved: [0; 4],
+            _reserved: [u32::from(extra_precision), 0, 0, 0],
         })
     }
 
@@ -151,40 +191,91 @@ impl VarDctResourceParams {
 
     #[must_use]
     pub fn smoothing_thresholds(self) -> [f32; 3] {
-        [self.scales[0], self.scales[1], self.scales[2]]
+        let precision_multiplier = (1u32 << self._reserved[0]) as f32;
+        [
+            self.scales[0] * precision_multiplier,
+            self.scales[1] * precision_multiplier,
+            self.scales[2] * precision_multiplier,
+        ]
     }
 }
 
-fn default_dct8_dequant_matrix() -> [[f32; 4]; 64] {
-    const PARAMETERS: [[f32; 6]; 3] = [
-        [3150.0, 0.0, -0.4, -0.4, -0.4, -2.0],
-        [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
-        [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
-    ];
-    let weights = PARAMETERS.map(|parameters| {
-        let mut bands = [0.0f32; 6];
-        bands[0] = parameters[0];
-        for index in 1..bands.len() {
-            let delta = parameters[index];
-            let multiplier = if delta > 0.0 {
-                1.0 + delta
+struct DefaultDequantMatrices(DequantMatrixSet);
+
+impl DefaultDequantMatrices {
+    fn matrix(&self, transform: TransformKind) -> Vec<[f32; 4]> {
+        let transform_type = vardct_transform_type(transform);
+        let channel = |index| {
+            if transform.needs_transpose() {
+                self.0.get_transposed(index, transform_type)
             } else {
-                1.0 / (1.0 - delta)
-            };
-            bands[index] = bands[index - 1] * multiplier;
+                self.0.get(index, transform_type)
+            }
+        };
+        let [x, y, b] = [channel(0), channel(1), channel(2)];
+        let extent = transform.pixel_extent();
+        let mut packed = vec![[0.0; 4]; x.len()];
+        for frequency_y in 0..extent.height {
+            for frequency_x in 0..extent.width {
+                let raster = (frequency_y * extent.width + frequency_x) as usize;
+                let packed_index = backend_matrix_index(transform, frequency_x, frequency_y);
+                packed[packed_index] = [x[raster], y[raster], b[raster], 0.0];
+            }
         }
-        std::array::from_fn::<_, 64, _>(|index| {
-            let x = (index % 8) as f32;
-            let y = (index / 8) as f32;
-            let position = (x * x + y * y).sqrt();
-            let scaled = position * 5.0 / (98.0f32).sqrt();
-            let lower = (scaled.floor() as usize).min(4);
-            let fraction = scaled - lower as f32;
-            let weight = bands[lower] * (bands[lower + 1] / bands[lower]).powf(fraction);
-            weight.recip()
-        })
-    });
-    std::array::from_fn(|index| [weights[0][index], weights[1][index], weights[2][index], 0.0])
+        packed
+    }
+}
+
+fn backend_matrix_index(transform: TransformKind, frequency_x: u32, frequency_y: u32) -> usize {
+    let extent = transform.pixel_extent();
+    let index = if transform.is_special() || extent.height < extent.width {
+        frequency_y * extent.width + frequency_x
+    } else {
+        frequency_x * extent.height + frequency_y
+    };
+    index as usize
+}
+
+fn default_dequant_matrices() -> Result<DefaultDequantMatrices, VarDctResourceError> {
+    let encoded_default = [1u8];
+    let mut bitstream = jxl_bitstream::Bitstream::new(&encoded_default);
+    let pool = jxl_threadpool::JxlThreadPool::none();
+    let params = DequantMatrixSetParams::new(8, 1, None, None, &pool);
+    DequantMatrixSet::parse(&mut bitstream, params)
+        .map(DefaultDequantMatrices)
+        .map_err(|_| VarDctResourceError::DefaultDequantMatrices)
+}
+
+const fn vardct_transform_type(transform: TransformKind) -> TransformType {
+    match transform {
+        TransformKind::Dct8 => TransformType::Dct8,
+        TransformKind::Hornuss => TransformType::Hornuss,
+        TransformKind::Dct2x2 => TransformType::Dct2,
+        TransformKind::Dct4x4 => TransformType::Dct4,
+        TransformKind::Dct16x16 => TransformType::Dct16,
+        TransformKind::Dct32x32 => TransformType::Dct32,
+        TransformKind::Dct16x8 => TransformType::Dct16x8,
+        TransformKind::Dct8x16 => TransformType::Dct8x16,
+        TransformKind::Dct32x8 => TransformType::Dct32x8,
+        TransformKind::Dct8x32 => TransformType::Dct8x32,
+        TransformKind::Dct32x16 => TransformType::Dct32x16,
+        TransformKind::Dct16x32 => TransformType::Dct16x32,
+        TransformKind::Dct4x8 => TransformType::Dct4x8,
+        TransformKind::Dct8x4 => TransformType::Dct8x4,
+        TransformKind::Afv0 => TransformType::Afv0,
+        TransformKind::Afv1 => TransformType::Afv1,
+        TransformKind::Afv2 => TransformType::Afv2,
+        TransformKind::Afv3 => TransformType::Afv3,
+        TransformKind::Dct64x64 => TransformType::Dct64,
+        TransformKind::Dct64x32 => TransformType::Dct64x32,
+        TransformKind::Dct32x64 => TransformType::Dct32x64,
+        TransformKind::Dct128x128 => TransformType::Dct128,
+        TransformKind::Dct128x64 => TransformType::Dct128x64,
+        TransformKind::Dct64x128 => TransformType::Dct64x128,
+        TransformKind::Dct256x256 => TransformType::Dct256,
+        TransformKind::Dct256x128 => TransformType::Dct256x128,
+        TransformKind::Dct128x256 => TransformType::Dct128x256,
+    }
 }
 
 pub struct VarDctResourceBuffers<'a> {
@@ -293,13 +384,21 @@ mod tests {
 
     #[test]
     fn layout_and_shader_are_bounded() {
-        let layout = VarDctResourceLayout::new(4, 2, 256, 1).unwrap();
+        let layout = VarDctResourceLayout::new(4, 2, 1).unwrap();
         assert_eq!(layout.correlation_count, 1);
         assert_eq!(layout.lf_offset, 2);
-        assert_eq!(layout.matrix_offset, 10);
-        assert_eq!(layout.vector_count, 266);
-        assert_eq!(layout.bytes(), 4_256);
-        assert_eq!(layout.initial_values().len(), 266);
+        assert_eq!(layout.matrix_offsets[0], 10);
+        for index in 1..TransformKind::ALL.len() {
+            let previous_area = TransformKind::ALL[index - 1].pixel_extent().area().unwrap() as u32;
+            assert_eq!(
+                layout.matrix_offsets[index],
+                layout.matrix_offsets[index - 1] + previous_area
+            );
+        }
+        assert_eq!(
+            layout.initial_values().unwrap().len(),
+            layout.vector_count as usize
+        );
         let module = naga::front::wgsl::parse_str(RESOURCE_SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -311,46 +410,73 @@ mod tests {
 
     #[test]
     fn correlation_grid_scales_past_one_frequency_cell() {
-        let layout = VarDctResourceLayout::new(17, 9, 64, 1).unwrap();
+        let layout = VarDctResourceLayout::new(17, 9, 1).unwrap();
         assert_eq!(layout.correlation_count, 6);
         assert_eq!(layout.correlation_offset, 1);
         assert_eq!(layout.lf_offset, 7);
-        let values = layout.initial_values();
+        let values = layout.initial_values().unwrap();
         assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
 
     #[test]
     fn multiple_quantization_entries_shift_every_following_region() {
-        let layout = VarDctResourceLayout::new(17, 9, 64, 5).unwrap();
+        let layout = VarDctResourceLayout::new(17, 9, 5).unwrap();
         assert_eq!(layout.quant_offset, 0);
         assert_eq!(layout.quant_count, 5);
         assert_eq!(layout.correlation_offset, 5);
         assert_eq!(layout.correlation_count, 6);
         assert_eq!(layout.lf_offset, 11);
-        assert_eq!(layout.matrix_offset, 164);
-        assert_eq!(layout.vector_count, 228);
-        assert_eq!(layout.bytes(), 3_648);
+        assert_eq!(layout.matrix_offsets[0], 164);
 
-        let values = layout.initial_values();
+        let values = layout.initial_values().unwrap();
         assert_eq!(&values[..5], &[[0.0; 4]; 5]);
         assert_eq!(&values[5..11], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
 
     #[test]
     fn default_dct8_matrix_matches_normative_band_interpolation_samples() {
-        let matrix = default_dct8_dequant_matrix();
+        let matrix = default_dequant_matrices()
+            .unwrap()
+            .matrix(TransformKind::Dct8);
         let expected = [
             [0.000_317_460_3, 0.001_785_714_3, 0.001_953_125],
             [0.000_745_078_5, 0.003_473_115_4, 0.016_986_076],
-            [0.002_613_333_3, 0.005_100_178_5, 0.070_312_5],
+            [0.002_613_333_3, 0.005_100_178_5, 0.070_312_24],
         ];
-        for (actual, expected) in [matrix[0], matrix[7], matrix[63]].into_iter().zip(expected) {
+        let samples = [
+            matrix[backend_matrix_index(TransformKind::Dct8, 0, 0)],
+            matrix[backend_matrix_index(TransformKind::Dct8, 7, 0)],
+            matrix[backend_matrix_index(TransformKind::Dct8, 7, 7)],
+        ];
+        for (actual, expected) in samples.into_iter().zip(expected) {
             for (actual, expected) in actual[..3].iter().zip(expected) {
-                assert!((actual - expected).abs() <= 1.0e-8);
+                assert!(
+                    (actual - expected).abs() <= 5.0e-8,
+                    "actual={actual:?} expected={expected:?}"
+                );
             }
             assert_eq!(actual[3], 0.0);
         }
-        assert_eq!(matrix[1], matrix[8]);
+        assert_eq!(
+            matrix[backend_matrix_index(TransformKind::Dct8, 1, 0)],
+            matrix[backend_matrix_index(TransformKind::Dct8, 0, 1)],
+        );
+    }
+
+    #[test]
+    fn rectangular_default_matrices_follow_wire_transposition() {
+        let matrices = default_dequant_matrices().unwrap();
+        let tall = matrices.matrix(TransformKind::Dct16x8);
+        let wide = matrices.matrix(TransformKind::Dct8x16);
+        assert_eq!(tall.len(), wide.len());
+        for y in 0..16 {
+            for x in 0..8 {
+                assert_eq!(
+                    tall[backend_matrix_index(TransformKind::Dct16x8, x, y)],
+                    wide[backend_matrix_index(TransformKind::Dct8x16, y, x)],
+                );
+            }
+        }
     }
 
     #[test]

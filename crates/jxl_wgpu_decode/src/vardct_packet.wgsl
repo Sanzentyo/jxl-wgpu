@@ -80,6 +80,7 @@ var<private> reconstruction_base: u32;
 var<private> params: Params;
 var<private> target_kind: u32;
 var<private> target_offset: u32;
+var<private> target_stride: u32;
 
 const STATUS_OK: u32 = 1u;
 const ERROR_TRUNCATED_BITS: u32 = 2u;
@@ -97,7 +98,6 @@ const ERROR_PREDICTOR: u32 = 13u;
 const ERROR_LF_HEADER: u32 = 20u;
 const ERROR_FIRST_BLOCK: u32 = 21u;
 const ERROR_HF_HEADER: u32 = 22u;
-const ERROR_CORRELATION: u32 = 23u;
 const ERROR_STRATEGY: u32 = 24u;
 const ERROR_SHARPNESS: u32 = 25u;
 const ERROR_HF_GLOBAL: u32 = 27u;
@@ -154,25 +154,28 @@ fn unpack_signed(value: u32) -> i32 {
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
 fn target_load(index: u32) -> i32 {
+    let physical_index = (index / params.width) * target_stride + index % params.width;
     if target_kind == 0u {
-        return bitcast<i32>(reconstructed[target_offset + index]);
+        return bitcast<i32>(reconstructed[target_offset + physical_index]);
     }
-    return bitcast<i32>(raw_metadata[target_offset + index]);
+    return bitcast<i32>(raw_metadata[target_offset + physical_index]);
 }
 
 fn target_store(index: u32, value: i32) {
+    let physical_index = (index / params.width) * target_stride + index % params.width;
     if target_kind == 0u {
-        reconstructed[target_offset + index] = bitcast<u32>(value);
+        reconstructed[target_offset + physical_index] = bitcast<u32>(value);
     } else {
-        raw_metadata[target_offset + index] = bitcast<u32>(value);
+        raw_metadata[target_offset + physical_index] = bitcast<u32>(value);
     }
 }
 
-fn decode_channel(width: u32, height: u32, offset: u32, kind: u32) -> u32 {
+fn decode_channel(width: u32, height: u32, stride: u32, offset: u32, kind: u32) -> u32 {
     params.width = width;
     params.height = height;
     target_kind = kind;
     target_offset = offset;
+    target_stride = stride;
     predictor_prev_grad = 0i;
     if params.needs_self_correcting != 0u {
         wp_reset();
@@ -234,14 +237,6 @@ fn reject(code: u32, value: u32) {
     }
 }
 
-fn validate_zero_range(offset: u32, count: u32, code: u32) {
-    for (var index = 0u; index < count && decode_error == 0u; index += 1u) {
-        if raw_metadata[offset + index] != 0u {
-            reject(code, raw_metadata[offset + index]);
-        }
-    }
-}
-
 fn validate_sharpness(block_count: u32) {
     for (var index = 0u; index < block_count && decode_error == 0u; index += 1u) {
         let sharpness = raw_metadata[control.expected.w + index];
@@ -278,7 +273,8 @@ fn decode_vardct_packet() {
     params.entropy.lz77_window_mask = 0u;
     params.stream_index = control.streams.x;
 
-    if read_bits(2u) != 0u || read_bits(4u) != 3u {
+    let extra_precision = read_bits(2u);
+    if read_bits(4u) != 3u {
         reject(ERROR_LF_HEADER, bit_cursor);
     }
     let block_count = control.geometry.z * control.geometry.w;
@@ -290,6 +286,7 @@ fn decode_vardct_packet() {
         lf_decoded += decode_channel(
             control.geometry.z,
             control.geometry.w,
+            control.geometry.z,
             current_channel * block_count,
             0u,
         );
@@ -298,7 +295,7 @@ fn decode_vardct_packet() {
 
     let first_block_bits = control.capacities.z;
     let first_blocks = read_bits(first_block_bits) + 1u;
-    if first_blocks != control.capacities.w {
+    if first_blocks > control.capacities.w {
         reject(ERROR_FIRST_BLOCK, first_blocks);
     }
     if read_bits(4u) != 3u {
@@ -318,6 +315,7 @@ fn decode_vardct_packet() {
     hf_decoded += decode_channel(
         correlation_width,
         correlation_height,
+        correlation_width,
         control.offsets.x,
         1u,
     );
@@ -325,24 +323,33 @@ fn decode_vardct_packet() {
     hf_decoded += decode_channel(
         correlation_width,
         correlation_height,
+        correlation_width,
         control.offsets.y,
         1u,
     );
     current_channel = 2u;
-    hf_decoded += decode_channel(first_blocks, 2u, control.offsets.z, 1u);
+    hf_decoded += decode_channel(
+        first_blocks,
+        2u,
+        control.capacities.w,
+        control.offsets.z,
+        1u,
+    );
     current_channel = 3u;
     hf_decoded += decode_channel(
         control.geometry.z,
         control.geometry.w,
+        control.geometry.z,
         control.expected.w,
         1u,
     );
     entropy_finalize();
 
-    validate_zero_range(control.offsets.x, 2u * correlation_samples, ERROR_CORRELATION);
-    for (var index = 0u; index < first_blocks && decode_error == 0u; index += 1u) {
-        if raw_metadata[control.offsets.z + index] != control.expected.x {
-            reject(ERROR_STRATEGY, raw_metadata[control.offsets.z + index]);
+    if control.expected.y != 0u {
+        for (var index = 0u; index < first_blocks && decode_error == 0u; index += 1u) {
+            if raw_metadata[control.offsets.z + index] != control.expected.x {
+                reject(ERROR_STRATEGY, raw_metadata[control.offsets.z + index]);
+            }
         }
     }
     validate_sharpness(block_count);
@@ -387,6 +394,8 @@ fn decode_vardct_packet() {
     status[7] = control.capacities.x;
     status[9] = control.quantization.x;
     status[10] = control.quantization.y;
+    status[11] = first_blocks;
+    status[12] = extra_precision;
 }
 
 @compute @workgroup_size(1, 1, 1)
