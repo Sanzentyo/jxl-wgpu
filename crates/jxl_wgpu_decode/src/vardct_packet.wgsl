@@ -99,6 +99,7 @@ const ERROR_FIRST_BLOCK: u32 = 21u;
 const ERROR_HF_HEADER: u32 = 22u;
 const ERROR_CORRELATION: u32 = 23u;
 const ERROR_STRATEGY: u32 = 24u;
+const ERROR_SHARPNESS: u32 = 25u;
 const ERROR_HF_GLOBAL: u32 = 27u;
 
 fn reconstruction_load(index: u32) -> u32 {
@@ -241,6 +242,15 @@ fn validate_zero_range(offset: u32, count: u32, code: u32) {
     }
 }
 
+fn validate_sharpness(block_count: u32) {
+    for (var index = 0u; index < block_count && decode_error == 0u; index += 1u) {
+        let sharpness = raw_metadata[control.expected.w + index];
+        if sharpness > 7u {
+            reject(ERROR_SHARPNESS, sharpness);
+        }
+    }
+}
+
 fn finish_section(expected_end: u32) {
     if decode_error != 0u { return; }
     if bit_cursor > expected_end {
@@ -335,6 +345,7 @@ fn decode_vardct_packet() {
             reject(ERROR_STRATEGY, raw_metadata[control.offsets.z + index]);
         }
     }
+    validate_sharpness(block_count);
     if control.streams.z != 0u {
         finish_section(control.section_bits.y);
         // Separate HF-global descriptors are host-packed into the shared entropy-table ABI and
@@ -376,4 +387,11 @@ fn decode_vardct_packet() {
     status[7] = control.capacities.x;
     status[9] = control.quantization.x;
     status[10] = control.quantization.y;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn validate_vardct_sharpness() {
+    decode_error = 0u;
+    validate_sharpness(control.geometry.z * control.geometry.w);
+    status[0] = select(STATUS_OK, decode_error, decode_error != 0u);
 }

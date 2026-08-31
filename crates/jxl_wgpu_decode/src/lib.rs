@@ -34,6 +34,7 @@ mod profile;
 mod session;
 mod vardct_artifact;
 mod vardct_engine;
+mod vardct_epf;
 mod vardct_frontend;
 mod vardct_lf;
 mod vardct_output;

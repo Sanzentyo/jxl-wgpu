@@ -777,7 +777,7 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
         .vardct()
         .expect("VarDCT input selects the VarDCT submission session")
         .memory_stats();
-    assert_eq!(memory.gaborish_scratch_bytes, memory.xyb_plane_bytes);
+    assert_eq!(memory.restoration_scratch_bytes, memory.xyb_plane_bytes);
     assert_eq!(memory.gaborish_uniform_bytes, 80);
     assert_eq!(
         memory.transient_bytes + memory.output_lease_bytes,
@@ -801,5 +801,93 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
             maximum_error(actual, &djxl) <= 1,
             "resident Gaborish output diverges from djxl",
         );
+    }
+}
+
+#[test]
+fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let extent = Extent2d::new(257, 17);
+    let mut epf2_output = None;
+    for (encoded, iterations) in [
+        (common::green_queen_crop_vardct_epf2(), 2_u32),
+        (common::green_queen_crop_vardct_epf3(), 3_u32),
+    ] {
+        let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        match (iterations, inventory.frames[0].restoration_filter) {
+            (2, RestorationFilterInventory::Default) => {}
+            (
+                3,
+                RestorationFilterInventory::Custom {
+                    gaborish: GaborishInventory::Default,
+                    epf: EdgePreservingFilterInventory::Enabled { iterations: 3, .. },
+                },
+            ) => {}
+            (_, actual) => panic!("unexpected EPF restoration inventory: {actual:?}"),
+        }
+
+        let mut session = decoder
+            .open(
+                encoded,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let memory = session
+            .submission_session()
+            .vardct()
+            .expect("EPF fixture selects the VarDCT submission session")
+            .memory_stats();
+        assert_eq!(memory.restoration_scratch_bytes, memory.xyb_plane_bytes);
+        assert_eq!(memory.gaborish_uniform_bytes, 80);
+        assert_eq!(memory.epf_sigma_bytes, 33 * 3 * 4);
+        assert_eq!(memory.epf_sigma_uniform_bytes, 64);
+        assert_eq!(memory.epf_filter_uniform_bytes, u64::from(iterations) * 80);
+        assert_eq!(
+            memory.transient_bytes + memory.output_lease_bytes,
+            memory.total_frame_bytes
+        );
+
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let actual = &readback.frame.outputs[0].bytes;
+        let rust = rust_jxl_rgb8(encoded, extent);
+        assert_eq!(actual.len(), rust.len());
+        let rust_error = maximum_error(actual, &rust);
+        assert!(
+            rust_error <= 1,
+            "resident EPF{iterations} output diverges from Rust jxl by {rust_error}",
+        );
+        if let Some(djxl) = djxl_ppm(encoded, extent) {
+            let djxl_error = maximum_error(actual, &djxl);
+            assert!(
+                djxl_error <= 1,
+                "resident EPF{iterations} output diverges from djxl by {djxl_error}",
+            );
+        }
+        if let Some(epf2) = &epf2_output {
+            assert_ne!(actual, epf2, "EPF3 must execute its additional EPF0 pass");
+        } else {
+            epf2_output = Some(actual.to_vec());
+        }
     }
 }

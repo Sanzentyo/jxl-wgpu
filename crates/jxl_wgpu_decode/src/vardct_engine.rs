@@ -25,11 +25,12 @@ use jxl_gpu_formats::{
     LayoutError, PixelFormat, RgbChannelOrder, TransferFunction, YcbcrEncoding,
 };
 use jxl_gpu_protocol::{
-    ChangedRegions, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
+    ChangedRegions, EpfPass, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
 };
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, KernelVariant, MemoryBudget,
-    MemoryBudgetSnapshot, MemoryPermit, ResidentF32Plane, ResidentGaborishError,
+    MemoryBudgetSnapshot, MemoryPermit, ResidentEpfError, ResidentEpfInputs, ResidentEpfMemoryPlan,
+    ResidentEpfParameters, ResidentEpfPipeline, ResidentF32Plane, ResidentGaborishError,
     ResidentGaborishInputs, ResidentGaborishMemoryPlan, ResidentGaborishPipeline,
     ResidentGaborishWeights, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
     ResidentVarDctMemoryPlan, ResidentVarDctRenderConfig, ResidentVarDctRenderer,
@@ -44,6 +45,7 @@ use crate::vardct_artifact::{
     HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
     VAR_DCT_STRATEGY_COUNT, VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
 };
+use crate::vardct_epf::{EpfSigmaConfig, EpfSigmaError, EpfSigmaMemoryPlan, EpfSigmaPipeline};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams, AdaptiveLfPipeline};
 use crate::vardct_output::{
     VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputError, VarDctOutputInputs,
@@ -82,8 +84,8 @@ pub enum VarDctDecodeError {
     UnsupportedOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
     UnsupportedColorEncoding,
-    #[error("the bounded VarDCT engine does not yet execute EPF with {iterations} iterations")]
-    UnsupportedEpf { iterations: u32 },
+    #[error("the VarDCT frame declares invalid EPF iteration count {iterations}")]
+    InvalidEpfIterations { iterations: u32 },
     #[error("the bounded VarDCT engine requires frame quant-matrix scales X=3 and B=2")]
     UnsupportedQuantMatrixScale,
     #[error("the XYB image header does not contain an inverse opsin matrix")]
@@ -108,6 +110,10 @@ pub enum VarDctDecodeError {
     Resident(#[from] ResidentVarDctError),
     #[error(transparent)]
     Gaborish(#[from] ResidentGaborishError),
+    #[error(transparent)]
+    Epf(#[from] ResidentEpfError),
+    #[error(transparent)]
+    EpfSigma(#[from] EpfSigmaError),
     #[error(transparent)]
     Output(#[from] VarDctOutputError),
     #[error(transparent)]
@@ -179,8 +185,11 @@ pub struct VarDctDecodeMemoryStats {
     pub hf_order_table_bytes: u64,
     pub hf_sink_uniform_bytes: u64,
     pub xyb_plane_bytes: u64,
-    pub gaborish_scratch_bytes: u64,
+    pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
+    pub epf_sigma_bytes: u64,
+    pub epf_sigma_uniform_bytes: u64,
+    pub epf_filter_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
     /// Packed RGB8 storage retained until the final [`GpuBufferLease`] clone is dropped.
@@ -199,7 +208,10 @@ impl VarDctDecodeMemoryStats {
             resource,
             artifact,
             hf_coefficients,
+            restoration_scratch,
             gaborish,
+            epf_sigma,
+            epf_iterations,
             resident,
             output,
         } = inputs;
@@ -291,12 +303,23 @@ impl VarDctDecodeMemoryStats {
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
                     field: "XYB plane bytes",
                 })?;
-        let gaborish_scratch_bytes = if gaborish { xyb_plane_bytes } else { 0 };
+        let restoration_scratch_bytes = if restoration_scratch {
+            xyb_plane_bytes
+        } else {
+            0
+        };
         let gaborish_uniform_bytes = if gaborish {
             ResidentGaborishMemoryPlan::new().uniform_bytes
         } else {
             0
         };
+        let epf_sigma_bytes = epf_sigma.map_or(0, |plan| plan.sigma_bytes);
+        let epf_sigma_uniform_bytes = epf_sigma.map_or(0, |plan| plan.uniform_bytes);
+        let epf_filter_uniform_bytes = u64::from(epf_iterations)
+            .checked_mul(ResidentEpfMemoryPlan::new().uniform_bytes)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "EPF filter uniform bytes",
+            })?;
         let resident_transient_bytes = resident.total_bytes;
         let output_uniform_bytes = output.memory.uniform_bytes;
         let output_lease_bytes = output.memory.output_storage_bytes;
@@ -324,8 +347,11 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             xyb_plane_bytes,
-            gaborish_scratch_bytes,
+            restoration_scratch_bytes,
             gaborish_uniform_bytes,
+            epf_sigma_bytes,
+            epf_sigma_uniform_bytes,
+            epf_filter_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
         ]
@@ -366,8 +392,11 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             xyb_plane_bytes,
-            gaborish_scratch_bytes,
+            restoration_scratch_bytes,
             gaborish_uniform_bytes,
+            epf_sigma_bytes,
+            epf_sigma_uniform_bytes,
+            epf_filter_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
             output_lease_bytes,
@@ -384,7 +413,10 @@ struct VarDctDecodeMemoryInputs<'a> {
     resource: VarDctResourceLayout,
     artifact: VarDctArtifactLayout,
     hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
+    restoration_scratch: bool,
     gaborish: bool,
+    epf_sigma: Option<EpfSigmaMemoryPlan>,
+    epf_iterations: u32,
     resident: ResidentVarDctMemoryPlan,
     output: VarDctOutputPlan,
 }
@@ -397,6 +429,8 @@ struct VarDctPipelines {
     hf_coefficients: HfCoefficientPipeline,
     renderer: ResidentVarDctRenderer,
     gaborish: ResidentGaborishPipeline,
+    epf_sigma: EpfSigmaPipeline,
+    epf: ResidentEpfPipeline,
     output: VarDctOutputPacker,
     output_variant: KernelVariant,
 }
@@ -409,6 +443,9 @@ impl VarDctPipelines {
             resolve_kernel_variant(backend, "vardct_output", KernelVariant::Lanes256)?;
         let gaborish_variant =
             resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
+        let epf_sigma_variant =
+            resolve_kernel_variant(backend, "vardct_epf_sigma", KernelVariant::Lanes64)?;
+        let epf_variant = resolve_kernel_variant(backend, "vardct_epf", KernelVariant::Tile16x16)?;
         let device = backend.device();
         Ok(Self {
             packet: VarDctPacketPipeline::new(device),
@@ -418,6 +455,8 @@ impl VarDctPipelines {
             hf_coefficients: HfCoefficientPipeline::new(device),
             renderer: ResidentVarDctRenderer::new(device),
             gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
+            epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
+            epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
             output_variant,
         })
@@ -536,6 +575,7 @@ struct VarDctSource {
     artifact_params: HfMetadataLoweringParams,
     hf_coefficients: Option<HfCoefficientExecutionPlan>,
     gaborish: Option<ResidentGaborishWeights>,
+    epf: Option<VarDctEpfPlan>,
     output_plan: VarDctOutputPlan,
     layout: ImageLayout,
     inverse_opsin: VarDctInverseOpsin,
@@ -543,6 +583,76 @@ struct VarDctSource {
     frame_name: String,
     transform_index: usize,
     memory: VarDctDecodeMemoryStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VarDctEpfHeader {
+    iterations: u32,
+    sharp_lut: [f32; 8],
+    channel_scale: [f32; 3],
+    quant_mul: f32,
+    pass0_sigma_scale: f32,
+    pass2_sigma_scale: f32,
+    border_sad_mul: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct VarDctEpfPlan {
+    sigma: EpfSigmaConfig,
+    passes: Vec<ResidentEpfParameters>,
+}
+
+impl VarDctEpfHeader {
+    fn plan(
+        self,
+        blocks_x: u32,
+        blocks_y: u32,
+        task_count: u32,
+        sharpness_offset_words: u32,
+        artifact: VarDctArtifactLayout,
+        global_scale: u32,
+    ) -> VarDctEpfPlan {
+        let mut passes = Vec::with_capacity(self.iterations as usize);
+        if self.iterations >= 3 {
+            passes.push(ResidentEpfParameters {
+                pass: EpfPass::Pass0,
+                sigma_scale: self.pass0_sigma_scale,
+                border_sad_mul: self.border_sad_mul,
+                channel_scale: self.channel_scale,
+            });
+        }
+        if self.iterations >= 1 {
+            passes.push(ResidentEpfParameters {
+                pass: EpfPass::Pass1,
+                sigma_scale: 1.0,
+                border_sad_mul: self.border_sad_mul,
+                channel_scale: self.channel_scale,
+            });
+        }
+        if self.iterations >= 2 {
+            passes.push(ResidentEpfParameters {
+                pass: EpfPass::Pass2,
+                sigma_scale: self.pass2_sigma_scale,
+                border_sad_mul: self.border_sad_mul,
+                channel_scale: self.channel_scale,
+            });
+        }
+        debug_assert_eq!(passes.len(), self.iterations as usize);
+        VarDctEpfPlan {
+            sigma: EpfSigmaConfig {
+                blocks_x,
+                blocks_y,
+                task_count,
+                sharpness_offset_words,
+                artifact_status_offset_words: artifact.status_offset_words,
+                task_metadata_offset_words: artifact.task_metadata_offset_words,
+                global_scale,
+                quant_mul: self.quant_mul,
+                sharp_lut: self.sharp_lut,
+            },
+            passes,
+        }
+    }
 }
 
 impl GpuSubmissionEngine for VarDctSubmissionEngine {
@@ -604,7 +714,7 @@ fn prepare_source(
         .frames
         .first()
         .ok_or(VarDctDecodeError::MissingFrame)?;
-    let gaborish = restoration_gaborish(frame.restoration_filter)?;
+    let (gaborish, epf_header) = restoration_config(frame.restoration_filter)?;
     if frame.x_qm_scale != 3 || frame.b_qm_scale != 2 {
         return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
     }
@@ -658,6 +768,17 @@ fn prepare_source(
         VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
     )?;
     let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
+    let epf = epf_header.map(|header| {
+        header.plan(
+            blocks_x,
+            blocks_y,
+            packet.task_count,
+            control.expected[3],
+            artifact_layout,
+            packet.global_scale,
+        )
+    });
+    let epf_sigma_memory = epf.as_ref().map(|plan| plan.sigma.plan()).transpose()?;
     let hf_coefficients = packet
         .hf_coefficients
         .as_ref()
@@ -708,7 +829,10 @@ fn prepare_source(
         resource: resource_layout,
         artifact: artifact_layout,
         hf_coefficients: hf_coefficients.as_ref(),
+        restoration_scratch: gaborish.is_some() || epf.is_some(),
         gaborish: gaborish.is_some(),
+        epf_sigma: epf_sigma_memory,
+        epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
         resident: resident_memory,
         output: output_plan,
     })?;
@@ -725,6 +849,7 @@ fn prepare_source(
         artifact_params,
         hf_coefficients,
         gaborish,
+        epf,
         output_plan,
         layout,
         inverse_opsin,
@@ -735,9 +860,9 @@ fn prepare_source(
     })
 }
 
-fn restoration_gaborish(
+fn restoration_config(
     restoration: RestorationFilterInventory,
-) -> Result<Option<ResidentGaborishWeights>, VarDctDecodeError> {
+) -> Result<(Option<ResidentGaborishWeights>, Option<VarDctEpfHeader>), VarDctDecodeError> {
     let (gaborish, epf) = match restoration {
         RestorationFilterInventory::Default => (
             GaborishInventory::Default,
@@ -745,10 +870,7 @@ fn restoration_gaborish(
         ),
         RestorationFilterInventory::Custom { gaborish, epf } => (gaborish, epf),
     };
-    if let EdgePreservingFilterInventory::Enabled { iterations, .. } = epf {
-        return Err(VarDctDecodeError::UnsupportedEpf { iterations });
-    }
-    Ok(match gaborish {
+    let gaborish = match gaborish {
         GaborishInventory::Disabled => None,
         GaborishInventory::Default => Some(ResidentGaborishWeights::DEFAULT),
         GaborishInventory::Custom { weights } => Some(ResidentGaborishWeights {
@@ -756,7 +878,56 @@ fn restoration_gaborish(
             y: weights[1].map(|value| value.to_f32()),
             b: weights[2].map(|value| value.to_f32()),
         }),
-    })
+    };
+    let epf = match epf {
+        EdgePreservingFilterInventory::Disabled => None,
+        EdgePreservingFilterInventory::Enabled {
+            iterations,
+            sharp_lut,
+            weights,
+            sigma,
+            sigma_for_modular: _,
+        } => {
+            if !(1..=3).contains(&iterations) {
+                return Err(VarDctDecodeError::InvalidEpfIterations { iterations });
+            }
+            let sharp_lut = sharp_lut.map_or(
+                [
+                    0.0,
+                    1.0 / 7.0,
+                    2.0 / 7.0,
+                    3.0 / 7.0,
+                    4.0 / 7.0,
+                    5.0 / 7.0,
+                    6.0 / 7.0,
+                    1.0,
+                ],
+                |values| values.map(|value| value.to_f32()),
+            );
+            let channel_scale = weights.map_or([40.0, 5.0, 3.5], |weights| {
+                weights.channel_scale.map(|value| value.to_f32())
+            });
+            let (quant_mul, pass0_sigma_scale, pass2_sigma_scale, border_sad_mul) =
+                sigma.map_or((0.46, 0.9, 6.5, 2.0 / 3.0), |sigma| {
+                    (
+                        sigma.quant_mul.map_or(0.46, |value| value.to_f32()),
+                        sigma.pass0_sigma_scale.to_f32(),
+                        sigma.pass2_sigma_scale.to_f32(),
+                        sigma.border_sad_mul.to_f32(),
+                    )
+                });
+            Some(VarDctEpfHeader {
+                iterations,
+                sharp_lut,
+                channel_scale,
+                quant_mul,
+                pass0_sigma_scale,
+                pass2_sigma_scale,
+                border_sad_mul,
+            })
+        }
+    };
+    Ok((gaborish, epf))
 }
 
 fn validate_device_limits(
@@ -787,10 +958,11 @@ fn validate_device_limits(
         ),
         ("one XYB plane", memory.xyb_plane_bytes / 3, true),
         (
-            "one Gaborish scratch plane",
-            memory.gaborish_scratch_bytes / 3,
+            "one restoration scratch plane",
+            memory.restoration_scratch_bytes / 3,
             true,
         ),
+        ("EPF sigma plane", memory.epf_sigma_bytes, true),
         ("packed RGB8 output", memory.output_lease_bytes, true),
     ] {
         check_limit(resource, required, limits.max_buffer_size)?;
@@ -805,6 +977,15 @@ fn validate_device_limits(
         ("artifact uniform", memory.artifact_uniform_bytes),
         ("HF coefficient sink uniform", memory.hf_sink_uniform_bytes),
         ("Gaborish uniform", memory.gaborish_uniform_bytes),
+        ("EPF sigma uniform", memory.epf_sigma_uniform_bytes),
+        (
+            "one EPF filter uniform",
+            if memory.epf_filter_uniform_bytes == 0 {
+                0
+            } else {
+                ResidentEpfMemoryPlan::UNIFORM_BYTES
+            },
+        ),
         ("output uniform", memory.output_uniform_bytes),
     ] {
         check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
@@ -923,9 +1104,46 @@ struct HfCoefficientJobBuffers {
     sink_params: wgpu::Buffer,
 }
 
-struct GaborishJobBuffers {
+struct RestorationCursor<'a> {
+    image: &'a [wgpu::Buffer; 3],
+    scratch: &'a [wgpu::Buffer; 3],
+    current_is_scratch: bool,
+}
+
+impl<'a> RestorationCursor<'a> {
+    fn new(image: &'a [wgpu::Buffer; 3], scratch: &'a [wgpu::Buffer; 3]) -> Self {
+        Self {
+            image,
+            scratch,
+            current_is_scratch: false,
+        }
+    }
+
+    fn advance(&mut self) -> (&'a [wgpu::Buffer; 3], &'a [wgpu::Buffer; 3]) {
+        let pair = if self.current_is_scratch {
+            (self.scratch, self.image)
+        } else {
+            (self.image, self.scratch)
+        };
+        self.current_is_scratch = !self.current_is_scratch;
+        pair
+    }
+
+    fn current(&self) -> &'a [wgpu::Buffer; 3] {
+        if self.current_is_scratch {
+            self.scratch
+        } else {
+            self.image
+        }
+    }
+}
+
+struct RestorationJobBuffers {
     _planes: [wgpu::Buffer; 3],
-    _uniform: wgpu::Buffer,
+    _gaborish_uniform: Option<wgpu::Buffer>,
+    _epf_sigma: Option<wgpu::Buffer>,
+    _epf_sigma_uniform: Option<wgpu::Buffer>,
+    _epf_uniforms: Vec<wgpu::Buffer>,
 }
 
 struct VarDctJobLifetime {
@@ -950,7 +1168,7 @@ struct VarDctJobLifetime {
     _artifact_uniform: wgpu::Buffer,
     _hf_coefficients: Option<HfCoefficientJobBuffers>,
     _xyb_planes: [wgpu::Buffer; 3],
-    _gaborish: Option<GaborishJobBuffers>,
+    _restoration: Option<RestorationJobBuffers>,
     _resident_scratch: ResidentVarDctScratch,
     _output_scratch: VarDctOutputScratch,
 }
@@ -1180,6 +1398,34 @@ fn resident_binding(
     Ok(ResidentStorageBinding::entire(buffer)?)
 }
 
+fn resident_image_planes<'a>(
+    buffers: &'a [wgpu::Buffer; 3],
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<[ResidentF32Plane<'a>; 3], VarDctDecodeError> {
+    Ok([
+        ResidentF32Plane {
+            storage: resident_binding(&buffers[0])?,
+            width,
+            height,
+            stride,
+        },
+        ResidentF32Plane {
+            storage: resident_binding(&buffers[1])?,
+            width,
+            height,
+            stride,
+        },
+        ResidentF32Plane {
+            storage: resident_binding(&buffers[2])?,
+            width,
+            height,
+            stride,
+        },
+    ])
+}
+
 fn submit_vardct(
     backend: &WgpuBackend,
     pipelines: &VarDctPipelines,
@@ -1322,13 +1568,20 @@ fn submit_vardct(
         "jxl-wgpu VarDCT B plane",
     ]
     .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::COPY_DST));
-    let gaborish_planes = source.gaborish.map(|_| {
+    let restoration_planes = (source.gaborish.is_some() || source.epf.is_some()).then(|| {
         [
-            "jxl-wgpu VarDCT Gaborish X plane",
-            "jxl-wgpu VarDCT Gaborish Y plane",
-            "jxl-wgpu VarDCT Gaborish B plane",
+            "jxl-wgpu VarDCT restoration scratch X plane",
+            "jxl-wgpu VarDCT restoration scratch Y plane",
+            "jxl-wgpu VarDCT restoration scratch B plane",
         ]
         .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::empty()))
+    });
+    let epf_sigma = source.epf.as_ref().map(|_| {
+        storage(
+            "jxl-wgpu VarDCT EPF inverse-sigma plane",
+            source.memory.epf_sigma_bytes,
+            wgpu::BufferUsages::COPY_DST,
+        )
     });
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
@@ -1369,6 +1622,9 @@ fn submit_vardct(
     if let Some(buffers) = &hf_coefficient_buffers {
         commands.clear_buffer(&buffers.lz77_scratch, 0, None);
         commands.clear_buffer(&buffers.status, 0, None);
+    }
+    if let Some(sigma) = &epf_sigma {
+        commands.clear_buffer(sigma, 0, None);
     }
     pipelines.packet.encode(
         device,
@@ -1419,6 +1675,18 @@ fn submit_vardct(
             params: &artifact_uniform,
         },
     );
+    let epf_sigma_uniform = match (source.epf.as_ref(), epf_sigma.as_ref()) {
+        (Some(plan), Some(sigma)) => Some(pipelines.epf_sigma.encode(
+            device,
+            &mut commands,
+            &raw_metadata,
+            &artifact,
+            sigma,
+            plan.sigma,
+        )?),
+        (None, None) => None,
+        _ => unreachable!("EPF plan and sigma buffer are constructed together"),
+    };
     if let (Some(plan), Some(buffers)) = (
         source.hf_coefficients.as_ref(),
         hf_coefficient_buffers.as_ref(),
@@ -1527,39 +1795,80 @@ fn submit_vardct(
             },
         },
     )?;
-    let gaborish_uniform =
-        if let (Some(weights), Some(planes)) = (source.gaborish, gaborish_planes.as_ref()) {
-            let input_planes = xyb_planes.each_ref().map(|plane| {
-                resident_binding(plane).map(|storage| ResidentF32Plane {
-                    storage,
-                    width: source.packet.profile.width,
-                    height: source.packet.profile.height,
-                    stride: padded_width,
-                })
-            });
-            let output_planes = planes.each_ref().map(|plane| {
-                resident_binding(plane).map(|storage| ResidentF32Plane {
-                    storage,
-                    width: source.packet.profile.width,
-                    height: source.packet.profile.height,
-                    stride: padded_width,
-                })
-            });
-            let [input_x, input_y, input_b] = input_planes;
-            let [output_x, output_y, output_b] = output_planes;
-            Some(pipelines.gaborish.encode(
+    let image_width = source.packet.profile.width;
+    let image_height = source.packet.profile.height;
+    let mut restoration = restoration_planes
+        .as_ref()
+        .map(|scratch| RestorationCursor::new(&xyb_planes, scratch));
+    let gaborish_uniform = match (source.gaborish, restoration.as_mut()) {
+        (Some(weights), Some(restoration)) => {
+            let (input_buffers, output_buffers) = restoration.advance();
+            let uniform = pipelines.gaborish.encode(
                 device,
                 &mut commands,
                 ResidentGaborishInputs {
-                    inputs: [input_x?, input_y?, input_b?],
-                    outputs: [output_x?, output_y?, output_b?],
+                    inputs: resident_image_planes(
+                        input_buffers,
+                        image_width,
+                        image_height,
+                        padded_width,
+                    )?,
+                    outputs: resident_image_planes(
+                        output_buffers,
+                        image_width,
+                        image_height,
+                        padded_width,
+                    )?,
                     weights,
                 },
-            )?)
-        } else {
-            None
+            )?;
+            Some(uniform)
+        }
+        (None, _) => None,
+        (Some(_), None) => unreachable!("Gaborish requires restoration scratch planes"),
+    };
+    let mut epf_uniforms =
+        Vec::with_capacity(source.epf.as_ref().map_or(0, |plan| plan.passes.len()));
+    if let Some(epf) = &source.epf {
+        let restoration = restoration
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("EPF requires restoration scratch planes"));
+        let sigma_buffer = epf_sigma
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("EPF requires a sigma plane"));
+        let sigma = ResidentF32Plane {
+            storage: resident_binding(sigma_buffer)?,
+            width: epf.sigma.blocks_x,
+            height: epf.sigma.blocks_y,
+            stride: epf.sigma.blocks_x,
         };
-    let presentation_planes = gaborish_planes.as_ref().unwrap_or(&xyb_planes);
+        for &parameters in &epf.passes {
+            let (input_buffers, output_buffers) = restoration.advance();
+            epf_uniforms.push(pipelines.epf.encode(
+                device,
+                &mut commands,
+                ResidentEpfInputs {
+                    inputs: resident_image_planes(
+                        input_buffers,
+                        image_width,
+                        image_height,
+                        padded_width,
+                    )?,
+                    outputs: resident_image_planes(
+                        output_buffers,
+                        image_width,
+                        image_height,
+                        padded_width,
+                    )?,
+                    sigma,
+                    parameters,
+                },
+            )?);
+        }
+    }
+    let presentation_planes = restoration
+        .as_ref()
+        .map_or(&xyb_planes, RestorationCursor::current);
     let output_scratch = pipelines.output.encode(
         device,
         &mut commands,
@@ -1587,14 +1896,13 @@ fn submit_vardct(
         },
     )?;
     debug_assert_eq!(output_scratch.plan, source.output_plan);
-    let gaborish_buffers = match (gaborish_planes, gaborish_uniform) {
-        (Some(planes), Some(uniform)) => Some(GaborishJobBuffers {
-            _planes: planes,
-            _uniform: uniform,
-        }),
-        (None, None) => None,
-        _ => unreachable!("Gaborish plan and buffers are constructed together"),
-    };
+    let restoration_buffers = restoration_planes.map(|planes| RestorationJobBuffers {
+        _planes: planes,
+        _gaborish_uniform: gaborish_uniform,
+        _epf_sigma: epf_sigma,
+        _epf_sigma_uniform: epf_sigma_uniform,
+        _epf_uniforms: epf_uniforms,
+    });
     commands.copy_buffer_to_buffer(&packet_status, 0, &status_staging, 0, PACKET_STATUS_BYTES);
     commands.copy_buffer_to_buffer(
         &artifact,
@@ -1636,7 +1944,7 @@ fn submit_vardct(
         _artifact_uniform: artifact_uniform,
         _hf_coefficients: hf_coefficient_buffers,
         _xyb_planes: xyb_planes,
-        _gaborish: gaborish_buffers,
+        _restoration: restoration_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
@@ -1782,48 +2090,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restoration_contract_types_unsupported_epf() {
-        let error = restoration_gaborish(RestorationFilterInventory::Default).unwrap_err();
+    fn restoration_contract_rejects_invalid_epf_iterations() {
+        let error = restoration_config(RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Disabled,
+            epf: EdgePreservingFilterInventory::Enabled {
+                iterations: 0,
+                sharp_lut: None,
+                weights: None,
+                sigma: None,
+                sigma_for_modular: None,
+            },
+        })
+        .unwrap_err();
         assert!(matches!(
             error,
-            VarDctDecodeError::UnsupportedEpf { iterations: 2 }
+            VarDctDecodeError::InvalidEpfIterations { iterations: 0 }
         ));
     }
 
     #[test]
-    fn restoration_contract_preserves_disabled_and_default_gaborish() {
-        let disabled = restoration_gaborish(RestorationFilterInventory::Custom {
+    fn restoration_contract_preserves_disabled_and_standard_defaults() {
+        let disabled = restoration_config(RestorationFilterInventory::Custom {
             gaborish: GaborishInventory::Disabled,
             epf: EdgePreservingFilterInventory::Disabled,
         })
         .unwrap();
-        assert_eq!(disabled, None);
+        assert_eq!(disabled, (None, None));
 
-        let default = restoration_gaborish(RestorationFilterInventory::Custom {
-            gaborish: GaborishInventory::Default,
-            epf: EdgePreservingFilterInventory::Disabled,
-        })
-        .unwrap();
-        assert_eq!(default, Some(ResidentGaborishWeights::DEFAULT));
+        let (gaborish, epf) = restoration_config(RestorationFilterInventory::Default).unwrap();
+        assert_eq!(gaborish, Some(ResidentGaborishWeights::DEFAULT));
+        assert_eq!(
+            epf,
+            Some(VarDctEpfHeader {
+                iterations: 2,
+                sharp_lut: [
+                    0.0,
+                    1.0 / 7.0,
+                    2.0 / 7.0,
+                    3.0 / 7.0,
+                    4.0 / 7.0,
+                    5.0 / 7.0,
+                    6.0 / 7.0,
+                    1.0,
+                ],
+                channel_scale: [40.0, 5.0, 3.5],
+                quant_mul: 0.46,
+                pass0_sigma_scale: 0.9,
+                pass2_sigma_scale: 6.5,
+                border_sad_mul: 2.0 / 3.0,
+            })
+        );
     }
 
     #[test]
-    fn restoration_contract_preserves_custom_channel_weights() {
+    fn restoration_contract_preserves_custom_gaborish_and_epf_values() {
         let half = jxl_gpu_bitstream::FiniteF16::from_bits(0x3800).unwrap();
         let quarter = jxl_gpu_bitstream::FiniteF16::from_bits(0x3400).unwrap();
+        let one = jxl_gpu_bitstream::FiniteF16::from_bits(0x3c00).unwrap();
+        let two = jxl_gpu_bitstream::FiniteF16::from_bits(0x4000).unwrap();
         let zero = jxl_gpu_bitstream::FiniteF16::from_bits(0).unwrap();
         let weights = [[half, quarter], [quarter, zero], [zero, half]];
-        let custom = restoration_gaborish(RestorationFilterInventory::Custom {
+        let (gaborish, epf) = restoration_config(RestorationFilterInventory::Custom {
             gaborish: GaborishInventory::Custom { weights },
-            epf: EdgePreservingFilterInventory::Disabled,
+            epf: EdgePreservingFilterInventory::Enabled {
+                iterations: 3,
+                sharp_lut: Some([zero, quarter, half, one, zero, quarter, half, one]),
+                weights: Some(jxl_gpu_bitstream::EpfWeightsInventory {
+                    channel_scale: [one, half, quarter],
+                    pass1_zeroflush: half,
+                    pass2_zeroflush: quarter,
+                }),
+                sigma: Some(jxl_gpu_bitstream::EpfSigmaInventory {
+                    quant_mul: Some(one),
+                    pass0_sigma_scale: half,
+                    pass2_sigma_scale: quarter,
+                    border_sad_mul: two,
+                }),
+                sigma_for_modular: None,
+            },
         })
         .unwrap();
         assert_eq!(
-            custom,
+            gaborish,
             Some(ResidentGaborishWeights {
                 x: [0.5, 0.25],
                 y: [0.25, 0.0],
                 b: [0.0, 0.5],
+            })
+        );
+        assert_eq!(
+            epf,
+            Some(VarDctEpfHeader {
+                iterations: 3,
+                sharp_lut: [0.0, 0.25, 0.5, 1.0, 0.0, 0.25, 0.5, 1.0],
+                channel_scale: [1.0, 0.5, 0.25],
+                quant_mul: 1.0,
+                pass0_sigma_scale: 0.5,
+                pass2_sigma_scale: 0.25,
+                border_sad_mul: 2.0,
             })
         );
     }

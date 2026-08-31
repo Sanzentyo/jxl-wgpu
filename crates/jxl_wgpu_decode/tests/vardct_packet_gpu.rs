@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu_decode::vardct::packet::{
-    BoundedVarDctPacketPlan, GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers,
-    VarDctPacketPipeline,
+    BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus, VarDctModularParams,
+    VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline, vardct_packet_shader_source,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, VarDctColorEncoding, VarDctEncoder, VarDctStrategy, WgpuContext,
@@ -188,4 +188,111 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         )
         .unwrap();
     assert_eq!(status.coefficient_words, plan.coefficient_words());
+}
+
+#[test]
+fn gpu_sharpness_validation_rejects_out_of_range_metadata() {
+    let Some((device, queue)) = device() else {
+        eprintln!("skipping VarDCT sharpness GPU validation: no adapter");
+        return;
+    };
+    let raw = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("malformed VarDCT sharpness metadata"),
+        contents: bytemuck::cast_slice(&[8_u32]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let status = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT sharpness status"),
+        size: std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let control = VarDctPacketControl {
+        section_bits: [0; 4],
+        geometry: [0, 0, 1, 1],
+        offsets: [0; 4],
+        capacities: [0; 4],
+        expected: [0; 4],
+        quantization: [0; 4],
+        streams: [0; 4],
+        scratch: [0; 4],
+    };
+    let control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("malformed VarDCT sharpness control"),
+        contents: bytemuck::bytes_of(&control),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT sharpness status readback"),
+        size: std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("VarDCT sharpness validation oracle"),
+        source: wgpu::ShaderSource::Wgsl(vardct_packet_shader_source().into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("VarDCT sharpness validation oracle"),
+        layout: None,
+        module: &module,
+        entry_point: Some("validate_vardct_sharpness"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("VarDCT sharpness validation oracle bindings"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: raw.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: status.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: control.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("VarDCT sharpness validation oracle"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("VarDCT sharpness validation oracle"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(
+        &status,
+        0,
+        &staging,
+        0,
+        std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+    );
+    let submission = queue.submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    staging.map_async(wgpu::MapMode::Read, .., move |result| {
+        sender.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = staging.slice(..).get_mapped_range().unwrap();
+    let status = *bytemuck::from_bytes::<GpuVarDctPacketStatus>(&mapped);
+    assert_eq!(
+        status.validate(TransformKind::Dct8, 0, 0, 0, 0),
+        Err(GpuVarDctPacketError::Sharpness { value: 8 })
+    );
 }

@@ -58,3 +58,21 @@ pub fn green_queen_vardct_gaborish() -> &'static [u8] {
     });
     BYTES.as_slice()
 }
+
+pub fn green_queen_crop_vardct_epf2() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/green_queen_crop_vardct_epf2.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn green_queen_crop_vardct_epf3() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/green_queen_crop_vardct_epf3.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}

@@ -87,6 +87,8 @@ pub enum GpuVarDctPacketError {
     Correlation { value: u32 },
     #[error("GPU VarDCT packet selects strategy {actual}, expected {expected}")]
     Strategy { actual: u32, expected: u32 },
+    #[error("GPU VarDCT packet selects invalid EPF sharpness {value}")]
+    Sharpness { value: u32 },
     #[error("GPU VarDCT packet does not contain the standard zero-AC HF-global bundle")]
     HfGlobal,
     #[error("GPU VarDCT packet returned unknown status {code}")]
@@ -766,6 +768,7 @@ impl GpuVarDctPacketStatus {
                 actual: self.detail,
                 expected: transform_id(expected_strategy),
             }),
+            25 => Err(GpuVarDctPacketError::Sharpness { value: self.detail }),
             27 => Err(GpuVarDctPacketError::HfGlobal),
             2..=13 => Err(GpuVarDctPacketError::Entropy {
                 code: self.code,

@@ -72,7 +72,7 @@ the ambiguity with a one-entry single-transform packet. This tiled form supports
 pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
 forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
 adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default dequantization metadata,
-disabled, default, or custom Gaborish with EPF explicitly disabled, zero chroma correlation, an order mask containing only the DCT8 bit,
+disabled, default, or custom Gaborish and disabled/default/custom one-to-three-iteration EPF, zero chroma correlation, an order mask containing only the DCT8 bit,
 default HF block-context thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
@@ -88,8 +88,10 @@ image entropy symbol or coefficient value. One GPU submission decodes and valida
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
 each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and custom-order
 coefficient sink, and runs the existing resident regular
-VarDCT renderer, optionally applies the signaled Gaborish weights between distinct resident XYB
-planes, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8 in the same GPU
+VarDCT renderer, optionally applies the signaled Gaborish weights, constructs the signaled
+per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
+contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
+and writes tightly packed RGB8 in the same GPU
 submission. Packet
 and artifact status plus one 32-byte record per pass group share one aggregate staging map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
@@ -99,7 +101,8 @@ The only output descriptor is `vardct_rgb8_format()`: interleaved RGB8 with expl
 primaries, IEC sRGB transfer, full range, and no YCbCr encoding. It is accepted directly by
 `DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
 intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
-uniform, artifact, coefficient, XYB, optional three-plane Gaborish scratch, transform-scratch, and
+uniform, artifact, coefficient, XYB, optional three-plane restoration scratch, EPF sigma and
+per-pass uniforms, transform-scratch, and
 output byte. By default those bytes use
 the backend budget shared by decode, encode, and readback; `VarDctSubmissionEngine::with_memory_budget`
 can instead select an explicit sharing group. Transient reservations survive until the aggregate
@@ -127,12 +130,22 @@ EPF. The same actual-adapter test executes inverse VarDCT, fused three-plane Gab
 packing in one command buffer, and differs from both development-only pixel oracles by at most one
 code. It also checks the exact extra reservation of three padded F32 planes and one 80-byte
 uniform.
+A pair of deterministic 257x17 libjxl fixtures covers the standard EPF2 bundle and EPF3 custom
+iteration count on an odd, 8-pixel-unaligned extent. The actual-adapter test executes Gaborish plus
+EPF1/EPF2 or EPF0/EPF1/EPF2 without readback between stages, checks the exact shared scratch,
+sigma, and uniform reservations, and permits at most one RGB8 code of difference from both Rust
+`jxl` and `djxl`. A separate actual-GPU malformed-metadata test feeds sharpness 8 through the same
+WGSL validation function used by the packet decoder and requires the typed `Sharpness` error.
+The serialized pass-1/pass-2 zero-flush values remain present in the frame inventory. libjxl 0.12
+and the Rust `jxl` implementation accept those parameters but their EPF weight function does not
+apply them; the GPU formula follows those executed references rather than inventing a threshold
+operation.
 
 This is not full VarDCT coverage. Multiple LF groups, mixed or non-DCT8 transform strategies,
 special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom block-context
 thresholds, custom quantization matrices,
-EPF (including the complete standard default filter bundle), alternate RGB/gray/YUV/NV12/VPI
-outputs, ICC/HDR and other bit depths, crop/blend,
+alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, cross-LF-group restoration,
+crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

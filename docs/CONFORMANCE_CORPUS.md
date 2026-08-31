@@ -55,6 +55,31 @@ cjxl /tmp/green_queen.png green_queen_vardct_gaborish.jxl -d 2 -e 1 -m 0 \
   --resampling=1 --gaborish=1 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
 ```
 
+`green_queen_crop_vardct_epf2.jxl.hex` and `green_queen_crop_vardct_epf3.jxl.hex` are a 257x17
+edge-bearing crop derived from the decoded Gaborish fixture. Their binary SHA-256 values are
+`d819804cfbdd66f0ae8af4eacb481bb5cadc682162aea2796a7a8b495859fac2` and
+`9034b2a4146db13220383400c65dc5949a6272dd77a76945d0987b6f2c8d53a2`. EPF2 retains the complete
+standard restoration bundle; EPF3 changes the signaled iteration count and therefore executes
+EPF0 before EPF1/EPF2. Both fixtures cross the 256-pixel pass-group boundary and end on partial
+8x8 blocks. The actual-adapter test verifies inventory, exact restoration scratch/sigma/uniform
+accounting, and at most one RGB8 code of difference from Rust `jxl` and optional `djxl`.
+
+They are reproduced with libjxl 0.12.0 and ffmpeg as follows; the explicit color-space option is
+required because PPM does not carry an ICC profile:
+
+```text
+xxd -r -p crates/jxl_wgpu_decode/test-data/green_queen_vardct_gaborish.jxl.hex \
+  /tmp/green_queen_vardct_gaborish.jxl
+djxl /tmp/green_queen_vardct_gaborish.jxl /tmp/green_queen.ppm --quiet
+ffmpeg -i /tmp/green_queen.ppm -vf crop=257:17:91:167 -frames:v 1 /tmp/green_queen_crop.ppm
+cjxl /tmp/green_queen_crop.ppm green_queen_crop_vardct_epf2.jxl -d 2 -e 1 -m 0 \
+  -x color_space=RGB_D65_SRG_Rel_SRG --resampling=1 --gaborish=1 --epf=2 \
+  --dots=0 --patches=0 --noise=0 --quiet
+cjxl /tmp/green_queen_crop.ppm green_queen_crop_vardct_epf3.jxl -d 2 -e 1 -m 0 \
+  -x color_space=RGB_D65_SRG_Rel_SRG --resampling=1 --gaborish=1 --epf=3 \
+  --dots=0 --patches=0 --noise=0 --quiet
+```
+
 ## Deterministic source contract
 
 Every case describes:
