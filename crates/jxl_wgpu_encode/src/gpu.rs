@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use jxl_gpu_formats::{ImageLayout, PixelFormat};
-use jxl_wgpu::{MemoryBudget, MemoryBudgetSnapshot, SubmissionPoller, WgpuBackend};
+use jxl_wgpu::{KernelPolicy, MemoryBudget, MemoryBudgetSnapshot, SubmissionPoller, WgpuBackend};
 
 use crate::{
     BackendError, EncodeError, EncodeSession, EncoderCapabilities, FrameEncodeRequest,
@@ -16,6 +16,7 @@ pub struct WgpuContext {
     queue: Arc<wgpu::Queue>,
     poller: SubmissionPoller,
     memory_budget: MemoryBudget,
+    kernel_policy: KernelPolicy,
     direct_mapping: bool,
 }
 
@@ -52,6 +53,7 @@ impl WgpuContext {
             queue,
             poller,
             memory_budget: MemoryBudget::new(memory_budget_bytes),
+            kernel_policy: KernelPolicy::Default,
         })
     }
 
@@ -63,6 +65,7 @@ impl WgpuContext {
             queue: Arc::new(backend.queue().clone()),
             poller: backend.submission_poller().clone(),
             memory_budget: backend.transient_memory_budget().clone(),
+            kernel_policy: backend.kernel_policy().clone(),
             direct_mapping: backend.direct_readback_enabled(),
         }
     }
@@ -75,6 +78,16 @@ impl WgpuContext {
     #[must_use]
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Returns the workgroup policy inherited from the render backend.
+    ///
+    /// Standalone contexts created with [`Self::new`] or [`Self::with_memory_budget`] use the
+    /// built-in defaults. Construct a [`WgpuBackend`] with an adapter-validated autotune profile
+    /// and pass it to [`Self::from_backend`] to share tuned choices with the encoder.
+    #[must_use]
+    pub const fn kernel_policy(&self) -> &KernelPolicy {
+        &self.kernel_policy
     }
 
     pub(crate) const fn submission_poller(&self) -> &SubmissionPoller {

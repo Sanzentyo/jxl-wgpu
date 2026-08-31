@@ -86,33 +86,49 @@ formats. Fixed GPU records do not use hand-written byte flattening.
 
 `RO`, `RW`, `U`, and `T` mean read-only storage, read-write storage, uniform, and write-only storage
 texture. All two-dimensional kernels return before accessing memory when `gid.x >= width` or
-`gid.y >= height`. The planner checks the selected workgroup dimensions/invocation count against
-the device and checks every dispatched dimension against `max_compute_workgroups_per_dimension`.
+`gid.y >= height`.
 
-| Shader / entry points | Bindings in order | Workgroup | Dispatch and address bound |
-|---|---|---:|---|
-| `copy` | input RO, output RW, U | 16x16 | checked 2-D extent and strides |
-| `modular_to_f32` | input RO, output RW, U | 16x16 | checked 2-D extent and strides |
-| `chroma_upsample` | input RO, output RW, U | 16x16 | checked input/output extents, axis and strides |
-| `chroma_2d` | input RO, output RW, U | 16x16 | checked input/output extents and strides |
-| `gaborish` | input RO, output RW, U | 16x16 | checked extent/strides; clamped neighbor reads |
-| `gaborish_rgb` | X/Y/B RO, X/Y/B RW, U | 16x16 | checked common extent and per-plane strides |
-| `epf0`, `epf1`, `epf2` | X/Y/B/sigma RO, X/Y/B RW, U | 16x16 | checked common extent, sigma shape and all strides |
-| `upsample` | input/weights RO, output RW, U | 16x16 | checked factor, output extent, weights and strides |
-| `ycbcr_to_rgb` | Cb/Y/Cr RO, output RW, U | 16x16 | one checked dispatch per output component |
-| `xyb_to_rgb` | X/Y/B RO, R/G/B RW, U | 16x16 | one dispatch; checked common F32 extent, per-plane strides, finite inverse-opsin parameters and positive intensity target |
-| `transfer_function` | R/G/B RO, R/G/B RW, U | 16x16 | one dispatch; checked common F32 extent and Linear/sRGB/BT.709/Gamma/PQ/HLG parameters |
-| `blend` | base/source/base-alpha/source-alpha RO, output RW, U | 16x16 | one scalar-channel dispatch; two or four equal F32 inputs keep the shader within portable storage-binding limits |
-| `premultiply_alpha` | color/alpha RO, output RW, U | 16x16 | one checked dispatch per color component |
-| `extend` | frame/reference RO, full-canvas output RW, U | 16x16 | exact u32 word copy for I32/F32; checked signed origin, crop, target extent and optional reference canvas |
-| `save` | source RO, packed output RW, U | 16x16 | checked orientation and exact packed allocation |
-| `rgb_to_image` | R/G/B RO, packed output RW, U | 256x1 | checked linear word count is split into a legal 2-D dispatch; shader checks `logical_size` before stores |
-| `display_rgb` | source RO, destination T, U | 16x16 | source must have `STORAGE`; logical samples and final source address fit the bound range/WGSL `u32` |
-| `display_numeric` | source words RO, destination T, U; native-F64 variant also binds the same source as F64 RO | 16x16 | exact pitch-linear plane range/stride and WGSL `u32` addresses; explicit sample kind, affine mapping, non-finite handling, clamp, transfer, and channel visualization |
-| `display_image` | source RO, destination T, U | 16x16 | source must have `STORAGE`; each pitch-linear plane and its final address is bounded |
-| `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
-| encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | profile dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
-| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, U | 1x1 | bounded `jwgp` index, aligned token words plus sentinel, prefix table, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated |
+Tier A size-agnostic entry points declare WGSL override constants (`override wg_x: u32 = ...; override wg_y: u32 = ...;`)
+and are parameterizable at pipeline creation via `KernelPolicy` and `KernelVariant` (`Tile16x16`, `Tile16x8`, `Tile8x8`,
+`Tile32x4`, `Lanes256`, `Lanes128`, `Lanes64`, `Lanes32`, `Scalar`). The planner, decoder, and display pipelines validate
+the selected workgroup dimensions and invocation counts against device limits prior to pipeline creation and dispatch
+recording. Tier B kernels (such as `vardct_dct8`, `vardct_special`, `vardct_artifact`, `vardct_packet`, and encoder
+control/modular passes) are structurally fixed to their algorithm-defined workgroup dimensions and reject non-default
+variants. Tier C kernels contain algorithm-specific reductions or tiling. The two encoder VarDCT data passes have
+generalized their lane assignment and accept every linear `KernelVariant`; `vardct_lf` and `vardct_general` remain
+fixed until their reduction or tiling structures are generalized.
+
+The table below states the default workgroup configuration for each entry point:
+
+| Shader / entry points | Bindings in order | Default workgroup | Parameterization | Dispatch and address bound |
+|---|---|---:|---|---|
+| `copy` | input RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked 2-D extent and strides |
+| `modular_to_f32` | input RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked 2-D extent and strides |
+| `chroma_upsample` | input RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked input/output extents, axis and strides |
+| `chroma_2d` | input RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked input/output extents and strides |
+| `gaborish` | input RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked extent/strides; clamped neighbor reads |
+| `gaborish_rgb` | X/Y/B RO, X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked common extent and per-plane strides |
+| `epf0`, `epf1`, `epf2` | X/Y/B/sigma RO, X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked common extent, sigma shape and all strides |
+| `upsample` | input/weights RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked factor, output extent, weights and strides |
+| `ycbcr_to_rgb` | Cb/Y/Cr RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one checked dispatch per output component |
+| `xyb_to_rgb` | X/Y/B RO, R/G/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one dispatch; checked common F32 extent, per-plane strides, finite inverse-opsin parameters and positive intensity target |
+| `transfer_function` | R/G/B RO, R/G/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one dispatch; checked common F32 extent and Linear/sRGB/BT.709/Gamma/PQ/HLG parameters |
+| `blend` | base/source/base-alpha/source-alpha RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one scalar-channel dispatch; two or four equal F32 inputs keep the shader within portable storage-binding limits |
+| `premultiply_alpha` | color/alpha RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one checked dispatch per color component |
+| `extend` | frame/reference RO, full-canvas output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | exact u32 word copy for I32/F32; checked signed origin, crop, target extent and optional reference canvas |
+| `save` | source RO, packed output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked orientation and exact packed allocation |
+| `rgb_to_image` | R/G/B RO, packed output RW, U | 256x1 | Tier A (`KernelVariant` 1-D) | checked linear word count is split into a legal 2-D dispatch; shader checks `logical_size` before stores |
+| `display_rgb` | source RO, destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; logical samples and final source address fit the bound range/WGSL `u32` |
+| `display_numeric` | source words RO, destination T, U; native-F64 variant also binds the same source as F64 RO | 16x16 | Tier A (`KernelVariant` 2-D) | exact pitch-linear plane range/stride and WGSL `u32` addresses; explicit sample kind, affine mapping, non-finite handling, clamp, transfer, and channel visualization |
+| `display_image` | source RO, destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; each pitch-linear plane and its final address is bounded |
+| `vardct_resource` (decoder) | table RO, dequantized LF RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | checked block count; one 1D workgroup per block batch |
+| `vardct_output` (decoder) | X/Y/B planes RO, output RW, U | 256x1 | Tier A (`KernelVariant` 1-D) | checked word count linearized across 2-D workgroups; each invocation writes one packed u32 |
+| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, prefix table, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane |
+| encoder `vardct_encode_bounded` | source RO, parameters RO, artifact RW | 256x1 | Tier C (`KernelVariant` 1-D) | one workgroup cooperatively loads and transforms at most 1,024 pixels; fixed 16 KiB workgroup storage is validated before pipeline creation |
+| encoder `vardct_encode_quantize` | source RO, parameters RO, artifact RW | 64x1 | Tier C (`KernelVariant` 1-D) | one workgroup per checked 8x8 block; lanes stride over exactly 64 samples and use fixed 1 KiB workgroup storage |
+| encoder VarDCT `serialize_control` | parameters RO, artifact RW | 1x1 | Tier B (fixed) | a separate pass establishes global visibility; one invocation performs sequential DC prediction and bit-offset serialization |
+| `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | Tier B (fixed) | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
+| encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | Tier B (fixed) | profile dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
 
 Display source buffers are now also checked for the usage needed by the operation: `STORAGE` for
 shader conversion and `COPY_SRC` for direct RGBA8 buffer-to-texture copies. A multi-row direct
@@ -120,16 +136,21 @@ buffer-to-texture copy requires `bytes_per_row` to be a multiple of 256.
 
 ## Workgroup-local storage
 
-Only `vardct_dct8.wgsl` declares `var<workgroup>` memory:
+The following shaders declare `var<workgroup>` memory:
 
 | Shader | Declaration | Bytes per workgroup | Host validation |
 |---|---|---:|---|
 | `vardct_dct8` | two `array<f32, 192>` scratch arrays | 1,536 | reject when `max_compute_workgroup_storage_size < 1,536` |
+| `vardct_special` | three `array<f32, 192>` scratch arrays | 2,304 | below the portable 16 KiB minimum; wgpu validates pipeline creation |
+| decoder `vardct_lf` | `array<vec4<f32>, 324>` tile | 5,184 | checked as `ADAPTIVE_LF_WORKGROUP_BYTES` before submission |
+| encoder `vardct_encode_bounded` | `array<vec3<f32>, 1024>` XYB block | 16,384 | selected variant and bytes checked before pipeline creation |
+| encoder `vardct_encode_quantize` | `array<vec3<f32>, 64>` XYB block | 1,024 | selected variant and bytes checked before pipeline creation |
 
-All other shaders use zero explicit workgroup-local bytes. The largest invocation count is 256
-(`16x16` kernels and `rgb_to_image`); VarDCT DCT8 uses 64 and the Gray8 encoder/decoder each use one.
-Planner capability checks cover the core kernels. The fixed VarDCT and Gray8 sizes are within
-WebGPU's portable baseline; VarDCT additionally checks its workgroup storage limit at submission.
+Other parameterized image kernels use zero explicit workgroup-local bytes. Default invocation counts are 256
+(`16x16` tiled 2D kernels and `256x1` linear kernels `rgb_to_image` / `vardct_output`), 64
+(`vardct_resource`, decoder `lossless_gray8`, encoder scalable VarDCT quantization at `64x1`, and fixed VarDCT DCT8 at `8x8`), and one (encoder control/modular passes).
+Planner and pipeline creation validate selected `KernelVariant` dimensions and invocation counts
+against device limits prior to pipeline compilation and dispatch recording.
 
 ## Four-byte copy and mapping invariant
 

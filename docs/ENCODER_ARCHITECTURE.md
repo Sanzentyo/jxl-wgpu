@@ -154,7 +154,12 @@ LosslessModularEncoder::encode / encode_container
 
 On native `wgpu`, each context owns a bounded `SubmissionPoller`, and every context clone shares its
 single completion worker. `WgpuContext::from_backend` reuses the backend's worker and byte budget,
-so encode, decode, and readback do not create per-submission polling threads. Poll capacity is
+and inherits its adapter-validated `KernelPolicy`, so encode, decode, and readback use one workgroup
+selection contract and do not create per-submission polling threads. The VarDCT keys
+`vardct_encode_bounded` and `vardct_encode_quantize` accept every linear `KernelVariant`; their
+fixed 16 KiB and 1 KiB workgroup allocations are checked before pipeline creation. VarDCT control
+serialization and the lossless Modular token pass remain fixed scalar kernels because changing only
+their workgroup sizes would race sequential predictor and bit-offset state. Poll capacity is
 reserved before queue submission and saturation is a typed retryable error. A browser cannot block
 `Device::poll`; its synchronous wait returns an error and callers must await.
 

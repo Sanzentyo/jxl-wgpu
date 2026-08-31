@@ -102,7 +102,8 @@ exact standard identifier rather than being relabeled or lowered to DCT8.
 The GPU executes sRGB linearization, XYB conversion, LF quantization, the per-8×8 clamped-gradient
 DC predictor, signed tokenization, prefix packing, histogramming, and construction of the standard
 strategy map. Through 32×32, one workgroup also records the complete diagnostic forward transform.
-Larger strategies dispatch one 64-thread workgroup per 8×8 block (1,024 bytes of workgroup storage)
+Its built-in workgroup is 256 lanes with 16 KiB of fixed shared XYB storage. Larger strategies
+dispatch one 64-lane workgroup per 8×8 block (1,024 bytes of workgroup storage)
 and then end that compute pass before a one-invocation control pass, making all DC writes visible
 before deterministic prediction and entropy serialization. The host validates the complete typed
 artifact, including status, live counts, orientation, every section offset/length, fragment length,
@@ -140,6 +141,14 @@ through the published Rust `jxl` decoder; black is exact and solid-red and gradi
 explicit quality guards. `djxl` verifies emitted streams, while `cjxl` serves as a development
 quality oracle rather than a strategy-selection oracle. There is no CPU transform, quantization,
 residual, entropy, pixel-codec fallback, or compatibility alias.
+
+Contexts created with `WgpuContext::from_backend` inherit that backend's adapter-validated
+`KernelPolicy`. Autotune keys `vardct_encode_bounded` and `vardct_encode_quantize` accept
+`Scalar`, `Lanes32`, `Lanes64`, `Lanes128`, and `Lanes256`; actual-GPU tests require every choice to
+emit the same codestream as the built-in variant. The fixed `serialize_control` pass is deliberately
+not tunable because its DC predictor and bit offset are sequential. The lossless Modular token
+kernel remains fixed for the same correctness reason until it is replaced by a parallel scan and
+compaction algorithm.
 
 ```rust,no_run
 # use jxl_wgpu_encode::{BufferImageSource, VarDctEncoder, VarDctStrategy, WgpuContext};

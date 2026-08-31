@@ -56,6 +56,8 @@ var<storage, read_write> artifact: Artifact;
 // portable 16 KiB workgroup-storage floor at the 32x32 maximum.
 var<workgroup> block_xyb: array<vec3<f32>, 1024>;
 
+override wg_x: u32 = 256u;
+
 const PI: f32 = 3.14159265358979323846;
 const SQRT_TWO: f32 = 1.41421356237309504880;
 const OPSIN_BIAS: f32 = 0.0037930732552754493;
@@ -172,10 +174,10 @@ fn quantized_block_dc(channel: u32, block_index: u32) -> i32 {
     return i32(round((mean.z - mean.y) * dc_scale / 256.0));
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(wg_x, 1, 1)
 fn encode(@builtin(local_invocation_index) local_index: u32) {
     let pixel_count = params.width * params.height;
-    for (var pixel = local_index; pixel < pixel_count; pixel += 256u) {
+    for (var pixel = local_index; pixel < pixel_count; pixel += wg_x) {
         let pixel_x = pixel % params.width;
         let pixel_y = pixel / params.width;
         let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
@@ -197,7 +199,7 @@ fn encode(@builtin(local_invocation_index) local_index: u32) {
     // this LF-first profile deliberately quantizes every AC coefficient to zero.
     for (var coefficient_index = local_index;
          coefficient_index < pixel_count;
-         coefficient_index += 256u) {
+         coefficient_index += wg_x) {
         let frequency_x = coefficient_index % params.width;
         let frequency_y = coefficient_index / params.width;
         var coefficient = vec3<f32>(0.0);

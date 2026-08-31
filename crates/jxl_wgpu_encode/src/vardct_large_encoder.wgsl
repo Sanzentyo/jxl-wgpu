@@ -46,6 +46,8 @@ var<storage, read_write> artifact_words: array<u32>;
 // 1,024 bytes: far below WebGPU's portable 16 KiB workgroup-storage floor.
 var<workgroup> block_xyb: array<vec3<f32>, 64>;
 
+override wg_x: u32 = 64u;
+
 const ARTIFACT_READY: u32 = 0x56444354u;
 const HEADER_HISTOGRAM_OFFSET: u32 = 22u;
 const OPSIN_BIAS: f32 = 0.0037930732552754493;
@@ -129,7 +131,7 @@ fn encode_dc_token(slot: u32, signed_value: i32, start: u32) -> u32 {
     return params.fragment_word_capacity * 32u + 1u;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(wg_x, 1, 1)
 fn quantize_blocks(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
@@ -141,25 +143,27 @@ fn quantize_blocks(
     }
     let block_x = block % params.blocks_x;
     let block_y = block / params.blocks_x;
-    let local_x = local_index & 7u;
-    let local_y = local_index >> 3u;
-    // JPEG XL pads a partial edge block by replicating the final source row
-    // or column. Keeping the clamped coordinates in the GPU kernel avoids a
-    // CPU-side staging/padding fallback for odd and asymmetric dimensions.
-    let pixel_x = min(block_x * 8u + local_x, params.width - 1u);
-    let pixel_y = min(block_y * 8u + local_y, params.height - 1u);
-    let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
-    let encoded = vec3<f32>(
-        f32(load_u8(pixel_address)) / 255.0,
-        f32(load_u8(pixel_address + 1u)) / 255.0,
-        f32(load_u8(pixel_address + 2u)) / 255.0,
-    );
-    let linear = vec3<f32>(
-        srgb_to_linear(encoded.x),
-        srgb_to_linear(encoded.y),
-        srgb_to_linear(encoded.z),
-    );
-    block_xyb[local_index] = linear_rgb_to_xyb(linear);
+    for (var sample = local_index; sample < 64u; sample += wg_x) {
+        let local_x = sample & 7u;
+        let local_y = sample >> 3u;
+        // JPEG XL pads a partial edge block by replicating the final source row
+        // or column. Keeping the clamped coordinates in the GPU kernel avoids a
+        // CPU-side staging/padding fallback for odd and asymmetric dimensions.
+        let pixel_x = min(block_x * 8u + local_x, params.width - 1u);
+        let pixel_y = min(block_y * 8u + local_y, params.height - 1u);
+        let pixel_address = params.byte_offset + pixel_y * params.row_stride + pixel_x * 3u;
+        let encoded = vec3<f32>(
+            f32(load_u8(pixel_address)) / 255.0,
+            f32(load_u8(pixel_address + 1u)) / 255.0,
+            f32(load_u8(pixel_address + 2u)) / 255.0,
+        );
+        let linear = vec3<f32>(
+            srgb_to_linear(encoded.x),
+            srgb_to_linear(encoded.y),
+            srgb_to_linear(encoded.z),
+        );
+        block_xyb[sample] = linear_rgb_to_xyb(linear);
+    }
     workgroupBarrier();
 
     if local_index == 0u {

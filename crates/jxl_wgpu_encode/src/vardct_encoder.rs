@@ -17,7 +17,7 @@ use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PixelFormat,
     PlaneFormat, PlaneSampling, SampleKind, Swizzle,
 };
-use jxl_wgpu::MemoryPermit;
+use jxl_wgpu::{KernelVariant, MemoryPermit};
 
 use crate::prefix::{LZ77_SYMBOLS, PrefixCode, RAW_SYMBOLS};
 use crate::{
@@ -39,7 +39,9 @@ const MAX_DC_FRAGMENT_WORDS: usize = 64;
 const SHADER: &str = include_str!("vardct_encoder.wgsl");
 const LARGE_SHADER: &str = include_str!("vardct_large_encoder.wgsl");
 const PROFILE_DISTANCE: f32 = 25.0;
-const LARGE_WORKGROUP_INVOCATIONS: u32 = 64;
+const BOUNDED_KERNEL_KEY: &str = "vardct_encode_bounded";
+const SCALABLE_QUANTIZE_KERNEL_KEY: &str = "vardct_encode_quantize";
+const BOUNDED_WORKGROUP_STORAGE_BYTES: u32 = 1_024 * 16;
 const LARGE_WORKGROUP_STORAGE_BYTES: u32 = 64 * 16;
 const AC_GROUP_DIM_PIXELS: u32 = 256;
 const LF_GROUP_DIM_PIXELS: u32 = 2_048;
@@ -1057,6 +1059,7 @@ enum VarDctPipelines {
 /// coefficients through a CPU codec.
 pub struct VarDctBackend {
     pipelines: VarDctPipelines,
+    workgroup_variant: KernelVariant,
     code: PrefixCode,
     topology: VarDctTopology,
     capabilities: EncoderCapabilities,
@@ -1090,6 +1093,26 @@ impl VarDctBackend {
     ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let limits = context.device().limits();
+        let (kernel_key, default_variant, workgroup_storage_bytes) =
+            if topology.uses_scalable_kernel() {
+                (
+                    SCALABLE_QUANTIZE_KERNEL_KEY,
+                    KernelVariant::Lanes64,
+                    LARGE_WORKGROUP_STORAGE_BYTES,
+                )
+            } else {
+                (
+                    BOUNDED_KERNEL_KEY,
+                    KernelVariant::Lanes256,
+                    BOUNDED_WORKGROUP_STORAGE_BYTES,
+                )
+            };
+        let workgroup_variant = context
+            .kernel_policy()
+            .variant_for(kernel_key, default_variant)?;
+        workgroup_variant.validate_for(kernel_key, &limits, workgroup_storage_bytes)?;
+        let (workgroup_x, _) = workgroup_variant.workgroup_size();
+        let workgroup_constants = [("wg_x", f64::from(workgroup_x))];
         let pipelines = if topology.uses_scalable_kernel() {
             validate_scalable_device_limits(&limits)?;
             let module = context
@@ -1098,23 +1121,30 @@ impl VarDctBackend {
                     label: Some("jxl-wgpu scalable VarDCT kernel"),
                     source: wgpu::ShaderSource::Wgsl(LARGE_SHADER.into()),
                 });
-            let descriptor = |label, entry_point| wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: None,
-                module: &module,
-                entry_point: Some(entry_point),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            };
             VarDctPipelines::Scalable {
-                quantize: Arc::new(context.device().create_compute_pipeline(&descriptor(
-                    "jxl-wgpu scalable VarDCT block quantization",
-                    "quantize_blocks",
-                ))),
-                serialize: Arc::new(context.device().create_compute_pipeline(&descriptor(
-                    "jxl-wgpu scalable VarDCT control serialization",
-                    "serialize_control",
-                ))),
+                quantize: Arc::new(context.device().create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some("jxl-wgpu scalable VarDCT block quantization"),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some("quantize_blocks"),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &workgroup_constants,
+                            ..Default::default()
+                        },
+                        cache: None,
+                    },
+                )),
+                serialize: Arc::new(context.device().create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some("jxl-wgpu scalable VarDCT control serialization"),
+                        layout: None,
+                        module: &module,
+                        entry_point: Some("serialize_control"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    },
+                )),
             }
         } else {
             let module = context
@@ -1129,7 +1159,10 @@ impl VarDctBackend {
                     layout: None,
                     module: &module,
                     entry_point: Some("encode"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &workgroup_constants,
+                        ..Default::default()
+                    },
                     cache: None,
                 },
             )))
@@ -1137,6 +1170,7 @@ impl VarDctBackend {
         let distance = profile_distance();
         Ok(Self {
             pipelines,
+            workgroup_variant,
             code,
             topology,
             capabilities: EncoderCapabilities {
@@ -1161,6 +1195,15 @@ impl VarDctBackend {
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
         })
+    }
+
+    /// Selected linear workgroup for the parallel forward/quantization pass.
+    ///
+    /// The scalable control serializer remains a separate fixed scalar pass because its DC
+    /// prediction and bit-offset state are sequential.
+    #[must_use]
+    pub const fn workgroup_variant(&self) -> KernelVariant {
+        self.workgroup_variant
     }
 
     /// Computes the exact memory admission and source binding before a job is
@@ -1363,28 +1406,11 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 }
 
 fn validate_scalable_device_limits(limits: &wgpu::Limits) -> Result<(), EncodeError> {
-    let checks = [
-        (
-            "max_compute_invocations_per_workgroup",
-            u64::from(LARGE_WORKGROUP_INVOCATIONS),
-            u64::from(limits.max_compute_invocations_per_workgroup),
-        ),
-        (
-            "max_compute_workgroup_size_x",
-            u64::from(LARGE_WORKGROUP_INVOCATIONS),
-            u64::from(limits.max_compute_workgroup_size_x),
-        ),
-        (
-            "max_compute_workgroup_storage_size",
-            u64::from(LARGE_WORKGROUP_STORAGE_BYTES),
-            u64::from(limits.max_compute_workgroup_storage_size),
-        ),
-        (
-            "max_storage_buffers_per_shader_stage",
-            3,
-            u64::from(limits.max_storage_buffers_per_shader_stage),
-        ),
-    ];
+    let checks = [(
+        "max_storage_buffers_per_shader_stage",
+        3,
+        u64::from(limits.max_storage_buffers_per_shader_stage),
+    )];
     if let Some((name, required, available)) = checks
         .into_iter()
         .find(|(_, required, available)| required > available)
@@ -2386,6 +2412,12 @@ impl VarDctEncoder {
         self.strategy
     }
 
+    /// Workgroup selected for this encoder's parallel VarDCT pass.
+    #[must_use]
+    pub fn workgroup_variant(&self) -> KernelVariant {
+        self.encoder.backend().workgroup_variant()
+    }
+
     #[must_use]
     pub const fn color_encoding(&self) -> VarDctColorEncoding {
         VarDctColorEncoding::SrgbD65
@@ -2487,6 +2519,12 @@ impl TiledVarDctEncoder {
     #[must_use]
     pub fn capabilities(&self) -> &EncoderCapabilities {
         self.encoder.capabilities()
+    }
+
+    /// Workgroup selected for block quantization. Control serialization remains scalar.
+    #[must_use]
+    pub fn workgroup_variant(&self) -> KernelVariant {
+        self.encoder.backend().workgroup_variant()
     }
 
     #[must_use]
@@ -2681,6 +2719,10 @@ mod tests {
     };
     use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
     use jxl_gpu_protocol::Extent2d;
+    use jxl_wgpu::{
+        AdapterFingerprint, AutotuneProfile, KernelPolicy, TunedKernel, WgpuBackend,
+        WgpuBackendConfig,
+    };
     use wgpu::util::DeviceExt;
 
     use super::*;
@@ -2718,7 +2760,7 @@ mod tests {
         decode_rgb8_sized(codestream, 8, 8)
     }
 
-    fn test_context() -> Option<WgpuContext> {
+    fn test_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>, wgpu::AdapterInfo)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::None,
@@ -2727,6 +2769,7 @@ mod tests {
             apply_limit_buckets: false,
         }))
         .ok()?;
+        let info = adapter.get_info();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jxl-wgpu VarDCT encoder test"),
             required_features: wgpu::Features::empty(),
@@ -2736,7 +2779,36 @@ mod tests {
             trace: wgpu::Trace::Off,
         }))
         .ok()?;
-        WgpuContext::new(Arc::new(device), Arc::new(queue)).ok()
+        Some((Arc::new(device), Arc::new(queue), info))
+    }
+
+    fn test_context() -> Option<WgpuContext> {
+        let (device, queue, _) = test_device()?;
+        WgpuContext::new(device, queue).ok()
+    }
+
+    fn test_context_with_variants(
+        device: &Arc<wgpu::Device>,
+        queue: &Arc<wgpu::Queue>,
+        info: &wgpu::AdapterInfo,
+        variants: &[(&str, KernelVariant)],
+    ) -> Option<WgpuContext> {
+        let mut profile = AutotuneProfile::new(AdapterFingerprint::from_adapter_info(info));
+        for &(kernel, variant) in variants {
+            profile.record(TunedKernel::from_samples(kernel, variant, &[1])?);
+        }
+        let backend = WgpuBackend::from_device(
+            device.as_ref().clone(),
+            queue.as_ref().clone(),
+            info.clone(),
+            WgpuBackendConfig {
+                enable_timestamps: false,
+                kernel_policy: KernelPolicy::Profile(profile),
+                ..WgpuBackendConfig::default()
+            },
+        )
+        .ok()?;
+        Some(WgpuContext::from_backend(&backend))
     }
 
     fn padded_rgb_source(context: &WgpuContext, pixels: &[[u8; 3]; 64]) -> BufferImageSource {
@@ -2933,7 +3005,7 @@ mod tests {
     }
 
     #[test]
-    fn naga_validates_strategy_shader_and_bounded_abi() {
+    fn naga_validates_vardct_shaders() {
         let module = naga::front::wgsl::parse_str(SHADER).expect("VarDCT WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -2941,10 +3013,6 @@ mod tests {
         )
         .validate(&module)
         .expect("VarDCT WGSL validates");
-        assert!(SHADER.contains("@compute @workgroup_size(256)"));
-        assert!(SHADER.contains("strategy_map: array<u32, 16>"));
-        assert!(SHADER.contains("padding: array<u32, 17>"));
-        assert!(SHADER.contains("forward_xyb_bits: array<u32, 3072>"));
 
         let module =
             naga::front::wgsl::parse_str(LARGE_SHADER).expect("scalable VarDCT WGSL parses");
@@ -2954,10 +3022,6 @@ mod tests {
         )
         .validate(&module)
         .expect("scalable VarDCT WGSL validates");
-        assert!(LARGE_SHADER.contains("@compute @workgroup_size(64)"));
-        assert!(LARGE_SHADER.contains("@compute @workgroup_size(1)"));
-        assert!(LARGE_SHADER.contains("block_xyb: array<vec3<f32>, 64>"));
-        assert!(LARGE_SHADER.contains("var<storage, read_write> artifact_words: array<u32>"));
     }
 
     #[test]
@@ -3061,6 +3125,126 @@ mod tests {
         let codestream = encoder.encode(source).unwrap();
         assert_eq!(decode_rgb8(&codestream), vec![0; 8 * 8 * 3]);
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn every_linear_workgroup_produces_identical_bounded_and_scalable_codestreams() {
+        let Some((device, queue, info)) = test_device() else {
+            return;
+        };
+        let default_context = WgpuContext::new(Arc::clone(&device), Arc::clone(&queue)).unwrap();
+
+        let mut bounded_pixels = [[0u8; 3]; 64];
+        for y in 0..8usize {
+            for x in 0..8usize {
+                bounded_pixels[y * 8 + x] = [
+                    (x * 29 + y * 5) as u8,
+                    (y * 31 + x * 3) as u8,
+                    ((x + y) * 17) as u8,
+                ];
+            }
+        }
+        let default_bounded_encoder =
+            VarDctEncoder::new(default_context.clone(), VarDctStrategy::Dct8).unwrap();
+        let default_bounded_source = padded_rgb_source(&default_context, &bounded_pixels);
+        assert_eq!(
+            default_bounded_encoder
+                .memory_plan(&default_bounded_source)
+                .unwrap()
+                .kernel_layout,
+            VarDctKernelLayout::Bounded,
+        );
+        let default_bounded = default_bounded_encoder
+            .encode(default_bounded_source)
+            .unwrap();
+
+        let scalable_width = 32usize;
+        let scalable_height = 64usize;
+        let scalable_pixels = (0..scalable_height)
+            .flat_map(|y| {
+                (0..scalable_width).map(move |x| {
+                    [
+                        (x * 255 / (scalable_width - 1)) as u8,
+                        (y * 255 / (scalable_height - 1)) as u8,
+                        ((x * 11 + y * 7) & 0xff) as u8,
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        let default_scalable_encoder =
+            VarDctEncoder::new(default_context.clone(), VarDctStrategy::Dct64x32).unwrap();
+        let default_scalable_source = padded_rgb_source_sized(
+            &default_context,
+            scalable_width,
+            scalable_height,
+            &scalable_pixels,
+        );
+        assert_eq!(
+            default_scalable_encoder
+                .memory_plan(&default_scalable_source)
+                .unwrap()
+                .kernel_layout,
+            VarDctKernelLayout::Scalable,
+        );
+        let default_scalable = default_scalable_encoder
+            .encode(default_scalable_source)
+            .unwrap();
+
+        for variant in [
+            KernelVariant::Scalar,
+            KernelVariant::Lanes32,
+            KernelVariant::Lanes64,
+            KernelVariant::Lanes128,
+            KernelVariant::Lanes256,
+        ] {
+            let context = test_context_with_variants(
+                &device,
+                &queue,
+                &info,
+                &[
+                    (BOUNDED_KERNEL_KEY, variant),
+                    (SCALABLE_QUANTIZE_KERNEL_KEY, variant),
+                ],
+            )
+            .unwrap();
+
+            let bounded = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8).unwrap();
+            assert_eq!(bounded.workgroup_variant(), variant);
+            assert_eq!(
+                bounded
+                    .encode(padded_rgb_source(&context, &bounded_pixels))
+                    .unwrap(),
+                default_bounded,
+                "bounded variant={variant:?}",
+            );
+
+            let scalable = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct64x32).unwrap();
+            assert_eq!(scalable.workgroup_variant(), variant);
+            assert_eq!(
+                scalable
+                    .encode(padded_rgb_source_sized(
+                        &context,
+                        scalable_width,
+                        scalable_height,
+                        &scalable_pixels,
+                    ))
+                    .unwrap(),
+                default_scalable,
+                "scalable variant={variant:?}",
+            );
+        }
+
+        let incompatible = test_context_with_variants(
+            &device,
+            &queue,
+            &info,
+            &[(BOUNDED_KERNEL_KEY, KernelVariant::Tile8x8)],
+        )
+        .unwrap();
+        assert!(matches!(
+            VarDctEncoder::new(incompatible, VarDctStrategy::Dct8),
+            Err(EncodeError::KernelPolicy(jxl_wgpu::Error::Unsupported(_)))
+        ));
     }
 
     #[test]

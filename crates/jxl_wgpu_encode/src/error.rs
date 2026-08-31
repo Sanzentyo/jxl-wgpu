@@ -123,6 +123,8 @@ pub enum EncodeError {
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error(transparent)]
     AccelerationIndex(#[from] jxl_gpu_bitstream::AccelerationIndexError),
+    #[error("GPU encoder kernel policy failed: {0}")]
+    KernelPolicy(#[from] jxl_wgpu::Error),
     #[error("invalid encoder configuration: {0}")]
     InvalidConfiguration(&'static str),
     #[error("invalid GPU frame source: {0}")]
