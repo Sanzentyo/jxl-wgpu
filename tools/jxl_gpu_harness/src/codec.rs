@@ -543,7 +543,7 @@ fn run_decode(
             error.to_string(),
         )
     })?);
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).map_err(decode_issue)?;
     let display = (options.output_target == OutputTarget::DisplayTexture)
         .then(|| DisplayPipeline::new(backend));
     let readback = (options.output_target == OutputTarget::CpuReadback)
@@ -750,7 +750,7 @@ fn run_round_trip(
         ));
     }
     let prepared = prepare_gray8_encode(path, Some(backend), options)?;
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).map_err(decode_issue)?;
     let request = options.format.output_request().map_err(decode_issue)?;
     let readback = ImageReadbackPipeline::new(backend);
     execute_workload(options.workload, || {
@@ -783,7 +783,7 @@ fn run_round_trip(
 }
 
 fn decode_once(
-    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuSubmissionEngine>,
+    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuDecodeEngine>,
     encoded: Arc<[u8]>,
     request: GpuOutputRequest,
     display: Option<&DisplayPipeline>,
@@ -803,7 +803,7 @@ fn decode_once(
 }
 
 fn decode_once_retained(
-    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuSubmissionEngine>,
+    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuDecodeEngine>,
     encoded: Arc<[u8]>,
     request: GpuOutputRequest,
     require_animation: bool,
@@ -820,7 +820,7 @@ fn decode_once_retained(
 }
 
 fn decode_once_inner(
-    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuSubmissionEngine>,
+    decoder: &GpuDecoder<jxl_wgpu_decode::WgpuDecodeEngine>,
     encoded: Arc<[u8]>,
     request: GpuOutputRequest,
     display: Option<&DisplayPipeline>,
@@ -839,20 +839,15 @@ fn decode_once_inner(
             "the animation workload requires an animated JPEG XL codestream",
         ));
     }
-    let submissions_per_frame = u64::try_from(
-        session
-            .submission_session()
-            .memory_stats()
-            .submissions_per_frame,
-    )
-    .map_err(|_| {
-        CodecIssue::new(
-            CodecIssueKind::Backend,
-            "gpu_decode",
-            "submission_count_overflow",
-            "the decoder GPU submission count does not fit report storage",
-        )
-    })?;
+    let submissions_per_frame = u64::try_from(session.submission_session().submissions_per_frame())
+        .map_err(|_| {
+            CodecIssue::new(
+                CodecIssueKind::Backend,
+                "gpu_decode",
+                "submission_count_overflow",
+                "the decoder GPU submission count does not fit report storage",
+            )
+        })?;
 
     let mut observation = DecodeObservation::default();
     let mut retained_frames = Vec::new();
@@ -2333,7 +2328,7 @@ mod tests {
         };
         let prepared = prepare_gray8_encode(&path, Some(&backend), &encode_options).unwrap();
         let encoded = prepared.encoder.encode_container(prepared.source).unwrap();
-        let decoder = GpuDecoder::wgpu(backend.clone());
+        let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
         let display = DisplayPipeline::new(&backend);
         let observation = decode_once(
             &decoder,

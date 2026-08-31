@@ -14,9 +14,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use jxl_gpu_bitstream::{
-    ColourEncodingInventory, ColourSpaceInventory, EdgePreservingFilterInventory,
-    GaborishInventory, InventoryLimits, ParseLimits, PrimariesInventory, RenderingIntentInventory,
-    RestorationFilterInventory, TransferFunctionInventory, WhitePointInventory,
+    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
+    EdgePreservingFilterInventory, GaborishInventory, InventoryLimits, ParseLimits,
+    PrimariesInventory, RenderingIntentInventory, RestorationFilterInventory,
+    TransferFunctionInventory, WhitePointInventory,
 };
 use jxl_gpu_formats::{
     ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, ImageLayout,
@@ -55,9 +56,8 @@ use crate::vardct_resource::{
 };
 use crate::{
     AnimationMetadata, DecodeProfile, Error as DecodeError, FrameDuration, FrameMetadata,
-    GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
-    GpuSubmissionEngine, GpuSubmissionSession, PreparedGpuSession, Result as DecodeResult,
-    SubmittedGpuFrame,
+    GpuCodestream, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
+    GpuSubmissionSession, PreparedGpuSession, Result as DecodeResult, SubmittedGpuFrame,
 };
 
 const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
@@ -387,6 +387,38 @@ impl VarDctSubmissionEngine {
     pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
         self.memory.snapshot()
     }
+
+    pub(crate) fn open_with_inventory(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        let source = prepare_source(
+            &self.backend,
+            codestream,
+            request,
+            inventory,
+            self.pipelines.output_variant,
+        )?;
+        let extent = source.layout.extent;
+        let profile = DecodeProfile::VarDctRegular {
+            bits_per_sample: 8,
+            transform: source.packet.transform,
+        };
+        Ok(PreparedGpuSession::new(
+            profile,
+            AnimationMetadata::still(extent),
+            VarDctDecodeSession {
+                backend: self.backend.clone(),
+                pipelines: Arc::clone(&self.pipelines),
+                memory_stats: source.memory,
+                source: Some(source),
+                memory: self.memory.clone(),
+            },
+        )
+        .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
+    }
 }
 
 impl std::fmt::Debug for VarDctSubmissionEngine {
@@ -441,30 +473,7 @@ impl GpuSubmissionEngine for VarDctSubmissionEngine {
                 .map_err(|_| DecodeError::backend("VarDCT codestream size exceeds u64"))?,
             ..InventoryLimits::default()
         })?;
-        let source = prepare_source(
-            &self.backend,
-            codestream,
-            request,
-            &inventory,
-            self.pipelines.output_variant,
-        )?;
-        let extent = source.layout.extent;
-        let profile = DecodeProfile::VarDctRegular {
-            bits_per_sample: 8,
-            transform: source.packet.transform,
-        };
-        Ok(PreparedGpuSession::new(
-            profile,
-            AnimationMetadata::still(extent),
-            VarDctDecodeSession {
-                backend: self.backend.clone(),
-                pipelines: Arc::clone(&self.pipelines),
-                memory_stats: source.memory,
-                source: Some(source),
-                memory: self.memory.clone(),
-            },
-        )
-        .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
+        self.open_with_inventory(codestream, request, &inventory)
     }
 }
 
@@ -710,6 +719,12 @@ impl VarDctDecodeSession {
     #[must_use]
     pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
         self.memory.snapshot()
+    }
+
+    /// All VarDCT compute phases and validation copies are recorded into one queue submission.
+    #[must_use]
+    pub const fn submissions_per_frame(&self) -> usize {
+        1
     }
 }
 
@@ -1434,13 +1449,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-impl GpuDecoder<VarDctSubmissionEngine> {
-    /// Constructs the bounded standard VarDCT GPU decoder on an existing backend.
-    pub fn vardct_wgpu(backend: WgpuBackend) -> Result<Self, VarDctDecodeError> {
-        Ok(Self::new(VarDctSubmissionEngine::new(backend)?))
-    }
 }
 
 fn align4(value: u64) -> Result<u64, VarDctDecodeError> {

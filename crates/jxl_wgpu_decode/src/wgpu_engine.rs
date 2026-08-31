@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
+use jxl_gpu_bitstream::{CodestreamInventory, InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{
     ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout, Packed422Order,
     PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
@@ -26,9 +26,9 @@ use crate::modular_tree::MaTreeNodeIr;
 use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
-    GpuCodestream, GpuDecoder, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame,
-    GpuSubmissionEngine, GpuSubmissionSession, ModularPredictionProfile, ModularPredictor,
-    NumericSampleMapping, PreparedGpuSession, Result, SubmittedGpuFrame,
+    GpuCodestream, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
+    GpuSubmissionSession, ModularPredictionProfile, ModularPredictor, NumericSampleMapping,
+    PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
@@ -477,6 +477,129 @@ impl WgpuSubmissionEngine {
     pub fn buffer_pool_stats(&self) -> WgpuDecodeBufferPoolStats {
         self.buffers.stats()
     }
+
+    pub(crate) fn open_with_inventory(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        let profile = parse_standard_modular_profile(codestream.bytes(), inventory)?;
+        let modular_metadata: Arc<[u32]> = profile.ma_config.pack_gpu_metadata()?.words.into();
+        let extent = Extent2d::new(profile.width, profile.height);
+        let output = OutputPlan::new(
+            extent,
+            request,
+            profile.channels,
+            profile.bits_per_sample,
+            self.capabilities(),
+        )?;
+        let output_write_path = output.write_path_for_groups(&profile.groups)?;
+        let reconstruction_specialization = reconstruction_specialization(&profile);
+        let kernel_variant = self
+            .backend
+            .kernel_policy()
+            .variant_for("lossless_gray8", DEFAULT_MODULAR_GROUP_VARIANT)?;
+        kernel_variant.validate_for("lossless_gray8", &self.backend.device().limits(), 0)?;
+        let (pipelines, pipeline_f64_path) = match output.f64_output_path {
+            Some(F64OutputPath::NativeArithmetic) => (
+                self.native_f64_pipelines
+                    .as_ref()
+                    .ok_or(Error::NativeF64Unavailable)?,
+                F64OutputPath::NativeArithmetic,
+            ),
+            Some(F64OutputPath::ExactF32Widening) | None => {
+                (&self.pipelines, F64OutputPath::ExactF32Widening)
+            }
+        };
+        let pipeline = pipelines.get_or_init(
+            &self.backend,
+            pipeline_f64_path,
+            output_write_path,
+            reconstruction_specialization,
+            kernel_variant,
+        );
+        let f64_output_path = output.f64_output_path;
+        let memory_limit_bytes = self.memory.snapshot().limit_bytes;
+        let dispatch_layout = GroupDispatchLayout::new(
+            self.backend.device(),
+            codestream.bytes(),
+            &profile,
+            &modular_metadata,
+            &output,
+            GroupDispatchOptions {
+                requested_frame_slots: request.max_frame_slots().get(),
+                memory_limit_bytes,
+                kernel_variant,
+            },
+        )?;
+        let memory_stats = validate_device_limits(
+            self.backend.device(),
+            &modular_metadata,
+            &dispatch_layout,
+            &output,
+            request.max_frame_slots().get(),
+            memory_limit_bytes,
+        )?;
+        let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
+            .expect("device admission always resolves at least one frame slot");
+        let node_count = u32::try_from(profile.ma_config.nodes.len())
+            .map_err(|_| Error::backend("MA tree node count exceeds public profile bounds"))?;
+        let decision_node_count = u32::try_from(
+            profile
+                .ma_config
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, MaTreeNodeIr::Decision { .. }))
+                .count(),
+        )
+        .map_err(|_| Error::backend("MA decision node count exceeds public profile bounds"))?;
+        let leaf_context_count = node_count
+            .checked_sub(decision_node_count)
+            .ok_or_else(|| Error::backend("MA leaf context count underflow"))?;
+        let max_depth = u32::try_from(profile.ma_config.max_depth)
+            .map_err(|_| Error::backend("MA tree depth exceeds public profile bounds"))?;
+        let prediction = ModularPredictionProfile::MetaAdaptive {
+            node_count,
+            decision_node_count,
+            leaf_context_count,
+            max_depth,
+            uses_self_correcting: profile.ma_config.needs_self_correcting(),
+        };
+        Ok(PreparedGpuSession::new(
+            DecodeProfile::ModularLossless {
+                bits_per_sample: profile.bits_per_sample,
+                channels: profile.channels,
+                prediction,
+                grouping: if profile.groups.len() == 1 {
+                    crate::ModularGrouping::SingleGroup
+                } else {
+                    crate::ModularGrouping::MultipleGroups {
+                        columns: profile.group_columns,
+                        rows: profile.group_rows,
+                    }
+                },
+            },
+            AnimationMetadata::still(extent),
+            WgpuDecodeSession {
+                backend: self.backend.clone(),
+                pipeline,
+                source: Some(DecodeSource {
+                    codestream_storage: codestream.shared_storage(),
+                    codestream_range: codestream.storage_range(),
+                    profile,
+                    dispatch_layout,
+                    modular_metadata,
+                    output,
+                }),
+                memory_stats,
+                memory_budget: self.memory.clone(),
+                buffers: Arc::clone(&self.buffers),
+                f64_output_path,
+            },
+        )
+        .with_resolved_frame_slots(resolved_frame_slots))
+    }
 }
 
 impl DecodePipelineCache {
@@ -644,121 +767,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
                 ..InventoryLimits::default()
             })
             .map_err(Error::CodestreamInventory)?;
-        let profile = parse_standard_modular_profile(codestream.bytes(), &inventory)?;
-        let modular_metadata: Arc<[u32]> = profile.ma_config.pack_gpu_metadata()?.words.into();
-        let extent = Extent2d::new(profile.width, profile.height);
-        let output = OutputPlan::new(
-            extent,
-            request,
-            profile.channels,
-            profile.bits_per_sample,
-            self.capabilities(),
-        )?;
-        let output_write_path = output.write_path_for_groups(&profile.groups)?;
-        let reconstruction_specialization = reconstruction_specialization(&profile);
-        let kernel_variant = self
-            .backend
-            .kernel_policy()
-            .variant_for("lossless_gray8", DEFAULT_MODULAR_GROUP_VARIANT)?;
-        kernel_variant.validate_for("lossless_gray8", &self.backend.device().limits(), 0)?;
-        let (pipelines, pipeline_f64_path) = match output.f64_output_path {
-            Some(F64OutputPath::NativeArithmetic) => (
-                self.native_f64_pipelines
-                    .as_ref()
-                    .ok_or(Error::NativeF64Unavailable)?,
-                F64OutputPath::NativeArithmetic,
-            ),
-            Some(F64OutputPath::ExactF32Widening) | None => {
-                (&self.pipelines, F64OutputPath::ExactF32Widening)
-            }
-        };
-        let pipeline = pipelines.get_or_init(
-            &self.backend,
-            pipeline_f64_path,
-            output_write_path,
-            reconstruction_specialization,
-            kernel_variant,
-        );
-        let f64_output_path = output.f64_output_path;
-        let memory_limit_bytes = self.memory.snapshot().limit_bytes;
-        let dispatch_layout = GroupDispatchLayout::new(
-            self.backend.device(),
-            codestream.bytes(),
-            &profile,
-            &modular_metadata,
-            &output,
-            GroupDispatchOptions {
-                requested_frame_slots: request.max_frame_slots().get(),
-                memory_limit_bytes,
-                kernel_variant,
-            },
-        )?;
-        let memory_stats = validate_device_limits(
-            self.backend.device(),
-            &modular_metadata,
-            &dispatch_layout,
-            &output,
-            request.max_frame_slots().get(),
-            memory_limit_bytes,
-        )?;
-        let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
-            .expect("device admission always resolves at least one frame slot");
-        let node_count = u32::try_from(profile.ma_config.nodes.len())
-            .map_err(|_| Error::backend("MA tree node count exceeds public profile bounds"))?;
-        let decision_node_count = u32::try_from(
-            profile
-                .ma_config
-                .nodes
-                .iter()
-                .filter(|node| matches!(node, MaTreeNodeIr::Decision { .. }))
-                .count(),
-        )
-        .map_err(|_| Error::backend("MA decision node count exceeds public profile bounds"))?;
-        let leaf_context_count = node_count
-            .checked_sub(decision_node_count)
-            .ok_or_else(|| Error::backend("MA leaf context count underflow"))?;
-        let max_depth = u32::try_from(profile.ma_config.max_depth)
-            .map_err(|_| Error::backend("MA tree depth exceeds public profile bounds"))?;
-        let prediction = ModularPredictionProfile::MetaAdaptive {
-            node_count,
-            decision_node_count,
-            leaf_context_count,
-            max_depth,
-            uses_self_correcting: profile.ma_config.needs_self_correcting(),
-        };
-        Ok(PreparedGpuSession::new(
-            DecodeProfile::ModularLossless {
-                bits_per_sample: profile.bits_per_sample,
-                channels: profile.channels,
-                prediction,
-                grouping: if profile.groups.len() == 1 {
-                    crate::ModularGrouping::SingleGroup
-                } else {
-                    crate::ModularGrouping::MultipleGroups {
-                        columns: profile.group_columns,
-                        rows: profile.group_rows,
-                    }
-                },
-            },
-            AnimationMetadata::still(extent),
-            WgpuDecodeSession {
-                backend: self.backend.clone(),
-                pipeline,
-                source: Some(DecodeSource {
-                    codestream_storage: codestream.shared_storage(),
-                    codestream_range: codestream.storage_range(),
-                    profile,
-                    dispatch_layout,
-                    modular_metadata,
-                    output,
-                }),
-                memory_stats,
-                memory_budget: self.memory.clone(),
-                buffers: Arc::clone(&self.buffers),
-                f64_output_path,
-            },
-        )
-        .with_resolved_frame_slots(resolved_frame_slots))
+        self.open_with_inventory(codestream, request, &inventory)
     }
 }
 
@@ -2577,14 +2586,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-impl GpuDecoder<WgpuSubmissionEngine> {
-    /// Constructs the GPU-required facade around an application's existing wgpu backend.
-    #[must_use]
-    pub fn wgpu(backend: WgpuBackend) -> Self {
-        Self::new(WgpuSubmissionEngine::new(backend))
-    }
 }
 
 #[cfg(test)]

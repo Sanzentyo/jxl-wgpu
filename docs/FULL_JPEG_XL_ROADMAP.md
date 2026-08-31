@@ -82,7 +82,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `FRONT-01` | P0 | **Partial** | Lower every parsed frame into one bounded backend-neutral execution graph. Modular and VarDCT must be selected by the same public decoder and may not require a caller to know the coding mode. Differential tests cover both modes and mixed-mode referenced frames. | — |
+| `FRONT-01` | P0 | **Partial** | `GpuDecoder::wgpu` now inventories once and automatically selects Modular or VarDCT while sharing one backend byte budget; one actual-adapter test decodes both modes sequentially through the same decoder and checks pixels and reservation release. Completion still requires lowering every frame into one bounded backend-neutral execution graph plus mixed-mode referenced-frame tests. | — |
 | `FRONT-02` | P0 | **Partial** | Preserve exact bit ranges and logical/physical TOC order for global, LF-group, HF-global, and pass-group sections, including entropy-coded permutations and arbitrary group order. Test scanline, center-first, and permuted fixtures. | — |
 | `FRONT-03` | P1 | **Partial** | Implement incremental bounded input: headers, boxes, fragments, frame sections, and end-of-input may arrive in arbitrary chunks without collecting an unbounded codestream copy. Test every byte split around signatures, box headers, TOCs, and entropy words. | `CONT-01` |
 | `CONT-01` | P1 | **Partial** | Fully validate naked streams, `jxlc`, ordered and out-of-order `jxlp`, large-box sizes, unknown boxes, ordering constraints, and truncation. Expose a streaming box/event API and preserve requested unknown boxes byte-for-byte. | — |
@@ -105,7 +105,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `ENT-D01` | P0 | **Partial** | Generalize the GPU Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 decoder so Modular auxiliary streams and all VarDCT LF/HF streams use one bounded implementation. Differential symbol tests cover all distribution forms and malformed termination. | `FRONT-02` |
+| `ENT-D01` | P0 | **Partial** | The bounded Modular and zero-AC VarDCT packet paths already compile the same WGSL Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 primitives. Completion requires a typed shared host/WGSL stream ABI, every VarDCT LF/HF consumer including nonzero AC, and differential symbol/termination tests for every distribution form. | `FRONT-02` |
 | `ENT-D02` | P0 | **Partial** | Decode arbitrarily large legal group streams through bounded windows while retaining enough history for LZ77 and context state. Prove exact results across window boundaries and cancellation. | `ENT-D01` |
 | `ENT-E01` | P1 | **Partial** | Add GPU ANS token serialization, histogram clustering, context clustering, hybrid-uint selection, general LZ77 search/distances, and canonical entropy metadata. `djxl`/`jxl` must accept every generated family. | — |
 | `ENT-E02` | P2 | **Missing** | Select entropy configurations by effort and workload with deterministic modes. Report density and speed independently; no heuristic may change lossless pixels. | `ENT-E01`, `QA-05` |
@@ -243,9 +243,10 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The immediate next implementation target is `FRONT-01` plus `ENT-D01`: feed the existing bounded
-inventory into one coding-mode-neutral frame graph and make the entropy executor reusable by
-VarDCT. The first externally visible milestone is a nonzero-AC, multi-group DCT8 VarDCT fixture
+The coding-mode selector portion of `FRONT-01` is implemented. The immediate next target is the
+shared typed stream ABI and remaining `ENT-D01/FRONT-02` topology, followed by `VDCT-D01/03` so the
+same entropy primitives feed real pass-group coefficient consumers rather than a zero-AC-only
+shape. The first externally visible milestone remains a nonzero-AC, multi-group DCT8 VarDCT fixture
 decoded and re-encoded without a CPU pixel path. This target is deliberately narrower than “full,”
 but it removes the current zero-AC architecture bottleneck rather than extending a test-only
 profile.

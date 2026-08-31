@@ -137,6 +137,8 @@ pub enum Error {
     PollBackpressure(#[from] jxl_wgpu::SubmissionPollerError),
     #[error("GPU decode engine violated its public contract: {0}")]
     EngineContract(&'static str),
+    #[error("JPEG XL codestream inventory contains no image frame")]
+    MissingImageFrame,
     #[error("all {limit} bounded GPU frame slots are in flight")]
     Backpressure { limit: usize },
     #[error("prefetch depth {requested} exceeds the configured frame-slot limit {limit}")]

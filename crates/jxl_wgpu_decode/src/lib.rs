@@ -24,6 +24,7 @@ compile_error!(
 );
 
 mod buffer_pool;
+mod codec_engine;
 mod error;
 mod inflight;
 mod model;
@@ -45,6 +46,7 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BUFFERS, DEFAULT_DECODE_BUFFER_POOL_BUFFERS_PER_KEY,
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
+pub use codec_engine::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularTransformFeature, ModularTreeError, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,

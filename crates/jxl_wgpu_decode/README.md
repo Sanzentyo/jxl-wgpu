@@ -53,16 +53,17 @@ the complete logical reconstruction workspace and finalize through the generic o
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
 
-For the lossless-Modular `WgpuSubmissionEngine`, VarDCT, multiple passes, palette/squeeze and
-non-YCoCg transforms, non-alpha extra channels, patches, splines, noise, and reference-frame
-animation remain typed unsupported profiles. `GpuDecoder::vardct_wgpu` is the separate bounded
-VarDCT production path described next; the public frontend does not yet select both modes through a
-single coding-mode-neutral engine.
+For the lossless-Modular `WgpuSubmissionEngine`, multiple passes, palette/squeeze and non-YCoCg
+transforms, non-alpha extra channels, patches, splines, noise, and reference-frame animation remain
+typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+the standard frame once, and selects this engine or the bounded VarDCT engine from
+`FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
+mode-specific bindings and pipeline caches while sharing the backend byte budget.
 
 ### Bounded standard VarDCT engine
 
-`GpuDecoder::vardct_wgpu` selects a separate production engine for two deliberately narrow,
-standard zero-AC VarDCT packet topologies. A one-entry TOC retains the original single regular
+The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two
+deliberately narrow, standard zero-AC VarDCT packet topologies. A one-entry TOC retains the original single regular
 8x8, 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC may instead
 cover one LF group with one independent DCT8 first block per padded 8x8 image block and at least two
 256-pixel pass groups; every pass-group packet must be empty. The explicit section topology removes
@@ -189,12 +190,13 @@ output in place; portable and aggregate requests retain the explicit staging-cop
 
 ## Public flow and bounds
 
-1. Construct `GpuDecoder::wgpu` around an application's existing `WgpuBackend`.
+1. Construct `GpuDecoder::wgpu` around an application's existing `WgpuBackend`; construction is
+   fallible because every mode-specific kernel policy is validated up front.
 2. Call `open` with encoded bytes and a `GpuOutputRequest`.
 3. Fill the ordered GPU queue with `prefetch`, `poll_prefetch`, or the runtime-neutral
    `prefetch_async` future. Prefetch submits work and never waits for frame completion.
 4. Optionally borrow `pending_frames`/`front_pending_frame` and call the stock
-   `WgpuPendingFrame::unvalidated_gpu_frame` to enqueue same-device, same-queue display, readback,
+   `WgpuDecodePendingFrame::unvalidated_gpu_frame` to enqueue same-device, same-queue display, readback,
    or custom GPU work before mapped-status validation completes.
 5. Consume the oldest pending frame with `next_frame` synchronously or
    `next_frame_async`/`poll_next_frame` through `std::future::Future`.

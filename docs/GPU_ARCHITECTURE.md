@@ -46,6 +46,14 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
                  -> deterministic group packet assembly -> JPEG XL codestream/container
 ```
 
+`GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
+inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that
+inventory into either the Modular or VarDCT submission session. The selector does not merge their
+incompatible storage-binding layouts: pipeline caches and mode-specific state remain independent,
+while device, queue, completion worker, and the aggregate byte budget are shared. The pending-frame
+enum performs only lifetime operations (`submit_next`, blocking wait, and runtime-neutral poll), so
+zero-AC VarDCT limitations do not become a common entropy or frame abstraction.
+
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode
 session. The initial interoperable target is a deliberately narrow single-group lossless Modular
@@ -163,7 +171,8 @@ A queued submission or returned `GpuFrameLease` occupies one slot. Engine work h
 release guards, and output allocations hold tracked `GpuBufferLease` permits; only the latter two
 participate in byte accounting. Raw wgpu handle clones cannot be observed by that budget.
 
-Clones of one stock decoder engine share its compiled pipelines. Decoders built from one backend
+Clones of one stock decoder engine share its compiled pipelines. Modular and VarDCT sessions
+selected by one `WgpuDecodeEngine` also share the backend-wide byte budget. Decoders built from one backend
 share the device, queue, bounded poll worker, and byte-weighted transient memory admission while
 retaining separate frame state. Its bounded exact-match pool reuses lookup, reconstruction,
 status/readback, and POD-parameter buffers only after the completion lifetime is safe; raw

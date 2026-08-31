@@ -652,7 +652,7 @@ fn indexed_jxl_entropy_and_gradient_reconstruct_exact_gray8_on_gpu() {
         eprintln!("skipping indexed Gray8 decode test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -684,7 +684,7 @@ fn indexed_gray8_direct_maps_the_tracked_output_on_supported_uma() {
         return;
     }
 
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -724,7 +724,7 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
         eprintln!("skipping standard multi-group Gray8 test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     for (width, height, container) in [
         (513, 257, false),
         (513, 257, true),
@@ -765,7 +765,11 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
                 && max_depth != 0
         ));
         if (width, height, container) == (513, 257, false) {
-            let stats = session.submission_session().memory_stats();
+            let stats = session
+                .submission_session()
+                .modular()
+                .expect("Modular input selects the Modular submission session")
+                .memory_stats();
             assert!(stats.parallel_group_lanes > 1);
             assert!(stats.parallel_group_lanes <= 64);
             assert_eq!(stats.max_lz77_window_words, 1);
@@ -799,7 +803,11 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert_eq!(stats.output_write_path, OutputWritePath::AtomicBytes);
         }
         if (width, height, container) == (516, 3, false) {
-            let stats = session.submission_session().memory_stats();
+            let stats = session
+                .submission_session()
+                .modular()
+                .expect("Modular input selects the Modular submission session")
+                .memory_stats();
             assert_eq!(stats.max_lz77_window_words, 1);
             assert_eq!(stats.max_lz77_scratch_words, 0);
             assert_eq!(stats.output_write_path, OutputWritePath::WordAligned);
@@ -826,7 +834,7 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         eprintln!("skipping standard Modular native matrix: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let (width, height) = (257, 3);
     let formats = [
         (LosslessModularFormat::Gray, ModularChannels::Gray),
@@ -882,7 +890,11 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         ));
         let bytes_per_sample = if bits_per_sample <= 8 { 1u64 } else { 2 };
         let row_bytes = u64::from(width) * u64::from(format.channel_count()) * bytes_per_sample;
-        let stats = session.submission_session().memory_stats();
+        let stats = session
+            .submission_session()
+            .modular()
+            .expect("Modular input selects the Modular submission session")
+            .memory_stats();
         assert_eq!(stats.max_lz77_window_words, 1);
         assert_eq!(stats.max_lz77_scratch_words, 0);
         let logical_sample_words = 256 * height * format.channel_count();
@@ -940,7 +952,7 @@ fn standard_modular_fused_rgb_and_rgba_groups_are_exact_on_gpu() {
         eprintln!("skipping fused standard Modular color test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let (width, height) = (17, 13);
     for (format, bits_per_sample, container) in [
         (LosslessModularFormat::Rgb, 10, false),
@@ -1055,7 +1067,7 @@ fn every_multigroup_gpu_status_is_validated_from_one_map() {
     encoded[start] &= 0x0f;
     encoded[start + 1..end].fill(0);
 
-    let decoder = GpuDecoder::wgpu(backend);
+    let decoder = GpuDecoder::wgpu(backend).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -1081,7 +1093,7 @@ fn stock_still_prefetch_submits_exactly_one_frame_before_waiting() {
         eprintln!("skipping indexed Gray8 prefetch test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend);
+    let decoder = GpuDecoder::wgpu(backend).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -1106,7 +1118,7 @@ fn unvalidated_handoff_queues_display_and_readback_before_codec_validation() {
         eprintln!("skipping unvalidated GPU handoff test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut session = decoder
         .open(
             indexed_gray8(),
@@ -1161,7 +1173,7 @@ fn unvalidated_lease_survives_abandoned_session_without_losing_budget_tracking()
         eprintln!("skipping unvalidated ownership test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -1227,7 +1239,7 @@ fn indexed_gray8_writes_native_limited_nv12_without_rgb_readback() {
     // packing/range conversion from transfer-function conversion.
     spec.transfer = TransferFunction::Srgb;
     let format = PixelFormat::nv12(ColorSpecification::Defined(spec));
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut session = decoder
         .open(indexed_gray8(), GpuOutputRequest::color(format).unwrap())
         .expect("native NV12 request is supported");
@@ -1254,7 +1266,7 @@ fn indexed_gray8_conforms_to_all_vpi_color_formats_on_gpu() {
         eprintln!("skipping indexed Gray8 VPI format test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let source = expected_pixels();
 
     for predefined in VPI_COLOR_FORMATS {
@@ -1306,7 +1318,7 @@ fn indexed_gray8_conforms_to_all_vpi_numeric_formats_on_gpu() {
         return;
     };
     assert_eq!(VPI_COLOR_FORMATS.len() + VPI_NUMERIC_FORMATS.len(), 30);
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let source = expected_pixels();
 
     for predefined in VPI_NUMERIC_FORMATS {
@@ -1437,7 +1449,7 @@ fn decode_output_and_generic_readback_share_backend_memory_admission() {
         eprintln!("skipping decode/readback shared-budget test: no wgpu adapter");
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     assert_eq!(decoder.engine().memory_budget_bytes(), SHARED_LIMIT);
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
@@ -1568,7 +1580,7 @@ fn poller_saturation_is_retryable_without_consuming_the_decode_source() {
     let mut held = (0..SUBMISSION_POLLER_CAPACITY)
         .map(|_| backend.submission_poller().try_reserve().unwrap())
         .collect::<Vec<_>>();
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -1637,13 +1649,15 @@ fn indexed_gray8_decode_matches_under_autotuned_workgroup_policy() {
     )
     .unwrap();
 
-    let default_decoder = GpuDecoder::wgpu(default_backend.clone());
+    let default_decoder = GpuDecoder::wgpu(default_backend.clone()).unwrap();
     let mut default_session = default_decoder
         .open(indexed_gray8(), request.clone())
         .expect("default indexed profile opens without CPU fallback");
     assert_eq!(
         default_session
             .submission_session()
+            .modular()
+            .expect("Modular input selects the Modular submission session")
             .memory_stats()
             .group_workgroup_size,
         64
@@ -1654,13 +1668,15 @@ fn indexed_gray8_decode_matches_under_autotuned_workgroup_policy() {
         .expect("one default frame is returned");
     let default_bytes = read_output(&default_backend, &default_frame.output().outputs[0]);
 
-    let tuned_decoder = GpuDecoder::wgpu(tuned_backend.clone());
+    let tuned_decoder = GpuDecoder::wgpu(tuned_backend.clone()).unwrap();
     let mut tuned_session = tuned_decoder
         .open(indexed_gray8(), request)
         .expect("tuned indexed profile opens without CPU fallback");
     assert_eq!(
         tuned_session
             .submission_session()
+            .modular()
+            .expect("Modular input selects the Modular submission session")
             .memory_stats()
             .group_workgroup_size,
         32

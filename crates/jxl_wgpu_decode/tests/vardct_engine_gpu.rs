@@ -7,7 +7,7 @@ use jxl::api::{
     JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
 use jxl_gpu_bitstream::{FrameSectionKind, InventoryLimits, ParseLimits};
-use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
+use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
@@ -18,12 +18,17 @@ use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
     UnsupportedVarDctPacketFeature,
 };
-use jxl_wgpu_decode::{Error as DecodeError, GpuDecoder, GpuOutputRequest, VarDctDecodeError};
+use jxl_wgpu_decode::{
+    DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
+    VarDctDecodeError,
+};
 use jxl_wgpu_encode::{
     BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
     WgpuContext,
 };
 use wgpu::util::DeviceExt;
+
+mod common;
 
 fn device() -> Option<(wgpu::AdapterInfo, wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -338,7 +343,7 @@ const SUPPORTED_STRATEGIES: [VarDctStrategy; 9] = [
 ];
 
 #[test]
-fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
+fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
     let Some((info, device, queue)) = device() else {
         eprintln!("skipping bounded VarDCT engine oracle: no adapter");
         return;
@@ -354,7 +359,44 @@ fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::vardct_wgpu(backend.clone()).unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+
+    let modular_request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        NumericSampleMapping::NormalizedGray8,
+    )
+    .unwrap();
+    let mut modular_session = decoder
+        .open(common::gpu_gray8_lossless(), modular_request)
+        .unwrap();
+    assert!(matches!(
+        modular_session.profile(),
+        DecodeProfile::ModularLossless { .. }
+    ));
+    assert!(modular_session.submission_session().modular().is_some());
+    let modular_frame = modular_session.next_frame().unwrap().unwrap();
+    let modular_readback = ImageReadbackPipeline::new(&backend)
+        .submit(modular_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let expected_modular = (0..13u32)
+        .flat_map(|y| {
+            (0..17u32).map(move |x| {
+                if y < 3 {
+                    0
+                } else {
+                    ((x * 17 + y * 31 + (x * y) % 19) & 255) as u8
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(modular_readback.frame.outputs[0].bytes, expected_modular);
+    drop(modular_readback);
+    drop(modular_frame);
+    drop(modular_session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
     let rgb = [19, 103, 229];
     let mut dct8_packet = None;
 
@@ -375,7 +417,11 @@ fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
                 GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
             )
             .unwrap();
-        let memory = session.submission_session().memory_stats();
+        let memory = session
+            .submission_session()
+            .vardct()
+            .expect("VarDCT input selects the VarDCT submission session")
+            .memory_stats();
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
         let frame = if index == 0 {
             pollster::block_on(session.next_frame_async())
@@ -523,7 +569,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::vardct_wgpu(backend.clone()).unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
 
     for extent in [Extent2d::new(257, 17), Extent2d::new(513, 259)] {
@@ -575,7 +621,11 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
                 GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
             )
             .unwrap();
-        let memory = session.submission_session().memory_stats();
+        let memory = session
+            .submission_session()
+            .vardct()
+            .expect("VarDCT input selects the VarDCT submission session")
+            .memory_stats();
         assert_eq!(
             memory.xyb_plane_bytes,
             u64::from(extent.width.div_ceil(8) * 8) * u64::from(extent.height.div_ceil(8) * 8) * 12,

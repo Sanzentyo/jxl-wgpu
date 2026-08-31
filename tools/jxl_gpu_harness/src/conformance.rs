@@ -1199,22 +1199,21 @@ fn execute_stock_gpu_round_trip(
     }
     .map_err(|source| StockGpuRoundTripError::OutputRequest { source })?;
     let request = request.with_max_frame_slots(stock_max_frame_slots(case));
-    let decoder = GpuDecoder::wgpu(backend.clone());
+    let decoder =
+        GpuDecoder::wgpu(backend.clone()).map_err(|source| StockGpuRoundTripError::Decode {
+            stage: "engine construction",
+            source,
+        })?;
     let mut session = decoder
         .open_shared(Arc::clone(&encoded), request)
         .map_err(|source| StockGpuRoundTripError::Decode {
             stage: "session creation",
             source,
         })?;
-    let decode_submissions = u64::try_from(
-        session
-            .submission_session()
-            .memory_stats()
-            .submissions_per_frame,
-    )
-    .map_err(|_| StockGpuRoundTripError::SizeOverflow {
-        what: "decode GPU submission count",
-    })?;
+    let decode_submissions = u64::try_from(session.submission_session().submissions_per_frame())
+        .map_err(|_| StockGpuRoundTripError::SizeOverflow {
+            what: "decode GPU submission count",
+        })?;
     let codec_submissions = encode_submissions.checked_add(decode_submissions).ok_or(
         StockGpuRoundTripError::SizeOverflow {
             what: "round-trip GPU submission count",
