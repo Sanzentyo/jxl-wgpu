@@ -59,11 +59,11 @@ fn entropy_read_prefix_symbol(cluster: u32) -> u32 {
     if single_plus_one != 0u {
         return single_plus_one - 1u;
     }
-    if bit_cursor >= params.token_end {
+    if bit_cursor >= params.entropy.token_end {
         decode_error = ERROR_TRUNCATED_BITS;
         return 0xffffffffu;
     }
-    let available = min(15u, params.token_end - bit_cursor);
+    let available = min(15u, params.entropy.token_end - bit_cursor);
     let lookup_index = peek_bits(available);
     let table_offset = modular_metadata[META_TABLE_OFFSET]
         + cluster * modular_metadata[META_TABLE_STRIDE];
@@ -187,16 +187,11 @@ fn entropy_special_distance(index: u32) -> vec2<i32> {
     return distances[index];
 }
 
-fn entropy_window_base() -> u32 {
-    return params.sample_count * params.source_channels
-        + params.needs_self_correcting * 5u * params.width;
-}
-
 fn entropy_copy_value() -> u32 {
     var value = entropy_last_value;
-    if params.lz77_window_mask != 0u {
+    if params.entropy.lz77_window_mask != 0u {
         value = reconstruction_load(
-            entropy_window_base() + (entropy_copy_position & params.lz77_window_mask)
+            entropy_window_base() + (entropy_copy_position & params.entropy.lz77_window_mask)
         );
     }
     entropy_copy_position += 1u;
@@ -205,11 +200,11 @@ fn entropy_copy_value() -> u32 {
 }
 
 fn entropy_record_value(value: u32) {
-    if params.lz77_window_mask == 0u {
+    if params.entropy.lz77_window_mask == 0u {
         entropy_last_value = value;
     } else {
         reconstruction_store(
-            entropy_window_base() + (entropy_decoded & params.lz77_window_mask),
+            entropy_window_base() + (entropy_decoded & params.entropy.lz77_window_mask),
             value,
         );
     }

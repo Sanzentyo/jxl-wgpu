@@ -5,6 +5,7 @@ use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
 use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
+use crate::entropy::EntropyStreamParams;
 use crate::modular_tree::{MaTreeLimits, MaTreeNodeIr, PackedModularMetadata, parse_ma_config};
 use crate::vardct_frontend::{
     LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError, VarDctPacketError,
@@ -12,8 +13,10 @@ use crate::vardct_frontend::{
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
+const MODULAR_ENTROPY_ABI: &str = include_str!("modular_entropy_abi.wgsl");
 const MODULAR_ENTROPY: &str = include_str!("modular_entropy.wgsl");
 const MODULAR_RECONSTRUCT: &str = include_str!("modular_reconstruct.wgsl");
+const ENTROPY_ABI_MARKER: &str = "/*__JXL_MODULAR_ENTROPY_ABI__*/";
 const ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 
@@ -446,29 +449,33 @@ pub struct VarDctPacketControl {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct VarDctModularParams {
-    pub words: [u32; 52],
+    entropy: EntropyStreamParams,
+    consumer_words: [u32; 49],
 }
 
 impl Default for VarDctModularParams {
     fn default() -> Self {
-        let mut words = [0; 52];
-        words[41] = 16;
-        words[42] = 10;
-        words[43] = 7;
-        words[44] = 7;
-        words[45] = 7;
-        words[48] = 13;
-        words[49] = 12;
-        words[50] = 12;
-        words[51] = 12;
-        Self { words }
+        let mut consumer_words = [0; 49];
+        consumer_words[38] = 16;
+        consumer_words[39] = 10;
+        consumer_words[40] = 7;
+        consumer_words[41] = 7;
+        consumer_words[42] = 7;
+        consumer_words[45] = 13;
+        consumer_words[46] = 12;
+        consumer_words[47] = 12;
+        consumer_words[48] = 12;
+        Self {
+            entropy: EntropyStreamParams::default(),
+            consumer_words,
+        }
     }
 }
 
 impl VarDctModularParams {
     /// Sets the exact power-of-two LZ ring represented by the packed entropy descriptor.
     pub fn with_lz77_window(mut self, words: u32) -> Self {
-        self.words[12] = words.saturating_sub(1);
+        self.entropy.lz77_window_mask = words.saturating_sub(1);
         self
     }
 }
@@ -620,6 +627,7 @@ pub fn vardct_packet_shader_source() -> String {
 
 fn shader_source() -> String {
     SHADER_TEMPLATE
+        .replace(ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI)
         .replace(ENTROPY_MARKER, MODULAR_ENTROPY)
         .replace(RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT)
 }
@@ -658,6 +666,7 @@ const _: () = {
     assert!(std::mem::size_of::<VarDctPacketControl>() == 128);
     assert!(std::mem::align_of::<VarDctPacketControl>() == 16);
     assert!(std::mem::size_of::<VarDctModularParams>() == 208);
+    assert!(std::mem::align_of::<VarDctModularParams>() == 4);
     assert!(std::mem::size_of::<GpuVarDctPacketStatus>() == 64);
 };
 
@@ -673,6 +682,20 @@ mod tests {
             naga::valid::Capabilities::empty(),
         );
         validator.validate(&module).unwrap();
+    }
+
+    #[test]
+    fn modular_parameter_record_preserves_the_consumer_word_layout() {
+        let params = VarDctModularParams::default().with_lz77_window(8);
+        let words = bytemuck::cast::<VarDctModularParams, [u32; 52]>(params);
+        let mut expected = [0; 52];
+        expected[2] = 7;
+        expected[41] = 16;
+        expected[42] = 10;
+        expected[43..=45].fill(7);
+        expected[48] = 13;
+        expected[49..=51].fill(12);
+        assert_eq!(words, expected);
     }
 
     #[test]

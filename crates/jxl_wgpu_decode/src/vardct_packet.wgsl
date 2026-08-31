@@ -1,6 +1,7 @@
+/*__JXL_MODULAR_ENTROPY_ABI__*/
+
 struct Params {
-    token_start: u32,
-    token_end: u32,
+    entropy: EntropyStreamParams,
     width: u32,
     height: u32,
     origin_x: u32,
@@ -11,7 +12,6 @@ struct Params {
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
-    lz77_window_mask: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -111,6 +111,11 @@ fn reconstruction_store(index: u32, value: u32) {
     reconstructed[reconstruction_base + index] = value;
 }
 
+fn entropy_window_base() -> u32 {
+    return params.sample_count * params.source_channels
+        + params.needs_self_correcting * 5u * params.width;
+}
+
 fn bit_mask(count: u32) -> u32 {
     if count == 0u { return 0u; }
     if count == 32u { return 0xffffffffu; }
@@ -130,7 +135,8 @@ fn peek_bits(count: u32) -> u32 {
 
 fn read_bits(count: u32) -> u32 {
     if decode_error != 0u { return 0u; }
-    if count > 32u || bit_cursor > params.token_end || count > params.token_end - bit_cursor {
+    if count > 32u || bit_cursor > params.entropy.token_end
+        || count > params.entropy.token_end - bit_cursor {
         decode_error = ERROR_TRUNCATED_BITS;
         return 0u;
     }
@@ -248,12 +254,12 @@ fn decode_vardct_packet() {
     reconstruction_base = 0u;
     decode_error = 0u;
     bit_cursor = control.section_bits.x;
-    params.token_start = bit_cursor;
-    params.token_end = control.section_bits.y;
+    params.entropy.token_start = bit_cursor;
+    params.entropy.token_end = control.section_bits.y;
     params.source_channels = 3u;
     params.source_mask = 0x7fffffffu;
     params.needs_self_correcting = 0u;
-    params.lz77_window_mask = 0u;
+    params.entropy.lz77_window_mask = 0u;
     params.stream_index = control.streams.x;
 
     if read_bits(2u) != 0u || read_bits(4u) != 3u {
@@ -331,8 +337,8 @@ fn decode_vardct_packet() {
     if control.streams.z != 0u {
         finish_section(control.section_bits.y);
         bit_cursor = control.section_bits.z;
-        params.token_start = bit_cursor;
-        params.token_end = control.section_bits.w;
+        params.entropy.token_start = bit_cursor;
+        params.entropy.token_end = control.section_bits.w;
     }
     let preset_bits = select(
         0u,
@@ -347,7 +353,7 @@ fn decode_vardct_packet() {
         || fixed_hf_tail != (control.expected.z >> 1u) {
         reject(ERROR_HF_GLOBAL, bit_cursor);
     }
-    finish_section(params.token_end);
+    finish_section(params.entropy.token_end);
 
     if decode_error == 0u {
         for (var index = 0u; index < control.capacities.x; index += 1u) {
@@ -358,7 +364,7 @@ fn decode_vardct_packet() {
         status[0] = decode_error;
     }
     status[1] = bit_cursor;
-    status[2] = params.token_end;
+    status[2] = params.entropy.token_end;
     status[3] = lf_decoded;
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];

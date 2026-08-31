@@ -105,7 +105,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `ENT-D01` | P0 | **Partial** | The bounded Modular and zero-AC VarDCT packet paths already compile the same WGSL Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 primitives. Completion requires a typed shared host/WGSL stream ABI, every VarDCT LF/HF consumer including nonzero AC, and differential symbol/termination tests for every distribution form. | `FRONT-02` |
+| `ENT-D01` | P0 | **Partial** | The bounded Modular and VarDCT packet paths now share a typed 12-byte Rust/WGSL `EntropyStreamParams` prefix for token bounds and the LZ ring mask while preserving their 212/208-byte consumer records; consumer-provided storage and scratch-base functions keep geometry, prediction, output, and coefficient state outside the common ABI. Both paths compile the same Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 primitives. Completion requires every VarDCT LF/HF consumer including nonzero AC plus differential symbol/termination tests for every distribution form. | `FRONT-02` |
 | `ENT-D02` | P0 | **Partial** | Decode arbitrarily large legal group streams through bounded windows while retaining enough history for LZ77 and context state. Prove exact results across window boundaries and cancellation. | `ENT-D01` |
 | `ENT-E01` | P1 | **Partial** | Add GPU ANS token serialization, histogram clustering, context clustering, hybrid-uint selection, general LZ77 search/distances, and canonical entropy metadata. `djxl`/`jxl` must accept every generated family. | — |
 | `ENT-E02` | P2 | **Missing** | Select entropy configurations by effort and workload with deterministic modes. Report density and speed independently; no heuristic may change lossless pixels. | `ENT-E01`, `QA-05` |
@@ -243,10 +243,11 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The coding-mode selector portion of `FRONT-01` is implemented. The immediate next target is the
-shared typed stream ABI and remaining `ENT-D01/FRONT-02` topology, followed by `VDCT-D01/03` so the
-same entropy primitives feed real pass-group coefficient consumers rather than a zero-AC-only
-shape. The first externally visible milestone remains a nonzero-AC, multi-group DCT8 VarDCT fixture
+The coding-mode selector portion of `FRONT-01` and the shared typed entropy-stream ABI are
+implemented. The immediate next target is the remaining `ENT-D01/FRONT-02` topology, followed by
+`VDCT-D01/03` so the same entropy primitives feed real pass-group coefficient consumers rather
+than a zero-AC-only shape. The first externally visible milestone remains a nonzero-AC,
+multi-group DCT8 VarDCT fixture
 decoded and re-encoded without a CPU pixel path. This target is deliberately narrower than “full,”
 but it removes the current zero-AC architecture bottleneck rather than extending a test-only
 profile.

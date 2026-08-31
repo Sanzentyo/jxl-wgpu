@@ -21,6 +21,7 @@ use jxl_wgpu::{
 use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
+use crate::entropy::EntropyStreamParams;
 use crate::model::native_modular_format;
 use crate::modular_tree::MaTreeNodeIr;
 use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
@@ -32,9 +33,11 @@ use crate::{
 };
 
 const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
+const MODULAR_ENTROPY_ABI_SHADER: &str = include_str!("modular_entropy_abi.wgsl");
 const MODULAR_ENTROPY_SHADER: &str = include_str!("modular_entropy.wgsl");
 const MODULAR_RECONSTRUCT_SHADER: &str = include_str!("modular_reconstruct.wgsl");
 const MODULAR_FIXED_GRADIENT_SHADER: &str = include_str!("modular_fixed_gradient.wgsl");
+const MODULAR_ENTROPY_ABI_MARKER: &str = "/*__JXL_MODULAR_ENTROPY_ABI__*/";
 const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
@@ -197,8 +200,7 @@ pub struct WgpuDecodeCapabilities {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ShaderParams {
-    token_start: u32,
-    token_end: u32,
+    entropy: EntropyStreamParams,
     width: u32,
     height: u32,
     origin_x: u32,
@@ -209,7 +211,6 @@ struct ShaderParams {
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
-    lz77_window_mask: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -691,6 +692,7 @@ fn shader_source(
         ModularReconstructionSpecialization::ChannelFixed { .. } => MODULAR_RECONSTRUCT_SHADER,
     };
     SHADER_TEMPLATE
+        .replace(MODULAR_ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI_SHADER)
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
         .replace(MODULAR_RECONSTRUCT_MARKER, reconstruction_shader)
         .replace(F64_OUTPUT_MARKER, implementation)
@@ -2467,8 +2469,11 @@ fn build_params(
         lz77_window_words,
     );
     Ok(ShaderParams {
-        token_start: stream_window.token_start,
-        token_end: stream_window.token_end,
+        entropy: EntropyStreamParams {
+            token_start: stream_window.token_start,
+            token_end: stream_window.token_end,
+            lz77_window_mask: lz77_window_words.saturating_sub(1),
+        },
         width: group.width,
         height: group.height,
         origin_x: group.x,
@@ -2479,7 +2484,6 @@ fn build_params(
         source_bits: u32::from(profile.bits_per_sample),
         source_mask: (1u32 << profile.bits_per_sample) - 1,
         needs_self_correcting: u32::from(profile.ma_config.needs_self_correcting()),
-        lz77_window_mask: lz77_window_words.saturating_sub(1),
         output_kind: output.kind as u32,
         transfer: output.transfer,
         limited_range: u32::from(output.limited_range),
@@ -3281,19 +3285,21 @@ mod tests {
         assert_eq!(std::mem::size_of::<ShaderParams>(), 212);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
-            token_start: 1,
-            token_end: 2,
-            width: 3,
-            height: 4,
-            origin_x: 5,
-            origin_y: 6,
-            sample_count: 7,
-            initialize_chroma: 8,
-            source_channels: 9,
-            source_bits: 10,
-            source_mask: 11,
-            needs_self_correcting: 12,
-            lz77_window_mask: 13,
+            entropy: EntropyStreamParams {
+                token_start: 1,
+                token_end: 2,
+                lz77_window_mask: 3,
+            },
+            width: 4,
+            height: 5,
+            origin_x: 6,
+            origin_y: 7,
+            sample_count: 8,
+            initialize_chroma: 9,
+            source_channels: 10,
+            source_bits: 11,
+            source_mask: 12,
+            needs_self_correcting: 13,
             output_kind: 14,
             transfer: 15,
             limited_range: 16,

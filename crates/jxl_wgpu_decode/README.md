@@ -225,13 +225,15 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 212-byte `repr(C)` POD. It carries the token
-range, local extent, canvas origin, source channel/depth/mask, chroma-initialization ownership,
-four plane offset/stride pairs, exact output channel/order/depth/range/transfer codes, the resolved
-numeric mapping, descriptor-derived LZ ring mask, global status index, MA stream index,
-the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, the output traversal
-mode, weighted-predictor header, and shader-visible logical size. Records are a tightly packed
-read-only storage array; a separate 16-byte uniform selects the global group range and local
+The CPU/WGSL per-group parameter ABI is a checked 212-byte `repr(C)` POD. Its first 12 bytes are the
+shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
+same typed prefix starts the 208-byte VarDCT packet entropy record. Each consumer supplies its own
+storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
+remain consumer-specific. The Modular suffix carries four plane offset/stride pairs, exact output
+channel/order/depth/range/transfer codes, the resolved numeric mapping, global status index, MA
+stream index, the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, the
+output traversal mode, weighted-predictor header, and shader-visible logical size. Records are a
+tightly packed read-only storage array; a separate 16-byte uniform selects the global group range and local
 scratch-lane stride for each wave.
 Codestream segments are rounded to four bytes and include a zero sentinel word for bounded
 cross-word peeks. Token offsets are rebased to their window rather than requiring a
@@ -273,7 +275,8 @@ reconstruction, status, status-staging, and POD parameter buffers (plus the nati
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
 aligned spans directly from the shared input storage, while metadata and packed 212-byte
-`ShaderParams` records use `Queue::write_buffer`; no second full-codestream host `Vec` is created.
+`ShaderParams` records (including the 12-byte shared entropy prefix) use `Queue::write_buffer`; no
+second full-codestream host `Vec` is created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.
 `WgpuSubmissionEngine::{buffer_pool_limits,set_buffer_pool_limits,clear_buffer_pool,buffer_pool_stats}`

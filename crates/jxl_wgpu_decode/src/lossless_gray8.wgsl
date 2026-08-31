@@ -1,9 +1,10 @@
 override wg_x: u32 = 64u;
 override wg_y: u32 = 1u;
 
+/*__JXL_MODULAR_ENTROPY_ABI__*/
+
 struct Params {
-    token_start: u32,
-    token_end: u32,
+    entropy: EntropyStreamParams,
     width: u32,
     height: u32,
     origin_x: u32,
@@ -14,7 +15,6 @@ struct Params {
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
-    lz77_window_mask: u32,
     output_kind: u32,
     transfer: u32,
     limited_range: u32,
@@ -104,6 +104,11 @@ fn reconstruction_store(index: u32, value: u32) {
     reconstructed[reconstruction_base + index] = value;
 }
 
+fn entropy_window_base() -> u32 {
+    return params.sample_count * params.source_channels
+        + params.needs_self_correcting * 5u * params.width;
+}
+
 fn bit_mask(count: u32) -> u32 {
     if count == 0u {
         return 0u;
@@ -131,7 +136,8 @@ fn read_bits(count: u32) -> u32 {
     if decode_error != 0u {
         return 0u;
     }
-    if count > 32u || bit_cursor > params.token_end || count > params.token_end - bit_cursor {
+    if count > 32u || bit_cursor > params.entropy.token_end
+        || count > params.entropy.token_end - bit_cursor {
         decode_error = ERROR_TRUNCATED_BITS;
         return 0u;
     }
@@ -520,7 +526,7 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let group_index = dispatch_control.first_group + lane_index;
     params = params_table[group_index];
     reconstruction_base = lane_index * dispatch_control.lane_stride_words;
-    bit_cursor = params.token_start;
+    bit_cursor = params.entropy.token_start;
     decode_error = 0u;
     current_channel = 0u;
     var decoded = 0u;
@@ -532,12 +538,12 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     }
     entropy_finalize();
 
-    if decode_error == 0u && bit_cursor != params.token_end {
-        let padding_bits = params.token_end - bit_cursor;
+    if decode_error == 0u && bit_cursor != params.entropy.token_end {
+        let padding_bits = params.entropy.token_end - bit_cursor;
         if padding_bits > 7u || peek_bits(padding_bits) != 0u {
             decode_error = ERROR_TRAILING_BITS;
         } else {
-            bit_cursor = params.token_end;
+            bit_cursor = params.entropy.token_end;
         }
     }
     if decode_error == 0u && params.fixed_output_mode == 0u {
@@ -551,5 +557,5 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     }
     status[status_base + 1u] = decoded;
     status[status_base + 2u] = bit_cursor;
-    status[status_base + 3u] = params.token_end;
+    status[status_base + 3u] = params.entropy.token_end;
 }

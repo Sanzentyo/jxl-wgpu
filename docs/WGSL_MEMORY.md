@@ -130,6 +130,16 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_dct8` | coefficients/tasks/resources RO, X/Y/B RW, U | 8x8 | Tier B (fixed) | exactly one workgroup per validated task; task count and all upload bindings are device-bounded |
 | encoder `lossless_gray8` | source words RO, artifact RW, U | 1x1 | Tier B (fixed) | profile dimensions are 2..=256; source subrange/alignment/u32 address and artifact capacity are prevalidated |
 
+The decoder entropy shaders share a nested host/WGSL ABI rather than duplicating an untyped word
+prefix. `EntropyStreamParams` is a 12-byte, four-byte-aligned `repr(C)`/`Pod` record of three `u32`
+values: token start/end bounds and the LZ77 ring mask. It begins both the 212-byte Modular
+`ShaderParams` storage record and the 208-byte VarDCT packet parameter record without changing
+either record's total size. Consumers supply storage access and LZ scratch-base functions; their
+geometry, prediction, output, and coefficient suffixes are not forced into one binding layout.
+Compile-time Rust size/alignment checks, full-record word casts, Naga parsing of every composed
+shader variant, and actual GPU Modular/VarDCT entropy tests validate this contract; shader source
+text is not used as a semantic test oracle.
+
 Display source buffers are now also checked for the usage needed by the operation: `STORAGE` for
 shader conversion and `COPY_SRC` for direct RGBA8 buffer-to-texture copies. A multi-row direct
 buffer-to-texture copy requires `bytes_per_row` to be a multiple of 256.
