@@ -26,6 +26,7 @@ compile_error!(
 mod buffer_pool;
 mod codec_engine;
 mod entropy;
+mod entropy_window;
 mod error;
 mod inflight;
 mod model;

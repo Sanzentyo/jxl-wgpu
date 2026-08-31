@@ -71,8 +71,12 @@ quantized LF planes and each pass group's LZ ring use non-overlapping slices of 
 buffer, preserving the portable eight-storage-buffer stage limit without a readback.
 
 Every accepted stock Modular reconstruction specialization supports intra-group streaming.
-The planner resolves one upload cap from the caller policy, storage binding limit, and shared
-per-frame byte budget. A group that exceeds it is divided into ordered core ranges with 16-byte
+A consumer-neutral entropy-window planner owns byte-range validation, four-byte packing, sentinel
+space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
+their own resume records and dispatch ordering. The Modular engine is currently the only production
+consumer, while VarDCT adoption remains `ENT-D02` work. The planner resolves one upload cap from the
+caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
+divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
 partial Prefix/ANS/hybrid/LZ token becomes host-visible state. The 236-byte record maps the one
 group-relative cursor into the current physical upload and identifies first/final segments. A

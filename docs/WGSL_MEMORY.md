@@ -161,7 +161,10 @@ text is not used as a semantic test oracle.
 
 The Modular record places six `u32` window values immediately after that prefix: logical segment
 start, physical upload start, full logical token end, yield end, flags, and the per-lane state
-offset. Each split segment is four-byte padded and followed by a zero sentinel word. A middle
+offset. The Rust window planner that produces those values is consumer-neutral, so VarDCT LF/HF/AC
+consumers can adopt the same checked overlap and batching contract without sharing their WGSL state
+layout; production use remains Modular-only at this checkpoint. Each split segment is four-byte
+padded and followed by a zero sentinel word. A middle
 segment includes 16 bytes before and after its core range; this exceeds the largest complete
 Prefix/ANS + hybrid/LZ77 output token, so the shader yields only after a complete value and can map
 the overshoot in the next upload. The common lane tail is rounded to 16 bytes and stores eight
