@@ -1,6 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, mpsc};
 
 use jxl::api::{
@@ -20,7 +20,7 @@ use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
 use jxl_wgpu_decode::vardct::packet::{BoundedVarDctPacketError, BoundedVarDctPacketPlan};
 use jxl_wgpu_decode::{
     DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
-    VarDctDecodeError,
+    VarDctDecodeError, WgpuDecodeEngine,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
@@ -724,6 +724,137 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
             "nonzero-AC GPU output diverges from djxl",
         );
     }
+}
+
+#[test]
+fn nonzero_ac_resumes_across_bounded_gpu_stream_windows() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let engine = WgpuDecodeEngine::new(backend.clone())
+        .unwrap()
+        .with_stream_window_limit(NonZeroU64::new(256).unwrap());
+    let decoder = GpuDecoder::new(engine);
+    let encoded = common::green_queen_vardct_nonzero_ac();
+    let extent = Extent2d::new(438, 589);
+    let expected = rust_jxl_rgb8(encoded, extent);
+
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let vardct = session.submission_session().vardct().unwrap();
+    let memory = vardct.memory_stats();
+    assert!(memory.hf_stream_window_bytes > 0);
+    assert!(memory.hf_stream_window_bytes <= 256);
+    assert!(memory.hf_stream_batch_count > 6);
+    assert_eq!(
+        vardct.submissions_per_frame(),
+        memory.hf_stream_batch_count + 2
+    );
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(maximum_error(&readback.frame.outputs[0].bytes, &expected) <= 1);
+    drop(readback);
+    drop(frame);
+    drop(session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut async_session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let async_frame = pollster::block_on(async_session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    let async_readback = ImageReadbackPipeline::new(&backend)
+        .submit(async_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(maximum_error(&async_readback.frame.outputs[0].bytes, &expected) <= 1);
+    drop(async_readback);
+    drop(async_frame);
+    drop(async_session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+    let damaged_range = packet
+        .hf_coefficients
+        .as_ref()
+        .unwrap()
+        .pass_groups
+        .iter()
+        .max_by_key(|range| range.length)
+        .copied()
+        .unwrap();
+    let mut damaged = encoded.to_vec();
+    let byte_start = usize::try_from(damaged_range.offset.div_ceil(8)).unwrap();
+    let byte_end = usize::try_from(damaged_range.end().unwrap() / 8).unwrap();
+    let damage_start = byte_start + (byte_end - byte_start) * 3 / 4;
+    for byte in &mut damaged[damage_start..(damage_start + 32).min(byte_end)] {
+        *byte ^= 0x5a;
+    }
+    let mut damaged_session = decoder
+        .open(
+            &damaged,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        damaged_session.next_frame(),
+        Err(DecodeError::VarDct(VarDctDecodeError::HfCoefficientGpu(_)))
+    ));
+    drop(damaged_session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend.device().poll(wgpu::PollType::Poll).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
 #[test]

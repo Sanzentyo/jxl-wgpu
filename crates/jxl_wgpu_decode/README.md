@@ -126,8 +126,12 @@ VarDCT renderer using the normative default matrix for that strategy and an expl
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
-and writes tightly packed RGB8 without an intermediate image readback. Global-tree frames use one
-GPU submission and one aggregate staging map. Local-tree frames first map one aggregate LF cursor
+and writes tightly packed RGB8 without an intermediate image readback. When every AC pass group
+fits the resolved entropy cap, global-tree frames retain the one-submission path. An oversized AC
+range instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/parameter pair,
+and ordered queue submissions. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
+state, nested block/channel/order progress, coefficient-sink error, and the 96-word nonzero context
+grid; only the final window validates exact ANS/padding termination. Local-tree frames first map one aggregate LF cursor
 record, then submit HF entropy and the already-recorded downstream work with one final aggregate
 validation map. Every LF group's packet and artifact status plus one 32-byte record per pass group
 share the final map; cleared downstream buffers and zeroed indirect
@@ -151,6 +155,13 @@ survives through the final tracked
 carries authoritative metadata and changed regions. Native blocking and runtime-neutral
 poll/future completion use the common decoder session API, and the engine compiles for browser
 WebGPU without a Tokio or async-std dependency.
+
+`VarDctDecodeMemoryStats` separately reports the reusable AC stream peak, ordered batch count,
+reusable parameter bytes, LZ scratch, and execution-state total. Applying
+`WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines; at this checkpoint
+the VarDCT cap governs AC pass groups while LF/HF packet windowing remains unfinished. A forced
+256-byte actual-adapter run covers blocking and runtime-neutral async decode, late-window typed
+corruption, and cancellation-driven reservation release against the libjxl nonzero-AC fixture.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27
@@ -329,6 +340,10 @@ storage access and LZ scratch-base functions; geometry, prediction, output, and 
 remain consumer-specific. Consumers whose entropy owns the complete token range also call one
 shared terminator for the ANS final-state and at most seven zero-padding bits; VarDCT packet streams
 followed by fixed metadata finalize ANS first and validate the enclosing section after that tail.
+The VarDCT AC parameter record is a separate 144-byte aligned `Pod`. Its window suffix carries
+logical/upload starts, available/full ends, the yield boundary, first/final flags, a 464-byte
+execution-state offset, and the canonical status index. LF/HF packet records remain whole-range
+consumers.
 The Modular suffix begins with six window fields: logical segment start, physical upload start,
 full stream end, yield boundary, first/final flags, and the aligned entropy-state offset. It then
 carries four plane offset/stride pairs, exact output

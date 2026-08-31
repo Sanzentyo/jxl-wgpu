@@ -4,6 +4,9 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
+use crate::entropy_window::{
+    GroupEntropyRange, GroupStreamSegment, StreamBatch, build_stream_batches,
+};
 use crate::vardct_artifact::{
     HF_ORDER_CHANNELS, HF_ORDER_COUNT, HfCoefficientSinkParams, VarDctArtifactLayout,
 };
@@ -20,6 +23,9 @@ const BLOCK_CONTEXT_MARKER: &str = "/*__JXL_VARDCT_BLOCK_CONTEXT__*/";
 const COEFFICIENT_SINK_MARKER: &str = "/*__JXL_HF_COEFFICIENT_SINK__*/";
 
 pub const HF_COEFFICIENT_STATUS_BYTES: u64 = 32;
+pub const HF_COEFFICIENT_EXECUTION_STATE_WORDS: u32 = 116;
+pub const HF_COEFFICIENT_EXECUTION_STATE_BYTES: u64 =
+    HF_COEFFICIENT_EXECUTION_STATE_WORDS as u64 * 4;
 
 /// Exact 48-byte storage ABI locating the variable-length HF block-context tables.
 #[repr(C)]
@@ -37,12 +43,19 @@ pub struct HfBlockContextTables {
     pub _reserved: [u32; 3],
 }
 
-/// One pass-group entropy invocation. The first 64 bytes keep the lane's bounds and scratch base
-/// in one naturally aligned cache line; the trailing 48 bytes carry the block-context table ABI.
+/// One pass-group entropy invocation. The first 96 bytes carry stream-window, progress-storage,
+/// geometry, and entropy-table bounds; the trailing 48 bytes carry the block-context table ABI.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct HfCoefficientPassParams {
     entropy: EntropyStreamParams,
+    window_logical_start: u32,
+    window_upload_start: u32,
+    stream_token_end: u32,
+    window_yield_end: u32,
+    window_flags: u32,
+    execution_state_base_words: u32,
+    status_index: u32,
     block_origin_x: u32,
     block_origin_y: u32,
     block_width: u32,
@@ -57,6 +70,21 @@ pub struct HfCoefficientPassParams {
     coeff_shift: u32,
     global_group_index: u32,
     block_context: HfBlockContextTables,
+    _reserved: u32,
+}
+
+/// Exact 464-byte resume record for one serial HF coefficient consumer.
+///
+/// The common prefix preserves bit/ANS/LZ state. Consumer words retain the nested block/channel/
+/// coefficient loop and the coefficient sink error. The 96-word tail is the three-channel
+/// nonzero-neighbour grid required by the JPEG XL coefficient contexts.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct HfCoefficientExecutionState {
+    common: [u32; 8],
+    consumer: [u32; 10],
+    nonzero_grid: [u32; 96],
+    _reserved: [u32; 2],
 }
 
 /// One LF group's pass-group parameters and coefficient sink.
@@ -66,6 +94,10 @@ pub struct HfCoefficientGroupExecutionPlan {
     pub params: Vec<HfCoefficientPassParams>,
     pub sink_params: HfCoefficientSinkParams,
     pub lz77_scratch_words: u32,
+    pub(crate) stream_segments: Vec<GroupStreamSegment>,
+    pub(crate) stream_batches: Vec<StreamBatch>,
+    pub(crate) segment_params: Vec<HfCoefficientPassParams>,
+    pub(crate) stream_bytes: u64,
 }
 
 /// Shared immutable entropy/order tables plus independently bounded LF-group jobs.
@@ -119,6 +151,8 @@ impl HfCoefficientExecutionPlan {
         packet: &BoundedVarDctPacketPlan,
         entropy: &HfCoefficientEntropyPlan,
         artifacts: &[VarDctArtifactLayout],
+        codestream: &[u8],
+        stream_limit: u64,
     ) -> Result<Self, HfCoefficientPlanError> {
         let metadata_words = u32::try_from(entropy.metadata.len()).map_err(|_| {
             HfCoefficientPlanError::ArithmeticOverflow {
@@ -179,6 +213,7 @@ impl HfCoefficientExecutionPlan {
             let lz77_scratch_base_words =
                 lf_group.reconstructed_words(packet.needs_self_correcting)?;
             let mut params = Vec::new();
+            let mut stream_ranges = Vec::new();
             for (global_group_index, range) in entropy.pass_groups.iter().copied().enumerate() {
                 let global_group_index = u32::try_from(global_group_index).map_err(|_| {
                     HfCoefficientPlanError::ArithmeticOverflow {
@@ -226,6 +261,13 @@ impl HfCoefficientExecutionPlan {
                         token_end,
                         lz77_window_mask,
                     },
+                    window_logical_start: 0,
+                    window_upload_start: 0,
+                    stream_token_end: token_end,
+                    window_yield_end: token_end,
+                    window_flags: 3,
+                    execution_state_base_words: 0,
+                    status_index: local_group_index,
                     block_origin_x: local_x / 8,
                     block_origin_y: local_y / 8,
                     block_width: rect.width.div_ceil(8),
@@ -245,6 +287,15 @@ impl HfCoefficientExecutionPlan {
                     coeff_shift: 0,
                     global_group_index,
                     block_context,
+                    _reserved: 0,
+                });
+                stream_ranges.push(GroupEntropyRange {
+                    token_bit_offset: range.offset,
+                    token_bit_end: range.end().ok_or(
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "pass-group stream end",
+                        },
+                    )?,
                 });
             }
             let local_group_count = u32::try_from(params.len()).map_err(|_| {
@@ -258,6 +309,39 @@ impl HfCoefficientExecutionPlan {
                 .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
                     field: "LF-group pass-group LZ77 scratch words",
                 })?;
+            let execution_state_base_words = lz77_scratch_base_words
+                .checked_add(lz77_scratch_words)
+                .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                    field: "HF execution-state base",
+                })?;
+            for (index, params) in params.iter_mut().enumerate() {
+                params.execution_state_base_words = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(HF_COEFFICIENT_EXECUTION_STATE_WORDS))
+                    .and_then(|offset| execution_state_base_words.checked_add(offset))
+                    .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "HF execution-state offset",
+                    })?;
+            }
+            let (stream_segments, stream_batches, stream_bytes) =
+                build_stream_batches(codestream, &stream_ranges, stream_limit, params.len())
+                    .map_err(|error| HfCoefficientPlanError::EntropyWindow {
+                        message: error.to_string(),
+                    })?;
+            let segment_params = stream_segments
+                .iter()
+                .map(|segment| {
+                    let mut params = params[segment.group_index];
+                    params.entropy.token_start = 0;
+                    params.entropy.token_end = segment.available_token_end;
+                    params.window_logical_start = segment.window_logical_start;
+                    params.window_upload_start = segment.window_upload_start;
+                    params.stream_token_end = segment.stream_token_end;
+                    params.window_yield_end = segment.window_yield_end;
+                    params.window_flags = segment.flags;
+                    params
+                })
+                .collect();
             groups.push(HfCoefficientGroupExecutionPlan {
                 lf_group_index: lf_group.index,
                 params,
@@ -270,6 +354,10 @@ impl HfCoefficientExecutionPlan {
                     _reserved: [0; 3],
                 },
                 lz77_scratch_words,
+                stream_segments,
+                stream_batches,
+                segment_params,
+                stream_bytes,
             });
         }
 
@@ -296,6 +384,52 @@ impl HfCoefficientExecutionPlan {
             .map(HfCoefficientGroupExecutionPlan::lz77_scratch_bytes)
             .sum()
     }
+
+    #[must_use]
+    pub fn execution_state_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(HfCoefficientGroupExecutionPlan::execution_state_bytes)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn uses_bounded_stream_windows(&self) -> bool {
+        self.groups.iter().any(|group| {
+            group.stream_segments.iter().any(|segment| {
+                segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
+            })
+        })
+    }
+
+    #[must_use]
+    pub fn stream_window_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|group| group.stream_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn stream_batch_count(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|group| group.stream_batches.len())
+            .sum()
+    }
+
+    #[must_use]
+    pub fn reusable_params_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .flat_map(|group| &group.stream_batches)
+            .map(|batch| {
+                batch.group_count as u64 * std::mem::size_of::<HfCoefficientPassParams>() as u64
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl HfCoefficientGroupExecutionPlan {
@@ -307,6 +441,11 @@ impl HfCoefficientGroupExecutionPlan {
     #[must_use]
     pub fn lz77_scratch_bytes(&self) -> u64 {
         u64::from(self.lz77_scratch_words) * 4
+    }
+
+    #[must_use]
+    pub fn execution_state_bytes(&self) -> u64 {
+        self.params.len() as u64 * HF_COEFFICIENT_EXECUTION_STATE_BYTES
     }
 
     pub(crate) fn global_group_indices(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
@@ -326,6 +465,8 @@ pub enum HfCoefficientPlanError {
     LfGroupCount { expected: usize, actual: usize },
     #[error("HF coefficient plan arithmetic overflowed while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("HF coefficient entropy window planning failed: {message}")]
+    EntropyWindow { message: String },
 }
 
 /// One 32-byte status record written by a pass-group invocation.
@@ -534,11 +675,14 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 112);
+    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 144);
     assert!(std::mem::align_of::<HfCoefficientPassParams>() == 16);
     assert!(std::mem::size_of::<HfBlockContextTables>() == 48);
     assert!(std::mem::align_of::<HfBlockContextTables>() == 4);
-    assert!(std::mem::offset_of!(HfCoefficientPassParams, block_context) == 64);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, block_context) == 92);
+    assert!(std::mem::size_of::<HfCoefficientExecutionState>() == 464);
+    assert!(std::mem::align_of::<HfCoefficientExecutionState>() == 16);
+    assert!(std::mem::offset_of!(HfCoefficientExecutionState, nonzero_grid) == 72);
     assert!(std::mem::size_of::<GpuHfCoefficientStatus>() == HF_COEFFICIENT_STATUS_BYTES as usize);
 };
 

@@ -56,6 +56,14 @@ test compares GPU RGB8 against Rust `jxl` and, when installed, `djxl`, with a ma
 difference of one code per channel. This fixture is decoder evidence; it is not counted among the
 24 exact Modular GPU encode/decode round trips.
 
+`vardct_engine_gpu::nonzero_ac_resumes_across_bounded_gpu_stream_windows` reuses this production
+fixture with a 256-byte cap. The six AC pass groups expand into multiple ordered uploads backed by
+one stream and one parameter buffer. Blocking and runtime-neutral async results stay within one
+RGB8 code of Rust `jxl`; a late mutation in the largest pass group must return typed
+`HfCoefficientGpu`, and abandoning a prefetched decode must release the shared reservation after
+the final queue fence. Reported stream bytes may not exceed the cap, and the submission count must
+equal the planned AC batches plus the pre/post resident stages.
+
 The decoded fixture SHA-256 is
 `95c3cd9a0769da10c1a8c0d4f903d0723bc760eebdd8023d8b7f81af5b73faa2`. It is reproduced from the
 checked-in `fixtures/green_queen_vardct_e3.jxl` source with libjxl as follows:
@@ -229,8 +237,8 @@ every oversized accepted Modular group is segmented. Rust/WGSL full-record word 
 shader variant is parsed and semantically validated with Naga; no shader-source substring
 assertion is used.
 
-Together these are Prefix+RLE/LZ77 and production ANS+Weighted cross-window evidence. VarDCT LF/HF
-and recursive entropy consumers still need the same bounded resume contract, and broader
+Together these are Prefix+RLE/LZ77, production ANS+Weighted, and nonzero/custom-order VarDCT AC
+cross-window evidence. VarDCT LF/HF packet and recursive entropy consumers still need the same bounded resume contract, and broader
 corruption/truncation fuzzing is still required before `ENT-D02` can be marked done.
 
 ## Common entropy differential matrix

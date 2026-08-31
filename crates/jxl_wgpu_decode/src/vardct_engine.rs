@@ -6,7 +6,7 @@
 //! coefficient, transform, quantization, residual, or entropy fallback runs on the CPU.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +38,7 @@ use jxl_wgpu::{
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
+use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
 use crate::vardct_artifact::{
     GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfMetadataArtifactConfig,
     HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
@@ -119,6 +120,13 @@ pub enum VarDctDecodeError {
     Layout(#[from] LayoutError),
     #[error("VarDCT GPU memory arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error(
+        "the bounded VarDCT entropy window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
+    )]
+    EntropyStreamWindowTooSmall {
+        limit_bytes: u64,
+        minimum_bytes: u64,
+    },
     #[error("VarDCT {resource} needs {required} bytes, device permits {available}")]
     DeviceLimit {
         resource: &'static str,
@@ -150,6 +158,8 @@ pub enum VarDctDecodeError {
         kernel: &'static str,
         message: String,
     },
+    #[error("VarDCT entropy-window execution contract failed: {detail}")]
+    EntropyWindowContract { detail: &'static str },
 }
 
 /// Exact canonical output supported by [`VarDctSubmissionEngine`].
@@ -192,8 +202,13 @@ pub struct VarDctDecodeMemoryStats {
     pub occupancy_bytes: u64,
     pub artifact_uniform_bytes: u64,
     pub hf_entropy_bundle_bytes: u64,
+    /// Reusable AC entropy upload. Zero when every pass group binds the original whole stream.
+    pub hf_stream_window_bytes: u64,
+    /// Ordered AC dispatch batches when the reusable stream path is active.
+    pub hf_stream_batch_count: usize,
     pub hf_params_bytes: u64,
     pub hf_lz77_scratch_bytes: u64,
+    pub hf_execution_state_bytes: u64,
     pub hf_status_bytes: u64,
     pub hf_order_table_bytes: u64,
     pub hf_sink_uniform_bytes: u64,
@@ -306,23 +321,41 @@ impl VarDctDecodeMemoryStats {
             .map(|plan| checked_words(plan.entropy_words.len() as u64, "HF entropy bundle bytes"))
             .transpose()?
             .unwrap_or(0);
-        let hf_params_bytes = hf_coefficients
-            .map(|plan| {
-                checked_sum(
-                    plan.groups.iter().map(|group| group.params.len() as u64),
-                    "HF parameter count",
-                )?
-                .checked_mul(
-                    std::mem::size_of::<crate::vardct_pass_group::HfCoefficientPassParams>() as u64,
-                )
-                .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "HF parameter bytes",
+        let hf_uses_stream_windows =
+            hf_coefficients.is_some_and(HfCoefficientExecutionPlan::uses_bounded_stream_windows);
+        let hf_stream_window_bytes = if hf_uses_stream_windows {
+            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::stream_window_bytes)
+        } else {
+            0
+        };
+        let hf_stream_batch_count = if hf_uses_stream_windows {
+            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::stream_batch_count)
+        } else {
+            0
+        };
+        let hf_params_bytes = if hf_uses_stream_windows {
+            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::reusable_params_bytes)
+        } else {
+            hf_coefficients
+                .map(|plan| {
+                    checked_sum(
+                        plan.groups.iter().map(|group| group.params.len() as u64),
+                        "HF parameter count",
+                    )?
+                    .checked_mul(std::mem::size_of::<
+                        crate::vardct_pass_group::HfCoefficientPassParams,
+                    >() as u64)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF parameter bytes",
+                    })
                 })
-            })
-            .transpose()?
-            .unwrap_or(0);
+                .transpose()?
+                .unwrap_or(0)
+        };
         let hf_lz77_scratch_bytes =
             hf_coefficients.map_or(0, HfCoefficientExecutionPlan::lz77_scratch_bytes);
+        let hf_execution_state_bytes =
+            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::execution_state_bytes);
         let hf_status_bytes = hf_coefficients.map_or(0, HfCoefficientExecutionPlan::status_bytes);
         let hf_order_table_bytes = hf_coefficients
             .map(|plan| checked_words(plan.order_words.len() as u64, "HF order-table bytes"))
@@ -462,8 +495,10 @@ impl VarDctDecodeMemoryStats {
             occupancy_bytes,
             artifact_uniform_bytes,
             hf_entropy_bundle_bytes,
+            hf_stream_window_bytes,
             hf_params_bytes,
             hf_lz77_scratch_bytes,
+            hf_execution_state_bytes,
             hf_status_bytes,
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
@@ -508,8 +543,11 @@ impl VarDctDecodeMemoryStats {
             occupancy_bytes,
             artifact_uniform_bytes,
             hf_entropy_bundle_bytes,
+            hf_stream_window_bytes,
+            hf_stream_batch_count,
             hf_params_bytes,
             hf_lz77_scratch_bytes,
+            hf_execution_state_bytes,
             hf_status_bytes,
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
@@ -612,6 +650,7 @@ pub struct VarDctSubmissionEngine {
     backend: WgpuBackend,
     pipelines: Arc<VarDctPipelines>,
     memory: MemoryBudget,
+    stream_window_limit: Option<NonZeroU64>,
 }
 
 impl VarDctSubmissionEngine {
@@ -630,7 +669,23 @@ impl VarDctSubmissionEngine {
             backend,
             pipelines,
             memory,
+            stream_window_limit: None,
         })
+    }
+
+    /// Caps reusable VarDCT entropy uploads.
+    ///
+    /// AC pass groups currently enforce this cap. LF/HF packet consumers will adopt the same
+    /// policy as their resume state machines land.
+    #[must_use]
+    pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
+        self.stream_window_limit = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub const fn stream_window_limit(&self) -> Option<NonZeroU64> {
+        self.stream_window_limit
     }
 
     #[must_use]
@@ -655,9 +710,11 @@ impl VarDctSubmissionEngine {
             request,
             inventory,
             self.pipelines.output_variant,
+            self.stream_window_limit,
         )?;
         let extent = source.layout.extent;
         let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
+        let submissions_per_frame = source.submissions_per_frame();
         Ok(PreparedGpuSession::new(
             profile,
             AnimationMetadata::still(extent),
@@ -665,7 +722,7 @@ impl VarDctSubmissionEngine {
                 backend: self.backend.clone(),
                 pipelines: Arc::clone(&self.pipelines),
                 memory_stats: source.memory,
-                submissions_per_frame: usize::from(source.packet.requires_local_tree_staging()) + 1,
+                submissions_per_frame,
                 source: Some(source),
                 memory: self.memory.clone(),
             },
@@ -699,6 +756,22 @@ struct VarDctSource {
     quant_biases: [f32; 4],
     frame_name: String,
     memory: VarDctDecodeMemoryStats,
+}
+
+impl VarDctSource {
+    fn submissions_per_frame(&self) -> usize {
+        let local_lf = usize::from(self.packet.requires_local_tree_staging());
+        if let Some(coefficients) = &self.hf_coefficients
+            && coefficients.uses_bounded_stream_windows()
+        {
+            // Packet/pre-coefficient work, one ordered submission per reusable upload, then the
+            // resident inverse-transform/render/status tail. Local-tree frames additionally map
+            // their LF cursors before this sequence.
+            local_lf + 2 + coefficients.stream_batch_count()
+        } else {
+            local_lf + 1
+        }
+    }
 }
 
 struct VarDctGroupSource {
@@ -823,6 +896,7 @@ fn prepare_source(
     request: &GpuOutputRequest,
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     output_variant: KernelVariant,
+    stream_window_limit: Option<NonZeroU64>,
 ) -> Result<VarDctSource, VarDctDecodeError> {
     if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
         return Err(VarDctDecodeError::UnsupportedOutput);
@@ -954,7 +1028,24 @@ fn prepare_source(
                 .iter()
                 .map(|group| group.artifact_layout)
                 .collect::<Vec<_>>();
-            HfCoefficientExecutionPlan::new(&packet, entropy, &artifacts)
+            let limits = backend.device().limits();
+            let stream_limit = stream_window_limit
+                .map_or(u64::MAX, NonZeroU64::get)
+                .min(limits.max_buffer_size)
+                .min(limits.max_storage_buffer_binding_size);
+            if stream_limit < MIN_STREAM_WINDOW_BYTES {
+                return Err(VarDctDecodeError::EntropyStreamWindowTooSmall {
+                    limit_bytes: stream_limit,
+                    minimum_bytes: MIN_STREAM_WINDOW_BYTES,
+                });
+            }
+            Ok(HfCoefficientExecutionPlan::new(
+                &packet,
+                entropy,
+                &artifacts,
+                codestream.bytes(),
+                stream_limit,
+            )?)
         })
         .transpose()?;
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
@@ -1142,12 +1233,17 @@ fn validate_device_limits(
         let lz77 = hf_coefficients
             .and_then(|plan| plan.groups.get(index))
             .map_or(0, HfCoefficientGroupExecutionPlan::lz77_scratch_bytes);
-        reconstruction_storage_bytes =
-            reconstruction_storage_bytes.max(reconstruction.checked_add(lz77).ok_or(
-                VarDctDecodeError::ArithmeticOverflow {
+        let execution_state = hf_coefficients
+            .and_then(|plan| plan.groups.get(index))
+            .map_or(0, HfCoefficientGroupExecutionPlan::execution_state_bytes);
+        reconstruction_storage_bytes = reconstruction_storage_bytes.max(
+            reconstruction
+                .checked_add(lz77)
+                .and_then(|bytes| bytes.checked_add(execution_state))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
                     field: "LF-group reconstruction binding bytes",
-                },
-            )?);
+                })?,
+        );
     }
     let raw_metadata_bytes = groups
         .iter()
@@ -1170,19 +1266,7 @@ fn validate_device_limits(
         .map(|group| group.artifact_layout.occupancy_bytes)
         .max()
         .unwrap_or(0);
-    let hf_params_bytes = hf_coefficients
-        .map(|plan| {
-            plan.groups
-                .iter()
-                .map(|group| {
-                    (group.params.len() as u64)
-                        * std::mem::size_of::<crate::vardct_pass_group::HfCoefficientPassParams>()
-                            as u64
-                })
-                .max()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
+    let hf_params_bytes = memory.hf_params_bytes;
     let hf_status_bytes = hf_coefficients
         .map(|plan| {
             plan.groups
@@ -1224,6 +1308,11 @@ fn validate_device_limits(
         ("VarDCT artifact", artifact_bytes, true),
         ("artifact occupancy", occupancy_bytes, true),
         ("HF entropy bundle", memory.hf_entropy_bundle_bytes, true),
+        (
+            "HF entropy stream window",
+            memory.hf_stream_window_bytes,
+            true,
+        ),
         ("HF pass-group parameters", hf_params_bytes, true),
         ("HF pass-group status", hf_status_bytes, true),
         (
@@ -1398,13 +1487,77 @@ struct VarDctMemoryPermits {
 struct HfCoefficientJobBuffers {
     entropy_bundle: wgpu::Buffer,
     order_table: wgpu::Buffer,
+    stream_window: Option<wgpu::Buffer>,
+    params_window: Option<wgpu::Buffer>,
     groups: Vec<HfCoefficientGroupJobBuffers>,
 }
 
 struct HfCoefficientGroupJobBuffers {
-    params: wgpu::Buffer,
+    params: Option<wgpu::Buffer>,
     status: wgpu::Buffer,
     sink_params: wgpu::Buffer,
+}
+
+struct HfCoefficientBatchSubmission {
+    stream_upload: Box<[u8]>,
+    params_upload: Box<[u8]>,
+    commands: wgpu::CommandBuffer,
+}
+
+enum VarDctDownstreamCommands {
+    Whole(wgpu::CommandBuffer),
+    Windowed {
+        before_coefficients: wgpu::CommandBuffer,
+        coefficient_batches: Vec<HfCoefficientBatchSubmission>,
+        after_coefficients: wgpu::CommandBuffer,
+    },
+}
+
+fn submit_vardct_downstream(
+    queue: &wgpu::Queue,
+    mut prefix: Vec<wgpu::CommandBuffer>,
+    downstream: VarDctDownstreamCommands,
+    lifetime: &VarDctJobLifetime,
+) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
+    match downstream {
+        VarDctDownstreamCommands::Whole(commands) => {
+            prefix.push(commands);
+            Ok(queue.submit(prefix))
+        }
+        VarDctDownstreamCommands::Windowed {
+            before_coefficients,
+            coefficient_batches,
+            after_coefficients,
+        } => {
+            prefix.push(before_coefficients);
+            queue.submit(prefix);
+            let buffers = lifetime._hf_coefficients.as_ref().ok_or(
+                VarDctDecodeError::EntropyWindowContract {
+                    detail: "windowed AC commands have no retained coefficient buffers",
+                },
+            )?;
+            let stream =
+                buffers
+                    .stream_window
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "windowed AC commands have no stream upload",
+                    })?;
+            let params =
+                buffers
+                    .params_window
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "windowed AC commands have no parameter upload",
+                    })?;
+            for batch in coefficient_batches {
+                queue.write_buffer(stream, 0, &batch.stream_upload);
+                queue.write_buffer(params, 0, &batch.params_upload);
+                queue.submit([batch.commands]);
+            }
+            Ok(queue.submit([after_coefficients]))
+        }
+    }
 }
 
 struct VarDctGroupJobBuffers {
@@ -1519,7 +1672,7 @@ enum VarDctPendingStage {
     LocalLf {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
-        downstream: Option<wgpu::CommandBuffer>,
+        downstream: Option<VarDctDownstreamCommands>,
     },
     Final {
         completion: Arc<MapCompletion>,
@@ -1571,7 +1724,7 @@ impl VarDctPendingFrame {
         }
     }
 
-    fn take_local_stage(&mut self) -> Option<(Box<VarDctSource>, wgpu::CommandBuffer)> {
+    fn take_local_stage(&mut self) -> Option<(Box<VarDctSource>, VarDctDownstreamCommands)> {
         let placeholder = VarDctPendingStage::Final {
             completion: Arc::new(MapCompletion::default()),
         };
@@ -1593,7 +1746,7 @@ impl VarDctPendingFrame {
         &mut self,
         mapping: Result<(), String>,
         source: Box<VarDctSource>,
-        downstream: wgpu::CommandBuffer,
+        downstream: VarDctDownstreamCommands,
     ) -> DecodeResult<()> {
         mapping.map_err(DecodeError::backend)?;
         let lifetime = self
@@ -1758,7 +1911,12 @@ impl VarDctPendingFrame {
             debug_assert_eq!(group.control.geometry, control.geometry);
         }
         let completion = Arc::new(MapCompletion::default());
-        let submission = self.backend.queue().submit([commands.finish(), downstream]);
+        let submission = submit_vardct_downstream(
+            self.backend.queue(),
+            vec![commands.finish()],
+            downstream,
+            lifetime,
+        )?;
         arm_status_map(lifetime, &completion, "VarDCT final validation mapping");
         let poll_completion = Arc::clone(&completion);
         if let Err(error) = poll_permit.register(submission, move |error| {
@@ -2106,13 +2264,19 @@ fn submit_vardct(
             .as_ref()
             .and_then(|plan| plan.groups.get(index))
             .map_or(0, HfCoefficientGroupExecutionPlan::lz77_scratch_bytes);
+        let hf_execution_state_bytes = source
+            .hf_coefficients
+            .as_ref()
+            .and_then(|plan| plan.groups.get(index))
+            .map_or(0, HfCoefficientGroupExecutionPlan::execution_state_bytes);
         let reconstructed = storage(
             "jxl-wgpu VarDCT LF-group reconstruction",
-            reconstructed_bytes.checked_add(hf_lz77_bytes).ok_or(
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "LF-group reconstruction and HF LZ77 bytes",
-                },
-            )?,
+            reconstructed_bytes
+                .checked_add(hf_lz77_bytes)
+                .and_then(|bytes| bytes.checked_add(hf_execution_state_bytes))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group reconstruction, HF LZ77, and execution-state bytes",
+                })?,
             wgpu::BufferUsages::COPY_DST,
         );
         let raw_metadata = storage(
@@ -2192,43 +2356,58 @@ fn submit_vardct(
         contents: bytemuck::cast_slice(&resource_values),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let hf_coefficient_buffers =
-        source
-            .hf_coefficients
-            .as_ref()
-            .map(|plan| HfCoefficientJobBuffers {
-                entropy_bundle: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("jxl-wgpu HF entropy bundle"),
-                    contents: bytemuck::cast_slice(&plan.entropy_words),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
-                order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("jxl-wgpu HF natural-order table"),
-                    contents: bytemuck::cast_slice(&plan.order_words),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
-                groups: plan
-                    .groups
-                    .iter()
-                    .map(|group| HfCoefficientGroupJobBuffers {
-                        params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let hf_coefficient_buffers = source.hf_coefficients.as_ref().map(|plan| {
+        let windowed = plan.uses_bounded_stream_windows();
+        HfCoefficientJobBuffers {
+            entropy_bundle: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu HF entropy bundle"),
+                contents: bytemuck::cast_slice(&plan.entropy_words),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+            order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu HF natural-order table"),
+                contents: bytemuck::cast_slice(&plan.order_words),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+            stream_window: windowed.then(|| {
+                storage(
+                    "jxl-wgpu reusable HF coefficient stream window",
+                    plan.stream_window_bytes(),
+                    wgpu::BufferUsages::COPY_DST,
+                )
+            }),
+            params_window: windowed.then(|| {
+                storage(
+                    "jxl-wgpu reusable HF coefficient parameter window",
+                    plan.reusable_params_bytes(),
+                    wgpu::BufferUsages::COPY_DST,
+                )
+            }),
+            groups: plan
+                .groups
+                .iter()
+                .map(|group| HfCoefficientGroupJobBuffers {
+                    params: (!windowed).then(|| {
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("jxl-wgpu LF-group HF pass-group params"),
                             contents: bytemuck::cast_slice(&group.params),
                             usage: wgpu::BufferUsages::STORAGE,
-                        }),
-                        status: storage(
-                            "jxl-wgpu LF-group HF pass-group status",
-                            group.status_bytes(),
-                            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                        ),
-                        sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("jxl-wgpu LF-group HF coefficient sink params"),
-                            contents: bytemuck::bytes_of(&group.sink_params),
-                            usage: wgpu::BufferUsages::UNIFORM,
-                        }),
-                    })
-                    .collect(),
-            });
+                        })
+                    }),
+                    status: storage(
+                        "jxl-wgpu LF-group HF pass-group status",
+                        group.status_bytes(),
+                        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    ),
+                    sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("jxl-wgpu LF-group HF coefficient sink params"),
+                        contents: bytemuck::bytes_of(&group.sink_params),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    }),
+                })
+                .collect(),
+        }
+    });
     let plane_bytes = source.memory.xyb_plane_bytes / 3;
     let xyb_planes = [
         "jxl-wgpu VarDCT X plane",
@@ -2449,33 +2628,126 @@ fn submit_vardct(
         (None, None) => {}
         _ => unreachable!("EPF plan and sigma buffer are constructed together"),
     }
+    let mut windowed_before_coefficients = None;
+    let mut windowed_coefficient_batches = Vec::new();
     if let (Some(plan), Some(buffers)) = (
         source.hf_coefficients.as_ref(),
         hf_coefficient_buffers.as_ref(),
     ) {
-        for ((group_plan, hf_buffers), group_buffers) in
-            plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
-        {
-            pipelines.hf_coefficients.encode(
-                device,
-                &mut commands,
-                HfCoefficientBuffers {
-                    codestream: &codestream_buffer,
-                    entropy_bundle: &buffers.entropy_bundle,
-                    reconstruction: &group_buffers.reconstructed,
-                    params: &hf_buffers.params,
-                    status: &hf_buffers.status,
-                    artifact: &group_buffers.artifact,
-                    order_table: &buffers.order_table,
-                    coefficients: &group_buffers.coefficients,
-                    sink_params: &hf_buffers.sink_params,
-                },
-                u32::try_from(group_plan.params.len()).map_err(|_| {
-                    VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF-group HF pass-group dispatch count",
+        if plan.uses_bounded_stream_windows() {
+            windowed_before_coefficients = Some(commands.finish());
+            commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu bounded VarDCT post-coefficient stage"),
+            });
+            let stream_window =
+                buffers
+                    .stream_window
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "windowed AC plan has no stream buffer",
+                    })?;
+            let params_window =
+                buffers
+                    .params_window
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "windowed AC plan has no parameter buffer",
+                    })?;
+            let upload_len = usize::try_from(plan.stream_window_bytes()).map_err(|_| {
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "HF stream window host length",
+                }
+            })?;
+            for ((group_plan, hf_buffers), group_buffers) in
+                plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
+            {
+                for batch in &group_plan.stream_batches {
+                    let mut stream_upload = vec![0_u8; upload_len];
+                    for segment in &group_plan.stream_segments[batch.segments.clone()] {
+                        let input = codestream
+                            .get(segment.input_start..segment.input_end)
+                            .ok_or(VarDctDecodeError::EntropyWindowContract {
+                                detail: "HF stream segment exceeds the retained codestream",
+                            })?;
+                        let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
+                            VarDctDecodeError::ArithmeticOverflow {
+                                field: "HF stream segment upload end",
+                            },
+                        )?;
+                        let output = stream_upload
+                            .get_mut(segment.upload_offset..output_end)
+                            .ok_or(VarDctDecodeError::EntropyWindowContract {
+                                detail: "HF stream segment exceeds the reusable upload",
+                            })?;
+                        output.copy_from_slice(input);
                     }
-                })?,
-            );
+                    let params_upload =
+                        bytemuck::cast_slice(&group_plan.segment_params[batch.segments.clone()])
+                            .to_vec()
+                            .into_boxed_slice();
+                    let mut batch_commands =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("jxl-wgpu bounded HF coefficient stream batch"),
+                        });
+                    pipelines.hf_coefficients.encode(
+                        device,
+                        &mut batch_commands,
+                        HfCoefficientBuffers {
+                            codestream: stream_window,
+                            entropy_bundle: &buffers.entropy_bundle,
+                            reconstruction: &group_buffers.reconstructed,
+                            params: params_window,
+                            status: &hf_buffers.status,
+                            artifact: &group_buffers.artifact,
+                            order_table: &buffers.order_table,
+                            coefficients: &group_buffers.coefficients,
+                            sink_params: &hf_buffers.sink_params,
+                        },
+                        u32::try_from(batch.group_count).map_err(|_| {
+                            VarDctDecodeError::ArithmeticOverflow {
+                                field: "HF stream batch dispatch count",
+                            }
+                        })?,
+                    );
+                    windowed_coefficient_batches.push(HfCoefficientBatchSubmission {
+                        stream_upload: stream_upload.into_boxed_slice(),
+                        params_upload,
+                        commands: batch_commands.finish(),
+                    });
+                }
+            }
+        } else {
+            for ((group_plan, hf_buffers), group_buffers) in
+                plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
+            {
+                let params =
+                    hf_buffers
+                        .params
+                        .as_ref()
+                        .ok_or(VarDctDecodeError::EntropyWindowContract {
+                            detail: "whole-range AC plan has no parameter buffer",
+                        })?;
+                pipelines.hf_coefficients.encode(
+                    device,
+                    &mut commands,
+                    HfCoefficientBuffers {
+                        codestream: &codestream_buffer,
+                        entropy_bundle: &buffers.entropy_bundle,
+                        reconstruction: &group_buffers.reconstructed,
+                        params,
+                        status: &hf_buffers.status,
+                        artifact: &group_buffers.artifact,
+                        order_table: &buffers.order_table,
+                        coefficients: &group_buffers.coefficients,
+                        sink_params: &hf_buffers.sink_params,
+                    },
+                    u32::try_from(group_plan.params.len()).map_err(|_| {
+                        VarDctDecodeError::ArithmeticOverflow {
+                            field: "LF-group HF pass-group dispatch count",
+                        }
+                    })?,
+                );
+            }
         }
     }
     let padded_width = blocks_x
@@ -2686,7 +2958,16 @@ fn submit_vardct(
         debug_assert_eq!(offset, source.memory.validation_staging_bytes);
     }
 
-    let downstream_commands = commands.finish();
+    let after_coefficients = commands.finish();
+    let downstream_commands = if let Some(before_coefficients) = windowed_before_coefficients {
+        VarDctDownstreamCommands::Windowed {
+            before_coefficients,
+            coefficient_batches: windowed_coefficient_batches,
+            after_coefficients,
+        }
+    } else {
+        VarDctDownstreamCommands::Whole(after_coefficients)
+    };
     let lifetime = Arc::new(VarDctJobLifetime {
         output: GpuBufferLease::from_tracked(output.as_ref().clone(), permits.output),
         status_staging,
@@ -2706,12 +2987,17 @@ fn submit_vardct(
         _output_scratch: output_scratch,
     });
     let completion = Arc::new(MapCompletion::default());
-    let (submitted_commands, downstream) = if let Some(lf_stage_commands) = lf_stage_commands {
-        (lf_stage_commands, Some(downstream_commands))
+    let (submission, downstream) = if let Some(lf_stage_commands) = lf_stage_commands {
+        (
+            backend.queue().submit([lf_stage_commands]),
+            Some(downstream_commands),
+        )
     } else {
-        (downstream_commands, None)
+        (
+            submit_vardct_downstream(backend.queue(), Vec::new(), downstream_commands, &lifetime)?,
+            None,
+        )
     };
-    let submission = backend.queue().submit([submitted_commands]);
     arm_status_map(
         &lifetime,
         &completion,

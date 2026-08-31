@@ -132,7 +132,7 @@ pub enum Error {
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
     #[error(
-        "the bounded Modular stream window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
+        "the bounded entropy stream window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
     )]
     StreamWindowTooSmall {
         limit_bytes: u64,

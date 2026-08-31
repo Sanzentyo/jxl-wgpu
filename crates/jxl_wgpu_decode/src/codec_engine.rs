@@ -4,6 +4,7 @@
 //! caches and submission state because their storage bindings and render phases are intentionally
 //! different. Both paths share the backend-wide byte budget and return the same GPU frame type.
 
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -54,6 +55,14 @@ impl WgpuDecodeEngine {
     #[must_use]
     pub fn memory_budget_bytes(&self) -> u64 {
         self.memory.snapshot().limit_bytes
+    }
+
+    /// Applies one entropy-window cap to both coding-mode engines.
+    #[must_use]
+    pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
+        self.modular = self.modular.with_stream_window_limit(limit);
+        self.vardct = self.vardct.with_stream_window_limit(limit);
+        self
     }
 
     /// Explicit low-level Modular engine access for diagnostics and cache policy.

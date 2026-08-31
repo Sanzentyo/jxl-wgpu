@@ -73,8 +73,8 @@ buffer, preserving the portable eight-storage-buffer stage limit without a readb
 Every accepted stock Modular reconstruction specialization supports intra-group streaming.
 A consumer-neutral entropy-window planner owns byte-range validation, four-byte packing, sentinel
 space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
-their own resume records and dispatch ordering. The Modular engine is currently the only production
-consumer, while VarDCT adoption remains `ENT-D02` work. The planner resolves one upload cap from the
+their own resume records and dispatch ordering. The Modular engine and VarDCT AC pass-group
+consumer use it in production; VarDCT LF/HF packet adoption remains `ENT-D02` work. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
@@ -87,7 +87,11 @@ Weighted/SelfCorrecting MA uses 112 bytes for its gradient history, four true er
 subprediction-error accumulators. Channel-local predictor state resets at a channel boundary.
 Every segment reuses one stream buffer and lane through queue ordering. Only the final segment
 performs exact entropy termination and only the last frame batch maps the aggregate group-status
-buffer. VarDCT consumers still require one complete entropy range.
+buffer. VarDCT AC retains an independent 464-byte aligned record containing the common state,
+nested coefficient progress, sink error, and 96-word nonzero-neighbour grid. Its stream and
+parameter buffers are rewritten only between ordered queue submissions; the final resident render
+and aggregate status map follow the last window. VarDCT LF/HF packet consumers still require one
+complete entropy range.
 
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local
