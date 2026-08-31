@@ -65,6 +65,10 @@ turning coefficient placement into a common stream type. The fragment also owns 
 termination: it validates the ANS signature, rejects more than seven trailing bits or any nonzero
 padding, and advances to the declared token end. Consumers with fixed fields after entropy retain
 the narrower ANS finalizer and validate the complete enclosing section after reading their tail.
+The HF pass-group consumer also applies the stream's quant-field and signed X/Y/B LF thresholds on
+GPU. Its context-map and threshold words follow the entropy tables in one storage bundle. Raw
+quantized LF planes and each pass group's LZ ring use non-overlapping slices of the reconstruction
+buffer, preserving the portable eight-storage-buffer stage limit without a readback.
 
 For the bounded stock VarDCT profile, restoration remains in that same submission. The inverse
 transform writes padded resident XYB planes; an optional fused Gaborish dispatch reads only the

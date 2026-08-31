@@ -110,6 +110,15 @@ truncated-input, invalid-final-ANS-state, nonzero-padding, and overlong-padding 
 probe shader is parsed and semantically validated by Naga even when an adapter is unavailable; no
 shader-source substring assertion is used.
 
+## HF block-context differential matrix
+
+The VarDCT unit suite composes the production `vardct_block_context.wgsl` fragment into an
+actual-GPU probe. A synthetic valid table covers negative and positive LF thresholds, values equal
+to a threshold (the comparison is strictly greater-than), three quant-field segments, every order
+channel, and distinct coefficient order IDs. GPU-selected map entries must equal an independent
+Rust implementation of the normative X/B/Y LF folding order. Naga parses and semantically
+validates the same fragment before adapter discovery; the test does not inspect shader text.
+
 ## Deterministic source contract
 
 Every case describes:

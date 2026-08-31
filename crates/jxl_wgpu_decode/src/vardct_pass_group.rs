@@ -10,15 +10,33 @@ use crate::vardct_packet::{BoundedVarDctPacketPlan, HfCoefficientEntropyPlan};
 const SHADER_TEMPLATE: &str = include_str!("vardct_pass_group.wgsl");
 const ENTROPY_ABI: &str = include_str!("modular_entropy_abi.wgsl");
 const ENTROPY: &str = include_str!("modular_entropy.wgsl");
+const BLOCK_CONTEXT: &str = include_str!("vardct_block_context.wgsl");
 const COEFFICIENT_SINK: &str = include_str!("vardct_hf_coefficient_sink.wgsl");
 const ENTROPY_ABI_MARKER: &str = "/*__JXL_MODULAR_ENTROPY_ABI__*/";
 const ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
+const BLOCK_CONTEXT_MARKER: &str = "/*__JXL_VARDCT_BLOCK_CONTEXT__*/";
 const COEFFICIENT_SINK_MARKER: &str = "/*__JXL_HF_COEFFICIENT_SINK__*/";
 
 pub const HF_COEFFICIENT_STATUS_BYTES: u64 = 32;
 
-/// One pass-group entropy invocation. The 64-byte array stride is valid for storage buffers and
-/// keeps each lane's bounds and scratch base in one naturally aligned cache line.
+/// Exact 48-byte storage ABI locating the variable-length HF block-context tables.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct HfBlockContextTables {
+    pub block_context_map_offset_words: u32,
+    pub qf_threshold_offset_words: u32,
+    pub qf_threshold_count: u32,
+    pub lf0_threshold_offset_words: u32,
+    pub lf0_threshold_count: u32,
+    pub lf1_threshold_offset_words: u32,
+    pub lf1_threshold_count: u32,
+    pub lf2_threshold_offset_words: u32,
+    pub lf2_threshold_count: u32,
+    pub _reserved: [u32; 3],
+}
+
+/// One pass-group entropy invocation. The first 64 bytes keep the lane's bounds and scratch base
+/// in one naturally aligned cache line; the trailing 48 bytes carry the block-context table ABI.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct HfCoefficientPassParams {
@@ -32,10 +50,11 @@ pub struct HfCoefficientPassParams {
     num_hf_presets: u32,
     num_block_clusters: u32,
     context_map_offset_words: u32,
-    block_context_map_offset_words: u32,
+    lf_plane_stride_words: u32,
     lz77_window_base_words: u32,
     coeff_shift: u32,
     _reserved: u32,
+    block_context: HfBlockContextTables,
 }
 
 /// Packed immutable input for all pass groups. Offsets are word-relative to `entropy_words`.
@@ -46,6 +65,44 @@ pub struct HfCoefficientExecutionPlan {
     pub params: Vec<HfCoefficientPassParams>,
     pub sink_params: HfCoefficientSinkParams,
     pub lz77_scratch_words: u32,
+}
+
+fn append_block_context_tables(
+    words: &mut Vec<u32>,
+    block_context_map: &[u32],
+    qf_thresholds: &[u32],
+    lf_thresholds: &[Vec<i32>; 3],
+) -> Result<HfBlockContextTables, HfCoefficientPlanError> {
+    let offset = |words: &[u32], field: &'static str| {
+        u32::try_from(words.len()).map_err(|_| HfCoefficientPlanError::ArithmeticOverflow { field })
+    };
+    let count = |values: usize, field: &'static str| {
+        u32::try_from(values).map_err(|_| HfCoefficientPlanError::ArithmeticOverflow { field })
+    };
+
+    let block_context_map_offset_words = offset(words, "block-context map offset")?;
+    words.extend_from_slice(block_context_map);
+    let qf_threshold_offset_words = offset(words, "QF threshold offset")?;
+    words.extend_from_slice(qf_thresholds);
+    let lf0_threshold_offset_words = offset(words, "LF0 threshold offset")?;
+    words.extend(lf_thresholds[0].iter().map(|&threshold| threshold as u32));
+    let lf1_threshold_offset_words = offset(words, "LF1 threshold offset")?;
+    words.extend(lf_thresholds[1].iter().map(|&threshold| threshold as u32));
+    let lf2_threshold_offset_words = offset(words, "LF2 threshold offset")?;
+    words.extend(lf_thresholds[2].iter().map(|&threshold| threshold as u32));
+
+    Ok(HfBlockContextTables {
+        block_context_map_offset_words,
+        qf_threshold_offset_words,
+        qf_threshold_count: count(qf_thresholds.len(), "QF threshold count")?,
+        lf0_threshold_offset_words,
+        lf0_threshold_count: count(lf_thresholds[0].len(), "LF0 threshold count")?,
+        lf1_threshold_offset_words,
+        lf1_threshold_count: count(lf_thresholds[1].len(), "LF1 threshold count")?,
+        lf2_threshold_offset_words,
+        lf2_threshold_count: count(lf_thresholds[2].len(), "LF2 threshold count")?,
+        _reserved: [0; 3],
+    })
 }
 
 impl HfCoefficientExecutionPlan {
@@ -60,29 +117,28 @@ impl HfCoefficientExecutionPlan {
             }
         })?;
         let context_map_offset_words = metadata_words;
-        let context_words = u32::try_from(entropy.context_map.len()).map_err(|_| {
-            HfCoefficientPlanError::ArithmeticOverflow {
-                field: "context-map words",
-            }
-        })?;
-        let block_context_map_offset_words = context_map_offset_words
-            .checked_add(context_words)
-            .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
-                field: "block-context map offset",
-            })?;
         let mut entropy_words = Vec::with_capacity(
             entropy
                 .metadata
                 .len()
                 .checked_add(entropy.context_map.len())
                 .and_then(|words| words.checked_add(entropy.block_context_map.len()))
+                .and_then(|words| words.checked_add(entropy.qf_thresholds.len()))
+                .and_then(|words| words.checked_add(entropy.lf_thresholds[0].len()))
+                .and_then(|words| words.checked_add(entropy.lf_thresholds[1].len()))
+                .and_then(|words| words.checked_add(entropy.lf_thresholds[2].len()))
                 .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
                     field: "entropy bundle words",
                 })?,
         );
         entropy_words.extend_from_slice(&entropy.metadata);
         entropy_words.extend_from_slice(&entropy.context_map);
-        entropy_words.extend_from_slice(&entropy.block_context_map);
+        let block_context = append_block_context_tables(
+            &mut entropy_words,
+            &entropy.block_context_map,
+            &entropy.qf_thresholds,
+            &entropy.lf_thresholds,
+        )?;
 
         let group_count = u32::try_from(entropy.pass_groups.len()).map_err(|_| {
             HfCoefficientPlanError::ArithmeticOverflow {
@@ -100,7 +156,13 @@ impl HfCoefficientExecutionPlan {
                 field: "pass-group LZ77 scratch words",
             },
         )?;
-        let [blocks_per_row, _] = packet.block_extent();
+        let [blocks_per_row, block_rows] = packet.block_extent();
+        let lz77_scratch_base_words = packet.reconstructed_words()?;
+        let lf_plane_stride_words = blocks_per_row.checked_mul(block_rows).ok_or(
+            HfCoefficientPlanError::ArithmeticOverflow {
+                field: "quantized LF plane stride",
+            },
+        )?;
         let lz77_window_mask = entropy.lz77_window_words.saturating_sub(1);
         let num_block_clusters = entropy.num_block_clusters;
         let mut params = Vec::with_capacity(entropy.pass_groups.len());
@@ -136,14 +198,16 @@ impl HfCoefficientExecutionPlan {
                 num_hf_presets: entropy.num_hf_presets,
                 num_block_clusters,
                 context_map_offset_words,
-                block_context_map_offset_words,
-                lz77_window_base_words: group_index.checked_mul(entropy.lz77_window_words).ok_or(
-                    HfCoefficientPlanError::ArithmeticOverflow {
+                lf_plane_stride_words,
+                lz77_window_base_words: group_index
+                    .checked_mul(entropy.lz77_window_words)
+                    .and_then(|offset| lz77_scratch_base_words.checked_add(offset))
+                    .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
                         field: "pass-group LZ77 scratch offset",
-                    },
-                )?,
+                    })?,
                 coeff_shift: 0,
                 _reserved: 0,
+                block_context,
             });
         }
 
@@ -179,6 +243,8 @@ impl HfCoefficientExecutionPlan {
 pub enum HfCoefficientPlanError {
     #[error(transparent)]
     Frontend(#[from] crate::vardct_frontend::VarDctFrontendError),
+    #[error(transparent)]
+    Packet(#[from] crate::vardct_packet::BoundedVarDctPacketError),
     #[error("HF coefficient plan has {actual} pass groups; expected {expected}")]
     PassGroupCount { expected: u64, actual: u64 },
     #[error("HF coefficient plan arithmetic overflowed while computing {field}")]
@@ -308,7 +374,8 @@ pub struct HfCoefficientPipeline {
 pub struct HfCoefficientBuffers<'a> {
     pub codestream: &'a wgpu::Buffer,
     pub entropy_bundle: &'a wgpu::Buffer,
-    pub lz77_scratch: &'a wgpu::Buffer,
+    /// Reconstruction workspace followed by disjoint per-group HF LZ77 scratch slices.
+    pub reconstruction: &'a wgpu::Buffer,
     pub params: &'a wgpu::Buffer,
     pub status: &'a wgpu::Buffer,
     pub artifact: &'a wgpu::Buffer,
@@ -348,7 +415,7 @@ impl HfCoefficientPipeline {
             entries: &[
                 binding(0, buffers.codestream),
                 binding(1, buffers.entropy_bundle),
-                binding(2, buffers.lz77_scratch),
+                binding(2, buffers.reconstruction),
                 binding(3, buffers.params),
                 binding(4, buffers.status),
             ],
@@ -377,6 +444,7 @@ impl HfCoefficientPipeline {
 fn shader_source() -> String {
     SHADER_TEMPLATE
         .replace(ENTROPY_ABI_MARKER, ENTROPY_ABI)
+        .replace(BLOCK_CONTEXT_MARKER, BLOCK_CONTEXT)
         .replace(ENTROPY_MARKER, ENTROPY)
         .replace(COEFFICIENT_SINK_MARKER, COEFFICIENT_SINK)
 }
@@ -389,8 +457,11 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 64);
+    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 112);
     assert!(std::mem::align_of::<HfCoefficientPassParams>() == 16);
+    assert!(std::mem::size_of::<HfBlockContextTables>() == 48);
+    assert!(std::mem::align_of::<HfBlockContextTables>() == 4);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, block_context) == 64);
     assert!(std::mem::size_of::<GpuHfCoefficientStatus>() == HF_COEFFICIENT_STATUS_BYTES as usize);
 };
 
@@ -408,4 +479,41 @@ mod tests {
         .validate(&module)
         .unwrap();
     }
+
+    #[test]
+    fn block_context_tables_are_word_exact_and_ordered() {
+        let mut words = vec![99, 98];
+        let tables = append_block_context_tables(
+            &mut words,
+            &[7, 8, 9],
+            &[4, 10],
+            &[vec![-2, 5], vec![0], vec![-10, 3]],
+        )
+        .unwrap();
+        assert_eq!(tables.block_context_map_offset_words, 2);
+        assert_eq!(tables.qf_threshold_offset_words, 5);
+        assert_eq!(tables.lf0_threshold_offset_words, 7);
+        assert_eq!(tables.lf1_threshold_offset_words, 9);
+        assert_eq!(tables.lf2_threshold_offset_words, 10);
+        assert_eq!(
+            &words,
+            &[
+                99,
+                98,
+                7,
+                8,
+                9,
+                4,
+                10,
+                (-2i32) as u32,
+                5,
+                0,
+                (-10i32) as u32,
+                3
+            ]
+        );
+    }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_tests;

@@ -935,10 +935,20 @@ fn validate_device_limits(
     memory: VarDctDecodeMemoryStats,
 ) -> Result<(), VarDctDecodeError> {
     let limits = device.limits();
+    let reconstruction_storage_bytes = memory
+        .reconstructed_bytes
+        .checked_add(memory.hf_lz77_scratch_bytes)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "combined LF reconstruction and HF LZ77 bytes",
+        })?;
     for (resource, required, storage) in [
         ("codestream upload", memory.codestream_bytes, true),
         ("Modular metadata", memory.modular_metadata_bytes, true),
-        ("LF reconstruction", memory.reconstructed_bytes, true),
+        (
+            "LF reconstruction and HF LZ77 storage",
+            reconstruction_storage_bytes,
+            true,
+        ),
         ("raw HF metadata", memory.raw_metadata_bytes, true),
         ("coefficients", memory.coefficient_bytes, true),
         ("packet status", memory.packet_status_bytes, true),
@@ -949,7 +959,6 @@ fn validate_device_limits(
         ("artifact occupancy", memory.occupancy_bytes, true),
         ("HF entropy bundle", memory.hf_entropy_bundle_bytes, true),
         ("HF pass-group parameters", memory.hf_params_bytes, true),
-        ("HF LZ77 scratch", memory.hf_lz77_scratch_bytes, true),
         ("HF pass-group status", memory.hf_status_bytes, true),
         (
             "HF coefficient order table",
@@ -1097,7 +1106,6 @@ struct VarDctMemoryPermits {
 
 struct HfCoefficientJobBuffers {
     entropy_bundle: wgpu::Buffer,
-    lz77_scratch: wgpu::Buffer,
     params: wgpu::Buffer,
     status: wgpu::Buffer,
     order_table: wgpu::Buffer,
@@ -1466,9 +1474,16 @@ fn submit_vardct(
             mapped_at_creation: false,
         })
     };
+    let reconstructed_storage_bytes = source
+        .memory
+        .reconstructed_bytes
+        .checked_add(source.memory.hf_lz77_scratch_bytes)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "combined LF reconstruction and HF LZ77 bytes",
+        })?;
     let reconstructed = storage(
         "jxl-wgpu VarDCT LF reconstruction",
-        source.memory.reconstructed_bytes,
+        reconstructed_storage_bytes,
         wgpu::BufferUsages::COPY_DST,
     );
     let raw_metadata = storage(
@@ -1535,11 +1550,6 @@ fn submit_vardct(
                     contents: bytemuck::cast_slice(&plan.entropy_words),
                     usage: wgpu::BufferUsages::STORAGE,
                 }),
-                lz77_scratch: storage(
-                    "jxl-wgpu HF LZ77 scratch",
-                    plan.lz77_scratch_bytes(),
-                    wgpu::BufferUsages::COPY_DST,
-                ),
                 params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("jxl-wgpu HF pass-group params"),
                     contents: bytemuck::cast_slice(&plan.params),
@@ -1620,7 +1630,6 @@ fn submit_vardct(
         commands.clear_buffer(buffer, 0, None);
     }
     if let Some(buffers) = &hf_coefficient_buffers {
-        commands.clear_buffer(&buffers.lz77_scratch, 0, None);
         commands.clear_buffer(&buffers.status, 0, None);
     }
     if let Some(sigma) = &epf_sigma {
@@ -1697,7 +1706,7 @@ fn submit_vardct(
             HfCoefficientBuffers {
                 codestream: &codestream_buffer,
                 entropy_bundle: &buffers.entropy_bundle,
-                lz77_scratch: &buffers.lz77_scratch,
+                reconstruction: &reconstructed,
                 params: &buffers.params,
                 status: &buffers.status,
                 artifact: &artifact,

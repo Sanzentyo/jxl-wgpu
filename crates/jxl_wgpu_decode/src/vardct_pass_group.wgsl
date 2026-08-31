@@ -1,4 +1,5 @@
 /*__JXL_MODULAR_ENTROPY_ABI__*/
+/*__JXL_VARDCT_BLOCK_CONTEXT__*/
 
 struct Params {
     entropy: EntropyStreamParams,
@@ -11,10 +12,11 @@ struct Params {
     num_hf_presets: u32,
     num_block_clusters: u32,
     context_map_offset_words: u32,
-    block_context_map_offset_words: u32,
+    lf_plane_stride_words: u32,
     lz77_window_base_words: u32,
     coeff_shift: u32,
     _reserved: u32,
+    block_context: HfBlockContextTables,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -188,9 +190,20 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
             for (var order_channel = 0u; order_channel < 3u && decode_error == 0u;
                 order_channel += 1u) {
                 let channel = channel_index(order_channel);
-                let block_context = modular_metadata[
-                    params.block_context_map_offset_words + order_channel * 13u
-                ];
+                let qf = hf_artifact[task_metadata + 6u];
+                let order_id = hf_artifact[task_metadata + 10u];
+                let lf = vec3<i32>(
+                    bitcast<i32>(reconstruction[params.lf_plane_stride_words + raster]),
+                    bitcast<i32>(reconstruction[raster]),
+                    bitcast<i32>(reconstruction[2u * params.lf_plane_stride_words + raster]),
+                );
+                let block_context = hf_block_context(
+                    params.block_context,
+                    order_channel,
+                    order_id,
+                    qf,
+                    lf,
+                );
                 if block_context >= params.num_block_clusters {
                     fail(ERROR_CONTEXT_MAP);
                     continue;

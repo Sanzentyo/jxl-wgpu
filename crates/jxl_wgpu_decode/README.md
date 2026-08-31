@@ -76,7 +76,7 @@ pixel extents through 2048x2048 when at least one axis exceeds 256, while keepin
 forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
 adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default dequantization metadata,
 disabled, default, or custom Gaborish and disabled/default/custom one-to-three-iteration EPF, zero chroma correlation, an order mask containing only the DCT8 bit,
-default HF block-context thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
+arbitrary valid HF block-context maps with stream-defined quant-field and signed X/Y/B LF thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
@@ -90,7 +90,10 @@ and expands only the small HF coefficient-order metadata permutation. It does no
 image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
 each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and custom-order
-coefficient sink, and runs the existing resident regular
+coefficient sink. Block-context selection reads the resident quantized LF planes and each task's
+`hf_mul`; its variable tables share the entropy bundle, while per-group LZ history occupies a
+disjoint tail slice of the same reconstruction buffer so the pass remains within eight portable
+storage bindings. The submission then runs the existing resident regular
 VarDCT renderer, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
@@ -143,14 +146,17 @@ EPF1/EPF2 or EPF0/EPF1/EPF2 without readback between stages, checks the exact sh
 sigma, and uniform reservations, and permits at most one RGB8 code of difference from both Rust
 `jxl` and `djxl`. A separate actual-GPU malformed-metadata test feeds sharpness 8 through the same
 WGSL validation function used by the packet decoder and requires the typed `Sharpness` error.
+An actual-GPU block-context differential test covers negative and positive LF thresholds, exact
+threshold boundaries, multiple quant-field segments, all channel positions, and distinct order
+IDs against the normative scalar index formula. Naga semantic validation runs even without an
+adapter.
 The serialized pass-1/pass-2 zero-flush values remain present in the frame inventory. libjxl 0.12
 and the Rust `jxl` implementation accept those parameters but their EPF weight function does not
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
 This is not full VarDCT coverage. Multiple LF groups, mixed or non-DCT8 transform strategies,
-special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom block-context
-thresholds, custom quantization matrices,
+special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom quantization matrices,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, cross-LF-group restoration,
 crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported

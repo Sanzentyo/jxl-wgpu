@@ -31,10 +31,6 @@ pub enum UnsupportedVarDctPacketFeature {
     MultipleLfGroups,
     #[error("the DCT8 coefficient executor cannot use coefficient-order mask {used_orders:#x}")]
     CustomCoefficientOrders { used_orders: u16 },
-    #[error(
-        "the bounded DCT8 coefficient executor requires the default HF block-context thresholds"
-    )]
-    HfBlockContextThresholds,
     #[error("the bounded regular-VarDCT decoder currently accepts 8-bit samples")]
     BitDepth,
     #[error("the one-entry packet extent is not one implemented regular VarDCT transform")]
@@ -70,6 +66,8 @@ pub enum BoundedVarDctPacketError {
     ArithmeticOverflow { field: &'static str },
     #[error("HF-global entropy metadata leaves {bits} non-padding bits")]
     HfGlobalTrailingBits { bits: u64 },
+    #[error("HF block-context map has {actual} entries; expected {expected}")]
+    HfBlockContextMapLength { expected: usize, actual: usize },
 }
 
 /// GPU-reported validation failure. No output is authoritative after this error.
@@ -137,6 +135,10 @@ pub struct HfCoefficientEntropyPlan {
     pub context_map: Vec<u32>,
     /// Default channel/order-to-block-cluster map used before coefficient contexts.
     pub block_context_map: Vec<u32>,
+    /// Quant-field thresholds used to select the HF block-context map segment.
+    pub qf_thresholds: Vec<u32>,
+    /// Quantized LF thresholds in X, Y, B channel order.
+    pub lf_thresholds: [Vec<i32>; 3],
     /// Three DCT8 order descriptors followed by their packed `(x, y)` coordinate tables.
     pub order_words: Vec<u32>,
     pub order_coordinate_offset_words: u32,
@@ -516,14 +518,23 @@ impl HfCoefficientEntropyPlan {
         }
         let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
             parse_dct8_coefficient_orders(codestream, prefix)?;
-        if !block_context.qf_thresholds.is_empty()
-            || block_context
-                .lf_thresholds
-                .iter()
-                .any(|thresholds| !thresholds.is_empty())
-            || block_context.block_context_map.len() != 39
-        {
-            return Err(UnsupportedVarDctPacketFeature::HfBlockContextThresholds.into());
+        let lf_context_count = block_context
+            .lf_thresholds
+            .iter()
+            .try_fold(1usize, |count, thresholds| {
+                count.checked_mul(thresholds.len().checked_add(1)?)
+            });
+        let expected_block_contexts = lf_context_count
+            .and_then(|count| count.checked_mul(block_context.qf_thresholds.len().checked_add(1)?))
+            .and_then(|count| count.checked_mul(3 * 13))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF block-context map length",
+            })?;
+        if block_context.block_context_map.len() != expected_block_contexts {
+            return Err(BoundedVarDctPacketError::HfBlockContextMapLength {
+                expected: expected_block_contexts,
+                actual: block_context.block_context_map.len(),
+            });
         }
         let block_cluster_count = block_context.num_block_clusters;
         let context_count = 495u32
@@ -590,6 +601,8 @@ impl HfCoefficientEntropyPlan {
             metadata: words,
             context_map,
             block_context_map,
+            qf_thresholds: block_context.qf_thresholds.clone(),
+            lf_thresholds: block_context.lf_thresholds.clone(),
             order_words,
             order_coordinate_offset_words,
             pass_groups,
