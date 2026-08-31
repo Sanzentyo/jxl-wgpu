@@ -783,6 +783,7 @@ dependencies = [
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
  "jxl_wgpu",
+ "jxl_wgpu_decode",
  "naga",
  "pollster",
  "thiserror",

@@ -62,7 +62,7 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 | Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. |
 | VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers mixed maps containing all 27 regular and special transform strategies, single-pass nonzero AC, all 13 natural/custom coefficient-order families, stream-defined block contexts and HF chroma correlation, every normative default dequant matrix, scanline or entropy-permuted center-first pass groups, multiple LF groups with a shared global MA tree, resident Gaborish plus one-to-three-iteration EPF, and a checked 2056×256 LF-boundary extent. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
-| VarDCT encode | **Partial** | All 27 strategy identifiers execute, but only in a fixed distance-25 LF-only profile with every AC coefficient quantized to zero; tiled DCT8 is limited to one LF group. |
+| VarDCT encode | **Partial** | All 27 strategy identifiers execute in fixed-transform form. The fixed distance-25 LF-only tiled DCT8 profile emits multiple LF/AC groups, resets prediction per LF group, and accepts checked axes through 16K, but every AC coefficient is still quantized to zero and image-wide mixed strategy selection is absent. |
 | Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the bounded stock VarDCT decoder constructs one full-image sigma plane and routes Gaborish plus signaled EPF0/EPF1/EPF2 across LF-group boundaries through one resident ping-pong scratch set in the same submission. Upsampling, composition, and the rest of the legal graph remain disconnected. |
 | Output formats | **Partial** | Native integer Gray/RGB/RGBA and 30 portable VPI pitch-linear outputs exist for the lossless Gray8 conversion path; VarDCT currently returns packed RGB8 only. |
 | Async/concurrency/memory | **Partial** | Native blocking and runtime-neutral futures, browser compilation, one shared byte budget, leased output lifetime, true aggregate readback, and bounded pools exist; codec submission is not yet coalesced across images. |
@@ -146,7 +146,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `VDCT-E01` | P0 | **Partial** | Generalize the existing 27-strategy forward-transform path from single/fixed blocks to mixed strategy maps, arbitrary image extents, multiple LF groups, and all edge blocks. Forward/inverse scalar oracles cover every strategy. | `VDCT-D04` |
+| `VDCT-E01` | P0 | **Partial** | All 27 fixed-transform identifiers and the arbitrary-extent tiled DCT8 subset execute. Tiled DCT8 now emits every 2048-pixel LF group and 256-pixel AC group, resets GPU Gradient prediction at LF boundaries, records checked per-group bit ranges, and uses a 2-D block dispatch. Actual-GPU 2056×256 and 256×2056 outputs decode with Rust `jxl`, `djxl`, and the stock GPU decoder/readback within one code; exact-black 16384×1 and 1×16384 exercise eight LF groups and 64 AC groups. Completion still requires mixed strategy maps over arbitrary images, non-DCT8 edge transforms, and forward/inverse scalar oracles for every strategy in that image-wide path. | `VDCT-D04` |
 | `VDCT-E02` | P0 | **Missing** | Quantize and serialize real nonzero AC coefficients with correct orders, contexts, signs, histograms, and pass groups. Generated streams must decode with libjxl across all strategies and group boundaries. | `ENT-E01`, `VDCT-E01`, `VDCT-D03` |
 | `VDCT-E03` | P1 | **Missing** | Implement adaptive quant fields, distance/quality control, DC/LF/AC quant selection, quant bias, chroma-from-luma search, and a bounded rate-control loop. Report size and quality distributions, not only one fixture. | `VDCT-E02`, `QA-05` |
 | `VDCT-E04` | P1 | **Missing** | Select strategy maps and coefficient orders by content and effort, including all special transforms. Decisions must be deterministic when requested and must improve a declared objective over DCT8-only. | `VDCT-E02`, `VDCT-D02` |
@@ -243,12 +243,12 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The coding-mode selector, shared typed entropy-stream ABI, first nonzero-AC multi-group DCT8
-decode milestone, bounded resident Gaborish/EPF restoration chain, and logical/physical TOC-order
-normalization are implemented. The immediate next target is the remaining `ENT-D01` topology,
-followed by mixed-strategy
-`VDCT-D01..05`, multi-LF-group restoration, and broader render-graph composition. The corresponding GPU
-nonzero-AC encoder remains required before the fixture can be re-encoded without a CPU pixel path.
+The coding-mode selector, shared typed entropy-stream ABI, nonzero-AC mixed/multi-group decode,
+bounded resident Gaborish/EPF restoration chain, logical/physical TOC-order normalization, and the
+multi-LF-group tiled-DCT8 LF-only encoder are implemented. The immediate P0 gap is the remaining
+`ENT-D01` topology, especially local per-substream MA trees. After that, `VDCT-E02` must emit real
+nonzero AC coefficients and the remaining `VDCT-E01` work must select mixed image-wide strategies;
+broader render-graph composition remains required in parallel with those format-completeness gates.
 
 ## Claims explicitly prohibited before their gates pass
 

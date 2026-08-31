@@ -322,10 +322,10 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
   alpha blending, and 4 reference slots with runtime-neutral in-flight futures.
 - **LF-only VarDCT baseline (Slice 5 partial)**: `VarDctEncoder` executes all 27 standard
-  strategies, and `TiledVarDctEncoder` supports multi-AC-group DCT8 grids up to 2048x2048; the GPU
-  executes sRGB linearization, XYB conversion, LF quantization, clamped-gradient DC prediction, and
-  prefix/histogram assembly in an LF-only fixed distance-25 profile that quantizes AC coefficients
-  to zero.
+  strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with checked axes
+  through 16K. The GPU executes sRGB linearization, XYB conversion, LF quantization, group-local
+  clamped-gradient DC prediction, prefix/histogram assembly, and per-LF-group bit-range emission in
+  an LF-only fixed distance-25 profile that quantizes AC coefficients to zero.
 
 ### Remaining work
 

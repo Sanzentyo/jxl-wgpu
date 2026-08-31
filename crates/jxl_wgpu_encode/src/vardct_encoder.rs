@@ -95,15 +95,19 @@ pub struct TiledVarDctGrid {
     pub block_rows: u32,
     pub ac_group_columns: u32,
     pub ac_group_rows: u32,
+    pub lf_group_columns: u32,
+    pub lf_group_rows: u32,
 }
 
 impl TiledVarDctGrid {
     /// Pixel dimension of one standard AC/pass group.
     pub const AC_GROUP_DIMENSION: u32 = AC_GROUP_DIM_PIXELS;
-    /// Current one-LF-group profile bound on each source axis.
-    pub const MAX_DIMENSION: u32 = LF_GROUP_DIM_PIXELS;
+    /// Pixel dimension of one standard LF/DC group.
+    pub const LF_GROUP_DIMENSION: u32 = LF_GROUP_DIM_PIXELS;
+    /// Largest source axis exercised by the checked GPU profile.
+    pub const MAX_DIMENSION: u32 = 16_384;
 
-    /// Derives the exact block and AC-group grid without allocating GPU data.
+    /// Derives the exact block, LF-group, and AC-group grids without allocating GPU data.
     pub fn new(width: u32, height: u32) -> Result<Self, EncodeError> {
         if width == 0 || height == 0 {
             return Err(EncodeError::InvalidSource(
@@ -111,7 +115,7 @@ impl TiledVarDctGrid {
             ));
         }
         if width > Self::MAX_DIMENSION || height > Self::MAX_DIMENSION {
-            return Err(UnsupportedFeature::TiledVarDctLfGroups {
+            return Err(UnsupportedFeature::TiledVarDctDimensions {
                 width,
                 height,
                 max_dimension: Self::MAX_DIMENSION,
@@ -125,6 +129,8 @@ impl TiledVarDctGrid {
             block_rows: height.div_ceil(8),
             ac_group_columns: width.div_ceil(Self::AC_GROUP_DIMENSION),
             ac_group_rows: height.div_ceil(Self::AC_GROUP_DIMENSION),
+            lf_group_columns: width.div_ceil(Self::LF_GROUP_DIMENSION),
+            lf_group_rows: height.div_ceil(Self::LF_GROUP_DIMENSION),
         };
         if grid.ac_group_count()? == 1 {
             return Err(UnsupportedFeature::TiledVarDctSingleAcGroup {
@@ -151,11 +157,18 @@ impl TiledVarDctGrid {
         )
     }
 
+    pub fn lf_group_count(self) -> Result<u32, EncodeError> {
+        self.lf_group_columns.checked_mul(self.lf_group_rows).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT LF group count overflow"),
+        )
+    }
+
     /// TOC entries for the deliberately non-fused tiled profile: DC global,
-    /// one DC group, AC global, then one pass packet per AC group.
+    /// every DC group, AC global, then one pass packet per AC group.
     pub fn toc_entries(self) -> Result<u32, EncodeError> {
-        self.ac_group_count()?
-            .checked_add(3)
+        self.lf_group_count()?
+            .checked_add(self.ac_group_count()?)
+            .and_then(|groups| groups.checked_add(2))
             .ok_or(EncodeError::InvalidConfiguration(
                 "VarDCT TOC entry count overflow",
             ))
@@ -312,7 +325,8 @@ pub enum VarDctKernelLayout {
     /// Runtime-sized artifact and 8x8-block reduction used above 32x32.
     Scalable,
     /// Runtime-sized artifact where every 8x8 block is an independent DCT8
-    /// transform and the frame may contain multiple 256-pixel AC groups.
+    /// transform and the frame may contain multiple 2,048-pixel LF groups and
+    /// 256-pixel AC groups.
     TiledDct8,
 }
 
@@ -429,7 +443,11 @@ struct ScalableVarDctKernelParams {
     fragment_word_capacity: u32,
     artifact_words: u32,
     topology: u32,
-    padding: [u32; 9],
+    fragment_descriptor_offset: u32,
+    fragment_descriptor_len: u32,
+    lf_groups_x: u32,
+    lf_groups_y: u32,
+    padding: [u32; 5],
 }
 
 #[repr(C)]
@@ -458,7 +476,19 @@ struct ScalableVarDctArtifactHeader {
     blocks_y: u32,
     topology: u32,
     raw_histogram: [u32; RAW_SYMBOLS],
-    padding: [u32; 23],
+    fragment_descriptor_offset: u32,
+    fragment_descriptor_len: u32,
+    lf_groups_x: u32,
+    lf_groups_y: u32,
+    lf_group_count: u32,
+    padding: [u32; 18],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScalableDcFragmentDescriptor {
+    bit_offset: u32,
+    bit_len: u32,
 }
 
 const _: () = {
@@ -472,6 +502,8 @@ const _: () = {
     assert!(std::mem::align_of::<ScalableVarDctKernelParams>() == 4);
     assert!(std::mem::size_of::<ScalableVarDctArtifactHeader>() == 256);
     assert!(std::mem::align_of::<ScalableVarDctArtifactHeader>() == 4);
+    assert!(std::mem::size_of::<ScalableDcFragmentDescriptor>() == 8);
+    assert!(std::mem::align_of::<ScalableDcFragmentDescriptor>() == 4);
 };
 
 fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
@@ -488,6 +520,8 @@ fn prefix_entries(code: &PrefixCode) -> [GpuPrefixEntry; RAW_SYMBOLS] {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScalableArtifactLayout {
+    fragment_descriptor_offset: u32,
+    fragment_descriptor_len: u32,
     strategy_offset: u32,
     strategy_len: u32,
     dc_offset: u32,
@@ -505,12 +539,13 @@ struct ScalableArtifactLayout {
 impl ScalableArtifactLayout {
     fn new(strategy: VarDctStrategy, code: &PrefixCode) -> Result<Self, EncodeError> {
         let (blocks_x, blocks_y) = strategy.block_grid();
-        Self::for_block_grid(blocks_x, blocks_y, code)
+        Self::for_block_grid(blocks_x, blocks_y, 1, code)
     }
 
     fn for_block_grid(
         blocks_x: u32,
         blocks_y: u32,
+        lf_group_count: u32,
         code: &PrefixCode,
     ) -> Result<Self, EncodeError> {
         let strategy_len =
@@ -551,7 +586,20 @@ impl ScalableArtifactLayout {
                 ))?
                 / 32;
 
-        let strategy_offset = SCALABLE_HEADER_WORDS;
+        let fragment_descriptor_offset = SCALABLE_HEADER_WORDS;
+        let fragment_descriptor_len =
+            lf_group_count
+                .checked_mul(2)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT fragment descriptor size overflow",
+                ))?;
+        let strategy_offset = align_words(
+            fragment_descriptor_offset
+                .checked_add(fragment_descriptor_len)
+                .ok_or(EncodeError::InvalidConfiguration(
+                    "VarDCT fragment descriptor section overflow",
+                ))?,
+        )?;
         let dc_offset = align_words(strategy_offset.checked_add(strategy_len).ok_or(
             EncodeError::InvalidConfiguration("VarDCT strategy section overflow"),
         )?)?;
@@ -569,6 +617,8 @@ impl ScalableArtifactLayout {
                 EncodeError::InvalidConfiguration("VarDCT artifact size overflow"),
             )?)?;
         Ok(Self {
+            fragment_descriptor_offset,
+            fragment_descriptor_len,
             strategy_offset,
             strategy_len,
             dc_offset,
@@ -633,6 +683,8 @@ struct VarDctFrameLayout {
     blocks_y: u32,
     ac_groups_x: u32,
     ac_groups_y: u32,
+    lf_groups_x: u32,
+    lf_groups_y: u32,
     topology: VarDctTopology,
 }
 
@@ -647,6 +699,8 @@ impl VarDctFrameLayout {
             blocks_y,
             ac_groups_x: 1,
             ac_groups_y: 1,
+            lf_groups_x: 1,
+            lf_groups_y: 1,
             topology: VarDctTopology::SingleTransform(strategy),
         }
     }
@@ -660,16 +714,10 @@ impl VarDctFrameLayout {
             blocks_y: grid.block_rows,
             ac_groups_x: grid.ac_group_columns,
             ac_groups_y: grid.ac_group_rows,
+            lf_groups_x: grid.lf_group_columns,
+            lf_groups_y: grid.lf_group_rows,
             topology: VarDctTopology::TiledDct8,
         })
-    }
-
-    fn block_count(self) -> Result<u32, EncodeError> {
-        self.blocks_x
-            .checked_mul(self.blocks_y)
-            .ok_or(EncodeError::InvalidConfiguration(
-                "VarDCT block count overflow",
-            ))
     }
 
     fn ac_group_count(self) -> Result<u32, EncodeError> {
@@ -680,11 +728,62 @@ impl VarDctFrameLayout {
             ))
     }
 
-    const fn first_block_count(self) -> u32 {
-        match self.topology {
-            VarDctTopology::SingleTransform(_) => 1,
-            VarDctTopology::TiledDct8 => self.blocks_x * self.blocks_y,
+    fn lf_group_count(self) -> Result<u32, EncodeError> {
+        self.lf_groups_x
+            .checked_mul(self.lf_groups_y)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT LF group count overflow",
+            ))
+    }
+
+    fn lf_group_blocks(self, group: u32) -> Result<LfGroupBlocks, EncodeError> {
+        let count = self.lf_group_count()?;
+        if group >= count {
+            return Err(EncodeError::InvalidConfiguration(
+                "VarDCT LF group index is out of range",
+            ));
         }
+        if matches!(self.topology, VarDctTopology::SingleTransform(_)) {
+            return Ok(LfGroupBlocks {
+                origin_x: 0,
+                origin_y: 0,
+                width: self.blocks_x,
+                height: self.blocks_y,
+                first_block_count: 1,
+            });
+        }
+        let group_x = group % self.lf_groups_x;
+        let group_y = group / self.lf_groups_x;
+        let origin_x = group_x * (LF_GROUP_DIM_PIXELS / 8);
+        let origin_y = group_y * (LF_GROUP_DIM_PIXELS / 8);
+        let width = (self.blocks_x - origin_x).min(LF_GROUP_DIM_PIXELS / 8);
+        let height = (self.blocks_y - origin_y).min(LF_GROUP_DIM_PIXELS / 8);
+        Ok(LfGroupBlocks {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            first_block_count: width * height,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LfGroupBlocks {
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+    first_block_count: u32,
+}
+
+impl LfGroupBlocks {
+    fn block_count(self) -> Result<u32, EncodeError> {
+        self.width
+            .checked_mul(self.height)
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT LF group block count overflow",
+            ))
     }
 }
 
@@ -886,26 +985,54 @@ fn pack_signed_control(value: i32) -> u32 {
 
 #[derive(Clone, Copy)]
 struct VarDctArtifactData<'a> {
-    block_count: u32,
     strategy: u32,
     dc_fragment_words: &'a [u32],
     dc_fragment_bit_len: u32,
+    dc_fragment_descriptors: &'a [ScalableDcFragmentDescriptor],
+}
+
+impl VarDctArtifactData<'_> {
+    fn dc_fragment_descriptor(
+        self,
+        group: u32,
+    ) -> Result<ScalableDcFragmentDescriptor, EncodeError> {
+        if self.dc_fragment_descriptors.is_empty() && group == 0 {
+            return Ok(ScalableDcFragmentDescriptor {
+                bit_offset: 0,
+                bit_len: self.dc_fragment_bit_len,
+            });
+        }
+        self.dc_fragment_descriptors
+            .get(usize::try_from(group).map_err(|_| {
+                EncodeError::InvalidConfiguration("VarDCT LF group index does not fit usize")
+            })?)
+            .copied()
+            .ok_or(EncodeError::InvalidConfiguration(
+                "VarDCT LF group fragment descriptor is missing",
+            ))
+    }
 }
 
 fn append_gpu_dc_fragment(
     output: &mut BitWriter,
-    artifact: VarDctArtifactData<'_>,
+    fragment_words: &[u32],
+    descriptor: ScalableDcFragmentDescriptor,
 ) -> Result<(), EncodeError> {
-    let bit_len = usize::try_from(artifact.dc_fragment_bit_len)
+    let bit_offset = usize::try_from(descriptor.bit_offset)
+        .map_err(|_| EncodeError::Backend("GPU DC fragment offset overflow".into()))?;
+    let bit_len = usize::try_from(descriptor.bit_len)
         .map_err(|_| EncodeError::Backend("GPU DC fragment length overflow".into()))?;
-    if bit_len > artifact.dc_fragment_words.len() * 32 {
+    let bit_end = bit_offset
+        .checked_add(bit_len)
+        .ok_or_else(|| EncodeError::Backend("GPU DC fragment range overflow".into()))?;
+    if bit_end > fragment_words.len() * 32 {
         return Err(EncodeError::Backend(
-            "GPU DC fragment exceeds its fixed artifact allocation".into(),
+            "GPU DC fragment exceeds its artifact allocation".into(),
         ));
     }
-    for bit_index in 0..bit_len {
-        let word = artifact.dc_fragment_words[bit_index / 32];
-        output.write_bits(u64::from((word >> (bit_index % 32)) & 1), 1)?;
+    for source_bit in bit_offset..bit_end {
+        let word = fragment_words[source_bit / 32];
+        output.write_bits(u64::from((word >> (source_bit % 32)) & 1), 1)?;
     }
     Ok(())
 }
@@ -915,38 +1042,45 @@ fn write_lf_group(
     code: &PrefixCode,
     artifact: VarDctArtifactData<'_>,
     frame: VarDctFrameLayout,
+    group_index: u32,
 ) -> Result<(), EncodeError> {
+    let group = frame.lf_group_blocks(group_index)?;
+    let block_count = group.block_count()?;
     output.write_bits(0, 2)?; // no extra LF precision
     write_local_modular_header(output)?;
-    append_gpu_dc_fragment(output, artifact)?;
+    append_gpu_dc_fragment(
+        output,
+        artifact.dc_fragment_words,
+        artifact.dc_fragment_descriptor(group_index)?,
+    )?;
 
     // GPU-selected regular strategies, no chroma-from-luma correction, fixed
     // HF multiplier, and zero EPF sharpness. Source-dependent DC entropy was
     // already packed by the GPU; these values describe its control map.
-    let first_block_bits = artifact.block_count.next_power_of_two().trailing_zeros() as u8;
+    let first_block_bits = block_count.next_power_of_two().trailing_zeros() as u8;
     output.write_bits(
-        u64::from(frame.first_block_count().checked_sub(1).ok_or(
+        u64::from(group.first_block_count.checked_sub(1).ok_or(
             EncodeError::InvalidConfiguration("VarDCT frame has no first transform block"),
         )?),
         first_block_bits,
     )?;
     write_local_modular_header(output)?;
-    let correlation_samples = frame.blocks_x.div_ceil(8) * frame.blocks_y.div_ceil(8);
+    let correlation_samples = group.width.div_ceil(8) * group.height.div_ceil(8);
     // The two chroma-from-luma maps are tiled on the 8x8-block grid. They are
     // one sample each through DCT64, then scale to 2x2 and 4x4 for the
     // DCT128/DCT256 families.
     for _ in 0..2 * correlation_samples {
         write_unsigned_token(output, code, 0)?;
     }
-    for _ in 0..frame.first_block_count() {
+    for _ in 0..group.first_block_count {
         write_unsigned_token(output, code, pack_signed_control(artifact.strategy as i32))?;
     }
     let first_quant_residual = (HF_MUL - 1) - artifact.strategy as i32;
     write_unsigned_token(output, code, pack_signed_control(first_quant_residual))?;
-    for _ in 1..frame.first_block_count() {
+    for _ in 1..group.first_block_count {
         write_unsigned_token(output, code, 0)?;
     }
-    for _ in 0..artifact.block_count {
+    for _ in 0..block_count {
         write_unsigned_token(output, code, 0)?;
     }
     Ok(())
@@ -972,10 +1106,11 @@ fn build_frame_packet(
     frame: VarDctFrameLayout,
 ) -> Result<FramePacketSet, EncodeError> {
     let ac_groups = frame.ac_group_count()?;
-    if ac_groups == 1 {
+    let lf_groups = frame.lf_group_count()?;
+    if ac_groups == 1 && lf_groups == 1 {
         let mut group = BitWriter::new();
         write_lf_global(&mut group, code)?;
-        write_lf_group(&mut group, code, artifact, frame)?;
+        write_lf_group(&mut group, code, artifact, frame, 0)?;
         write_hf_global(&mut group, ac_groups)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
@@ -991,26 +1126,30 @@ fn build_frame_packet(
     let mut dc_global = BitWriter::new();
     write_lf_global(&mut dc_global, code)?;
     dc_global.align_to_byte()?;
-    let mut dc_group = BitWriter::new();
-    write_lf_group(&mut dc_group, code, artifact, frame)?;
-    dc_group.align_to_byte()?;
     let mut ac_global = BitWriter::new();
     write_hf_global(&mut ac_global, ac_groups)?;
     ac_global.align_to_byte()?;
 
     let mut packets = Vec::with_capacity(
-        usize::try_from(ac_groups)
-            .map_err(|_| EncodeError::InvalidConfiguration("VarDCT AC group count overflow"))?
-            + 3,
+        usize::try_from(ac_groups.checked_add(lf_groups).ok_or(
+            EncodeError::InvalidConfiguration("VarDCT packet count overflow"),
+        )?)
+        .map_err(|_| EncodeError::InvalidConfiguration("VarDCT packet count overflow"))?
+            + 2,
     );
     packets.push(GroupPacket::new(
         GroupPacketKind::DcGlobal,
         dc_global.into_bytes(),
     ));
-    packets.push(GroupPacket::new(
-        GroupPacketKind::DcGroup(0),
-        dc_group.into_bytes(),
-    ));
+    for group_index in 0..lf_groups {
+        let mut dc_group = BitWriter::new();
+        write_lf_group(&mut dc_group, code, artifact, frame, group_index)?;
+        dc_group.align_to_byte()?;
+        packets.push(GroupPacket::new(
+            GroupPacketKind::DcGroup(group_index),
+            dc_group.into_bytes(),
+        ));
+    }
     packets.push(GroupPacket::new(
         GroupPacketKind::AcGlobal,
         ac_global.into_bytes(),
@@ -1021,7 +1160,7 @@ fn build_frame_packet(
         }));
     Ok(FramePacketSet::new(
         frame_header()?,
-        FrameGroupLayout::new(1, ac_groups, 1)?,
+        FrameGroupLayout::new(lf_groups, ac_groups, 1)?,
         packets,
     )?)
 }
@@ -1082,7 +1221,8 @@ impl VarDctBackend {
 
     /// Creates the bounded tiled-DCT8 profile used by [`TiledVarDctEncoder`].
     /// Every padded 8x8 block is an independent regular transform. The source
-    /// extent selects the checked block and AC-group grid at submission time.
+    /// extent selects the checked block, LF-group, and AC-group grids at
+    /// submission time.
     pub fn new_tiled_dct8(context: &WgpuContext) -> Result<Self, EncodeError> {
         Self::new_with_topology(context, VarDctTopology::TiledDct8)
     }
@@ -1308,15 +1448,18 @@ impl VarDctBackend {
                 VarDctTopology::SingleTransform(strategy) => {
                     ScalableArtifactLayout::new(strategy, &self.code)?
                 }
-                VarDctTopology::TiledDct8 => {
-                    ScalableArtifactLayout::for_block_grid(blocks_x, blocks_y, &self.code)?
-                }
+                VarDctTopology::TiledDct8 => ScalableArtifactLayout::for_block_grid(
+                    blocks_x,
+                    blocks_y,
+                    frame.lf_group_count()?,
+                    &self.code,
+                )?,
             };
-            let block_count = frame.block_count()?;
-            if block_count > self.max_compute_workgroups_per_dimension {
+            let required_workgroup_axis = blocks_x.max(blocks_y);
+            if required_workgroup_axis > self.max_compute_workgroups_per_dimension {
                 return Err(UnsupportedFeature::DeviceLimit {
                     name: "max_compute_workgroups_per_dimension",
-                    required: u64::from(block_count),
+                    required: u64::from(required_workgroup_axis),
                     available: u64::from(self.max_compute_workgroups_per_dimension),
                 }
                 .into());
@@ -1359,7 +1502,11 @@ impl VarDctBackend {
                         fragment_word_capacity: layout.fragment_word_capacity,
                         artifact_words: layout.artifact_words,
                         topology: frame.topology.artifact_id(),
-                        padding: [0; 9],
+                        fragment_descriptor_offset: layout.fragment_descriptor_offset,
+                        fragment_descriptor_len: layout.fragment_descriptor_len,
+                        lf_groups_x: frame.lf_groups_x,
+                        lf_groups_y: frame.lf_groups_y,
+                        padding: [0; 5],
                     },
                     layout,
                 },
@@ -1590,7 +1737,7 @@ impl GpuEncodeBackend for VarDctBackend {
                     });
                     pass.set_pipeline(quantize);
                     pass.set_bind_group(0, &quantize_bind_group, &[]);
-                    pass.dispatch_workgroups(params.blocks_x * params.blocks_y, 1, 1);
+                    pass.dispatch_workgroups(params.blocks_x, params.blocks_y, 1);
                 }
                 // A separate WebGPU pass is the explicit global storage
                 // visibility boundary for all block workgroups before the
@@ -2012,10 +2159,10 @@ fn validate_artifact<'a>(
 
 fn fixed_artifact_data(artifact: &VarDctKernelArtifact) -> VarDctArtifactData<'_> {
     VarDctArtifactData {
-        block_count: artifact.block_count,
         strategy: artifact.strategy,
         dc_fragment_words: &artifact.dc_fragment_words,
         dc_fragment_bit_len: artifact.dc_fragment_bit_len,
+        dc_fragment_descriptors: &[],
     }
 }
 
@@ -2056,6 +2203,9 @@ fn validate_scalable_artifact<'a>(
             "scalable VarDCT sample count overflow",
         ))?;
     let strategy = frame.topology.strategy();
+    let lf_group_count = frame
+        .lf_group_count()
+        .map_err(|_| BackendError::InvalidArtifact("scalable VarDCT LF group count overflow"))?;
     if header.status != SCALABLE_ARTIFACT_READY
         || header.block_count != block_count
         || header.dc_sample_count != dc_sample_count
@@ -2077,6 +2227,11 @@ fn validate_scalable_artifact<'a>(
         || header.blocks_x != blocks_x
         || header.blocks_y != blocks_y
         || header.topology != frame.topology.artifact_id()
+        || header.fragment_descriptor_offset != layout.fragment_descriptor_offset
+        || header.fragment_descriptor_len != layout.fragment_descriptor_len
+        || header.lf_groups_x != frame.lf_groups_x
+        || header.lf_groups_y != frame.lf_groups_y
+        || header.lf_group_count != lf_group_count
     {
         return Err(BackendError::InvalidArtifact(
             "scalable VarDCT status, live counts, orientation, or layout metadata mismatch",
@@ -2101,13 +2256,40 @@ fn validate_scalable_artifact<'a>(
         ));
     }
 
+    let descriptor_words = artifact_words(
+        words,
+        layout.fragment_descriptor_offset,
+        layout.fragment_descriptor_len,
+    )?;
+    let fragment_descriptors =
+        bytemuck::try_cast_slice::<u32, ScalableDcFragmentDescriptor>(descriptor_words).map_err(
+            |_| BackendError::InvalidArtifact("scalable VarDCT fragment descriptor ABI alignment"),
+        )?;
+    if fragment_descriptors.len()
+        != usize::try_from(lf_group_count).map_err(|_| {
+            BackendError::InvalidArtifact("scalable VarDCT LF group count does not fit usize")
+        })?
+    {
+        return Err(BackendError::InvalidArtifact(
+            "scalable VarDCT fragment descriptor count mismatch",
+        ));
+    }
     let strategy_map = artifact_words(words, layout.strategy_offset, layout.strategy_len)?;
     let quantized_dc = artifact_words(words, layout.dc_offset, layout.dc_len)?;
     let raw_tokens = artifact_words(words, layout.token_offset, layout.token_len)?;
     let extra_bits = artifact_words(words, layout.extra_offset, layout.extra_len)?;
     let fragment_words =
         artifact_words(words, layout.fragment_offset, layout.fragment_word_capacity)?;
-    validate_zero_gap(words, SCALABLE_HEADER_WORDS, layout.strategy_offset)?;
+    validate_zero_gap(
+        words,
+        SCALABLE_HEADER_WORDS,
+        layout.fragment_descriptor_offset,
+    )?;
+    validate_zero_gap(
+        words,
+        layout.fragment_descriptor_offset + layout.fragment_descriptor_len,
+        layout.strategy_offset,
+    )?;
     validate_zero_gap(
         words,
         layout.strategy_offset + layout.strategy_len,
@@ -2149,70 +2331,91 @@ fn validate_scalable_artifact<'a>(
     let entries = code.raw_entries();
     let mut expected_histogram = [0u32; RAW_SYMBOLS];
     let mut bit_offset = 0u32;
-    for channel in 0..3usize {
-        let base = channel * block_count_usize;
-        for block in 0..block_count_usize {
-            let block_x = block % blocks_x as usize;
-            let block_y = block / blocks_x as usize;
-            let left = if block_x > 0 {
-                quantized_dc[base + block - 1] as i32
-            } else if block_y > 0 {
-                quantized_dc[base + block - blocks_x as usize] as i32
-            } else {
-                0
-            };
-            let top = if block_y > 0 {
-                quantized_dc[base + block - blocks_x as usize] as i32
-            } else {
-                left
-            };
-            let top_left = if block_x > 0 && block_y > 0 {
-                quantized_dc[base + block - blocks_x as usize - 1] as i32
-            } else {
-                left
-            };
-            let actual = quantized_dc[base + block] as i32;
-            let residual = gradient_residual_i32(actual, top, left, top_left);
-            let (token, extra_bit_count, extra) = signed_token(residual)?;
-            let slot = base + block;
-            if raw_tokens[slot] != token || extra_bits[slot] != extra {
-                return Err(BackendError::InvalidArtifact(
-                    "scalable VarDCT DC token does not match its predicted residual",
-                ));
+    for (group_index, descriptor) in fragment_descriptors.iter().enumerate() {
+        let group_index = u32::try_from(group_index).map_err(|_| {
+            BackendError::InvalidArtifact("scalable VarDCT LF group index exceeds u32")
+        })?;
+        let group = frame.lf_group_blocks(group_index).map_err(|_| {
+            BackendError::InvalidArtifact("scalable VarDCT LF group geometry mismatch")
+        })?;
+        if descriptor.bit_offset != bit_offset {
+            return Err(BackendError::InvalidArtifact(
+                "scalable VarDCT fragment descriptors are not contiguous",
+            ));
+        }
+        for channel in 0..3usize {
+            let base = channel * block_count_usize;
+            for local_y in 0..group.height as usize {
+                for local_x in 0..group.width as usize {
+                    let block_x = group.origin_x as usize + local_x;
+                    let block_y = group.origin_y as usize + local_y;
+                    let block = block_y * blocks_x as usize + block_x;
+                    let left = if local_x > 0 {
+                        quantized_dc[base + block - 1] as i32
+                    } else if local_y > 0 {
+                        quantized_dc[base + block - blocks_x as usize] as i32
+                    } else {
+                        0
+                    };
+                    let top = if local_y > 0 {
+                        quantized_dc[base + block - blocks_x as usize] as i32
+                    } else {
+                        left
+                    };
+                    let top_left = if local_x > 0 && local_y > 0 {
+                        quantized_dc[base + block - blocks_x as usize - 1] as i32
+                    } else {
+                        left
+                    };
+                    let actual = quantized_dc[base + block] as i32;
+                    let residual = gradient_residual_i32(actual, top, left, top_left);
+                    let (token, extra_bit_count, extra) = signed_token(residual)?;
+                    let slot = base + block;
+                    if raw_tokens[slot] != token || extra_bits[slot] != extra {
+                        return Err(BackendError::InvalidArtifact(
+                            "scalable VarDCT DC token does not match its predicted residual",
+                        ));
+                    }
+                    let token_index = usize::try_from(token).map_err(|_| {
+                        BackendError::InvalidArtifact("VarDCT DC token index does not fit usize")
+                    })?;
+                    let entry = entries
+                        .get(token_index)
+                        .ok_or(BackendError::InvalidArtifact(
+                            "VarDCT DC token exceeds the fixed entropy alphabet",
+                        ))?;
+                    if read_fragment_slice(
+                        fragment_words,
+                        header.dc_fragment_bit_len,
+                        bit_offset,
+                        u32::from(entry.bit_len),
+                    )? != u32::from(entry.bits)
+                    {
+                        return Err(BackendError::InvalidArtifact(
+                            "scalable VarDCT GPU prefix fragment does not match its token",
+                        ));
+                    }
+                    bit_offset += u32::from(entry.bit_len);
+                    if read_fragment_slice(
+                        fragment_words,
+                        header.dc_fragment_bit_len,
+                        bit_offset,
+                        extra_bit_count,
+                    )? != extra
+                    {
+                        return Err(BackendError::InvalidArtifact(
+                            "scalable VarDCT GPU extra-bit fragment does not match its token",
+                        ));
+                    }
+                    bit_offset += extra_bit_count;
+                    expected_histogram[token_index] += 1;
+                }
             }
-            let token_index = usize::try_from(token).map_err(|_| {
-                BackendError::InvalidArtifact("VarDCT DC token index does not fit usize")
-            })?;
-            let entry = entries
-                .get(token_index)
-                .ok_or(BackendError::InvalidArtifact(
-                    "VarDCT DC token exceeds the fixed entropy alphabet",
-                ))?;
-            if read_fragment_slice(
-                fragment_words,
-                header.dc_fragment_bit_len,
-                bit_offset,
-                u32::from(entry.bit_len),
-            )? != u32::from(entry.bits)
-            {
-                return Err(BackendError::InvalidArtifact(
-                    "scalable VarDCT GPU prefix fragment does not match its token",
-                ));
-            }
-            bit_offset += u32::from(entry.bit_len);
-            if read_fragment_slice(
-                fragment_words,
-                header.dc_fragment_bit_len,
-                bit_offset,
-                extra_bit_count,
-            )? != extra
-            {
-                return Err(BackendError::InvalidArtifact(
-                    "scalable VarDCT GPU extra-bit fragment does not match its token",
-                ));
-            }
-            bit_offset += extra_bit_count;
-            expected_histogram[token_index] += 1;
+        }
+        if descriptor.bit_len != bit_offset - descriptor.bit_offset {
+            return Err(BackendError::InvalidArtifact(
+                "scalable VarDCT fragment descriptor length mismatch",
+            ));
         }
     }
     if bit_offset != header.dc_fragment_bit_len || header.raw_histogram != expected_histogram {
@@ -2222,10 +2425,10 @@ fn validate_scalable_artifact<'a>(
     }
     validate_fragment_padding(fragment_words, header.dc_fragment_bit_len)?;
     Ok(VarDctArtifactData {
-        block_count,
         strategy: expected_strategy,
         dc_fragment_words: fragment_words,
         dc_fragment_bit_len: header.dc_fragment_bit_len,
+        dc_fragment_descriptors: fragment_descriptors,
     })
 }
 
@@ -2492,12 +2695,12 @@ impl VarDctEncoder {
 /// GPU-only JPEG XL VarDCT encoder for a rectangular grid of independent
 /// regular DCT8 transforms.
 ///
-/// The current executable subset accepts RGB8 dimensions through 2048 pixels
+/// The current executable subset accepts RGB8 dimensions through 16,384 pixels
 /// on each axis when at least one axis exceeds 256 pixels, including partial
-/// 8x8 edge blocks. This guarantees an explicit multi-section TOC: one LF/DC
-/// group and at least two 256x256 AC/pass groups. AC coefficients are
-/// deliberately zero, so decoded quality is the profile's LF-only contract
-/// rather than a general distance-25 guarantee.
+/// 8x8 edge blocks. This guarantees an explicit multi-section TOC with every
+/// 2,048x2,048 LF/DC group and at least two 256x256 AC/pass groups. AC
+/// coefficients are deliberately zero, so decoded quality is the profile's
+/// LF-only contract rather than a general distance-25 guarantee.
 pub struct TiledVarDctEncoder {
     encoder: GpuEncoder<VarDctBackend>,
 }
@@ -2720,9 +2923,10 @@ mod tests {
     use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
     use jxl_gpu_protocol::Extent2d;
     use jxl_wgpu::{
-        AdapterFingerprint, AutotuneProfile, KernelPolicy, TunedKernel, WgpuBackend,
-        WgpuBackendConfig,
+        AdapterFingerprint, AutotuneProfile, ImageReadbackPipeline, KernelPolicy, TunedKernel,
+        WgpuBackend, WgpuBackendConfig,
     };
+    use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, vardct_rgb8_format};
     use wgpu::util::DeviceExt;
 
     use super::*;
@@ -2997,11 +3201,32 @@ mod tests {
         assert_pod::<VarDctKernelArtifact>();
         assert_pod::<ScalableVarDctKernelParams>();
         assert_pod::<ScalableVarDctArtifactHeader>();
+        assert_pod::<ScalableDcFragmentDescriptor>();
         assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 256);
         assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 25_600);
         assert_eq!(std::mem::align_of::<VarDctKernelArtifact>(), 4);
         assert_eq!(std::mem::size_of::<ScalableVarDctKernelParams>(), 256);
         assert_eq!(std::mem::size_of::<ScalableVarDctArtifactHeader>(), 256);
+        assert_eq!(std::mem::size_of::<ScalableDcFragmentDescriptor>(), 8);
+
+        let mut params: ScalableVarDctKernelParams = bytemuck::Zeroable::zeroed();
+        params.fragment_descriptor_offset = 0x55;
+        params.fragment_descriptor_len = 0x56;
+        params.lf_groups_x = 0x57;
+        params.lf_groups_y = 0x58;
+        let params = [params];
+        let parameter_words = bytemuck::cast_slice::<ScalableVarDctKernelParams, u32>(&params);
+        assert_eq!(&parameter_words[55..59], &[0x55, 0x56, 0x57, 0x58]);
+
+        let mut header: ScalableVarDctArtifactHeader = bytemuck::Zeroable::zeroed();
+        header.fragment_descriptor_offset = 0x41;
+        header.fragment_descriptor_len = 0x42;
+        header.lf_groups_x = 0x43;
+        header.lf_groups_y = 0x44;
+        header.lf_group_count = 0x45;
+        let headers = [header];
+        let header_words = bytemuck::cast_slice::<ScalableVarDctArtifactHeader, u32>(&headers);
+        assert_eq!(&header_words[41..46], &[0x41, 0x42, 0x43, 0x44, 0x45]);
     }
 
     #[test]
@@ -3082,7 +3307,9 @@ mod tests {
         assert_eq!(landscape.strategy_len, 32 * 16);
         assert_eq!(portrait.dc_len, 3 * 16 * 32);
         assert_eq!(portrait, landscape);
-        assert_eq!(portrait.strategy_offset, SCALABLE_HEADER_WORDS);
+        assert_eq!(portrait.fragment_descriptor_offset, SCALABLE_HEADER_WORDS);
+        assert_eq!(portrait.fragment_descriptor_len, 2);
+        assert_eq!(portrait.strategy_offset, 2 * SCALABLE_HEADER_WORDS);
         assert_eq!(
             portrait.strategy_offset % SCALABLE_SECTION_ALIGNMENT_WORDS,
             0
@@ -3099,11 +3326,11 @@ mod tests {
             0
         );
         assert!(portrait.fragment_max_bits > 0);
-        assert_eq!(portrait.artifact_bytes(), 25_600);
+        assert_eq!(portrait.artifact_bytes(), 25_856);
         assert_eq!(largest.strategy_len, 1_024);
         assert_eq!(largest.dc_len, 3_072);
         assert_eq!(largest.fragment_max_bits, 76_800);
-        assert_eq!(largest.artifact_bytes(), 50_944);
+        assert_eq!(largest.artifact_bytes(), 51_200);
     }
 
     #[test]
@@ -3358,25 +3585,54 @@ mod tests {
     }
 
     #[test]
-    fn tiled_dct8_reports_lf_group_boundary_as_a_typed_error() {
-        let Some(context) = test_context() else {
-            return;
-        };
-        let width = 2_049usize;
-        let height = 1usize;
-        let pixels = vec![[0u8; 3]; width * height];
-        let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
-        let source = padded_rgb_source_sized(&context, width, height, &pixels);
+    fn tiled_dct8_grid_covers_multiple_lf_groups_and_checked_16k_axes() {
+        let horizontal = TiledVarDctGrid::new(2_049, 1).unwrap();
+        assert_eq!(
+            (horizontal.lf_group_columns, horizontal.lf_group_rows),
+            (2, 1)
+        );
+        assert_eq!(horizontal.lf_group_count().unwrap(), 2);
+        assert_eq!(horizontal.toc_entries().unwrap(), 13);
+
+        let square = TiledVarDctGrid::new(16_384, 16_384).unwrap();
+        assert_eq!((square.lf_group_columns, square.lf_group_rows), (8, 8));
+        assert_eq!(square.lf_group_count().unwrap(), 64);
+        assert_eq!(square.ac_group_count().unwrap(), 4_096);
+        assert_eq!(square.toc_entries().unwrap(), 4_162);
+
         assert!(matches!(
-            encoder.memory_plan(&source),
+            TiledVarDctGrid::new(16_385, 1),
             Err(EncodeError::Unsupported(
-                UnsupportedFeature::TiledVarDctLfGroups {
-                    width: 2_049,
+                UnsupportedFeature::TiledVarDctDimensions {
+                    width: 16_385,
                     height: 1,
-                    max_dimension: 2_048,
+                    max_dimension: 16_384,
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn tiled_dct8_gpu_encodes_checked_16k_panorama_axes() {
+        let Some(context) = test_context() else {
+            return;
+        };
+        let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
+        for (width, height) in [(16_384usize, 1usize), (1usize, 16_384usize)] {
+            let pixels = vec![[0u8; 3]; width * height];
+            let source = padded_rgb_source_sized(&context, width, height, &pixels);
+            let grid = encoder.grid(&source).unwrap();
+            assert_eq!(grid.lf_group_count().unwrap(), 8);
+            assert_eq!(grid.ac_group_count().unwrap(), 64);
+            assert_eq!(grid.toc_entries().unwrap(), 74);
+
+            let codestream = encoder.encode(source).unwrap();
+            assert_eq!(
+                decode_rgb8_sized(&codestream, width, height),
+                vec![0; width * height * 3],
+                "{width}x{height}",
+            );
+        }
     }
 
     #[test]
@@ -3731,16 +3987,31 @@ mod tests {
         if !Path::new(CJXL).is_file() || !Path::new(DJXL).is_file() {
             return;
         }
-        let Some(context) = test_context() else {
+        let Some((device, queue, info)) = test_device() else {
             return;
         };
+        let backend = WgpuBackend::from_device(
+            device.as_ref().clone(),
+            queue.as_ref().clone(),
+            info,
+            WgpuBackendConfig {
+                enable_timestamps: false,
+                ..WgpuBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let context = WgpuContext::from_backend(&backend);
         let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
+        let gpu_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+        let readback = ImageReadbackPipeline::new(&backend);
         let directory = oracle_directory();
         fs::create_dir_all(&directory).unwrap();
 
         for (case, width, height) in [
             ("odd-group-edge", 257usize, 17usize),
             ("larger-asymmetric", 768usize, 513usize),
+            ("multi-lf-horizontal", 2_056usize, 256usize),
+            ("multi-lf-vertical", 256usize, 2_056usize),
         ] {
             let fixture = (0..height)
                 .flat_map(|y| {
@@ -3756,8 +4027,40 @@ mod tests {
             let codestream = encoder
                 .encode(padded_rgb_source_sized(&context, width, height, &fixture))
                 .unwrap();
+            let grid = TiledVarDctGrid::new(width as u32, height as u32).unwrap();
+            let inventory =
+                jxl_gpu_bitstream::parse(&codestream, jxl_gpu_bitstream::ParseLimits::default())
+                    .unwrap()
+                    .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+                    .unwrap();
+            assert_eq!(
+                inventory.frames[0].low_frequency_group_count,
+                u64::from(grid.lf_group_count().unwrap()),
+                "case={case}",
+            );
             let rust_pixels = decode_rgb8_sized(&codestream, width, height);
             assert!(psnr(&fixture, &rust_pixels) > 9.0, "case={case}");
+
+            let mut gpu_session = gpu_decoder
+                .open(
+                    &codestream,
+                    GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                )
+                .unwrap();
+            let gpu_frame = gpu_session.next_frame().unwrap().unwrap();
+            assert_eq!(gpu_frame.output().outputs.len(), 1, "case={case}");
+            assert_eq!(
+                gpu_frame.output().outputs[0].layout.extent,
+                Extent2d::new(width as u32, height as u32),
+                "case={case}",
+            );
+            let gpu_pixels = readback.submit(gpu_frame.output()).unwrap().wait().unwrap();
+            assert!(
+                max_abs_error(&gpu_pixels.frame.outputs[0].bytes, &rust_pixels) <= 1,
+                "case={case}",
+            );
+            drop(gpu_frame);
+            assert!(gpu_session.next_frame().unwrap().is_none(), "case={case}");
 
             let source_path = directory.join(format!("source-{case}.ppm"));
             let gpu_path = directory.join(format!("gpu-{case}.jxl"));

@@ -23,6 +23,21 @@ The checked-in inventory includes 1x1, tiny (2x2), odd (17x13, 19x11), square (6
 1x16384), 255/256/257 group boundaries, HD 1280x720 (Gray8 and RGB8), FHD 1920x1080 (RGBA8), UHD 4K
 3840x2160 (RGB10), UHD 8K 7680x4320 (Gray8), and UHD 16K 15360x8640 (Gray8).
 
+## Procedural VarDCT encoder matrix
+
+The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than
+checking in large duplicate raster files. Odd 257x17, asymmetric 513x259 and 768x513, horizontal
+2056x256 and vertical 256x2056 LF-boundary images exercise padded edge blocks and row/column group
+ordering. The two boundary images contain two standard LF groups; the GPU artifact stores one
+validated fragment descriptor per group and resets the clamped-Gradient predictor at that boundary.
+Rust `jxl` and installed `djxl` must decode each emitted codestream, while the stock GPU decoder plus
+explicit readback must differ from Rust `jxl` by at most one RGB8 code.
+
+Exact-black 16384x1 and 1x16384 cases execute the encoder on an actual adapter with eight LF groups,
+64 AC groups, and 74 TOC entries, then decode through Rust `jxl` byte-exactly. The 16384x16384 grid
+is checked for 64 LF groups, 4,096 AC groups, and 4,162 TOC entries without asserting that every
+adapter or configured byte budget can allocate the full-square source and artifact.
+
 The decode integration corpus separately includes
 `crates/jxl_wgpu_decode/test-data/green_queen_vardct_nonzero_ac.jxl.hex`. It is a deterministic
 libjxl 0.12.0 re-encode of the checked-in 438×589 green-queen image using VarDCT effort 1,

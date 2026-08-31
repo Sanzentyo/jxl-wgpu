@@ -116,27 +116,31 @@ distance-25 profile deliberately quantizes every AC coefficient to zero, so it i
 is not yet a general quality or rate-control implementation.
 
 `TiledVarDctEncoder` extends that same honest LF-only contract to a grid of independent regular
-DCT8 transforms. Width and height may reach 2,048, with at least one axis above 256; partial edge
-blocks are padded by GPU-side edge replication. The current bound is deliberately one standard
-LF/DC group and at least two AC groups. A one-AC-group frame has a normatively fused one-packet
+DCT8 transforms. Width and height may independently reach the checked 16,384-pixel bound, with at
+least one axis above 256; partial edge blocks are padded by GPU-side edge replication. A
+one-AC-group frame has a normatively fused one-packet
 layout that cannot identify this tiled subset, so it returns typed
 `UnsupportedFeature::TiledVarDctSingleAcGroup` instead of emitting an ambiguous stream.
 Within it, the codestream uses the full `ceil(width / 256) * ceil(height / 256)` AC/pass-group grid,
 so 257-pixel and larger axes exercise real multi-packet TOC topology rather than pretending that
-the image is one transform. Each 8×8 block is marked as a first DCT8 transform. GPU workgroups
-produce the block DC values, one LF-group-local Gradient residual stream, prefix bits, histogram,
-and strategy map; the CPU validates and packetizes those artifacts but does not pad pixels,
-transform, quantize, predict, or entropy-code them. Multiple LF groups (an axis above 2,048) return
-the typed `UnsupportedFeature::TiledVarDctLfGroups` error. The block-product dispatch and all
-storage allocations remain independently bounded by the selected device limits.
+the image is one transform. The corresponding LF/DC grid is
+`ceil(width / 2048) * ceil(height / 2048)`. Each 8×8 block is marked as a first DCT8 transform.
+GPU workgroups produce the block DC values, reset the clamped-Gradient predictor at every LF-group
+boundary, serialize one bit range per LF group, and record those ranges in a checked descriptor
+table. The CPU validates every token, predictor result, descriptor, fragment bit and zero-padding
+word before packetizing the LF groups; it does not pad pixels, transform, quantize, predict, or
+entropy-code them. Quantization dispatches the two-dimensional block grid rather than a
+block-product axis. Source, artifact, buffer and per-axis dispatch limits remain independently
+bounded by the selected device.
 
 `VarDctMemoryPlan::kernel_layout` distinguishes fixed, scalable single-transform, and tiled-DCT8
 artifacts. Fixed submissions
 reserve exactly 51,456 encoder-owned bytes: one 256-byte parameter record, one 25,600-byte artifact,
 and one equal-size readback. Scalable artifacts are computed from the live block/sample count and
-the maximum fragment bits derived from the actual prefix entries; they range from 2,560 bytes for
-64×32 or 32×64 to 50,944 bytes for 256×256, so the largest encoder-owned reservation is 102,144
-bytes.
+the maximum fragment bits derived from the actual prefix entries. Including the LF-fragment
+descriptor section, the single-transform range is 2,816 bytes for 64×32 or 32×64 through 51,200
+bytes for 256×256. Tiled artifacts scale with the live block and LF-group counts; the exact
+reservation remains one 256-byte parameter record plus one artifact and one equal-size readback.
 Every section starts on a 256-byte boundary. Parameter/header records are `bytemuck::Pod`, all
 arithmetic is checked, and source binding, buffer, workgroup-storage, invocation, and dispatch
 limits are validated before submission. Completion supports blocking native use and a
@@ -183,11 +187,12 @@ encoder.encode(source_768_by_513)
 # }
 ```
 
-Actual-GPU conformance covers odd 257×17, asymmetric 513×259, and larger 768×513 inputs. Black is
-exact, solid colors and LF gradients have explicit PSNR floors, and both Rust `jxl` and `djxl`
-decode the emitted multi-group streams with at most one byte of mutual output disagreement.
-`cjxl` provides a separately decoded distance-25 development-quality reference for the same edge
-and larger fixtures.
+Actual-GPU conformance covers odd 257×17, asymmetric 513×259 and 768×513, horizontal 2056×256 and
+vertical 256×2056 two-LF-group inputs, plus exact-black 16384×1 and 1×16384 panoramas. Rust `jxl`
+and `djxl` decode the emitted multi-group streams with at most one byte of mutual output
+disagreement. The two-LF-group streams also execute through the stock GPU decoder and explicit
+readback within one code of Rust `jxl`. `cjxl` provides a separately decoded distance-25
+development-quality reference for the edge and two-LF-group fixtures.
 
 ## Animation sessions
 

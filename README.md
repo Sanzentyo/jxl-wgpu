@@ -48,7 +48,7 @@ The checked-in paths are interoperable but are not yet a complete JPEG XL implem
 
 | Direction | Stock `wgpu` implementation | Current limits |
 |---|---|---|
-| Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills, crops/references/blending animation, plus an experimental all-27-strategy VarDCT RGB8 still profile | Modular uses one pass and the implemented predictor/entropy set; VarDCT is a fixed distance-25 LF-only profile that quantizes every AC coefficient to zero |
+| Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills, crops/references/blending animation, plus an experimental all-27-strategy VarDCT RGB8 still profile. Tiled DCT8 emits multiple LF and AC groups and accepts checked axes through 16K. | Modular uses one pass and the implemented predictor/entropy set; VarDCT remains a fixed distance-25 LF-only profile that quantizes every AC coefficient to zero and does not yet select mixed strategies over an image. |
 | Decode | One public `GpuDecoder::wgpu` reads the frame coding mode and routes one-pass lossless Modular stills or the authoritative bounded VarDCT path without caller mode knowledge. Modular uses GPU Prefix/ANS entropy, LZ77, MA prediction, residual reconstruction, reversible color transform, and requested output conversion; VarDCT decodes mixed maps containing all 27 transform strategies, single-pass nonzero AC, all 13 natural/custom coefficient-order families, stream-defined HF block contexts and chroma correlation, scanline or entropy-permuted center-first pass groups, every normative default dequant matrix, multiple LF groups, resident Gaborish and one-to-three-iteration EPF restoration. A 2056×256 two-LF-group boundary case is checked on an actual adapter. | The selector and both engines share one backend byte budget, but Modular still lacks Palette/Squeeze/multiple passes. VarDCT still requires a global MA tree, one spectral pass, default dequant matrices, RGB8 output, and no composition features; the local-tree layout emitted by ordinary multi-LF-group `cjxl` streams is not yet accepted. |
 | Output | GPU-resident native integer Gray/RGB/RGBA plus all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts | numeric normalization is explicit; F64 requires a native-or-exact-widening precision policy |
 | Presentation | Same-queue buffer-to-linear-BT.709 RGBA display pipeline | explicit unvalidated handoff can enqueue display/readback/custom GPU work before the 16-byte validation map completes; derived results are discarded if validation later fails |
@@ -58,7 +58,8 @@ Lossless encoder output is independently accepted and reproduced exactly by the 
 `jxl` decoder and by `djxl` when it is available in the test environment. `jwgp` is an optional
 single-group acceleration box; conforming decoders, including this workspace's generic standard
 path, ignore it and decode the standard `jxlc`. The VarDCT encoder is likewise checked with both
-oracles, with exact black and bounded-quality color fixtures.
+oracles, including horizontal and vertical two-LF-group images; its output also round-trips through
+the stock GPU decoder. Actual GPU tests cover 16K×1 and 1×16K tiled panoramas.
 
 The public decode session traits separate queue submission from completion, prefetch an ordered
 bounded frame window, and expose native blocking plus runtime-neutral asynchronous completion.

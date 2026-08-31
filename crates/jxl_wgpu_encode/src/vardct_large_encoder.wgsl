@@ -30,7 +30,11 @@ struct Params {
     fragment_word_capacity: u32,
     artifact_words: u32,
     topology: u32,
-    padding: array<u32, 9>,
+    fragment_descriptor_offset: u32,
+    fragment_descriptor_len: u32,
+    lf_groups_x: u32,
+    lf_groups_y: u32,
+    padding: array<u32, 5>,
 }
 
 @group(0) @binding(0)
@@ -136,13 +140,13 @@ fn quantize_blocks(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
 ) {
-    let block_count = params.blocks_x * params.blocks_y;
-    let block = workgroup_id.x;
-    if block >= block_count {
+    let block_x = workgroup_id.x;
+    let block_y = workgroup_id.y;
+    if block_x >= params.blocks_x || block_y >= params.blocks_y {
         return;
     }
-    let block_x = block % params.blocks_x;
-    let block_y = block / params.blocks_x;
+    let block_count = params.blocks_x * params.blocks_y;
+    let block = block_y * params.blocks_x + block_x;
     for (var sample = local_index; sample < 64u; sample += wg_x) {
         let local_x = sample & 7u;
         let local_y = sample >> 3u;
@@ -187,46 +191,69 @@ fn serialize_control() {
     let block_count = params.blocks_x * params.blocks_y;
     let sample_count = block_count * 3u;
     var bit_offset = 0u;
+    let lf_group_count = params.lf_groups_x * params.lf_groups_y;
 
     for (var block = 0u; block < block_count; block += 1u) {
         let is_first = block == 0u || params.topology == 1u;
         artifact_words[params.strategy_offset + block] =
             params.strategy | select(0u, 1u << 8u, is_first);
     }
-    for (var channel = 0u; channel < 3u; channel += 1u) {
-        let base = channel * block_count;
-        for (var block = 0u; block < block_count; block += 1u) {
-            let block_x = block % params.blocks_x;
-            let block_y = block / params.blocks_x;
-            var left = 0;
-            if block_x > 0u {
-                left = bitcast<i32>(artifact_words[params.dc_offset + base + block - 1u]);
-            } else if block_y > 0u {
-                left = bitcast<i32>(
-                    artifact_words[params.dc_offset + base + block - params.blocks_x],
-                );
+    for (var group = 0u; group < lf_group_count; group += 1u) {
+        let group_x = group % params.lf_groups_x;
+        let group_y = group / params.lf_groups_x;
+        let origin_x = group_x * 256u;
+        let origin_y = group_y * 256u;
+        let group_width = min(256u, params.blocks_x - origin_x);
+        let group_height = min(256u, params.blocks_y - origin_y);
+        let group_bit_offset = bit_offset;
+        for (var channel = 0u; channel < 3u; channel += 1u) {
+            let base = channel * block_count;
+            for (var local_y = 0u; local_y < group_height; local_y += 1u) {
+                for (var local_x = 0u; local_x < group_width; local_x += 1u) {
+                    let block =
+                        (origin_y + local_y) * params.blocks_x + origin_x + local_x;
+                    var left = 0;
+                    if local_x > 0u {
+                        left = bitcast<i32>(
+                            artifact_words[params.dc_offset + base + block - 1u],
+                        );
+                    } else if local_y > 0u {
+                        left = bitcast<i32>(
+                            artifact_words[
+                                params.dc_offset + base + block - params.blocks_x
+                            ],
+                        );
+                    }
+                    var top = left;
+                    if local_y > 0u {
+                        top = bitcast<i32>(
+                            artifact_words[
+                                params.dc_offset + base + block - params.blocks_x
+                            ],
+                        );
+                    }
+                    var top_left = left;
+                    if local_x > 0u && local_y > 0u {
+                        top_left = bitcast<i32>(
+                            artifact_words[
+                                params.dc_offset + base + block - params.blocks_x - 1u
+                            ],
+                        );
+                    }
+                    let actual = bitcast<i32>(
+                        artifact_words[params.dc_offset + base + block],
+                    );
+                    bit_offset = encode_dc_token(
+                        base + block,
+                        actual - clamped_gradient(top, left, top_left),
+                        bit_offset,
+                    );
+                }
             }
-            var top = left;
-            if block_y > 0u {
-                top = bitcast<i32>(
-                    artifact_words[params.dc_offset + base + block - params.blocks_x],
-                );
-            }
-            var top_left = left;
-            if block_x > 0u && block_y > 0u {
-                top_left = bitcast<i32>(
-                    artifact_words[
-                        params.dc_offset + base + block - params.blocks_x - 1u
-                    ],
-                );
-            }
-            let actual = bitcast<i32>(artifact_words[params.dc_offset + base + block]);
-            bit_offset = encode_dc_token(
-                base + block,
-                actual - clamped_gradient(top, left, top_left),
-                bit_offset,
-            );
         }
+        artifact_words[params.fragment_descriptor_offset + 2u * group] = group_bit_offset;
+        artifact_words[params.fragment_descriptor_offset + 2u * group + 1u] =
+            bit_offset - group_bit_offset;
     }
 
     // Header ABI. Status is written last so a mapped ready record cannot
@@ -252,5 +279,10 @@ fn serialize_control() {
     artifact_words[19] = params.blocks_x;
     artifact_words[20] = params.blocks_y;
     artifact_words[21] = params.topology;
+    artifact_words[41] = params.fragment_descriptor_offset;
+    artifact_words[42] = params.fragment_descriptor_len;
+    artifact_words[43] = params.lf_groups_x;
+    artifact_words[44] = params.lf_groups_y;
+    artifact_words[45] = lf_group_count;
     artifact_words[0] = ARTIFACT_READY;
 }

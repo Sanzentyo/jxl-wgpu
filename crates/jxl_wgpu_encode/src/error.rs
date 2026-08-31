@@ -55,9 +55,9 @@ pub enum UnsupportedFeature {
         available: u64,
     },
     #[error(
-        "tiled VarDCT currently supports one LF group: {width}x{height} exceeds {max_dimension}px on one or both axes"
+        "tiled VarDCT dimensions {width}x{height} exceed the checked {max_dimension}px-per-axis profile"
     )]
-    TiledVarDctLfGroups {
+    TiledVarDctDimensions {
         width: u32,
         height: u32,
         max_dimension: u32,
