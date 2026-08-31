@@ -121,7 +121,9 @@ fn lower_topology(
         VarDctArtifactDeviceLimits::from_wgpu(&device.limits()),
     )
     .unwrap();
-    let params = HfMetadataLoweringParams::new(&config, layout, [0.8, 1.0, 1.0]).unwrap();
+    let params =
+        HfMetadataLoweringParams::new(&config, layout, [0.8, 1.0, 1.0], [0.0, 1.0, 1.0 / 84.0])
+            .unwrap();
     let raw = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("malformed VarDCT topology"),
         contents: bytemuck::cast_slice(&raw),
@@ -246,7 +248,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     assert_eq!(std::mem::size_of::<GpuGeneralVarDctTask>(), 64);
     assert_eq!(std::mem::size_of::<GpuHfTaskMetadata>(), 48);
     assert_eq!(std::mem::size_of::<GpuDispatchIndirectArgs>(), 12);
-    assert_eq!(std::mem::size_of::<HfMetadataLoweringParams>(), 224);
+    assert_eq!(std::mem::size_of::<HfMetadataLoweringParams>(), 240);
 }
 
 #[test]
@@ -403,14 +405,17 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
     // Raster varblocks: DCT8 at x=0, DCT8x16 at x=1..2, AFV0 at x=3, DCT4x8 at x=4.
     // The fifth raw entry is deliberately unused, matching libjxl's bounded list semantics.
     let raw_metadata = [0i32, 7, 14, 12, 26, 2, 4, 6, 8, 10];
-    let config = config(raw_metadata.len() as u64);
+    let mut config = config(raw_metadata.len() as u64);
+    config.quant_offset = 1;
     let layout = VarDctArtifactLayout::plan(
         &config,
         VarDctArtifactDeviceLimits::from_wgpu(&device.limits()),
     )
     .expect("artifact fits the test adapter");
     let dequant_scales = [0.512, 1.0, 0.32768];
-    let params = HfMetadataLoweringParams::new(&config, layout, dequant_scales).unwrap();
+    let correlation_params = [-0.5, 0.5, 1.0 / 256.0];
+    let params =
+        HfMetadataLoweringParams::new(&config, layout, dequant_scales, correlation_params).unwrap();
 
     let raw_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("raw HF metadata"),
@@ -444,7 +449,7 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
     });
     let resource_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("VarDCT quantization resources"),
-        size: u64::from(layout.task_capacity) * 16,
+        size: u64::from(layout.task_capacity + 1) * 16,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -601,7 +606,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     let coefficient_readback_offset = align_256(layout.artifact_bytes);
     let resource_readback_offset =
         align_256(coefficient_readback_offset + layout.coefficient_bytes);
-    let resource_bytes = u64::from(layout.task_capacity) * 16;
+    let resource_bytes = u64::from(layout.task_capacity + 1) * 16;
     let staging_bytes = resource_readback_offset + resource_bytes;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("aggregate VarDCT artifact readback"),
@@ -785,7 +790,10 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         &bytes[resource_readback_offset as usize
             ..(resource_readback_offset + resource_bytes) as usize],
     );
-    for (actual, hf_mul) in resources[..4].iter().zip([3.0_f32, 5.0, 9.0, 7.0]) {
+    assert_eq!(resources[0][0], correlation_params[0]);
+    assert!((resources[0][1] - (correlation_params[1] + 7.0 / 256.0)).abs() <= 1.0e-7);
+    assert_eq!(&resources[0][2..], &[0.0, 0.0]);
+    for (actual, hf_mul) in resources[1..5].iter().zip([3.0_f32, 5.0, 9.0, 7.0]) {
         let quant_scale = 65536.0 / (config.global_scale as f32 * hf_mul);
         for channel in 0..3 {
             let expected = quant_scale * dequant_scales[channel];

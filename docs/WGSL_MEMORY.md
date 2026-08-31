@@ -57,9 +57,11 @@ name shown in parentheses.
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuResourceVector` / `vec4<f32>` | four `f32` lanes | 16 | 16 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, LF stride, 3 pads, `quant_biases[4]` | 128 | 16 | uniform |
-| `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, seven `vec4<u32>` records containing all 27 strategy matrix offsets, then one `vec4<f32>` containing X/Y/B dequantization scale multipliers and padding | 224 | 16 | uniform |
+| `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry and source/output offsets, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 64 | 16 | uniform |
+| `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 240 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
-| `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableVarDctKernelParams` / `Params` | source/block geometry, strategy/quantization, 19 two-word prefix entries, five artifact offsets/capacities, topology, LF-fragment descriptor offset/length and LF-grid dimensions, 5 pads | 256 | 4 | read-only storage |
+| `jxl_wgpu_encode/vardct_encoder.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, strategy/quantization, 19 two-word prefix entries, X/Y/B inverse LF-dequantization factors, X/B LF-correlation slopes, and 12 pads | 256 | 4 | read-only storage |
+| `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableVarDctKernelParams` / `Params` | source/block geometry, strategy/quantization, 19 two-word prefix entries, five artifact offsets/capacities, topology, LF-fragment descriptor offset/length and LF-grid dimensions, X/Y/B inverse LF-dequantization factors, and X/B LF-correlation slopes | 256 | 4 | read-only storage |
 | `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableVarDctArtifactHeader` / header words | status/live counts, section offsets/lengths, total fragment bits, source/block geometry, topology, 19-bin histogram, LF-fragment descriptor offset/length/grid/count, 18 pads | 256 | 4 | storage/readback record |
 | `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableDcFragmentDescriptor` / two words | `bit_offset, bit_len` for one row-major LF group | 8 | 4 | storage/readback element |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
@@ -268,6 +270,9 @@ strategy, the deterministic encoder fixture, and the bounded decoder. Dedicated 
   enabled `SHADER_F64`, plus an explicitly skipped native-F64 GPU test on unsupported adapters;
 - the 1,536-byte DCT8 and 2,304-byte special-VarDCT workgroup-storage requirements, all 27 inverse
   transforms, mixed strategy buckets, and raster versus transposed coefficient placement;
+- custom LF dequantization and LF/HF chroma-correlation parameters through Naga validation and
+  actual-GPU numeric buffer readback, including the unchanged 64-byte LF uniform and expanded
+  240-byte HF-lowering uniform;
 - stream-defined inverse XYB, all six standard transfer curves, and all eight JPEG XL patch/frame
   blend modes, including straight and associated alpha; and
 - the encoder's worst-case event capacity.

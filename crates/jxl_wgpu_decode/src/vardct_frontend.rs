@@ -90,6 +90,10 @@ pub enum VarDctPacketError {
     BlockContextMap(#[from] jxl_coding::Error),
     #[error("the initial GPU VarDCT profile requires default {field}")]
     NonDefaultMetadata { field: &'static str },
+    #[error("LF dequantization multiplier for {channel} is too small: {value}")]
+    LfDequantizationTooSmall { channel: &'static str, value: f32 },
+    #[error("base channel correlation for {channel} is outside [-4, 4]: {value}")]
+    BaseCorrelationOutOfRange { channel: &'static str, value: f32 },
     #[error("VarDCT metadata cursor {cursor} exceeds packet end {packet_end}")]
     PacketBoundary { cursor: u64, packet_end: u64 },
     #[error("VarDCT packet bit range overflows")]
@@ -113,15 +117,67 @@ pub struct HfBlockContextIr {
     pub num_block_clusters: u32,
 }
 
+/// Per-channel LF dequantization multipliers in JPEG XL X/Y/B order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LfChannelDequantization {
+    pub multipliers: [f32; 3],
+}
+
+impl Default for LfChannelDequantization {
+    fn default() -> Self {
+        Self {
+            multipliers: [1.0 / 32.0, 1.0 / 4.0, 1.0 / 2.0],
+        }
+    }
+}
+
+/// Global chroma-from-luma parameters shared by LF and HF reconstruction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LfChannelCorrelation {
+    pub colour_factor: u32,
+    pub base: [f32; 2],
+    pub lf_factors: [i32; 2],
+}
+
+impl LfChannelCorrelation {
+    /// Returns the final LF Y-to-X and Y-to-B correlation slopes.
+    #[must_use]
+    pub fn lf_slopes(self) -> [f32; 2] {
+        let inverse_colour_factor = 1.0 / self.colour_factor as f32;
+        [
+            self.base[0] + self.lf_factors[0] as f32 * inverse_colour_factor,
+            self.base[1] + self.lf_factors[1] as f32 * inverse_colour_factor,
+        ]
+    }
+
+    /// Returns base X/B correlation and reciprocal color factor for HF map lowering.
+    #[must_use]
+    pub fn hf_params(self) -> [f32; 3] {
+        [self.base[0], self.base[1], 1.0 / self.colour_factor as f32]
+    }
+}
+
+impl Default for LfChannelCorrelation {
+    fn default() -> Self {
+        Self {
+            colour_factor: 84,
+            base: [0.0, 1.0],
+            lf_factors: [0, 0],
+        }
+    }
+}
+
 /// Scalar LF-global metadata preceding an optional entropy-coded global MA tree.
 ///
 /// `global_ma_tree_bit_offset` is `Some` only when the LF-global packet declares a global tree.
 /// No tree or sample symbol has been expanded while constructing this value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LfGlobalPrefix {
+    pub lf_dequantization: LfChannelDequantization,
     pub global_scale: u32,
     pub quant_lf: u32,
     pub hf_block_context: HfBlockContextIr,
+    pub lf_correlation: LfChannelCorrelation,
     /// The bit after the global-tree presence flag. This is either the global tree descriptor or,
     /// when no global tree exists, the following LF-group payload.
     pub suffix_bit_offset: u64,
@@ -539,11 +595,8 @@ fn validate_gpu_u32(field: &'static str, value: u64) -> Result<(), VarDctPacketE
 }
 
 impl LfGlobalPrefix {
-    /// Parse only the fixed/default dequant, block-context, and correlation headers.
-    ///
-    /// The initial profile deliberately requires the standard LF dequantization, HF block
-    /// context, and LF correlation defaults. Their numerical values are supplied by the GPU
-    /// implementation, not materialized by a CPU dequantization path.
+    /// Parses LF dequantization, block-context, and channel-correlation headers without expanding
+    /// image entropy on the host.
     pub fn parse(codestream: &[u8], packet: BitRange) -> Result<Self, VarDctPacketError> {
         let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
         validate_packet_end(codestream, packet_end)?;
@@ -553,7 +606,7 @@ impl LfGlobalPrefix {
         metadata_at(&mut reader, "LF-global packet offset", |reader| {
             reader.skip_bits(packet_offset)
         })?;
-        metadata_require_default(&mut reader, "LF channel dequantization")?;
+        let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
         let global_scale = metadata_at(&mut reader, "global quantizer scale", |reader| {
             reader.read_u32(1 + U(11), 2049 + U(11), 4097 + U(12), 8193 + U(16))
         })?;
@@ -561,7 +614,7 @@ impl LfGlobalPrefix {
             reader.read_u32(16, 1 + U(5), 1 + U(8), 1 + U(16))
         })?;
         let hf_block_context = parse_hf_block_context(&mut reader)?;
-        metadata_require_default(&mut reader, "LF channel correlation")?;
+        let lf_correlation = parse_lf_channel_correlation(&mut reader)?;
         let has_global_ma_tree = metadata_at(&mut reader, "global MA-tree flag", |reader| {
             reader.read_bool()
         })?;
@@ -571,13 +624,77 @@ impl LfGlobalPrefix {
             return Err(VarDctPacketError::PacketBoundary { cursor, packet_end });
         }
         Ok(Self {
+            lf_dequantization,
             global_scale,
             quant_lf,
             hf_block_context,
+            lf_correlation,
             suffix_bit_offset: cursor,
             global_ma_tree_bit_offset: has_global_ma_tree.then_some(cursor),
         })
     }
+}
+
+fn parse_lf_channel_dequantization(
+    reader: &mut MetadataBitstream<'_>,
+) -> Result<LfChannelDequantization, VarDctPacketError> {
+    if metadata_at(reader, "LF channel dequantization default flag", |reader| {
+        reader.read_bool()
+    })? {
+        return Ok(LfChannelDequantization::default());
+    }
+
+    let mut multipliers = [0.0; 3];
+    for (channel, multiplier) in ["X", "Y", "B"].into_iter().zip(&mut multipliers) {
+        *multiplier = metadata_at(reader, "LF channel dequantization multiplier", |reader| {
+            reader.read_f16_as_f32()
+        })?;
+        if *multiplier / 128.0 < 1.0e-8 {
+            return Err(VarDctPacketError::LfDequantizationTooSmall {
+                channel,
+                value: *multiplier,
+            });
+        }
+    }
+    Ok(LfChannelDequantization { multipliers })
+}
+
+fn parse_lf_channel_correlation(
+    reader: &mut MetadataBitstream<'_>,
+) -> Result<LfChannelCorrelation, VarDctPacketError> {
+    if metadata_at(reader, "LF channel correlation default flag", |reader| {
+        reader.read_bool()
+    })? {
+        return Ok(LfChannelCorrelation::default());
+    }
+
+    let colour_factor = metadata_at(reader, "channel correlation colour factor", |reader| {
+        reader.read_u32(84, 256, 2 + U(8), 258 + U(16))
+    })?;
+    let mut base = [0.0; 2];
+    for (channel, correlation) in ["X", "B"].into_iter().zip(&mut base) {
+        *correlation = metadata_at(reader, "base channel correlation", |reader| {
+            reader.read_f16_as_f32()
+        })?;
+        if correlation.abs() > 4.0 {
+            return Err(VarDctPacketError::BaseCorrelationOutOfRange {
+                channel,
+                value: *correlation,
+            });
+        }
+    }
+    let mut lf_factors = [0; 2];
+    for factor in &mut lf_factors {
+        *factor = metadata_at(reader, "LF channel correlation factor", |reader| {
+            reader.read_bits(8)
+        })? as i32
+            - 128;
+    }
+    Ok(LfChannelCorrelation {
+        colour_factor,
+        base,
+        lf_factors,
+    })
 }
 
 fn parse_hf_block_context(

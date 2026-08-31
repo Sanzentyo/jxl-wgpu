@@ -11,9 +11,9 @@ use crate::modular_tree::{
     parse_ma_config,
 };
 use crate::vardct_frontend::{
-    HfBlockContextIr, HfGlobalPrefix, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
-    VarDctGroupRect, VarDctPacketError, VarDctSectionLayout, parse_hf_metadata_header_prefix,
-    parse_lf_group_header_prefix,
+    HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation, LfChannelDequantization,
+    LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError, VarDctGroupRect, VarDctPacketError,
+    VarDctSectionLayout, parse_hf_metadata_header_prefix, parse_lf_group_header_prefix,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -111,8 +111,10 @@ pub struct BoundedVarDctPacketPlan {
     pub modular_metadata: Vec<u32>,
     /// Whether the shared MA tree requires the weighted self-correcting predictor workspace.
     pub needs_self_correcting: bool,
+    pub lf_dequantization: LfChannelDequantization,
     pub global_scale: u32,
     pub quant_lf: u32,
+    pub lf_correlation: LfChannelCorrelation,
     /// One independently bounded LF quantization/HF-metadata packet in logical raster order.
     pub groups: Vec<BoundedVarDctGroupPlan>,
     /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
@@ -487,8 +489,10 @@ impl BoundedVarDctPacketPlan {
             needs_self_correcting: global_ma_config
                 .as_ref()
                 .is_some_and(MaConfigIr::needs_self_correcting),
+            lf_dequantization: lf_global.lf_dequantization,
             global_scale: lf_global.global_scale,
             quant_lf: lf_global.quant_lf,
+            lf_correlation: lf_global.lf_correlation,
             groups,
             hf_coefficients,
             global_ma_config,

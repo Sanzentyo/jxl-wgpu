@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use jxl_gpu_bitstream::{BitWriter, PrefixCodeEntry};
+use jxl_gpu_bitstream::{BitWriter, FiniteF16, PrefixCodeEntry};
 use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PixelFormat,
     PlaneFormat, PlaneSampling, SampleKind, Swizzle,
@@ -60,6 +60,115 @@ const TILED_DCT8_TOPOLOGY: u32 = 1;
 pub enum VarDctColorEncoding {
     #[default]
     SrgbD65,
+}
+
+/// Exact LF dequantization and chroma-from-luma metadata serialized in a VarDCT frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VarDctLfMetadata {
+    lf_dequantization: [FiniteF16; 3],
+    colour_factor: u32,
+    base_correlation: [FiniteF16; 2],
+    lf_factors: [i8; 2],
+}
+
+impl VarDctLfMetadata {
+    /// Validates an exact JPEG XL LF metadata bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when a dequantization multiplier, colour factor, or base
+    /// correlation is outside the interoperable JPEG XL range.
+    pub fn new(
+        lf_dequantization: [FiniteF16; 3],
+        colour_factor: u32,
+        base_correlation: [FiniteF16; 2],
+        lf_factors: [i8; 2],
+    ) -> Result<Self, EncodeError> {
+        for (channel, value) in ["X", "Y", "B"]
+            .into_iter()
+            .zip(lf_dequantization.map(FiniteF16::to_f32))
+        {
+            if value / 128.0 < 1.0e-8 {
+                return Err(EncodeError::VarDctLfDequantization { channel, value });
+            }
+        }
+        if !(2..=65_793).contains(&colour_factor) {
+            return Err(EncodeError::VarDctColourFactor {
+                value: colour_factor,
+            });
+        }
+        for (channel, value) in ["X", "B"]
+            .into_iter()
+            .zip(base_correlation.map(FiniteF16::to_f32))
+        {
+            if value.abs() > 4.0 {
+                return Err(EncodeError::VarDctBaseCorrelation { channel, value });
+            }
+        }
+        Ok(Self {
+            lf_dequantization,
+            colour_factor,
+            base_correlation,
+            lf_factors,
+        })
+    }
+
+    #[must_use]
+    pub const fn lf_dequantization(self) -> [FiniteF16; 3] {
+        self.lf_dequantization
+    }
+
+    #[must_use]
+    pub const fn colour_factor(self) -> u32 {
+        self.colour_factor
+    }
+
+    #[must_use]
+    pub const fn base_correlation(self) -> [FiniteF16; 2] {
+        self.base_correlation
+    }
+
+    #[must_use]
+    pub const fn lf_factors(self) -> [i8; 2] {
+        self.lf_factors
+    }
+
+    fn has_default_dequantization(self) -> bool {
+        self.lf_dequantization == Self::default().lf_dequantization
+    }
+
+    fn has_default_correlation(self) -> bool {
+        let default = Self::default();
+        self.colour_factor == default.colour_factor
+            && self.base_correlation == default.base_correlation
+            && self.lf_factors == default.lf_factors
+    }
+
+    fn forward_quantization(self) -> ([f32; 3], [f32; 2]) {
+        let inverse_dequantization = self
+            .lf_dequantization
+            .map(|value| 1.0 / (512.0 * value.to_f32()));
+        let inverse_colour_factor = 1.0 / self.colour_factor as f32;
+        let base = self.base_correlation.map(FiniteF16::to_f32);
+        let correlation = [
+            base[0] + f32::from(self.lf_factors[0]) * inverse_colour_factor,
+            base[1] + f32::from(self.lf_factors[1]) * inverse_colour_factor,
+        ];
+        (inverse_dequantization, correlation)
+    }
+}
+
+impl Default for VarDctLfMetadata {
+    fn default() -> Self {
+        Self {
+            lf_dequantization: [0x2800, 0x3400, 0x3800]
+                .map(|bits| FiniteF16::from_bits(bits).expect("default LF F16 is finite")),
+            colour_factor: 84,
+            base_correlation: [0x0000, 0x3c00]
+                .map(|bits| FiniteF16::from_bits(bits).expect("default correlation F16 is finite")),
+            lf_factors: [0, 0],
+        }
+    }
 }
 
 impl VarDctColorEncoding {
@@ -394,7 +503,9 @@ struct VarDctKernelParams {
     global_scale: u32,
     quant_lf: u32,
     raw_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
-    padding: [u32; 17],
+    lf_quantization: [f32; 3],
+    lf_correlation: [f32; 2],
+    padding: [u32; 12],
 }
 
 #[repr(C)]
@@ -447,7 +558,8 @@ struct ScalableVarDctKernelParams {
     fragment_descriptor_len: u32,
     lf_groups_x: u32,
     lf_groups_y: u32,
-    padding: [u32; 5],
+    lf_quantization: [f32; 3],
+    lf_correlation: [f32; 2],
 }
 
 #[repr(C)]
@@ -939,8 +1051,17 @@ fn write_global_ma_config(
     Ok(())
 }
 
-fn write_lf_global(output: &mut BitWriter, code: &PrefixCode) -> Result<(), EncodeError> {
-    output.write_bits(1, 1)?; // default LF dequantization
+fn write_lf_global(
+    output: &mut BitWriter,
+    code: &PrefixCode,
+    lf_metadata: VarDctLfMetadata,
+) -> Result<(), EncodeError> {
+    output.write_bits(u64::from(lf_metadata.has_default_dequantization()), 1)?;
+    if !lf_metadata.has_default_dequantization() {
+        for value in lf_metadata.lf_dequantization {
+            output.write_bits(u64::from(value.to_bits()), 16)?;
+        }
+    }
     write_u32(
         output,
         GLOBAL_SCALE,
@@ -948,7 +1069,20 @@ fn write_lf_global(output: &mut BitWriter, code: &PrefixCode) -> Result<(), Enco
     )?;
     write_u32(output, QUANT_LF, [(16, 0), (1, 5), (1, 8), (1, 16)])?;
     output.write_bits(1, 1)?; // default HF block contexts
-    output.write_bits(1, 1)?; // default LF channel correlation
+    output.write_bits(u64::from(lf_metadata.has_default_correlation()), 1)?;
+    if !lf_metadata.has_default_correlation() {
+        write_u32(
+            output,
+            lf_metadata.colour_factor,
+            [(84, 0), (256, 0), (2, 8), (258, 16)],
+        )?;
+        for value in lf_metadata.base_correlation {
+            output.write_bits(u64::from(value.to_bits()), 16)?;
+        }
+        for factor in lf_metadata.lf_factors {
+            output.write_bits((i16::from(factor) + 128) as u64, 8)?;
+        }
+    }
     write_global_ma_config(
         output,
         &[code.clone(), code.clone(), code.clone(), code.clone()],
@@ -1104,12 +1238,13 @@ fn build_frame_packet(
     artifact: VarDctArtifactData<'_>,
     code: &PrefixCode,
     frame: VarDctFrameLayout,
+    lf_metadata: VarDctLfMetadata,
 ) -> Result<FramePacketSet, EncodeError> {
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
     if ac_groups == 1 && lf_groups == 1 {
         let mut group = BitWriter::new();
-        write_lf_global(&mut group, code)?;
+        write_lf_global(&mut group, code, lf_metadata)?;
         write_lf_group(&mut group, code, artifact, frame, 0)?;
         write_hf_global(&mut group, ac_groups)?;
         group.align_to_byte()?;
@@ -1124,7 +1259,7 @@ fn build_frame_packet(
     }
 
     let mut dc_global = BitWriter::new();
-    write_lf_global(&mut dc_global, code)?;
+    write_lf_global(&mut dc_global, code, lf_metadata)?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
     write_hf_global(&mut ac_global, ac_groups)?;
@@ -1201,6 +1336,7 @@ pub struct VarDctBackend {
     workgroup_variant: KernelVariant,
     code: PrefixCode,
     topology: VarDctTopology,
+    lf_metadata: VarDctLfMetadata,
     capabilities: EncoderCapabilities,
     max_storage_binding_size: u64,
     max_buffer_size: u64,
@@ -1216,7 +1352,20 @@ impl VarDctBackend {
     /// Returns an encoder error if the fixed standard entropy tree cannot be
     /// represented by the JPEG XL prefix-code writer.
     pub fn new(context: &WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
-        Self::new_with_topology(context, VarDctTopology::SingleTransform(strategy))
+        Self::new_with_lf_metadata(context, strategy, VarDctLfMetadata::default())
+    }
+
+    /// Creates a standard VarDCT strategy backend with explicit LF metadata.
+    pub fn new_with_lf_metadata(
+        context: &WgpuContext,
+        strategy: VarDctStrategy,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        Self::new_with_topology(
+            context,
+            VarDctTopology::SingleTransform(strategy),
+            lf_metadata,
+        )
     }
 
     /// Creates the bounded tiled-DCT8 profile used by [`TiledVarDctEncoder`].
@@ -1224,12 +1373,21 @@ impl VarDctBackend {
     /// extent selects the checked block, LF-group, and AC-group grids at
     /// submission time.
     pub fn new_tiled_dct8(context: &WgpuContext) -> Result<Self, EncodeError> {
-        Self::new_with_topology(context, VarDctTopology::TiledDct8)
+        Self::new_tiled_dct8_with_lf_metadata(context, VarDctLfMetadata::default())
+    }
+
+    /// Creates the tiled DCT8 backend with explicit LF metadata.
+    pub fn new_tiled_dct8_with_lf_metadata(
+        context: &WgpuContext,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        Self::new_with_topology(context, VarDctTopology::TiledDct8, lf_metadata)
     }
 
     fn new_with_topology(
         context: &WgpuContext,
         topology: VarDctTopology,
+        lf_metadata: VarDctLfMetadata,
     ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
         let limits = context.device().limits();
@@ -1313,6 +1471,7 @@ impl VarDctBackend {
             workgroup_variant,
             code,
             topology,
+            lf_metadata,
             capabilities: EncoderCapabilities {
                 profiles: vec![ProfileCapability::VarDct {
                     min_distance: distance,
@@ -1344,6 +1503,11 @@ impl VarDctBackend {
     #[must_use]
     pub const fn workgroup_variant(&self) -> KernelVariant {
         self.workgroup_variant
+    }
+
+    #[must_use]
+    pub const fn lf_metadata(&self) -> VarDctLfMetadata {
+        self.lf_metadata
     }
 
     /// Computes the exact memory admission and source binding before a job is
@@ -1442,6 +1606,7 @@ impl VarDctBackend {
         })?;
         let blocks_x = frame.blocks_x;
         let blocks_y = frame.blocks_y;
+        let (lf_quantization, lf_correlation) = self.lf_metadata.forward_quantization();
         let common_strategy = u32::from(frame.topology.strategy().codestream_id());
         let (kernel, memory) = if frame.topology.uses_scalable_kernel() {
             let layout = match frame.topology {
@@ -1506,7 +1671,8 @@ impl VarDctBackend {
                         fragment_descriptor_len: layout.fragment_descriptor_len,
                         lf_groups_x: frame.lf_groups_x,
                         lf_groups_y: frame.lf_groups_y,
-                        padding: [0; 5],
+                        lf_quantization,
+                        lf_correlation,
                     },
                     layout,
                 },
@@ -1529,7 +1695,9 @@ impl VarDctBackend {
                     global_scale: GLOBAL_SCALE,
                     quant_lf: QUANT_LF,
                     raw_prefix: prefix_entries(&self.code),
-                    padding: [0; 17],
+                    lf_quantization,
+                    lf_correlation,
+                    padding: [0; 12],
                 }),
                 VarDctMemoryPlan::fixed(source_binding_bytes),
             )
@@ -1832,6 +2000,7 @@ impl GpuEncodeBackend for VarDctBackend {
             lifetime: Some(lifetime),
             completion,
             code: self.code.clone(),
+            lf_metadata: self.lf_metadata,
             frame_layout: plan.frame,
             artifact_layout: job_layout,
             frame_index: request.frame_index,
@@ -1928,6 +2097,7 @@ pub struct VarDctJob {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
     code: PrefixCode,
+    lf_metadata: VarDctLfMetadata,
     frame_layout: VarDctFrameLayout,
     artifact_layout: VarDctJobLayout,
     frame_index: FrameIndex,
@@ -1967,7 +2137,12 @@ impl VarDctJob {
             Ok(GpuFrameArtifacts {
                 frame_index: self.frame_index,
                 is_last: self.is_last,
-                packets: build_frame_packet(artifact, &self.code, self.frame_layout)?,
+                packets: build_frame_packet(
+                    artifact,
+                    &self.code,
+                    self.frame_layout,
+                    self.lf_metadata,
+                )?,
                 acceleration: None,
             })
         })();
@@ -2598,7 +2773,16 @@ impl VarDctEncoder {
     /// constructed or the selected device cannot execute the strategy's
     /// checked storage/workgroup/dispatch requirements.
     pub fn new(context: WgpuContext, strategy: VarDctStrategy) -> Result<Self, EncodeError> {
-        let backend = VarDctBackend::new(&context, strategy)?;
+        Self::new_with_lf_metadata(context, strategy, VarDctLfMetadata::default())
+    }
+
+    /// Creates the profile backend with explicit LF dequantization and channel correlation.
+    pub fn new_with_lf_metadata(
+        context: WgpuContext,
+        strategy: VarDctStrategy,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        let backend = VarDctBackend::new_with_lf_metadata(&context, strategy, lf_metadata)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
             strategy,
@@ -2619,6 +2803,11 @@ impl VarDctEncoder {
     #[must_use]
     pub fn workgroup_variant(&self) -> KernelVariant {
         self.encoder.backend().workgroup_variant()
+    }
+
+    #[must_use]
+    pub fn lf_metadata(&self) -> VarDctLfMetadata {
+        self.encoder.backend().lf_metadata()
     }
 
     #[must_use]
@@ -2713,7 +2902,15 @@ impl TiledVarDctEncoder {
     /// Returns an encoder error if the fixed entropy tree cannot be built or
     /// the device cannot execute the checked scalable kernel ABI.
     pub fn new(context: WgpuContext) -> Result<Self, EncodeError> {
-        let backend = VarDctBackend::new_tiled_dct8(&context)?;
+        Self::new_with_lf_metadata(context, VarDctLfMetadata::default())
+    }
+
+    /// Creates the tiled DCT8 backend with explicit LF dequantization and channel correlation.
+    pub fn new_with_lf_metadata(
+        context: WgpuContext,
+        lf_metadata: VarDctLfMetadata,
+    ) -> Result<Self, EncodeError> {
+        let backend = VarDctBackend::new_tiled_dct8_with_lf_metadata(&context, lf_metadata)?;
         Ok(Self {
             encoder: GpuEncoder::new(context, backend),
         })
@@ -2728,6 +2925,11 @@ impl TiledVarDctEncoder {
     #[must_use]
     pub fn workgroup_variant(&self) -> KernelVariant {
         self.encoder.backend().workgroup_variant()
+    }
+
+    #[must_use]
+    pub fn lf_metadata(&self) -> VarDctLfMetadata {
+        self.encoder.backend().lf_metadata()
     }
 
     #[must_use]
@@ -2926,11 +3128,27 @@ mod tests {
         AdapterFingerprint, AutotuneProfile, ImageReadbackPipeline, KernelPolicy, TunedKernel,
         WgpuBackend, WgpuBackendConfig,
     };
-    use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, vardct_rgb8_format};
+    use jxl_wgpu_decode::{
+        GpuDecoder, GpuOutputRequest, vardct::packet::BoundedVarDctPacketPlan, vardct_rgb8_format,
+    };
     use wgpu::util::DeviceExt;
 
     use super::*;
     use crate::assemble_frame;
+
+    fn f16(bits: u16) -> FiniteF16 {
+        FiniteF16::from_bits(bits).expect("test binary16 value is finite")
+    }
+
+    fn custom_lf_metadata() -> VarDctLfMetadata {
+        VarDctLfMetadata::new(
+            [f16(0x2c00), f16(0x3000), f16(0x3400)],
+            256,
+            [f16(0xb800), f16(0x3800)],
+            [-16, 32],
+        )
+        .unwrap()
+    }
 
     fn decode_rgb8_sized(codestream: &[u8], width: usize, height: usize) -> Vec<u8> {
         let mut input = codestream;
@@ -3158,6 +3376,7 @@ mod tests {
                 fixed_artifact_data(&artifact),
                 &code,
                 VarDctFrameLayout::single(VarDctStrategy::Dct8),
+                VarDctLfMetadata::default(),
             )
             .unwrap(),
         )
@@ -3179,6 +3398,7 @@ mod tests {
                 fixed_artifact_data(&artifact),
                 &code,
                 VarDctFrameLayout::single(VarDctStrategy::Dct8),
+                VarDctLfMetadata::default(),
             )
             .unwrap(),
         )
@@ -3191,6 +3411,73 @@ mod tests {
             assert!(pixel[1] < 16, "green={}", pixel[1]);
             assert!(pixel[2] < 16, "blue={}", pixel[2]);
         }
+    }
+
+    #[test]
+    fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
+        let metadata = custom_lf_metadata();
+        let code = fixed_prefix_code().unwrap();
+        let artifact = cpu_test_artifact([332, 153, -6], &code);
+        let frame = assemble_frame(
+            build_frame_packet(
+                fixed_artifact_data(&artifact),
+                &code,
+                VarDctFrameLayout::single(VarDctStrategy::Dct8),
+                metadata,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
+        codestream.extend_from_slice(frame.bytes());
+        let inventory =
+            jxl_gpu_bitstream::parse(&codestream, jxl_gpu_bitstream::ParseLimits::default())
+                .unwrap()
+                .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+                .unwrap();
+        let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+        assert_eq!(plan.lf_dequantization.multipliers, [0.0625, 0.125, 0.25]);
+        assert_eq!(plan.lf_correlation.colour_factor, 256);
+        assert_eq!(plan.lf_correlation.base, [-0.5, 0.5]);
+        assert_eq!(plan.lf_correlation.lf_factors, [-16, 32]);
+        assert_eq!(decode_rgb8(&codestream).len(), 8 * 8 * 3);
+    }
+
+    #[test]
+    fn custom_lf_metadata_rejects_non_interoperable_ranges() {
+        assert!(matches!(
+            VarDctLfMetadata::new(
+                [f16(0), f16(0x3000), f16(0x3400)],
+                84,
+                [f16(0), f16(0x3c00)],
+                [0, 0],
+            ),
+            Err(EncodeError::VarDctLfDequantization {
+                channel: "X",
+                value: 0.0,
+            })
+        ));
+        assert!(matches!(
+            VarDctLfMetadata::new(
+                [f16(0x2800), f16(0x3400), f16(0x3800)],
+                1,
+                [f16(0), f16(0x3c00)],
+                [0, 0],
+            ),
+            Err(EncodeError::VarDctColourFactor { value: 1 })
+        ));
+        assert!(matches!(
+            VarDctLfMetadata::new(
+                [f16(0x2800), f16(0x3400), f16(0x3800)],
+                84,
+                [f16(0xc480), f16(0x3c00)],
+                [0, 0],
+            ),
+            Err(EncodeError::VarDctBaseCorrelation {
+                channel: "X",
+                value: -4.5,
+            })
+        ));
     }
 
     #[test]
@@ -3882,6 +4169,93 @@ mod tests {
             assert!(pixel[1] < 8);
             assert!(pixel[2] < 8);
         }
+    }
+
+    #[test]
+    fn custom_lf_metadata_gpu_encoder_and_decoders_agree() {
+        const DJXL: &str = "/opt/homebrew/bin/djxl";
+        let Some((device, queue, info)) = test_device() else {
+            return;
+        };
+        let backend = WgpuBackend::from_device(
+            device.as_ref().clone(),
+            queue.as_ref().clone(),
+            info,
+            WgpuBackendConfig {
+                enable_timestamps: false,
+                ..WgpuBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let context = WgpuContext::from_backend(&backend);
+        let metadata = custom_lf_metadata();
+        let encoder =
+            VarDctEncoder::new_with_lf_metadata(context.clone(), VarDctStrategy::Dct8, metadata)
+                .unwrap();
+        assert_eq!(encoder.lf_metadata(), metadata);
+        let fixture = std::array::from_fn::<_, 64, _>(|index| {
+            let x = index % 8;
+            let y = index / 8;
+            [
+                (x * 31 + y * 3) as u8,
+                (y * 31 + x * 3) as u8,
+                ((x + y) * 16) as u8,
+            ]
+        });
+        let source = padded_rgb_source(&context, &fixture);
+        let codestream = encoder.encode(source.clone()).unwrap();
+        let async_codestream = pollster::block_on(encoder.submit(source).unwrap()).unwrap();
+        assert_eq!(codestream, async_codestream);
+
+        let rust_pixels = decode_rgb8(&codestream);
+        let quality = psnr(&fixture, &rust_pixels);
+        assert!(quality > 9.0, "custom LF metadata PSNR={quality}");
+        let gpu_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+        let mut session = gpu_decoder
+            .open(
+                &codestream,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(max_abs_error(&readback.frame.outputs[0].bytes, &rust_pixels) <= 1);
+        drop(frame);
+        assert!(session.next_frame().unwrap().is_none());
+
+        if Path::new(DJXL).is_file() {
+            let directory = oracle_directory();
+            fs::create_dir_all(&directory).unwrap();
+            let codestream_path = directory.join("custom-lf.jxl");
+            let ppm_path = directory.join("custom-lf.ppm");
+            fs::write(&codestream_path, &codestream).unwrap();
+            let status = Command::new(DJXL)
+                .arg(&codestream_path)
+                .arg(&ppm_path)
+                .args(["--num_threads=0", "--quiet"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let libjxl_pixels = read_ppm_rgb8(&ppm_path, 8, 8);
+            assert!(max_abs_error(&libjxl_pixels, &rust_pixels) <= 1);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        let tiled = TiledVarDctEncoder::new_with_lf_metadata(context.clone(), metadata).unwrap();
+        let tiled_fixture = vec![[255, 0, 0]; 257];
+        let tiled_stream = tiled
+            .encode(padded_rgb_source_sized(&context, 257, 1, &tiled_fixture))
+            .unwrap();
+        let tiled_pixels = decode_rgb8_sized(&tiled_stream, 257, 1);
+        let tiled_quality = psnr(&tiled_fixture, &tiled_pixels);
+        assert!(
+            tiled_quality > 30.0,
+            "custom LF tiled solid PSNR={tiled_quality}",
+        );
     }
 
     #[test]

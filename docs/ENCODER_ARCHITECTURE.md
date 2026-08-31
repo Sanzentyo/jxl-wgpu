@@ -325,7 +325,10 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with checked axes
   through 16K. The GPU executes sRGB linearization, XYB conversion, LF quantization, group-local
   clamped-gradient DC prediction, prefix/histogram assembly, and per-LF-group bit-range emission in
-  an LF-only fixed distance-25 profile that quantizes AC coefficients to zero.
+  an LF-only fixed distance-25 profile that quantizes AC coefficients to zero. Both frontends can
+  serialize validated exact-binary16 LF dequantization plus LF/HF chroma-correlation metadata; the
+  bounded and scalable kernels use the same bundle for forward LF decorrelation and quantization.
+  The host writes only this bounded control bundle and never receives image pixels or coefficients.
 
 ### Remaining work
 

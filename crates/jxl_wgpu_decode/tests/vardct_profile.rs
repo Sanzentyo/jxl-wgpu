@@ -1,4 +1,4 @@
-use jxl_gpu_bitstream::{BitRange, FrameSectionKind, InventoryLimits, parse};
+use jxl_gpu_bitstream::{BitRange, BitWriter, FrameSectionKind, InventoryLimits, parse};
 use jxl_wgpu_decode::vardct::frontend::{
     HfGlobalPrefix, HfMetadataPrefix, LfGlobalPrefix, LfGroupPrefix, ModularChannelPlan,
     StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError, VarDctPacketError,
@@ -32,6 +32,46 @@ fn inventory(bytes: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
         .unwrap()
 }
 
+fn custom_lf_global(
+    dequant_bits: [u16; 3],
+    colour_factor: (u8, u16),
+    base_bits: [u16; 2],
+    lf_factors: [u8; 2],
+) -> (Vec<u8>, BitRange) {
+    let mut writer = BitWriter::new();
+    writer.write_bits(0, 1).unwrap();
+    for bits in dequant_bits {
+        writer.write_bits(u64::from(bits), 16).unwrap();
+    }
+    writer.write_bits(0, 2).unwrap();
+    writer.write_bits(0, 11).unwrap();
+    writer.write_bits(0, 2).unwrap();
+    writer.write_bits(1, 1).unwrap();
+    writer.write_bits(0, 1).unwrap();
+    writer.write_bits(u64::from(colour_factor.0), 2).unwrap();
+    let factor_bits = match colour_factor.0 {
+        0 | 1 => 0,
+        2 => 8,
+        3 => 16,
+        _ => unreachable!(),
+    };
+    writer
+        .write_bits(u64::from(colour_factor.1), factor_bits)
+        .unwrap();
+    for bits in base_bits {
+        writer.write_bits(u64::from(bits), 16).unwrap();
+    }
+    for factor in lf_factors {
+        writer.write_bits(u64::from(factor), 8).unwrap();
+    }
+    writer.write_bits(0, 1).unwrap();
+    let packet = BitRange {
+        offset: 0,
+        length: writer.bit_len() as u64,
+    };
+    (writer.into_bytes(), packet)
+}
+
 #[test]
 fn accepts_basic_single_entry_without_host_entropy_decode() {
     let bytes = decode_hex(include_str!("../test-data/basic.jxl.hex"));
@@ -45,10 +85,73 @@ fn accepts_basic_single_entry_without_host_entropy_decode() {
         panic!("basic uses a single-entry TOC")
     };
     let prefix = LfGlobalPrefix::parse(&bytes, packet).unwrap();
+    assert_eq!(prefix.lf_dequantization, Default::default());
+    assert_eq!(prefix.lf_correlation, Default::default());
     assert_eq!((prefix.global_scale, prefix.quant_lf), (4587, 16));
     assert_eq!(prefix.hf_block_context.num_block_clusters, 15);
     assert_eq!(prefix.hf_block_context.block_context_map.len(), 39);
     assert!(prefix.global_ma_tree_bit_offset.unwrap() > packet.offset);
+}
+
+#[test]
+fn parses_non_default_lf_dequantization_and_channel_correlation() {
+    for (selector, extra, expected_colour_factor) in
+        [(0, 0, 84), (1, 0, 256), (2, 40, 42), (3, 42, 300)]
+    {
+        let (bytes, packet) = custom_lf_global(
+            [0x2c00, 0x3000, 0x3400],
+            (selector, extra),
+            [0xb800, 0x3800],
+            [112, 160],
+        );
+        let prefix = LfGlobalPrefix::parse(&bytes, packet).unwrap();
+        assert_eq!(prefix.lf_dequantization.multipliers, [0.0625, 0.125, 0.25]);
+        assert_eq!(prefix.lf_correlation.colour_factor, expected_colour_factor);
+        assert_eq!(prefix.lf_correlation.base, [-0.5, 0.5]);
+        assert_eq!(prefix.lf_correlation.lf_factors, [-16, 32]);
+        let inverse = 1.0 / expected_colour_factor as f32;
+        assert_eq!(
+            prefix.lf_correlation.lf_slopes(),
+            [-0.5 - 16.0 * inverse, 0.5 + 32.0 * inverse]
+        );
+        assert_eq!(prefix.lf_correlation.hf_params(), [-0.5, 0.5, inverse]);
+    }
+}
+
+#[test]
+fn rejects_invalid_lf_dequantization_and_base_correlation() {
+    let (bytes, packet) = custom_lf_global([0, 0x3000, 0x3400], (0, 0), [0, 0x3c00], [128, 128]);
+    assert!(matches!(
+        LfGlobalPrefix::parse(&bytes, packet),
+        Err(VarDctPacketError::LfDequantizationTooSmall {
+            channel: "X",
+            value: 0.0,
+        })
+    ));
+
+    let (bytes, packet) = custom_lf_global(
+        [0x2c00, 0x3000, 0x3400],
+        (0, 0),
+        [0xc480, 0x3c00],
+        [128, 128],
+    );
+    assert!(matches!(
+        LfGlobalPrefix::parse(&bytes, packet),
+        Err(VarDctPacketError::BaseCorrelationOutOfRange {
+            channel: "X",
+            value: -4.5,
+        })
+    ));
+
+    let (bytes, packet) =
+        custom_lf_global([0x7c00, 0x3000, 0x3400], (0, 0), [0, 0x3c00], [128, 128]);
+    assert!(matches!(
+        LfGlobalPrefix::parse(&bytes, packet),
+        Err(VarDctPacketError::MetadataBitstream {
+            stage: "LF channel dequantization multiplier",
+            ..
+        })
+    ));
 }
 
 #[test]

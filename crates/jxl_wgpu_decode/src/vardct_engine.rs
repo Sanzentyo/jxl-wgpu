@@ -60,8 +60,8 @@ use crate::vardct_pass_group::{
     HfCoefficientPlanError,
 };
 use crate::vardct_resource::{
-    VarDctResourceBuffers, VarDctResourceError, VarDctResourceLayout, VarDctResourceParams,
-    VarDctResourcePipeline,
+    VarDctResourceBuffers, VarDctResourceConfig, VarDctResourceError, VarDctResourceLayout,
+    VarDctResourceParams, VarDctResourcePipeline,
 };
 use crate::{
     AnimationMetadata, DecodeProfile, Error as DecodeError, FrameDuration, FrameMetadata,
@@ -875,15 +875,16 @@ fn prepare_source(
         };
         let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
         let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
-        let resource_params = VarDctResourceParams::new(
-            group_blocks_x,
-            group_blocks_y,
-            blocks_x,
-            block_origin,
-            packet.global_scale,
-            packet.quant_lf,
-            packet_group.extra_precision,
-        )?;
+        let resource_params = VarDctResourceParams::new(VarDctResourceConfig {
+            block_extent: [group_blocks_x, group_blocks_y],
+            output_stride: blocks_x,
+            output_origin: block_origin,
+            global_scale: packet.global_scale,
+            quant_lf: packet.quant_lf,
+            lf_dequantization: packet.lf_dequantization.multipliers,
+            lf_correlation: packet.lf_correlation.lf_slopes(),
+            extra_precision: packet_group.extra_precision,
+        })?;
         let group_correlation_width = packet_group.rect.width.div_ceil(64);
         let group_correlation_height = packet_group.rect.height.div_ceil(64);
         let correlation_origin = [packet_group.rect.x / 64, packet_group.rect.y / 64];
@@ -921,6 +922,7 @@ fn prepare_source(
             &artifact_config,
             artifact_layout,
             dequant_channel_scales,
+            packet.lf_correlation.hf_params(),
         )?;
         groups.push(VarDctGroupSource {
             control,

@@ -154,19 +154,33 @@ pub struct VarDctResourceParams {
     pub geometry: [u32; 4],
     pub offsets: [u32; 4],
     pub scales: [f32; 4],
-    pub _reserved: [u32; 4],
+    pub correlation: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VarDctResourceConfig {
+    pub block_extent: [u32; 2],
+    pub output_stride: u32,
+    pub output_origin: [u32; 2],
+    pub global_scale: u32,
+    pub quant_lf: u32,
+    pub lf_dequantization: [f32; 3],
+    pub lf_correlation: [f32; 2],
+    pub extra_precision: u8,
 }
 
 impl VarDctResourceParams {
-    pub fn new(
-        blocks_x: u32,
-        blocks_y: u32,
-        output_stride: u32,
-        output_origin: [u32; 2],
-        global_scale: u32,
-        quant_lf: u32,
-        extra_precision: u8,
-    ) -> Result<Self, VarDctResourceError> {
+    pub fn new(config: VarDctResourceConfig) -> Result<Self, VarDctResourceError> {
+        let VarDctResourceConfig {
+            block_extent: [blocks_x, blocks_y],
+            output_stride,
+            output_origin,
+            global_scale,
+            quant_lf,
+            lf_dequantization,
+            lf_correlation,
+            extra_precision,
+        } = config;
         let blocks =
             blocks_x
                 .checked_mul(blocks_y)
@@ -196,12 +210,12 @@ impl VarDctResourceParams {
             geometry: [blocks_x, blocks_y, blocks, output_stride],
             offsets: [0, blocks, 2 * blocks, output_offset],
             scales: [
-                16.0 / denominator / precision_divisor,
-                128.0 / denominator / precision_divisor,
-                256.0 / denominator / precision_divisor,
-                1.0,
+                512.0 * lf_dequantization[0] / denominator / precision_divisor,
+                512.0 * lf_dequantization[1] / denominator / precision_divisor,
+                512.0 * lf_dequantization[2] / denominator / precision_divisor,
+                precision_divisor,
             ],
-            _reserved: [u32::from(extra_precision), 0, 0, 0],
+            correlation: [lf_correlation[0], lf_correlation[1], 0.0, 0.0],
         })
     }
 
@@ -212,11 +226,10 @@ impl VarDctResourceParams {
 
     #[must_use]
     pub fn smoothing_thresholds(self) -> [f32; 3] {
-        let precision_multiplier = (1u32 << self._reserved[0]) as f32;
         [
-            self.scales[0] * precision_multiplier,
-            self.scales[1] * precision_multiplier,
-            self.scales[2] * precision_multiplier,
+            self.scales[0] * self.scales[3],
+            self.scales[1] * self.scales[3],
+            self.scales[2] * self.scales[3],
         ]
     }
 }

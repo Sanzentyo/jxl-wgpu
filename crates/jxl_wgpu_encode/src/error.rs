@@ -129,6 +129,12 @@ pub enum EncodeError {
     InvalidConfiguration(&'static str),
     #[error("invalid GPU frame source: {0}")]
     InvalidSource(&'static str),
+    #[error("VarDCT LF dequantization multiplier for {channel} is too small: {value}")]
+    VarDctLfDequantization { channel: &'static str, value: f32 },
+    #[error("VarDCT channel correlation colour factor {value} is outside 2..=65793")]
+    VarDctColourFactor { value: u32 },
+    #[error("VarDCT base channel correlation for {channel} is outside [-4, 4]: {value}")]
+    VarDctBaseCorrelation { channel: &'static str, value: f32 },
     #[error(transparent)]
     Backend(#[from] BackendError),
     #[error("GPU encoder memory backpressure: {0}")]

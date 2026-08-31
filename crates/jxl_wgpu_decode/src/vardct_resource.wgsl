@@ -5,7 +5,7 @@ struct Params {
     geometry: vec4<u32>,
     offsets: vec4<u32>,
     scales: vec4<f32>,
-    _reserved: vec4<u32>,
+    correlation: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> quantized_lf: array<u32>;
@@ -24,9 +24,9 @@ fn prepare_lf(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = index % params.geometry.x;
     let row = index / params.geometry.x;
     dequantized_lf[params.offsets.w + row * params.geometry.w + x] = vec4<f32>(
-        f32(raw_x) * params.scales.x,
+        fma(y, params.correlation.x, f32(raw_x) * params.scales.x),
         y,
-        f32(raw_b) * params.scales.z + y * params.scales.w,
+        fma(y, params.correlation.y, f32(raw_b) * params.scales.z),
         0.0,
     );
 }

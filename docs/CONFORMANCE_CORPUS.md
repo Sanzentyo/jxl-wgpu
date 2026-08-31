@@ -33,6 +33,15 @@ validated fragment descriptor per group and resets the clamped-Gradient predicto
 Rust `jxl` and installed `djxl` must decode each emitted codestream, while the stock GPU decoder plus
 explicit readback must differ from Rust `jxl` by at most one RGB8 code.
 
+An additional generated 8x8 patterned case serializes non-default exact-binary16 LF
+dequantization, colour factor 256, non-default X/B base correlations, and signed LF factors. The
+stock frontend must recover every field exactly. The synchronous encoder and runtime-neutral
+Future must emit identical bytes, the patterned fixed-kernel case must exceed 9 dB PSNR, and a
+257x1 solid-red scalable-kernel case must exceed 30 dB PSNR. Rust `jxl`, the stock GPU decoder plus
+explicit readback, and installed `djxl` must differ by at most one RGB8 code. Lower-level actual-GPU
+probes independently read back the LF dequantization/CfL result and the per-cell HF correlation
+vectors, so a parser-only round trip cannot satisfy this gate.
+
 Exact-black 16384x1 and 1x16384 cases execute the encoder on an actual adapter with eight LF groups,
 64 AC groups, and 74 TOC entries, then decode through Rust `jxl` byte-exactly. The 16384x16384 grid
 is checked for 64 LF groups, 4,096 AC groups, and 4,162 TOC entries without asserting that every

@@ -7,6 +7,7 @@ struct Params {
     source_offsets: vec4<u32>,
     matrix_offsets: array<vec4<u32>, 7>,
     dequant_scales: vec4<f32>,
+    correlation_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> raw_metadata: array<i32>;
@@ -23,7 +24,6 @@ const STATUS_COVERED_BLOCKS: u32 = 6u;
 const STATUS_CONSUMED_ENTRIES: u32 = 7u;
 const STATUS_BACKEND_REQUIREMENTS: u32 = 8u;
 const STATUS_STRATEGY_MASK: u32 = 9u;
-const HF_CORRELATION_BASE: f32 = 84.0;
 const BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID: u32 = 1u;
 const ERROR_INVALID_STRATEGY: u32 = 1u;
 const ERROR_NON_POSITIVE_HF_MUL: u32 = 2u;
@@ -250,8 +250,16 @@ fn lower_hf_metadata() {
         let destination = params.metadata_offsets.w
             + correlation_y * params.source_offsets.w + correlation_x;
         resources[destination] = vec4<f32>(
-            f32(raw_metadata[index]) / HF_CORRELATION_BASE,
-            1.0 + f32(raw_metadata[correlation_count + index]) / HF_CORRELATION_BASE,
+            fma(
+                f32(raw_metadata[index]),
+                params.correlation_params.z,
+                params.correlation_params.x,
+            ),
+            fma(
+                f32(raw_metadata[correlation_count + index]),
+                params.correlation_params.z,
+                params.correlation_params.y,
+            ),
             0.0,
             0.0,
         );

@@ -34,7 +34,8 @@ struct Params {
     fragment_descriptor_len: u32,
     lf_groups_x: u32,
     lf_groups_y: u32,
-    padding: array<u32, 5>,
+    lf_quantization: array<f32, 3>,
+    lf_correlation: array<f32, 2>,
 }
 
 @group(0) @binding(0)
@@ -177,9 +178,15 @@ fn quantize_blocks(
         }
         let mean = sum / 64.0;
         let dc_scale = f32(params.global_scale * params.quant_lf);
-        let quantized_y = i32(round(mean.y * dc_scale / 128.0));
-        let quantized_x = i32(round(mean.x * dc_scale / 16.0));
-        let quantized_b = i32(round((mean.z - mean.y) * dc_scale / 256.0));
+        let decorrelated_x = fma(-mean.y, params.lf_correlation[0], mean.x);
+        let decorrelated_b = fma(-mean.y, params.lf_correlation[1], mean.z);
+        let quantized_y = i32(round(mean.y * dc_scale * params.lf_quantization[1]));
+        let quantized_x = i32(round(
+            decorrelated_x * dc_scale * params.lf_quantization[0],
+        ));
+        let quantized_b = i32(round(
+            decorrelated_b * dc_scale * params.lf_quantization[2],
+        ));
         artifact_words[params.dc_offset + block] = bitcast<u32>(quantized_y);
         artifact_words[params.dc_offset + block_count + block] = bitcast<u32>(quantized_x);
         artifact_words[params.dc_offset + 2u * block_count + block] = bitcast<u32>(quantized_b);

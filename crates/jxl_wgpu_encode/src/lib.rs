@@ -56,6 +56,7 @@ pub use gpu::{
     BufferImageSource, GpuEncodeBackend, GpuEncodeJob, GpuEncoder, GpuFrameSource,
     TextureImageSource, WgpuContext,
 };
+pub use jxl_gpu_bitstream::FiniteF16;
 pub use lossless_modular::{
     LOSSLESS_MODULAR_GROUP_DIMENSION, LosslessModularAnimationDescriptor,
     LosslessModularAnimationSession, LosslessModularBackend, LosslessModularEncoder,
@@ -74,5 +75,6 @@ pub use session::{
 };
 pub use vardct_encoder::{
     TiledVarDctEncoder, TiledVarDctGrid, VarDctBackend, VarDctColorEncoding, VarDctEncoder,
-    VarDctJob, VarDctKernelLayout, VarDctMemoryPlan, VarDctStrategy, VarDctSubmission,
+    VarDctJob, VarDctKernelLayout, VarDctLfMetadata, VarDctMemoryPlan, VarDctStrategy,
+    VarDctSubmission,
 };

@@ -108,8 +108,10 @@ is below the allocation capacity. Block-context selection reads the resident qua
 and each task's `hf_mul`; its variable tables share the entropy bundle, while per-group LZ history
 occupies a disjoint tail slice of its LF group's reconstruction buffer so the pass remains within eight
 portable storage bindings. Each LF group owns independent reconstruction, raw-metadata,
-coefficient, packet-status, artifact, occupancy, and HF-status buffers. Dequantized LF and
-correlation values scatter into full-image resident atlases; adaptive LF smoothing runs once over
+coefficient, packet-status, artifact, occupancy, and HF-status buffers. LF values use the stream's
+default or explicit channel dequantization multipliers and LF chroma-from-luma slopes before
+scattering into the full-image resident atlas. HF correlation uses the same explicit base values
+and colour-factor reciprocal while lowering each frequency cell. Adaptive LF smoothing runs once over
 the complete block grid, so the 2048-pixel LF boundary is not treated as an image edge. Each
 artifact carries global output/LF/correlation origins and creates 27 compact strategy buckets and indirect dispatch
 records. The submission executes every populated bucket through the resident regular or special
@@ -199,7 +201,7 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Multiple spectral/refinement passes, custom
-quantization matrices, non-default LF channel-correlation metadata, Modular side images,
+strategy quantization matrices, Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

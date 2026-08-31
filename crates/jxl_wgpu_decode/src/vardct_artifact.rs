@@ -675,6 +675,7 @@ pub struct HfMetadataLoweringParams {
     pub source_offsets: [u32; 4],
     pub matrix_offsets: [[u32; 4]; 7],
     pub dequant_scales: [f32; 4],
+    pub correlation_params: [f32; 4],
 }
 
 impl HfMetadataLoweringParams {
@@ -682,6 +683,7 @@ impl HfMetadataLoweringParams {
         config: &HfMetadataArtifactConfig,
         layout: VarDctArtifactLayout,
         dequant_scales: [f32; 3],
+        correlation_params: [f32; 3],
     ) -> Result<Self, VarDctArtifactError> {
         let groups_per_row = config.blocks_width.div_ceil(config.pass_group_dim_blocks);
         let mut matrix_offsets = [[0u32; 4]; 7];
@@ -727,6 +729,12 @@ impl HfMetadataLoweringParams {
             ],
             matrix_offsets,
             dequant_scales: [dequant_scales[0], dequant_scales[1], dequant_scales[2], 0.0],
+            correlation_params: [
+                correlation_params[0],
+                correlation_params[1],
+                correlation_params[2],
+                0.0,
+            ],
         })
     }
 }
@@ -953,7 +961,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuDispatchIndirectArgs>() == 12);
     assert!(std::mem::size_of::<GpuHfOrderDescriptor>() == 16);
     assert!(std::mem::size_of::<HfCoefficientSinkParams>() == 32);
-    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 224);
+    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 240);
     assert!(std::mem::align_of::<HfMetadataLoweringParams>() == 16);
 };
 

@@ -21,7 +21,9 @@ struct Params {
     global_scale: u32,
     quant_lf: u32,
     raw_prefix: array<PrefixEntry, 19>,
-    padding: array<u32, 17>,
+    lf_quantization: array<f32, 3>,
+    lf_correlation: array<f32, 2>,
+    padding: array<u32, 12>,
 }
 
 // Exactly 25 KiB. Fixed maxima keep browser allocations bounded while covering
@@ -166,12 +168,14 @@ fn quantized_block_dc(channel: u32, block_index: u32) -> i32 {
     let mean = sum / 64.0;
     let dc_scale = f32(params.global_scale * params.quant_lf);
     if channel == 0u {
-        return i32(round(mean.y * dc_scale / 128.0));
+        return i32(round(mean.y * dc_scale * params.lf_quantization[1]));
     }
     if channel == 1u {
-        return i32(round(mean.x * dc_scale / 16.0));
+        let decorrelated_x = fma(-mean.y, params.lf_correlation[0], mean.x);
+        return i32(round(decorrelated_x * dc_scale * params.lf_quantization[0]));
     }
-    return i32(round((mean.z - mean.y) * dc_scale / 256.0));
+    let decorrelated_b = fma(-mean.y, params.lf_correlation[1], mean.z);
+    return i32(round(decorrelated_b * dc_scale * params.lf_quantization[2]));
 }
 
 @compute @workgroup_size(wg_x, 1, 1)

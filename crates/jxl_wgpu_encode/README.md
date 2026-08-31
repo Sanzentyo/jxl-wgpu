@@ -103,6 +103,17 @@ from the 8×8-footprint strategies through the regular 16/32/64/128/256 square a
 families. `VarDctStrategy::EXECUTABLE` is the authoritative inventory, and every entry emits its
 exact standard identifier rather than being relabeled or lowered to DCT8.
 
+`VarDctEncoder::new_with_lf_metadata` and `TiledVarDctEncoder::new_with_lf_metadata` accept a
+validated `VarDctLfMetadata`. Its LF dequantization and base-correlation fields retain exact finite
+binary16 values, while the colour factor and signed LF factors use their normative integer
+domains. Construction rejects dequantized coefficients below libjxl's `1e-8` threshold, colour
+factors outside `2..=65793`, and base correlations outside `[-4, 4]` with typed `EncodeError`
+variants. Default and explicit bundles share one serializer, and both bounded and scalable GPU
+kernels subtract the selected LF chroma-from-luma slopes and quantize with the selected channel
+dequantization multipliers. Generated explicit-metadata streams are parsed back by the stock
+frontend and agree across Rust `jxl`, the stock GPU decoder, and optional `djxl` within one RGB8
+code; blocking and runtime-neutral Future assembly are identical.
+
 The GPU executes sRGB linearization, XYB conversion, LF quantization, the per-8×8 clamped-gradient
 DC predictor, signed tokenization, prefix packing, histogramming, and construction of the standard
 strategy map. Through 32×32, one workgroup also records the complete diagnostic forward transform.
