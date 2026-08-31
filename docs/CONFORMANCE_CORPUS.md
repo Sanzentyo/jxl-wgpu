@@ -23,6 +23,25 @@ The checked-in inventory includes 1x1, tiny (2x2), odd (17x13, 19x11), square (6
 1x16384), 255/256/257 group boundaries, HD 1280x720 (Gray8 and RGB8), FHD 1920x1080 (RGBA8), UHD 4K
 3840x2160 (RGB10), UHD 8K 7680x4320 (Gray8), and UHD 16K 15360x8640 (Gray8).
 
+The decode integration corpus separately includes
+`crates/jxl_wgpu_decode/test-data/green_queen_vardct_nonzero_ac.jxl.hex`. It is a deterministic
+libjxl 0.12.0 re-encode of the checked-in 438×589 green-queen image using VarDCT effort 1,
+distance 2, resampling 1, and disabled Gaborish, EPF, dots, patches, and noise. Its six nonempty
+pass groups contain a custom DCT8 coefficient order and real AC coefficients. The actual-adapter
+test compares GPU RGB8 against Rust `jxl` and, when installed, `djxl`, with a maximum accepted
+difference of one code per channel. This fixture is decoder evidence; it is not counted among the
+24 exact Modular GPU encode/decode round trips.
+
+The decoded fixture SHA-256 is
+`95c3cd9a0769da10c1a8c0d4f903d0723bc760eebdd8023d8b7f81af5b73faa2`. It is reproduced from the
+checked-in `fixtures/green_queen_vardct_e3.jxl` source with libjxl as follows:
+
+```text
+djxl fixtures/green_queen_vardct_e3.jxl /tmp/green_queen.png
+cjxl /tmp/green_queen.png green_queen_vardct_nonzero_ac.jxl -d 2 -e 1 -m 0 \
+  --resampling=1 --gaborish=0 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
+```
+
 ## Deterministic source contract
 
 Every case describes:

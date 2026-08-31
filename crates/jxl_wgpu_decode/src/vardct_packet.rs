@@ -1,4 +1,4 @@
-//! GPU entropy frontend for the bounded standard zero-AC regular-VarDCT packet profile.
+//! GPU entropy frontend for the bounded standard regular-VarDCT packet profiles.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
@@ -6,10 +6,12 @@ use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
-use crate::modular_tree::{MaTreeLimits, MaTreeNodeIr, PackedModularMetadata, parse_ma_config};
+use crate::modular_tree::{
+    EntropyDecoderIr, MaTreeLimits, MaTreeNodeIr, PackedModularMetadata, parse_ma_config,
+};
 use crate::vardct_frontend::{
-    LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError, VarDctPacketError,
-    VarDctSectionLayout,
+    HfBlockContextIr, HfGlobalPrefix, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
+    VarDctPacketError, VarDctSectionLayout,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -20,9 +22,6 @@ const ENTROPY_ABI_MARKER: &str = "/*__JXL_MODULAR_ENTROPY_ABI__*/";
 const ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 
-const GLOBAL_SCALE: u32 = 8_813;
-const QUANT_LF: u32 = 10;
-const RAW_HF_MULTIPLIER: u32 = 5;
 const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
 
 /// A standard feature excluded from the deliberately bounded regular-VarDCT packet profile.
@@ -30,20 +29,22 @@ const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
 pub enum UnsupportedVarDctPacketFeature {
     #[error("the bounded tiled-VarDCT decoder requires exactly one LF group")]
     MultipleLfGroups,
-    #[error("pass group {group} contains {bits} AC payload bits; the bounded profile is zero-AC")]
-    NonEmptyPassGroup { group: u32, bits: u64 },
+    #[error("the DCT8 coefficient executor cannot use coefficient-order mask {used_orders:#x}")]
+    CustomCoefficientOrders { used_orders: u16 },
+    #[error(
+        "the bounded DCT8 coefficient executor requires the default HF block-context thresholds"
+    )]
+    HfBlockContextThresholds,
     #[error("the bounded regular-VarDCT decoder currently accepts 8-bit samples")]
     BitDepth,
     #[error("the one-entry packet extent is not one implemented regular VarDCT transform")]
     TransformExtent,
     #[error("the standard packet requests skip-adaptive-LF smoothing")]
     SkipAdaptiveLfSmoothing,
-    #[error("the packet does not use the fixed global_scale=8813 and quant_lf=10 profile")]
-    Quantization,
-    #[error("the MA tree uses property {property}; only channel and stream routing are supported")]
-    MaProperty { property: u32 },
-    #[error("the MA tree uses self-correcting prediction")]
-    SelfCorrectingPredictor,
+    #[error(
+        "the MA tree uses previous-channel property {property}; the heterogeneous VarDCT metadata layout is not implemented"
+    )]
+    PreviousChannelMaProperty { property: u32 },
 }
 
 /// Host-side failure before image entropy is submitted to the GPU.
@@ -59,10 +60,16 @@ pub enum BoundedVarDctPacketError {
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error("failed to parse the bounded MA-tree descriptor: {0}")]
     ModularTree(String),
+    #[error("failed to position the HF coefficient-order reader: {0}")]
+    CoefficientOrderBitstream(#[source] jxl_bitstream::Error),
+    #[error("failed to decode the HF coefficient-order permutation: {0}")]
+    CoefficientOrderCoding(#[source] jxl_coding::Error),
     #[error("the packed MA-tree metadata ABI is malformed")]
     PackedMetadata,
     #[error("VarDCT packet arithmetic overflowed while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("HF-global entropy metadata leaves {bits} non-padding bits")]
+    HfGlobalTrailingBits { bits: u64 },
 }
 
 /// GPU-reported validation failure. No output is authoritative after this error.
@@ -80,10 +87,6 @@ pub enum GpuVarDctPacketError {
     Correlation { value: u32 },
     #[error("GPU VarDCT packet selects strategy {actual}, expected {expected}")]
     Strategy { actual: u32, expected: u32 },
-    #[error("GPU VarDCT packet reconstructs raw HF multiplier {actual}, expected 5")]
-    HfMultiplier { actual: u32 },
-    #[error("GPU VarDCT packet uses nonzero EPF sharpness {value}")]
-    Sharpness { value: u32 },
     #[error("GPU VarDCT packet does not contain the standard zero-AC HF-global bundle")]
     HfGlobal,
     #[error("GPU VarDCT packet returned unknown status {code}")]
@@ -112,6 +115,32 @@ pub struct BoundedVarDctPacketPlan {
     pub modular_metadata: Vec<u32>,
     /// Physical power-of-two history ring used by both sequential Modular streams.
     pub lz77_window_words: u32,
+    /// Whether the shared MA tree requires the weighted self-correcting predictor workspace.
+    pub needs_self_correcting: bool,
+    pub global_scale: u32,
+    pub quant_lf: u32,
+    /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
+    /// packets and are never expanded on the host.
+    pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
+}
+
+/// Host-packed entropy tables and untouched pass-group packets for one VarDCT AC pass.
+#[derive(Clone, Debug)]
+pub struct HfCoefficientEntropyPlan {
+    pub num_hf_presets: u32,
+    pub num_block_clusters: u32,
+    pub metadata: Vec<u32>,
+    /// One packed entropy-cluster index per JPEG XL HF coefficient context. The optional final
+    /// LZ77 distance context remains internal to `metadata`.
+    pub context_map: Vec<u32>,
+    /// Default channel/order-to-block-cluster map used before coefficient contexts.
+    pub block_context_map: Vec<u32>,
+    /// Three DCT8 order descriptors followed by their packed `(x, y)` coordinate tables.
+    pub order_words: Vec<u32>,
+    pub order_coordinate_offset_words: u32,
+    pub pass_groups: Vec<BitRange>,
+    /// Per-pass-group power-of-two history capacity for the common GPU entropy executor.
+    pub lz77_window_words: u32,
 }
 
 impl BoundedVarDctPacketPlan {
@@ -130,58 +159,44 @@ impl BoundedVarDctPacketPlan {
         if !profile.adaptive_lf_smoothing {
             return Err(UnsupportedVarDctPacketFeature::SkipAdaptiveLfSmoothing.into());
         }
-        let (transform, task_count, lf_global_packet, lf_group, hf_global) = match &profile.sections
-        {
-            VarDctSectionLayout::Single { packet } => (
-                transform_for_extent(profile.width, profile.height)
-                    .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
-                1,
-                *packet,
-                *packet,
-                None,
-            ),
-            VarDctSectionLayout::Sections {
-                lf_global,
-                lf_groups,
-                hf_global,
-                pass_groups,
-            } => {
-                let lf_group = *lf_groups
-                    .first()
-                    .ok_or(UnsupportedVarDctPacketFeature::MultipleLfGroups)?;
-                for (group, packet) in pass_groups.iter().copied().enumerate() {
-                    if packet.length != 0 {
-                        return Err(UnsupportedVarDctPacketFeature::NonEmptyPassGroup {
-                            group: u32::try_from(group).map_err(|_| {
-                                BoundedVarDctPacketError::ArithmeticOverflow {
-                                    field: "pass-group index",
-                                }
-                            })?,
-                            bits: packet.length,
-                        }
-                        .into());
-                    }
+        let (transform, task_count, lf_global_packet, lf_group, hf_global, pass_groups) =
+            match &profile.sections {
+                VarDctSectionLayout::Single { packet } => (
+                    transform_for_extent(profile.width, profile.height)
+                        .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                    1,
+                    *packet,
+                    *packet,
+                    None,
+                    Vec::new(),
+                ),
+                VarDctSectionLayout::Sections {
+                    lf_global,
+                    lf_groups,
+                    hf_global,
+                    pass_groups,
+                } => {
+                    let lf_group = *lf_groups
+                        .first()
+                        .ok_or(UnsupportedVarDctPacketFeature::MultipleLfGroups)?;
+                    let blocks = profile
+                        .width
+                        .div_ceil(8)
+                        .checked_mul(profile.height.div_ceil(8))
+                        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "tiled DCT8 task count",
+                        })?;
+                    (
+                        TransformKind::Dct8,
+                        blocks,
+                        *lf_global,
+                        lf_group,
+                        Some(*hf_global),
+                        pass_groups.clone(),
+                    )
                 }
-                let blocks = profile
-                    .width
-                    .div_ceil(8)
-                    .checked_mul(profile.height.div_ceil(8))
-                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                        field: "tiled DCT8 task count",
-                    })?;
-                (
-                    TransformKind::Dct8,
-                    blocks,
-                    *lf_global,
-                    lf_group,
-                    Some(*hf_global),
-                )
-            }
-        };
+            };
         let lf_global = LfGlobalPrefix::parse(codestream, lf_global_packet)?;
-        if lf_global.global_scale != GLOBAL_SCALE || lf_global.quant_lf != QUANT_LF {
-            return Err(UnsupportedVarDctPacketFeature::Quantization.into());
-        }
         let mut reader = BitReader::new(codestream);
         reader.skip_bits(lf_global.ma_tree_bit_offset)?;
         let ma_config = parse_ma_config(&mut reader, MaTreeLimits::default())
@@ -200,14 +215,13 @@ impl BoundedVarDctPacketPlan {
             }
             .into());
         }
-        if ma_config.needs_self_correcting() {
-            return Err(UnsupportedVarDctPacketFeature::SelfCorrectingPredictor.into());
-        }
         for node in &ma_config.nodes {
             if let MaTreeNodeIr::Decision { property, .. } = *node
-                && property > 1
+                && property >= 16
             {
-                return Err(UnsupportedVarDctPacketFeature::MaProperty { property }.into());
+                return Err(
+                    UnsupportedVarDctPacketFeature::PreviousChannelMaProperty { property }.into(),
+                );
             }
         }
         let PackedModularMetadata { words } = ma_config
@@ -260,6 +274,34 @@ impl BoundedVarDctPacketPlan {
             .entropy
             .lz77_window_words(blocks_x.max(1), decoded_symbol_limit)
             .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let hf_coefficients = hf_global
+            .map(|packet| {
+                let max_group_blocks = profile
+                    .group_dimension
+                    .div_ceil(8)
+                    .checked_mul(profile.group_dimension.div_ceil(8))
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "pass-group block count",
+                    })?;
+                let decoded_symbol_limit = max_group_blocks.checked_mul(3 * 64).ok_or(
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "pass-group coefficient symbol limit",
+                    },
+                )?;
+                HfCoefficientEntropyPlan::parse(
+                    codestream,
+                    packet,
+                    u32::try_from(profile.group_count).map_err(|_| {
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "pass-group count",
+                        }
+                    })?,
+                    &lf_global.hf_block_context,
+                    pass_groups,
+                    decoded_symbol_limit,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             lf_stream_index: profile.lf_quant_stream_index(0)?,
             hf_stream_index: profile.hf_metadata_stream_index(0)?,
@@ -273,6 +315,10 @@ impl BoundedVarDctPacketPlan {
             entropy_bit_offset,
             modular_metadata: words,
             lz77_window_words,
+            needs_self_correcting: ma_config.needs_self_correcting(),
+            global_scale: lf_global.global_scale,
+            quant_lf: lf_global.quant_lf,
+            hf_coefficients,
         })
     }
 
@@ -289,7 +335,7 @@ impl BoundedVarDctPacketPlan {
         ]
     }
 
-    /// U32 scratch words retaining LF samples plus the conservative LZ history ring.
+    /// U32 scratch words retaining LF samples, weighted-predictor rows, and the LZ history ring.
     pub fn reconstructed_words(&self) -> Result<u32, BoundedVarDctPacketError> {
         let [blocks_x, blocks_y] = self.block_extent();
         let blocks =
@@ -315,11 +361,21 @@ impl BoundedVarDctPacketPlan {
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction samples",
             })?;
-        samples.checked_add(self.lz77_window_words).ok_or(
-            BoundedVarDctPacketError::ArithmeticOverflow {
+        let predictor_words = if self.needs_self_correcting {
+            self.predictor_width_capacity()?.checked_mul(5).ok_or(
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "VarDCT weighted-predictor rows",
+                },
+            )?
+        } else {
+            0
+        };
+        samples
+            .checked_add(predictor_words)
+            .and_then(|words| words.checked_add(self.lz77_window_words))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction scratch",
-            },
-        )
+            })
     }
 
     pub fn packet_control(&self) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
@@ -401,11 +457,11 @@ impl BoundedVarDctPacketPlan {
             ],
             expected: [
                 transform_id(self.transform),
-                RAW_HF_MULTIPLIER,
+                0,
                 ZERO_AC_HF_GLOBAL,
                 sharpness_offset,
             ],
-            quantization: [GLOBAL_SCALE, QUANT_LF, 0, 0],
+            quantization: [self.global_scale, self.quant_lf, 0, 0],
             streams: [
                 self.lf_stream_index,
                 self.hf_stream_index,
@@ -416,8 +472,15 @@ impl BoundedVarDctPacketPlan {
                     }
                 })?,
             ],
-            _reserved1: [0; 4],
+            scratch: [self.predictor_width_capacity()?, 0, 0, 0],
         })
+    }
+
+    fn predictor_width_capacity(&self) -> Result<u32, BoundedVarDctPacketError> {
+        let [blocks_x, _] = self.block_extent();
+        Ok(blocks_x
+            .max(self.task_count)
+            .max(self.profile.width.div_ceil(64)))
     }
 
     fn correlation_samples(&self) -> Result<u32, BoundedVarDctPacketError> {
@@ -431,6 +494,171 @@ impl BoundedVarDctPacketPlan {
     }
 }
 
+impl HfCoefficientEntropyPlan {
+    /// Parses HF-global tables without consuming a coefficient symbol. Pass-group ranges remain
+    /// exact views into the caller-owned codestream for the GPU executor.
+    fn parse(
+        codestream: &[u8],
+        packet: BitRange,
+        group_count: u32,
+        block_context: &HfBlockContextIr,
+        pass_groups: Vec<BitRange>,
+        decoded_symbol_limit: u32,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        let prefix = HfGlobalPrefix::parse(codestream, packet, group_count)?;
+        if prefix.used_orders & !1 != 0 {
+            return Err(UnsupportedVarDctPacketFeature::CustomCoefficientOrders {
+                used_orders: prefix.used_orders,
+            }
+            .into());
+        }
+        let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
+            parse_dct8_coefficient_orders(codestream, prefix)?;
+        if !block_context.qf_thresholds.is_empty()
+            || block_context
+                .lf_thresholds
+                .iter()
+                .any(|thresholds| !thresholds.is_empty())
+            || block_context.block_context_map.len() != 39
+        {
+            return Err(UnsupportedVarDctPacketFeature::HfBlockContextThresholds.into());
+        }
+        let block_cluster_count = block_context.num_block_clusters;
+        let context_count = 495u32
+            .checked_mul(prefix.num_hf_presets)
+            .and_then(|count| count.checked_mul(block_cluster_count))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF coefficient context count",
+            })?;
+        let context_count = usize::try_from(context_count).map_err(|_| {
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF coefficient context count",
+            }
+        })?;
+        let packet_end = packet
+            .end()
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF-global packet end",
+            })?;
+        if coefficient_entropy_bit_offset > packet_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: coefficient_entropy_bit_offset,
+                packet_end,
+            }
+            .into());
+        }
+        let mut reader = BitReader::new(codestream);
+        reader.skip_bits(coefficient_entropy_bit_offset)?;
+        let descriptor =
+            EntropyDecoderIr::parse(&mut reader, context_count, MaTreeLimits::default())
+                .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let descriptor_end = reader.bit_offset();
+        if descriptor_end > packet_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: descriptor_end,
+                packet_end,
+            }
+            .into());
+        }
+        let remaining = packet_end - descriptor_end;
+        if remaining > 7 || reader.read_bits(remaining as u8)? != 0 {
+            return Err(BoundedVarDctPacketError::HfGlobalTrailingBits { bits: remaining });
+        }
+        let lz77_window_words = descriptor
+            .lz77_window_words(0, decoded_symbol_limit)
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let context_map = descriptor
+            .context_to_cluster
+            .get(..context_count)
+            .ok_or(BoundedVarDctPacketError::PackedMetadata)?
+            .iter()
+            .map(|&cluster| u32::from(cluster))
+            .collect();
+        let block_context_map = block_context
+            .block_context_map
+            .iter()
+            .map(|&cluster| u32::from(cluster))
+            .collect();
+        let PackedModularMetadata { words } = descriptor
+            .pack_gpu_metadata()
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        Ok(Self {
+            num_hf_presets: prefix.num_hf_presets,
+            num_block_clusters: block_cluster_count,
+            metadata: words,
+            context_map,
+            block_context_map,
+            order_words,
+            order_coordinate_offset_words,
+            pass_groups,
+            lz77_window_words,
+        })
+    }
+}
+
+fn parse_dct8_coefficient_orders(
+    codestream: &[u8],
+    prefix: HfGlobalPrefix,
+) -> Result<(u64, Vec<u32>, u32), BoundedVarDctPacketError> {
+    use crate::vardct_artifact::NaturalDct8OrderTable;
+
+    const DESCRIPTOR_WORDS: u32 = 3 * 4;
+
+    let natural = NaturalDct8OrderTable::new();
+    if prefix.used_orders == 0 {
+        return Ok((
+            prefix.order_entropy_bit_offset,
+            natural.packed_words(),
+            DESCRIPTOR_WORDS,
+        ));
+    }
+
+    let mut bitstream = jxl_bitstream::Bitstream::new(codestream);
+    bitstream
+        .skip_bits(
+            usize::try_from(prefix.order_entropy_bit_offset).map_err(|_| {
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF coefficient-order bit offset",
+                }
+            })?,
+        )
+        .map_err(BoundedVarDctPacketError::CoefficientOrderBitstream)?;
+    let mut decoder = jxl_coding::Decoder::parse(&mut bitstream, 8)
+        .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+    let permutations = (0..3)
+        .map(|_| {
+            jxl_coding::read_permutation(&mut bitstream, &mut decoder, 64, 1)
+                .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    decoder
+        .finalize()
+        .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+    let coefficient_entropy_bit_offset =
+        u64::try_from(bitstream.num_read_bits()).map_err(|_| {
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF coefficient entropy bit offset",
+            }
+        })?;
+
+    let mut order_words = Vec::with_capacity(DESCRIPTOR_WORDS as usize + 3 * 64);
+    for channel in 0..3u32 {
+        order_words.extend_from_slice(&[channel * 64, 64, 8, 8]);
+    }
+    for permutation in permutations {
+        order_words.extend(
+            permutation
+                .into_iter()
+                .map(|index| natural.coordinates[index]),
+        );
+    }
+    Ok((
+        coefficient_entropy_bit_offset,
+        order_words,
+        DESCRIPTOR_WORDS,
+    ))
+}
+
 /// Exact 128-byte uniform consumed by `vardct_packet.wgsl`.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -442,7 +670,8 @@ pub struct VarDctPacketControl {
     pub expected: [u32; 4],
     pub quantization: [u32; 4],
     pub streams: [u32; 4],
-    pub _reserved1: [u32; 4],
+    /// Maximum predictor row width followed by reserved words.
+    pub scratch: [u32; 4],
 }
 
 /// Generic Modular parameter ABI retained by the composable entropy/reconstruction fragments.
@@ -478,6 +707,12 @@ impl VarDctModularParams {
         self.entropy.lz77_window_mask = words.saturating_sub(1);
         self
     }
+
+    /// Enables the weighted self-correcting predictor declared by the MA tree.
+    pub fn with_self_correcting(mut self, enabled: bool) -> Self {
+        self.consumer_words[9] = u32::from(enabled);
+        self
+    }
 }
 
 /// Exact 64-byte status written once by the serial packet parser.
@@ -504,15 +739,17 @@ impl GpuVarDctPacketStatus {
         expected_strategy: TransformKind,
         expected_lf_samples: u32,
         expected_hf_samples: u32,
+        expected_global_scale: u32,
+        expected_quant_lf: u32,
     ) -> Result<(), GpuVarDctPacketError> {
         match self.code {
             1 if self.cursor == self.expected_end
                 && self.lf_decoded == expected_lf_samples
                 && self.hf_decoded == expected_hf_samples
                 && self.strategy == transform_id(expected_strategy)
-                && self.hf_mul == RAW_HF_MULTIPLIER + 1
-                && self.global_scale == GLOBAL_SCALE
-                && self.quant_lf == QUANT_LF =>
+                && self.hf_mul > 0
+                && self.global_scale == expected_global_scale
+                && self.quant_lf == expected_quant_lf =>
             {
                 Ok(())
             }
@@ -529,10 +766,6 @@ impl GpuVarDctPacketStatus {
                 actual: self.detail,
                 expected: transform_id(expected_strategy),
             }),
-            25 => Err(GpuVarDctPacketError::HfMultiplier {
-                actual: self.detail,
-            }),
-            26 => Err(GpuVarDctPacketError::Sharpness { value: self.detail }),
             27 => Err(GpuVarDctPacketError::HfGlobal),
             2..=13 => Err(GpuVarDctPacketError::Entropy {
                 code: self.code,
@@ -674,6 +907,21 @@ const _: () = {
 mod tests {
     use super::*;
 
+    fn decode_hex(source: &str) -> Vec<u8> {
+        let digits = source
+            .bytes()
+            .filter(u8::is_ascii_hexdigit)
+            .collect::<Vec<_>>();
+        digits
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap();
+                let low = (pair[1] as char).to_digit(16).unwrap();
+                ((high << 4) | low) as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn packet_shader_is_portable_wgsl() {
         let module = naga::front::wgsl::parse_str(&shader_source()).unwrap();
@@ -686,16 +934,53 @@ mod tests {
 
     #[test]
     fn modular_parameter_record_preserves_the_consumer_word_layout() {
-        let params = VarDctModularParams::default().with_lz77_window(8);
+        let params = VarDctModularParams::default()
+            .with_lz77_window(8)
+            .with_self_correcting(true);
         let words = bytemuck::cast::<VarDctModularParams, [u32; 52]>(params);
         let mut expected = [0; 52];
         expected[2] = 7;
+        expected[12] = 1;
         expected[41] = 16;
         expected[42] = 10;
         expected[43..=45].fill(7);
         expected[48] = 13;
         expected[49..=51].fill(12);
         assert_eq!(words, expected);
+    }
+
+    #[test]
+    fn coefficient_entropy_plan_expands_dct8_custom_orders_before_coefficient_symbols() {
+        let codestream = decode_hex(include_str!(
+            "../../jxl_gpu_bitstream/test-data/green_queen_vardct_e3.jxl.hex"
+        ));
+        let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+        let VarDctSectionLayout::Sections {
+            lf_global,
+            hf_global,
+            ..
+        } = profile.sections
+        else {
+            panic!("fixture has physical VarDCT sections")
+        };
+        let lf = LfGlobalPrefix::parse(&codestream, lf_global).unwrap();
+        let plan = HfCoefficientEntropyPlan::parse(
+            &codestream,
+            hf_global,
+            u32::try_from(profile.group_count).unwrap(),
+            &lf.hf_block_context,
+            Vec::new(),
+            32 * 32 * 3 * 64,
+        )
+        .unwrap();
+        assert_eq!(plan.order_coordinate_offset_words, 12);
+        assert_eq!(plan.order_words.len(), 12 + 3 * 64);
+        assert_eq!(
+            &plan.order_words[..12],
+            &[0, 64, 8, 8, 64, 64, 8, 8, 128, 64, 8, 8]
+        );
     }
 
     #[test]

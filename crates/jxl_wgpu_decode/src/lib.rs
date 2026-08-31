@@ -38,6 +38,7 @@ mod vardct_frontend;
 mod vardct_lf;
 mod vardct_output;
 mod vardct_packet;
+mod vardct_pass_group;
 mod vardct_resource;
 mod wgpu_engine;
 

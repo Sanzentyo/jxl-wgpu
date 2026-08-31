@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 use jxl::api::{
     JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
-use jxl_gpu_bitstream::{FrameSectionKind, InventoryLimits, ParseLimits};
+use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
@@ -14,10 +14,7 @@ use jxl_wgpu::{
     ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
-use jxl_wgpu_decode::vardct::packet::{
-    BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
-    UnsupportedVarDctPacketFeature,
-};
+use jxl_wgpu_decode::vardct::packet::{BoundedVarDctPacketPlan, GpuVarDctPacketError};
 use jxl_wgpu_decode::{
     DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
     VarDctDecodeError,
@@ -588,6 +585,19 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         assert_eq!(plan.task_count, blocks);
         assert!(plan.hf_global.is_some());
         assert!(plan.profile.group_count >= 2);
+        let hf_coefficients = plan
+            .hf_coefficients
+            .as_ref()
+            .expect("multi-entry VarDCT parses the descriptor-only HF coefficient plan");
+        assert_eq!(hf_coefficients.num_hf_presets, 1);
+        assert_eq!(hf_coefficients.context_map.len(), 495 * 15);
+        assert_eq!(hf_coefficients.block_context_map.len(), 39);
+        assert_eq!(
+            hf_coefficients.pass_groups.len() as u64,
+            plan.profile.group_count
+        );
+        assert!(hf_coefficients.metadata.len() >= 28);
+        assert_eq!(hf_coefficients.lz77_window_words, 0);
         let control = plan.packet_control().unwrap();
         let correlations = extent.width.div_ceil(64) * extent.height.div_ceil(64);
         assert_eq!(control.offsets[0], 0);
@@ -597,23 +607,6 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         assert_eq!(control.capacities[0], blocks * 8 * 8 * 3);
         assert_eq!(control.capacities[1], 2 * correlations + 3 * blocks);
         assert_eq!(control.capacities[3], blocks);
-
-        let mut nonempty_ac = inventory.clone();
-        let mut malformed_codestream = parsed.codestream().to_vec();
-        malformed_codestream.push(0);
-        nonempty_ac.codestream_bytes = malformed_codestream.len() as u64;
-        let pass_group = nonempty_ac.frames[0]
-            .sections
-            .iter_mut()
-            .find(|section| matches!(section.kind, FrameSectionKind::PassGroup { .. }))
-            .unwrap();
-        pass_group.bits.length = 1;
-        assert!(matches!(
-            BoundedVarDctPacketPlan::parse(&malformed_codestream, &nonempty_ac),
-            Err(BoundedVarDctPacketError::Unsupported(
-                UnsupportedVarDctPacketFeature::NonEmptyPassGroup { bits: 1, .. }
-            ))
-        ));
 
         let mut session = decoder
             .open(
@@ -677,5 +670,65 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             drop(retained);
         }
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+}
+
+#[test]
+fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let encoded = common::green_queen_vardct_nonzero_ac();
+    let extent = Extent2d::new(438, 589);
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+    assert!(plan.needs_self_correcting);
+    let hf = plan.hf_coefficients.as_ref().unwrap();
+    assert_eq!(hf.pass_groups.len(), 6);
+    assert_eq!(hf.order_coordinate_offset_words, 12);
+    assert_eq!(hf.order_words.len(), 12 + 3 * 64);
+    assert_eq!(
+        &hf.order_words[..12],
+        &[0, 64, 8, 8, 64, 64, 8, 8, 128, 64, 8, 8]
+    );
+
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    assert!(
+        maximum_error(actual, &rust) <= 1,
+        "nonzero-AC GPU output diverges from Rust jxl",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        assert!(
+            maximum_error(actual, &djxl) <= 1,
+            "nonzero-AC GPU output diverges from djxl",
+        );
     }
 }

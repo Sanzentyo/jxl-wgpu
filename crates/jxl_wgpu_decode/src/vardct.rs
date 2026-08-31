@@ -28,9 +28,14 @@ pub mod frontend {
     pub use crate::vardct_frontend::*;
 }
 
-/// Strict zero-AC regular-VarDCT packet profile and GPU entropy ABI.
+/// Bounded regular-VarDCT packet profile and GPU entropy ABI.
 pub mod packet {
     pub use crate::vardct_packet::*;
+}
+
+/// Single-pass DCT8 coefficient entropy execution and typed GPU status ABI.
+pub mod pass_group {
+    pub use crate::vardct_pass_group::*;
 }
 
 /// Resident XYB-to-sRGB8 GPU output packing.
@@ -43,7 +48,7 @@ pub mod lf {
     pub use crate::vardct_lf::*;
 }
 
-/// Strict zero-AC resource table and LF dequantization ABI.
+/// Bounded default-matrix resource table and LF dequantization ABI.
 pub mod resource {
     pub use crate::vardct_resource::*;
 }

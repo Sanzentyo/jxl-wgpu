@@ -106,6 +106,10 @@ pub struct HfMetadataArtifactConfig {
     pub destination_origin: [u32; 2],
     /// Offset of the immutable AFV basis in the general VarDCT resource-vector buffer.
     pub afv_basis_offset: u32,
+    /// Vec4 offset where one quantization scale per lowered task is written.
+    pub quant_offset: u32,
+    /// LF-global quantization scale denominator component.
+    pub global_scale: u32,
     /// Resource-vector offsets for the dequant matrix selected by each wire strategy.
     pub matrix_offsets: [u32; VAR_DCT_STRATEGY_COUNT],
 }
@@ -671,13 +675,13 @@ impl HfMetadataLoweringParams {
             metadata_offsets: [
                 layout.task_metadata_offset_words,
                 layout.block_task_map_offset_words,
-                0,
+                config.quant_offset,
                 0,
             ],
             source_offsets: [
                 config.strategy_offset_words,
                 config.hf_mul_offset_words,
-                0,
+                config.global_scale,
                 0,
             ],
             matrix_offsets,
@@ -690,6 +694,7 @@ pub struct HfMetadataLoweringBuffers<'a> {
     pub raw_metadata: &'a wgpu::Buffer,
     pub artifact: &'a wgpu::Buffer,
     pub occupancy: &'a wgpu::Buffer,
+    pub resources: &'a wgpu::Buffer,
     pub params: &'a wgpu::Buffer,
 }
 
@@ -729,7 +734,8 @@ impl HfMetadataLoweringPipeline {
                 binding(0, buffers.raw_metadata),
                 binding(1, buffers.artifact),
                 binding(2, buffers.occupancy),
-                binding(3, buffers.params),
+                binding(3, buffers.resources),
+                binding(4, buffers.params),
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -750,6 +756,64 @@ pub struct GpuHfOrderDescriptor {
     pub len: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Compact natural-order table used by the first production DCT8 coefficient executor.
+///
+/// All three channels share the same immutable 64-word coordinate table. Custom orders retain a
+/// separate GPU-decoded layout and are deliberately not represented by this type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NaturalDct8OrderTable {
+    pub descriptors: [GpuHfOrderDescriptor; HF_ORDER_CHANNELS],
+    pub coordinates: [u32; 64],
+}
+
+impl NaturalDct8OrderTable {
+    #[must_use]
+    pub fn new() -> Self {
+        let descriptor = GpuHfOrderDescriptor {
+            offset: 0,
+            len: 64,
+            width: 8,
+            height: 8,
+        };
+        let mut coordinates = [0; 64];
+        coordinates[0] = 0;
+        let mut cursor = 1usize;
+        for distance in 2u32..16 {
+            let margin = distance.saturating_sub(8);
+            for order in margin..distance - margin {
+                let (x, y) = if distance & 1 == 1 {
+                    (order, distance - 1 - order)
+                } else {
+                    (distance - 1 - order, order)
+                };
+                coordinates[cursor] = x | (y << 16);
+                cursor += 1;
+            }
+        }
+        debug_assert_eq!(cursor, coordinates.len());
+        Self {
+            descriptors: [descriptor; HF_ORDER_CHANNELS],
+            coordinates,
+        }
+    }
+
+    /// Packs descriptors followed by coordinates into the sink's single immutable word binding.
+    #[must_use]
+    pub fn packed_words(&self) -> Vec<u32> {
+        let descriptor_words = bytemuck::cast_slice::<GpuHfOrderDescriptor, u32>(&self.descriptors);
+        let mut words = Vec::with_capacity(descriptor_words.len() + self.coordinates.len());
+        words.extend_from_slice(descriptor_words);
+        words.extend_from_slice(&self.coordinates);
+        words
+    }
+}
+
+impl Default for NaturalDct8OrderTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Layout for entropy-decoded custom order permutations.
@@ -816,6 +880,8 @@ pub struct HfCoefficientSinkParams {
     pub task_count: u32,
     pub coefficient_words: u32,
     pub order_descriptor_count: u32,
+    pub order_coordinate_offset_words: u32,
+    pub _reserved: [u32; 3],
 }
 
 pub const VAR_DCT_ARTIFACT_SHADER: &str = include_str!("vardct_artifact.wgsl");
@@ -844,7 +910,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuHfTaskMetadata>() == 48);
     assert!(std::mem::size_of::<GpuDispatchIndirectArgs>() == 12);
     assert!(std::mem::size_of::<GpuHfOrderDescriptor>() == 16);
-    assert!(std::mem::size_of::<HfCoefficientSinkParams>() == 16);
+    assert!(std::mem::size_of::<HfCoefficientSinkParams>() == 32);
     assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 208);
     assert!(std::mem::align_of::<HfMetadataLoweringParams>() == 16);
 };
@@ -895,5 +961,29 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_dct8_order_matches_the_decoder_oracle() {
+        let table = NaturalDct8OrderTable::new();
+        assert!(table.descriptors.iter().all(|descriptor| {
+            *descriptor
+                == GpuHfOrderDescriptor {
+                    offset: 0,
+                    len: 64,
+                    width: 8,
+                    height: 8,
+                }
+        }));
+        let expected = jxl_vardct::DCT8_NATURAL_ORDER
+            .iter()
+            .map(|&(x, y)| u32::from(x) | (u32::from(y) << 16))
+            .collect::<Vec<_>>();
+        assert_eq!(table.coordinates.as_slice(), expected);
     }
 }

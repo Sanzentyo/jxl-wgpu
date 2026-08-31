@@ -1,12 +1,9 @@
 //! Reusable packed JPEG XL entropy descriptor decoder.
 //!
-//! Required caller ABI: `modular_metadata`, `reconstructed`, `Params` fields `token_end`,
-//! `sample_count`, `source_channels`, `needs_self_correcting`, `width`, and
-//! `lz77_window_mask`; private
-//! `bit_cursor`/`decode_error`; `read_bits`/`peek_bits`; and the shared `ERROR_*` constants.
-//! The LZ window begins after raw sample words and the optional five-words-per-column weighted
-//! predictor state. Call `entropy_begin`, `entropy_read_varint`, then `entropy_finalize` once per
-//! logical stream.
+//! Required caller ABI: `modular_metadata`; `params.entropy`; private `bit_cursor` and
+//! `decode_error`; `read_bits`, `peek_bits`, `reconstruction_load`, `reconstruction_store`, and
+//! `entropy_window_base`; plus the shared `ERROR_*` constants. Call `entropy_begin`,
+//! `entropy_read_varint`, then `entropy_finalize` once per logical stream.
 
 const META_NODE_COUNT: u32 = 0u;
 const META_MAX_DEPTH: u32 = 1u;

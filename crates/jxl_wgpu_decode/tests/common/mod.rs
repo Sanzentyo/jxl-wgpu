@@ -40,3 +40,12 @@ pub fn fragmented_animation() -> &'static [u8] {
         LazyLock::new(|| decode_hex(include_str!("../../test-data/fragmented_animation.jxl.hex")));
     BYTES.as_slice()
 }
+
+pub fn green_queen_vardct_nonzero_ac() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/green_queen_vardct_nonzero_ac.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}

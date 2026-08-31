@@ -12,14 +12,20 @@ struct HfCoefficientSinkParams {
     task_count: u32,
     coefficient_words: u32,
     order_descriptor_count: u32,
+    order_coordinate_offset_words: u32,
+    _reserved0: u32,
+    _reserved1: u32,
+    _reserved2: u32,
 };
 
 @group(1) @binding(0) var<storage, read> hf_artifact: array<u32>;
-@group(1) @binding(1) var<storage, read> hf_order_descriptors: array<HfOrderDescriptor>;
-@group(1) @binding(2) var<storage, read> hf_order_coordinates: array<u32>;
-@group(1) @binding(3) var<storage, read_write> hf_coefficients: array<atomic<i32>>;
-@group(1) @binding(4) var<storage, read_write> hf_coefficient_status: atomic<u32>;
-@group(1) @binding(5) var<uniform> hf_sink_params: HfCoefficientSinkParams;
+// Descriptors and coordinates share one immutable word buffer so a complete entropy decoder plus
+// this sink stays within WebGPU's portable eight-storage-buffer stage limit.
+@group(1) @binding(1) var<storage, read> hf_order_table: array<u32>;
+@group(1) @binding(2) var<storage, read_write> hf_coefficients: array<atomic<i32>>;
+@group(1) @binding(3) var<uniform> hf_sink_params: HfCoefficientSinkParams;
+
+var<private> hf_coefficient_error: u32;
 
 const HF_SINK_ERROR_TASK: u32 = 1u;
 const HF_SINK_ERROR_CHANNEL: u32 = 2u;
@@ -29,7 +35,17 @@ const HF_SINK_ERROR_COORDINATE: u32 = 5u;
 const HF_SINK_ERROR_COEFFICIENT: u32 = 6u;
 
 fn hf_sink_fail(code: u32) {
-    atomicMax(&hf_coefficient_status, code);
+    hf_coefficient_error = max(hf_coefficient_error, code);
+}
+
+fn hf_order_descriptor(index: u32) -> HfOrderDescriptor {
+    let base = index * 4u;
+    return HfOrderDescriptor(
+        hf_order_table[base],
+        hf_order_table[base + 1u],
+        hf_order_table[base + 2u],
+        hf_order_table[base + 3u],
+    );
 }
 
 // Stores one already entropy-decoded signed coefficient. `order_index` is the absolute index in
@@ -61,14 +77,16 @@ fn hf_store_quantized_coefficient(
         hf_sink_fail(HF_SINK_ERROR_ORDER_DESCRIPTOR);
         return false;
     }
-    let descriptor = hf_order_descriptors[descriptor_index];
+    let descriptor = hf_order_descriptor(descriptor_index);
     let area = block_width * block_height * 64u;
     if (descriptor.len != area || descriptor.width * descriptor.height != area
         || order_index >= descriptor.len) {
         hf_sink_fail(HF_SINK_ERROR_ORDER_INDEX);
         return false;
     }
-    let packed_coordinate = hf_order_coordinates[descriptor.offset + order_index];
+    let packed_coordinate = hf_order_table[
+        hf_sink_params.order_coordinate_offset_words + descriptor.offset + order_index
+    ];
     var frequency_x = packed_coordinate & 0xffffu;
     var frequency_y = packed_coordinate >> 16u;
     if ((flags & 1u) != 0u) {

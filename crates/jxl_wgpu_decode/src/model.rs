@@ -23,9 +23,9 @@ pub enum DecodeProfile {
     },
     /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer.
     ///
-    /// `transform` is shared by every first block in the negotiated bounded profile. A legacy
-    /// one-entry packet has one image-sized regular task; the tiled profile has one DCT8 task per
-    /// padded 8x8 block and may span several normatively empty zero-AC pass groups.
+    /// `transform` is shared by every first block in the negotiated bounded profile. A single-entry
+    /// packet has one image-sized regular task; the tiled profile has one DCT8 task per padded 8x8
+    /// block and may span several pass groups carrying single-pass AC coefficients.
     VarDctRegular {
         bits_per_sample: u8,
         transform: TransformKind,

@@ -129,8 +129,9 @@ pub struct LfGlobalPrefix {
 /// Fixed HF-global metadata preceding an optional entropy-coded coefficient-order permutation.
 ///
 /// If `used_orders` is zero, `order_entropy_bit_offset` is also the beginning of the HF
-/// coefficient entropy descriptor. Otherwise it points to the order decoder descriptor; its
-/// permutation symbols and resulting cursor are consumed on the GPU.
+/// coefficient entropy descriptor. Otherwise it points to the order decoder descriptor; the
+/// bounded frontend expands this small metadata permutation before preserving coefficient symbols
+/// for the GPU pass-group executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HfGlobalPrefix {
     pub num_hf_presets: u32,

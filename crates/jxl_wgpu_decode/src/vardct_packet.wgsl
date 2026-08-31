@@ -61,7 +61,7 @@ struct PacketControl {
     expected: vec4<u32>,
     quantization: vec4<u32>,
     streams: vec4<u32>,
-    _reserved1: vec4<u32>,
+    scratch: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -99,8 +99,6 @@ const ERROR_FIRST_BLOCK: u32 = 21u;
 const ERROR_HF_HEADER: u32 = 22u;
 const ERROR_CORRELATION: u32 = 23u;
 const ERROR_STRATEGY: u32 = 24u;
-const ERROR_HF_MULTIPLIER: u32 = 25u;
-const ERROR_SHARPNESS: u32 = 26u;
 const ERROR_HF_GLOBAL: u32 = 27u;
 
 fn reconstruction_load(index: u32) -> u32 {
@@ -113,7 +111,7 @@ fn reconstruction_store(index: u32, value: u32) {
 
 fn entropy_window_base() -> u32 {
     return params.sample_count * params.source_channels
-        + params.needs_self_correcting * 5u * params.width;
+        + params.needs_self_correcting * 5u * control.scratch.x;
 }
 
 fn bit_mask(count: u32) -> u32 {
@@ -175,6 +173,9 @@ fn decode_channel(width: u32, height: u32, offset: u32, kind: u32) -> u32 {
     target_kind = kind;
     target_offset = offset;
     predictor_prev_grad = 0i;
+    if params.needs_self_correcting != 0u {
+        wp_reset();
+    }
     var decoded = 0u;
     let channel_samples = width * height;
     while decoded < channel_samples && decode_error == 0u {
@@ -201,8 +202,11 @@ fn decode_channel(width: u32, height: u32, offset: u32, kind: u32) -> u32 {
         if y >= 2u { nn = target_load(decoded - 2u * width); }
         var ww = w;
         if x >= 2u { ww = target_load(decoded - 2u); }
-        let weighted = WeightedPrediction(0i, 0i, array<i32, 4>(0i, 0i, 0i, 0i));
-        let leaf = ma_leaf(decoded, x, y, n, w, nw, ne, nn, ww, 0i);
+        var weighted = WeightedPrediction(0i, 0i, array<i32, 4>(0i, 0i, 0i, 0i));
+        if params.needs_self_correcting != 0u {
+            weighted = weighted_predict(n, nw, ne, w, nn);
+        }
+        let leaf = ma_leaf(decoded, x, y, n, w, nw, ne, nn, ww, weighted.max_error);
         if decode_error != 0u { break; }
         let predictor = modular_metadata[leaf + 1u];
         let leaf_offset = modular_metadata[leaf + 2u];
@@ -213,6 +217,9 @@ fn decode_channel(width: u32, height: u32, offset: u32, kind: u32) -> u32 {
         let prediction = predictor_value(predictor, weighted, n, w, nw, ne, nn, ww, nee);
         let sample = bitcast<i32>(bitcast<u32>(residual) + bitcast<u32>(prediction));
         target_store(decoded, sample);
+        if params.needs_self_correcting != 0u {
+            weighted_record(weighted, sample);
+        }
         predictor_prev_grad = select(w - nw + n, 0i, x + 1u == width);
         decoded += 1u;
     }
@@ -258,7 +265,6 @@ fn decode_vardct_packet() {
     params.entropy.token_end = control.section_bits.y;
     params.source_channels = 3u;
     params.source_mask = 0x7fffffffu;
-    params.needs_self_correcting = 0u;
     params.entropy.lz77_window_mask = 0u;
     params.stream_index = control.streams.x;
 
@@ -328,32 +334,30 @@ fn decode_vardct_packet() {
         if raw_metadata[control.offsets.z + index] != control.expected.x {
             reject(ERROR_STRATEGY, raw_metadata[control.offsets.z + index]);
         }
-        if raw_metadata[control.offsets.w + index] != control.expected.y {
-            reject(ERROR_HF_MULTIPLIER, raw_metadata[control.offsets.w + index]);
-        }
     }
-    validate_zero_range(control.expected.w, block_count, ERROR_SHARPNESS);
-
     if control.streams.z != 0u {
         finish_section(control.section_bits.y);
-        bit_cursor = control.section_bits.z;
+        // Separate HF-global descriptors are host-packed into the shared entropy-table ABI and
+        // their coefficient symbols remain in pass-group packets for the next GPU dispatch.
+        bit_cursor = control.section_bits.w;
         params.entropy.token_start = bit_cursor;
         params.entropy.token_end = control.section_bits.w;
+    } else {
+        let preset_bits = select(
+            0u,
+            32u - countLeadingZeros(control.streams.w - 1u),
+            control.streams.w > 1u,
+        );
+        let default_matrix = read_bits(1u);
+        let preset = read_bits(preset_bits);
+        let fixed_hf_tail = read_bits(17u);
+        if default_matrix != (control.expected.z & 1u)
+            || preset != 0u
+            || fixed_hf_tail != (control.expected.z >> 1u) {
+            reject(ERROR_HF_GLOBAL, bit_cursor);
+        }
+        finish_section(params.entropy.token_end);
     }
-    let preset_bits = select(
-        0u,
-        32u - countLeadingZeros(control.streams.w - 1u),
-        control.streams.w > 1u,
-    );
-    let default_matrix = read_bits(1u);
-    let preset = read_bits(preset_bits);
-    let fixed_hf_tail = read_bits(17u);
-    if default_matrix != (control.expected.z & 1u)
-        || preset != 0u
-        || fixed_hf_tail != (control.expected.z >> 1u) {
-        reject(ERROR_HF_GLOBAL, bit_cursor);
-    }
-    finish_section(params.entropy.token_end);
 
     if decode_error == 0u {
         for (var index = 0u; index < control.capacities.x; index += 1u) {

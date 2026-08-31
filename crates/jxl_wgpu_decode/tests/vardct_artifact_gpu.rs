@@ -63,6 +63,8 @@ fn config(raw_metadata_words: u64) -> HfMetadataArtifactConfig {
         correlation_height: 1,
         destination_origin: [8, 16],
         afv_basis_offset: 9_999,
+        quant_offset: 0,
+        global_scale: 8_813,
         matrix_offsets: std::array::from_fn(|strategy| 1_000 + strategy as u32 * 64),
     }
 }
@@ -106,6 +108,8 @@ fn lower_topology(
         correlation_height: blocks[1].div_ceil(8),
         destination_origin: [0, 0],
         afv_basis_offset: 0,
+        quant_offset: 0,
+        global_scale: 8_813,
         matrix_offsets: [0; VAR_DCT_STRATEGY_COUNT],
     };
     let layout = VarDctArtifactLayout::plan(
@@ -136,6 +140,12 @@ fn lower_topology(
         contents: bytemuck::bytes_of(&params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let resources = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT quantization resources"),
+        size: u64::from(entries.max(1)) * 16,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("malformed VarDCT topology status"),
         size: std::mem::size_of::<GpuVarDctArtifactStatus>() as u64,
@@ -153,6 +163,7 @@ fn lower_topology(
             raw_metadata: &raw,
             artifact: &artifact,
             occupancy: &occupancy,
+            resources: &resources,
             params: &params,
         },
     );
@@ -410,6 +421,12 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
         contents: bytemuck::bytes_of(&params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let resource_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("VarDCT quantization resources"),
+        size: u64::from(layout.task_capacity) * 16,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
 
     let order_layout = HfOrderTableLayout::new((1 << 0) | (1 << 4)).unwrap();
     let mut order_coordinates = vec![0u32; order_layout.coordinate_words as usize];
@@ -424,14 +441,14 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
     // A custom DCT8/X order sends order slot 1 to the bottom-right frequency.
     let dct8_x = order_layout.descriptor(0, 0).unwrap();
     order_coordinates[(dct8_x.offset + 1) as usize] = 7 | (7 << 16);
-    let order_descriptors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("HF order descriptors"),
-        contents: bytemuck::cast_slice(&order_layout.descriptors),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let order_coordinates_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("HF order coordinates"),
-        contents: bytemuck::cast_slice(&order_coordinates),
+    let descriptor_words = bytemuck::cast_slice::<_, u32>(&order_layout.descriptors);
+    let order_coordinate_offset_words = descriptor_words.len() as u32;
+    let mut order_words = Vec::with_capacity(descriptor_words.len() + order_coordinates.len());
+    order_words.extend_from_slice(descriptor_words);
+    order_words.extend_from_slice(&order_coordinates);
+    let order_table = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("HF packed order table"),
+        contents: bytemuck::cast_slice(&order_words),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -481,13 +498,10 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
             task_count: 4,
             coefficient_words: layout.coefficient_capacity_words,
             order_descriptor_count: (13 * 3) as u32,
+            order_coordinate_offset_words,
+            _reserved: [0; 3],
         }),
         usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let sink_status = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("HF coefficient sink status"),
-        contents: bytemuck::bytes_of(&0u32),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     });
 
     let sink_source = format!(
@@ -549,22 +563,14 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: order_descriptors.as_entire_binding(),
+                resource: order_table.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: order_coordinates_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: coefficient_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 4,
-                resource: sink_status.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
+                binding: 3,
                 resource: sink_params.as_entire_binding(),
             },
         ],
@@ -572,9 +578,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
 
     let artifact_readback_offset = 0;
     let coefficient_readback_offset = align_256(layout.artifact_bytes);
-    let sink_status_readback_offset =
-        align_256(coefficient_readback_offset + layout.coefficient_bytes);
-    let staging_bytes = sink_status_readback_offset + 4;
+    let staging_bytes = coefficient_readback_offset + layout.coefficient_bytes;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("aggregate VarDCT artifact readback"),
         size: staging_bytes,
@@ -593,6 +597,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
             raw_metadata: &raw_buffer,
             artifact: &artifact_buffer,
             occupancy: &occupancy_buffer,
+            resources: &resource_buffer,
             params: &params_buffer,
         },
     );
@@ -620,7 +625,6 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         coefficient_readback_offset,
         layout.coefficient_bytes,
     );
-    encoder.copy_buffer_to_buffer(&sink_status, 0, &staging, sink_status_readback_offset, 4);
     let submission = queue.submit([encoder.finish()]);
     let (sender, receiver) = mpsc::sync_channel(1);
     staging
@@ -745,8 +749,4 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     // Square/tall transform buffers are frequency-X-major, so coordinate (5, 0) is slot 40.
     assert_eq!(coefficients[576 + 2 * 64 + 40], -7);
     assert_eq!(coefficients.iter().filter(|&&value| value != 0).count(), 3);
-    assert_eq!(
-        cast_one::<u32>(bytes, sink_status_readback_offset as usize),
-        0
-    );
 }

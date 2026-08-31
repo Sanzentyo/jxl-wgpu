@@ -63,16 +63,18 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 ### Bounded standard VarDCT engine
 
 The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two
-deliberately narrow, standard zero-AC VarDCT packet topologies. A one-entry TOC retains the original single regular
+deliberately narrow standard VarDCT packet topologies. A one-entry zero-AC TOC retains the original single regular
 8x8, 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC may instead
 cover one LF group with one independent DCT8 first block per padded 8x8 image block and at least two
-256-pixel pass groups; every pass-group packet must be empty. The explicit section topology removes
+256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients with the
+natural DCT8 order or the standard entropy-coded custom DCT8 order. The explicit section topology removes
 the ambiguity with a one-entry single-transform packet. This tiled form supports odd and asymmetric
 pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
 forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
-adaptive LF smoothing, `global_scale=8813`, `quant_lf=10`, frame quant-matrix scales X=3/B=2,
-default dequantization metadata, disabled Gaborish/EPF, zero chroma correlation and sharpness, and
-the standard zero-AC HF-global bundle. The image header must declare the standard sRGB/D65
+adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default dequantization metadata,
+disabled Gaborish/EPF, zero chroma correlation, an order mask containing only the DCT8 bit,
+default HF block-context thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
+properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
@@ -80,11 +82,14 @@ typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes befor
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
 1-GiB parser ceiling.
 
-The host inventories bounded scalar headers and packs the MA-tree descriptor, but does not decode
-an image entropy symbol. One GPU submission decodes and validates LF/HF metadata, dequantizes and
-smooths LF, lowers every non-overlapping first block into typed HF tasks and a coefficient sink, runs the existing resident regular
+The host inventories bounded scalar headers, packs the MA-tree and coefficient entropy descriptors,
+and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF
+image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
+dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
+each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and custom-order
+coefficient sink, and runs the existing resident regular
 VarDCT renderer, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8. Packet
-and artifact status share one 128-byte staging map; cleared downstream buffers and zeroed indirect
+and artifact status plus one 32-byte record per pass group share one aggregate staging map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
@@ -110,10 +115,14 @@ runtime-neutral async completion and GPU display conversion. A deterministic ent
 corruption remains host-parseable, is exposed only through the explicitly unvalidated type, and
 then fails packet-status validation before authoritative metadata is returned. The matrix also
 verifies that readback releases its shared reservation while the last decode-output buffer clone
-continues to own the exact output bytes.
+continues to own the exact output bytes. A separate 438x589 libjxl fixture exercises six nonempty
+pass groups, 4,070 DCT8 tasks, a custom three-channel coefficient order, nonzero AC coefficients,
+and a self-correcting MA tree; GPU RGB8 output differs from both Rust `jxl` and `djxl` by at most
+one code.
 
-This is not full VarDCT coverage. Nonzero AC/HF coefficient entropy, multiple LF groups, mixed
-transform strategies, nonempty pass groups, special transform strategies, custom quantization matrices and HF orders/presets,
+This is not full VarDCT coverage. Multiple LF groups, mixed or non-DCT8 transform strategies,
+special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom block-context
+thresholds, custom quantization matrices,
 Gaborish/EPF, alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

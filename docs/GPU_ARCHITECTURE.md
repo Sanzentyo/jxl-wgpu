@@ -52,7 +52,7 @@ inventory into either the Modular or VarDCT submission session. The selector doe
 incompatible storage-binding layouts: pipeline caches and mode-specific state remain independent,
 while device, queue, completion worker, and the aggregate byte budget are shared. The pending-frame
 enum performs only lifetime operations (`submit_next`, blocking wait, and runtime-neutral poll), so
-zero-AC VarDCT limitations do not become a common entropy or frame abstraction.
+bounded VarDCT profile limitations do not become a common entropy or frame abstraction.
 
 The entropy executor has a narrower shared boundary than either submission pipeline. Rust and WGSL
 both define a 12-byte, four-byte-aligned `EntropyStreamParams` prefix for token start/end bounds and
@@ -60,8 +60,8 @@ the LZ77 ring mask. It is the first field of the 212-byte Modular parameter reco
 VarDCT packet record. The shared entropy fragment consumes that prefix plus consumer-provided
 storage access and LZ scratch-base functions. Geometry, prediction/output, and VarDCT
 metadata/coefficient state retain separate suffixes and bindings. This preserves one checked
-executor ABI without encoding the current zero-AC restriction
-into a common stream type.
+executor ABI while allowing the VarDCT pass-group consumer to decode nonzero coefficients without
+turning coefficient placement into a common stream type.
 
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode

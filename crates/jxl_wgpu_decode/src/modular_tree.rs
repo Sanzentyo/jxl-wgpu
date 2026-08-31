@@ -911,13 +911,6 @@ impl EntropyDecoderIr {
     ///
     /// The common 24-word header reports zero MA nodes and a zero maximum depth. Config and
     /// entropy tables use the exact same offsets and representation as [`MaConfigIr`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "crate-private VarDCT frontend consumes this shared entropy ABI after integration"
-        )
-    )]
     pub(crate) fn pack_gpu_metadata(&self) -> Result<PackedModularMetadata> {
         MaConfigIr {
             nodes: Vec::new(),

@@ -179,7 +179,13 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     staging.unmap();
     let block_count = control.geometry[2] * control.geometry[3];
     status
-        .validate(plan.transform, block_count * 3, block_count + 4)
+        .validate(
+            plan.transform,
+            block_count * 3,
+            block_count + 4,
+            plan.global_scale,
+            plan.quant_lf,
+        )
         .unwrap();
     assert_eq!(status.coefficient_words, plan.coefficient_words());
 }

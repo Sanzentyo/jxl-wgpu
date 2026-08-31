@@ -82,7 +82,7 @@ jobs:
         if: runner.os == 'macOS'
         run: >-
           cargo run -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl
-          --format gray8 --output-target cpu-readback
+          --format u8 --output-target cpu-readback
 
   msrv:
     runs-on: ubuntu-latest

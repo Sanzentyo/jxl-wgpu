@@ -1,9 +1,10 @@
 //! Runtime-neutral GPU submission engine for the bounded standard VarDCT profile.
 //!
-//! The accepted codestream profile is intentionally small and authoritative: one still XYB
-//! frame, one regular transform covering the complete image, fixed quantization, GPU-decoded LF
-//! and HF metadata, and a GPU-validated zero-AC HF bundle. No pixel, coefficient, transform,
-//! quantization, residual, or entropy fallback runs on the CPU.
+//! The accepted codestream profile is intentionally bounded and authoritative: one still XYB
+//! frame, either one image-sized regular zero-AC transform or one LF group of tiled DCT8 tasks,
+//! stream-provided quantization, GPU-decoded LF/HF metadata, and GPU-decoded single-pass DCT8 AC
+//! coefficients. No pixel, coefficient, transform, quantization, residual, or entropy fallback
+//! runs on the CPU.
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -50,6 +51,10 @@ use crate::vardct_packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
     VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline,
 };
+use crate::vardct_pass_group::{
+    GpuHfCoefficientError, GpuHfCoefficientStatus, HfCoefficientBuffers,
+    HfCoefficientExecutionPlan, HfCoefficientPipeline, HfCoefficientPlanError,
+};
 use crate::vardct_resource::{
     VarDctResourceBuffers, VarDctResourceError, VarDctResourceLayout, VarDctResourceParams,
     VarDctResourcePipeline,
@@ -62,7 +67,7 @@ use crate::{
 
 const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
 const ARTIFACT_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctArtifactStatus>() as u64;
-const VALIDATION_STAGING_BYTES: u64 = PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES;
+const BASE_VALIDATION_STAGING_BYTES: u64 = PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES;
 const ADAPTIVE_LF_WORKGROUP_BYTES: u64 = 18 * 18 * 16;
 const VAR_DCT_PARSE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -91,6 +96,10 @@ pub enum VarDctDecodeError {
     Artifact(#[from] VarDctArtifactError),
     #[error(transparent)]
     ArtifactGpu(#[from] GpuVarDctLoweringError),
+    #[error(transparent)]
+    HfCoefficientPlan(#[from] HfCoefficientPlanError),
+    #[error(transparent)]
+    HfCoefficientGpu(#[from] GpuHfCoefficientError),
     #[error(transparent)]
     Resource(#[from] VarDctResourceError),
     #[error(transparent)]
@@ -159,6 +168,12 @@ pub struct VarDctDecodeMemoryStats {
     pub artifact_bytes: u64,
     pub occupancy_bytes: u64,
     pub artifact_uniform_bytes: u64,
+    pub hf_entropy_bundle_bytes: u64,
+    pub hf_params_bytes: u64,
+    pub hf_lz77_scratch_bytes: u64,
+    pub hf_status_bytes: u64,
+    pub hf_order_table_bytes: u64,
+    pub hf_sink_uniform_bytes: u64,
     pub xyb_plane_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
@@ -170,15 +185,17 @@ pub struct VarDctDecodeMemoryStats {
 }
 
 impl VarDctDecodeMemoryStats {
-    fn plan(
-        codestream_len: usize,
-        packet: &BoundedVarDctPacketPlan,
-        control: VarDctPacketControl,
-        resource: VarDctResourceLayout,
-        artifact: VarDctArtifactLayout,
-        resident: ResidentVarDctMemoryPlan,
-        output: VarDctOutputPlan,
-    ) -> Result<Self, VarDctDecodeError> {
+    fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
+        let VarDctDecodeMemoryInputs {
+            codestream_len,
+            packet,
+            control,
+            resource,
+            artifact,
+            hf_coefficients,
+            resident,
+            output,
+        } = inputs;
         let checked_words = |words: u64, field: &'static str| {
             words
                 .checked_mul(4)
@@ -206,7 +223,37 @@ impl VarDctDecodeMemoryStats {
         let coefficient_bytes =
             checked_words(u64::from(packet.coefficient_words()), "coefficient bytes")?;
         let packet_status_bytes = PACKET_STATUS_BYTES;
-        let validation_staging_bytes = VALIDATION_STAGING_BYTES;
+        let hf_entropy_bundle_bytes = hf_coefficients
+            .map(|plan| checked_words(plan.entropy_words.len() as u64, "HF entropy bundle bytes"))
+            .transpose()?
+            .unwrap_or(0);
+        let hf_params_bytes = hf_coefficients
+            .map(|plan| {
+                (plan.params.len() as u64)
+                    .checked_mul(std::mem::size_of::<
+                        crate::vardct_pass_group::HfCoefficientPassParams,
+                    >() as u64)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF parameter bytes",
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let hf_lz77_scratch_bytes =
+            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::lz77_scratch_bytes);
+        let hf_status_bytes = hf_coefficients.map_or(0, HfCoefficientExecutionPlan::status_bytes);
+        let hf_order_table_bytes = hf_coefficients
+            .map(|plan| checked_words(plan.order_words.len() as u64, "HF order-table bytes"))
+            .transpose()?
+            .unwrap_or(0);
+        let hf_sink_uniform_bytes = hf_coefficients
+            .map(|_| std::mem::size_of::<crate::vardct_artifact::HfCoefficientSinkParams>() as u64)
+            .unwrap_or(0);
+        let validation_staging_bytes = BASE_VALIDATION_STAGING_BYTES
+            .checked_add(hf_status_bytes)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "VarDCT validation staging bytes",
+        })?;
         let packet_control_bytes = std::mem::size_of::<VarDctPacketControl>() as u64;
         let modular_params_bytes = std::mem::size_of::<VarDctModularParams>() as u64;
         let lf_temporary_bytes = u64::from(resource.block_count).checked_mul(16).ok_or(
@@ -257,6 +304,12 @@ impl VarDctDecodeMemoryStats {
             artifact_bytes,
             occupancy_bytes,
             artifact_uniform_bytes,
+            hf_entropy_bundle_bytes,
+            hf_params_bytes,
+            hf_lz77_scratch_bytes,
+            hf_status_bytes,
+            hf_order_table_bytes,
+            hf_sink_uniform_bytes,
             xyb_plane_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
@@ -291,6 +344,12 @@ impl VarDctDecodeMemoryStats {
             artifact_bytes,
             occupancy_bytes,
             artifact_uniform_bytes,
+            hf_entropy_bundle_bytes,
+            hf_params_bytes,
+            hf_lz77_scratch_bytes,
+            hf_status_bytes,
+            hf_order_table_bytes,
+            hf_sink_uniform_bytes,
             xyb_plane_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
@@ -301,11 +360,23 @@ impl VarDctDecodeMemoryStats {
     }
 }
 
+struct VarDctDecodeMemoryInputs<'a> {
+    codestream_len: usize,
+    packet: &'a BoundedVarDctPacketPlan,
+    control: VarDctPacketControl,
+    resource: VarDctResourceLayout,
+    artifact: VarDctArtifactLayout,
+    hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
+    resident: ResidentVarDctMemoryPlan,
+    output: VarDctOutputPlan,
+}
+
 struct VarDctPipelines {
     packet: VarDctPacketPipeline,
     resource: VarDctResourcePipeline,
     adaptive_lf: AdaptiveLfPipeline,
     artifact: HfMetadataLoweringPipeline,
+    hf_coefficients: HfCoefficientPipeline,
     renderer: ResidentVarDctRenderer,
     output: VarDctOutputPacker,
     output_variant: KernelVariant,
@@ -323,6 +394,7 @@ impl VarDctPipelines {
             resource: VarDctResourcePipeline::with_variant(device, resource_variant)?,
             adaptive_lf: AdaptiveLfPipeline::new(device),
             artifact: HfMetadataLoweringPipeline::new(device),
+            hf_coefficients: HfCoefficientPipeline::new(device),
             renderer: ResidentVarDctRenderer::new(device),
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
             output_variant,
@@ -351,7 +423,7 @@ fn resolve_kernel_variant(
     Ok(variant)
 }
 
-/// GPU-only submission engine for the strict standard zero-AC regular-VarDCT profile.
+/// GPU-only submission engine for the bounded standard regular-VarDCT profile.
 #[derive(Clone)]
 pub struct VarDctSubmissionEngine {
     backend: WgpuBackend,
@@ -440,6 +512,7 @@ struct VarDctSource {
     resource_params: VarDctResourceParams,
     artifact_layout: VarDctArtifactLayout,
     artifact_params: HfMetadataLoweringParams,
+    hf_coefficients: Option<HfCoefficientExecutionPlan>,
     output_plan: VarDctOutputPlan,
     layout: ImageLayout,
     inverse_opsin: VarDctInverseOpsin,
@@ -530,8 +603,10 @@ fn prepare_source(
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "transform area",
         })?;
-    let resource_layout = VarDctResourceLayout::new(blocks_x, blocks_y, transform_area)?;
-    let resource_params = VarDctResourceParams::new(blocks_x, blocks_y)?;
+    let resource_layout =
+        VarDctResourceLayout::new(blocks_x, blocks_y, transform_area, packet.task_count)?;
+    let resource_params =
+        VarDctResourceParams::new(blocks_x, blocks_y, packet.global_scale, packet.quant_lf)?;
     let transform_index = TransformKind::ALL
         .iter()
         .position(|&candidate| candidate == packet.transform)
@@ -559,6 +634,8 @@ fn prepare_source(
         correlation_height,
         destination_origin: [0, 0],
         afv_basis_offset: resource_layout.matrix_offset,
+        quant_offset: resource_layout.quant_offset,
+        global_scale: packet.global_scale,
         matrix_offsets,
     };
     let artifact_layout = VarDctArtifactLayout::plan(
@@ -566,6 +643,11 @@ fn prepare_source(
         VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
     )?;
     let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
+    let hf_coefficients = packet
+        .hf_coefficients
+        .as_ref()
+        .map(|entropy| HfCoefficientExecutionPlan::new(&packet, entropy, artifact_layout))
+        .transpose()?;
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
         packet.profile.width,
         packet.profile.height,
@@ -604,15 +686,16 @@ fn prepare_source(
             field: "resident transform scratch scalars",
         })?;
     let resident_memory = ResidentVarDctMemoryPlan::new(scratch_scalars)?;
-    let memory = VarDctDecodeMemoryStats::plan(
-        codestream.bytes().len(),
-        &packet,
+    let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
+        codestream_len: codestream.bytes().len(),
+        packet: &packet,
         control,
-        resource_layout,
-        artifact_layout,
-        resident_memory,
-        output_plan,
-    )?;
+        resource: resource_layout,
+        artifact: artifact_layout,
+        hf_coefficients: hf_coefficients.as_ref(),
+        resident: resident_memory,
+        output: output_plan,
+    })?;
     validate_device_limits(backend.device(), memory)?;
     let frame_name = packet.profile.frame_name.clone();
     Ok(VarDctSource {
@@ -624,6 +707,7 @@ fn prepare_source(
         resource_params,
         artifact_layout,
         artifact_params,
+        hf_coefficients,
         output_plan,
         layout,
         inverse_opsin,
@@ -651,6 +735,15 @@ fn validate_device_limits(
         ("VarDCT resources", memory.resource_bytes, true),
         ("VarDCT artifact", memory.artifact_bytes, true),
         ("artifact occupancy", memory.occupancy_bytes, true),
+        ("HF entropy bundle", memory.hf_entropy_bundle_bytes, true),
+        ("HF pass-group parameters", memory.hf_params_bytes, true),
+        ("HF LZ77 scratch", memory.hf_lz77_scratch_bytes, true),
+        ("HF pass-group status", memory.hf_status_bytes, true),
+        (
+            "HF coefficient order table",
+            memory.hf_order_table_bytes,
+            true,
+        ),
         ("one XYB plane", memory.xyb_plane_bytes / 3, true),
         ("packed RGB8 output", memory.output_lease_bytes, true),
     ] {
@@ -664,6 +757,7 @@ fn validate_device_limits(
         ("LF resource uniform", memory.resource_uniform_bytes),
         ("adaptive LF uniform", memory.adaptive_lf_uniform_bytes),
         ("artifact uniform", memory.artifact_uniform_bytes),
+        ("HF coefficient sink uniform", memory.hf_sink_uniform_bytes),
         ("output uniform", memory.output_uniform_bytes),
     ] {
         check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
@@ -773,6 +867,15 @@ struct VarDctMemoryPermits {
     transient: MemoryPermit,
 }
 
+struct HfCoefficientJobBuffers {
+    entropy_bundle: wgpu::Buffer,
+    lz77_scratch: wgpu::Buffer,
+    params: wgpu::Buffer,
+    status: wgpu::Buffer,
+    order_table: wgpu::Buffer,
+    sink_params: wgpu::Buffer,
+}
+
 struct VarDctJobLifetime {
     output: GpuBufferLease,
     status_staging: wgpu::Buffer,
@@ -793,6 +896,7 @@ struct VarDctJobLifetime {
     _artifact: wgpu::Buffer,
     _occupancy: wgpu::Buffer,
     _artifact_uniform: wgpu::Buffer,
+    _hf_coefficients: Option<HfCoefficientJobBuffers>,
     _xyb_planes: [wgpu::Buffer; 3],
     _resident_scratch: ResidentVarDctScratch,
     _output_scratch: VarDctOutputScratch,
@@ -820,6 +924,9 @@ pub struct VarDctPendingFrame {
     expected_coefficients: u32,
     expected_blocks: u32,
     expected_tasks: u32,
+    expected_hf_groups: u32,
+    expected_global_scale: u32,
+    expected_quant_lf: u32,
 }
 
 impl std::fmt::Debug for VarDctPendingFrame {
@@ -869,15 +976,16 @@ impl VarDctPendingFrame {
             .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
             .ok_or(VarDctDecodeError::StatusAbi { status: "packet" })?;
         let artifact: GpuVarDctArtifactStatus = mapped
-            .get(PACKET_STATUS_BYTES as usize..VALIDATION_STAGING_BYTES as usize)
+            .get(PACKET_STATUS_BYTES as usize..BASE_VALIDATION_STAGING_BYTES as usize)
             .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
             .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
-        drop(mapped);
         packet
             .validate(
                 self.transform,
                 self.expected_lf_samples,
                 self.expected_hf_samples,
+                self.expected_global_scale,
+                self.expected_quant_lf,
             )
             .map_err(VarDctDecodeError::from)?;
         if packet.coefficient_words != self.expected_coefficients {
@@ -889,6 +997,27 @@ impl VarDctPendingFrame {
             .into());
         }
         artifact.validate().map_err(VarDctDecodeError::from)?;
+        let hf_status_bytes = mapped.get(BASE_VALIDATION_STAGING_BYTES as usize..).ok_or(
+            VarDctDecodeError::StatusAbi {
+                status: "HF coefficient",
+            },
+        )?;
+        let hf_statuses = bytemuck::try_cast_slice::<u8, GpuHfCoefficientStatus>(hf_status_bytes)
+            .map_err(|_| VarDctDecodeError::StatusAbi {
+            status: "HF coefficient",
+        })?;
+        if hf_statuses.len() != self.expected_hf_groups as usize {
+            return Err(VarDctDecodeError::StatusAbi {
+                status: "HF coefficient count",
+            }
+            .into());
+        }
+        for (group, status) in hf_statuses.iter().copied().enumerate() {
+            status
+                .validate(group as u32)
+                .map_err(VarDctDecodeError::from)?;
+        }
+        drop(mapped);
         for (field, expected, actual) in [
             ("task_count", self.expected_tasks, artifact.task_count),
             (
@@ -1063,7 +1192,9 @@ fn submit_vardct(
         contents: bytemuck::bytes_of(&source.control),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let params = VarDctModularParams::default().with_lz77_window(source.packet.lz77_window_words);
+    let params = VarDctModularParams::default()
+        .with_lz77_window(source.packet.lz77_window_words)
+        .with_self_correcting(source.packet.needs_self_correcting);
     let modular_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu VarDCT Modular params"),
         contents: bytemuck::bytes_of(&params),
@@ -1095,6 +1226,42 @@ fn submit_vardct(
         contents: bytemuck::bytes_of(&source.artifact_params),
         usage: wgpu::BufferUsages::UNIFORM,
     });
+    let hf_coefficient_buffers =
+        source
+            .hf_coefficients
+            .as_ref()
+            .map(|plan| HfCoefficientJobBuffers {
+                entropy_bundle: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu HF entropy bundle"),
+                    contents: bytemuck::cast_slice(&plan.entropy_words),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                lz77_scratch: storage(
+                    "jxl-wgpu HF LZ77 scratch",
+                    plan.lz77_scratch_bytes(),
+                    wgpu::BufferUsages::COPY_DST,
+                ),
+                params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu HF pass-group params"),
+                    contents: bytemuck::cast_slice(&plan.params),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                status: storage(
+                    "jxl-wgpu HF pass-group status",
+                    plan.status_bytes(),
+                    wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                ),
+                order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu HF natural-order table"),
+                    contents: bytemuck::cast_slice(&plan.order_words),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu HF coefficient sink params"),
+                    contents: bytemuck::bytes_of(&plan.sink_params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                }),
+            });
     let plane_bytes = source.memory.xyb_plane_bytes / 3;
     let xyb_planes = [
         "jxl-wgpu VarDCT X plane",
@@ -1115,7 +1282,7 @@ fn submit_vardct(
     }));
     let status_staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT aggregate validation staging"),
-        size: VALIDATION_STAGING_BYTES,
+        size: source.memory.validation_staging_bytes,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -1137,6 +1304,10 @@ fn submit_vardct(
         output.as_ref(),
     ] {
         commands.clear_buffer(buffer, 0, None);
+    }
+    if let Some(buffers) = &hf_coefficient_buffers {
+        commands.clear_buffer(&buffers.lz77_scratch, 0, None);
+        commands.clear_buffer(&buffers.status, 0, None);
     }
     pipelines.packet.encode(
         device,
@@ -1183,9 +1354,35 @@ fn submit_vardct(
             raw_metadata: &raw_metadata,
             artifact: &artifact,
             occupancy: &occupancy,
+            resources: &resources,
             params: &artifact_uniform,
         },
     );
+    if let (Some(plan), Some(buffers)) = (
+        source.hf_coefficients.as_ref(),
+        hf_coefficient_buffers.as_ref(),
+    ) {
+        pipelines.hf_coefficients.encode(
+            device,
+            &mut commands,
+            HfCoefficientBuffers {
+                codestream: &codestream_buffer,
+                entropy_bundle: &buffers.entropy_bundle,
+                lz77_scratch: &buffers.lz77_scratch,
+                params: &buffers.params,
+                status: &buffers.status,
+                artifact: &artifact,
+                order_table: &buffers.order_table,
+                coefficients: &coefficients,
+                sink_params: &buffers.sink_params,
+            },
+            u32::try_from(plan.params.len()).map_err(|_| {
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "HF pass-group dispatch count",
+                }
+            })?,
+        );
+    }
 
     let (tasks_offset, tasks_size) = source.artifact_layout.task_binding();
     let tasks = ResidentStorageBinding {
@@ -1304,6 +1501,15 @@ fn submit_vardct(
         PACKET_STATUS_BYTES,
         ARTIFACT_STATUS_BYTES,
     );
+    if let Some(buffers) = &hf_coefficient_buffers {
+        commands.copy_buffer_to_buffer(
+            &buffers.status,
+            0,
+            &status_staging,
+            BASE_VALIDATION_STAGING_BYTES,
+            source.memory.hf_status_bytes,
+        );
+    }
 
     let completion = Arc::new(MapCompletion::default());
     let lifetime = Arc::new(VarDctJobLifetime {
@@ -1326,6 +1532,7 @@ fn submit_vardct(
         _artifact: artifact,
         _occupancy: occupancy,
         _artifact_uniform: artifact_uniform,
+        _hf_coefficients: hf_coefficient_buffers,
         _xyb_planes: xyb_planes,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
@@ -1390,6 +1597,13 @@ fn submit_vardct(
         expected_coefficients: source.packet.coefficient_words(),
         expected_blocks: blocks,
         expected_tasks: source.packet.task_count,
+        expected_hf_groups: source
+            .hf_coefficients
+            .as_ref()
+            .map(|plan| plan.params.len() as u32)
+            .unwrap_or(0),
+        expected_global_scale: source.packet.global_scale,
+        expected_quant_lf: source.packet.quant_lf,
     })
 }
 

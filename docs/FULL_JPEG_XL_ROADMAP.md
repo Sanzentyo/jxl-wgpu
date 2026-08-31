@@ -60,7 +60,7 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 |---|---|---|
 | Raw/`jxlc`/`jxlp` transport and header inventory | **Partial** | Bounded still-image transport, frame/TOC inventory, ICC reconstruction, and feature metadata exist; streaming box delivery and the complete container API do not. |
 | Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. |
-| VarDCT decode | **Partial** | A separate authoritative zero-AC 8-bit XYB engine covers nine regular single transforms and tiled DCT8 through one LF group/2048×2048. |
+| VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers nine regular zero-AC single transforms and tiled DCT8 with single-pass nonzero AC, natural/custom DCT8 order, one LF group, and extents through 2048×2048. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
 | VarDCT encode | **Partial** | All 27 strategy identifiers execute, but only in a fixed distance-25 LF-only profile with every AC coefficient quantized to zero; tiled DCT8 is limited to one LF group. |
 | Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the stock decoders do not yet route the full legal feature graph through them. |
@@ -105,7 +105,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `ENT-D01` | P0 | **Partial** | The bounded Modular and VarDCT packet paths now share a typed 12-byte Rust/WGSL `EntropyStreamParams` prefix for token bounds and the LZ ring mask while preserving their 212/208-byte consumer records; consumer-provided storage and scratch-base functions keep geometry, prediction, output, and coefficient state outside the common ABI. Both paths compile the same Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 primitives. Completion requires every VarDCT LF/HF consumer including nonzero AC plus differential symbol/termination tests for every distribution form. | `FRONT-02` |
+| `ENT-D01` | P0 | **Partial** | The bounded Modular, VarDCT packet, and DCT8 pass-group paths share a typed 12-byte Rust/WGSL `EntropyStreamParams` prefix for token bounds and the LZ ring mask while preserving consumer-specific records and bindings. The single-pass DCT8 consumer now executes real nonzero coefficient contexts through the same Prefix/ANS, hybrid-uint, context-map, histogram, alias-distribution, and LZ77 primitives. Completion requires every remaining VarDCT LF/HF consumer plus differential symbol/termination tests for every distribution form. | `FRONT-02` |
 | `ENT-D02` | P0 | **Partial** | Decode arbitrarily large legal group streams through bounded windows while retaining enough history for LZ77 and context state. Prove exact results across window boundaries and cancellation. | `ENT-D01` |
 | `ENT-E01` | P1 | **Partial** | Add GPU ANS token serialization, histogram clustering, context clustering, hybrid-uint selection, general LZ77 search/distances, and canonical entropy metadata. `djxl`/`jxl` must accept every generated family. | — |
 | `ENT-E02` | P2 | **Missing** | Select entropy configurations by effort and workload with deterministic modes. Report density and speed independently; no heuristic may change lossless pixels. | `ENT-E01`, `QA-05` |
@@ -134,11 +134,11 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `VDCT-D01` | P0 | **Partial** | Parse and execute complete LF-global/LF-group/HF-global/pass-group topology, including multiple LF groups, recursive LF frames, nonempty pass groups, arbitrary group order, and images beyond 2048 pixels per axis. | `FRONT-02`, `ENT-D01` |
+| `VDCT-D01` | P0 | **Partial** | One LF-global/LF-group/HF-global topology now executes nonempty single-pass DCT8 pass groups in standard TOC order. Completion requires multiple LF groups, recursive LF frames, arbitrary group order, additional passes, and images beyond 2048 pixels per axis. | `FRONT-02`, `ENT-D01` |
 | `VDCT-D02` | P0 | **Partial** | Decode the block context map, strategy map, all 27 regular and special strategies in mixed images, quant field, sharpness, chroma-from-luma factors, and required Modular side images. No legal strategy may be lowered to DCT8. | `VDCT-D01`, `MOD-D05` |
-| `VDCT-D03` | P0 | **Missing** | Decode nonzero AC coefficients: presets, all HF coefficient orders, contexts, tokens, signs, pass refinement, dequantization, and coefficient placement. Differential coefficient sinks cover sparse, dense, edge, and corruption cases. | `VDCT-D01`, `ENT-D01` |
+| `VDCT-D03` | P0 | **Partial** | Single-pass DCT8 now decodes real nonzero counts, contexts, Prefix/ANS tokens, signs, natural or custom DCT8 order, quant bias/dequantization, and coefficient placement entirely on GPU after the small order metadata permutation is expanded on the host. A 438×589 libjxl fixture with six groups and 4,070 tasks matches Rust `jxl` and `djxl` within one RGB8 code. Completion requires all order masks/strategies, multiple presets, pass refinement, sparse/dense/edge fixtures, and corruption at the coefficient layer. | `VDCT-D01`, `ENT-D01` |
 | `VDCT-D04` | P0 | **Partial** | Execute inverse transforms for every strategy and mixed block map with exact edge extension/cropping. Existing resident kernels must be reached from the stock decoder, with per-strategy precision tests. | `VDCT-D02`, `VDCT-D03` |
-| `VDCT-D05` | P0 | **Missing** | Implement default and custom dequant matrices, quant bias/scales, adaptive LF smoothing, DC prediction, and chroma-from-luma restoration across group boundaries. | `VDCT-D02`, `VDCT-D03` |
+| `VDCT-D05` | P0 | **Partial** | Default DCT8 dequantization, stream-selected global/LF/HF scales, quant bias, adaptive LF smoothing, and DC prediction execute on GPU for the bounded one-LF-group profile. Completion requires all default strategy matrices, custom matrices, nonzero chroma-from-luma factors, and cross-LF-group behavior. | `VDCT-D02`, `VDCT-D03` |
 | `VDCT-D06` | P1 | **Missing** | Sum spectral and quantized progressive AC passes and expose DC/LF/pass progression without publishing an invalid final frame. Every intermediate level is compared with libjxl and the final image meets conformance bounds. | `VDCT-D03`, `API-03` |
 | `VDCT-D07` | P1 | **Partial** | Support color/extra-channel resampling and normative 2×/4×/8× upsampling weights for color and extra channels, including odd borders and group halos. | `MOD-D05`, `RENDER-01` |
 
@@ -243,14 +243,10 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The coding-mode selector portion of `FRONT-01` and the shared typed entropy-stream ABI are
-implemented. The immediate next target is the remaining `ENT-D01/FRONT-02` topology, followed by
-`VDCT-D01/03` so the same entropy primitives feed real pass-group coefficient consumers rather
-than a zero-AC-only shape. The first externally visible milestone remains a nonzero-AC,
-multi-group DCT8 VarDCT fixture
-decoded and re-encoded without a CPU pixel path. This target is deliberately narrower than “full,”
-but it removes the current zero-AC architecture bottleneck rather than extending a test-only
-profile.
+The coding-mode selector, shared typed entropy-stream ABI, and first nonzero-AC multi-group DCT8
+decode milestone are implemented. The immediate next target is restoration and remaining
+`ENT-D01/FRONT-02` topology, followed by mixed-strategy `VDCT-D01..05`. The corresponding GPU
+nonzero-AC encoder remains required before the fixture can be re-encoded without a CPU pixel path.
 
 ## Claims explicitly prohibited before their gates pass
 

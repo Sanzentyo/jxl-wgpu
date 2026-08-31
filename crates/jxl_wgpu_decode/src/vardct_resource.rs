@@ -1,4 +1,4 @@
-//! Default resource table and LF dequantization for the strict zero-AC VarDCT profile.
+//! Default resource table and LF dequantization for the bounded VarDCT profile.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_wgpu::KernelVariant;
@@ -6,14 +6,12 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 const RESOURCE_SHADER: &str = include_str!("vardct_resource.wgsl");
-const GLOBAL_SCALE: f32 = 8_813.0;
-const QUANT_LF: f32 = 10.0;
-const HF_MUL: f32 = 6.0;
 
 /// Vec4-indexed resource table consumed by the resident VarDCT renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctResourceLayout {
     pub quant_offset: u32,
+    pub quant_count: u32,
     pub correlation_offset: u32,
     pub lf_offset: u32,
     pub matrix_offset: u32,
@@ -28,6 +26,7 @@ impl VarDctResourceLayout {
         blocks_x: u32,
         blocks_y: u32,
         transform_area: u32,
+        quant_count: u32,
     ) -> Result<Self, VarDctResourceError> {
         let block_count =
             blocks_x
@@ -42,7 +41,10 @@ impl VarDctResourceLayout {
                 field: "correlation cell count",
             })?;
         let quant_offset = 0_u32;
-        let correlation_offset = 1_u32;
+        if quant_count == 0 {
+            return Err(VarDctResourceError::ZeroQuantizationEntries);
+        }
+        let correlation_offset = quant_count;
         let lf_offset = correlation_offset.checked_add(correlation_count).ok_or(
             VarDctResourceError::ArithmeticOverflow {
                 field: "LF resource offset",
@@ -61,6 +63,7 @@ impl VarDctResourceLayout {
         )?;
         Ok(Self {
             quant_offset,
+            quant_count,
             correlation_offset,
             lf_offset,
             matrix_offset,
@@ -76,24 +79,18 @@ impl VarDctResourceLayout {
         self.vector_count as u64 * 16
     }
 
-    /// Builds immutable quant/correlation values and the semantically unused zero-AC matrix.
-    ///
-    /// The accepted packet's GPU status proves every AC coefficient is zero before this table is
-    /// authoritative. Matrix entries therefore cannot affect any accepted output; finite ones are
-    /// retained solely so the common resident shader has a complete in-bounds resource range.
+    /// Builds the immutable correlation defaults and normative default DCT8 dequantization matrix.
+    /// Per-task quantization scales are populated by GPU artifact lowering from decoded `hf_mul`.
     #[must_use]
     pub fn initial_values(self) -> Vec<[f32; 4]> {
         let mut values = vec![[0.0; 4]; self.vector_count as usize];
-        values[self.quant_offset as usize] = [
-            0.8 * 65_536.0 / (GLOBAL_SCALE * HF_MUL),
-            65_536.0 / (GLOBAL_SCALE * HF_MUL),
-            0.8 * 65_536.0 / (GLOBAL_SCALE * HF_MUL),
-            0.0,
-        ];
         let correlation_end = self.correlation_offset + self.correlation_count;
         values[self.correlation_offset as usize..correlation_end as usize]
             .fill([0.0, 1.0, 0.0, 0.0]);
         values[self.matrix_offset as usize..].fill([1.0, 1.0, 1.0, 0.0]);
+        if self.transform_area == 64 {
+            values[self.matrix_offset as usize..].copy_from_slice(&default_dct8_dequant_matrix());
+        }
         values
     }
 }
@@ -102,6 +99,8 @@ impl VarDctResourceLayout {
 pub enum VarDctResourceError {
     #[error("VarDCT resource arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("VarDCT resource preparation requires at least one quantization entry")]
+    ZeroQuantizationEntries,
     #[error("VarDCT resource preparation requires a linear workgroup, got {variant:?}")]
     WorkgroupShape { variant: KernelVariant },
     #[error("VarDCT resource workgroup variant {variant:?} exceeds device limits")]
@@ -119,14 +118,19 @@ pub struct VarDctResourceParams {
 }
 
 impl VarDctResourceParams {
-    pub fn new(blocks_x: u32, blocks_y: u32) -> Result<Self, VarDctResourceError> {
+    pub fn new(
+        blocks_x: u32,
+        blocks_y: u32,
+        global_scale: u32,
+        quant_lf: u32,
+    ) -> Result<Self, VarDctResourceError> {
         let blocks =
             blocks_x
                 .checked_mul(blocks_y)
                 .ok_or(VarDctResourceError::ArithmeticOverflow {
                     field: "LF preparation block count",
                 })?;
-        let denominator = GLOBAL_SCALE * QUANT_LF;
+        let denominator = global_scale as f32 * quant_lf as f32;
         Ok(Self {
             geometry: [blocks_x, blocks_y, blocks, 0],
             offsets: [0, blocks, 2 * blocks, 0],
@@ -147,9 +151,40 @@ impl VarDctResourceParams {
 
     #[must_use]
     pub fn smoothing_thresholds(self) -> [f32; 3] {
-        let denominator = GLOBAL_SCALE * QUANT_LF;
-        [16.0 / denominator, 128.0 / denominator, 256.0 / denominator]
+        [self.scales[0], self.scales[1], self.scales[2]]
     }
+}
+
+fn default_dct8_dequant_matrix() -> [[f32; 4]; 64] {
+    const PARAMETERS: [[f32; 6]; 3] = [
+        [3150.0, 0.0, -0.4, -0.4, -0.4, -2.0],
+        [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
+        [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
+    ];
+    let weights = PARAMETERS.map(|parameters| {
+        let mut bands = [0.0f32; 6];
+        bands[0] = parameters[0];
+        for index in 1..bands.len() {
+            let delta = parameters[index];
+            let multiplier = if delta > 0.0 {
+                1.0 + delta
+            } else {
+                1.0 / (1.0 - delta)
+            };
+            bands[index] = bands[index - 1] * multiplier;
+        }
+        std::array::from_fn::<_, 64, _>(|index| {
+            let x = (index % 8) as f32;
+            let y = (index / 8) as f32;
+            let position = (x * x + y * y).sqrt();
+            let scaled = position * 5.0 / (98.0f32).sqrt();
+            let lower = (scaled.floor() as usize).min(4);
+            let fraction = scaled - lower as f32;
+            let weight = bands[lower] * (bands[lower + 1] / bands[lower]).powf(fraction);
+            weight.recip()
+        })
+    });
+    std::array::from_fn(|index| [weights[0][index], weights[1][index], weights[2][index], 0.0])
 }
 
 pub struct VarDctResourceBuffers<'a> {
@@ -258,7 +293,7 @@ mod tests {
 
     #[test]
     fn layout_and_shader_are_bounded() {
-        let layout = VarDctResourceLayout::new(4, 2, 256).unwrap();
+        let layout = VarDctResourceLayout::new(4, 2, 256, 1).unwrap();
         assert_eq!(layout.correlation_count, 1);
         assert_eq!(layout.lf_offset, 2);
         assert_eq!(layout.matrix_offset, 10);
@@ -276,12 +311,46 @@ mod tests {
 
     #[test]
     fn correlation_grid_scales_past_one_frequency_cell() {
-        let layout = VarDctResourceLayout::new(17, 9, 64).unwrap();
+        let layout = VarDctResourceLayout::new(17, 9, 64, 1).unwrap();
         assert_eq!(layout.correlation_count, 6);
         assert_eq!(layout.correlation_offset, 1);
         assert_eq!(layout.lf_offset, 7);
         let values = layout.initial_values();
         assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
+    }
+
+    #[test]
+    fn multiple_quantization_entries_shift_every_following_region() {
+        let layout = VarDctResourceLayout::new(17, 9, 64, 5).unwrap();
+        assert_eq!(layout.quant_offset, 0);
+        assert_eq!(layout.quant_count, 5);
+        assert_eq!(layout.correlation_offset, 5);
+        assert_eq!(layout.correlation_count, 6);
+        assert_eq!(layout.lf_offset, 11);
+        assert_eq!(layout.matrix_offset, 164);
+        assert_eq!(layout.vector_count, 228);
+        assert_eq!(layout.bytes(), 3_648);
+
+        let values = layout.initial_values();
+        assert_eq!(&values[..5], &[[0.0; 4]; 5]);
+        assert_eq!(&values[5..11], &[[0.0, 1.0, 0.0, 0.0]; 6]);
+    }
+
+    #[test]
+    fn default_dct8_matrix_matches_normative_band_interpolation_samples() {
+        let matrix = default_dct8_dequant_matrix();
+        let expected = [
+            [0.000_317_460_3, 0.001_785_714_3, 0.001_953_125],
+            [0.000_745_078_5, 0.003_473_115_4, 0.016_986_076],
+            [0.002_613_333_3, 0.005_100_178_5, 0.070_312_5],
+        ];
+        for (actual, expected) in [matrix[0], matrix[7], matrix[63]].into_iter().zip(expected) {
+            for (actual, expected) in actual[..3].iter().zip(expected) {
+                assert!((actual - expected).abs() <= 1.0e-8);
+            }
+            assert_eq!(actual[3], 0.0);
+        }
+        assert_eq!(matrix[1], matrix[8]);
     }
 
     #[test]

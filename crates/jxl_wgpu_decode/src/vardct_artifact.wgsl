@@ -11,7 +11,8 @@ struct Params {
 @group(0) @binding(0) var<storage, read> raw_metadata: array<i32>;
 @group(0) @binding(1) var<storage, read_write> artifact: array<u32>;
 @group(0) @binding(2) var<storage, read_write> occupancy: array<atomic<u32>>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> resources: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> params: Params;
 
 const STRATEGY_COUNT: u32 = 27u;
 const STATUS_ERROR: u32 = 0u;
@@ -228,6 +229,13 @@ fn write_task(
     artifact[task_metadata + 11u] = select(0u, 1u, needs_transpose(strategy))
         | select(0u, 2u, is_special(strategy));
     artifact[params.metadata_offsets.y + raster_index] = task_index + 1u;
+    let quant_scale = 65536.0 / (f32(params.source_offsets.z) * f32(hf_mul));
+    resources[params.metadata_offsets.z + task_index] = vec4<f32>(
+        0.8 * quant_scale,
+        quant_scale,
+        quant_scale,
+        0.0,
+    );
 }
 
 @compute @workgroup_size(1, 1, 1)
