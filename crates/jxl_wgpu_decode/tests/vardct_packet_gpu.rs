@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{fs, process::Command};
 
 use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
@@ -58,6 +59,67 @@ fn black_source(context: &WgpuContext) -> BufferImageSource {
             }),
     );
     BufferImageSource::new(buffer, layout).unwrap()
+}
+
+fn cjxl_local_tree_codestream() -> Option<Vec<u8>> {
+    if Command::new("cjxl").arg("--version").output().is_err() {
+        eprintln!("skipping local-tree VarDCT oracle: cjxl is not installed");
+        return None;
+    }
+    let stem = format!("jxl-wgpu-local-tree-{}", std::process::id());
+    let ppm_path = std::env::temp_dir().join(format!("{stem}.ppm"));
+    let jxl_path = std::env::temp_dir().join(format!("{stem}.jxl"));
+    let width = 2056_u32;
+    let height = 256_u32;
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.reserve((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            ppm.extend_from_slice(&[
+                (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8,
+                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+                (x.wrapping_mul(5) + y.wrapping_mul(17) + (x ^ y)) as u8,
+            ]);
+        }
+    }
+    fs::write(&ppm_path, ppm).unwrap();
+    let output = Command::new("cjxl")
+        .args(["-d", "2", "-e", "7", "--container=0"])
+        .arg(&ppm_path)
+        .arg(&jxl_path)
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&ppm_path);
+    if !output.status.success() {
+        let _ = fs::remove_file(&jxl_path);
+        panic!("cjxl failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let codestream = fs::read(&jxl_path).unwrap();
+    let _ = fs::remove_file(&jxl_path);
+    Some(codestream)
+}
+
+fn map_statuses(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    submission: wgpu::SubmissionIndex,
+) -> Vec<GpuVarDctPacketStatus> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    staging.map_async(wgpu::MapMode::Read, .., move |result| {
+        sender.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = staging.slice(..).get_mapped_range().unwrap();
+    let statuses = bytemuck::cast_slice::<u8, GpuVarDctPacketStatus>(&mapped).to_vec();
+    drop(mapped);
+    staging.unmap();
+    statuses
 }
 
 #[test]
@@ -197,6 +259,216 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         })
         .unwrap();
     assert_eq!(status.coefficient_words, group.coefficient_words());
+}
+
+#[test]
+fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
+    let Some(codestream) = cjxl_local_tree_codestream() else {
+        return;
+    };
+    let Some((device, queue)) = device() else {
+        eprintln!("skipping local-tree VarDCT GPU oracle: no adapter");
+        return;
+    };
+    let parsed = jxl_gpu_bitstream::parse(&codestream, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: codestream.len() as u64,
+            ..InventoryLimits::default()
+        })
+        .unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+    assert!(plan.requires_local_tree_staging());
+    assert!(plan.groups.len() > 1);
+
+    let mut stream_bytes = codestream;
+    stream_bytes.resize((stream_bytes.len() + 7) & !3, 0);
+    let stream = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("local-tree VarDCT codestream"),
+        contents: &stream_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    struct GroupBuffers {
+        reconstructed: wgpu::Buffer,
+        raw: wgpu::Buffer,
+        coefficients: wgpu::Buffer,
+        status: wgpu::Buffer,
+    }
+    let mut groups = Vec::with_capacity(plan.groups.len());
+    for group in &plan.groups {
+        let control = group.lf_stage_control(&plan).unwrap();
+        groups.push(GroupBuffers {
+            reconstructed: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local-tree LF reconstruction"),
+                size: u64::from(group.reconstructed_words(true).unwrap()) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            raw: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local-tree raw HF metadata"),
+                size: u64::from(control.capacities[1]) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            coefficients: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local-tree coefficients"),
+                size: u64::from(group.coefficient_words()) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            status: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local-tree packet status"),
+                size: std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+        });
+    }
+    let status_bytes = (groups.len() * std::mem::size_of::<GpuVarDctPacketStatus>()) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("local-tree aggregate status staging"),
+        size: status_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let pipeline = VarDctPacketPipeline::new(&device);
+    let mut first = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("local-tree LF stage"),
+    });
+    for (index, (group, buffers)) in plan.groups.iter().zip(&groups).enumerate() {
+        let metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree LF MA metadata"),
+            contents: bytemuck::cast_slice(&group.lf_modular.metadata),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree LF control"),
+            contents: bytemuck::bytes_of(&group.lf_stage_control(&plan).unwrap()),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree LF Modular params"),
+            contents: bytemuck::bytes_of(
+                &VarDctModularParams::default()
+                    .with_lz77_window(group.lf_modular.lz77_window_words)
+                    .with_self_correcting(group.lf_modular.needs_self_correcting),
+            ),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        pipeline.encode_lf(
+            &device,
+            &mut first,
+            VarDctPacketBuffers {
+                codestream: &stream,
+                modular_metadata: &metadata,
+                reconstructed_lf: &buffers.reconstructed,
+                raw_hf_metadata: &buffers.raw,
+                coefficients: &buffers.coefficients,
+                status: &buffers.status,
+                control: &control,
+                modular_params: &params,
+            },
+        );
+        first.copy_buffer_to_buffer(
+            &buffers.status,
+            0,
+            &staging,
+            (index * std::mem::size_of::<GpuVarDctPacketStatus>()) as u64,
+            std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+        );
+    }
+    let first_statuses = map_statuses(&device, &staging, queue.submit([first.finish()]));
+    let continuations = plan
+        .groups
+        .iter()
+        .zip(first_statuses)
+        .map(|(group, status)| {
+            let block_count = group.block_extent()[0] * group.block_extent()[1];
+            let cursor = status
+                .validate_lf_stage(
+                    block_count * 3,
+                    plan.global_scale,
+                    plan.quant_lf,
+                    group.extra_precision,
+                )
+                .unwrap();
+            plan.parse_hf_continuation(&stream_bytes, group, cursor)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let mut second = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("local-tree HF stage"),
+    });
+    for (index, ((group, buffers), continuation)) in plan
+        .groups
+        .iter()
+        .zip(&groups)
+        .zip(&continuations)
+        .enumerate()
+    {
+        let metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree HF MA metadata"),
+            contents: bytemuck::cast_slice(&continuation.modular.metadata),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let control_value = group.hf_stage_control(&plan, continuation).unwrap();
+        let control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree HF control"),
+            contents: bytemuck::bytes_of(&control_value),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("local-tree HF Modular params"),
+            contents: bytemuck::bytes_of(
+                &VarDctModularParams::default()
+                    .with_lz77_window(continuation.modular.lz77_window_words)
+                    .with_self_correcting(continuation.modular.needs_self_correcting),
+            ),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        pipeline.encode_hf(
+            &device,
+            &mut second,
+            VarDctPacketBuffers {
+                codestream: &stream,
+                modular_metadata: &metadata,
+                reconstructed_lf: &buffers.reconstructed,
+                raw_hf_metadata: &buffers.raw,
+                coefficients: &buffers.coefficients,
+                status: &buffers.status,
+                control: &control,
+                modular_params: &params,
+            },
+        );
+        second.copy_buffer_to_buffer(
+            &buffers.status,
+            0,
+            &staging,
+            (index * std::mem::size_of::<GpuVarDctPacketStatus>()) as u64,
+            std::mem::size_of::<GpuVarDctPacketStatus>() as u64,
+        );
+    }
+    let final_statuses = map_statuses(&device, &staging, queue.submit([second.finish()]));
+    for ((group, continuation), status) in
+        plan.groups.iter().zip(&continuations).zip(final_statuses)
+    {
+        let [blocks_x, blocks_y] = group.block_extent();
+        status
+            .validate(VarDctPacketValidation {
+                expected_strategy: plan.uniform_transform,
+                expected_lf_samples: blocks_x * blocks_y * 3,
+                block_count: blocks_x * blocks_y,
+                correlation_samples: group.rect.width.div_ceil(64) * group.rect.height.div_ceil(64),
+                task_capacity: group.task_capacity,
+                expected_global_scale: plan.global_scale,
+                expected_quant_lf: plan.quant_lf,
+                expected_extra_precision: group.extra_precision,
+            })
+            .unwrap();
+        assert_eq!(status.first_blocks, continuation.block_count);
+    }
 }
 
 #[test]

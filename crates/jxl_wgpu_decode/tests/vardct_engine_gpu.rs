@@ -1,6 +1,5 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::num::NonZeroUsize;
 use std::sync::{Arc, mpsc};
 
 use jxl::api::{
@@ -17,7 +16,7 @@ use jxl_wgpu::{
     ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
-use jxl_wgpu_decode::vardct::packet::{BoundedVarDctPacketPlan, GpuVarDctPacketError};
+use jxl_wgpu_decode::vardct::packet::{BoundedVarDctPacketError, BoundedVarDctPacketPlan};
 use jxl_wgpu_decode::{
     DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
     VarDctDecodeError,
@@ -522,34 +521,19 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
     let modular_header_bit = entropy_bit + 2;
     corrupted[modular_header_bit / 8] ^= 1 << (modular_header_bit % 8);
 
-    let mut rejected = decoder
-        .open(
-            &corrupted,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .expect("the corrupted image entropy remains host-parseable");
-    rejected.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
-    let unvalidated = rejected
-        .front_pending_frame()
-        .unwrap()
-        .unvalidated_gpu_frame()
-        .unwrap();
-    let output_bytes = unvalidated.outputs[0].buffer.reserved_bytes();
-    let error = match rejected.next_frame() {
+    let error = match decoder.open(
+        &corrupted,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+    ) {
         Err(error) => error,
-        Ok(_) => panic!("corrupt VarDCT image entropy must not become authoritative"),
+        Ok(_) => panic!("corrupt local MA metadata must be rejected before submission"),
     };
     assert!(matches!(
         error,
-        DecodeError::VarDct(VarDctDecodeError::PacketGpu(GpuVarDctPacketError::LfHeader))
+        DecodeError::VarDct(VarDctDecodeError::Packet(
+            BoundedVarDctPacketError::ModularTree(_)
+        ))
     ));
-    assert_eq!(
-        decoder.engine().in_flight_memory_stats().reserved_bytes,
-        output_bytes,
-        "explicitly unvalidated output stays accounted but must be discarded"
-    );
-    drop(unvalidated);
-    drop(rejected);
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 

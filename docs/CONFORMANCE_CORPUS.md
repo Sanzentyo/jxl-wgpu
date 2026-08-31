@@ -154,7 +154,13 @@ cargo run --release --example test_multi_group
 
 These fixtures prove cross-LF-group addressing and restoration for the accepted global-tree
 profile. They do not prove local per-substream MA trees: ordinary multi-LF-group `cjxl` output uses
-that different layout, which remains explicitly listed as incomplete.
+that different layout. `vardct_packet_gpu::gpu_stages_cjxl_local_ma_trees_without_host_image_entropy`
+generates a deterministic 2056x256 RGB PPM, invokes an installed `cjxl` 0.12-compatible CLI with
+distance 2/effort 7/raw-codestream output, and requires more than one LF group with no global MA
+tree. On an actual adapter it dispatches every LF-local stream, maps the aggregate 64-byte status
+records, validates and uses only their entropy-end cursors, packs the following HF-local metadata,
+and dispatches every HF stream. This proves the packet-stage boundary; it does not yet claim the
+stock frame engine or final RGB output accepts that layout.
 
 ## Common entropy differential matrix
 

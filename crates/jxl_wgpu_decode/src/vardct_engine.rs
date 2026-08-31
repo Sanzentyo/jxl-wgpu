@@ -92,6 +92,8 @@ pub enum VarDctDecodeError {
     MissingInverseOpsin,
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
+    #[error("the staged local-MA packet frontend is not yet connected to the frame engine")]
+    LocalMaTreeStagingNotIntegrated,
     #[error(transparent)]
     Packet(#[from] BoundedVarDctPacketError),
     #[error(transparent)]
@@ -830,6 +832,9 @@ fn prepare_source(
         return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
     }
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
+    if packet.requires_local_tree_staging() {
+        return Err(VarDctDecodeError::LocalMaTreeStagingNotIntegrated);
+    }
     let [blocks_x, blocks_y] = packet.block_extent();
     let resource_layout =
         VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;

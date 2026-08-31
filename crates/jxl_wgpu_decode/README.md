@@ -81,8 +81,13 @@ one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spect
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
 per-frequency-cell HF chroma correlation, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
-current sectioned profile requires the LF-global MA tree; local MA trees embedded separately in LF
-quantization or HF-metadata substreams remain a typed rejection. The image header must declare the standard sRGB/D65
+packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,
+executes LF image entropy on GPU, maps the aggregate end cursors, then parses and packs the following
+HF-local trees without decoding host image symbols. Separate `decode_vardct_lf` and
+`decode_vardct_hf` entry points preserve the resident LF reconstruction across that boundary. This
+two-stage packet core is actual-GPU tested with ordinary multi-LF-group `cjxl` output; the stock
+frame engine still returns `LocalMaTreeStagingNotIntegrated` until its pending-frame state machine
+owns both submissions and budget reservations. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
@@ -137,9 +142,9 @@ inverse transforms, including AFV and 64/128/256-scale strategies. It GPU-encode
 standard packet, executes the complete resident decode, reads the result back explicitly, and,
 when `djxl` is installed, compares it with that independent decoder (at most one RGB8 code of
 rounding difference for the covered solid-image cases). The Dct8 case also exercises the
-runtime-neutral async completion and GPU display conversion. A deterministic entropy-bit
-corruption remains host-parseable, is exposed only through the explicitly unvalidated type, and
-then fails packet-status validation before authoritative metadata is returned. The matrix also
+runtime-neutral async completion and GPU display conversion. A deterministic mutation of the
+Modular header into a malformed local-tree descriptor is rejected by the bounded host metadata
+parser before submission. The matrix also
 verifies that readback releases its shared reservation while the last decode-output buffer clone
 continues to own the exact output bytes. A separate 438x589 libjxl fixture exercises six nonempty
 pass groups, 4,070 DCT8 tasks, a custom three-channel coefficient order, nonzero AC coefficients,
@@ -179,7 +184,8 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Local per-substream MA trees, multiple spectral/refinement passes, custom
+This is not full VarDCT coverage. Frame-engine integration of the implemented staged local
+per-substream MA-tree packet core, multiple spectral/refinement passes, custom
 quantization matrices, non-default LF channel-correlation metadata, Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported

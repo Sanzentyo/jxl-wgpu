@@ -101,6 +101,7 @@ const ERROR_HF_HEADER: u32 = 22u;
 const ERROR_STRATEGY: u32 = 24u;
 const ERROR_SHARPNESS: u32 = 25u;
 const ERROR_HF_GLOBAL: u32 = 27u;
+const STATUS_LF_READY: u32 = 30u;
 
 fn reconstruction_load(index: u32) -> u32 {
     return reconstructed[reconstruction_base + index];
@@ -260,30 +261,26 @@ fn finish_section(expected_end: u32) {
     bit_cursor = expected_end;
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn decode_vardct_packet() {
+fn initialize_packet(start: u32, end: u32, stream_index: u32) {
     params = params_input[0];
     reconstruction_base = 0u;
     decode_error = 0u;
-    bit_cursor = control.section_bits.x;
-    params.entropy.token_start = bit_cursor;
-    params.entropy.token_end = control.section_bits.y;
-    params.source_channels = 3u;
+    bit_cursor = start;
+    params.entropy.token_start = start;
+    params.entropy.token_end = end;
     params.source_mask = 0x7fffffffu;
-    params.entropy.lz77_window_mask = 0u;
-    params.stream_index = control.streams.x;
+    params.entropy.lz77_window_mask = params_input[0].entropy.lz77_window_mask;
+    params.stream_index = stream_index;
+}
 
-    let extra_precision = read_bits(2u);
-    if read_bits(4u) != 3u {
-        reject(ERROR_LF_HEADER, bit_cursor);
-    }
+fn decode_lf_channels() -> u32 {
     let block_count = control.geometry.z * control.geometry.w;
     params.sample_count = block_count;
     params.source_channels = 3u;
-    var lf_decoded = 0u;
+    var decoded = 0u;
     entropy_begin();
     for (current_channel = 0u; current_channel < 3u && decode_error == 0u; current_channel += 1u) {
-        lf_decoded += decode_channel(
+        decoded += decode_channel(
             control.geometry.z,
             control.geometry.w,
             control.geometry.z,
@@ -292,27 +289,21 @@ fn decode_vardct_packet() {
         );
     }
     entropy_finalize();
+    return decoded;
+}
 
-    let first_block_bits = control.capacities.z;
-    let first_blocks = read_bits(first_block_bits) + 1u;
-    if first_blocks > control.capacities.w {
-        reject(ERROR_FIRST_BLOCK, first_blocks);
-    }
-    if read_bits(4u) != 3u {
-        reject(ERROR_HF_HEADER, bit_cursor);
-    }
-
-    params.stream_index = control.streams.y;
+fn decode_hf_channels(first_blocks: u32) -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
     let correlation_width = (control.geometry.x + 63u) / 64u;
     let correlation_height = (control.geometry.y + 63u) / 64u;
     let correlation_samples = correlation_width * correlation_height;
     let hf_samples = 2u * correlation_samples + 2u * first_blocks + block_count;
     params.sample_count = max(3u * block_count, hf_samples);
     params.source_channels = 1u;
-    var hf_decoded = 0u;
+    var decoded = 0u;
     entropy_begin();
     current_channel = 0u;
-    hf_decoded += decode_channel(
+    decoded += decode_channel(
         correlation_width,
         correlation_height,
         correlation_width,
@@ -320,7 +311,7 @@ fn decode_vardct_packet() {
         1u,
     );
     current_channel = 1u;
-    hf_decoded += decode_channel(
+    decoded += decode_channel(
         correlation_width,
         correlation_height,
         correlation_width,
@@ -328,7 +319,7 @@ fn decode_vardct_packet() {
         1u,
     );
     current_channel = 2u;
-    hf_decoded += decode_channel(
+    decoded += decode_channel(
         first_blocks,
         2u,
         control.capacities.w,
@@ -336,7 +327,7 @@ fn decode_vardct_packet() {
         1u,
     );
     current_channel = 3u;
-    hf_decoded += decode_channel(
+    decoded += decode_channel(
         control.geometry.z,
         control.geometry.w,
         control.geometry.z,
@@ -344,7 +335,11 @@ fn decode_vardct_packet() {
         1u,
     );
     entropy_finalize();
+    return decoded;
+}
 
+fn validate_hf_values(first_blocks: u32) {
+    let block_count = control.geometry.z * control.geometry.w;
     if control.expected.y != 0u {
         for (var index = 0u; index < first_blocks && decode_error == 0u; index += 1u) {
             if raw_metadata[control.offsets.z + index] != control.expected.x {
@@ -353,10 +348,11 @@ fn decode_vardct_packet() {
         }
     }
     validate_sharpness(block_count);
+}
+
+fn finish_hf_packet() {
     if control.streams.z != 0u {
         finish_section(control.section_bits.y);
-        // Separate HF-global descriptors are host-packed into the shared entropy-table ABI and
-        // their coefficient symbols remain in pass-group packets for the next GPU dispatch.
         bit_cursor = control.section_bits.w;
         params.entropy.token_start = bit_cursor;
         params.entropy.token_end = control.section_bits.w;
@@ -376,15 +372,83 @@ fn decode_vardct_packet() {
         }
         finish_section(params.entropy.token_end);
     }
+}
 
+fn clear_coefficients() {
     if decode_error == 0u {
         for (var index = 0u; index < control.capacities.x; index += 1u) {
             coefficients[index] = 0u;
         }
-        status[0] = STATUS_OK;
-    } else {
-        status[0] = decode_error;
     }
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn decode_vardct_lf() {
+    initialize_packet(control.section_bits.x, control.section_bits.y, control.streams.x);
+    let lf_decoded = decode_lf_channels();
+    status[0] = select(STATUS_LF_READY, decode_error, decode_error != 0u);
+    status[1] = bit_cursor;
+    status[2] = control.section_bits.y;
+    status[3] = lf_decoded;
+    status[4] = 0u;
+    status[7] = control.capacities.x;
+    status[9] = control.quantization.x;
+    status[10] = control.quantization.y;
+    status[11] = 0u;
+    status[12] = control.quantization.z;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn decode_vardct_hf() {
+    initialize_packet(control.section_bits.z, control.section_bits.y, control.streams.y);
+    let first_blocks = control.quantization.w;
+    if first_blocks == 0u || first_blocks > control.capacities.w {
+        reject(ERROR_FIRST_BLOCK, first_blocks);
+    }
+    let hf_decoded = decode_hf_channels(first_blocks);
+    validate_hf_values(first_blocks);
+    finish_hf_packet();
+    clear_coefficients();
+    status[0] = select(STATUS_OK, decode_error, decode_error != 0u);
+    status[1] = bit_cursor;
+    status[2] = params.entropy.token_end;
+    status[4] = hf_decoded;
+    status[5] = raw_metadata[control.offsets.z];
+    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[7] = control.capacities.x;
+    status[8] = select(status[8], 0u, decode_error == 0u);
+    status[9] = control.quantization.x;
+    status[10] = control.quantization.y;
+    status[11] = first_blocks;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn decode_vardct_packet() {
+    initialize_packet(control.section_bits.x, control.section_bits.y, control.streams.x);
+    params.source_channels = 3u;
+
+    let extra_precision = read_bits(2u);
+    if read_bits(4u) != 3u {
+        reject(ERROR_LF_HEADER, bit_cursor);
+    }
+    let block_count = control.geometry.z * control.geometry.w;
+    let lf_decoded = decode_lf_channels();
+
+    let first_block_bits = control.capacities.z;
+    let first_blocks = read_bits(first_block_bits) + 1u;
+    if first_blocks > control.capacities.w {
+        reject(ERROR_FIRST_BLOCK, first_blocks);
+    }
+    if read_bits(4u) != 3u {
+        reject(ERROR_HF_HEADER, bit_cursor);
+    }
+
+    params.stream_index = control.streams.y;
+    let hf_decoded = decode_hf_channels(first_blocks);
+    validate_hf_values(first_blocks);
+    finish_hf_packet();
+    clear_coefficients();
+    status[0] = select(STATUS_OK, decode_error, decode_error != 0u);
     status[1] = bit_cursor;
     status[2] = params.entropy.token_end;
     status[3] = lf_decoded;

@@ -48,7 +48,7 @@ fn accepts_basic_single_entry_without_host_entropy_decode() {
     assert_eq!((prefix.global_scale, prefix.quant_lf), (4587, 16));
     assert_eq!(prefix.hf_block_context.num_block_clusters, 15);
     assert_eq!(prefix.hf_block_context.block_context_map.len(), 39);
-    assert!(prefix.ma_tree_bit_offset > packet.offset);
+    assert!(prefix.global_ma_tree_bit_offset.unwrap() > packet.offset);
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn accepts_green_queen_physical_group_packets() {
     assert_eq!((prefix.global_scale, prefix.quant_lf), (8813, 10));
     assert_eq!(prefix.hf_block_context.num_block_clusters, 15);
     assert_eq!(prefix.hf_block_context.block_context_map.len(), 39);
-    assert!(prefix.ma_tree_bit_offset > lf_global.offset);
+    assert!(prefix.global_ma_tree_bit_offset.unwrap() > lf_global.offset);
     let hf_prefix = HfGlobalPrefix::parse(&bytes, hf_global, 6).unwrap();
     assert_eq!(hf_prefix.num_hf_presets, 1);
     assert_ne!(hf_prefix.used_orders, 0);

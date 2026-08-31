@@ -113,16 +113,45 @@ pub struct HfBlockContextIr {
     pub num_block_clusters: u32,
 }
 
-/// Scalar LF-global metadata preceding the entropy-coded MA tree.
+/// Scalar LF-global metadata preceding an optional entropy-coded global MA tree.
 ///
-/// `ma_tree_bit_offset` points at the first bit of the MA-tree entropy descriptor. No tree or
-/// sample symbol has been expanded while constructing this value.
+/// `global_ma_tree_bit_offset` is `Some` only when the LF-global packet declares a global tree.
+/// No tree or sample symbol has been expanded while constructing this value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LfGlobalPrefix {
     pub global_scale: u32,
     pub quant_lf: u32,
     pub hf_block_context: HfBlockContextIr,
-    pub ma_tree_bit_offset: u64,
+    /// The bit after the global-tree presence flag. This is either the global tree descriptor or,
+    /// when no global tree exists, the following LF-group payload.
+    pub suffix_bit_offset: u64,
+    pub global_ma_tree_bit_offset: Option<u64>,
+}
+
+/// Parsed JPEG XL Modular group header and the bit immediately following it.
+///
+/// When `use_global_tree` is false, `tree_or_token_bit_offset` points at the local MA-tree
+/// descriptor. Otherwise it points directly at the first image-entropy descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModularHeaderPrefix {
+    pub use_global_tree: bool,
+    pub tree_or_token_bit_offset: u64,
+}
+
+/// LF-group scalar prefix before its MA tree or quantized-LF entropy descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LfGroupHeaderPrefix {
+    pub extra_precision: u8,
+    pub modular: ModularHeaderPrefix,
+}
+
+/// HF-metadata scalar prefix before its MA tree or image-entropy descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HfMetadataHeaderPrefix {
+    pub block_width: u32,
+    pub block_height: u32,
+    pub block_count: u32,
+    pub modular: ModularHeaderPrefix,
 }
 
 /// Fixed HF-global metadata preceding an optional entropy-coded coefficient-order permutation.
@@ -242,8 +271,13 @@ impl LfGroupPrefix {
         })?;
         let extra_precision =
             u8::try_from(extra_precision).map_err(|_| VarDctPacketError::GeometryOverflow)?;
-        parse_default_modular_header(&mut reader, "LF quantization")?;
-        let token_bit_offset = metadata_cursor(&reader)?;
+        let modular = parse_modular_header(&mut reader, "LF quantization")?;
+        if !modular.use_global_tree {
+            return Err(VarDctPacketError::NonDefaultMetadata {
+                field: "local Modular MA tree",
+            });
+        }
+        let token_bit_offset = modular.tree_or_token_bit_offset;
         if token_bit_offset >= packet_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: token_bit_offset,
@@ -318,8 +352,13 @@ impl HfMetadataPrefix {
         if block_count > block_area {
             return Err(VarDctPacketError::GeometryOverflow);
         }
-        parse_default_modular_header(&mut reader, "HF metadata")?;
-        let metadata_token_offset = metadata_cursor(&reader)?;
+        let modular = parse_modular_header(&mut reader, "HF metadata")?;
+        if !modular.use_global_tree {
+            return Err(VarDctPacketError::NonDefaultMetadata {
+                field: "local Modular MA tree",
+            });
+        }
+        let metadata_token_offset = modular.tree_or_token_bit_offset;
         if metadata_token_offset >= packet_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: metadata_token_offset,
@@ -362,16 +401,11 @@ impl HfMetadataPrefix {
     }
 }
 
-fn parse_default_modular_header(
+fn parse_modular_header(
     reader: &mut MetadataBitstream<'_>,
     stage: &'static str,
-) -> Result<(), VarDctPacketError> {
+) -> Result<ModularHeaderPrefix, VarDctPacketError> {
     let use_global_tree = metadata_at(reader, stage, |reader| reader.read_bool())?;
-    if !use_global_tree {
-        return Err(VarDctPacketError::NonDefaultMetadata {
-            field: "local Modular MA tree",
-        });
-    }
     metadata_require_default(reader, "local Modular weighted predictor")?;
     let transform_count = metadata_at(reader, stage, |reader| {
         reader.read_u32(0, 1, 2 + U(4), 18 + U(8))
@@ -381,7 +415,94 @@ fn parse_default_modular_header(
             field: "local Modular transforms",
         });
     }
-    Ok(())
+    Ok(ModularHeaderPrefix {
+        use_global_tree,
+        tree_or_token_bit_offset: metadata_cursor(reader)?,
+    })
+}
+
+pub(crate) fn parse_lf_group_header_prefix(
+    codestream: &[u8],
+    packet: BitRange,
+) -> Result<LfGroupHeaderPrefix, VarDctPacketError> {
+    let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
+    validate_packet_end(codestream, packet_end)?;
+    let packet_offset =
+        usize::try_from(packet.offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
+    let mut reader = MetadataBitstream::new(codestream);
+    metadata_at(&mut reader, "LF-group packet offset", |reader| {
+        reader.skip_bits(packet_offset)
+    })?;
+    let extra_precision = metadata_at(&mut reader, "LF extra precision", |reader| {
+        reader.read_bits(2)
+    })?;
+    let extra_precision =
+        u8::try_from(extra_precision).map_err(|_| VarDctPacketError::GeometryOverflow)?;
+    let modular = parse_modular_header(&mut reader, "LF quantization")?;
+    if modular.tree_or_token_bit_offset >= packet_end {
+        return Err(VarDctPacketError::PacketBoundary {
+            cursor: modular.tree_or_token_bit_offset,
+            packet_end,
+        });
+    }
+    Ok(LfGroupHeaderPrefix {
+        extra_precision,
+        modular,
+    })
+}
+
+pub(crate) fn parse_hf_metadata_header_prefix(
+    codestream: &[u8],
+    bit_offset: u64,
+    packet_end: u64,
+    lf_width: u32,
+    lf_height: u32,
+) -> Result<HfMetadataHeaderPrefix, VarDctPacketError> {
+    validate_packet_end(codestream, packet_end)?;
+    if bit_offset >= packet_end {
+        return Err(VarDctPacketError::PacketBoundary {
+            cursor: bit_offset,
+            packet_end,
+        });
+    }
+    let offset = usize::try_from(bit_offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
+    let mut reader = MetadataBitstream::new(codestream);
+    metadata_at(&mut reader, "HF metadata packet offset", |reader| {
+        reader.skip_bits(offset)
+    })?;
+    let block_width = lf_width.div_ceil(8);
+    let block_height = lf_height.div_ceil(8);
+    let block_area = block_width
+        .checked_mul(block_height)
+        .ok_or(VarDctPacketError::GeometryOverflow)?;
+    if block_area == 0 {
+        return Err(VarDctPacketError::GeometryOverflow);
+    }
+    let count_bits = block_area
+        .checked_next_power_of_two()
+        .ok_or(VarDctPacketError::GeometryOverflow)?
+        .trailing_zeros();
+    let count_bits =
+        usize::try_from(count_bits).map_err(|_| VarDctPacketError::GeometryOverflow)?;
+    let block_count = metadata_at(&mut reader, "HF varblock count", |reader| {
+        reader.read_bits(count_bits).map(|value| value + 1)
+    })?;
+    if block_count > block_area {
+        return Err(VarDctPacketError::GeometryOverflow);
+    }
+    let modular = parse_modular_header(&mut reader, "HF metadata")?;
+    if modular.tree_or_token_bit_offset >= packet_end {
+        return Err(VarDctPacketError::PacketBoundary {
+            cursor: modular.tree_or_token_bit_offset,
+            packet_end,
+        });
+    }
+    Ok(HfMetadataHeaderPrefix {
+        block_width,
+        block_height,
+        block_count,
+        modular,
+    })
 }
 
 fn metadata_cursor(reader: &MetadataBitstream<'_>) -> Result<u64, VarDctPacketError> {
@@ -444,11 +565,6 @@ impl LfGlobalPrefix {
         let has_global_ma_tree = metadata_at(&mut reader, "global MA-tree flag", |reader| {
             reader.read_bool()
         })?;
-        if !has_global_ma_tree {
-            return Err(VarDctPacketError::NonDefaultMetadata {
-                field: "global MA tree presence",
-            });
-        }
         let cursor = u64::try_from(reader.num_read_bits())
             .map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
         if cursor > packet_end {
@@ -458,7 +574,8 @@ impl LfGlobalPrefix {
             global_scale,
             quant_lf,
             hf_block_context,
-            ma_tree_bit_offset: cursor,
+            suffix_bit_offset: cursor,
+            global_ma_tree_bit_offset: has_global_ma_tree.then_some(cursor),
         })
     }
 }

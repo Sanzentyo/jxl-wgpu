@@ -7,11 +7,13 @@ use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
 use crate::modular_tree::{
-    EntropyDecoderIr, MaTreeLimits, MaTreeNodeIr, PackedModularMetadata, parse_ma_config,
+    EntropyDecoderIr, MaConfigIr, MaTreeLimits, MaTreeNodeIr, PackedModularMetadata,
+    parse_ma_config,
 };
 use crate::vardct_frontend::{
     HfBlockContextIr, HfGlobalPrefix, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
-    VarDctGroupRect, VarDctPacketError, VarDctSectionLayout,
+    VarDctGroupRect, VarDctPacketError, VarDctSectionLayout, parse_hf_metadata_header_prefix,
+    parse_lf_group_header_prefix,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -58,6 +60,10 @@ pub enum BoundedVarDctPacketError {
     CoefficientOrderCoding(#[source] jxl_coding::Error),
     #[error("the packed MA-tree metadata ABI is malformed")]
     PackedMetadata,
+    #[error("{stage} requests a global MA tree, but LF-global did not provide one")]
+    MissingGlobalMaTree { stage: &'static str },
+    #[error("HF continuation cursor {cursor} precedes LF entropy start {lf_start}")]
+    HfContinuationBeforeLf { cursor: u32, lf_start: u32 },
     #[error("VarDCT packet arithmetic overflowed while computing {field}")]
     ArithmeticOverflow { field: &'static str },
     #[error("HF-global entropy metadata leaves {bits} non-padding bits")]
@@ -100,6 +106,8 @@ pub struct BoundedVarDctPacketPlan {
     pub hf_global: Option<BitRange>,
     /// Descriptor end used as the LF-group start by the one-entry TOC form.
     pub entropy_bit_offset: u32,
+    /// Packed global MA metadata when LF-global declared it. Local-tree streams carry their own
+    /// descriptor in each group plan instead.
     pub modular_metadata: Vec<u32>,
     /// Whether the shared MA tree requires the weighted self-correcting predictor workspace.
     pub needs_self_correcting: bool,
@@ -110,6 +118,23 @@ pub struct BoundedVarDctPacketPlan {
     /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
     /// packets and are never expanded on the host.
     pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
+    global_ma_config: Option<MaConfigIr>,
+}
+
+/// One host-packed MA tree/histogram bundle and its exact GPU reconstruction requirements.
+#[derive(Clone, Debug)]
+pub struct BoundedModularEntropyPlan {
+    pub metadata: Vec<u32>,
+    pub needs_self_correcting: bool,
+    pub lz77_window_words: u32,
+}
+
+/// Host metadata discovered after the first GPU stage returns the LF entropy cursor.
+#[derive(Clone, Debug)]
+pub struct BoundedHfMetadataContinuation {
+    pub token_bit_offset: u32,
+    pub block_count: u32,
+    pub modular: BoundedModularEntropyPlan,
 }
 
 /// One LF group's packet geometry and persistent decode contract.
@@ -125,6 +150,10 @@ pub struct BoundedVarDctGroupPlan {
     pub lf_group: BitRange,
     pub lf_stream_index: u32,
     pub hf_stream_index: u32,
+    /// First LF image-entropy bit, after either the selected global tree header or this group's
+    /// local MA descriptor.
+    pub lf_entropy_bit_offset: u32,
+    pub lf_modular: BoundedModularEntropyPlan,
     /// Physical power-of-two history ring reused by the group's two sequential Modular streams.
     pub lz77_window_words: u32,
     pub extra_precision: u8,
@@ -153,6 +182,65 @@ pub struct HfCoefficientEntropyPlan {
     pub pass_groups: Vec<BitRange>,
     /// Per-pass-group power-of-two history capacity for the common GPU entropy executor.
     pub lz77_window_words: u32,
+}
+
+fn parse_ma_config_at(
+    codestream: &[u8],
+    bit_offset: u64,
+    packet_end: u64,
+) -> Result<(MaConfigIr, u64), BoundedVarDctPacketError> {
+    let mut reader = BitReader::new(codestream);
+    reader.skip_bits(bit_offset)?;
+    let config = parse_ma_config(&mut reader, MaTreeLimits::default())
+        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+    let descriptor_end = reader.bit_offset();
+    if descriptor_end > packet_end {
+        return Err(VarDctPacketError::PacketBoundary {
+            cursor: descriptor_end,
+            packet_end,
+        }
+        .into());
+    }
+    validate_ma_config(&config)?;
+    Ok((config, descriptor_end))
+}
+
+fn validate_ma_config(config: &MaConfigIr) -> Result<(), BoundedVarDctPacketError> {
+    for node in &config.nodes {
+        if let MaTreeNodeIr::Decision { property, .. } = *node
+            && property >= 16
+        {
+            return Err(
+                UnsupportedVarDctPacketFeature::PreviousChannelMaProperty { property }.into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn pack_ma_metadata(config: &MaConfigIr) -> Result<Vec<u32>, BoundedVarDctPacketError> {
+    let PackedModularMetadata { words } = config
+        .pack_gpu_metadata()
+        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+    if words.len() <= 9 {
+        return Err(BoundedVarDctPacketError::PackedMetadata);
+    }
+    Ok(words)
+}
+
+fn pack_modular_plan(
+    config: &MaConfigIr,
+    distance_multiplier: u32,
+    decoded_symbol_limit: u32,
+) -> Result<BoundedModularEntropyPlan, BoundedVarDctPacketError> {
+    Ok(BoundedModularEntropyPlan {
+        metadata: pack_ma_metadata(config)?,
+        needs_self_correcting: config.needs_self_correcting(),
+        lz77_window_words: config
+            .entropy
+            .lz77_window_words(distance_multiplier, decoded_symbol_limit)
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?,
+    })
 }
 
 impl BoundedVarDctPacketPlan {
@@ -198,11 +286,21 @@ impl BoundedVarDctPacketPlan {
                 ),
             };
         let lf_global = LfGlobalPrefix::parse(codestream, lf_global_packet)?;
-        let mut reader = BitReader::new(codestream);
-        reader.skip_bits(lf_global.ma_tree_bit_offset)?;
-        let ma_config = parse_ma_config(&mut reader, MaTreeLimits::default())
-            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-        let descriptor_end = reader.bit_offset();
+        let (global_ma_config, descriptor_end) =
+            if let Some(tree_offset) = lf_global.global_ma_tree_bit_offset {
+                let (config, end) = parse_ma_config_at(
+                    codestream,
+                    tree_offset,
+                    lf_global_packet
+                        .end()
+                        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-global end",
+                        })?,
+                )?;
+                (Some(config), end)
+            } else {
+                (None, lf_global.suffix_bit_offset)
+            };
         let lf_global_end =
             lf_global_packet
                 .end()
@@ -216,21 +314,11 @@ impl BoundedVarDctPacketPlan {
             }
             .into());
         }
-        for node in &ma_config.nodes {
-            if let MaTreeNodeIr::Decision { property, .. } = *node
-                && property >= 16
-            {
-                return Err(
-                    UnsupportedVarDctPacketFeature::PreviousChannelMaProperty { property }.into(),
-                );
-            }
-        }
-        let PackedModularMetadata { words } = ma_config
-            .pack_gpu_metadata()
-            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-        if words.len() <= 9 {
-            return Err(BoundedVarDctPacketError::PackedMetadata);
-        }
+        let words = global_ma_config
+            .as_ref()
+            .map(pack_ma_metadata)
+            .transpose()?
+            .unwrap_or_default();
         let entropy_bit_offset = u32::try_from(descriptor_end).map_err(|_| {
             BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "entropy bit offset",
@@ -266,7 +354,7 @@ impl BoundedVarDctPacketPlan {
                     .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group correlation sample count",
                     })?;
-                let decoded_symbol_limit = block_count
+                let hf_decoded_symbol_limit = block_count
                     .checked_mul(4)
                     .and_then(|samples| {
                         block_count
@@ -281,18 +369,67 @@ impl BoundedVarDctPacketPlan {
                     .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group decoded symbol limit",
                     })?;
-                let lz77_window_words = ma_config
-                    .entropy
-                    .lz77_window_words(blocks_x.max(1), decoded_symbol_limit)
-                    .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-                let lf_entropy_bit_offset = if hf_global.is_some() {
+                let lf_group_start = if hf_global.is_some() {
                     lf_group.offset
                 } else {
                     descriptor_end
                 };
-                let mut lf_header = BitReader::new(codestream);
-                lf_header.skip_bits(lf_entropy_bit_offset)?;
-                let extra_precision = lf_header.read_bits(2)? as u8;
+                let lf_group_end =
+                    lf_group
+                        .end()
+                        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-group end",
+                        })?;
+                let lf_header = parse_lf_group_header_prefix(
+                    codestream,
+                    BitRange {
+                        offset: lf_group_start,
+                        length: lf_group_end.checked_sub(lf_group_start).ok_or(
+                            BoundedVarDctPacketError::ArithmeticOverflow {
+                                field: "LF-group range",
+                            },
+                        )?,
+                    },
+                )?;
+                let (lf_config, lf_token_bit_offset) = if lf_header.modular.use_global_tree {
+                    (
+                        global_ma_config.clone().ok_or(
+                            BoundedVarDctPacketError::MissingGlobalMaTree {
+                                stage: "LF quantization",
+                            },
+                        )?,
+                        lf_header.modular.tree_or_token_bit_offset,
+                    )
+                } else {
+                    parse_ma_config_at(
+                        codestream,
+                        lf_header.modular.tree_or_token_bit_offset,
+                        lf_group_end,
+                    )?
+                };
+                let lf_decoded_symbol_limit = block_count.checked_mul(3).ok_or(
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group LF decoded symbol limit",
+                    },
+                )?;
+                let lf_modular =
+                    pack_modular_plan(&lf_config, blocks_x.max(1), lf_decoded_symbol_limit)?;
+                let hf_window_words = if let Some(config) = &global_ma_config {
+                    config
+                        .entropy
+                        .lz77_window_words(
+                            block_count.max(blocks_x).max(1),
+                            hf_decoded_symbol_limit,
+                        )
+                        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?
+                } else {
+                    hf_decoded_symbol_limit.checked_next_power_of_two().ok_or(
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-group deferred HF LZ77 window",
+                        },
+                    )?
+                };
+                let lz77_window_words = lf_modular.lz77_window_words.max(hf_window_words);
                 Ok(BoundedVarDctGroupPlan {
                     index,
                     rect,
@@ -301,8 +438,14 @@ impl BoundedVarDctPacketPlan {
                     lf_group,
                     lf_stream_index: profile.lf_quant_stream_index(u64::from(index))?,
                     hf_stream_index: profile.hf_metadata_stream_index(u64::from(index))?,
+                    lf_entropy_bit_offset: u32::try_from(lf_token_bit_offset).map_err(|_| {
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF image-entropy bit offset",
+                        }
+                    })?,
+                    lf_modular,
                     lz77_window_words,
-                    extra_precision,
+                    extra_precision: lf_header.extra_precision,
                 })
             })
             .collect::<Result<Vec<_>, BoundedVarDctPacketError>>()?;
@@ -341,11 +484,14 @@ impl BoundedVarDctPacketPlan {
             hf_global,
             entropy_bit_offset,
             modular_metadata: words,
-            needs_self_correcting: ma_config.needs_self_correcting(),
+            needs_self_correcting: global_ma_config
+                .as_ref()
+                .is_some_and(MaConfigIr::needs_self_correcting),
             global_scale: lf_global.global_scale,
             quant_lf: lf_global.quant_lf,
             groups,
             hf_coefficients,
+            global_ma_config,
         })
     }
 
@@ -374,6 +520,90 @@ impl BoundedVarDctPacketPlan {
                     field: "total LF-group coefficient words",
                 },
             )
+        })
+    }
+
+    /// Whether the HF metadata boundary must be discovered by a first GPU LF-only submission.
+    #[must_use]
+    pub const fn requires_local_tree_staging(&self) -> bool {
+        self.global_ma_config.is_none()
+    }
+
+    /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
+    /// LF entropy end cursor. No image symbol is decoded on the host.
+    pub fn parse_hf_continuation(
+        &self,
+        codestream: &[u8],
+        group: &BoundedVarDctGroupPlan,
+        lf_entropy_end: u32,
+    ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
+        if lf_entropy_end < group.lf_entropy_bit_offset {
+            return Err(BoundedVarDctPacketError::HfContinuationBeforeLf {
+                cursor: lf_entropy_end,
+                lf_start: group.lf_entropy_bit_offset,
+            });
+        }
+        let packet_end =
+            group
+                .lf_group
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-group end",
+                })?;
+        let prefix = parse_hf_metadata_header_prefix(
+            codestream,
+            u64::from(lf_entropy_end),
+            packet_end,
+            group.rect.width,
+            group.rect.height,
+        )?;
+        let (config, token_bit_offset) = if prefix.modular.use_global_tree {
+            (
+                self.global_ma_config.clone().ok_or(
+                    BoundedVarDctPacketError::MissingGlobalMaTree {
+                        stage: "HF metadata",
+                    },
+                )?,
+                prefix.modular.tree_or_token_bit_offset,
+            )
+        } else {
+            parse_ma_config_at(
+                codestream,
+                prefix.modular.tree_or_token_bit_offset,
+                packet_end,
+            )?
+        };
+        let correlation_samples = group.correlation_samples()?;
+        let block_count = prefix.block_width.checked_mul(prefix.block_height).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF metadata block count",
+            },
+        )?;
+        let decoded_symbol_limit = correlation_samples
+            .checked_mul(2)
+            .and_then(|samples| {
+                prefix
+                    .block_count
+                    .checked_mul(2)
+                    .and_then(|tasks| samples.checked_add(tasks))
+            })
+            .and_then(|samples| samples.checked_add(block_count))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF metadata decoded symbol limit",
+            })?;
+        let distance_multiplier = prefix
+            .block_width
+            .max(prefix.block_count)
+            .max(group.rect.width.div_ceil(64))
+            .max(1);
+        Ok(BoundedHfMetadataContinuation {
+            token_bit_offset: u32::try_from(token_bit_offset).map_err(|_| {
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF metadata entropy bit offset",
+                }
+            })?,
+            block_count: prefix.block_count,
+            modular: pack_modular_plan(&config, distance_multiplier, decoded_symbol_limit)?,
         })
     }
 }
@@ -539,6 +769,27 @@ impl BoundedVarDctGroupPlan {
             ],
             scratch: [self.predictor_width_capacity()?, 0, 0, 0],
         })
+    }
+
+    pub fn lf_stage_control(
+        &self,
+        packet: &BoundedVarDctPacketPlan,
+    ) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
+        let mut control = self.packet_control(packet)?;
+        control.section_bits[0] = self.lf_entropy_bit_offset;
+        control.quantization[3] = 0;
+        Ok(control)
+    }
+
+    pub fn hf_stage_control(
+        &self,
+        packet: &BoundedVarDctPacketPlan,
+        continuation: &BoundedHfMetadataContinuation,
+    ) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
+        let mut control = self.packet_control(packet)?;
+        control.section_bits[2] = continuation.token_bit_offset;
+        control.quantization[3] = continuation.block_count;
+        Ok(control)
     }
 
     fn predictor_width_capacity(&self) -> Result<u32, BoundedVarDctPacketError> {
@@ -897,6 +1148,38 @@ pub struct VarDctPacketValidation {
 }
 
 impl GpuVarDctPacketStatus {
+    /// Validates the synchronization record produced by the LF-only staging entry point.
+    pub fn validate_lf_stage(
+        self,
+        expected_lf_samples: u32,
+        expected_global_scale: u32,
+        expected_quant_lf: u32,
+        expected_extra_precision: u8,
+    ) -> Result<u32, GpuVarDctPacketError> {
+        match self.code {
+            30 if self.cursor < self.expected_end
+                && self.lf_decoded == expected_lf_samples
+                && self.hf_decoded == 0
+                && self.global_scale == expected_global_scale
+                && self.quant_lf == expected_quant_lf
+                && self.extra_precision == u32::from(expected_extra_precision) =>
+            {
+                Ok(self.cursor)
+            }
+            30 => Err(GpuVarDctPacketError::Entropy {
+                code: self.code,
+                cursor: self.cursor,
+                end: self.expected_end,
+            }),
+            2..=13 => Err(GpuVarDctPacketError::Entropy {
+                code: self.code,
+                cursor: self.cursor,
+                end: self.expected_end,
+            }),
+            code => Err(GpuVarDctPacketError::Unknown { code }),
+        }
+    }
+
     pub fn validate(
         self,
         expected: VarDctPacketValidation,
@@ -969,7 +1252,10 @@ pub struct VarDctPacketBuffers<'a> {
 
 /// Reusable serial control-plane decoder. Image entropy is decoded in WGSL.
 pub struct VarDctPacketPipeline {
-    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    combined: wgpu::ComputePipeline,
+    lf: wgpu::ComputePipeline,
+    hf: wgpu::ComputePipeline,
 }
 
 impl VarDctPacketPipeline {
@@ -980,15 +1266,62 @@ impl VarDctPacketPipeline {
             label: Some("jxl-wgpu bounded VarDCT packet frontend"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("jxl-wgpu bounded VarDCT packet frontend"),
-            layout: None,
-            module: &module,
-            entry_point: Some("decode_vardct_packet"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+        let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("jxl-wgpu VarDCT packet bindings"),
+            entries: &[
+                storage(0, true),
+                storage(1, true),
+                storage(2, false),
+                storage(3, false),
+                storage(4, false),
+                storage(5, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage(7, true),
+            ],
         });
-        Self { pipeline }
+        let staged_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("jxl-wgpu staged VarDCT packet layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |label, entry_point| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&staged_layout),
+                module: &module,
+                entry_point: Some(entry_point),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        Self {
+            layout,
+            combined: pipeline(
+                "jxl-wgpu bounded VarDCT combined packet frontend",
+                "decode_vardct_packet",
+            ),
+            lf: pipeline("jxl-wgpu bounded VarDCT LF frontend", "decode_vardct_lf"),
+            hf: pipeline("jxl-wgpu bounded VarDCT HF frontend", "decode_vardct_hf"),
+        }
     }
 
     pub fn encode(
@@ -997,7 +1330,37 @@ impl VarDctPacketPipeline {
         encoder: &mut wgpu::CommandEncoder,
         buffers: VarDctPacketBuffers<'_>,
     ) {
-        let layout = self.pipeline.get_bind_group_layout(0);
+        self.encode_stage(device, encoder, buffers, &self.combined);
+    }
+
+    /// Records only the LF Modular stream. Its status cursor is the host metadata boundary for a
+    /// subsequent [`Self::encode_hf`] dispatch.
+    pub fn encode_lf(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: VarDctPacketBuffers<'_>,
+    ) {
+        self.encode_stage(device, encoder, buffers, &self.lf);
+    }
+
+    /// Continues from host-packed HF metadata while retaining the resident LF reconstruction.
+    pub fn encode_hf(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: VarDctPacketBuffers<'_>,
+    ) {
+        self.encode_stage(device, encoder, buffers, &self.hf);
+    }
+
+    fn encode_stage(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: VarDctPacketBuffers<'_>,
+        pipeline: &wgpu::ComputePipeline,
+    ) {
         let resources = [
             buffers.codestream,
             buffers.modular_metadata,
@@ -1018,14 +1381,14 @@ impl VarDctPacketPipeline {
             .collect::<Vec<_>>();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jxl-wgpu bounded VarDCT packet bindings"),
-            layout: &layout,
+            layout: &self.layout,
             entries: &entries,
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("jxl-wgpu bounded VarDCT packet frontend"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
