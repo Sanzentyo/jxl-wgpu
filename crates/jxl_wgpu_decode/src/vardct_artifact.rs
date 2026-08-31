@@ -665,7 +665,7 @@ pub struct GpuDispatchIndirectArgs {
 
 /// Uniform consumed by `vardct_artifact.wgsl`.
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct HfMetadataLoweringParams {
     pub dimensions: [u32; 4],
     pub capacities: [u32; 4],
@@ -674,12 +674,14 @@ pub struct HfMetadataLoweringParams {
     pub metadata_offsets: [u32; 4],
     pub source_offsets: [u32; 4],
     pub matrix_offsets: [[u32; 4]; 7],
+    pub dequant_scales: [f32; 4],
 }
 
 impl HfMetadataLoweringParams {
     pub fn new(
         config: &HfMetadataArtifactConfig,
         layout: VarDctArtifactLayout,
+        dequant_scales: [f32; 3],
     ) -> Result<Self, VarDctArtifactError> {
         let groups_per_row = config.blocks_width.div_ceil(config.pass_group_dim_blocks);
         let mut matrix_offsets = [[0u32; 4]; 7];
@@ -724,6 +726,7 @@ impl HfMetadataLoweringParams {
                 config.correlation_stride,
             ],
             matrix_offsets,
+            dequant_scales: [dequant_scales[0], dequant_scales[1], dequant_scales[2], 0.0],
         })
     }
 }
@@ -950,7 +953,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuDispatchIndirectArgs>() == 12);
     assert!(std::mem::size_of::<GpuHfOrderDescriptor>() == 16);
     assert!(std::mem::size_of::<HfCoefficientSinkParams>() == 32);
-    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 208);
+    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 224);
     assert!(std::mem::align_of::<HfMetadataLoweringParams>() == 16);
 };
 

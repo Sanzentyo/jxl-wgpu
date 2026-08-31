@@ -222,9 +222,9 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
             Self::Modular(session) => session
                 .submit_next()
                 .map(|pending| pending.map(WgpuDecodePendingFrame::Modular)),
-            Self::VarDct(session) => session
-                .submit_next()
-                .map(|pending| pending.map(WgpuDecodePendingFrame::VarDct)),
+            Self::VarDct(session) => session.submit_next().map(|pending| {
+                pending.map(|pending| WgpuDecodePendingFrame::VarDct(Box::new(pending)))
+            }),
         }
     }
 }
@@ -232,7 +232,7 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
 /// One submitted frame from either stock GPU coding-mode pipeline.
 pub enum WgpuDecodePendingFrame {
     Modular(WgpuPendingFrame),
-    VarDct(VarDctPendingFrame),
+    VarDct(Box<VarDctPendingFrame>),
 }
 
 impl WgpuDecodePendingFrame {
@@ -261,7 +261,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         match self {
             Self::Modular(pending) => pending.wait(),
-            Self::VarDct(pending) => pending.wait(),
+            Self::VarDct(pending) => (*pending).wait(),
         }
     }
 
@@ -271,7 +271,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
             Self::Modular(pending) => Pin::new(pending).poll_complete(context),
-            Self::VarDct(pending) => Pin::new(pending).poll_complete(context),
+            Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
         }
     }
 }
@@ -286,7 +286,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
             Self::Modular(pending) => Pin::new(pending).poll_complete(context),
-            Self::VarDct(pending) => Pin::new(pending).poll_complete(context),
+            Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
         }
     }
 }

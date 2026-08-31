@@ -108,8 +108,8 @@ impl VarDctResourceLayout {
     }
 
     /// Builds immutable correlation defaults, all normative default dequantization matrices, and
-    /// the AFV basis. Per-task quantization scales are populated by GPU artifact lowering from
-    /// decoded `hf_mul`.
+    /// the AFV basis. Per-task and per-channel quantization scales are populated by GPU artifact
+    /// lowering from decoded `hf_mul` and the frame header.
     pub fn initial_values(self) -> Result<Vec<[f32; 4]>, VarDctResourceError> {
         let mut values = vec![[0.0; 4]; self.vector_count as usize];
         let correlation_end = self.correlation_offset + self.correlation_count;

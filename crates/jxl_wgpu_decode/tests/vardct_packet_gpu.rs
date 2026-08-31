@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::{fs, process::Command};
 
 use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
@@ -13,6 +12,8 @@ use jxl_wgpu_encode::{
     BufferImageSource, VarDctColorEncoding, VarDctEncoder, VarDctStrategy, WgpuContext,
 };
 use wgpu::util::DeviceExt;
+
+mod common;
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -59,44 +60,6 @@ fn black_source(context: &WgpuContext) -> BufferImageSource {
             }),
     );
     BufferImageSource::new(buffer, layout).unwrap()
-}
-
-fn cjxl_local_tree_codestream() -> Option<Vec<u8>> {
-    if Command::new("cjxl").arg("--version").output().is_err() {
-        eprintln!("skipping local-tree VarDCT oracle: cjxl is not installed");
-        return None;
-    }
-    let stem = format!("jxl-wgpu-local-tree-{}", std::process::id());
-    let ppm_path = std::env::temp_dir().join(format!("{stem}.ppm"));
-    let jxl_path = std::env::temp_dir().join(format!("{stem}.jxl"));
-    let width = 2056_u32;
-    let height = 256_u32;
-    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-    ppm.reserve((width * height * 3) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            ppm.extend_from_slice(&[
-                (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8,
-                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
-                (x.wrapping_mul(5) + y.wrapping_mul(17) + (x ^ y)) as u8,
-            ]);
-        }
-    }
-    fs::write(&ppm_path, ppm).unwrap();
-    let output = Command::new("cjxl")
-        .args(["-d", "2", "-e", "7", "--container=0"])
-        .arg(&ppm_path)
-        .arg(&jxl_path)
-        .output()
-        .unwrap();
-    let _ = fs::remove_file(&ppm_path);
-    if !output.status.success() {
-        let _ = fs::remove_file(&jxl_path);
-        panic!("cjxl failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let codestream = fs::read(&jxl_path).unwrap();
-    let _ = fs::remove_file(&jxl_path);
-    Some(codestream)
 }
 
 fn map_statuses(
@@ -263,7 +226,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
 
 #[test]
 fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
-    let Some(codestream) = cjxl_local_tree_codestream() else {
+    let Some(codestream) = common::cjxl_local_tree_codestream() else {
         return;
     };
     let Some((device, queue)) = device() else {

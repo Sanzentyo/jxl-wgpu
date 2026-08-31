@@ -1,5 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, mpsc};
 
 use jxl::api::{
@@ -948,6 +949,123 @@ fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
 #[test]
 fn standard_multiple_lf_groups_share_one_resident_image_and_status_map() {
     assert_multiple_lf_groups(common::testsrc_vardct_multi_lf(), true);
+}
+
+#[test]
+fn ordinary_cjxl_local_trees_complete_through_two_stage_frame_engine() {
+    let Some(encoded) = common::cjxl_local_tree_codestream() else {
+        return;
+    };
+    let Some((info, device, queue)) = device() else {
+        eprintln!("skipping local-tree VarDCT frame oracle: no adapter");
+        return;
+    };
+    let extent = Extent2d::new(2056, 256);
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let vardct = session
+        .submission_session()
+        .vardct()
+        .expect("ordinary cjxl selects the VarDCT submission session");
+    assert_eq!(vardct.submissions_per_frame(), 2);
+    assert!(vardct.memory_stats().deferred_hf_modular_metadata);
+
+    session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(matches!(
+        session
+            .front_pending_frame()
+            .unwrap()
+            .unvalidated_gpu_frame(),
+        Err(DecodeError::VarDct(
+            VarDctDecodeError::UnvalidatedOutputNotSubmitted
+        ))
+    ));
+
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(&encoded, extent);
+    let rust_error = maximum_error(actual, &rust);
+    assert!(
+        rust_error <= 1,
+        "local-tree GPU output diverges from Rust jxl by {rust_error}",
+    );
+    if let Some(djxl) = djxl_ppm(&encoded, extent) {
+        let djxl_error = maximum_error(actual, &djxl);
+        assert!(
+            djxl_error <= 1,
+            "local-tree GPU output diverges from djxl by {djxl_error}",
+        );
+    }
+    drop(readback);
+    drop(frame);
+    drop(session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut async_session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let async_frame = pollster::block_on(async_session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    let async_readback = ImageReadbackPipeline::new(&backend)
+        .submit(async_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(maximum_error(&async_readback.frame.outputs[0].bytes, &rust) <= 1);
+    drop(async_readback);
+    drop(async_frame);
+    drop(async_session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend.device().poll(wgpu::PollType::Poll).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
 #[test]

@@ -121,7 +121,7 @@ fn lower_topology(
         VarDctArtifactDeviceLimits::from_wgpu(&device.limits()),
     )
     .unwrap();
-    let params = HfMetadataLoweringParams::new(&config, layout).unwrap();
+    let params = HfMetadataLoweringParams::new(&config, layout, [0.8, 1.0, 1.0]).unwrap();
     let raw = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("malformed VarDCT topology"),
         contents: bytemuck::cast_slice(&raw),
@@ -246,7 +246,7 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     assert_eq!(std::mem::size_of::<GpuGeneralVarDctTask>(), 64);
     assert_eq!(std::mem::size_of::<GpuHfTaskMetadata>(), 48);
     assert_eq!(std::mem::size_of::<GpuDispatchIndirectArgs>(), 12);
-    assert_eq!(std::mem::size_of::<HfMetadataLoweringParams>(), 208);
+    assert_eq!(std::mem::size_of::<HfMetadataLoweringParams>(), 224);
 }
 
 #[test]
@@ -409,7 +409,8 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
         VarDctArtifactDeviceLimits::from_wgpu(&device.limits()),
     )
     .expect("artifact fits the test adapter");
-    let params = HfMetadataLoweringParams::new(&config, layout).unwrap();
+    let dequant_scales = [0.512, 1.0, 0.32768];
+    let params = HfMetadataLoweringParams::new(&config, layout, dequant_scales).unwrap();
 
     let raw_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("raw HF metadata"),
@@ -444,7 +445,7 @@ fn mixed_odd_tail_lowers_and_custom_order_scatters_without_cpu_readback_boundary
     let resource_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("VarDCT quantization resources"),
         size: u64::from(layout.task_capacity) * 16,
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
@@ -598,7 +599,10 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
 
     let artifact_readback_offset = 0;
     let coefficient_readback_offset = align_256(layout.artifact_bytes);
-    let staging_bytes = coefficient_readback_offset + layout.coefficient_bytes;
+    let resource_readback_offset =
+        align_256(coefficient_readback_offset + layout.coefficient_bytes);
+    let resource_bytes = u64::from(layout.task_capacity) * 16;
+    let staging_bytes = resource_readback_offset + resource_bytes;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("aggregate VarDCT artifact readback"),
         size: staging_bytes,
@@ -644,6 +648,13 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         &staging,
         coefficient_readback_offset,
         layout.coefficient_bytes,
+    );
+    encoder.copy_buffer_to_buffer(
+        &resource_buffer,
+        0,
+        &staging,
+        resource_readback_offset,
+        resource_bytes,
     );
     let submission = queue.submit([encoder.finish()]);
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -769,4 +780,17 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     // Special-transform coefficient buffers use raster order, so coordinate (5, 0) is slot 5.
     assert_eq!(coefficients[576 + 2 * 64 + 5], -7);
     assert_eq!(coefficients.iter().filter(|&&value| value != 0).count(), 3);
+
+    let resources = bytemuck::cast_slice::<u8, [f32; 4]>(
+        &bytes[resource_readback_offset as usize
+            ..(resource_readback_offset + resource_bytes) as usize],
+    );
+    for (actual, hf_mul) in resources[..4].iter().zip([3.0_f32, 5.0, 9.0, 7.0]) {
+        let quant_scale = 65536.0 / (config.global_scale as f32 * hf_mul);
+        for channel in 0..3 {
+            let expected = quant_scale * dequant_scales[channel];
+            assert!((actual[channel] - expected).abs() <= 1.0e-7);
+        }
+        assert_eq!(actual[3], 0.0);
+    }
 }

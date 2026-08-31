@@ -16,8 +16,7 @@ use std::task::{Context, Poll, Waker};
 use jxl_gpu_bitstream::{
     CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
     EdgePreservingFilterInventory, GaborishInventory, InventoryLimits, ParseLimits,
-    PrimariesInventory, RenderingIntentInventory, RestorationFilterInventory,
-    TransferFunctionInventory, WhitePointInventory,
+    PrimariesInventory, RestorationFilterInventory, TransferFunctionInventory, WhitePointInventory,
 };
 use jxl_gpu_formats::{
     ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, ImageLayout,
@@ -86,14 +85,12 @@ pub enum VarDctDecodeError {
     UnsupportedColorEncoding,
     #[error("the VarDCT frame declares invalid EPF iteration count {iterations}")]
     InvalidEpfIterations { iterations: u32 },
-    #[error("the bounded VarDCT engine requires frame quant-matrix scales X=3 and B=2")]
-    UnsupportedQuantMatrixScale,
+    #[error("the VarDCT frame declares invalid {channel} quant-matrix scale {scale}")]
+    InvalidQuantMatrixScale { channel: &'static str, scale: u32 },
     #[error("the XYB image header does not contain an inverse opsin matrix")]
     MissingInverseOpsin,
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
-    #[error("the staged local-MA packet frontend is not yet connected to the frame engine")]
-    LocalMaTreeStagingNotIntegrated,
     #[error(transparent)]
     Packet(#[from] BoundedVarDctPacketError),
     #[error(transparent)]
@@ -144,6 +141,10 @@ pub enum VarDctDecodeError {
     },
     #[error("VarDCT GPU completion was consumed more than once")]
     CompletionConsumed,
+    #[error(
+        "unvalidated VarDCT output is unavailable until the local-tree HF submission is queued"
+    )]
+    UnvalidatedOutputNotSubmitted,
     #[error("VarDCT kernel '{kernel}' configuration failed: {message}")]
     KernelPolicy {
         kernel: &'static str,
@@ -172,6 +173,10 @@ pub fn vardct_rgb8_format() -> PixelFormat {
 pub struct VarDctDecodeMemoryStats {
     pub codestream_bytes: u64,
     pub modular_metadata_bytes: u64,
+    /// True when HF-local metadata size is discovered after the LF cursor map. The initial
+    /// reservation covers all LF-local metadata; a larger HF peak is admitted through the same
+    /// shared byte budget before the second submission.
+    pub deferred_hf_modular_metadata: bool,
     pub reconstructed_bytes: u64,
     pub raw_metadata_bytes: u64,
     pub coefficient_bytes: u64,
@@ -243,19 +248,33 @@ impl VarDctDecodeMemoryStats {
                 field: "codestream upload length",
             }
         })?)?;
-        let modular_metadata_bytes = checked_words(
+        let modular_metadata_words = if packet.requires_local_tree_staging() {
+            packet.groups.iter().try_fold(0_u64, |total, group| {
+                let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-local Modular metadata length",
+                    }
+                })?;
+                total
+                    .checked_add(words)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-local Modular metadata words",
+                    })
+            })?
+        } else {
             u64::try_from(packet.modular_metadata.len()).map_err(|_| {
                 VarDctDecodeError::ArithmeticOverflow {
                     field: "Modular metadata length",
                 }
-            })?,
-            "Modular metadata bytes",
-        )?;
+            })?
+        };
+        let modular_metadata_bytes =
+            checked_words(modular_metadata_words, "Modular metadata bytes")?;
+        let predictor_capacity =
+            packet.needs_self_correcting || packet.requires_local_tree_staging();
         let mut reconstructed_words = Vec::with_capacity(packet.groups.len());
         for group in &packet.groups {
-            reconstructed_words.push(u64::from(
-                group.reconstructed_words(packet.needs_self_correcting)?,
-            ));
+            reconstructed_words.push(u64::from(group.reconstructed_words(predictor_capacity)?));
         }
         let reconstructed_bytes = checked_words(
             checked_sum(reconstructed_words, "LF reconstruction word total")?,
@@ -473,6 +492,7 @@ impl VarDctDecodeMemoryStats {
         Ok(Self {
             codestream_bytes,
             modular_metadata_bytes,
+            deferred_hf_modular_metadata: packet.requires_local_tree_staging(),
             reconstructed_bytes,
             raw_metadata_bytes,
             coefficient_bytes,
@@ -645,6 +665,7 @@ impl VarDctSubmissionEngine {
                 backend: self.backend.clone(),
                 pipelines: Arc::clone(&self.pipelines),
                 memory_stats: source.memory,
+                submissions_per_frame: usize::from(source.packet.requires_local_tree_staging()) + 1,
                 source: Some(source),
                 memory: self.memory.clone(),
             },
@@ -818,7 +839,7 @@ fn prepare_source(
             white_point: WhitePointInventory::D65,
             primaries: PrimariesInventory::Srgb,
             transfer_function: TransferFunctionInventory::Srgb,
-            rendering_intent: RenderingIntentInventory::Relative,
+            rendering_intent: _,
         }
     ) {
         return Err(VarDctDecodeError::UnsupportedColorEncoding);
@@ -828,13 +849,13 @@ fn prepare_source(
         .first()
         .ok_or(VarDctDecodeError::MissingFrame)?;
     let (gaborish, epf_header) = restoration_config(frame.restoration_filter)?;
-    if frame.x_qm_scale != 3 || frame.b_qm_scale != 2 {
-        return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
-    }
+    let dequant_channel_scales = [
+        dequant_matrix_multiplier("X", frame.x_qm_scale)?,
+        1.0,
+        dequant_matrix_multiplier("B", frame.b_qm_scale)?,
+    ];
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
-    if packet.requires_local_tree_staging() {
-        return Err(VarDctDecodeError::LocalMaTreeStagingNotIntegrated);
-    }
+    let staged_local_trees = packet.requires_local_tree_staging();
     let [blocks_x, blocks_y] = packet.block_extent();
     let resource_layout =
         VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;
@@ -847,7 +868,11 @@ fn prepare_source(
     let mut quant_offset = resource_layout.quant_offset;
     let mut groups = Vec::with_capacity(packet.groups.len());
     for packet_group in &packet.groups {
-        let control = packet_group.packet_control(&packet)?;
+        let control = if staged_local_trees {
+            packet_group.lf_stage_control(&packet)?
+        } else {
+            packet_group.packet_control(&packet)?
+        };
         let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
         let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
         let resource_params = VarDctResourceParams::new(
@@ -892,7 +917,11 @@ fn prepare_source(
             &artifact_config,
             VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
         )?;
-        let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
+        let artifact_params = HfMetadataLoweringParams::new(
+            &artifact_config,
+            artifact_layout,
+            dequant_channel_scales,
+        )?;
         groups.push(VarDctGroupSource {
             control,
             resource_params,
@@ -1002,6 +1031,15 @@ fn prepare_source(
     })
 }
 
+fn dequant_matrix_multiplier(channel: &'static str, scale: u32) -> Result<f32, VarDctDecodeError> {
+    // JPEG XL 3-bit X/B quant-matrix scale: (1 / 1.25)^(scale - 2).
+    const MULTIPLIERS: [f32; 8] = [1.5625, 1.25, 1.0, 0.8, 0.64, 0.512, 0.4096, 0.32768];
+    MULTIPLIERS
+        .get(scale as usize)
+        .copied()
+        .ok_or(VarDctDecodeError::InvalidQuantMatrixScale { channel, scale })
+}
+
 fn restoration_config(
     restoration: RestorationFilterInventory,
 ) -> Result<(Option<ResidentGaborishWeights>, Option<VarDctEpfHeader>), VarDctDecodeError> {
@@ -1091,9 +1129,10 @@ fn validate_device_limits(
             actual: 0,
         });
     }
+    let predictor_capacity = packet.needs_self_correcting || packet.requires_local_tree_staging();
     let mut reconstruction_storage_bytes = 0_u64;
     for (index, group) in packet.groups.iter().enumerate() {
-        let reconstruction = u64::from(group.reconstructed_words(packet.needs_self_correcting)?)
+        let reconstruction = u64::from(group.reconstructed_words(predictor_capacity)?)
             .checked_mul(4)
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "LF-group reconstruction binding bytes",
@@ -1151,9 +1190,19 @@ fn validate_device_limits(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
+    let modular_metadata_binding_bytes = if packet.requires_local_tree_staging() {
+        packet
+            .groups
+            .iter()
+            .map(|group| group.lf_modular.metadata.len() as u64 * 4)
+            .max()
+            .unwrap_or(0)
+    } else {
+        memory.modular_metadata_bytes
+    };
     for (resource, required, storage) in [
         ("codestream upload", memory.codestream_bytes, true),
-        ("Modular metadata", memory.modular_metadata_bytes, true),
+        ("Modular metadata", modular_metadata_binding_bytes, true),
         (
             "LF reconstruction and HF LZ77 storage",
             reconstruction_storage_bytes,
@@ -1273,6 +1322,7 @@ pub struct VarDctDecodeSession {
     backend: WgpuBackend,
     pipelines: Arc<VarDctPipelines>,
     memory_stats: VarDctDecodeMemoryStats,
+    submissions_per_frame: usize,
     source: Option<VarDctSource>,
     memory: MemoryBudget,
 }
@@ -1288,10 +1338,9 @@ impl VarDctDecodeSession {
         self.memory.snapshot()
     }
 
-    /// All VarDCT compute phases and validation copies are recorded into one queue submission.
     #[must_use]
     pub const fn submissions_per_frame(&self) -> usize {
-        1
+        self.submissions_per_frame
     }
 }
 
@@ -1320,9 +1369,14 @@ impl GpuSubmissionSession for VarDctDecodeSession {
             .map_err(DecodeError::PollBackpressure)?;
         let output_permit = self.memory.try_reserve(source.memory.output_lease_bytes)?;
         let transient_permit = self.memory.try_reserve(source.memory.transient_bytes)?;
+        let source = self
+            .source
+            .take()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
         let pending = submit_vardct(
             &self.backend,
-            &self.pipelines,
+            Arc::clone(&self.pipelines),
+            self.memory.clone(),
             source,
             VarDctMemoryPermits {
                 output: output_permit,
@@ -1330,7 +1384,6 @@ impl GpuSubmissionSession for VarDctDecodeSession {
             },
             poll_permit,
         )?;
-        self.source = None;
         Ok(Some(pending))
     }
 }
@@ -1410,9 +1463,9 @@ struct VarDctJobLifetime {
     output: GpuBufferLease,
     status_staging: wgpu::Buffer,
     status_mapped: AtomicBool,
-    _transient_permit: MemoryPermit,
+    _transient_permits: Mutex<Vec<MemoryPermit>>,
     _codestream: wgpu::Buffer,
-    _modular_metadata: wgpu::Buffer,
+    _modular_metadata: Mutex<Vec<wgpu::Buffer>>,
     _groups: Vec<VarDctGroupJobBuffers>,
     _lf_temporary: wgpu::Buffer,
     _resources: wgpu::Buffer,
@@ -1448,14 +1501,27 @@ struct VarDctGroupValidation {
 
 /// Submitted VarDCT frame awaiting one aggregate map of every LF/pass-group status record.
 pub struct VarDctPendingFrame {
-    device: wgpu::Device,
+    backend: WgpuBackend,
+    pipelines: Arc<VarDctPipelines>,
+    memory: MemoryBudget,
     lifetime: Option<Arc<VarDctJobLifetime>>,
-    completion: Arc<MapCompletion>,
+    stage: VarDctPendingStage,
     token: SubmissionToken,
     layout: ImageLayout,
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
     expected_hf_group_indices: Vec<u32>,
+}
+
+enum VarDctPendingStage {
+    LocalLf {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+        downstream: Option<wgpu::CommandBuffer>,
+    },
+    Final {
+        completion: Arc<MapCompletion>,
+    },
 }
 
 impl std::fmt::Debug for VarDctPendingFrame {
@@ -1465,6 +1531,13 @@ impl std::fmt::Debug for VarDctPendingFrame {
             .field("token", &self.token)
             .field("layout", &self.layout)
             .field("lf_group_count", &self.expected_groups.len())
+            .field(
+                "stage",
+                &match &self.stage {
+                    VarDctPendingStage::LocalLf { .. } => "local-lf",
+                    VarDctPendingStage::Final { .. } => "final",
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1472,6 +1545,9 @@ impl std::fmt::Debug for VarDctPendingFrame {
 impl VarDctPendingFrame {
     /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
     pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
+        if matches!(self.stage, VarDctPendingStage::LocalLf { .. }) {
+            return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted.into());
+        }
         let lifetime = self
             .lifetime
             .as_ref()
@@ -1484,6 +1560,212 @@ impl VarDctPendingFrame {
                 buffer: lifetime.output.clone(),
             }],
         })
+    }
+
+    fn stage_completion(&self) -> Arc<MapCompletion> {
+        match &self.stage {
+            VarDctPendingStage::LocalLf { completion, .. }
+            | VarDctPendingStage::Final { completion } => Arc::clone(completion),
+        }
+    }
+
+    fn take_local_stage(&mut self) -> Option<(Box<VarDctSource>, wgpu::CommandBuffer)> {
+        let placeholder = VarDctPendingStage::Final {
+            completion: Arc::new(MapCompletion::default()),
+        };
+        let stage = std::mem::replace(&mut self.stage, placeholder);
+        match stage {
+            VarDctPendingStage::LocalLf {
+                source,
+                mut downstream,
+                ..
+            } => downstream.take().map(|commands| (source, commands)),
+            final_stage @ VarDctPendingStage::Final { .. } => {
+                self.stage = final_stage;
+                None
+            }
+        }
+    }
+
+    fn submit_hf_stage(
+        &mut self,
+        mapping: Result<(), String>,
+        source: Box<VarDctSource>,
+        downstream: wgpu::CommandBuffer,
+    ) -> DecodeResult<()> {
+        mapping.map_err(DecodeError::backend)?;
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        let mapped = lifetime
+            .status_staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(DecodeError::backend)?;
+        let mut cursors = Vec::with_capacity(self.expected_groups.len());
+        for (index, expected) in self.expected_groups.iter().enumerate() {
+            let offset = index.checked_mul(PACKET_STATUS_BYTES as usize).ok_or(
+                VarDctDecodeError::StatusAbi {
+                    status: "LF cursor offset",
+                },
+            )?;
+            let status: GpuVarDctPacketStatus = mapped
+                .get(offset..offset + PACKET_STATUS_BYTES as usize)
+                .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+                .ok_or(VarDctDecodeError::StatusAbi {
+                    status: "LF cursor",
+                })?;
+            cursors.push(
+                status
+                    .validate_lf_stage(
+                        expected.expected_lf_samples,
+                        expected.expected_global_scale,
+                        expected.expected_quant_lf,
+                        expected.expected_extra_precision,
+                    )
+                    .map_err(VarDctDecodeError::from)?,
+            );
+        }
+        drop(mapped);
+        lifetime.status_staging.unmap();
+        lifetime.status_mapped.store(false, Ordering::Release);
+
+        let codestream = source
+            .codestream_storage
+            .get(source.codestream_range.clone())
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "staged codestream storage range",
+            })?;
+        let continuations = source
+            .packet
+            .groups
+            .iter()
+            .zip(cursors)
+            .map(|(group, cursor)| {
+                source
+                    .packet
+                    .parse_hf_continuation(codestream, group, cursor)
+                    .map_err(VarDctDecodeError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let hf_metadata_bytes = continuations
+            .iter()
+            .try_fold(0_u64, |total, continuation| {
+                let words = u64::try_from(continuation.modular.metadata.len()).map_err(|_| {
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF-local Modular metadata length",
+                    }
+                })?;
+                total
+                    .checked_add(words.checked_mul(4).ok_or(
+                        VarDctDecodeError::ArithmeticOverflow {
+                            field: "HF-local Modular metadata bytes",
+                        },
+                    )?)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF-local Modular metadata total",
+                    })
+            })?;
+        let additional_permit = hf_metadata_bytes
+            .checked_sub(source.memory.modular_metadata_bytes)
+            .filter(|&bytes| bytes != 0)
+            .map(|bytes| self.memory.try_reserve(bytes))
+            .transpose()?;
+        let limits = self.backend.device().limits();
+        for continuation in &continuations {
+            let bytes = u64::try_from(continuation.modular.metadata.len())
+                .ok()
+                .and_then(|words| words.checked_mul(4))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "HF-local Modular metadata binding",
+                })?;
+            check_limit("HF-local Modular metadata", bytes, limits.max_buffer_size)?;
+            check_limit(
+                "HF-local Modular metadata",
+                bytes,
+                limits.max_storage_buffer_binding_size,
+            )?;
+        }
+        let poll_permit = self
+            .backend
+            .submission_poller()
+            .try_reserve()
+            .map_err(DecodeError::PollBackpressure)?;
+        let device = self.backend.device();
+        lock_unpoisoned(&lifetime._modular_metadata).clear();
+        let mut metadata_buffers = Vec::with_capacity(continuations.len());
+        for continuation in &continuations {
+            metadata_buffers.push(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu VarDCT HF-local Modular metadata"),
+                    contents: bytemuck::cast_slice(&continuation.modular.metadata),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+            );
+        }
+        {
+            let mut retained = lock_unpoisoned(&lifetime._modular_metadata);
+            retained.extend(metadata_buffers.iter().cloned());
+        }
+        if let Some(permit) = additional_permit {
+            lock_unpoisoned(&lifetime._transient_permits).push(permit);
+        }
+        let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu bounded VarDCT HF-local stage"),
+        });
+        for ((((packet_group, group), buffers), continuation), metadata) in source
+            .packet
+            .groups
+            .iter()
+            .zip(&source.groups)
+            .zip(&lifetime._groups)
+            .zip(&continuations)
+            .zip(&metadata_buffers)
+        {
+            let control = packet_group
+                .hf_stage_control(&source.packet, continuation)
+                .map_err(VarDctDecodeError::from)?;
+            let params = VarDctModularParams::default()
+                .with_lz77_window(continuation.modular.lz77_window_words)
+                .with_self_correcting(continuation.modular.needs_self_correcting);
+            self.backend.queue().write_buffer(
+                &buffers.packet_control,
+                0,
+                bytemuck::bytes_of(&control),
+            );
+            self.backend.queue().write_buffer(
+                &buffers.modular_params,
+                0,
+                bytemuck::bytes_of(&params),
+            );
+            self.pipelines.packet.encode_hf(
+                device,
+                &mut commands,
+                VarDctPacketBuffers {
+                    codestream: &lifetime._codestream,
+                    modular_metadata: metadata,
+                    reconstructed_lf: &buffers.reconstructed,
+                    raw_hf_metadata: &buffers.raw_metadata,
+                    coefficients: &buffers.coefficients,
+                    status: &buffers.packet_status,
+                    control: &buffers.packet_control,
+                    modular_params: &buffers.modular_params,
+                },
+            );
+            debug_assert_eq!(group.control.geometry, control.geometry);
+        }
+        let completion = Arc::new(MapCompletion::default());
+        let submission = self.backend.queue().submit([commands.finish(), downstream]);
+        arm_status_map(lifetime, &completion, "VarDCT final validation mapping");
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission, move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
+        }
+        self.stage = VarDctPendingStage::Final { completion };
+        Ok(())
     }
 
     fn finish(
@@ -1640,20 +1922,34 @@ impl GpuPendingFrame for VarDctPendingFrame {
     type Frame = GpuImageFrame;
 
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
-        let mapping = self.completion.wait();
-        self.finish(mapping)
+        loop {
+            let mapping = self.stage_completion().wait();
+            if let Some((source, downstream)) = self.take_local_stage() {
+                self.submit_hf_stage(mapping, source, downstream)?;
+            } else {
+                return self.finish(mapping);
+            }
+        }
     }
 
     fn poll_complete(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
-        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
-            return Poll::Ready(Err(DecodeError::backend(error)));
-        }
-        match self.completion.poll(context) {
-            Some(mapping) => Poll::Ready(self.finish(mapping)),
-            None => Poll::Pending,
+        loop {
+            if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
+                return Poll::Ready(Err(DecodeError::backend(error)));
+            }
+            let Some(mapping) = self.stage_completion().poll(context) else {
+                return Poll::Pending;
+            };
+            if let Some((source, downstream)) = self.take_local_stage() {
+                if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                    return Poll::Ready(Err(error));
+                }
+            } else {
+                return Poll::Ready(self.finish(mapping));
+            }
         }
     }
 }
@@ -1666,12 +1962,20 @@ impl GpuPendingFrame for VarDctPendingFrame {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
-        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
-            return Poll::Ready(Err(DecodeError::backend(error)));
-        }
-        match self.completion.poll(context) {
-            Some(mapping) => Poll::Ready(self.finish(mapping)),
-            None => Poll::Pending,
+        loop {
+            if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
+                return Poll::Ready(Err(DecodeError::backend(error)));
+            }
+            let Some(mapping) = self.stage_completion().poll(context) else {
+                return Poll::Pending;
+            };
+            if let Some((source, downstream)) = self.take_local_stage() {
+                if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                    return Poll::Ready(Err(error));
+                }
+            } else {
+                return Poll::Ready(self.finish(mapping));
+            }
         }
     }
 }
@@ -1712,8 +2016,9 @@ fn resident_image_planes<'a>(
 
 fn submit_vardct(
     backend: &WgpuBackend,
-    pipelines: &VarDctPipelines,
-    source: &VarDctSource,
+    pipelines: Arc<VarDctPipelines>,
+    memory: MemoryBudget,
+    source: VarDctSource,
     permits: VarDctMemoryPermits,
     poll_permit: SubmissionPollPermit,
 ) -> Result<VarDctPendingFrame, VarDctDecodeError> {
@@ -1737,11 +2042,29 @@ fn submit_vardct(
         contents: &upload,
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let modular_metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT Modular metadata"),
-        contents: bytemuck::cast_slice(&source.packet.modular_metadata),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let staged_local_trees = source.packet.requires_local_tree_staging();
+    let modular_metadata = if staged_local_trees {
+        source
+            .packet
+            .groups
+            .iter()
+            .map(|group| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu VarDCT LF-local Modular metadata"),
+                    contents: bytemuck::cast_slice(&group.lf_modular.metadata),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("jxl-wgpu VarDCT global Modular metadata"),
+                contents: bytemuck::cast_slice(&source.packet.modular_metadata),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+        ]
+    };
     let storage = |label: &'static str, size: u64, extra: wgpu::BufferUsages| {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -1770,12 +2093,12 @@ fn submit_vardct(
     for (index, (packet_group, group)) in
         source.packet.groups.iter().zip(&source.groups).enumerate()
     {
-        let reconstructed_bytes =
-            u64::from(packet_group.reconstructed_words(source.packet.needs_self_correcting)?)
-                .checked_mul(4)
-                .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "LF-group reconstruction bytes",
-                })?;
+        let predictor_capacity = source.packet.needs_self_correcting || staged_local_trees;
+        let reconstructed_bytes = u64::from(packet_group.reconstructed_words(predictor_capacity)?)
+            .checked_mul(4)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group reconstruction bytes",
+            })?;
         let hf_lz77_bytes = source
             .hf_coefficients
             .as_ref()
@@ -1808,15 +2131,24 @@ fn submit_vardct(
         let packet_control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu VarDCT LF-group packet control"),
             contents: bytemuck::bytes_of(&group.control),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let modular = &packet_group.lf_modular;
         let params = VarDctModularParams::default()
-            .with_lz77_window(packet_group.lz77_window_words)
-            .with_self_correcting(source.packet.needs_self_correcting);
+            .with_lz77_window(if staged_local_trees {
+                modular.lz77_window_words
+            } else {
+                packet_group.lz77_window_words
+            })
+            .with_self_correcting(if staged_local_trees {
+                modular.needs_self_correcting
+            } else {
+                source.packet.needs_self_correcting
+            });
         let modular_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu VarDCT LF-group Modular params"),
             contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let artifact = storage(
             "jxl-wgpu VarDCT LF-group resident artifact",
@@ -1935,8 +2267,8 @@ fn submit_vardct(
         mapped_at_creation: false,
     });
 
-    let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("jxl-wgpu bounded VarDCT decode"),
+    let mut packet_commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("jxl-wgpu bounded VarDCT packet stage"),
     });
     for buffer in [
         &lf_temporary,
@@ -1945,7 +2277,7 @@ fn submit_vardct(
         &xyb_planes[2],
         output.as_ref(),
     ] {
-        commands.clear_buffer(buffer, 0, None);
+        packet_commands.clear_buffer(buffer, 0, None);
     }
     for group in &group_buffers {
         for buffer in [
@@ -1956,33 +2288,80 @@ fn submit_vardct(
             &group.artifact,
             &group.occupancy,
         ] {
-            commands.clear_buffer(buffer, 0, None);
+            packet_commands.clear_buffer(buffer, 0, None);
         }
     }
     if let Some(buffers) = &hf_coefficient_buffers {
         for group in &buffers.groups {
-            commands.clear_buffer(&group.status, 0, None);
+            packet_commands.clear_buffer(&group.status, 0, None);
         }
     }
     if let Some(sigma) = &epf_sigma {
-        commands.clear_buffer(sigma, 0, None);
+        packet_commands.clear_buffer(sigma, 0, None);
     }
+    for (index, buffers) in group_buffers.iter().enumerate() {
+        let metadata = if staged_local_trees {
+            modular_metadata
+                .get(index)
+                .ok_or(VarDctDecodeError::GroupPlanCount {
+                    component: "LF-local Modular metadata",
+                    expected: group_buffers.len(),
+                    actual: modular_metadata.len(),
+                })?
+        } else {
+            modular_metadata
+                .first()
+                .ok_or(VarDctDecodeError::GroupPlanCount {
+                    component: "global Modular metadata",
+                    expected: 1,
+                    actual: 0,
+                })?
+        };
+        let buffers = VarDctPacketBuffers {
+            codestream: &codestream_buffer,
+            modular_metadata: metadata,
+            reconstructed_lf: &buffers.reconstructed,
+            raw_hf_metadata: &buffers.raw_metadata,
+            coefficients: &buffers.coefficients,
+            status: &buffers.packet_status,
+            control: &buffers.packet_control,
+            modular_params: &buffers.modular_params,
+        };
+        if staged_local_trees {
+            pipelines
+                .packet
+                .encode_lf(device, &mut packet_commands, buffers);
+        } else {
+            pipelines
+                .packet
+                .encode(device, &mut packet_commands, buffers);
+        }
+    }
+    if staged_local_trees {
+        for (index, buffers) in group_buffers.iter().enumerate() {
+            packet_commands.copy_buffer_to_buffer(
+                &buffers.packet_status,
+                0,
+                &status_staging,
+                u64::try_from(index).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF staging status index",
+                })? * PACKET_STATUS_BYTES,
+                PACKET_STATUS_BYTES,
+            );
+        }
+    }
+    let (lf_stage_commands, mut commands) = if staged_local_trees {
+        (
+            Some(packet_commands.finish()),
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu bounded VarDCT downstream stage"),
+            }),
+        )
+    } else {
+        (None, packet_commands)
+    };
     let mut resource_uniforms = Vec::with_capacity(source.groups.len());
     for (group, buffers) in source.groups.iter().zip(&group_buffers) {
-        pipelines.packet.encode(
-            device,
-            &mut commands,
-            VarDctPacketBuffers {
-                codestream: &codestream_buffer,
-                modular_metadata: &modular_metadata,
-                reconstructed_lf: &buffers.reconstructed,
-                raw_hf_metadata: &buffers.raw_metadata,
-                coefficients: &buffers.coefficients,
-                status: &buffers.packet_status,
-                control: &buffers.packet_control,
-                modular_params: &buffers.modular_params,
-            },
-        );
         resource_uniforms.push(pipelines.resource.encode(
             device,
             &mut commands,
@@ -2305,14 +2684,14 @@ fn submit_vardct(
         debug_assert_eq!(offset, source.memory.validation_staging_bytes);
     }
 
-    let completion = Arc::new(MapCompletion::default());
+    let downstream_commands = commands.finish();
     let lifetime = Arc::new(VarDctJobLifetime {
         output: GpuBufferLease::from_tracked(output.as_ref().clone(), permits.output),
         status_staging,
         status_mapped: AtomicBool::new(false),
-        _transient_permit: permits.transient,
+        _transient_permits: Mutex::new(vec![permits.transient]),
         _codestream: codestream_buffer,
-        _modular_metadata: modular_metadata,
+        _modular_metadata: Mutex::new(modular_metadata),
         _groups: group_buffers,
         _lf_temporary: lf_temporary,
         _resources: resources,
@@ -2324,25 +2703,22 @@ fn submit_vardct(
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
-    let callback_lifetime = Arc::clone(&lifetime);
-    let callback_completion = Arc::clone(&completion);
-    commands.map_buffer_on_submit(
-        &lifetime.status_staging,
-        wgpu::MapMode::Read,
-        ..,
-        move |result| {
-            if result.is_ok() {
-                callback_lifetime
-                    .status_mapped
-                    .store(true, Ordering::Release);
-            }
-            drop(callback_lifetime);
-            callback_completion.complete(
-                result.map_err(|error| format!("VarDCT validation mapping failed: {error}")),
-            );
+    let completion = Arc::new(MapCompletion::default());
+    let (submitted_commands, downstream) = if let Some(lf_stage_commands) = lf_stage_commands {
+        (lf_stage_commands, Some(downstream_commands))
+    } else {
+        (downstream_commands, None)
+    };
+    let submission = backend.queue().submit([submitted_commands]);
+    arm_status_map(
+        &lifetime,
+        &completion,
+        if staged_local_trees {
+            "VarDCT LF cursor mapping"
+        } else {
+            "VarDCT validation mapping"
         },
     );
-    let submission = backend.queue().submit([commands.finish()]);
     let poll_completion = Arc::clone(&completion);
     if let Err(error) = poll_permit.register(submission, move |error| {
         poll_completion.complete(Err(error));
@@ -2387,16 +2763,50 @@ fn submit_vardct(
         .flat_map(|plan| &plan.groups)
         .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
         .collect();
+    let layout = source.layout.clone();
+    let frame_name = source.frame_name.clone();
+    let stage = if let Some(downstream) = downstream {
+        VarDctPendingStage::LocalLf {
+            completion,
+            source: Box::new(source),
+            downstream: Some(downstream),
+        }
+    } else {
+        VarDctPendingStage::Final { completion }
+    };
     Ok(VarDctPendingFrame {
-        device: device.clone(),
+        backend: backend.clone(),
+        pipelines,
+        memory,
         lifetime: Some(lifetime),
-        completion,
+        stage,
         token: SubmissionToken(1),
-        layout: source.layout.clone(),
-        frame_name: source.frame_name.clone(),
+        layout,
+        frame_name,
         expected_groups,
         expected_hf_group_indices,
     })
+}
+
+fn arm_status_map(
+    lifetime: &Arc<VarDctJobLifetime>,
+    completion: &Arc<MapCompletion>,
+    stage: &'static str,
+) {
+    let callback_lifetime = Arc::clone(lifetime);
+    let callback_completion = Arc::clone(completion);
+    lifetime
+        .status_staging
+        .map_async(wgpu::MapMode::Read, .., move |result| {
+            if result.is_ok() {
+                callback_lifetime
+                    .status_mapped
+                    .store(true, Ordering::Release);
+            }
+            drop(callback_lifetime);
+            callback_completion
+                .complete(result.map_err(|error| format!("{stage} failed: {error}")));
+        });
 }
 
 #[derive(Default)]
@@ -2469,6 +2879,24 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quant_matrix_scales_cover_all_wire_values_and_reject_out_of_range() {
+        let expected = [1.5625, 1.25, 1.0, 0.8, 0.64, 0.512, 0.4096, 0.32768];
+        for (scale, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                dequant_matrix_multiplier("X", scale as u32).unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            dequant_matrix_multiplier("B", 8),
+            Err(VarDctDecodeError::InvalidQuantMatrixScale {
+                channel: "B",
+                scale: 8
+            })
+        ));
+    }
 
     #[test]
     fn restoration_contract_rejects_invalid_epf_iterations() {

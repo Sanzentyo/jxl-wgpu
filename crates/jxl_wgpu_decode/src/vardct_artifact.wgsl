@@ -6,6 +6,7 @@ struct Params {
     metadata_offsets: vec4<u32>,
     source_offsets: vec4<u32>,
     matrix_offsets: array<vec4<u32>, 7>,
+    dequant_scales: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> raw_metadata: array<i32>;
@@ -234,9 +235,7 @@ fn write_task(
     artifact[params.metadata_offsets.y + raster_index] = task_index + 1u;
     let quant_scale = 65536.0 / (f32(params.source_offsets.z) * f32(hf_mul));
     resources[params.metadata_offsets.z + task_index] = vec4<f32>(
-        0.8 * quant_scale,
-        quant_scale,
-        quant_scale,
+        params.dequant_scales.xyz * quant_scale,
         0.0,
     );
 }
