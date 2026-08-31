@@ -42,6 +42,19 @@ cjxl /tmp/green_queen.png green_queen_vardct_nonzero_ac.jxl -d 2 -e 1 -m 0 \
   --resampling=1 --gaborish=0 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
 ```
 
+`crates/jxl_wgpu_decode/test-data/green_queen_vardct_gaborish.jxl.hex` uses the same decoded source
+and encoder settings, but enables the standard Gaborish weights while leaving EPF disabled. Its
+binary SHA-256 is `9b934f7367787132eb44e16698b5c0deb8f884f9bcfabe10a2a36c4c47941feb`.
+The actual-adapter test verifies the parsed restoration inventory, executes inverse VarDCT,
+resident Gaborish, and RGB8 packing in one GPU submission, and accepts at most one code of
+difference from Rust `jxl` and optional `djxl`. It is reproduced with:
+
+```text
+djxl fixtures/green_queen_vardct_e3.jxl /tmp/green_queen.png
+cjxl /tmp/green_queen.png green_queen_vardct_gaborish.jxl -d 2 -e 1 -m 0 \
+  --resampling=1 --gaborish=1 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
+```
+
 ## Deterministic source contract
 
 Every case describes:

@@ -313,6 +313,12 @@ The current planner and scheduler execute these protocol stages:
   and generic image packing; and
 - direct generic-image and RGBA display conversion.
 
+`ResidentGaborishPipeline` is also the stock VarDCT decoder's direct restoration boundary. It
+accepts six checked, non-aliasing `ResidentF32Plane` bindings, normalizes serialized per-channel
+weights on the host, and records the fused XYB dispatch without coefficient or pixel readback.
+The decoder retains its three destination planes and 80-byte `Pod` uniform through aggregate
+status validation and charges both to the shared frame budget.
+
 The backend validates precision contracts, node arity, plane types/extents/strides, resource
 revisions, transform coverage, dispatch dimensions, shader-visible addresses, and device limits
 before submission. Unsupported render operations, explicit streaming execution, invalid color

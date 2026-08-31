@@ -34,6 +34,7 @@ mod pipeline_cache;
 mod planner;
 mod poller;
 mod readback;
+mod resident_gaborish;
 mod resident_vardct;
 mod scheduler;
 mod session;
@@ -74,9 +75,13 @@ pub use readback::{
     ImageReadbackMapping, ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats,
     ImageReadbackSubmission, UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
 };
+pub use resident_gaborish::{
+    ResidentGaborishError, ResidentGaborishInputs, ResidentGaborishMemoryPlan,
+    ResidentGaborishPipeline, ResidentGaborishWeights,
+};
 pub use resident_vardct::{
-    ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs, ResidentVarDctMemoryPlan,
-    ResidentVarDctOutputPlane, ResidentVarDctRenderConfig, ResidentVarDctRenderer,
+    ResidentF32Plane, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
+    ResidentVarDctMemoryPlan, ResidentVarDctRenderConfig, ResidentVarDctRenderer,
     ResidentVarDctScratch,
 };
 pub use session::{

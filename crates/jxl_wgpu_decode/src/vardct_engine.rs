@@ -29,10 +29,12 @@ use jxl_gpu_protocol::{
 };
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, KernelVariant, MemoryBudget,
-    MemoryBudgetSnapshot, MemoryPermit, ResidentStorageBinding, ResidentVarDctError,
-    ResidentVarDctInputs, ResidentVarDctMemoryPlan, ResidentVarDctOutputPlane,
-    ResidentVarDctRenderConfig, ResidentVarDctRenderer, ResidentVarDctScratch,
-    SubmissionPollPermit, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
+    MemoryBudgetSnapshot, MemoryPermit, ResidentF32Plane, ResidentGaborishError,
+    ResidentGaborishInputs, ResidentGaborishMemoryPlan, ResidentGaborishPipeline,
+    ResidentGaborishWeights, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
+    ResidentVarDctMemoryPlan, ResidentVarDctRenderConfig, ResidentVarDctRenderer,
+    ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
+    UnvalidatedGpuImageOutput, WgpuBackend,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -80,8 +82,8 @@ pub enum VarDctDecodeError {
     UnsupportedOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
     UnsupportedColorEncoding,
-    #[error("the bounded VarDCT engine requires disabled Gaborish and EPF restoration")]
-    UnsupportedRestoration,
+    #[error("the bounded VarDCT engine does not yet execute EPF with {iterations} iterations")]
+    UnsupportedEpf { iterations: u32 },
     #[error("the bounded VarDCT engine requires frame quant-matrix scales X=3 and B=2")]
     UnsupportedQuantMatrixScale,
     #[error("the XYB image header does not contain an inverse opsin matrix")]
@@ -104,6 +106,8 @@ pub enum VarDctDecodeError {
     Resource(#[from] VarDctResourceError),
     #[error(transparent)]
     Resident(#[from] ResidentVarDctError),
+    #[error(transparent)]
+    Gaborish(#[from] ResidentGaborishError),
     #[error(transparent)]
     Output(#[from] VarDctOutputError),
     #[error(transparent)]
@@ -175,6 +179,8 @@ pub struct VarDctDecodeMemoryStats {
     pub hf_order_table_bytes: u64,
     pub hf_sink_uniform_bytes: u64,
     pub xyb_plane_bytes: u64,
+    pub gaborish_scratch_bytes: u64,
+    pub gaborish_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
     /// Packed RGB8 storage retained until the final [`GpuBufferLease`] clone is dropped.
@@ -193,6 +199,7 @@ impl VarDctDecodeMemoryStats {
             resource,
             artifact,
             hf_coefficients,
+            gaborish,
             resident,
             output,
         } = inputs;
@@ -284,6 +291,12 @@ impl VarDctDecodeMemoryStats {
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
                     field: "XYB plane bytes",
                 })?;
+        let gaborish_scratch_bytes = if gaborish { xyb_plane_bytes } else { 0 };
+        let gaborish_uniform_bytes = if gaborish {
+            ResidentGaborishMemoryPlan::new().uniform_bytes
+        } else {
+            0
+        };
         let resident_transient_bytes = resident.total_bytes;
         let output_uniform_bytes = output.memory.uniform_bytes;
         let output_lease_bytes = output.memory.output_storage_bytes;
@@ -311,6 +324,8 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             xyb_plane_bytes,
+            gaborish_scratch_bytes,
+            gaborish_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
         ]
@@ -351,6 +366,8 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             xyb_plane_bytes,
+            gaborish_scratch_bytes,
+            gaborish_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
             output_lease_bytes,
@@ -367,6 +384,7 @@ struct VarDctDecodeMemoryInputs<'a> {
     resource: VarDctResourceLayout,
     artifact: VarDctArtifactLayout,
     hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
+    gaborish: bool,
     resident: ResidentVarDctMemoryPlan,
     output: VarDctOutputPlan,
 }
@@ -378,6 +396,7 @@ struct VarDctPipelines {
     artifact: HfMetadataLoweringPipeline,
     hf_coefficients: HfCoefficientPipeline,
     renderer: ResidentVarDctRenderer,
+    gaborish: ResidentGaborishPipeline,
     output: VarDctOutputPacker,
     output_variant: KernelVariant,
 }
@@ -388,6 +407,8 @@ impl VarDctPipelines {
             resolve_kernel_variant(backend, "vardct_resource", KernelVariant::Lanes64)?;
         let output_variant =
             resolve_kernel_variant(backend, "vardct_output", KernelVariant::Lanes256)?;
+        let gaborish_variant =
+            resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
         let device = backend.device();
         Ok(Self {
             packet: VarDctPacketPipeline::new(device),
@@ -396,6 +417,7 @@ impl VarDctPipelines {
             artifact: HfMetadataLoweringPipeline::new(device),
             hf_coefficients: HfCoefficientPipeline::new(device),
             renderer: ResidentVarDctRenderer::new(device),
+            gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
             output_variant,
         })
@@ -513,6 +535,7 @@ struct VarDctSource {
     artifact_layout: VarDctArtifactLayout,
     artifact_params: HfMetadataLoweringParams,
     hf_coefficients: Option<HfCoefficientExecutionPlan>,
+    gaborish: Option<ResidentGaborishWeights>,
     output_plan: VarDctOutputPlan,
     layout: ImageLayout,
     inverse_opsin: VarDctInverseOpsin,
@@ -581,15 +604,7 @@ fn prepare_source(
         .frames
         .first()
         .ok_or(VarDctDecodeError::MissingFrame)?;
-    if !matches!(
-        frame.restoration_filter,
-        RestorationFilterInventory::Custom {
-            gaborish: GaborishInventory::Disabled,
-            epf: EdgePreservingFilterInventory::Disabled,
-        }
-    ) {
-        return Err(VarDctDecodeError::UnsupportedRestoration);
-    }
+    let gaborish = restoration_gaborish(frame.restoration_filter)?;
     if frame.x_qm_scale != 3 || frame.b_qm_scale != 2 {
         return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
     }
@@ -693,6 +708,7 @@ fn prepare_source(
         resource: resource_layout,
         artifact: artifact_layout,
         hf_coefficients: hf_coefficients.as_ref(),
+        gaborish: gaborish.is_some(),
         resident: resident_memory,
         output: output_plan,
     })?;
@@ -708,6 +724,7 @@ fn prepare_source(
         artifact_layout,
         artifact_params,
         hf_coefficients,
+        gaborish,
         output_plan,
         layout,
         inverse_opsin,
@@ -715,6 +732,30 @@ fn prepare_source(
         frame_name,
         transform_index,
         memory,
+    })
+}
+
+fn restoration_gaborish(
+    restoration: RestorationFilterInventory,
+) -> Result<Option<ResidentGaborishWeights>, VarDctDecodeError> {
+    let (gaborish, epf) = match restoration {
+        RestorationFilterInventory::Default => (
+            GaborishInventory::Default,
+            EdgePreservingFilterInventory::default(),
+        ),
+        RestorationFilterInventory::Custom { gaborish, epf } => (gaborish, epf),
+    };
+    if let EdgePreservingFilterInventory::Enabled { iterations, .. } = epf {
+        return Err(VarDctDecodeError::UnsupportedEpf { iterations });
+    }
+    Ok(match gaborish {
+        GaborishInventory::Disabled => None,
+        GaborishInventory::Default => Some(ResidentGaborishWeights::DEFAULT),
+        GaborishInventory::Custom { weights } => Some(ResidentGaborishWeights {
+            x: weights[0].map(|value| value.to_f32()),
+            y: weights[1].map(|value| value.to_f32()),
+            b: weights[2].map(|value| value.to_f32()),
+        }),
     })
 }
 
@@ -745,6 +786,11 @@ fn validate_device_limits(
             true,
         ),
         ("one XYB plane", memory.xyb_plane_bytes / 3, true),
+        (
+            "one Gaborish scratch plane",
+            memory.gaborish_scratch_bytes / 3,
+            true,
+        ),
         ("packed RGB8 output", memory.output_lease_bytes, true),
     ] {
         check_limit(resource, required, limits.max_buffer_size)?;
@@ -758,6 +804,7 @@ fn validate_device_limits(
         ("adaptive LF uniform", memory.adaptive_lf_uniform_bytes),
         ("artifact uniform", memory.artifact_uniform_bytes),
         ("HF coefficient sink uniform", memory.hf_sink_uniform_bytes),
+        ("Gaborish uniform", memory.gaborish_uniform_bytes),
         ("output uniform", memory.output_uniform_bytes),
     ] {
         check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
@@ -876,6 +923,11 @@ struct HfCoefficientJobBuffers {
     sink_params: wgpu::Buffer,
 }
 
+struct GaborishJobBuffers {
+    _planes: [wgpu::Buffer; 3],
+    _uniform: wgpu::Buffer,
+}
+
 struct VarDctJobLifetime {
     output: GpuBufferLease,
     status_staging: wgpu::Buffer,
@@ -898,6 +950,7 @@ struct VarDctJobLifetime {
     _artifact_uniform: wgpu::Buffer,
     _hf_coefficients: Option<HfCoefficientJobBuffers>,
     _xyb_planes: [wgpu::Buffer; 3],
+    _gaborish: Option<GaborishJobBuffers>,
     _resident_scratch: ResidentVarDctScratch,
     _output_scratch: VarDctOutputScratch,
 }
@@ -1269,6 +1322,14 @@ fn submit_vardct(
         "jxl-wgpu VarDCT B plane",
     ]
     .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::COPY_DST));
+    let gaborish_planes = source.gaborish.map(|_| {
+        [
+            "jxl-wgpu VarDCT Gaborish X plane",
+            "jxl-wgpu VarDCT Gaborish Y plane",
+            "jxl-wgpu VarDCT Gaborish B plane",
+        ]
+        .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::empty()))
+    });
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
     if backend.direct_readback_enabled() {
@@ -1434,7 +1495,7 @@ fn submit_vardct(
                 field: "padded output height",
             })?;
     let resident_outputs = xyb_planes.each_ref().map(|plane| {
-        resident_binding(plane).map(|storage| ResidentVarDctOutputPlane {
+        resident_binding(plane).map(|storage| ResidentF32Plane {
             storage,
             width: padded_width,
             height: padded_height,
@@ -1466,21 +1527,54 @@ fn submit_vardct(
             },
         },
     )?;
+    let gaborish_uniform =
+        if let (Some(weights), Some(planes)) = (source.gaborish, gaborish_planes.as_ref()) {
+            let input_planes = xyb_planes.each_ref().map(|plane| {
+                resident_binding(plane).map(|storage| ResidentF32Plane {
+                    storage,
+                    width: source.packet.profile.width,
+                    height: source.packet.profile.height,
+                    stride: padded_width,
+                })
+            });
+            let output_planes = planes.each_ref().map(|plane| {
+                resident_binding(plane).map(|storage| ResidentF32Plane {
+                    storage,
+                    width: source.packet.profile.width,
+                    height: source.packet.profile.height,
+                    stride: padded_width,
+                })
+            });
+            let [input_x, input_y, input_b] = input_planes;
+            let [output_x, output_y, output_b] = output_planes;
+            Some(pipelines.gaborish.encode(
+                device,
+                &mut commands,
+                ResidentGaborishInputs {
+                    inputs: [input_x?, input_y?, input_b?],
+                    outputs: [output_x?, output_y?, output_b?],
+                    weights,
+                },
+            )?)
+        } else {
+            None
+        };
+    let presentation_planes = gaborish_planes.as_ref().unwrap_or(&xyb_planes);
     let output_scratch = pipelines.output.encode(
         device,
         &mut commands,
         VarDctOutputInputs {
             planes: [
                 VarDctOutputPlane {
-                    storage: resident_binding(&xyb_planes[0])?,
+                    storage: resident_binding(&presentation_planes[0])?,
                     stride: padded_width,
                 },
                 VarDctOutputPlane {
-                    storage: resident_binding(&xyb_planes[1])?,
+                    storage: resident_binding(&presentation_planes[1])?,
                     stride: padded_width,
                 },
                 VarDctOutputPlane {
-                    storage: resident_binding(&xyb_planes[2])?,
+                    storage: resident_binding(&presentation_planes[2])?,
                     stride: padded_width,
                 },
             ],
@@ -1493,6 +1587,14 @@ fn submit_vardct(
         },
     )?;
     debug_assert_eq!(output_scratch.plan, source.output_plan);
+    let gaborish_buffers = match (gaborish_planes, gaborish_uniform) {
+        (Some(planes), Some(uniform)) => Some(GaborishJobBuffers {
+            _planes: planes,
+            _uniform: uniform,
+        }),
+        (None, None) => None,
+        _ => unreachable!("Gaborish plan and buffers are constructed together"),
+    };
     commands.copy_buffer_to_buffer(&packet_status, 0, &status_staging, 0, PACKET_STATUS_BYTES);
     commands.copy_buffer_to_buffer(
         &artifact,
@@ -1534,6 +1636,7 @@ fn submit_vardct(
         _artifact_uniform: artifact_uniform,
         _hf_coefficients: hf_coefficient_buffers,
         _xyb_planes: xyb_planes,
+        _gaborish: gaborish_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
@@ -1672,4 +1775,56 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "four-byte buffer alignment",
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoration_contract_types_unsupported_epf() {
+        let error = restoration_gaborish(RestorationFilterInventory::Default).unwrap_err();
+        assert!(matches!(
+            error,
+            VarDctDecodeError::UnsupportedEpf { iterations: 2 }
+        ));
+    }
+
+    #[test]
+    fn restoration_contract_preserves_disabled_and_default_gaborish() {
+        let disabled = restoration_gaborish(RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Disabled,
+            epf: EdgePreservingFilterInventory::Disabled,
+        })
+        .unwrap();
+        assert_eq!(disabled, None);
+
+        let default = restoration_gaborish(RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Default,
+            epf: EdgePreservingFilterInventory::Disabled,
+        })
+        .unwrap();
+        assert_eq!(default, Some(ResidentGaborishWeights::DEFAULT));
+    }
+
+    #[test]
+    fn restoration_contract_preserves_custom_channel_weights() {
+        let half = jxl_gpu_bitstream::FiniteF16::from_bits(0x3800).unwrap();
+        let quarter = jxl_gpu_bitstream::FiniteF16::from_bits(0x3400).unwrap();
+        let zero = jxl_gpu_bitstream::FiniteF16::from_bits(0).unwrap();
+        let weights = [[half, quarter], [quarter, zero], [zero, half]];
+        let custom = restoration_gaborish(RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Custom { weights },
+            epf: EdgePreservingFilterInventory::Disabled,
+        })
+        .unwrap();
+        assert_eq!(
+            custom,
+            Some(ResidentGaborishWeights {
+                x: [0.5, 0.25],
+                y: [0.25, 0.0],
+                b: [0.0, 0.5],
+            })
+        );
+    }
 }

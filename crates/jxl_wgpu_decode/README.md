@@ -72,7 +72,7 @@ the ambiguity with a one-entry single-transform packet. This tiled form supports
 pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
 forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
 adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default dequantization metadata,
-disabled Gaborish/EPF, zero chroma correlation, an order mask containing only the DCT8 bit,
+disabled, default, or custom Gaborish with EPF explicitly disabled, zero chroma correlation, an order mask containing only the DCT8 bit,
 default HF block-context thresholds, and one spectral pass. `global_scale`, `quant_lf`, per-block `hf_mul`, sharpness, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
@@ -88,7 +88,9 @@ image entropy symbol or coefficient value. One GPU submission decodes and valida
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
 each pass group through the common Prefix/ANS/hybrid-integer/LZ77 executor and custom-order
 coefficient sink, and runs the existing resident regular
-VarDCT renderer, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8. Packet
+VarDCT renderer, optionally applies the signaled Gaborish weights between distinct resident XYB
+planes, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8 in the same GPU
+submission. Packet
 and artifact status plus one 32-byte record per pass group share one aggregate staging map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
@@ -97,7 +99,8 @@ The only output descriptor is `vardct_rgb8_format()`: interleaved RGB8 with expl
 primaries, IEC sRGB transfer, full range, and no YCbCr encoding. It is accepted directly by
 `DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
 intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
-uniform, artifact, coefficient, XYB, transform-scratch, and output byte. By default those bytes use
+uniform, artifact, coefficient, XYB, optional three-plane Gaborish scratch, transform-scratch, and
+output byte. By default those bytes use
 the backend budget shared by decode, encode, and readback; `VarDctSubmissionEngine::with_memory_budget`
 can instead select an explicit sharing group. Transient reservations survive until the aggregate
 status map completes. The packed output reservation survives through the final tracked
@@ -119,11 +122,17 @@ continues to own the exact output bytes. A separate 438x589 libjxl fixture exerc
 pass groups, 4,070 DCT8 tasks, a custom three-channel coefficient order, nonzero AC coefficients,
 and a self-correcting MA tree; GPU RGB8 output differs from both Rust `jxl` and `djxl` by at most
 one code.
+A second deterministic 438x589 libjxl fixture enables standard Gaborish weights while disabling
+EPF. The same actual-adapter test executes inverse VarDCT, fused three-plane Gaborish, and RGB8
+packing in one command buffer, and differs from both development-only pixel oracles by at most one
+code. It also checks the exact extra reservation of three padded F32 planes and one 80-byte
+uniform.
 
 This is not full VarDCT coverage. Multiple LF groups, mixed or non-DCT8 transform strategies,
 special transforms, coefficient-order masks beyond DCT8, multiple HF presets, custom block-context
 thresholds, custom quantization matrices,
-Gaborish/EPF, alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
+EPF (including the complete standard default filter bundle), alternate RGB/gray/YUV/NV12/VPI
+outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

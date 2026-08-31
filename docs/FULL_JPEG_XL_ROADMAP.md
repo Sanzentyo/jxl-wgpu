@@ -60,10 +60,10 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 |---|---|---|
 | Raw/`jxlc`/`jxlp` transport and header inventory | **Partial** | Bounded still-image transport, frame/TOC inventory, ICC reconstruction, and feature metadata exist; streaming box delivery and the complete container API do not. |
 | Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. |
-| VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers nine regular zero-AC single transforms and tiled DCT8 with single-pass nonzero AC, natural/custom DCT8 order, one LF group, and extents through 2048×2048. |
+| VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers nine regular zero-AC single transforms and tiled DCT8 with single-pass nonzero AC, natural/custom DCT8 order, one LF group, resident Gaborish with EPF disabled, and extents through 2048×2048. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
 | VarDCT encode | **Partial** | All 27 strategy identifiers execute, but only in a fixed distance-25 LF-only profile with every AC coefficient quantized to zero; tiled DCT8 is limited to one LF group. |
-| Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the stock decoders do not yet route the full legal feature graph through them. |
+| Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the bounded stock VarDCT decoder now routes default/custom Gaborish through resident XYB planes in the same submission, while EPF and the rest of the legal graph remain disconnected. |
 | Output formats | **Partial** | Native integer Gray/RGB/RGBA and 30 portable VPI pitch-linear outputs exist for the lossless Gray8 conversion path; VarDCT currently returns packed RGB8 only. |
 | Async/concurrency/memory | **Partial** | Native blocking and runtime-neutral futures, browser compilation, one shared byte budget, leased output lifetime, true aggregate readback, and bounded pools exist; codec submission is not yet coalesced across images. |
 | Decoder animation and composition | **Missing** | Metadata/session contracts exist, but the stock decoder still rejects animation/reference-frame streams. |
@@ -158,7 +158,7 @@ correctness. Dependencies name other item IDs in this document.
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `RENDER-01` | P0 | **Partial** | Route exact 2×/4×/8× upsampling, halo extension, crop, and channel recombination through the unified render graph. Tile boundaries must equal whole-frame reference results. | `FRONT-01` |
-| `RENDER-02` | P0 | **Partial** | Route Gaborish and EPF0/1/2/3 with signaled strengths, sharpness, sigma, border handling, and cross-group halos. Meet 18181-3 precision bounds on each stage and their composition. | `VDCT-D05`, `RENDER-01` |
+| `RENDER-02` | P0 | **Partial** | The bounded one-LF-group VarDCT path now applies signaled default/custom Gaborish weights to distinct resident XYB planes before output packing, with mirrored whole-image borders, exact shared-budget accounting, and Rust `jxl`/`djxl` error at most one RGB8 code. Completion requires EPF0/1/2/3 with signaled sharpness/sigma, cross-group halos, filter composition, and 18181-3 precision coverage. | `VDCT-D05`, `RENDER-01` |
 | `RENDER-03` | P1 | **Missing** | Decode and render patches with reference-frame lookup, all blend modes, alpha/extra-channel behavior, clipping, and mixed Modular/VarDCT sources. | `FRAME-01`, `MOD-D05` |
 | `RENDER-04` | P1 | **Missing** | Decode and rasterize splines with normative quantization, Catmull–Rom geometry, color, thickness, and clipping. Include stress tests for count/length limits. | `COLOR-01` |
 | `RENDER-05` | P1 | **Missing** | Decode and synthesize noise from the signaled luma-dependent model with deterministic seed/state and correct ordering relative to filters/color. | `VDCT-D05` |
@@ -243,9 +243,10 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The coding-mode selector, shared typed entropy-stream ABI, and first nonzero-AC multi-group DCT8
-decode milestone are implemented. The immediate next target is restoration and remaining
-`ENT-D01/FRONT-02` topology, followed by mixed-strategy `VDCT-D01..05`. The corresponding GPU
+The coding-mode selector, shared typed entropy-stream ABI, first nonzero-AC multi-group DCT8
+decode milestone, and resident stock Gaborish stage are implemented. The immediate next target is
+EPF restoration and remaining `ENT-D01/FRONT-02` topology, followed by mixed-strategy
+`VDCT-D01..05`. The corresponding GPU
 nonzero-AC encoder remains required before the fixture can be re-encoded without a CPU pixel path.
 
 ## Claims explicitly prohibited before their gates pass

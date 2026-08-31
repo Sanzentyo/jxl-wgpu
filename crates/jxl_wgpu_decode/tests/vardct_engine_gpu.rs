@@ -6,7 +6,10 @@ use std::sync::{Arc, mpsc};
 use jxl::api::{
     JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
-use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
+use jxl_gpu_bitstream::{
+    EdgePreservingFilterInventory, GaborishInventory, InventoryLimits, ParseLimits,
+    RestorationFilterInventory,
+};
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
@@ -729,6 +732,74 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
         assert!(
             maximum_error(actual, &djxl) <= 1,
             "nonzero-AC GPU output diverges from djxl",
+        );
+    }
+}
+
+#[test]
+fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let encoded = common::green_queen_vardct_gaborish();
+    let extent = Extent2d::new(438, 589);
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    assert!(matches!(
+        inventory.frames[0].restoration_filter,
+        RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Default,
+            epf: EdgePreservingFilterInventory::Disabled,
+        }
+    ));
+
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let memory = session
+        .submission_session()
+        .vardct()
+        .expect("VarDCT input selects the VarDCT submission session")
+        .memory_stats();
+    assert_eq!(memory.gaborish_scratch_bytes, memory.xyb_plane_bytes);
+    assert_eq!(memory.gaborish_uniform_bytes, 80);
+    assert_eq!(
+        memory.transient_bytes + memory.output_lease_bytes,
+        memory.total_frame_bytes
+    );
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    assert!(
+        maximum_error(actual, &rust) <= 1,
+        "resident Gaborish output diverges from Rust jxl",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        assert!(
+            maximum_error(actual, &djxl) <= 1,
+            "resident Gaborish output diverges from djxl",
         );
     }
 }

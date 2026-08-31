@@ -63,6 +63,13 @@ metadata/coefficient state retain separate suffixes and bindings. This preserves
 executor ABI while allowing the VarDCT pass-group consumer to decode nonzero coefficients without
 turning coefficient placement into a common stream type.
 
+For the bounded stock VarDCT profile, restoration remains in that same submission. The inverse
+transform writes padded resident XYB planes; an optional fused Gaborish dispatch reads only the
+actual image extent with mirrored image-edge sampling and writes three separately reserved planes;
+the output packer consumes those planes directly. No coefficient or pixel crosses the host. The
+three F32 scratch planes and 80-byte uniform are included in the same exact backend byte admission
+as entropy, transform, output, and aggregate validation storage.
+
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode
 session. The initial interoperable target is a deliberately narrow single-group lossless Modular

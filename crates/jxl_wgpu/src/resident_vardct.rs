@@ -50,9 +50,9 @@ impl<'a> ResidentStorageBinding<'a> {
     }
 }
 
-/// One F32 planar output binding and its scalar geometry.
+/// One GPU-resident F32 planar binding and its scalar geometry.
 #[derive(Clone, Copy, Debug)]
-pub struct ResidentVarDctOutputPlane<'a> {
+pub struct ResidentF32Plane<'a> {
     pub storage: ResidentStorageBinding<'a>,
     pub width: u32,
     pub height: u32,
@@ -60,8 +60,9 @@ pub struct ResidentVarDctOutputPlane<'a> {
     pub stride: u32,
 }
 
-impl ResidentVarDctOutputPlane<'_> {
-    fn effective_stride(self) -> u32 {
+impl ResidentF32Plane<'_> {
+    #[must_use]
+    pub const fn effective_stride(self) -> u32 {
         if self.stride == 0 {
             self.width
         } else {
@@ -94,7 +95,7 @@ pub struct ResidentVarDctInputs<'a> {
     pub coefficients: ResidentStorageBinding<'a>,
     pub tasks: ResidentStorageBinding<'a>,
     pub resources: ResidentStorageBinding<'a>,
-    pub outputs: [ResidentVarDctOutputPlane<'a>; 3],
+    pub outputs: [ResidentF32Plane<'a>; 3],
     pub indirect: &'a wgpu::Buffer,
     /// Byte offsets of dequantize, horizontal, and vertical `DispatchIndirectArgs` records.
     pub indirect_offsets: [u64; 3],

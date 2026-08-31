@@ -49,3 +49,12 @@ pub fn green_queen_vardct_nonzero_ac() -> &'static [u8] {
     });
     BYTES.as_slice()
 }
+
+pub fn green_queen_vardct_gaborish() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/green_queen_vardct_gaborish.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
