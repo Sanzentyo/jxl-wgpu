@@ -153,14 +153,20 @@ cargo run --release --example test_multi_group
 ```
 
 These fixtures prove cross-LF-group addressing and restoration for the accepted global-tree
-profile. They do not prove local per-substream MA trees: ordinary multi-LF-group `cjxl` output uses
-that different layout. `vardct_packet_gpu::gpu_stages_cjxl_local_ma_trees_without_host_image_entropy`
+profile. Ordinary multi-LF-group `cjxl` output uses a different, local per-substream MA-tree
+layout. `vardct_packet_gpu::gpu_stages_cjxl_local_ma_trees_without_host_image_entropy`
 generates a deterministic 2056x256 RGB PPM, invokes an installed `cjxl` 0.12-compatible CLI with
 distance 2/effort 7/raw-codestream output, and requires more than one LF group with no global MA
 tree. On an actual adapter it dispatches every LF-local stream, maps the aggregate 64-byte status
 records, validates and uses only their entropy-end cursors, packs the following HF-local metadata,
-and dispatches every HF stream. This proves the packet-stage boundary; it does not yet claim the
-stock frame engine or final RGB output accepts that layout.
+and dispatches every HF stream. The companion
+`vardct_engine_gpu::ordinary_cjxl_local_trees_complete_through_two_stage_frame_engine` runs the
+same generated codestream through the stock frame engine. It requires two queue submissions, the
+typed pre-HF `UnvalidatedOutputNotSubmitted` handoff error, blocking and runtime-neutral async RGB8
+results within one code of Rust `jxl` and optional `djxl`, and complete shared-budget release after
+normal consumption or cancellation at the LF stage. The effort-7 stream also exercises X=5/B=5
+quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
+for all three channels directly in the resident resource vectors.
 
 ## Common entropy differential matrix
 

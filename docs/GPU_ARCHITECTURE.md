@@ -70,7 +70,10 @@ GPU. Its context-map and threshold words follow the entropy tables in one storag
 quantized LF planes and each pass group's LZ ring use non-overlapping slices of the reconstruction
 buffer, preserving the portable eight-storage-buffer stage limit without a readback.
 
-For the bounded stock VarDCT profile, restoration remains in that same submission. The inverse
+For the bounded stock VarDCT profile, restoration remains resident in the downstream command
+buffer. Global-tree streams execute that buffer in the packet submission. Streams with local
+per-substream MA trees first submit LF entropy, map only aggregate end cursors, host-pack the
+cursor-dependent HF descriptors, and then submit HF entropy plus the downstream buffer. The inverse
 transform dispatches each independently bounded LF-group artifact into shared padded resident XYB
 planes. Group-local LF and correlation data first scatter into full-image atlases; adaptive LF
 smoothing runs once over that atlas, or the standard skip flag copies it resident-to-resident.
@@ -79,8 +82,9 @@ sampling. When EPF is enabled, one linear dispatch per LF group lowers per-trans
 per-block sharpness into disjoint rectangles of the full-image inverse-sigma plane, then the
 signaled EPF0/EPF1/EPF2 sequence and Gaborish advance one shared restoration cursor between the
 resident image and one three-plane scratch set. The output packer consumes whichever set is current
-after the final pass. Every LF group's packet and artifact status plus all pass-group status records
-are copied into one staging buffer and mapped once. No coefficient or pixel crosses the host. The
+after the final pass. Global-tree frames copy every LF group's packet and artifact status plus all
+pass-group records into one mapped staging buffer. Local-tree frames map that buffer once for LF
+cursors and once for final validation. No coefficient or pixel crosses the host. The
 three F32 scratch planes, inverse-sigma plane, and exact 80-byte restoration uniforms are included
 in the same backend byte admission as entropy, transform, output, and aggregate validation storage.
 

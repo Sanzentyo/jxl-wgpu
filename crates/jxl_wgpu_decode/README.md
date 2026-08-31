@@ -75,7 +75,8 @@ single-transform packet. The sectioned form supports odd and asymmetric pixel ex
 group boundaries while keeping edge padding internal to GPU storage; 2056x256 is the checked
 two-LF-group boundary case.
 Both forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract
-accepts either adaptive LF smoothing or its standard skip flag, frame quant-matrix scales X=3/B=2, default
+accepts either adaptive LF smoothing or its standard skip flag, every 3-bit X/B frame
+quant-matrix scale, default
 dequantization metadata, disabled/default/custom Gaborish, disabled/default/custom
 one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spectral pass.
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
@@ -84,10 +85,11 @@ properties 0 through 15, and weighted self-correcting prediction are read from t
 packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,
 executes LF image entropy on GPU, maps the aggregate end cursors, then parses and packs the following
 HF-local trees without decoding host image symbols. Separate `decode_vardct_lf` and
-`decode_vardct_hf` entry points preserve the resident LF reconstruction across that boundary. This
-two-stage packet core is actual-GPU tested with ordinary multi-LF-group `cjxl` output; the stock
-frame engine still returns `LocalMaTreeStagingNotIntegrated` until its pending-frame state machine
-owns both submissions and budget reservations. The image header must declare the standard sRGB/D65
+`decode_vardct_hf` entry points preserve the resident LF reconstruction across that boundary. The
+stock runtime-neutral pending-frame state machine owns both submissions, both aggregate status
+maps, and the initial plus dynamically admitted metadata reservations. It is actual-GPU tested
+with ordinary multi-LF-group `cjxl` output through blocking and async completion. The image header
+must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
@@ -95,7 +97,7 @@ typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes befor
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
 1-GiB parser ceiling.
 
-The host inventories bounded scalar headers, packs the shared MA-tree and coefficient entropy descriptors,
+The host inventories bounded scalar headers, packs the shared or local MA-tree and coefficient entropy descriptors,
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF
 image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
@@ -115,9 +117,11 @@ VarDCT renderer using the normative default matrix for that strategy and an expl
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
-and writes tightly packed RGB8 in the same GPU
-submission. Every LF group's packet and artifact status plus one 32-byte record per pass group
-share one aggregate staging map; cleared downstream buffers and zeroed indirect
+and writes tightly packed RGB8 without an intermediate image readback. Global-tree frames use one
+GPU submission and one aggregate staging map. Local-tree frames first map one aggregate LF cursor
+record, then submit HF entropy and the already-recorded downstream work with one final aggregate
+validation map. Every LF group's packet and artifact status plus one 32-byte record per pass group
+share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
@@ -129,8 +133,11 @@ uniform, artifact, coefficient, XYB, optional three-plane restoration scratch, E
 per-pass uniforms, transform-scratch, and
 output byte. By default those bytes use
 the backend budget shared by decode, encode, and readback; `VarDctSubmissionEngine::with_memory_budget`
-can instead select an explicit sharing group. Transient reservations survive until the aggregate
-status map completes. The packed output reservation survives through the final tracked
+can instead select an explicit sharing group. Transient reservations survive until the final
+aggregate status map completes. For local-tree frames the initial reservation contains all LF
+metadata; if the cursor-dependent HF metadata peak is larger, the exact difference is admitted
+from the same shared byte budget before the second submission. The packed output reservation
+survives through the final tracked
 `GpuBufferLease` clone, including an early `UnvalidatedGpuImageFrame`; only the validated frame
 carries authoritative metadata and changed regions. Native blocking and runtime-neutral
 poll/future completion use the common decoder session API, and the engine compiles for browser
@@ -179,13 +186,19 @@ An actual-GPU block-context differential test covers negative and positive LF th
 threshold boundaries, multiple quant-field segments, all channel positions, and distinct order
 IDs against the normative scalar index formula. Naga semantic validation runs even without an
 adapter.
+An additional actual-adapter test generates a deterministic 2056x256 RGB source and invokes
+`cjxl` with distance 2, effort 7, and raw-codestream output. Its ordinary per-LF-group local trees,
+including non-default X=5/B=5 quant-matrix scales, complete through the stock frame engine in two
+submissions. Blocking and runtime-neutral async results differ from Rust `jxl` and optional `djxl`
+by at most one RGB8 code. The test also requires a typed refusal of early unvalidated output before
+the HF submission, and verifies that abandoning the LF stage releases its shared memory reservation
+after GPU/map completion.
 The serialized pass-1/pass-2 zero-flush values remain present in the frame inventory. libjxl 0.12
 and the Rust `jxl` implementation accept those parameters but their EPF weight function does not
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Frame-engine integration of the implemented staged local
-per-substream MA-tree packet core, multiple spectral/refinement passes, custom
+This is not full VarDCT coverage. Multiple spectral/refinement passes, custom
 quantization matrices, non-default LF channel-correlation metadata, Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
@@ -270,7 +283,9 @@ output in place; portable and aggregate requests retain the explicit staging-cop
    `prefetch_async` future. Prefetch submits work and never waits for frame completion.
 4. Optionally borrow `pending_frames`/`front_pending_frame` and call the stock
    `WgpuDecodePendingFrame::unvalidated_gpu_frame` to enqueue same-device, same-queue display, readback,
-   or custom GPU work before mapped-status validation completes.
+   or custom GPU work before mapped-status validation completes. For a local-tree VarDCT frame,
+   this returns typed `UnvalidatedOutputNotSubmitted` while only the LF stage is queued; call it
+   after polling/waiting has validated the LF cursors and queued the dependent HF submission.
 5. Consume the oldest pending frame with `next_frame` synchronously or
    `next_frame_async`/`poll_next_frame` through `std::future::Future`.
 6. Retain each `GpuFrameLease` only while its GPU resource is needed. The lease holds an
