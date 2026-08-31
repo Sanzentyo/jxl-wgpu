@@ -73,7 +73,7 @@ pub use vardct_engine::{
     VarDctSubmissionEngine, vardct_rgb8_format,
 };
 pub use wgpu_engine::{
-    F64OutputPath, ModularOutputSpecialization, ModularReconstructionSpecialization,
-    OutputWritePath, WgpuDecodeCapabilities, WgpuDecodeMemoryStats, WgpuDecodeSession,
-    WgpuPendingFrame, WgpuSubmissionEngine,
+    F64OutputPath, ModularEntropyCoding, ModularOutputSpecialization,
+    ModularReconstructionSpecialization, OutputWritePath, WgpuDecodeCapabilities,
+    WgpuDecodeMemoryStats, WgpuDecodeSession, WgpuPendingFrame, WgpuSubmissionEngine,
 };

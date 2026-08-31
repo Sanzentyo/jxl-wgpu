@@ -188,6 +188,32 @@ identical to the source, the reported peak stream allocation must not exceed the
 submission count must prove that more than one segment executed. A third submission is abandoned;
 after a queue fence and callback polling, the shared byte reservation must return to zero.
 
+`crates/jxl_wgpu_decode/test-data/testsrc_modular_weighted.jxl.hex` is a checked-in 193×197 RGB8
+raw codestream produced by libjxl 0.12.0. Its binary SHA-256 is
+`2c76b3c36ebc6a0c3f6b2107ab0978119d04e08180c43c59ada37a9804fa2442`; the source PPM SHA-256 is
+`ed91b02ce3acaa1077a8f184379fc3a37bc4063bff1c447113c81100350a5497`. The profile disables
+palette, squeeze, patches, and color transforms other than YCoCg while selecting learned MA and
+Weighted prediction:
+
+```text
+ffmpeg -hide_banner -loglevel error -f lavfi \
+  -i "testsrc=size=193x197:rate=1" -frames:v 1 -pix_fmt rgb24 weighted-single.ppm
+cjxl weighted-single.ppm weighted-single.jxl \
+  -d 0 -e 9 -m 1 -I 100 -C 6 -g 1 -P 6 -E 0 \
+  --modular_palette_colors=0 -X 0 -Y 0 -R 0 --patches=0 \
+  --container=0 --num_threads=0 \
+  -x color_space=RGB_D65_SRG_Rel_SRG --quiet
+```
+
+`wgpu_gray8::weighted_ma_groups_resume_across_bounded_gpu_stream_windows` first requires the
+production parser to report `ModularEntropyCoding::Ans`, generic MetaAdaptive reconstruction with
+SelfCorrecting prediction, and the exact 112-byte lane state. A 256-byte stream cap forces more
+than two ordered submissions. Blocking and runtime-neutral async paths must both match the Rust
+`jxl` integer oracle byte-for-byte, and abandoning a submitted frame must release the shared byte
+reservation after its completion fence. The test then preserves more than the first two upload
+windows, destroys the late ANS tail, and requires a typed
+`ModularEntropyRejected { group_index: 0, .. }` rather than partial output or a host pixel fallback.
+
 `wgpu_gray8::every_multigroup_gpu_status_is_validated_from_one_map` uses the same 256-byte cap on a
 513×257 multi-group stream, leaves the first 512 bytes of group 1 intact, and corrupts its remaining
 entropy bytes. Bounded host metadata must still open; the final aggregate status map must return the
@@ -197,15 +223,15 @@ cannot overwrite an earlier sticky GPU failure with a successful status.
 Host scheduling tests independently use an unaligned three-bit group start and a 64-byte cap to
 verify physical/logical mapping, first/final flags, 16-byte overlap, monotonic yield boundaries,
 one-lane scratch isolation, and exact peak bytes. Budget tests show that lane count and stream peak
-trade against the same per-frame target. A cap below the 40-byte minimum and an oversized generic
-MA group produce distinct typed errors. Rust/WGSL full-record word casts pin the 236-byte parameter
-record and the 32-byte, 16-byte-aligned resume state. Every composed shader variant is parsed and
-semantically validated with Naga; no shader-source substring assertion is used.
+trade against the same per-frame target. A cap below the 40-byte minimum is a typed error, while
+every oversized accepted Modular group is segmented. Rust/WGSL full-record word casts pin the
+236-byte parameter record and the 32/48/112-byte, 16-byte-aligned resume layouts. Every composed
+shader variant is parsed and semantically validated with Naga; no shader-source substring
+assertion is used.
 
-This is Prefix+RLE/LZ77 production evidence. The common differential matrix below covers ANS
-execution and termination without crossing production windows. A production ANS split fixture,
-generic-MA and VarDCT intra-stream resume, targeted noninitial-window truncation, and broader
-corruption fuzzing are still required before `ENT-D02` can be marked done.
+Together these are Prefix+RLE/LZ77 and production ANS+Weighted cross-window evidence. VarDCT LF/HF
+and recursive entropy consumers still need the same bounded resume contract, and broader
+corruption/truncation fuzzing is still required before `ENT-D02` can be marked done.
 
 ## Common entropy differential matrix
 

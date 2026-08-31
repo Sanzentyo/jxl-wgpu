@@ -84,6 +84,15 @@ pub fn gpu_gray8_lossless() -> &'static [u8] {
     BYTES.as_slice()
 }
 
+pub fn testsrc_modular_weighted() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_modular_weighted.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
 pub fn fragmented_animation() -> &'static [u8] {
     static BYTES: LazyLock<Vec<u8>> =
         LazyLock::new(|| decode_hex(include_str!("../../test-data/fragmented_animation.jxl.hex")));

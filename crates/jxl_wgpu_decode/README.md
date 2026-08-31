@@ -29,14 +29,16 @@ validates every bit and output bound, applies LZ77, walks the MA tree, reconstru
 and reverses YCoCg for RGB(A). Up to 512 budget- and device-resolved scratch lanes decode independent
 groups in one `dispatch_workgroups` wave; 64 logical group invocations are packed into each portable
 compute workgroup and their canvas rectangles do not overlap. Large frames use ordered batches backed
-by one reusable stream window instead of binding the full codestream. If one channel-fixed Gradient
-group itself exceeds the resolved window, it resumes over ordered segments with 16-byte backward
-and forward overlap. The logical cursor, Prefix/ANS state, LZ77 copy state, decoded count, last value,
-and first error remain in a 16-byte-aligned 32-byte record at the end of the same scratch lane. A
-generic MA group that cannot fit one resolved window returns a typed
-`IntraGroupStreamingUnsupported` error until its larger predictor/context state is resumable. One
-aggregate status staging buffer is mapped once after the last batch, and every four-word group
-status is checked before the frame is reported. No reconstructed sample is produced on the CPU.
+by one reusable stream window instead of binding the full codestream. If any accepted stock Modular
+group exceeds the resolved window, it resumes over ordered segments with 16-byte backward and
+forward overlap. The common logical cursor, Prefix/ANS state, LZ77 copy state, decoded count, last
+value, and first error remain in a 16-byte-aligned 32-byte record at the end of the same scratch
+lane. Generic MA adds the Property-8 gradient history for a 48-byte record; a
+Weighted/SelfCorrecting consumer also retains four true errors and twelve subprediction-error
+accumulators for a 112-byte record. A resume exactly at a channel boundary resets channel-local
+predictor state. One aggregate status staging buffer is mapped once after the last batch, and every
+four-word group status is checked before the frame is reported. No reconstructed sample is produced
+on the CPU.
 Output pipeline selection is also per frame. When every plane offset and row stride is four-byte
 aligned and every actual internal group edge ends on a distinct storage word, the shader uses
 ordinary word RMW/store. Layouts with an odd stride, offset, or group edge use the atomic byte-safe
@@ -346,7 +348,7 @@ zero-padding validation runs only on the final segment. The peak window grows on
 batch fits the actual per-slot shared byte budget and device storage-binding limit, allowing a large
 still image to coalesce submissions without compromising concurrent small-frame admission.
 
-Entropy metadata, bounded lane scratch including the 32-byte resume record, aggregate
+Entropy metadata, bounded lane scratch including the selected 32/48/112-byte resume record, aggregate
 status/readback, parameters, dispatch control,
 output, and peak stream-window sizes are overflow-checked against storage, uniform, and device
 buffer limits. Lane count is the minimum of the 512-lane watchdog cap, group count, device workgroup/storage
@@ -358,7 +360,8 @@ no reconstruction storage; wider histories retain the descriptor-sized storage r
 not affordable but one complete frame is, the prepared backend narrows it and propagates the
 resolved bound into the actual session limiter and prefetch validation. `WgpuDecodeSession::memory_stats`
 reports complete per-frame, output-lease, transient, peak-window, resolved-slot, logical/physical
-LZ sizes, logical/physical reconstruction-sample workspace, per-lane entropy-state bytes, selected output-write/output-traversal
+LZ sizes, logical/physical reconstruction-sample workspace, per-lane execution-state bytes, parsed
+Prefix/ANS representation, selected output-write/output-traversal
 and reconstruction-specialization paths, lane/workgroup counts, stream batches, and actual
 submission counts. Concurrent jobs opened through an engine or its
 clones use the `WgpuBackend`'s shared

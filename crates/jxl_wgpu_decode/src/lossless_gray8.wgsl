@@ -192,6 +192,7 @@ fn load_entropy_execution_state() {
     entropy_last_value = reconstruction_load(base + 5u);
     consumer_decoded = reconstruction_load(base + 6u);
     decode_error = reconstruction_load(base + 7u);
+    load_modular_execution_state();
 }
 
 fn save_entropy_execution_state(error_code: u32) {
@@ -204,6 +205,7 @@ fn save_entropy_execution_state(error_code: u32) {
     reconstruction_store(base + 5u, entropy_last_value);
     reconstruction_store(base + 6u, consumer_decoded);
     reconstruction_store(base + 7u, error_code);
+    save_modular_execution_state();
 }
 
 fn unpack_signed(value: u32) -> i32 {
@@ -573,6 +575,7 @@ fn finalize_output() {
     }
 }
 
+/*__JXL_MODULAR_RESUME__*/
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
 @compute @workgroup_size(wg_x, wg_y, 1)
@@ -596,7 +599,12 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
 
     while current_channel < params.source_channels && decode_error == 0u
         && !window_should_pause() {
-        let decoded = decode_adaptive_channel();
+        let channel_start = current_channel * params.sample_count;
+        let decoded = decode_adaptive_channel(
+            consumer_decoded - channel_start,
+            !window_is_final(),
+            params.window_yield_end,
+        );
         consumer_decoded += decoded;
         if decode_error != 0u || window_should_pause() {
             break;

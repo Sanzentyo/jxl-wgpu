@@ -388,13 +388,16 @@ fn predictor_value(
     }
 }
 
-fn decode_adaptive_channel() -> u32 {
-    predictor_prev_grad = 0i;
-    if params.needs_self_correcting != 0u {
-        wp_reset();
+fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u32 {
+    if start == 0u {
+        predictor_prev_grad = 0i;
+        if params.needs_self_correcting != 0u {
+            wp_reset();
+        }
     }
-    var decoded = 0u;
-    while decoded < params.sample_count && decode_error == 0u {
+    var decoded = start;
+    while decoded < params.sample_count && decode_error == 0u
+        && (!may_pause || bit_cursor < pause_cursor) {
         let x = decoded % params.width;
         let y = decoded / params.width;
         var w = 0i;
@@ -469,5 +472,5 @@ fn decode_adaptive_channel() -> u32 {
         }
         decoded += 1u;
     }
-    return decoded;
+    return decoded - start;
 }

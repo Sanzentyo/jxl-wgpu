@@ -23,7 +23,7 @@ use crate::buffer_pool::{
 };
 use crate::entropy::EntropyStreamParams;
 use crate::model::native_modular_format;
-use crate::modular_tree::MaTreeNodeIr;
+use crate::modular_tree::{EntropyCoderIr, MaTreeNodeIr};
 use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
@@ -36,9 +36,11 @@ const SHADER_TEMPLATE: &str = include_str!("lossless_gray8.wgsl");
 const MODULAR_ENTROPY_ABI_SHADER: &str = include_str!("modular_entropy_abi.wgsl");
 const MODULAR_ENTROPY_SHADER: &str = include_str!("modular_entropy.wgsl");
 const MODULAR_RECONSTRUCT_SHADER: &str = include_str!("modular_reconstruct.wgsl");
+const MODULAR_RESUME_SHADER: &str = include_str!("modular_resume.wgsl");
 const MODULAR_FIXED_GRADIENT_SHADER: &str = include_str!("modular_fixed_gradient.wgsl");
 const MODULAR_ENTROPY_ABI_MARKER: &str = "/*__JXL_MODULAR_ENTROPY_ABI__*/";
 const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
+const MODULAR_RESUME_MARKER: &str = "/*__JXL_MODULAR_RESUME__*/";
 const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
@@ -97,6 +99,13 @@ const STREAM_OVERLAP_BYTES: u64 = 16;
 const MIN_STREAM_WINDOW_BYTES: u64 = 40;
 const ENTROPY_EXECUTION_STATE_WORDS: u64 = 8;
 const ENTROPY_EXECUTION_STATE_BYTES: u64 = ENTROPY_EXECUTION_STATE_WORDS * 4;
+// Generic MA reconstruction additionally persists Property-8 gradient history. The weighted
+// predictor extends that tail with four true errors and twelve subprediction-error accumulators.
+// Both layouts end on a 16-byte boundary so adjacent scratch lanes cannot alias.
+const GENERIC_PREDICTOR_EXECUTION_STATE_BYTES: u64 =
+    std::mem::size_of::<GenericPredictorExecutionState>() as u64;
+const GENERIC_WEIGHTED_EXECUTION_STATE_BYTES: u64 =
+    std::mem::size_of::<WeightedModularExecutionState>() as u64;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
 const DEFAULT_MODULAR_GROUP_VARIANT: KernelVariant = KernelVariant::Lanes64;
 // Each lane is one serial reconstruction invocation which may process a full 256x256 group. Keep
@@ -120,8 +129,10 @@ pub struct WgpuDecodeMemoryStats {
     pub reconstruction_scratch_bytes: u64,
     /// Byte stride of one reconstruction lane.
     pub reconstruction_lane_stride_bytes: u64,
-    /// Per-lane 16-byte-aligned entropy/LZ77 resume record included in the lane stride.
-    pub entropy_execution_state_bytes_per_lane: u64,
+    /// Per-lane 16-byte-aligned entropy and reconstruction resume record included in the stride.
+    pub execution_state_bytes_per_lane: u64,
+    /// Entropy representation parsed from the frame's Modular MA configuration.
+    pub entropy_coding: ModularEntropyCoding,
     /// Largest decoded sample count represented by one logical group stream.
     pub max_logical_reconstruction_sample_words: u32,
     /// Largest sample workspace physically retained by one reconstruction lane.
@@ -151,6 +162,15 @@ pub struct WgpuDecodeMemoryStats {
     pub output_specialization: ModularOutputSpecialization,
     /// Reconstruction kernel selected from the fully validated MA-tree IR.
     pub reconstruction_specialization: ModularReconstructionSpecialization,
+}
+
+/// Entropy representation used by the decoded Modular image stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModularEntropyCoding {
+    /// Canonical prefix-code histograms.
+    Prefix,
+    /// JPEG XL's 12-bit asymmetric numeral system.
+    Ans,
 }
 
 /// GPU output update strategy selected for a validated frame layout.
@@ -293,6 +313,31 @@ struct EntropyExecutionState {
     error_code: u32,
 }
 
+/// Persistent state for a generic MA consumer without SelfCorrecting prediction.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GenericPredictorExecutionState {
+    entropy: EntropyExecutionState,
+    predictor_prev_grad: i32,
+    _padding: [u32; 3],
+}
+
+/// Complete persistent state for a generic MA consumer using SelfCorrecting prediction.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct WeightedModularExecutionState {
+    entropy: EntropyExecutionState,
+    predictor_prev_grad: i32,
+    wp_true_err_w: i32,
+    wp_true_err_nw: i32,
+    wp_true_err_n: i32,
+    wp_true_err_ne: i32,
+    wp_subpred_nw_ww: [u32; 4],
+    wp_subpred_n_w: [u32; 4],
+    wp_subpred_ne: [u32; 4],
+    _padding: [u32; 3],
+}
+
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -310,6 +355,10 @@ const _: () = {
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<EntropyExecutionState>() == 32);
     assert!(std::mem::align_of::<EntropyExecutionState>() == 16);
+    assert!(std::mem::size_of::<GenericPredictorExecutionState>() == 48);
+    assert!(std::mem::align_of::<GenericPredictorExecutionState>() == 16);
+    assert!(std::mem::size_of::<WeightedModularExecutionState>() == 112);
+    assert!(std::mem::align_of::<WeightedModularExecutionState>() == 16);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
 };
@@ -745,9 +794,14 @@ fn shader_source(
         } => MODULAR_FIXED_GRADIENT_SHADER,
         ModularReconstructionSpecialization::ChannelFixed { .. } => MODULAR_RECONSTRUCT_SHADER,
     };
+    let resume_shader = match reconstruction {
+        ModularReconstructionSpecialization::GenericMetaAdaptive => MODULAR_RESUME_SHADER,
+        ModularReconstructionSpecialization::ChannelFixed { .. } => "",
+    };
     SHADER_TEMPLATE
         .replace(MODULAR_ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI_SHADER)
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
+        .replace(MODULAR_RESUME_MARKER, resume_shader)
         .replace(MODULAR_RECONSTRUCT_MARKER, reconstruction_shader)
         .replace(F64_OUTPUT_MARKER, implementation)
         .replace(F64_BINDING_MARKER, binding)
@@ -1134,6 +1188,8 @@ struct DecodeMemoryPermits {
 struct GroupDispatchLayout {
     group_workgroup_size: u32,
     reconstruction_lane_stride: u64,
+    execution_state_bytes_per_lane: u64,
+    entropy_coding: ModularEntropyCoding,
     max_logical_reconstruction_sample_words: u32,
     max_physical_reconstruction_sample_words: u32,
     max_lz77_window_words: u32,
@@ -1205,6 +1261,14 @@ impl GroupDispatchLayout {
     ) -> Result<Self> {
         let output_write_path = output.write_path_for_groups(&profile.groups)?;
         let reconstruction_specialization = reconstruction_specialization(profile);
+        let execution_state_bytes_per_lane = modular_execution_state_bytes(
+            reconstruction_specialization,
+            profile.ma_config.needs_self_correcting(),
+        );
+        let entropy_coding = match profile.ma_config.entropy.coder {
+            EntropyCoderIr::Prefix(_) => ModularEntropyCoding::Prefix,
+            EntropyCoderIr::Ans { .. } => ModularEntropyCoding::Ans,
+        };
         let limits = device.limits();
         let group_workgroup_size = options.kernel_variant.workgroup_size().0;
         let mut reconstruction_lane_stride = 0u64;
@@ -1249,6 +1313,7 @@ impl GroupDispatchLayout {
                     *group,
                     decoded_symbol_count,
                     physical_sample_words,
+                    execution_state_bytes_per_lane,
                 )?)?);
         }
         if reconstruction_lane_stride == 0 {
@@ -1315,13 +1380,6 @@ impl GroupDispatchLayout {
         let requested_slots = u64::try_from(options.requested_frame_slots.max(1))
             .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
         let requested_target = options.memory_limit_bytes / requested_slots;
-        let allow_intra_group_windows = matches!(
-            reconstruction_specialization,
-            ModularReconstructionSpecialization::ChannelFixed {
-                predictor: ModularPredictor::Gradient,
-                ..
-            }
-        );
         let selected = match select_parallel_group_layout(
             codestream,
             &profile.groups,
@@ -1331,24 +1389,20 @@ impl GroupDispatchLayout {
                 lane_stride: reconstruction_lane_stride,
                 fixed_bytes,
                 per_frame_target: requested_target,
-                allow_intra_group_windows,
             },
         ) {
             Ok(Some(selected)) => Some(selected),
-            Ok(None) | Err(Error::IntraGroupStreamingUnsupported { .. }) => {
-                select_parallel_group_layout(
-                    codestream,
-                    &profile.groups,
-                    ParallelGroupLimits {
-                        stream_limit,
-                        lane_cap,
-                        lane_stride: reconstruction_lane_stride,
-                        fixed_bytes,
-                        per_frame_target: options.memory_limit_bytes,
-                        allow_intra_group_windows,
-                    },
-                )?
-            }
+            Ok(None) => select_parallel_group_layout(
+                codestream,
+                &profile.groups,
+                ParallelGroupLimits {
+                    stream_limit,
+                    lane_cap,
+                    lane_stride: reconstruction_lane_stride,
+                    fixed_bytes,
+                    per_frame_target: options.memory_limit_bytes,
+                },
+            )?,
             Err(error) => return Err(error),
         }
         .ok_or_else(|| {
@@ -1364,6 +1418,8 @@ impl GroupDispatchLayout {
         Ok(Self {
             group_workgroup_size,
             reconstruction_lane_stride,
+            execution_state_bytes_per_lane,
+            entropy_coding,
             max_logical_reconstruction_sample_words,
             max_physical_reconstruction_sample_words,
             max_lz77_window_words,
@@ -1389,7 +1445,6 @@ fn build_stream_batches(
     groups: &[ModularGroup],
     stream_limit: u64,
     max_groups_per_batch: usize,
-    allow_intra_group_windows: bool,
 ) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
     if max_groups_per_batch == 0 {
         return Err(Error::backend(
@@ -1472,14 +1527,6 @@ fn build_stream_batches(
             )?;
             batch_group_count = 0;
             upload_cursor = 0;
-            if !allow_intra_group_windows {
-                return Err(Error::IntraGroupStreamingUnsupported {
-                    group_index,
-                    required_bytes: group_packet_bytes,
-                    window_bytes: stream_limit,
-                });
-            }
-
             let maximum_input_bytes = ((stream_limit - STREAM_SENTINEL_BYTES) / 4) * 4;
             let core_bytes = maximum_input_bytes
                 .checked_sub(2 * STREAM_OVERLAP_BYTES)
@@ -1630,7 +1677,6 @@ struct ParallelGroupLimits {
     lane_stride: u64,
     fixed_bytes: u64,
     per_frame_target: u64,
-    allow_intra_group_windows: bool,
 }
 
 fn select_parallel_group_layout(
@@ -1644,7 +1690,6 @@ fn select_parallel_group_layout(
     };
     let budget_lane_cap = usize::try_from(available / limits.lane_stride).unwrap_or(usize::MAX);
     let mut lanes = limits.lane_cap.min(budget_lane_cap);
-    let mut unsupported = None;
     while lanes != 0 {
         let scratch_bytes = limits
             .lane_stride
@@ -1659,21 +1704,8 @@ fn select_parallel_group_layout(
             lanes -= 1;
             continue;
         }
-        let (segments, batches, stream_bytes) = match build_stream_batches(
-            codestream,
-            groups,
-            effective_stream_limit,
-            lanes,
-            limits.allow_intra_group_windows,
-        ) {
-            Ok(layout) => layout,
-            Err(error @ Error::IntraGroupStreamingUnsupported { .. }) => {
-                unsupported = Some(error);
-                lanes -= 1;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let (segments, batches, stream_bytes) =
+            build_stream_batches(codestream, groups, effective_stream_limit, lanes)?;
         let required = limits
             .fixed_bytes
             .checked_add(stream_bytes)
@@ -1683,9 +1715,6 @@ fn select_parallel_group_layout(
             return Ok(Some((lanes, segments, batches, stream_bytes)));
         }
         lanes -= 1;
-    }
-    if let Some(error) = unsupported {
-        return Err(error);
     }
     Ok(None)
 }
@@ -1702,6 +1731,7 @@ fn group_reconstructed_bytes(
     group: ModularGroup,
     decoded_symbol_count: u32,
     physical_sample_words: u32,
+    execution_state_bytes: u64,
 ) -> Result<u64> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
         u64::from(group.width)
@@ -1721,8 +1751,25 @@ fn group_reconstructed_bytes(
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))?;
     align16(working_bytes)?
-        .checked_add(ENTROPY_EXECUTION_STATE_BYTES)
-        .ok_or_else(|| Error::backend("group entropy execution state size overflow"))
+        .checked_add(execution_state_bytes)
+        .ok_or_else(|| Error::backend("group execution state size overflow"))
+}
+
+const fn modular_execution_state_bytes(
+    reconstruction: ModularReconstructionSpecialization,
+    needs_self_correcting: bool,
+) -> u64 {
+    match (reconstruction, needs_self_correcting) {
+        (
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                ..
+            },
+            false,
+        ) => ENTROPY_EXECUTION_STATE_BYTES,
+        (_, true) => GENERIC_WEIGHTED_EXECUTION_STATE_BYTES,
+        _ => GENERIC_PREDICTOR_EXECUTION_STATE_BYTES,
+    }
 }
 
 fn group_entropy_state_offset_words(
@@ -2359,7 +2406,8 @@ fn validate_device_limits(
         stream_window_bytes: dispatch.stream_bytes,
         reconstruction_scratch_bytes: dispatch.reconstructed_bytes,
         reconstruction_lane_stride_bytes: dispatch.reconstruction_lane_stride,
-        entropy_execution_state_bytes_per_lane: ENTROPY_EXECUTION_STATE_BYTES,
+        execution_state_bytes_per_lane: dispatch.execution_state_bytes_per_lane,
+        entropy_coding: dispatch.entropy_coding,
         max_logical_reconstruction_sample_words: dispatch.max_logical_reconstruction_sample_words,
         max_physical_reconstruction_sample_words: dispatch.max_physical_reconstruction_sample_words,
         max_lz77_window_words: dispatch.max_lz77_window_words,
@@ -2955,8 +3003,7 @@ mod tests {
             stream_index: 0,
         };
         let groups = [group(3, 67), group(75, 139), group(147, 211)];
-        let (segments, batches, peak) =
-            build_stream_batches(&codestream, &groups, 40, 1, false).unwrap();
+        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 40, 1).unwrap();
         assert_eq!(
             batches
                 .iter()
@@ -3004,8 +3051,7 @@ mod tests {
                 stream_index: index as u32,
             })
             .collect::<Vec<_>>();
-        let (segments, batches, _) =
-            build_stream_batches(&codestream, &groups, 1024, 2, false).unwrap();
+        let (segments, batches, _) = build_stream_batches(&codestream, &groups, 1024, 2).unwrap();
         assert_eq!(
             batches
                 .iter()
@@ -3030,8 +3076,7 @@ mod tests {
             height: 1,
             stream_index: 0,
         }];
-        let (segments, batches, peak) =
-            build_stream_batches(&codestream, &groups, 64, 8, true).unwrap();
+        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 64, 8).unwrap();
         assert!(segments.len() > 2);
         assert_eq!(segments.len(), batches.len());
         assert_eq!(peak, 64);
@@ -3063,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_generic_group_reports_typed_resume_error() {
+    fn every_oversized_modular_group_uses_bounded_segments() {
         let codestream = vec![0u8; 256];
         let groups = [ModularGroup {
             token_bit_offset: 0,
@@ -3074,16 +3119,12 @@ mod tests {
             height: 1,
             stream_index: 0,
         }];
+        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 64, 1).unwrap();
+        assert!(segments.len() > 1);
+        assert_eq!(segments.len(), batches.len());
+        assert_eq!(peak, 64);
         assert!(matches!(
-            build_stream_batches(&codestream, &groups, 64, 1, false),
-            Err(Error::IntraGroupStreamingUnsupported {
-                group_index: 0,
-                required_bytes: 204,
-                window_bytes: 64,
-            })
-        ));
-        assert!(matches!(
-            build_stream_batches(&codestream, &groups, 39, 1, true),
+            build_stream_batches(&codestream, &groups, 39, 1),
             Err(Error::StreamWindowTooSmall {
                 limit_bytes: 39,
                 minimum_bytes: 40,
@@ -3114,7 +3155,6 @@ mod tests {
                 lane_stride: 4096,
                 fixed_bytes: 1024,
                 per_frame_target: 64 * 1024,
-                allow_intra_group_windows: false,
             },
         )
         .unwrap()
@@ -3134,7 +3174,6 @@ mod tests {
                 lane_stride: 4096,
                 fixed_bytes: 1024,
                 per_frame_target: 20 * 1024,
-                allow_intra_group_windows: false,
             },
         )
         .unwrap()
@@ -3805,6 +3844,49 @@ mod tests {
         assert_eq!(
             bytemuck::cast::<EntropyExecutionState, [u32; 8]>(execution),
             [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(GENERIC_PREDICTOR_EXECUTION_STATE_BYTES, 48);
+        let generic = GenericPredictorExecutionState {
+            entropy: execution,
+            predictor_prev_grad: 9,
+            _padding: [0; 3],
+        };
+        assert_eq!(
+            bytemuck::cast::<GenericPredictorExecutionState, [u32; 12]>(generic),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0]
+        );
+        assert_eq!(std::mem::size_of::<WeightedModularExecutionState>(), 112);
+        assert_eq!(std::mem::align_of::<WeightedModularExecutionState>(), 16);
+        let weighted = WeightedModularExecutionState {
+            entropy: execution,
+            predictor_prev_grad: 9,
+            wp_true_err_w: 10,
+            wp_true_err_nw: 11,
+            wp_true_err_n: 12,
+            wp_true_err_ne: 13,
+            wp_subpred_nw_ww: [14, 15, 16, 17],
+            wp_subpred_n_w: [18, 19, 20, 21],
+            wp_subpred_ne: [22, 23, 24, 25],
+            _padding: [0; 3],
+        };
+        assert_eq!(
+            bytemuck::cast::<WeightedModularExecutionState, [u32; 28]>(weighted),
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 0, 0, 0,
+            ]
+        );
+        assert_eq!(
+            modular_execution_state_bytes(FIXED_GRADIENT_RECONSTRUCTION, false),
+            32
+        );
+        assert_eq!(
+            modular_execution_state_bytes(GENERIC_RECONSTRUCTION, false),
+            48
+        );
+        assert_eq!(
+            modular_execution_state_bytes(GENERIC_RECONSTRUCTION, true),
+            112
         );
         assert_eq!(std::mem::size_of::<DispatchControl>(), 16);
         assert_eq!(std::mem::align_of::<DispatchControl>(), 4);

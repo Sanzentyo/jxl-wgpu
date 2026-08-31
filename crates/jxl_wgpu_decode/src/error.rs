@@ -139,14 +139,6 @@ pub enum Error {
         minimum_bytes: u64,
     },
     #[error(
-        "Modular group {group_index} requires {required_bytes} stream bytes, exceeding the {window_bytes}-byte window; intra-group resume is not available for its reconstruction profile"
-    )]
-    IntraGroupStreamingUnsupported {
-        group_index: usize,
-        required_bytes: u64,
-        window_bytes: u64,
-    },
-    #[error(
         "Modular GPU group {group_index} rejected entropy stream: status={status}, decoded={decoded_samples}/{expected_samples}, cursor={cursor}/{expected_cursor}"
     )]
     ModularEntropyRejected {

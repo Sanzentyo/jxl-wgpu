@@ -11,6 +11,12 @@ fn fixed_gradient_i32(north: i32, west: i32, north_west: i32) -> i32 {
     return clamp(gradient, min(north, west), max(north, west));
 }
 
+// The specialized path derives every predictor neighbor from the resident sample rows, so the
+// common 32-byte entropy record is its complete resume state.
+fn load_modular_execution_state() {}
+
+fn save_modular_execution_state() {}
+
 fn fixed_leaf_cluster(channel: u32) -> u32 {
     switch channel {
         case 0u: { return params.fixed_leaf_cluster0; }
@@ -24,7 +30,7 @@ fn fixed_leaf_cluster(channel: u32) -> u32 {
     }
 }
 
-fn decode_adaptive_channel() -> u32 {
+fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u32 {
     if params.fixed_leaf_predictor != 5u
         || params.fixed_leaf_offset != 0u
         || params.fixed_leaf_multiplier != 1u {
@@ -36,13 +42,10 @@ fn decode_adaptive_channel() -> u32 {
     let maximum = i32(params.source_mask);
     let signed_transform_channel = params.source_channels >= 3u
         && (current_channel == 1u || current_channel == 2u);
-    let channel_start = current_channel * params.sample_count;
-    var decoded = consumer_decoded - channel_start;
+    var decoded = start;
     let initial_decoded = decoded;
-    while decoded < params.sample_count && decode_error == 0u {
-        if window_should_pause() {
-            break;
-        }
+    while decoded < params.sample_count && decode_error == 0u
+        && (!may_pause || bit_cursor < pause_cursor) {
         let y = decoded / params.width;
         let x = decoded - y * params.width;
         let row_base = y * params.width;

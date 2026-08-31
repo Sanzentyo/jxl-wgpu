@@ -33,6 +33,7 @@ use wgpu::util::DeviceExt;
 mod common;
 
 use common::gpu_gray8_lossless as indexed_gray8;
+use common::testsrc_modular_weighted;
 const VPI_COLOR_FORMATS: [Vpi; 20] = [
     Vpi::Y8,
     Vpi::Y8Er,
@@ -791,7 +792,11 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert_eq!(stats.max_logical_reconstruction_sample_words, 256 * 256);
             assert_eq!(stats.max_physical_reconstruction_sample_words, 256 * 2);
             assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4 + 32);
-            assert_eq!(stats.entropy_execution_state_bytes_per_lane, 32);
+            assert_eq!(stats.execution_state_bytes_per_lane, 32);
+            assert_eq!(
+                stats.entropy_coding,
+                jxl_wgpu_decode::ModularEntropyCoding::Prefix
+            );
             assert_eq!(
                 stats.output_specialization,
                 jxl_wgpu_decode::ModularOutputSpecialization::DirectNormalizedGray8
@@ -917,6 +922,125 @@ fn fixed_gradient_group_resumes_across_bounded_gpu_stream_windows() {
             .expect("drive abandoned bounded-window callback");
         std::thread::yield_now();
     }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+}
+
+#[test]
+fn weighted_ma_groups_resume_across_bounded_gpu_stream_windows() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping bounded weighted-MA stream test: no wgpu adapter");
+        return;
+    };
+    let encoded = testsrc_modular_weighted();
+    let (oracle_extent, oracle) = rust_jxl_decode_integer(encoded, LosslessModularFormat::Rgb, 8)
+        .unwrap_or_else(|error| panic!("bounded weighted-MA Rust jxl oracle failed: {error}"));
+    assert_eq!(oracle_extent, (193, 197));
+    let expected = oracle
+        .into_iter()
+        .map(|sample| sample as u8)
+        .collect::<Vec<_>>();
+
+    let decoder = GpuDecoder::new(
+        WgpuSubmissionEngine::new(backend.clone())
+            .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+    );
+    let request =
+        || GpuOutputRequest::color(LosslessModularFormat::Rgb.pixel_format(8).unwrap()).unwrap();
+
+    let mut blocking = decoder.open(encoded, request()).unwrap();
+    assert!(matches!(
+        blocking.profile(),
+        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            prediction: jxl_wgpu_decode::ModularPredictionProfile::MetaAdaptive {
+                uses_self_correcting: true,
+                ..
+            },
+            ..
+        }
+    ));
+    let stats = blocking.submission_session().memory_stats();
+    assert!(stats.stream_window_bytes <= 256);
+    assert!(stats.stream_batch_count > 2);
+    assert_eq!(stats.submissions_per_frame, stats.stream_batch_count);
+    assert_eq!(stats.execution_state_bytes_per_lane, 112);
+    assert_eq!(
+        stats.entropy_coding,
+        jxl_wgpu_decode::ModularEntropyCoding::Ans
+    );
+    assert_eq!(
+        stats.reconstruction_specialization,
+        ModularReconstructionSpecialization::GenericMetaAdaptive
+    );
+    let frame = blocking.next_frame().unwrap().unwrap();
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(blocking);
+
+    let mut asynchronous = decoder.open(encoded, request()).unwrap();
+    let frame = pollster::block_on(asynchronous.next_frame_async())
+        .expect("runtime-neutral bounded weighted-MA decode succeeds")
+        .expect("one bounded weighted-MA frame is returned");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(asynchronous);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder.open(encoded, request()).unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let commands = backend
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bounded weighted-MA abandonment completion fence"),
+        });
+    let fence = backend.queue().submit([commands.finish()]);
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .expect("abandoned bounded weighted-MA submissions complete");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend
+            .device()
+            .poll(wgpu::PollType::Poll)
+            .expect("drive abandoned bounded weighted-MA callback");
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let damage_start = 2048usize;
+    assert!(damage_start > usize::try_from(stats.stream_window_bytes).unwrap() * 2);
+    assert!(encoded.len() > damage_start + 1);
+    let mut damaged = encoded.to_vec();
+    damaged[damage_start] ^= 0x5a;
+    damaged[damage_start + 1..].fill(0);
+    let mut damaged_session = decoder
+        .open(&damaged, request())
+        .expect("late ANS damage leaves the parsed MA configuration intact");
+    assert_eq!(
+        damaged_session
+            .submission_session()
+            .memory_stats()
+            .entropy_coding,
+        jxl_wgpu_decode::ModularEntropyCoding::Ans
+    );
+    let error = damaged_session
+        .next_frame()
+        .expect_err("damage after the initial ANS windows must fail GPU validation");
+    assert!(
+        matches!(
+            error,
+            jxl_wgpu_decode::Error::ModularEntropyRejected { group_index: 0, .. }
+        ),
+        "unexpected late-window ANS error: {error}"
+    );
+    drop(damaged_session);
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
