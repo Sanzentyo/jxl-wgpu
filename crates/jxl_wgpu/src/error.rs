@@ -23,12 +23,18 @@ pub enum Error {
     InvalidPayload(String),
     #[error("GPU buffer size overflow")]
     BufferSizeOverflow,
+    #[error("GPU buffer cannot be submitted while an in-place CPU map is active")]
+    GpuBufferDirectMapBusy,
     #[error("generic image readback requires at least one frame")]
     ImageReadbackNoFrames,
     #[error("generic image readback frame {frame} requires at least one output")]
     ImageReadbackFrameEmpty { frame: usize },
     #[error("generic image readback frame {frame} output {output} does not have COPY_SRC usage")]
     ImageReadbackSourceUsage { frame: usize, output: usize },
+    #[error(
+        "generic image readback frame {frame} output {output} cannot be mapped directly while the buffer is reserved for GPU submission or another map"
+    )]
+    ImageReadbackDirectMapBusy { frame: usize, output: usize },
     #[error(
         "generic image readback frame {frame} output {output} buffer is too small: requires {required} bytes, has {actual}"
     )]
@@ -99,6 +105,9 @@ impl From<Error> for BackendError {
             }
             Error::ResourceLimit(message) => Self::ResourceLimit(message),
             Error::BufferSizeOverflow => Self::ResourceLimit("GPU buffer size overflow".into()),
+            Error::GpuBufferDirectMapBusy => Self::ResourceLimit(
+                "GPU buffer cannot be submitted while an in-place CPU map is active".into(),
+            ),
             Error::ImageReadbackNoFrames => {
                 Self::InvalidPayload("generic image readback has no frames".into())
             }
@@ -107,6 +116,9 @@ impl From<Error> for BackendError {
             )),
             Error::ImageReadbackSourceUsage { frame, output } => Self::InvalidPayload(format!(
                 "generic image readback frame {frame} output {output} does not have COPY_SRC usage"
+            )),
+            Error::ImageReadbackDirectMapBusy { frame, output } => Self::ResourceLimit(format!(
+                "generic image readback frame {frame} output {output} cannot be mapped directly while the buffer is busy"
             )),
             Error::ImageReadbackSourceSize {
                 frame,

@@ -16,13 +16,13 @@ use jxl_gpu_formats::{
 use jxl_gpu_protocol::{
     BlendComponent, BlendMode, BlendParams, ChromaAxis, EpfParams, EpfPass, Extent2d, GroupId,
     GroupPayload, MemoryMode, OutputColorEncoding, OutputDesc, OutputId, OutputLayout,
-    OutputOrientation, PlaneDesc, PlaneId, PlaneRole, RenderNode, RenderOp, RenderOpKind,
-    RenderPlan, ResourceData, ResourceId, ResourceUpdate, RgbColorEncoding, RgbPrimaries,
-    SampleType, TransferFunction as SourceTransferFunction,
+    OutputOrientation, PlaneDesc, PlaneId, PlaneRole, RenderNode, RenderOp, RenderPlan,
+    ResourceData, ResourceId, ResourceUpdate, RgbColorEncoding, RgbPrimaries, SampleType,
+    TransferFunction as SourceTransferFunction,
 };
 use wgpu::util::DeviceExt;
 
-use crate::autotune::KernelVariant;
+use crate::autotune::{KernelPolicy, KernelVariant};
 use crate::buffer_pool::{BufferPool, PooledBuffer};
 use crate::context::WgpuBackend;
 use crate::pipeline_cache::{PipelineCache, PipelineKey};
@@ -37,8 +37,6 @@ use crate::video::{
     ImageOutputRequest, ImageReadbackRequest, PackedImageOutput, stage_image_output,
 };
 use crate::{Error, Result};
-
-const WORKGROUP_SIZE: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputMode {
@@ -108,6 +106,8 @@ struct PipelineFactory<'a> {
     device: &'a wgpu::Device,
     cache: &'a PipelineCache,
     buffers: &'a Arc<BufferPool>,
+    kernel_policy: &'a KernelPolicy,
+    variant: KernelVariant,
 }
 
 impl Scheduler {
@@ -365,11 +365,6 @@ impl Scheduler {
             output_mode,
             output_encoding,
         )?;
-        let factory = PipelineFactory {
-            device,
-            cache: &backend.pipelines,
-            buffers: &backend.buffers,
-        };
         let alignment = resident_alignment(device);
         let slot_sizes = resident_slot_sizes(execution, alignment)?;
         let zero_required_slots = zero_required_slot_offsets(plan, execution)?;
@@ -441,6 +436,13 @@ impl Scheduler {
         let mut fused_dispatches = 0u32;
 
         for dispatch in &execution.dispatches {
+            let factory = PipelineFactory {
+                device,
+                cache: &backend.pipelines,
+                buffers: &backend.buffers,
+                kernel_policy: &backend.config.kernel_policy,
+                variant: dispatch.variant,
+            };
             match &dispatch.kernel {
                 FusedKernel::Single(expected_kind) => {
                     let [node_index] = dispatch.node_indices.as_slice() else {
@@ -1065,18 +1067,13 @@ fn validate_dispatch_metadata(plan: &RenderPlan, execution: &ExecutionPlan) -> R
                 dispatch.label
             )));
         }
-        let expected_variant = match dispatch.kernel {
-            FusedKernel::Single(RenderOpKind::VarDct) => KernelVariant::Tile8x8,
-            FusedKernel::Single(_) | FusedKernel::Chroma2d | FusedKernel::GaborishRgb => {
-                KernelVariant::Tile16x16
-            }
-        };
-        if dispatch.variant != expected_variant
-            || dispatch.workgroup_size != expected_variant.workgroup_size()
+        if dispatch.workgroup_size != dispatch.variant.workgroup_size()
+            || (!dispatch.kernel.is_workgroup_tunable()
+                && dispatch.variant != dispatch.kernel.default_variant())
         {
             return Err(Error::Execution(format!(
-                "planned dispatch '{}' does not match the fixed {:?} shader workgroup",
-                dispatch.label, expected_variant
+                "planned dispatch '{}' has incompatible {:?} workgroup metadata",
+                dispatch.label, dispatch.variant
             )));
         }
         match dispatch.kernel {
@@ -1364,6 +1361,7 @@ fn encode_copy(
         ],
         input.desc.extent.width,
         input.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1412,6 +1410,7 @@ fn encode_modular_to_f32(
         ],
         input.desc.extent.width,
         input.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1476,6 +1475,7 @@ fn encode_chroma_upsample(
         ],
         output.desc.extent.width,
         output.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1551,6 +1551,7 @@ fn encode_chroma_2d(
         ],
         output.desc.extent.width,
         output.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1600,6 +1601,7 @@ fn encode_gaborish(
         ],
         input.desc.extent.width,
         input.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1704,6 +1706,7 @@ fn encode_gaborish_rgb(
         ],
         extent.width,
         extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1833,6 +1836,7 @@ fn encode_epf(
         wgpu::include_wgsl!("../shaders/epf.wgsl"),
         entry_point,
         0x4550_4600 | pass_key,
+        factory.variant,
     );
     record_dispatch(
         device,
@@ -1850,6 +1854,7 @@ fn encode_epf(
         ],
         extent.width,
         extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1927,6 +1932,7 @@ fn encode_upsample(
         ],
         output.desc.extent.width,
         output.desc.extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -1992,6 +1998,7 @@ fn encode_ycbcr(
             ],
             extent.width,
             extent.height,
+            factory.variant,
         );
     }
     Ok(())
@@ -2089,6 +2096,7 @@ fn encode_xyb_to_rgb(
         ],
         extent.width,
         extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -2176,6 +2184,7 @@ fn encode_transfer_function(
         ],
         extent.width,
         extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -2269,6 +2278,7 @@ fn encode_blend(
         ],
         extent.width,
         extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -2346,6 +2356,7 @@ fn encode_premultiply(
             ],
             color.desc.extent.width,
             color.desc.extent.height,
+            factory.variant,
         );
     }
     if node.outputs.len() == node.inputs.len() {
@@ -2457,6 +2468,7 @@ fn encode_extend(
         ],
         image_extent.width,
         image_extent.height,
+        factory.variant,
     );
     Ok(())
 }
@@ -2544,6 +2556,7 @@ fn encode_save(
             ],
             output.extent.width,
             output.extent.height,
+            factory.variant,
         );
     }
     Ok((
@@ -2633,9 +2646,13 @@ fn encode_image_save(
         padded_size,
         output_target,
     );
+    let variant = factory
+        .kernel_policy
+        .variant_for("rgb_to_image", KernelVariant::Lanes256)?;
+    variant.validate_for("rgb_to_image", &factory.device.limits(), 0)?;
     let word_count = layout.logical_size.div_ceil(4);
     let (dispatch_x, dispatch_y, dispatch_width) =
-        linear_dispatch_shape(factory.device, word_count)?;
+        linear_dispatch_shape(factory.device, word_count, variant)?;
     let params = ImageOutputUniform {
         width: output.extent.width,
         height: output.extent.height,
@@ -2671,10 +2688,13 @@ fn encode_image_save(
         _padding: 0,
     };
     let uniform = create_uniform(factory.device, "jxl-wgpu generic image params", &params);
-    let pipeline = create_pipeline(
+    let pipeline = create_pipeline_with_variant(
         factory,
         "jxl-wgpu RGB to generic image",
         wgpu::include_wgsl!("../shaders/rgb_to_image.wgsl"),
+        "main",
+        0,
+        variant,
     );
     record_linear_dispatch(
         factory.device,
@@ -3071,7 +3091,25 @@ fn create_pipeline(
     label: &str,
     descriptor: wgpu::ShaderModuleDescriptor<'static>,
 ) -> std::sync::Arc<wgpu::ComputePipeline> {
-    create_pipeline_entry(factory, label, descriptor, "main", 0)
+    create_pipeline_with_variant(factory, label, descriptor, "main", 0, factory.variant)
+}
+
+fn create_pipeline_with_variant(
+    factory: &PipelineFactory<'_>,
+    label: &str,
+    descriptor: wgpu::ShaderModuleDescriptor<'static>,
+    entry_point: &'static str,
+    layout_hash: u64,
+    variant: KernelVariant,
+) -> std::sync::Arc<wgpu::ComputePipeline> {
+    create_pipeline_entry(
+        factory,
+        label,
+        descriptor,
+        entry_point,
+        layout_hash,
+        variant,
+    )
 }
 
 fn create_pipeline_entry(
@@ -3080,20 +3118,29 @@ fn create_pipeline_entry(
     descriptor: wgpu::ShaderModuleDescriptor<'static>,
     entry_point: &'static str,
     layout_hash: u64,
+    variant: KernelVariant,
 ) -> std::sync::Arc<wgpu::ComputePipeline> {
-    let key = PipelineKey::new(label, entry_point, KernelVariant::Tile16x16, layout_hash);
+    let key = PipelineKey::new(label, entry_point, variant, layout_hash);
     if let Some(pipeline) = factory.cache.get(&key) {
         return pipeline;
     }
     match factory.cache.get_or_insert_with(key, || {
         let module = factory.device.create_shader_module(descriptor);
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
         Ok::<_, std::convert::Infallible>(factory.device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: None,
                 module: &module,
                 entry_point: Some(entry_point),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             },
         ))
@@ -3110,6 +3157,7 @@ fn record_dispatch(
     resources: &[wgpu::BindingResource<'_>],
     width: u32,
     height: u32,
+    variant: KernelVariant,
 ) {
     let layout = pipeline.get_bind_group_layout(0);
     let entries = resources
@@ -3131,11 +3179,8 @@ fn record_dispatch(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(
-        width.div_ceil(WORKGROUP_SIZE),
-        height.div_ceil(WORKGROUP_SIZE),
-        1,
-    );
+    let (workgroup_x, workgroup_y) = variant.workgroup_size();
+    pass.dispatch_workgroups(width.div_ceil(workgroup_x), height.div_ceil(workgroup_y), 1);
 }
 
 fn record_linear_dispatch(
@@ -3169,15 +3214,21 @@ fn record_linear_dispatch(
     pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
 }
 
-fn linear_dispatch_shape(device: &wgpu::Device, word_count: u64) -> Result<(u32, u32, u32)> {
+fn linear_dispatch_shape(
+    device: &wgpu::Device,
+    word_count: u64,
+    variant: KernelVariant,
+) -> Result<(u32, u32, u32)> {
+    let (workgroup_x, workgroup_y) = variant.workgroup_size();
     let limit = device.limits().max_compute_workgroups_per_dimension;
-    let required_x = word_count.div_ceil(256);
+    let required_x = word_count.div_ceil(u64::from(workgroup_x));
     let workgroups_x =
         u32::try_from(required_x.min(u64::from(limit))).map_err(|_| Error::BufferSizeOverflow)?;
     let dispatch_width = workgroups_x
-        .checked_mul(256)
+        .checked_mul(workgroup_x)
         .ok_or(Error::BufferSizeOverflow)?;
-    let workgroups_y = u32::try_from(word_count.div_ceil(u64::from(dispatch_width)))
+    let required_y = word_count.div_ceil(u64::from(dispatch_width));
+    let workgroups_y = u32::try_from(required_y.div_ceil(u64::from(workgroup_y)))
         .map_err(|_| Error::BufferSizeOverflow)?;
     if workgroups_y > limit {
         return Err(Error::ResourceLimit(format!(
@@ -3503,16 +3554,19 @@ mod tests {
     }
 
     fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
-        let marker = format!("struct {name} {{");
-        let (_, after_marker) = shader
-            .split_once(&marker)
+        let module = naga::front::wgsl::parse_str(shader).expect("WGSL parses");
+        let ty = module
+            .types
+            .iter()
+            .map(|(_, ty)| ty)
+            .find(|ty| ty.name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
-        let (body, _) = after_marker
-            .split_once("};")
-            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
-        let actual = body
-            .lines()
-            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("WGSL type '{name}' is not a struct");
+        };
+        let actual = members
+            .iter()
+            .map(|member| member.name.as_deref().expect("WGSL struct member is named"))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected, "WGSL field-order drift for {name}");
     }

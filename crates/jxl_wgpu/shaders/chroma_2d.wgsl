@@ -1,3 +1,6 @@
+override wg_x: u32 = 16u;
+override wg_y: u32 = 16u;
+
 struct Params {
     input_width: u32,
     input_height: u32,
@@ -45,7 +48,7 @@ fn horizontal_sample(output_x: u32, input_y: i32) -> f32 {
     return fma(neighbor, 0.25, current * 0.75);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= params.output_width || gid.y >= params.output_height {
         return;

@@ -1,3 +1,6 @@
+override wg_x: u32 = 16u;
+override wg_y: u32 = 16u;
+
 struct Params {
     width: u32,
     height: u32,
@@ -377,17 +380,17 @@ fn run_epf0(gid: vec3<u32>) {
     }
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn epf0(@builtin(global_invocation_id) gid: vec3<u32>) {
     run_epf0(gid);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn epf1(@builtin(global_invocation_id) gid: vec3<u32>) {
     run_epf1(gid);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn epf2(@builtin(global_invocation_id) gid: vec3<u32>) {
     run_epf2(gid);
 }

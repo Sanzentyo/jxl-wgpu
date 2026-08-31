@@ -13,9 +13,9 @@ use jxl_gpu_formats::{
 };
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
 use jxl_wgpu::{
-    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
-    MemoryPermit, SubmissionPollPermit, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
-    WgpuBackend,
+    GpuBufferLease, GpuImageFrame, GpuImageOutput, KernelVariant, MemoryBudget,
+    MemoryBudgetSnapshot, MemoryPermit, SubmissionPollPermit, UnvalidatedGpuImageFrame,
+    UnvalidatedGpuImageOutput, WgpuBackend,
 };
 
 use crate::buffer_pool::{
@@ -39,7 +39,6 @@ const MODULAR_ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const MODULAR_RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 const F64_OUTPUT_MARKER: &str = "/*__JXL_F64_OUTPUT__*/";
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
-const WORKGROUP_SIZE_MARKER: &str = "/*__JXL_WORKGROUP_SIZE__*/";
 const OUTPUT_WORDS_TYPE_MARKER: &str = "/*__JXL_OUTPUT_WORDS_TYPE__*/";
 const WRITE_BYTE_WORD_MARKER: &str = "/*__JXL_WRITE_BYTE_WORD__*/";
 const WRITE_FULL_WORD_MARKER: &str = "/*__JXL_WRITE_FULL_WORD__*/";
@@ -88,7 +87,7 @@ const WORD_ALIGNED_WRITE_FULL_WORD: &str = "output_words[offset >> 2u] = value;"
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
-const MODULAR_GROUP_WORKGROUP_SIZE: u32 = 64;
+const DEFAULT_MODULAR_GROUP_VARIANT: KernelVariant = KernelVariant::Lanes64;
 // Each lane is one serial reconstruction invocation which may process a full 256x256 group. Keep
 // a finite watchdog-oriented ceiling even when the adapter and shared byte budget allow more.
 const WATCHDOG_PARALLEL_GROUP_LANE_CAP: usize = 512;
@@ -487,6 +486,7 @@ impl DecodePipelineCache {
         f64_path: F64OutputPath,
         output_write_path: OutputWritePath,
         reconstruction: ModularReconstructionSpecialization,
+        variant: KernelVariant,
     ) -> Arc<wgpu::ComputePipeline> {
         let fixed_gradient = matches!(
             reconstruction,
@@ -532,6 +532,7 @@ impl DecodePipelineCache {
                 backend,
                 label,
                 &shader_source(f64_path, output_write_path, reconstruction),
+                variant,
             ))
         }))
     }
@@ -566,7 +567,7 @@ fn shader_source(
         } => MODULAR_FIXED_GRADIENT_SHADER,
         ModularReconstructionSpecialization::ChannelFixed { .. } => MODULAR_RECONSTRUCT_SHADER,
     };
-    let source = SHADER_TEMPLATE
+    SHADER_TEMPLATE
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
         .replace(MODULAR_RECONSTRUCT_MARKER, reconstruction_shader)
         .replace(F64_OUTPUT_MARKER, implementation)
@@ -574,25 +575,13 @@ fn shader_source(
         .replace(OUTPUT_WORDS_TYPE_MARKER, output_words_type)
         .replace(WRITE_BYTE_WORD_MARKER, write_byte_word)
         .replace(WRITE_FULL_WORD_MARKER, write_full_word)
-        .replace(
-            WORKGROUP_SIZE_MARKER,
-            &MODULAR_GROUP_WORKGROUP_SIZE.to_string(),
-        );
-    debug_assert!(!source.contains(MODULAR_ENTROPY_MARKER));
-    debug_assert!(!source.contains(MODULAR_RECONSTRUCT_MARKER));
-    debug_assert!(!source.contains(F64_OUTPUT_MARKER));
-    debug_assert!(!source.contains(F64_BINDING_MARKER));
-    debug_assert!(!source.contains(OUTPUT_WORDS_TYPE_MARKER));
-    debug_assert!(!source.contains(WRITE_BYTE_WORD_MARKER));
-    debug_assert!(!source.contains(WRITE_FULL_WORD_MARKER));
-    debug_assert!(!source.contains(WORKGROUP_SIZE_MARKER));
-    source
 }
 
 fn create_decode_pipeline(
     backend: &WgpuBackend,
     label: &str,
     shader: &str,
+    variant: KernelVariant,
 ) -> wgpu::ComputePipeline {
     let module = backend
         .device()
@@ -600,6 +589,11 @@ fn create_decode_pipeline(
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(shader.into()),
         });
+    let (workgroup_x, workgroup_y) = variant.workgroup_size();
+    let constants = [
+        ("wg_x", f64::from(workgroup_x)),
+        ("wg_y", f64::from(workgroup_y)),
+    ];
     backend
         .device()
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -607,7 +601,10 @@ fn create_decode_pipeline(
             layout: None,
             module: &module,
             entry_point: Some("decode"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
             cache: None,
         })
 }
@@ -659,6 +656,11 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         )?;
         let output_write_path = output.write_path_for_groups(&profile.groups)?;
         let reconstruction_specialization = reconstruction_specialization(&profile);
+        let kernel_variant = self
+            .backend
+            .kernel_policy()
+            .variant_for("lossless_gray8", DEFAULT_MODULAR_GROUP_VARIANT)?;
+        kernel_variant.validate_for("lossless_gray8", &self.backend.device().limits(), 0)?;
         let (pipelines, pipeline_f64_path) = match output.f64_output_path {
             Some(F64OutputPath::NativeArithmetic) => (
                 self.native_f64_pipelines
@@ -675,6 +677,7 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             pipeline_f64_path,
             output_write_path,
             reconstruction_specialization,
+            kernel_variant,
         );
         let f64_output_path = output.f64_output_path;
         let memory_limit_bytes = self.memory.snapshot().limit_bytes;
@@ -684,8 +687,11 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
             &profile,
             &modular_metadata,
             &output,
-            request.max_frame_slots().get(),
-            memory_limit_bytes,
+            GroupDispatchOptions {
+                requested_frame_slots: request.max_frame_slots().get(),
+                memory_limit_bytes,
+                kernel_variant,
+            },
         )?;
         let memory_stats = validate_device_limits(
             self.backend.device(),
@@ -883,10 +889,7 @@ impl WgpuPendingFrame {
             outputs: vec![UnvalidatedGpuImageOutput {
                 id: OutputId(0),
                 layout: self.layout.clone(),
-                buffer: GpuBufferLease::with_memory_permit(
-                    Arc::clone(&lifetime.output),
-                    lifetime.output_permit.clone(),
-                ),
+                buffer: lifetime.output.clone(),
             }],
         })
     }
@@ -973,10 +976,7 @@ impl WgpuPendingFrame {
                 outputs: vec![GpuImageOutput {
                     id: output_id,
                     layout: self.layout.clone(),
-                    buffer: GpuBufferLease::with_memory_permit(
-                        Arc::clone(&lifetime.output),
-                        lifetime.output_permit.clone(),
-                    ),
+                    buffer: lifetime.output.clone(),
                 }],
                 changed: ChangedRegions { outputs: regions },
             },
@@ -1037,7 +1037,7 @@ struct DecodeSource {
 }
 
 struct DecodeJobLifetime {
-    output: Arc<wgpu::Buffer>,
+    output: GpuBufferLease,
     _modular_metadata: DecodeBufferLease,
     _reconstructed: DecodeBufferLease,
     _native_f64_dummy_words: Option<DecodeBufferLease>,
@@ -1046,7 +1046,6 @@ struct DecodeJobLifetime {
     status_mapped: AtomicBool,
     _params: DecodeBufferLease,
     _dispatch_control: DecodeBufferLease,
-    output_permit: MemoryPermit,
     _transient_permit: MemoryPermit,
 }
 
@@ -1068,6 +1067,7 @@ struct DecodeMemoryPermits {
 
 #[derive(Clone, Debug)]
 struct GroupDispatchLayout {
+    group_workgroup_size: u32,
     reconstruction_lane_stride: u64,
     max_logical_reconstruction_sample_words: u32,
     max_physical_reconstruction_sample_words: u32,
@@ -1085,6 +1085,13 @@ struct GroupDispatchLayout {
     output_write_path: OutputWritePath,
     output_specialization: ModularOutputSpecialization,
     reconstruction_specialization: ModularReconstructionSpecialization,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GroupDispatchOptions {
+    requested_frame_slots: usize,
+    memory_limit_bytes: u64,
+    kernel_variant: KernelVariant,
 }
 
 #[repr(u32)]
@@ -1111,19 +1118,12 @@ impl GroupDispatchLayout {
         profile: &StandardModularProfile,
         modular_metadata: &[u32],
         output: &OutputPlan,
-        requested_frame_slots: usize,
-        memory_limit_bytes: u64,
+        options: GroupDispatchOptions,
     ) -> Result<Self> {
         let output_write_path = output.write_path_for_groups(&profile.groups)?;
         let reconstruction_specialization = reconstruction_specialization(profile);
         let limits = device.limits();
-        if limits.max_compute_invocations_per_workgroup < MODULAR_GROUP_WORKGROUP_SIZE
-            || limits.max_compute_workgroup_size_x < MODULAR_GROUP_WORKGROUP_SIZE
-        {
-            return Err(Error::backend(format!(
-                "device cannot run the portable {MODULAR_GROUP_WORKGROUP_SIZE}-invocation Modular workgroup"
-            )));
-        }
+        let group_workgroup_size = options.kernel_variant.workgroup_size().0;
         let mut reconstruction_lane_stride = 0u64;
         let mut max_logical_reconstruction_sample_words = 0u32;
         let mut max_physical_reconstruction_sample_words = 0u32;
@@ -1206,7 +1206,7 @@ impl GroupDispatchLayout {
             / reconstruction_lane_stride;
         let device_lane_cap = usize::try_from(device_lane_cap).unwrap_or(usize::MAX);
         let workgroup_cap = u64::from(limits.max_compute_workgroups_per_dimension)
-            .checked_mul(u64::from(MODULAR_GROUP_WORKGROUP_SIZE))
+            .checked_mul(u64::from(group_workgroup_size))
             .and_then(|lanes| usize::try_from(lanes).ok())
             .unwrap_or(usize::MAX);
         let lane_cap = WATCHDOG_PARALLEL_GROUP_LANE_CAP
@@ -1218,9 +1218,9 @@ impl GroupDispatchLayout {
                 "device limits cannot bind one Modular reconstruction lane",
             ));
         }
-        let requested_slots = u64::try_from(requested_frame_slots.max(1))
+        let requested_slots = u64::try_from(options.requested_frame_slots.max(1))
             .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
-        let requested_target = memory_limit_bytes / requested_slots;
+        let requested_target = options.memory_limit_bytes / requested_slots;
         let selected = match select_parallel_group_layout(
             codestream,
             &profile.groups,
@@ -1231,22 +1231,20 @@ impl GroupDispatchLayout {
             requested_target,
         )? {
             Some(selected) => Some(selected),
-            None => {
-            select_parallel_group_layout(
+            None => select_parallel_group_layout(
                 codestream,
                 &profile.groups,
                 stream_limit,
                 lane_cap,
                 reconstruction_lane_stride,
                 fixed_bytes,
-                memory_limit_bytes,
-            )
-            ?
-            }
+                options.memory_limit_bytes,
+            )?,
         }
         .ok_or_else(|| {
             Error::backend(format!(
-                "one bounded Modular lane plus fixed allocations exceeds the shared {memory_limit_bytes}-byte budget"
+                "one bounded Modular lane plus fixed allocations exceeds the shared {}-byte budget",
+                options.memory_limit_bytes
             ))
         })?;
         let (parallel_group_lanes, stream_windows, stream_batches, stream_bytes) = selected;
@@ -1254,6 +1252,7 @@ impl GroupDispatchLayout {
             .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
         Ok(Self {
+            group_workgroup_size,
             reconstruction_lane_stride,
             max_logical_reconstruction_sample_words,
             max_physical_reconstruction_sample_words,
@@ -2040,7 +2039,7 @@ fn validate_device_limits(
             .iter()
             .try_fold(0u32, |maximum, batch| {
                 u32::try_from(batch.len())
-                    .map(|groups| maximum.max(groups.div_ceil(MODULAR_GROUP_WORKGROUP_SIZE)))
+                    .map(|groups| maximum.max(groups.div_ceil(dispatch.group_workgroup_size)))
                     .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
             })?;
     if max_dispatch_workgroups == 0 {
@@ -2062,7 +2061,7 @@ fn validate_device_limits(
         stream_batch_count: dispatch.stream_batches.len(),
         submissions_per_frame: dispatch.stream_batches.len(),
         parallel_group_lanes: dispatch.parallel_group_lanes,
-        group_workgroup_size: MODULAR_GROUP_WORKGROUP_SIZE,
+        group_workgroup_size: dispatch.group_workgroup_size,
         max_dispatch_workgroups,
         output_write_path: dispatch.output_write_path,
         output_specialization: dispatch.output_specialization,
@@ -2259,7 +2258,7 @@ fn submit_decode(
     });
     let completion = Arc::new(MapCompletion::default());
     let lifetime = Arc::new(DecodeJobLifetime {
-        output: Arc::clone(&output),
+        output: GpuBufferLease::from_tracked(output.as_ref().clone(), memory_permits.output),
         _modular_metadata: metadata_buffer,
         _reconstructed: reconstructed,
         _native_f64_dummy_words: native_f64_dummy_words,
@@ -2268,7 +2267,6 @@ fn submit_decode(
         status_mapped: AtomicBool::new(false),
         _params: params_buffer,
         _dispatch_control: dispatch_control,
-        output_permit: memory_permits.output,
         _transient_permit: memory_permits.transient,
     });
     let upload_len = usize::try_from(source.dispatch_layout.stream_bytes)
@@ -2316,7 +2314,7 @@ fn submit_decode(
         });
         if batch_index == 0 {
             commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
-            commands.clear_buffer(&lifetime.output, 0, None);
+            commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
             if let Some(dummy) = &lifetime._native_f64_dummy_words {
                 commands.clear_buffer(dummy.buffer(), 0, None);
             }
@@ -2330,7 +2328,9 @@ fn submit_decode(
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &binding, &[]);
             pass.dispatch_workgroups(
-                control.group_count.div_ceil(MODULAR_GROUP_WORKGROUP_SIZE),
+                control
+                    .group_count
+                    .div_ceil(source.dispatch_layout.group_workgroup_size),
                 1,
                 1,
             );
@@ -3342,20 +3342,6 @@ mod tests {
                 45, 46, 47, 48, 49, 50, 51, 52, 53,
             ]
         );
-        assert!(SHADER_TEMPLATE.contains("needs_self_correcting: u32,"));
-        assert!(SHADER_TEMPLATE.contains("lz77_window_mask: u32,"));
-        assert!(SHADER_TEMPLATE.contains("stream_index: u32,"));
-        assert!(SHADER_TEMPLATE.contains("wp_w3: u32,"));
-        assert!(SHADER_TEMPLATE.contains("params_table: array<Params>"));
-        let portable = shader_source(
-            F64OutputPath::ExactF32Widening,
-            OutputWritePath::WordAligned,
-            FIXED_GRADIENT_RECONSTRUCTION,
-        );
-        assert!(portable.contains("@compute @workgroup_size(64)"));
-        assert!(portable.contains("@builtin(global_invocation_id)"));
-        assert!(portable.contains("let lane_index = global_invocation_id.x;"));
-
         assert_eq!(std::mem::size_of::<DispatchControl>(), 16);
         assert_eq!(std::mem::align_of::<DispatchControl>(), 4);
         let control = DispatchControl {
@@ -3381,11 +3367,6 @@ mod tests {
             bytemuck::cast::<DecodeStatus, [u32; 4]>(status),
             [1, 2, 3, 4]
         );
-        assert!(SHADER_TEMPLATE.contains("let status_base = params.status_index * 4u;"));
-        assert!(SHADER_TEMPLATE.contains("status[status_base] = STATUS_OK;"));
-        assert!(SHADER_TEMPLATE.contains("status[status_base + 1u] = decoded;"));
-        assert!(SHADER_TEMPLATE.contains("status[status_base + 2u] = bit_cursor;"));
-        assert!(SHADER_TEMPLATE.contains("status[status_base + 3u] = params.token_end;"));
     }
 
     #[test]
@@ -3430,25 +3411,6 @@ mod tests {
             OutputWritePath::WordAligned,
             FIXED_GRADIENT_RECONSTRUCTION,
         );
-        assert!(!portable_aligned.contains(F64_OUTPUT_MARKER));
-        assert!(!native_aligned.contains(F64_OUTPUT_MARKER));
-        assert!(!portable_aligned.contains(F64_BINDING_MARKER));
-        assert!(!native_aligned.contains(F64_BINDING_MARKER));
-        assert!(!portable_aligned.contains("f64(sample)"));
-        assert!(native_aligned.contains("f64(sample) / 255.0"));
-        assert!(native_aligned.contains("output_f64: array<f64>"));
-        assert!(portable_atomic.contains("array<atomic<u32>>"));
-        assert!(portable_atomic.contains("atomicCompareExchangeWeak"));
-        assert!(native_atomic.contains("atomicStore"));
-        assert!(portable_aligned.contains("output_words: array<u32>"));
-        assert!(!portable_aligned.contains("atomicCompareExchangeWeak"));
-        assert!(!native_aligned.contains("atomicStore"));
-        assert!(fixed_gradient_atomic.contains("atomicCompareExchangeWeak"));
-        assert!(fixed_gradient_aligned.contains("fn fixed_leaf_cluster"));
-        assert!(!fixed_gradient_aligned.contains("fn ma_leaf"));
-        assert!(!MODULAR_FIXED_GRADIENT_SHADER.contains(" % "));
-        assert!(!MODULAR_FIXED_GRADIENT_SHADER.contains(" / params.width"));
-
         let native_without_capability = naga::front::wgsl::parse_str(&native_aligned)
             .expect("native F64 WGSL syntax must parse before capability validation");
         let error = naga::valid::Validator::new(

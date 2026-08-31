@@ -15,7 +15,7 @@ use jxl_gpu_protocol::{
 };
 
 use crate::arena::{ArenaPlan, ArenaPlanner};
-use crate::autotune::KernelVariant;
+use crate::autotune::{KernelPolicy, KernelVariant};
 use crate::context::WgpuMemoryPolicy;
 use crate::{Error, Result};
 
@@ -28,11 +28,46 @@ pub enum FusedKernel {
 }
 
 impl FusedKernel {
-    pub fn key(&self) -> String {
+    pub const fn key(&self) -> &'static str {
         match self {
-            Self::Single(kind) => format!("{kind:?}"),
-            Self::Chroma2d => "chroma_2d".into(),
-            Self::GaborishRgb => "gaborish_rgb".into(),
+            Self::Single(RenderOpKind::Copy) => "copy",
+            Self::Single(RenderOpKind::ModularToF32) => "modular_to_f32",
+            Self::Single(RenderOpKind::ChromaUpsample) => "chroma_upsample",
+            Self::Single(RenderOpKind::Gaborish) => "gaborish",
+            Self::Single(RenderOpKind::Epf) => "epf",
+            Self::Single(RenderOpKind::Upsample) => "upsample",
+            Self::Single(RenderOpKind::VarDct) => "vardct",
+            Self::Single(RenderOpKind::AddNoise) => "add_noise",
+            Self::Single(RenderOpKind::XybToRgb) => "xyb_to_rgb",
+            Self::Single(RenderOpKind::YcbcrToRgb) => "ycbcr_to_rgb",
+            Self::Single(RenderOpKind::TransferFunction) => "transfer_function",
+            Self::Single(RenderOpKind::Blend) => "blend",
+            Self::Single(RenderOpKind::PremultiplyAlpha) => "premultiply_alpha",
+            Self::Single(RenderOpKind::Convert) => "convert",
+            Self::Single(RenderOpKind::Extend) => "extend",
+            Self::Single(RenderOpKind::Save) => "save",
+            Self::Chroma2d => "chroma_2d",
+            Self::GaborishRgb => "gaborish_rgb",
+        }
+    }
+
+    pub const fn default_variant(&self) -> KernelVariant {
+        match self {
+            Self::Single(RenderOpKind::VarDct) => KernelVariant::Tile8x8,
+            Self::Single(_) | Self::Chroma2d | Self::GaborishRgb => KernelVariant::Tile16x16,
+        }
+    }
+
+    pub const fn is_workgroup_tunable(&self) -> bool {
+        !matches!(self, Self::Single(RenderOpKind::VarDct))
+    }
+
+    pub fn variant_for(&self, policy: &KernelPolicy) -> Result<KernelVariant> {
+        let default = self.default_variant();
+        if self.is_workgroup_tunable() {
+            policy.variant_for(self.key(), default)
+        } else {
+            Ok(default)
         }
     }
 }
@@ -72,6 +107,7 @@ pub struct ExecutionPlan {
 pub struct Planner {
     limits: wgpu::Limits,
     memory: WgpuMemoryPolicy,
+    kernel_policy: KernelPolicy,
     supported_ops: BTreeSet<RenderOpKind>,
     supports_f16: bool,
 }
@@ -81,9 +117,15 @@ impl Planner {
         Self {
             limits,
             memory,
+            kernel_policy: KernelPolicy::Default,
             supported_ops: portable_supported_ops(),
             supports_f16: false,
         }
+    }
+
+    pub fn with_kernel_policy(mut self, kernel_policy: KernelPolicy) -> Self {
+        self.kernel_policy = kernel_policy;
+        self
     }
 
     pub fn with_supported_ops(
@@ -273,18 +315,9 @@ impl Planner {
                 .unwrap_or((1, FusedKernel::Single(plan.nodes[index].op.kind())));
             let indices: Vec<_> = (index..index + length).collect();
             let nodes = &plan.nodes[index..index + length];
-            let variant = self.variant_for(&kernel);
+            let variant = kernel.variant_for(&self.kernel_policy)?;
             let workgroup_size = variant.workgroup_size();
-            if workgroup_size.0 > self.limits.max_compute_workgroup_size_x
-                || workgroup_size.1 > self.limits.max_compute_workgroup_size_y
-                || variant.invocations() > self.limits.max_compute_invocations_per_workgroup
-            {
-                return Err(Error::ResourceLimit(format!(
-                    "fixed {:?} kernel for '{}' exceeds the device workgroup limits",
-                    variant,
-                    joined_label(nodes)
-                )));
-            }
+            variant.validate_for(kernel.key(), &self.limits, 0)?;
             let extent = dispatch_extent(nodes, extents)?;
             let workgroups = (
                 extent.width.div_ceil(workgroup_size.0),
@@ -321,17 +354,6 @@ impl Planner {
             index += length;
         }
         Ok(dispatches)
-    }
-
-    fn variant_for(&self, kernel: &FusedKernel) -> KernelVariant {
-        // WGSL workgroup sizes are currently compile-time constants. Do not advertise autotuned
-        // variants until shader overrides are wired through pipeline creation.
-        match kernel {
-            FusedKernel::Single(RenderOpKind::VarDct) => KernelVariant::Tile8x8,
-            FusedKernel::Single(_) | FusedKernel::Chroma2d | FusedKernel::GaborishRgb => {
-                KernelVariant::Tile16x16
-            }
-        }
     }
 }
 
@@ -1287,6 +1309,20 @@ mod tests {
 
     use super::*;
 
+    fn tuned_policy(kernel: &str, variant: KernelVariant) -> KernelPolicy {
+        let mut profile = crate::AutotuneProfile::new(crate::AdapterFingerprint {
+            name: "planner test".into(),
+            vendor: 0,
+            device: 0,
+            device_type: "Cpu".into(),
+            backend: "Empty".into(),
+            driver: String::new(),
+            driver_info: String::new(),
+        });
+        profile.record(crate::TunedKernel::from_samples(kernel, variant, &[1, 2, 3]).unwrap());
+        KernelPolicy::Profile(profile)
+    }
+
     fn memory() -> WgpuMemoryPolicy {
         WgpuMemoryPolicy {
             max_resident_bytes: 64 * 1024 * 1024,
@@ -1354,6 +1390,16 @@ mod tests {
             )],
             outputs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn profile_selects_non_default_tier_a_variant() {
+        let execution = Planner::new(wgpu::Limits::default(), memory())
+            .with_kernel_policy(tuned_policy("copy", KernelVariant::Tile8x8))
+            .plan(&frame(MemoryMode::Resident), &copy_plan())
+            .unwrap();
+        assert_eq!(execution.dispatches[0].variant, KernelVariant::Tile8x8);
+        assert_eq!(execution.dispatches[0].workgroup_size, (8, 8));
     }
 
     #[test]

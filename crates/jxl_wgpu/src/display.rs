@@ -11,6 +11,8 @@
 //! pipeline was constructed. None of these display paths waits for the host. Once a caller owns a
 //! source buffer lease, queue ordering makes an earlier producer submission a valid dependency, and
 //! the returned texture can be sampled, rendered, or copied by later commands on that queue.
+//! Caller-owned encoder paths also take a [`GpuBufferSubmissionGuard`], which must remain alive
+//! through queue submission; convenience `submit_*` methods manage that guard automatically.
 //!
 //! This module consumes portable pitch-linear storage buffers. Native multi-plane textures and
 //! platform-specific external-memory layouts are deliberately outside this API contract.
@@ -32,9 +34,8 @@ use wgpu::util::DeviceExt;
 use crate::context::WgpuBackend;
 use crate::session::GpuOutputBuffer;
 use crate::video::{GpuImageOutput, UnvalidatedGpuImageOutput};
-use crate::{Error, Result};
+use crate::{Error, GpuBufferSubmissionGuard, KernelPolicy, KernelVariant, Result};
 
-const WORKGROUP_SIZE: u32 = 16;
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 const NUMERIC_F64_MARKER: &str = "/*__JXL_NUMERIC_F64__*/";
 
@@ -221,14 +222,17 @@ enum DisplayPipelineKey {
         channels: u8,
         layout: u8,
         destination: wgpu::TextureFormat,
+        variant: KernelVariant,
     },
     Image {
         format: DisplayImageFormat,
         destination: wgpu::TextureFormat,
+        variant: KernelVariant,
     },
     Numeric {
         native_f64: bool,
         destination: wgpu::TextureFormat,
+        variant: KernelVariant,
     },
 }
 
@@ -236,6 +240,7 @@ struct DisplayPipelineInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     native_f64_enabled: bool,
+    kernel_policy: KernelPolicy,
     pipelines: Mutex<HashMap<DisplayPipelineKey, Arc<wgpu::ComputePipeline>>>,
 }
 
@@ -261,6 +266,7 @@ impl DisplayPipeline {
             backend.device().clone(),
             backend.queue().clone(),
             backend.native_f64_enabled(),
+            backend.kernel_policy().clone(),
         )
     }
 
@@ -272,19 +278,21 @@ impl DisplayPipeline {
     /// supplied logical device exposes `wgpu::Features::SHADER_F64`.
     pub fn from_device_queue(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let native_f64_enabled = device.features().contains(wgpu::Features::SHADER_F64);
-        Self::from_device_queue_with_f64(device, queue, native_f64_enabled)
+        Self::from_device_queue_with_f64(device, queue, native_f64_enabled, KernelPolicy::Default)
     }
 
     fn from_device_queue_with_f64(
         device: wgpu::Device,
         queue: wgpu::Queue,
         native_f64_enabled: bool,
+        kernel_policy: KernelPolicy,
     ) -> Self {
         Self {
             inner: Arc::new(DisplayPipelineInner {
                 device,
                 queue,
                 native_f64_enabled,
+                kernel_policy,
                 pipelines: Mutex::new(HashMap::new()),
             }),
         }
@@ -327,8 +335,10 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &GpuOutputBuffer,
+        submission_guard: &GpuBufferSubmissionGuard,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
+        require_submission_guard(submission_guard, &source.buffer)?;
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), source.extent)?;
         require_buffer_usage(
@@ -340,17 +350,20 @@ impl DisplayPipeline {
         validate_storage_binding(self.device(), validated.binding_size)?;
 
         let texture = self.create_texture(source.extent, descriptor, "jxl-wgpu RGB display");
+        let variant = self.kernel_variant("display_rgb", KernelVariant::Tile16x16)?;
         let key = DisplayPipelineKey::Rgb {
             sample_type: validated.sample_type,
             channels: source.channels,
             layout: validated.layout,
             destination: descriptor.format,
+            variant,
         };
         let pipeline = self.compute_pipeline(
             key,
             "jxl-wgpu RGB display",
             wgpu::include_wgsl!("../shaders/display_rgb.wgsl"),
-        );
+            variant,
+        )?;
         let params = DisplayRgbParams {
             width: source.extent.width,
             height: source.extent.height,
@@ -368,6 +381,7 @@ impl DisplayPipeline {
             texture.view(),
             &params,
             source.extent,
+            variant,
             "jxl-wgpu RGB display bindings",
         );
         Ok(texture)
@@ -379,8 +393,9 @@ impl DisplayPipeline {
         source: &GpuOutputBuffer,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded("jxl-wgpu RGB display submission", |encoder| {
-            self.encode_rgb(encoder, source, descriptor)
+            self.encode_rgb(encoder, source, &submission_guard, descriptor)
         })
     }
 
@@ -395,12 +410,14 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &GpuImageOutput,
+        submission_guard: &GpuBufferSubmissionGuard,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
         self.encode_image_source(
             encoder,
             &source.layout,
             &source.buffer,
+            submission_guard,
             descriptor,
             "jxl-wgpu image display",
         )
@@ -416,12 +433,14 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &UnvalidatedGpuImageOutput,
+        submission_guard: &GpuBufferSubmissionGuard,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
         self.encode_image_source(
             encoder,
             &source.layout,
             &source.buffer,
+            submission_guard,
             descriptor,
             "jxl-wgpu unvalidated image display",
         )
@@ -432,9 +451,11 @@ impl DisplayPipeline {
         encoder: &mut wgpu::CommandEncoder,
         layout: &ImageLayout,
         buffer: &crate::GpuBufferLease,
+        submission_guard: &GpuBufferSubmissionGuard,
         descriptor: DisplayTextureDescriptor,
         label: &str,
     ) -> Result<DisplayTexture> {
+        require_submission_guard(submission_guard, buffer)?;
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), layout.extent)?;
         require_buffer_usage(
@@ -446,14 +467,17 @@ impl DisplayPipeline {
         validate_storage_binding(self.device(), validated.binding_size)?;
 
         let texture = self.create_texture(layout.extent, descriptor, label);
+        let variant = self.kernel_variant("display_image", KernelVariant::Tile16x16)?;
         let pipeline = self.compute_pipeline(
             DisplayPipelineKey::Image {
                 format: validated.format,
                 destination: descriptor.format,
+                variant,
             },
             label,
             wgpu::include_wgsl!("../shaders/display_image.wgsl"),
-        );
+            variant,
+        )?;
         let params = validated.params;
         self.record_dispatch(
             encoder,
@@ -463,6 +487,7 @@ impl DisplayPipeline {
             texture.view(),
             &params,
             layout.extent,
+            variant,
             "jxl-wgpu YUV display bindings",
         );
         Ok(texture)
@@ -474,8 +499,9 @@ impl DisplayPipeline {
         source: &GpuImageOutput,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded("jxl-wgpu YUV display submission", |encoder| {
-            self.encode_image(encoder, source, descriptor)
+            self.encode_image(encoder, source, &submission_guard, descriptor)
         })
     }
 
@@ -485,8 +511,9 @@ impl DisplayPipeline {
         source: &UnvalidatedGpuImageOutput,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded("jxl-wgpu unvalidated image display submission", |encoder| {
-            self.encode_unvalidated_image(encoder, source, descriptor)
+            self.encode_unvalidated_image(encoder, source, &submission_guard, descriptor)
         })
     }
 
@@ -501,6 +528,7 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &GpuImageOutput,
+        submission_guard: &GpuBufferSubmissionGuard,
         contract: NumericDisplayContract,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
@@ -508,6 +536,7 @@ impl DisplayPipeline {
             encoder,
             &source.layout,
             &source.buffer,
+            submission_guard,
             contract,
             descriptor,
             "jxl-wgpu numeric image display",
@@ -519,6 +548,7 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &UnvalidatedGpuImageOutput,
+        submission_guard: &GpuBufferSubmissionGuard,
         contract: NumericDisplayContract,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
@@ -526,21 +556,25 @@ impl DisplayPipeline {
             encoder,
             &source.layout,
             &source.buffer,
+            submission_guard,
             contract,
             descriptor,
             "jxl-wgpu unvalidated numeric image display",
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_numeric_image_source(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         layout: &ImageLayout,
         buffer: &crate::GpuBufferLease,
+        submission_guard: &GpuBufferSubmissionGuard,
         contract: NumericDisplayContract,
         descriptor: DisplayTextureDescriptor,
         label: &str,
     ) -> Result<DisplayTexture> {
+        require_submission_guard(submission_guard, buffer)?;
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), layout.extent)?;
         require_buffer_usage(
@@ -561,14 +595,17 @@ impl DisplayPipeline {
         };
         let mut texture = self.create_texture(layout.extent, descriptor, label);
         texture.numeric_precision = Some(precision);
+        let variant = self.kernel_variant("display_numeric", KernelVariant::Tile16x16)?;
         let pipeline = self.numeric_compute_pipeline(
             DisplayPipelineKey::Numeric {
                 native_f64,
                 destination: descriptor.format,
+                variant,
             },
             label,
             native_f64,
-        );
+            variant,
+        )?;
         self.record_numeric_dispatch(
             encoder,
             &pipeline,
@@ -578,6 +615,7 @@ impl DisplayPipeline {
             &validated.params,
             layout.extent,
             native_f64,
+            variant,
             "jxl-wgpu numeric display bindings",
         );
         Ok(texture)
@@ -590,8 +628,9 @@ impl DisplayPipeline {
         contract: NumericDisplayContract,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded("jxl-wgpu numeric image display submission", |encoder| {
-            self.encode_numeric_image(encoder, source, contract, descriptor)
+            self.encode_numeric_image(encoder, source, &submission_guard, contract, descriptor)
         })
     }
 
@@ -602,9 +641,18 @@ impl DisplayPipeline {
         contract: NumericDisplayContract,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded(
             "jxl-wgpu unvalidated numeric image display submission",
-            |encoder| self.encode_unvalidated_numeric_image(encoder, source, contract, descriptor),
+            |encoder| {
+                self.encode_unvalidated_numeric_image(
+                    encoder,
+                    source,
+                    &submission_guard,
+                    contract,
+                    descriptor,
+                )
+            },
         )
     }
 
@@ -617,8 +665,10 @@ impl DisplayPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         source: &GpuOutputBuffer,
+        submission_guard: &GpuBufferSubmissionGuard,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplayTexture> {
+        require_submission_guard(submission_guard, &source.buffer)?;
         validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), source.extent)?;
         require_buffer_usage(
@@ -666,8 +716,9 @@ impl DisplayPipeline {
         source: &GpuOutputBuffer,
         descriptor: DisplayTextureDescriptor,
     ) -> Result<DisplaySubmission> {
+        let submission_guard = source.buffer.try_acquire_gpu_submission()?;
         self.submit_encoded("jxl-wgpu RGBA8 copy submission", |encoder| {
-            self.encode_rgba8_copy(encoder, source, descriptor)
+            self.encode_rgba8_copy(encoder, source, &submission_guard, descriptor)
         })
     }
 
@@ -726,24 +777,33 @@ impl DisplayPipeline {
         key: DisplayPipelineKey,
         label: &str,
         shader: wgpu::ShaderModuleDescriptor<'static>,
-    ) -> Arc<wgpu::ComputePipeline> {
+        variant: KernelVariant,
+    ) -> Result<Arc<wgpu::ComputePipeline>> {
         let mut pipelines = self.pipelines();
         if let Some(pipeline) = pipelines.get(&key) {
-            return Arc::clone(pipeline);
+            return Ok(Arc::clone(pipeline));
         }
         let module = self.device().create_shader_module(shader);
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
         let pipeline = Arc::new(self.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: None,
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             },
         ));
         pipelines.insert(key, Arc::clone(&pipeline));
-        pipeline
+        Ok(pipeline)
     }
 
     fn numeric_compute_pipeline(
@@ -751,10 +811,11 @@ impl DisplayPipeline {
         key: DisplayPipelineKey,
         label: &str,
         native_f64: bool,
-    ) -> Arc<wgpu::ComputePipeline> {
+        variant: KernelVariant,
+    ) -> Result<Arc<wgpu::ComputePipeline>> {
         let mut pipelines = self.pipelines();
         if let Some(pipeline) = pipelines.get(&key) {
-            return Arc::clone(pipeline);
+            return Ok(Arc::clone(pipeline));
         }
         let source = numeric_shader_source(native_f64);
         let module = self
@@ -763,18 +824,32 @@ impl DisplayPipeline {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
         let pipeline = Arc::new(self.device().create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: None,
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             },
         ));
         pipelines.insert(key, Arc::clone(&pipeline));
-        pipeline
+        Ok(pipeline)
+    }
+
+    fn kernel_variant(&self, key: &str, default: KernelVariant) -> Result<KernelVariant> {
+        let variant = self.inner.kernel_policy.variant_for(key, default)?;
+        variant.validate_for(key, &self.device().limits(), 0)?;
+        Ok(variant)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -788,6 +863,7 @@ impl DisplayPipeline {
         params: &DisplayNumericParams,
         extent: Extent2d,
         native_f64: bool,
+        variant: KernelVariant,
         label: &str,
     ) {
         let uniform = self
@@ -837,9 +913,10 @@ impl DisplayPipeline {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
         pass.dispatch_workgroups(
-            extent.width.div_ceil(WORKGROUP_SIZE),
-            extent.height.div_ceil(WORKGROUP_SIZE),
+            extent.width.div_ceil(workgroup_x),
+            extent.height.div_ceil(workgroup_y),
             1,
         );
     }
@@ -854,6 +931,7 @@ impl DisplayPipeline {
         destination: &wgpu::TextureView,
         params: &T,
         extent: Extent2d,
+        variant: KernelVariant,
         label: &str,
     ) {
         let uniform = self
@@ -892,9 +970,10 @@ impl DisplayPipeline {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
         pass.dispatch_workgroups(
-            extent.width.div_ceil(WORKGROUP_SIZE),
-            extent.height.div_ceil(WORKGROUP_SIZE),
+            extent.width.div_ceil(workgroup_x),
+            extent.height.div_ceil(workgroup_y),
             1,
         );
     }
@@ -1404,6 +1483,19 @@ fn validate_image_plane_range(
     Ok(())
 }
 
+fn require_submission_guard(
+    guard: &GpuBufferSubmissionGuard,
+    buffer: &crate::GpuBufferLease,
+) -> Result<()> {
+    if guard.protects(buffer) {
+        Ok(())
+    } else {
+        Err(Error::InvalidPayload(
+            "display submission guard belongs to a different GPU buffer".into(),
+        ))
+    }
+}
+
 fn require_buffer_usage(
     buffer: &wgpu::Buffer,
     required: wgpu::BufferUsages,
@@ -1558,10 +1650,7 @@ fn numeric_shader_source(native_f64: bool) -> String {
     } else {
         PORTABLE_F64_NORMALIZATION
     };
-    let source =
-        include_str!("../shaders/display_numeric.wgsl").replace(NUMERIC_F64_MARKER, implementation);
-    debug_assert!(!source.contains(NUMERIC_F64_MARKER));
-    source
+    include_str!("../shaders/display_numeric.wgsl").replace(NUMERIC_F64_MARKER, implementation)
 }
 
 #[repr(C)]
@@ -1647,16 +1736,19 @@ mod tests {
     }
 
     fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
-        let marker = format!("struct {name} {{");
-        let (_, after_marker) = shader
-            .split_once(&marker)
+        let module = naga::front::wgsl::parse_str(shader).expect("WGSL parses");
+        let ty = module
+            .types
+            .iter()
+            .map(|(_, ty)| ty)
+            .find(|ty| ty.name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
-        let (body, _) = after_marker
-            .split_once("};")
-            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
-        let actual = body
-            .lines()
-            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("WGSL type '{name}' is not a struct");
+        };
+        let actual = members
+            .iter()
+            .map(|member| member.name.as_deref().expect("WGSL struct member is named"))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected, "WGSL field-order drift for {name}");
     }
@@ -1897,7 +1989,7 @@ mod tests {
         };
         assert_eq!(abi_words(&numeric), (1..=16).collect::<Vec<_>>());
         assert_wgsl_fields(
-            include_str!("../shaders/display_numeric.wgsl"),
+            &numeric_shader_source(false),
             "NumericParams",
             &[
                 "width",
@@ -1999,6 +2091,7 @@ mod tests {
         let base = DisplayPipelineKey::Image {
             format,
             destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
         };
         let matrix = DisplayPipelineKey::Image {
             format: DisplayImageFormat {
@@ -2006,14 +2099,17 @@ mod tests {
                 ..format
             },
             destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
         };
         let range = DisplayPipelineKey::Image {
             format: DisplayImageFormat { range: 0, ..format },
             destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
         };
         let planar = DisplayPipelineKey::Image {
             format: DisplayImageFormat { kind: 4, ..format },
             destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
         };
         let transfer = DisplayPipelineKey::Image {
             format: DisplayImageFormat {
@@ -2021,6 +2117,7 @@ mod tests {
                 ..format
             },
             destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
         };
         assert_ne!(base, matrix);
         assert_ne!(base, range);

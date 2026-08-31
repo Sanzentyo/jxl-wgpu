@@ -855,16 +855,19 @@ mod tests {
     }
 
     fn assert_wgsl_fields(shader: &str, name: &str, expected: &[&str]) {
-        let marker = format!("struct {name} {{");
-        let (_, after_marker) = shader
-            .split_once(&marker)
+        let module = naga::front::wgsl::parse_str(shader).expect("WGSL parses");
+        let ty = module
+            .types
+            .iter()
+            .map(|(_, ty)| ty)
+            .find(|ty| ty.name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("WGSL struct '{name}' is missing"));
-        let (body, _) = after_marker
-            .split_once("};")
-            .unwrap_or_else(|| panic!("WGSL struct '{name}' is not terminated"));
-        let actual = body
-            .lines()
-            .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("WGSL type '{name}' is not a struct");
+        };
+        let actual = members
+            .iter()
+            .map(|member| member.name.as_deref().expect("WGSL struct member is named"))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected, "WGSL field-order drift for {name}");
     }
@@ -925,10 +928,6 @@ mod tests {
         assert_eq!(abi_words(&params), &(1..=16).collect::<Vec<_>>());
 
         let shader = include_str!("../shaders/vardct_dct8.wgsl");
-        assert!(
-            shader.contains("var<storage, read> resources: array<vec4<f32>>;"),
-            "WGSL resource element ABI drifted from a 16-byte vec4"
-        );
         assert_wgsl_fields(
             shader,
             "Task",

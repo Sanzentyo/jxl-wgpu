@@ -367,7 +367,10 @@ impl WgpuFrameSession {
                 channels: output.channels,
                 layout: output.layout,
                 logical_size: output.logical_size,
-                buffer: GpuBufferLease::with_memory_permit(output.buffer, memory_permit.clone()),
+                buffer: GpuBufferLease::from_tracked(
+                    output.buffer.as_ref().clone(),
+                    memory_permit.clone(),
+                ),
             })
             .collect();
         let token = self.allocate_token()?;
@@ -489,7 +492,10 @@ impl WgpuFrameSession {
             .map(|output| GpuImageOutput {
                 id: output.id,
                 layout: output.layout,
-                buffer: GpuBufferLease::with_memory_permit(output.buffer, memory_permit.clone()),
+                buffer: GpuBufferLease::from_tracked(
+                    output.buffer.as_ref().clone(),
+                    memory_permit.clone(),
+                ),
             })
             .collect();
         let token = self.allocate_token()?;
@@ -2369,7 +2375,7 @@ mod tests {
             outputs: vec![GpuImageOutput {
                 id: OutputId(99),
                 layout,
-                buffer: GpuBufferLease::new(source),
+                buffer: GpuBufferLease::from_external(source.as_ref().clone()),
             }],
             changed: ChangedRegions::default(),
         };

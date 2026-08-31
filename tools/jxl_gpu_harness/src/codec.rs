@@ -1564,6 +1564,13 @@ fn readback_issue(error: jxl_wgpu::Error) -> CodecIssue {
             "poll_admission",
             error.to_string(),
         ),
+        jxl_wgpu::Error::GpuBufferDirectMapBusy
+        | jxl_wgpu::Error::ImageReadbackDirectMapBusy { .. } => CodecIssue::new(
+            CodecIssueKind::Backend,
+            "cpu_readback",
+            "buffer_busy",
+            error.to_string(),
+        ),
         jxl_wgpu::Error::Unsupported(detail) => CodecIssue::new(
             CodecIssueKind::Unsupported,
             "cpu_readback",
@@ -2009,7 +2016,7 @@ mod tests {
             outputs: vec![GpuImageOutput {
                 id: jxl_gpu_protocol::OutputId(token),
                 layout: layout.clone(),
-                buffer: jxl_wgpu::GpuBufferLease::new(Arc::new(
+                buffer: jxl_wgpu::GpuBufferLease::from_external(
                     backend
                         .device()
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2017,7 +2024,7 @@ mod tests {
                             contents: &[fill; 12],
                             usage: wgpu::BufferUsages::COPY_SRC,
                         }),
-                )),
+                ),
             }],
             changed: jxl_gpu_protocol::ChangedRegions::default(),
         }
@@ -2232,6 +2239,7 @@ mod tests {
                 max_transient_bytes: 24,
                 max_in_flight_bytes: 24,
             },
+            jxl_wgpu::ImageReadbackMapping::StagingOnly,
         )
         .unwrap();
         let pending = pipeline.submit_frames(&frames).unwrap();

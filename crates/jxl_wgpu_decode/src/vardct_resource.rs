@@ -1,6 +1,7 @@
 //! Default resource table and LF dequantization for the strict zero-AC VarDCT profile.
 
 use bytemuck::{Pod, Zeroable};
+use jxl_wgpu::KernelVariant;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -101,6 +102,10 @@ impl VarDctResourceLayout {
 pub enum VarDctResourceError {
     #[error("VarDCT resource arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("VarDCT resource preparation requires a linear workgroup, got {variant:?}")]
+    WorkgroupShape { variant: KernelVariant },
+    #[error("VarDCT resource workgroup variant {variant:?} exceeds device limits")]
+    WorkgroupVariant { variant: KernelVariant },
 }
 
 /// Exact 64-byte LF preparation uniform.
@@ -136,8 +141,8 @@ impl VarDctResourceParams {
     }
 
     #[must_use]
-    pub const fn dispatch(self) -> u32 {
-        self.geometry[2].div_ceil(64)
+    pub const fn dispatch_with_variant(self, variant: KernelVariant) -> u32 {
+        self.geometry[2].div_ceil(variant.workgroup_size().0)
     }
 
     #[must_use]
@@ -154,24 +159,52 @@ pub struct VarDctResourceBuffers<'a> {
 
 pub struct VarDctResourcePipeline {
     pipeline: wgpu::ComputePipeline,
+    variant: KernelVariant,
+}
+
+fn validate_workgroup_variant(
+    variant: KernelVariant,
+    limits: &wgpu::Limits,
+) -> Result<(), VarDctResourceError> {
+    if !variant.is_linear() {
+        return Err(VarDctResourceError::WorkgroupShape { variant });
+    }
+    variant
+        .validate_for("vardct_resource", limits, 0)
+        .map_err(|_| VarDctResourceError::WorkgroupVariant { variant })
 }
 
 impl VarDctResourcePipeline {
-    #[must_use]
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device) -> Result<Self, VarDctResourceError> {
+        Self::with_variant(device, KernelVariant::Lanes64)
+    }
+
+    pub fn with_variant(
+        device: &wgpu::Device,
+        variant: KernelVariant,
+    ) -> Result<Self, VarDctResourceError> {
+        validate_workgroup_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jxl-wgpu VarDCT LF resource preparation"),
             source: wgpu::ShaderSource::Wgsl(RESOURCE_SHADER.into()),
         });
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("jxl-wgpu VarDCT LF resource preparation"),
             layout: None,
             module: &module,
             entry_point: Some("prepare_lf"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
             cache: None,
         });
-        Self { pipeline }
+        Ok(Self { pipeline, variant })
     }
 
     pub fn encode(
@@ -201,7 +234,7 @@ impl VarDctResourcePipeline {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(params.dispatch(), 1, 1);
+        pass.dispatch_workgroups(params.dispatch_with_variant(self.variant), 1, 1);
         drop(pass);
         uniform
     }
@@ -249,5 +282,16 @@ mod tests {
         assert_eq!(layout.lf_offset, 7);
         let values = layout.initial_values();
         assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
+    }
+
+    #[test]
+    fn tiled_workgroup_is_rejected_before_pipeline_creation() {
+        assert_eq!(
+            validate_workgroup_variant(KernelVariant::Tile8x8, &wgpu::Limits::default())
+                .unwrap_err(),
+            VarDctResourceError::WorkgroupShape {
+                variant: KernelVariant::Tile8x8,
+            }
+        );
     }
 }

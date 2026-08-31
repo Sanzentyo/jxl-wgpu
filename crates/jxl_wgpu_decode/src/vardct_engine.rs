@@ -26,11 +26,11 @@ use jxl_gpu_protocol::{
     ChangedRegions, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
 };
 use jxl_wgpu::{
-    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
-    MemoryPermit, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
-    ResidentVarDctMemoryPlan, ResidentVarDctOutputPlane, ResidentVarDctRenderConfig,
-    ResidentVarDctRenderer, ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
-    UnvalidatedGpuImageOutput, WgpuBackend,
+    GpuBufferLease, GpuImageFrame, GpuImageOutput, KernelVariant, MemoryBudget,
+    MemoryBudgetSnapshot, MemoryPermit, ResidentStorageBinding, ResidentVarDctError,
+    ResidentVarDctInputs, ResidentVarDctMemoryPlan, ResidentVarDctOutputPlane,
+    ResidentVarDctRenderConfig, ResidentVarDctRenderer, ResidentVarDctScratch,
+    SubmissionPollPermit, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
 };
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -117,6 +117,11 @@ pub enum VarDctDecodeError {
     StatusAbi { status: &'static str },
     #[error("VarDCT GPU completion was consumed more than once")]
     CompletionConsumed,
+    #[error("VarDCT kernel '{kernel}' configuration failed: {message}")]
+    KernelPolicy {
+        kernel: &'static str,
+        message: String,
+    },
 }
 
 /// Exact canonical output supported by [`VarDctSubmissionEngine`].
@@ -303,19 +308,47 @@ struct VarDctPipelines {
     artifact: HfMetadataLoweringPipeline,
     renderer: ResidentVarDctRenderer,
     output: VarDctOutputPacker,
+    output_variant: KernelVariant,
 }
 
 impl VarDctPipelines {
-    fn new(device: &wgpu::Device) -> Self {
-        Self {
+    fn new(backend: &WgpuBackend) -> Result<Self, VarDctDecodeError> {
+        let resource_variant =
+            resolve_kernel_variant(backend, "vardct_resource", KernelVariant::Lanes64)?;
+        let output_variant =
+            resolve_kernel_variant(backend, "vardct_output", KernelVariant::Lanes256)?;
+        let device = backend.device();
+        Ok(Self {
             packet: VarDctPacketPipeline::new(device),
-            resource: VarDctResourcePipeline::new(device),
+            resource: VarDctResourcePipeline::with_variant(device, resource_variant)?,
             adaptive_lf: AdaptiveLfPipeline::new(device),
             artifact: HfMetadataLoweringPipeline::new(device),
             renderer: ResidentVarDctRenderer::new(device),
-            output: VarDctOutputPacker::new(device),
-        }
+            output: VarDctOutputPacker::with_variant(device, output_variant)?,
+            output_variant,
+        })
     }
+}
+
+fn resolve_kernel_variant(
+    backend: &WgpuBackend,
+    kernel: &'static str,
+    default: KernelVariant,
+) -> Result<KernelVariant, VarDctDecodeError> {
+    let variant = backend
+        .kernel_policy()
+        .variant_for(kernel, default)
+        .map_err(|error| VarDctDecodeError::KernelPolicy {
+            kernel,
+            message: error.to_string(),
+        })?;
+    variant
+        .validate_for(kernel, &backend.device().limits(), 0)
+        .map_err(|error| VarDctDecodeError::KernelPolicy {
+            kernel,
+            message: error.to_string(),
+        })?;
+    Ok(variant)
 }
 
 /// GPU-only submission engine for the strict standard zero-AC regular-VarDCT profile.
@@ -327,21 +360,22 @@ pub struct VarDctSubmissionEngine {
 }
 
 impl VarDctSubmissionEngine {
-    #[must_use]
-    pub fn new(backend: WgpuBackend) -> Self {
+    pub fn new(backend: WgpuBackend) -> Result<Self, VarDctDecodeError> {
         let memory = backend.transient_memory_budget().clone();
         Self::with_memory_budget(backend, memory)
     }
 
     /// Uses an explicitly shared byte budget for output, entropy, render, and validation buffers.
-    #[must_use]
-    pub fn with_memory_budget(backend: WgpuBackend, memory: MemoryBudget) -> Self {
-        let pipelines = Arc::new(VarDctPipelines::new(backend.device()));
-        Self {
+    pub fn with_memory_budget(
+        backend: WgpuBackend,
+        memory: MemoryBudget,
+    ) -> Result<Self, VarDctDecodeError> {
+        let pipelines = Arc::new(VarDctPipelines::new(&backend)?);
+        Ok(Self {
             backend,
             pipelines,
             memory,
-        }
+        })
     }
 
     #[must_use]
@@ -407,7 +441,13 @@ impl GpuSubmissionEngine for VarDctSubmissionEngine {
                 .map_err(|_| DecodeError::backend("VarDCT codestream size exceeds u64"))?,
             ..InventoryLimits::default()
         })?;
-        let source = prepare_source(&self.backend, codestream, request, &inventory)?;
+        let source = prepare_source(
+            &self.backend,
+            codestream,
+            request,
+            &inventory,
+            self.pipelines.output_variant,
+        )?;
         let extent = source.layout.extent;
         let profile = DecodeProfile::VarDctRegular {
             bits_per_sample: 8,
@@ -433,6 +473,7 @@ fn prepare_source(
     codestream: GpuCodestream,
     request: &GpuOutputRequest,
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
+    output_variant: KernelVariant,
 ) -> Result<VarDctSource, VarDctDecodeError> {
     if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
         return Err(VarDctDecodeError::UnsupportedOutput);
@@ -516,10 +557,11 @@ fn prepare_source(
         VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
     )?;
     let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
-    let output_plan = VarDctOutputPlan::for_limits(
+    let output_plan = VarDctOutputPlan::for_limits_with_variant(
         packet.profile.width,
         packet.profile.height,
         &backend.device().limits(),
+        output_variant,
     )?;
     let layout = ImageLayout::packed(
         Extent2d::new(packet.profile.width, packet.profile.height),
@@ -717,10 +759,9 @@ struct VarDctMemoryPermits {
 }
 
 struct VarDctJobLifetime {
-    output: Arc<wgpu::Buffer>,
+    output: GpuBufferLease,
     status_staging: wgpu::Buffer,
     status_mapped: AtomicBool,
-    output_permit: MemoryPermit,
     _transient_permit: MemoryPermit,
     _codestream: wgpu::Buffer,
     _modular_metadata: wgpu::Buffer,
@@ -789,10 +830,7 @@ impl VarDctPendingFrame {
             outputs: vec![UnvalidatedGpuImageOutput {
                 id: OutputId(0),
                 layout: self.layout.clone(),
-                buffer: GpuBufferLease::with_memory_permit(
-                    Arc::clone(&lifetime.output),
-                    lifetime.output_permit.clone(),
-                ),
+                buffer: lifetime.output.clone(),
             }],
         })
     }
@@ -890,10 +928,7 @@ impl VarDctPendingFrame {
                 outputs: vec![GpuImageOutput {
                     id: output_id,
                     layout: self.layout.clone(),
-                    buffer: GpuBufferLease::with_memory_permit(
-                        Arc::clone(&lifetime.output),
-                        lifetime.output_permit.clone(),
-                    ),
+                    buffer: lifetime.output.clone(),
                 }],
                 changed: ChangedRegions { outputs: regions },
             },
@@ -1257,10 +1292,9 @@ fn submit_vardct(
 
     let completion = Arc::new(MapCompletion::default());
     let lifetime = Arc::new(VarDctJobLifetime {
-        output: Arc::clone(&output),
+        output: GpuBufferLease::from_tracked(output.as_ref().clone(), permits.output),
         status_staging,
         status_mapped: AtomicBool::new(false),
-        output_permit: permits.output,
         _transient_permit: permits.transient,
         _codestream: codestream_buffer,
         _modular_metadata: modular_metadata,
@@ -1404,9 +1438,8 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl GpuDecoder<VarDctSubmissionEngine> {
     /// Constructs the bounded standard VarDCT GPU decoder on an existing backend.
-    #[must_use]
-    pub fn vardct_wgpu(backend: WgpuBackend) -> Self {
-        Self::new(VarDctSubmissionEngine::new(backend))
+    pub fn vardct_wgpu(backend: WgpuBackend) -> Result<Self, VarDctDecodeError> {
+        Ok(Self::new(VarDctSubmissionEngine::new(backend)?))
     }
 }
 

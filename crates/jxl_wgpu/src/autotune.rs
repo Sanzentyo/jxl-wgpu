@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-const PROFILE_VERSION: u32 = 1;
+const PROFILE_VERSION: u32 = 2;
 
 /// Stable-enough adapter identity for rejecting stale tuning data.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -47,6 +47,10 @@ impl AdapterFingerprint {
 #[serde(rename_all = "snake_case")]
 pub enum KernelVariant {
     Scalar,
+    Lanes32,
+    Lanes64,
+    Lanes128,
+    Lanes256,
     Tile8x8,
     Tile16x8,
     #[default]
@@ -55,8 +59,12 @@ pub enum KernelVariant {
 }
 
 impl KernelVariant {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::Scalar,
+        Self::Lanes32,
+        Self::Lanes64,
+        Self::Lanes128,
+        Self::Lanes256,
         Self::Tile8x8,
         Self::Tile16x8,
         Self::Tile16x16,
@@ -66,6 +74,10 @@ impl KernelVariant {
     pub const fn workgroup_size(self) -> (u32, u32) {
         match self {
             Self::Scalar => (1, 1),
+            Self::Lanes32 => (32, 1),
+            Self::Lanes64 => (64, 1),
+            Self::Lanes128 => (128, 1),
+            Self::Lanes256 => (256, 1),
             Self::Tile8x8 => (8, 8),
             Self::Tile16x8 => (16, 8),
             Self::Tile16x16 => (16, 16),
@@ -76,6 +88,38 @@ impl KernelVariant {
     pub const fn invocations(self) -> u32 {
         let (x, y) = self.workgroup_size();
         x * y
+    }
+
+    pub const fn is_linear(self) -> bool {
+        matches!(
+            self,
+            Self::Scalar | Self::Lanes32 | Self::Lanes64 | Self::Lanes128 | Self::Lanes256
+        )
+    }
+
+    /// Rejects a selected workgroup before wgpu pipeline validation.
+    pub fn validate_for(
+        self,
+        kernel: &str,
+        limits: &wgpu::Limits,
+        workgroup_storage_bytes: u32,
+    ) -> Result<()> {
+        let (x, y) = self.workgroup_size();
+        if x > limits.max_compute_workgroup_size_x
+            || y > limits.max_compute_workgroup_size_y
+            || self.invocations() > limits.max_compute_invocations_per_workgroup
+            || workgroup_storage_bytes > limits.max_compute_workgroup_storage_size
+        {
+            return Err(Error::ResourceLimit(format!(
+                "kernel '{kernel}' selected {self:?} ({x}x{y}, {} invocations, {workgroup_storage_bytes} workgroup-storage bytes), exceeding device limits {}x{}, {} invocations, {} workgroup-storage bytes",
+                self.invocations(),
+                limits.max_compute_workgroup_size_x,
+                limits.max_compute_workgroup_size_y,
+                limits.max_compute_invocations_per_workgroup,
+                limits.max_compute_workgroup_storage_size,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -125,6 +169,61 @@ pub struct AutotuneProfile {
     pub kernels: BTreeMap<String, TunedKernel>,
 }
 
+/// Runtime selection policy for size-agnostic compute kernels.
+#[derive(Clone, Debug, Default)]
+pub enum KernelPolicy {
+    /// Use the built-in variant for every kernel.
+    #[default]
+    Default,
+    /// Use measured variants when present and built-in variants for missing kernel keys.
+    Profile(AutotuneProfile),
+}
+
+impl KernelPolicy {
+    pub fn variant_for(&self, kernel: &str, default: KernelVariant) -> Result<KernelVariant> {
+        let selected = match self {
+            Self::Default => default,
+            Self::Profile(profile) => {
+                if profile.version != PROFILE_VERSION {
+                    return Err(profile_version_error(profile.version));
+                }
+                profile.best_variant(kernel).unwrap_or(default)
+            }
+        };
+        if selected != KernelVariant::Scalar
+            && default != KernelVariant::Scalar
+            && selected.is_linear() != default.is_linear()
+        {
+            return Err(Error::Unsupported(format!(
+                "autotune kernel '{kernel}' selects incompatible {selected:?} workgroup shape; expected a {} variant",
+                if default.is_linear() {
+                    "linear"
+                } else {
+                    "tiled"
+                }
+            )));
+        }
+        Ok(selected)
+    }
+
+    pub fn validate_adapter(&self, info: &wgpu::AdapterInfo) -> Result<()> {
+        let Self::Profile(profile) = self else {
+            return Ok(());
+        };
+        if profile.version != PROFILE_VERSION {
+            return Err(profile_version_error(profile.version));
+        }
+        let actual = AdapterFingerprint::from_adapter_info(info);
+        if profile.adapter != actual {
+            return Err(Error::Unsupported(format!(
+                "autotune profile adapter {:?} does not match selected adapter {:?}",
+                profile.adapter, actual
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl AutotuneProfile {
     pub fn new(adapter: AdapterFingerprint) -> Self {
         Self {
@@ -157,10 +256,7 @@ impl AutotuneProfile {
     pub fn from_json(json: &str) -> Result<Self> {
         let profile: Self = serde_json::from_str(json)?;
         if profile.version != PROFILE_VERSION {
-            return Err(Error::Unsupported(format!(
-                "autotune profile version {} is unsupported (expected {PROFILE_VERSION})",
-                profile.version
-            )));
+            return Err(profile_version_error(profile.version));
         }
         Ok(profile)
     }
@@ -179,6 +275,12 @@ impl AutotuneProfile {
         std::fs::write(path, self.to_json()?)?;
         Ok(())
     }
+}
+
+fn profile_version_error(version: u32) -> Error {
+    Error::Unsupported(format!(
+        "autotune profile version {version} is unsupported (expected {PROFILE_VERSION})"
+    ))
 }
 
 #[cfg(test)]
@@ -222,15 +324,31 @@ mod tests {
     #[test]
     fn json_round_trip_is_versioned() {
         let mut profile = AutotuneProfile::new(fingerprint());
-        profile
-            .record(TunedKernel::from_samples("copy", KernelVariant::Scalar, &[5, 6, 7]).unwrap());
+        for variant in KernelVariant::ALL {
+            profile.record(
+                TunedKernel::from_samples(format!("kernel-{variant:?}"), variant, &[5, 6, 7])
+                    .unwrap(),
+            );
+        }
         let json = profile.to_json().unwrap();
         assert_eq!(AutotuneProfile::from_json(&json).unwrap(), profile);
 
-        let incompatible = json.replacen("\"version\": 1", "\"version\": 2", 1);
+        let incompatible = json.replacen("\"version\": 2", "\"version\": 1", 1);
         assert!(matches!(
             AutotuneProfile::from_json(&incompatible),
             Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn kernel_policy_rejects_incompatible_shape_classes() {
+        let mut profile = AutotuneProfile::new(fingerprint());
+        profile
+            .record(TunedKernel::from_samples("copy", KernelVariant::Lanes64, &[5, 6, 7]).unwrap());
+        let policy = KernelPolicy::Profile(profile);
+        assert!(matches!(
+            policy.variant_for("copy", KernelVariant::Tile16x16),
+            Err(Error::Unsupported(message)) if message.contains("incompatible")
         ));
     }
 
@@ -242,5 +360,26 @@ mod tests {
             assert_ne!(x, 0);
             assert_ne!(y, 0);
         }
+    }
+
+    #[test]
+    fn variant_limit_failure_is_typed_before_pipeline_creation() {
+        let mut limits = wgpu::Limits {
+            max_compute_workgroup_size_x: 64,
+            max_compute_invocations_per_workgroup: 64,
+            ..wgpu::Limits::default()
+        };
+        assert!(matches!(
+            KernelVariant::Lanes128.validate_for("test-linear", &limits, 0),
+            Err(Error::ResourceLimit(message)) if message.contains("Lanes128")
+        ));
+
+        limits.max_compute_workgroup_size_x = 256;
+        limits.max_compute_invocations_per_workgroup = 256;
+        limits.max_compute_workgroup_storage_size = 32;
+        assert!(matches!(
+            KernelVariant::Lanes64.validate_for("test-storage", &limits, 64),
+            Err(Error::ResourceLimit(message)) if message.contains("workgroup-storage")
+        ));
     }
 }

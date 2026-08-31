@@ -16,7 +16,9 @@ use crate::buffer_pool::{BufferPool, WgpuBufferPoolStats};
 use crate::capability::capabilities;
 use crate::pipeline_cache::PipelineCache;
 use crate::session::WgpuFrameSession;
-use crate::{Error, MemoryBudget, MemoryBudgetSnapshot, Planner, Result, SubmissionPoller};
+use crate::{
+    Error, KernelPolicy, MemoryBudget, MemoryBudgetSnapshot, Planner, Result, SubmissionPoller,
+};
 
 #[derive(Clone, Debug)]
 pub struct WgpuMemoryPolicy {
@@ -92,6 +94,8 @@ pub struct WgpuBackendConfig {
     pub direct_readback_policy: DirectReadbackPolicy,
     /// Controls optional native double-precision shader arithmetic.
     pub shader_f64_policy: ShaderF64Policy,
+    /// Selects built-in or adapter-specific workgroup variants for size-agnostic kernels.
+    pub kernel_policy: KernelPolicy,
     pub enable_timestamps: bool,
     pub strict_features: bool,
 }
@@ -104,6 +108,7 @@ impl Default for WgpuBackendConfig {
             memory: WgpuMemoryPolicy::default(),
             direct_readback_policy: DirectReadbackPolicy::Auto,
             shader_f64_policy: ShaderF64Policy::Auto,
+            kernel_policy: KernelPolicy::Default,
             enable_timestamps: true,
             strict_features: false,
         }
@@ -141,6 +146,7 @@ impl WgpuBackend {
         info: wgpu::AdapterInfo,
         config: WgpuBackendConfig,
     ) -> Result<Self> {
+        config.kernel_policy.validate_adapter(&info)?;
         if config.enable_timestamps
             && config.strict_features
             && !device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
@@ -279,6 +285,12 @@ impl WgpuBackend {
         &self.info
     }
 
+    /// Returns the configured workgroup-variant selection policy.
+    #[must_use]
+    pub const fn kernel_policy(&self) -> &KernelPolicy {
+        &self.config.kernel_policy
+    }
+
     /// Whether CPU submissions can use direct mapping on this configured device.
     pub fn direct_readback_enabled(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
@@ -328,8 +340,9 @@ impl WgpuBackend {
         plan: Arc<RenderPlan>,
     ) -> Result<WgpuFrameSession> {
         plan.validate()?;
-        let execution =
-            Planner::new(self.device.limits(), self.config.memory.clone()).plan(frame, &plan)?;
+        let execution = Planner::new(self.device.limits(), self.config.memory.clone())
+            .with_kernel_policy(self.config.kernel_policy.clone())
+            .plan(frame, &plan)?;
         WgpuFrameSession::new(self.clone(), frame.clone(), plan, execution)
     }
 }

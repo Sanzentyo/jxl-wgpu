@@ -1,3 +1,6 @@
+override wg_x: u32 = 256u;
+override wg_y: u32 = 1u;
+
 struct Params {
     width: u32,
     height: u32,
@@ -315,7 +318,7 @@ fn byte_at(index: u32) -> u32 {
     return 0u;
 }
 
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let word_index = gid.y * params.dispatch_width + gid.x;
     let byte_index = word_index * 4u;

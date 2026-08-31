@@ -43,7 +43,7 @@ mod vardct_general;
 mod video;
 
 pub use arena::{ArenaAllocation, ArenaPlan, ArenaPlanner};
-pub use autotune::{AdapterFingerprint, AutotuneProfile, KernelVariant, TunedKernel};
+pub use autotune::{AdapterFingerprint, AutotuneProfile, KernelPolicy, KernelVariant, TunedKernel};
 pub use buffer_pool::WgpuBufferPoolStats;
 pub use context::{
     DirectReadbackPolicy, ShaderF64Policy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy,
@@ -71,8 +71,8 @@ pub use poller::{
 };
 pub use readback::{
     ImageReadbackBatchResult, ImageReadbackBatchSubmission, ImageReadbackLimits,
-    ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats, ImageReadbackSubmission,
-    UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
+    ImageReadbackMapping, ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats,
+    ImageReadbackSubmission, UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
 };
 pub use resident_vardct::{
     ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs, ResidentVarDctMemoryPlan,
@@ -83,6 +83,6 @@ pub use session::{
     GpuFrame, GpuOutputBuffer, SubmissionMode, WgpuFrameSession, WgpuSubmissionStats,
 };
 pub use video::{
-    CpuImageFrame, CpuImageOutput, GpuBufferLease, GpuImageFrame, GpuImageOutput,
-    ImageOutputRequest, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
+    CpuImageFrame, CpuImageOutput, GpuBufferLease, GpuBufferSubmissionGuard, GpuImageFrame,
+    GpuImageOutput, ImageOutputRequest, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
 };

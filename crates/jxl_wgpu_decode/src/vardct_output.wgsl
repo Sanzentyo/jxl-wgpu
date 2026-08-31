@@ -1,3 +1,6 @@
+override wg_x: u32 = 256u;
+override wg_y: u32 = 1u;
+
 struct Params {
     width: u32,
     height: u32,
@@ -100,7 +103,7 @@ fn pack_rgb8_word(word_index: u32) -> u32 {
         | (second.b << 24u);
 }
 
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn pack_rgb8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let word_index = gid.y * params.dispatch_width + gid.x;
     if (word_index >= params.output_word_count) {

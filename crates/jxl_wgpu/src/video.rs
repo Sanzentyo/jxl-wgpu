@@ -11,7 +11,7 @@
 //! concrete wgpu session (or the core trait must gain an output-request hook) before this API can
 //! provide end-to-end decoder zero-copy.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
@@ -48,8 +48,10 @@ impl ImageOutputRequest {
 /// Clone this lease, rather than the raw [`wgpu::Buffer`], when ownership must remain covered by
 /// the crate's byte budget. [`Self::as_wgpu_buffer`] deliberately makes raw access explicit:
 /// `wgpu::Buffer` is itself cloneable, and a raw handle cloned through that borrow is outside this
-/// lease's accounting. Safe Rust cannot keep a reservation coupled to a handle after callers clone
-/// the raw wgpu value.
+/// lease's accounting and direct-map synchronization. Clone the lease itself to create another
+/// synchronized owner. Every call to [`Self::from_external`] or [`Self::from_tracked`] creates a
+/// new ownership domain and therefore requires a buffer handle that is not already managed by
+/// another lease.
 ///
 /// ```compile_fail
 /// fn implicit_raw(lease: &jxl_wgpu::GpuBufferLease) -> &wgpu::Buffer {
@@ -58,24 +60,44 @@ impl ImageOutputRequest {
 /// ```
 #[derive(Clone)]
 pub struct GpuBufferLease {
-    buffer: Arc<wgpu::Buffer>,
+    inner: Arc<GpuBufferLeaseInner>,
+}
+
+struct GpuBufferLeaseInner {
+    buffer: wgpu::Buffer,
     memory_permit: Option<MemoryPermit>,
+    access: Mutex<BufferAccess>,
 }
 
 impl GpuBufferLease {
+    /// Creates a root ownership domain for an externally budgeted buffer.
+    ///
+    /// This consumes one raw handle and does not attempt process-global resource identity. Calling
+    /// it more than once for handles that refer to the same GPU allocation creates unsynchronized
+    /// domains and violates this API's ownership contract. Use [`Clone::clone`] on the returned
+    /// lease for every synchronized alias.
     #[must_use]
-    pub fn new(buffer: Arc<wgpu::Buffer>) -> Self {
-        Self {
-            buffer,
-            memory_permit: None,
-        }
+    pub fn from_external(buffer: wgpu::Buffer) -> Self {
+        Self::from_parts(buffer, None)
     }
 
+    /// Creates a root ownership domain whose lifetime retains a byte-budget reservation.
+    ///
+    /// This is the producer-side counterpart to [`Self::from_external`]. Construct it exactly once
+    /// for an output allocation, then clone the lease for early, validated, display, and readback
+    /// consumers.
     #[must_use]
-    pub fn with_memory_permit(buffer: Arc<wgpu::Buffer>, memory_permit: MemoryPermit) -> Self {
+    pub fn from_tracked(buffer: wgpu::Buffer, memory_permit: MemoryPermit) -> Self {
+        Self::from_parts(buffer, Some(memory_permit))
+    }
+
+    fn from_parts(buffer: wgpu::Buffer, memory_permit: Option<MemoryPermit>) -> Self {
         Self {
-            buffer,
-            memory_permit: Some(memory_permit),
+            inner: Arc::new(GpuBufferLeaseInner {
+                buffer,
+                memory_permit,
+                access: Mutex::new(BufferAccess::Idle),
+            }),
         }
     }
 
@@ -85,19 +107,19 @@ impl GpuBufferLease {
     /// [`GpuBufferLease`] clone alive whenever the raw handle must remain covered by the budget.
     #[must_use]
     pub fn as_wgpu_buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+        &self.inner.buffer
     }
 
     /// Size of the underlying wgpu allocation.
     #[must_use]
     pub fn size(&self) -> u64 {
-        self.buffer.size()
+        self.inner.buffer.size()
     }
 
     /// Usage flags of the underlying wgpu allocation.
     #[must_use]
     pub fn usage(&self) -> wgpu::BufferUsages {
-        self.buffer.usage()
+        self.inner.buffer.usage()
     }
 
     /// Size of the shared reservation retained by this lease, or zero for externally managed
@@ -107,7 +129,116 @@ impl GpuBufferLease {
     /// independent charges. Do not add their values together.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
-        self.memory_permit.as_ref().map_or(0, MemoryPermit::bytes)
+        self.inner
+            .memory_permit
+            .as_ref()
+            .map_or(0, MemoryPermit::bytes)
+    }
+
+    /// Reserves this buffer for commands that the caller will submit to its producer queue.
+    ///
+    /// Keep the returned guard alive until [`wgpu::Queue::submit`] has returned. This prevents an
+    /// in-place CPU readback map from racing command encoding/submission. The guard need not remain
+    /// alive until GPU completion: subsequent map submissions on the same queue are ordered after
+    /// the commands it protected.
+    pub fn try_acquire_gpu_submission(&self) -> Result<GpuBufferSubmissionGuard> {
+        self.try_acquire_gpu_submission_guard()
+            .ok_or(Error::GpuBufferDirectMapBusy)
+    }
+
+    pub(crate) fn try_acquire_gpu_submission_guard(&self) -> Option<GpuBufferSubmissionGuard> {
+        let mut access = lock_access(&self.inner);
+        match &mut *access {
+            BufferAccess::Idle => *access = BufferAccess::GpuSubmissions(1),
+            BufferAccess::GpuSubmissions(count) => *count += 1,
+            BufferAccess::DirectMap => return None,
+        }
+        Some(GpuBufferSubmissionGuard {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn try_acquire_direct_map(&self) -> Option<DirectMapPermit> {
+        let mut access = lock_access(&self.inner);
+        match *access {
+            BufferAccess::Idle => *access = BufferAccess::DirectMap,
+            BufferAccess::GpuSubmissions(_) | BufferAccess::DirectMap => return None,
+        }
+        Some(DirectMapPermit {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn try_acquire_direct_map(&self) -> Option<DirectMapPermit> {
+        None
+    }
+}
+
+/// Shared reservation for submitting GPU work that reads or writes one leased buffer.
+///
+/// Multiple GPU submission guards may coexist. A direct CPU map is exclusive and cannot begin
+/// until every guard is dropped after its corresponding queue submission.
+pub struct GpuBufferSubmissionGuard {
+    inner: Arc<GpuBufferLeaseInner>,
+}
+
+impl GpuBufferSubmissionGuard {
+    pub(crate) fn protects(&self, lease: &GpuBufferLease) -> bool {
+        Arc::ptr_eq(&self.inner, &lease.inner)
+    }
+}
+
+impl std::fmt::Debug for GpuBufferSubmissionGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuBufferSubmissionGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum BufferAccess {
+    Idle,
+    GpuSubmissions(usize),
+    DirectMap,
+}
+
+fn lock_access(inner: &GpuBufferLeaseInner) -> std::sync::MutexGuard<'_, BufferAccess> {
+    inner
+        .access
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Drop for GpuBufferSubmissionGuard {
+    fn drop(&mut self) {
+        let mut access = lock_access(&self.inner);
+        match &mut *access {
+            BufferAccess::GpuSubmissions(1) => *access = BufferAccess::Idle,
+            BufferAccess::GpuSubmissions(count) => *count -= 1,
+            BufferAccess::Idle | BufferAccess::DirectMap => {
+                unreachable!("GPU submission guard lost its shared access state")
+            }
+        }
+    }
+}
+
+pub(crate) struct DirectMapPermit {
+    inner: Arc<GpuBufferLeaseInner>,
+}
+
+impl Drop for DirectMapPermit {
+    fn drop(&mut self) {
+        let mut access = lock_access(&self.inner);
+        match *access {
+            BufferAccess::DirectMap => *access = BufferAccess::Idle,
+            BufferAccess::Idle | BufferAccess::GpuSubmissions(_) => {
+                unreachable!("direct-map permit lost its exclusive access state")
+            }
+        }
     }
 }
 

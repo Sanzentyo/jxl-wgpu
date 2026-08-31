@@ -1,3 +1,6 @@
+override wg_x: u32 = 16u;
+override wg_y: u32 = 16u;
+
 struct Params {
     width: u32,
     height: u32,
@@ -26,7 +29,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> rgb_b_plane: array<f32>;
 @group(0) @binding(6) var<uniform> params: Params;
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.width || gid.y >= params.height) {
         return;

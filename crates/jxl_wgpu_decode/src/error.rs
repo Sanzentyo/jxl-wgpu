@@ -119,6 +119,8 @@ pub enum Error {
     F64OutputPolicyForNonF64,
     #[error("native F64 output was required but the wgpu device lacks enabled SHADER_F64")]
     NativeF64Unavailable,
+    #[error("GPU kernel policy failed: {0}")]
+    KernelPolicy(#[from] jxl_wgpu::Error),
     #[error(transparent)]
     UnsupportedProfile(#[from] UnsupportedProfile),
     #[error(transparent)]

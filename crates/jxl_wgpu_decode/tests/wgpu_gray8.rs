@@ -15,9 +15,10 @@ use jxl_gpu_formats::{
 };
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, SubmissionToken};
 use jxl_wgpu::{
-    DirectReadbackPolicy, DisplayPipeline, DisplayTextureDescriptor, GpuBufferLease, GpuImageFrame,
-    GpuImageOutput, ImageReadbackPipeline, MemoryBudget, SUBMISSION_POLLER_CAPACITY,
-    ShaderF64Policy, WgpuBackend, WgpuBackendConfig,
+    AdapterFingerprint, AutotuneProfile, DirectReadbackPolicy, DisplayPipeline,
+    DisplayTextureDescriptor, GpuBufferLease, GpuImageFrame, GpuImageOutput, ImageReadbackPipeline,
+    KernelPolicy, KernelVariant, MemoryBudget, SUBMISSION_POLLER_CAPACITY, ShaderF64Policy,
+    TunedKernel, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::{
     F64OutputPath, F64OutputPolicy, GpuDecoder, GpuOutputRequest, ModularChannels,
@@ -1470,7 +1471,7 @@ fn decode_output_and_generic_readback_share_backend_memory_admission() {
         outputs: vec![GpuImageOutput {
             id: OutputId(0),
             layout,
-            buffer: GpuBufferLease::new(source),
+            buffer: GpuBufferLease::from_external(source.as_ref().clone()),
         }],
         changed: ChangedRegions::default(),
     };
@@ -1603,4 +1604,73 @@ fn poller_saturation_is_retryable_without_consuming_the_decode_source() {
     );
     drop(frame);
     drop(held);
+}
+
+#[test]
+fn indexed_gray8_decode_matches_under_autotuned_workgroup_policy() {
+    let Some(default_backend) = backend() else {
+        eprintln!("skipping indexed Gray8 autotune test: no wgpu adapter");
+        return;
+    };
+    let fingerprint = AdapterFingerprint::from_adapter_info(default_backend.adapter_info());
+    let mut profile = AutotuneProfile::new(fingerprint);
+    profile.record(
+        TunedKernel::from_samples("lossless_gray8", KernelVariant::Lanes32, &[10, 20, 30]).unwrap(),
+    );
+    let tuned_config = WgpuBackendConfig {
+        enable_timestamps: false,
+        direct_readback_policy: DirectReadbackPolicy::Disabled,
+        kernel_policy: KernelPolicy::Profile(profile),
+        ..WgpuBackendConfig::default()
+    };
+    let tuned_backend = WgpuBackend::from_device(
+        default_backend.device().clone(),
+        default_backend.queue().clone(),
+        default_backend.adapter_info().clone(),
+        tuned_config,
+    )
+    .expect("matching-adapter autotune profile is accepted by the existing device");
+
+    let request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        NumericSampleMapping::NormalizedGray8,
+    )
+    .unwrap();
+
+    let default_decoder = GpuDecoder::wgpu(default_backend.clone());
+    let mut default_session = default_decoder
+        .open(indexed_gray8(), request.clone())
+        .expect("default indexed profile opens without CPU fallback");
+    assert_eq!(
+        default_session
+            .submission_session()
+            .memory_stats()
+            .group_workgroup_size,
+        64
+    );
+    let default_frame = default_session
+        .next_frame()
+        .expect("default GPU decode succeeds")
+        .expect("one default frame is returned");
+    let default_bytes = read_output(&default_backend, &default_frame.output().outputs[0]);
+
+    let tuned_decoder = GpuDecoder::wgpu(tuned_backend.clone());
+    let mut tuned_session = tuned_decoder
+        .open(indexed_gray8(), request)
+        .expect("tuned indexed profile opens without CPU fallback");
+    assert_eq!(
+        tuned_session
+            .submission_session()
+            .memory_stats()
+            .group_workgroup_size,
+        32
+    );
+    let tuned_frame = tuned_session
+        .next_frame()
+        .expect("tuned GPU decode succeeds")
+        .expect("one tuned frame is returned");
+    let tuned_bytes = read_output(&tuned_backend, &tuned_frame.output().outputs[0]);
+
+    assert_eq!(default_bytes, expected_pixels());
+    assert_eq!(tuned_bytes, default_bytes);
 }

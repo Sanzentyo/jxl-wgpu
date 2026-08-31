@@ -170,7 +170,25 @@ enforces WebGPU's 256-byte multi-row pitch requirement.
 
 Callers that already own a command encoder can use `encode_rgb`, `encode_image`,
 `encode_numeric_image`, or `encode_rgba8_copy`, then submit all work as one application-defined
-batch.
+batch. These encode methods require a `GpuBufferSubmissionGuard`; acquire it from the source
+lease before encoding and keep it alive until `Queue::submit` returns. The `submit_*` convenience
+methods acquire and release the guard automatically. Custom commands using
+`GpuBufferLease::as_wgpu_buffer()` follow the same rule:
+
+```rust,ignore
+let source = &nv12.outputs[0];
+let guard = source.buffer.try_acquire_gpu_submission()?;
+let mut encoder = backend.device().create_command_encoder(&Default::default());
+let texture = display.encode_image(
+    &mut encoder,
+    source,
+    &guard,
+    DisplayTextureDescriptor::default(),
+)?;
+let submission = backend.queue().submit([encoder.finish()]);
+drop(guard); // queue order is established; GPU completion is not required here.
+# let _ = (texture, submission);
+```
 
 `encode_unvalidated_image` and `submit_unvalidated_image` accept only the visibly distinct
 `UnvalidatedGpuImageOutput` type. They preserve same-queue ordering without a host wait. If the
@@ -209,6 +227,17 @@ On a native unified-memory backend with `MAPPABLE_PRIMARY_BUFFERS`, `submit` map
 producer-marked output allocation directly. It records no buffer copy or staging allocation and
 still preserves queue order, tracked source ownership, cancellation safety, and runtime-neutral
 completion. Multi-output or multi-frame requests continue to use the single aggregate staging map.
+`ImageReadbackPipeline::new` honors the backend's `DirectReadbackPolicy`; raw device/queue
+construction requires an explicit `ImageReadbackMapping::StagingOnly` or `AllowDirect` argument
+instead of inferring adapter topology.
+
+An in-place map is exclusive until its result is consumed, or an abandoned mapping callback has
+unmapped the allocation. A second direct map and a later aggregate/display/custom GPU submission
+through a clone of the same lease return typed busy errors instead of reaching wgpu validation.
+Earlier GPU work is safe: its submission guard is released only after `Queue::submit`, so a later
+map is ordered behind it. `GpuBufferLease::from_external` and `from_tracked` each create a new root
+ownership domain; clone that root lease for every synchronized alias. A raw wgpu handle cloned
+through `as_wgpu_buffer` is outside both memory accounting and direct-map synchronization.
 `submit_unvalidated` is the corresponding explicit early-handoff path; its distinct result omits
 changed regions and remains non-authoritative even after transport completes, until codec
 validation separately succeeds.

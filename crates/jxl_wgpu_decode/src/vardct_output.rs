@@ -7,11 +7,13 @@
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::XybParams;
-use jxl_wgpu::ResidentStorageBinding;
+use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
 
 const OUTPUT_WORD_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+#[cfg(test)]
 const WORKGROUP_SIZE: u32 = 256;
+const DEFAULT_VARIANT: KernelVariant = KernelVariant::Lanes256;
 
 /// WGSL source for the fused VarDCT output kernel.
 pub const VAR_DCT_OUTPUT_SHADER: &str = include_str!("vardct_output.wgsl");
@@ -146,6 +148,16 @@ impl VarDctOutputPlan {
         height: u32,
         limits: &wgpu::Limits,
     ) -> Result<Self, VarDctOutputError> {
+        Self::for_limits_with_variant(width, height, limits, DEFAULT_VARIANT)
+    }
+
+    /// Plans a dispatch using the selected 1D workgroup variant.
+    pub fn for_limits_with_variant(
+        width: u32,
+        height: u32,
+        limits: &wgpu::Limits,
+        variant: KernelVariant,
+    ) -> Result<Self, VarDctOutputError> {
         let memory = VarDctOutputMemoryPlan::new(width, height)?;
         validate_required_buffer(
             "packed RGB8 output",
@@ -159,15 +171,7 @@ impl VarDctOutputPlan {
                 available: limits.max_uniform_buffer_binding_size,
             });
         }
-        if limits.max_compute_invocations_per_workgroup < WORKGROUP_SIZE
-            || limits.max_compute_workgroup_size_x < WORKGROUP_SIZE
-        {
-            return Err(VarDctOutputError::WorkgroupSizeLimit {
-                required: WORKGROUP_SIZE,
-                max_invocations: limits.max_compute_invocations_per_workgroup,
-                max_size_x: limits.max_compute_workgroup_size_x,
-            });
-        }
+        validate_workgroup_variant(variant, limits)?;
 
         let output_words_u64 = memory.output_storage_bytes / OUTPUT_WORD_BYTES;
         let output_words =
@@ -183,14 +187,17 @@ impl VarDctOutputPlan {
                 available: 0,
             });
         }
-        let required_x = output_words.div_ceil(WORKGROUP_SIZE);
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let required_x = output_words.div_ceil(workgroup_x);
         let workgroups_x = required_x.min(limit);
-        let dispatch_width = workgroups_x.checked_mul(WORKGROUP_SIZE).ok_or(
-            VarDctOutputError::ArithmeticOverflow {
-                field: "VarDCT output dispatch width",
-            },
-        )?;
-        let workgroups_y = output_words.div_ceil(dispatch_width);
+        let dispatch_width =
+            workgroups_x
+                .checked_mul(workgroup_x)
+                .ok_or(VarDctOutputError::ArithmeticOverflow {
+                    field: "VarDCT output dispatch width",
+                })?;
+        let required_y = output_words.div_ceil(dispatch_width);
+        let workgroups_y = required_y.div_ceil(workgroup_y);
         if workgroups_y > limit {
             return Err(VarDctOutputError::DispatchLimit {
                 required_y: workgroups_y,
@@ -205,6 +212,22 @@ impl VarDctOutputPlan {
             dispatch_width,
         })
     }
+}
+
+fn validate_workgroup_variant(
+    variant: KernelVariant,
+    limits: &wgpu::Limits,
+) -> Result<(), VarDctOutputError> {
+    if !variant.is_linear() {
+        return Err(VarDctOutputError::WorkgroupShape { variant });
+    }
+    variant
+        .validate_for("vardct_output", limits, 0)
+        .map_err(|_| VarDctOutputError::WorkgroupSizeLimit {
+            required: variant.invocations(),
+            max_invocations: limits.max_compute_invocations_per_workgroup,
+            max_size_x: limits.max_compute_workgroup_size_x,
+        })
 }
 
 /// Uniform allocation that must remain live through command submission.
@@ -292,7 +315,10 @@ pub enum VarDctOutputError {
     /// The 128-byte uniform exceeds an unusual device limit.
     #[error("VarDCT RGB8 uniform needs {required} bytes, uniform binding limit is {available}")]
     UniformBindingLimit { required: u64, available: u64 },
-    /// The fixed 256-lane kernel cannot run on the device.
+    /// Output packing requires a one-dimensional workgroup.
+    #[error("VarDCT RGB8 output requires a linear workgroup, got {variant:?}")]
+    WorkgroupShape { variant: KernelVariant },
+    /// The selected output workgroup cannot run on the device.
     #[error(
         "VarDCT RGB8 workgroup needs {required} X invocations, device permits {max_invocations} total and {max_size_x} in X"
     )]
@@ -309,25 +335,42 @@ pub enum VarDctOutputError {
 /// Reusable fused XYB-to-packed-sRGB8 compute pipeline.
 pub struct VarDctOutputPacker {
     pipeline: wgpu::ComputePipeline,
+    variant: KernelVariant,
 }
 
 impl VarDctOutputPacker {
-    /// Compiles the fixed output shader once for a logical device.
-    #[must_use]
-    pub fn new(device: &wgpu::Device) -> Self {
+    /// Compiles the output shader with the portable default workgroup.
+    pub fn new(device: &wgpu::Device) -> Result<Self, VarDctOutputError> {
+        Self::with_variant(device, DEFAULT_VARIANT)
+    }
+
+    /// Compiles the output shader with a selected workgroup variant.
+    pub fn with_variant(
+        device: &wgpu::Device,
+        variant: KernelVariant,
+    ) -> Result<Self, VarDctOutputError> {
+        validate_workgroup_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jxl-wgpu decode VarDCT packed RGB8"),
             source: wgpu::ShaderSource::Wgsl(VAR_DCT_OUTPUT_SHADER.into()),
         });
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("jxl-wgpu decode VarDCT packed RGB8"),
             layout: None,
             module: &module,
             entry_point: Some("pack_rgb8"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
             cache: None,
         });
-        Self { pipeline }
+        Ok(Self { pipeline, variant })
     }
 
     /// Validates resident bindings and records one fused output dispatch.
@@ -346,7 +389,7 @@ impl VarDctOutputPacker {
         encoder: &mut wgpu::CommandEncoder,
         inputs: VarDctOutputInputs<'_>,
     ) -> Result<VarDctOutputScratch, VarDctOutputError> {
-        let (params, plan) = validate_inputs(device, inputs)?;
+        let (params, plan) = validate_inputs(device, inputs, self.variant)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu decode VarDCT packed RGB8 params"),
             contents: bytemuck::bytes_of(&params),
@@ -401,10 +444,15 @@ struct VarDctOutputParams {
 fn validate_inputs(
     device: &wgpu::Device,
     inputs: VarDctOutputInputs<'_>,
+    variant: KernelVariant,
 ) -> Result<(VarDctOutputParams, VarDctOutputPlan), VarDctOutputError> {
     validate_inverse_opsin(inputs.config.inverse_opsin)?;
-    let plan =
-        VarDctOutputPlan::for_limits(inputs.config.width, inputs.config.height, &device.limits())?;
+    let plan = VarDctOutputPlan::for_limits_with_variant(
+        inputs.config.width,
+        inputs.config.height,
+        &device.limits(),
+        variant,
+    )?;
     let pixel_count_u64 = u64::from(inputs.config.width)
         .checked_mul(u64::from(inputs.config.height))
         .ok_or(VarDctOutputError::ArithmeticOverflow {
@@ -734,6 +782,18 @@ mod tests {
             validate_inverse_opsin(invalid).unwrap_err(),
             VarDctOutputError::InvalidIntensityTarget
         );
+        assert_eq!(
+            VarDctOutputPlan::for_limits_with_variant(
+                1,
+                1,
+                &wgpu::Limits::default(),
+                KernelVariant::Tile8x8,
+            )
+            .unwrap_err(),
+            VarDctOutputError::WorkgroupShape {
+                variant: KernelVariant::Tile8x8,
+            }
+        );
         invalid = inverse_opsin();
         invalid.inverse_opsin_matrix[2][1] = f32::NAN;
         assert_eq!(
@@ -827,7 +887,7 @@ mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("VarDCT RGB8 test commands"),
         });
-        let packer = VarDctOutputPacker::new(&device);
+        let packer = VarDctOutputPacker::new(&device).unwrap();
         let scratch = packer
             .encode(
                 &device,

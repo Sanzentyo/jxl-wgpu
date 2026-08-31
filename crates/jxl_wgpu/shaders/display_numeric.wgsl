@@ -1,3 +1,6 @@
+override wg_x: u32 = 16u;
+override wg_y: u32 = 16u;
+
 struct NumericParams {
     width: u32,
     height: u32,
@@ -79,7 +82,7 @@ fn srgb_to_linear(value: f32) -> f32 {
     return pow((value + 0.055) / 1.055, 2.4);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if invocation.x >= params.width || invocation.y >= params.height { return; }
     let pixel = invocation.xy;

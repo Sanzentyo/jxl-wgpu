@@ -141,7 +141,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: rgb_buffer.size(),
-        buffer: jxl_wgpu::GpuBufferLease::new(rgb_buffer),
+        buffer: jxl_wgpu::GpuBufferLease::from_external(rgb_buffer.as_ref().clone()),
     };
     let submitted = display
         .submit_rgb(&rgb_output, DisplayTextureDescriptor::default())
@@ -184,7 +184,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
     let yuv_output = GpuImageOutput {
         id: OutputId(1),
         layout,
-        buffer: jxl_wgpu::GpuBufferLease::new(yuv_buffer),
+        buffer: jxl_wgpu::GpuBufferLease::from_external(yuv_buffer.as_ref().clone()),
     };
     let submitted = display
         .submit_image(&yuv_output, DisplayTextureDescriptor::default())
@@ -236,7 +236,7 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: buffer.size(),
-        buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+        buffer: jxl_wgpu::GpuBufferLease::from_external(buffer.as_ref().clone()),
     };
     let submitted = display
         .submit_rgba8_copy(&output, DisplayTextureDescriptor::default())
@@ -263,7 +263,7 @@ fn rgba8_copy_validates_row_alignment_and_copies_when_aligned() {
         channels: 4,
         layout: OutputLayout::Interleaved,
         logical_size: buffer.size(),
-        buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+        buffer: jxl_wgpu::GpuBufferLease::from_external(buffer.as_ref().clone()),
     };
     assert!(matches!(
         display.submit_rgba8_copy(&output, DisplayTextureDescriptor::default()),
@@ -314,7 +314,7 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
         let output = GpuImageOutput {
             id: OutputId(u32::try_from(index).unwrap()),
             layout: converted.layout,
-            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+            buffer: jxl_wgpu::GpuBufferLease::from_external(buffer.as_ref().clone()),
         };
         let submitted = display
             .submit_image(&output, DisplayTextureDescriptor::default())
@@ -378,7 +378,7 @@ fn odd_width_packed_422_preserves_color_and_tail_luma_order() {
         let output = GpuImageOutput {
             id: OutputId(u32::try_from(index).unwrap()),
             layout: converted.layout,
-            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+            buffer: jxl_wgpu::GpuBufferLease::from_external(buffer.as_ref().clone()),
         };
         let submitted = display
             .submit_image(&output, DisplayTextureDescriptor::default())
@@ -442,7 +442,7 @@ fn all_vpi_numeric_formats_use_explicit_gpu_display_contracts() {
         let source = GpuImageOutput {
             id: OutputId(u32::try_from(index).unwrap()),
             layout,
-            buffer: jxl_wgpu::GpuBufferLease::new(buffer),
+            buffer: jxl_wgpu::GpuBufferLease::from_external(buffer.as_ref().clone()),
         };
         let submission = display
             .submit_numeric_image(&source, contract, DisplayTextureDescriptor::default())

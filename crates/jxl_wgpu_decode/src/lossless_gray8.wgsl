@@ -1,3 +1,6 @@
+override wg_x: u32 = 64u;
+override wg_y: u32 = 1u;
+
 struct Params {
     token_start: u32,
     token_end: u32,
@@ -508,7 +511,7 @@ fn finalize_output() {
 
 /*__JXL_MODULAR_RECONSTRUCT__*/
 
-@compute @workgroup_size(/*__JXL_WORKGROUP_SIZE__*/)
+@compute @workgroup_size(wg_x, wg_y, 1)
 fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let lane_index = global_invocation_id.x;
     if lane_index >= dispatch_control.group_count {

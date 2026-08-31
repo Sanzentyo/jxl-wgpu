@@ -354,7 +354,7 @@ fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::vardct_wgpu(backend.clone());
+    let decoder = GpuDecoder::vardct_wgpu(backend.clone()).unwrap();
     let rgb = [19, 103, 229];
     let mut dct8_packet = None;
 
@@ -523,7 +523,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::vardct_wgpu(backend.clone());
+    let decoder = GpuDecoder::vardct_wgpu(backend.clone()).unwrap();
     let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
 
     for extent in [Extent2d::new(257, 17), Extent2d::new(513, 259)] {
