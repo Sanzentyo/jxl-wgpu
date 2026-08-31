@@ -50,7 +50,6 @@ pub enum UnsupportedVarDctFeature {
     Blending,
     FrameReferences,
     ProgressivePasses,
-    PermutedToc,
     SectionLayout,
 }
 
@@ -561,6 +560,8 @@ pub enum VarDctSectionLayout {
     /// carried forward as checked bit cursors; the host does not entropy-decode the entry.
     Single { packet: BitRange },
     /// Independently addressable LF-global, LF-group, HF-global, and pass-group packets.
+    /// Group vectors are normalized to logical group order; each range still addresses the
+    /// section's original physical location in the codestream.
     Sections {
         lf_global: BitRange,
         lf_groups: Vec<BitRange>,
@@ -822,9 +823,6 @@ fn validate_frame(inventory: &CodestreamInventory) -> Result<&FrameInventory, Va
         || !frame.progressive_passes.last_pass.is_empty()
     {
         return unsupported(UnsupportedVarDctFeature::ProgressivePasses);
-    }
-    if frame.toc_permuted {
-        return unsupported(UnsupportedVarDctFeature::PermutedToc);
     }
     if frame.group_count == 0
         || frame.low_frequency_group_count == 0

@@ -42,6 +42,25 @@ cjxl /tmp/green_queen.png green_queen_vardct_nonzero_ac.jxl -d 2 -e 1 -m 0 \
   --resampling=1 --gaborish=0 --epf=0 --dots=0 --patches=0 --noise=0 --quiet
 ```
 
+`crates/jxl_wgpu_decode/test-data/green_queen_vardct_permuted.jxl.hex` is a deterministic
+libjxl 0.12.0 center-first re-encode of that decoded 438x589 image. Its binary SHA-256 is
+`8c3a5dd8c8b1a5d9b4934810325cb87b65a5985b322a95ecb92303ab6a529a2e`. Six pass groups are stored
+in a non-row-major entropy-coded TOC permutation. The structural test verifies that each logical
+group selects its original physical bit range, and the actual-adapter test executes the complete
+GPU path and permits at most one RGB8 code of difference from Rust `jxl` and optional `djxl`.
+
+It is reproduced with an explicit sRGB interpretation because PPM carries no color profile:
+
+```text
+xxd -r -p crates/jxl_wgpu_decode/test-data/green_queen_vardct_nonzero_ac.jxl.hex \
+  /tmp/green_queen_vardct_nonzero_ac.jxl
+djxl /tmp/green_queen_vardct_nonzero_ac.jxl /tmp/green_queen.ppm \
+  --bits_per_sample=8 --num_threads=1
+cjxl /tmp/green_queen.ppm green_queen_vardct_permuted.jxl -d 1 -e 3 -m 0 \
+  --group_order=1 --center_x=400 --center_y=550 --epf=0 --gaborish=0 \
+  --num_threads=1 -x color_space=sRGB --container=0
+```
+
 `crates/jxl_wgpu_decode/test-data/green_queen_vardct_gaborish.jxl.hex` uses the same decoded source
 and encoder settings, but enables the standard Gaborish weights while leaving EPF disabled. Its
 binary SHA-256 is `9b934f7367787132eb44e16698b5c0deb8f884f9bcfabe10a2a36c4c47941feb`.

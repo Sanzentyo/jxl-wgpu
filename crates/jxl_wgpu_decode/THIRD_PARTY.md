@@ -15,3 +15,8 @@ and Modular subimage geometry from the following `jxl-oxide` crates:
 Those crates are distributed under `MIT OR Apache-2.0`. Production code uses `jxl-bitstream` and
 `jxl-coding` only for bounded metadata parsing; `jxl-frame`, `jxl-modular`, and `jxl-vardct` are
 dev-only scalar-oracle dependencies and are not a CPU codec fallback.
+
+`test-data/green_queen_vardct_permuted.jxl.hex` is a libjxl 0.12.0 re-encode derived from the
+BSD-3-Clause `green_queen_vardct_e3.jxl` fixture retained by this workspace. It is used only as a
+decode interoperability fixture; its exact generation command and binary hash are recorded in
+`docs/CONFORMANCE_CORPUS.md`.

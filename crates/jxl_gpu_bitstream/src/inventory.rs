@@ -491,7 +491,7 @@ pub enum RestorationFilterInventory {
     },
 }
 
-/// Logical meaning of a physical TOC entry when the TOC is not permuted.
+/// Logical meaning of a physical TOC entry after undoing an optional TOC permutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameSectionKind {
     /// Single-section special case containing all frame data.

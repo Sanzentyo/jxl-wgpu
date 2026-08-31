@@ -60,7 +60,7 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 |---|---|---|
 | Raw/`jxlc`/`jxlp` transport and header inventory | **Partial** | Bounded still-image transport, frame/TOC inventory, ICC reconstruction, and feature metadata exist; streaming box delivery and the complete container API do not. |
 | Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. |
-| VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers nine regular zero-AC single transforms and tiled DCT8 with single-pass nonzero AC, natural/custom DCT8 order, one LF group, resident Gaborish plus one-to-three-iteration EPF, and extents through 2048×2048. |
+| VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers nine regular zero-AC single transforms and tiled DCT8 with single-pass nonzero AC, scanline or entropy-permuted center-first pass groups, natural/custom DCT8 coefficient order, one LF group, resident Gaborish plus one-to-three-iteration EPF, and extents through 2048×2048. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
 | VarDCT encode | **Partial** | All 27 strategy identifiers execute, but only in a fixed distance-25 LF-only profile with every AC coefficient quantized to zero; tiled DCT8 is limited to one LF group. |
 | Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the bounded stock VarDCT decoder now constructs per-block sigma and routes Gaborish plus signaled EPF0/EPF1/EPF2 through one resident ping-pong scratch set in the same submission. Upsampling, composition, multi-LF-group restoration, and the rest of the legal graph remain disconnected. |
@@ -83,7 +83,7 @@ correctness. Dependencies name other item IDs in this document.
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `FRONT-01` | P0 | **Partial** | `GpuDecoder::wgpu` now inventories once and automatically selects Modular or VarDCT while sharing one backend byte budget; one actual-adapter test decodes both modes sequentially through the same decoder and checks pixels and reservation release. Completion still requires lowering every frame into one bounded backend-neutral execution graph plus mixed-mode referenced-frame tests. | — |
-| `FRONT-02` | P0 | **Partial** | Preserve exact bit ranges and logical/physical TOC order for global, LF-group, HF-global, and pass-group sections, including entropy-coded permutations and arbitrary group order. Test scanline, center-first, and permuted fixtures. | — |
+| `FRONT-02` | P0 | **Done** | Inventory preserves each physical section index/range and its logical TOC index after bounded entropy-coded permutation decode. Frontend section vectors normalize to logical group order while retaining those physical ranges. Scanline fixtures, the imported 49-section permutation fixture, a deterministic six-group center-first VarDCT fixture, structural range checks, and an actual-GPU Rust-`jxl`/`djxl` oracle cover the acceptance contract. | — |
 | `FRONT-03` | P1 | **Partial** | Implement incremental bounded input: headers, boxes, fragments, frame sections, and end-of-input may arrive in arbitrary chunks without collecting an unbounded codestream copy. Test every byte split around signatures, box headers, TOCs, and entropy words. | `CONT-01` |
 | `CONT-01` | P1 | **Partial** | Fully validate naked streams, `jxlc`, ordered and out-of-order `jxlp`, large-box sizes, unknown boxes, ordering constraints, and truncation. Expose a streaming box/event API and preserve requested unknown boxes byte-for-byte. | — |
 | `CONT-02` | P1 | **Missing** | Expose, preserve, replace, and encode the opaque payloads of Exif, XMP (`xml `), and JUMBF (`jumb`) boxes, and decompress/compress `brob` boxes with explicit size/decompression-ratio limits. Rendering must continue to follow codestream metadata precedence. | `CONT-01` |
@@ -134,7 +134,7 @@ correctness. Dependencies name other item IDs in this document.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
-| `VDCT-D01` | P0 | **Partial** | One LF-global/LF-group/HF-global topology now executes nonempty single-pass DCT8 pass groups in standard TOC order. Completion requires multiple LF groups, recursive LF frames, arbitrary group order, additional passes, and images beyond 2048 pixels per axis. | `FRONT-02`, `ENT-D01` |
+| `VDCT-D01` | P0 | **Partial** | One LF-global/LF-group/HF-global topology now executes nonempty single-pass DCT8 pass groups in scanline or arbitrary entropy-permuted physical order, including center-first. Completion requires multiple LF groups, recursive LF frames, additional passes, and images beyond 2048 pixels per axis. | `FRONT-02`, `ENT-D01` |
 | `VDCT-D02` | P0 | **Partial** | Decode the block context map, strategy map, all 27 regular and special strategies in mixed images, quant field, sharpness, chroma-from-luma factors, and required Modular side images. No legal strategy may be lowered to DCT8. | `VDCT-D01`, `MOD-D05` |
 | `VDCT-D03` | P0 | **Partial** | Single-pass DCT8 now decodes real nonzero counts, contexts, Prefix/ANS tokens, signs, natural or custom DCT8 order, quant bias/dequantization, and coefficient placement entirely on GPU after the small order metadata permutation is expanded on the host. A 438×589 libjxl fixture with six groups and 4,070 tasks matches Rust `jxl` and `djxl` within one RGB8 code. Completion requires all order masks/strategies, multiple presets, pass refinement, sparse/dense/edge fixtures, and corruption at the coefficient layer. | `VDCT-D01`, `ENT-D01` |
 | `VDCT-D04` | P0 | **Partial** | Execute inverse transforms for every strategy and mixed block map with exact edge extension/cropping. Existing resident kernels must be reached from the stock decoder, with per-strategy precision tests. | `VDCT-D02`, `VDCT-D03` |
@@ -244,8 +244,9 @@ stage. Performance work continues only where it does not freeze an incomplete pa
    browser adapters.
 
 The coding-mode selector, shared typed entropy-stream ABI, first nonzero-AC multi-group DCT8
-decode milestone, and bounded resident Gaborish/EPF restoration chain are implemented. The
-immediate next target is the remaining `ENT-D01/FRONT-02` topology, followed by mixed-strategy
+decode milestone, bounded resident Gaborish/EPF restoration chain, and logical/physical TOC-order
+normalization are implemented. The immediate next target is the remaining `ENT-D01` topology,
+followed by mixed-strategy
 `VDCT-D01..05`, multi-LF-group restoration, and broader render-graph composition. The corresponding GPU
 nonzero-AC encoder remains required before the fixture can be re-encoded without a CPU pixel path.
 

@@ -4,6 +4,7 @@ use jxl_wgpu_decode::vardct::frontend::{
     StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError, VarDctPacketError,
     VarDctSectionLayout,
 };
+use jxl_wgpu_decode::vardct::packet::BoundedVarDctPacketPlan;
 
 fn decode_hex(source: &str) -> Vec<u8> {
     let digits: Vec<_> = source
@@ -129,6 +130,60 @@ fn accepts_green_queen_physical_group_packets() {
     assert_eq!(hf_prefix.num_hf_presets, 1);
     assert_ne!(hf_prefix.used_orders, 0);
     assert!(hf_prefix.order_entropy_bit_offset > hf_global.offset);
+}
+
+#[test]
+fn permuted_toc_is_normalized_to_logical_pass_group_order() {
+    let bytes = decode_hex(include_str!(
+        "../test-data/green_queen_vardct_permuted.jxl.hex"
+    ));
+    let inventory = inventory(&bytes);
+    let frame = &inventory.frames[0];
+    assert!(frame.toc_permuted);
+
+    let physical_group_order = frame
+        .sections
+        .iter()
+        .filter_map(|section| match section.kind {
+            FrameSectionKind::PassGroup {
+                pass_index: 0,
+                group_index,
+            } => Some(group_index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(physical_group_order.len() as u64, frame.group_count);
+    assert_ne!(
+        physical_group_order,
+        (0..frame.group_count).collect::<Vec<_>>()
+    );
+
+    let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+    assert_eq!((profile.width, profile.height), (438, 589));
+    let VarDctSectionLayout::Sections { pass_groups, .. } = &profile.sections else {
+        panic!("center-first fixture must expose independent pass-group sections")
+    };
+    assert_eq!(pass_groups.len() as u64, frame.group_count);
+    for (group_index, &range) in pass_groups.iter().enumerate() {
+        let physical = frame
+            .sections
+            .iter()
+            .find(|section| {
+                section.kind
+                    == FrameSectionKind::PassGroup {
+                        pass_index: 0,
+                        group_index: group_index as u64,
+                    }
+            })
+            .unwrap();
+        assert_eq!(range, physical.bits);
+    }
+
+    let packet = BoundedVarDctPacketPlan::parse(&bytes, &inventory).unwrap();
+    assert_eq!(
+        packet.hf_coefficients.unwrap().pass_groups,
+        pass_groups.as_slice()
+    );
 }
 
 #[test]

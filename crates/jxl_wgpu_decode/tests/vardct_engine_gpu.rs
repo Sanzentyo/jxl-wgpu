@@ -737,6 +737,72 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
 }
 
 #[test]
+fn libjxl_center_first_permuted_toc_matches_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let encoded = common::green_queen_vardct_permuted();
+    let extent = Extent2d::new(438, 589);
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    assert!(inventory.frames[0].toc_permuted);
+    let physical_group_order = inventory.frames[0]
+        .sections
+        .iter()
+        .filter_map(|section| match section.kind {
+            jxl_gpu_bitstream::FrameSectionKind::PassGroup {
+                pass_index: 0,
+                group_index,
+            } => Some(group_index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(physical_group_order.len(), 6);
+    assert_ne!(physical_group_order, (0..6).collect::<Vec<_>>());
+
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    let rust_error = maximum_error(actual, &rust);
+    assert!(
+        rust_error <= 1,
+        "center-first GPU output diverges from Rust jxl by {rust_error}",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        let djxl_error = maximum_error(actual, &djxl);
+        assert!(
+            djxl_error <= 1,
+            "center-first GPU output diverges from djxl by {djxl_error}",
+        );
+    }
+}
+
+#[test]
 fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
     let Some((info, device, queue)) = device() else {
         return;

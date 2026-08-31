@@ -67,7 +67,10 @@ deliberately narrow standard VarDCT packet topologies. A one-entry zero-AC TOC r
 8x8, 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC may instead
 cover one LF group with one independent DCT8 first block per padded 8x8 image block and at least two
 256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients with the
-natural DCT8 order or the standard entropy-coded custom DCT8 order. The explicit section topology removes
+natural DCT8 order or the standard entropy-coded custom DCT8 order. Scanline and entropy-coded
+center-first TOC order are both accepted: inventory retains physical section ranges and the
+frontend normalizes them to logical group order before assigning pixel rectangles and per-group
+scratch. The explicit section topology removes
 the ambiguity with a one-entry single-transform packet. This tiled form supports odd and asymmetric
 pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
 forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
@@ -125,6 +128,10 @@ continues to own the exact output bytes. A separate 438x589 libjxl fixture exerc
 pass groups, 4,070 DCT8 tasks, a custom three-channel coefficient order, nonzero AC coefficients,
 and a self-correcting MA tree; GPU RGB8 output differs from both Rust `jxl` and `djxl` by at most
 one code.
+A separate deterministic 438x589 fixture stores the same bounded one-pass DCT8 topology in libjxl's
+center-first entropy-coded TOC order. Its physical pass-group order differs from row-major order;
+the frontend test proves each logical group retains the matching physical bit range, and the
+actual-adapter test matches both development-only pixel oracles within one RGB8 code.
 A second deterministic 438x589 libjxl fixture enables standard Gaborish weights while disabling
 EPF. The same actual-adapter test executes inverse VarDCT, fused three-plane Gaborish, and RGB8
 packing in one command buffer, and differs from both development-only pixel oracles by at most one
