@@ -80,7 +80,8 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         })
         .unwrap();
     let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
-    let control = plan.packet_control().unwrap();
+    let group = plan.groups.first().unwrap();
+    let control = group.packet_control(&plan).unwrap();
 
     let mut stream_bytes = codestream.clone();
     stream_bytes.resize((stream_bytes.len() + 7) & !3, 0);
@@ -96,7 +97,11 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     });
     let lf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("VarDCT packet LF samples"),
-        size: u64::from(plan.reconstructed_words().unwrap()) * 4,
+        size: u64::from(
+            group
+                .reconstructed_words(plan.needs_self_correcting)
+                .unwrap(),
+        ) * 4,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -108,7 +113,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     });
     let coefficients = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("VarDCT packet zero AC coefficients"),
-        size: u64::from(plan.coefficient_words()) * 4,
+        size: u64::from(group.coefficient_words()) * 4,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -126,7 +131,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("VarDCT packet Modular params"),
         contents: bytemuck::bytes_of(
-            &VarDctModularParams::default().with_lz77_window(plan.lz77_window_words),
+            &VarDctModularParams::default().with_lz77_window(group.lz77_window_words),
         ),
         usage: wgpu::BufferUsages::STORAGE,
     });
@@ -185,13 +190,13 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
             expected_lf_samples: block_count * 3,
             block_count,
             correlation_samples: plan.profile.width.div_ceil(64) * plan.profile.height.div_ceil(64),
-            task_capacity: plan.task_capacity,
+            task_capacity: group.task_capacity,
             expected_global_scale: plan.global_scale,
             expected_quant_lf: plan.quant_lf,
-            expected_extra_precision: plan.extra_precision,
+            expected_extra_precision: group.extra_precision,
         })
         .unwrap();
-    assert_eq!(status.coefficient_words, plan.coefficient_words());
+    assert_eq!(status.coefficient_words, group.coefficient_words());
 }
 
 #[test]

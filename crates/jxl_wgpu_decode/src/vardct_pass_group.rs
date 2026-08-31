@@ -55,18 +55,25 @@ pub struct HfCoefficientPassParams {
     lf_plane_stride_words: u32,
     lz77_window_base_words: u32,
     coeff_shift: u32,
-    _reserved: u32,
+    global_group_index: u32,
     block_context: HfBlockContextTables,
 }
 
-/// Packed immutable input for all pass groups. Offsets are word-relative to `entropy_words`.
+/// One LF group's pass-group parameters and coefficient sink.
+#[derive(Clone, Debug)]
+pub struct HfCoefficientGroupExecutionPlan {
+    pub lf_group_index: u32,
+    pub params: Vec<HfCoefficientPassParams>,
+    pub sink_params: HfCoefficientSinkParams,
+    pub lz77_scratch_words: u32,
+}
+
+/// Shared immutable entropy/order tables plus independently bounded LF-group jobs.
 #[derive(Clone, Debug)]
 pub struct HfCoefficientExecutionPlan {
     pub entropy_words: Vec<u32>,
     pub order_words: Vec<u32>,
-    pub params: Vec<HfCoefficientPassParams>,
-    pub sink_params: HfCoefficientSinkParams,
-    pub lz77_scratch_words: u32,
+    pub groups: Vec<HfCoefficientGroupExecutionPlan>,
 }
 
 fn append_block_context_tables(
@@ -111,7 +118,7 @@ impl HfCoefficientExecutionPlan {
     pub fn new(
         packet: &BoundedVarDctPacketPlan,
         entropy: &HfCoefficientEntropyPlan,
-        artifact: VarDctArtifactLayout,
+        artifacts: &[VarDctArtifactLayout],
     ) -> Result<Self, HfCoefficientPlanError> {
         let metadata_words = u32::try_from(entropy.metadata.len()).map_err(|_| {
             HfCoefficientPlanError::ArithmeticOverflow {
@@ -153,63 +160,116 @@ impl HfCoefficientExecutionPlan {
                 actual: u64::from(group_count),
             });
         }
-        let lz77_scratch_words = entropy.lz77_window_words.checked_mul(group_count).ok_or(
-            HfCoefficientPlanError::ArithmeticOverflow {
-                field: "pass-group LZ77 scratch words",
-            },
-        )?;
-        let [blocks_per_row, block_rows] = packet.block_extent();
-        let lz77_scratch_base_words = packet.reconstructed_words()?;
-        let lf_plane_stride_words = blocks_per_row.checked_mul(block_rows).ok_or(
-            HfCoefficientPlanError::ArithmeticOverflow {
-                field: "quantized LF plane stride",
-            },
-        )?;
         let lz77_window_mask = entropy.lz77_window_words.saturating_sub(1);
         let num_block_clusters = entropy.num_block_clusters;
-        let mut params = Vec::with_capacity(entropy.pass_groups.len());
-        for (group_index, range) in entropy.pass_groups.iter().copied().enumerate() {
-            let group_index = u32::try_from(group_index).map_err(|_| {
+        if artifacts.len() != packet.groups.len() {
+            return Err(HfCoefficientPlanError::LfGroupCount {
+                expected: packet.groups.len(),
+                actual: artifacts.len(),
+            });
+        }
+        let mut groups = Vec::with_capacity(packet.groups.len());
+        for (lf_group, &artifact) in packet.groups.iter().zip(artifacts) {
+            let [blocks_per_row, block_rows] = lf_group.block_extent();
+            let lf_plane_stride_words = blocks_per_row.checked_mul(block_rows).ok_or(
                 HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "pass-group index",
-                }
-            })?;
-            let rect = packet.profile.pass_group_rect(u64::from(group_index))?;
-            let token_start = u32::try_from(range.offset).map_err(|_| {
-                HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "pass-group bit start",
-                }
-            })?;
-            let token_end = range.end().and_then(|end| u32::try_from(end).ok()).ok_or(
-                HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "pass-group bit end",
+                    field: "quantized LF plane stride",
                 },
             )?;
-            params.push(HfCoefficientPassParams {
-                entropy: EntropyStreamParams {
-                    token_start,
-                    token_end,
-                    lz77_window_mask,
+            let lz77_scratch_base_words =
+                lf_group.reconstructed_words(packet.needs_self_correcting)?;
+            let mut params = Vec::new();
+            for (global_group_index, range) in entropy.pass_groups.iter().copied().enumerate() {
+                let global_group_index = u32::try_from(global_group_index).map_err(|_| {
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "pass-group index",
+                    }
+                })?;
+                if packet
+                    .profile
+                    .low_frequency_group_index_for_pass_group(u64::from(global_group_index))?
+                    != lf_group.index
+                {
+                    continue;
+                }
+                let rect = packet
+                    .profile
+                    .pass_group_rect(u64::from(global_group_index))?;
+                let local_x = rect.x.checked_sub(lf_group.rect.x).ok_or(
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "local pass-group x origin",
+                    },
+                )?;
+                let local_y = rect.y.checked_sub(lf_group.rect.y).ok_or(
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "local pass-group y origin",
+                    },
+                )?;
+                let token_start = u32::try_from(range.offset).map_err(|_| {
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "pass-group bit start",
+                    }
+                })?;
+                let token_end = range.end().and_then(|end| u32::try_from(end).ok()).ok_or(
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "pass-group bit end",
+                    },
+                )?;
+                let local_group_index = u32::try_from(params.len()).map_err(|_| {
+                    HfCoefficientPlanError::ArithmeticOverflow {
+                        field: "local pass-group index",
+                    }
+                })?;
+                params.push(HfCoefficientPassParams {
+                    entropy: EntropyStreamParams {
+                        token_start,
+                        token_end,
+                        lz77_window_mask,
+                    },
+                    block_origin_x: local_x / 8,
+                    block_origin_y: local_y / 8,
+                    block_width: rect.width.div_ceil(8),
+                    block_height: rect.height.div_ceil(8),
+                    blocks_per_row,
+                    block_task_map_offset_words: artifact.block_task_map_offset_words,
+                    num_hf_presets: entropy.num_hf_presets,
+                    num_block_clusters,
+                    context_map_offset_words,
+                    lf_plane_stride_words,
+                    lz77_window_base_words: local_group_index
+                        .checked_mul(entropy.lz77_window_words)
+                        .and_then(|offset| lz77_scratch_base_words.checked_add(offset))
+                        .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "pass-group LZ77 scratch offset",
+                        })?,
+                    coeff_shift: 0,
+                    global_group_index,
+                    block_context,
+                });
+            }
+            let local_group_count = u32::try_from(params.len()).map_err(|_| {
+                HfCoefficientPlanError::ArithmeticOverflow {
+                    field: "LF-group pass-group count",
+                }
+            })?;
+            let lz77_scratch_words = entropy
+                .lz77_window_words
+                .checked_mul(local_group_count)
+                .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                    field: "LF-group pass-group LZ77 scratch words",
+                })?;
+            groups.push(HfCoefficientGroupExecutionPlan {
+                lf_group_index: lf_group.index,
+                params,
+                sink_params: HfCoefficientSinkParams {
+                    task_metadata_offset_words: artifact.task_metadata_offset_words,
+                    task_count: lf_group.task_capacity,
+                    coefficient_words: lf_group.coefficient_words(),
+                    order_descriptor_count: (HF_ORDER_COUNT * HF_ORDER_CHANNELS) as u32,
+                    order_coordinate_offset_words: entropy.order_coordinate_offset_words,
+                    _reserved: [0; 3],
                 },
-                block_origin_x: rect.x / 8,
-                block_origin_y: rect.y / 8,
-                block_width: rect.width.div_ceil(8),
-                block_height: rect.height.div_ceil(8),
-                blocks_per_row,
-                block_task_map_offset_words: artifact.block_task_map_offset_words,
-                num_hf_presets: entropy.num_hf_presets,
-                num_block_clusters,
-                context_map_offset_words,
-                lf_plane_stride_words,
-                lz77_window_base_words: group_index
-                    .checked_mul(entropy.lz77_window_words)
-                    .and_then(|offset| lz77_scratch_base_words.checked_add(offset))
-                    .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "pass-group LZ77 scratch offset",
-                    })?,
-                coeff_shift: 0,
-                _reserved: 0,
-                block_context,
+                lz77_scratch_words,
             });
         }
 
@@ -217,19 +277,28 @@ impl HfCoefficientExecutionPlan {
         Ok(Self {
             entropy_words,
             order_words,
-            params,
-            sink_params: HfCoefficientSinkParams {
-                task_metadata_offset_words: artifact.task_metadata_offset_words,
-                task_count: packet.task_capacity,
-                coefficient_words: packet.coefficient_words(),
-                order_descriptor_count: (HF_ORDER_COUNT * HF_ORDER_CHANNELS) as u32,
-                order_coordinate_offset_words: entropy.order_coordinate_offset_words,
-                _reserved: [0; 3],
-            },
-            lz77_scratch_words,
+            groups,
         })
     }
 
+    #[must_use]
+    pub fn status_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(HfCoefficientGroupExecutionPlan::status_bytes)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn lz77_scratch_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(HfCoefficientGroupExecutionPlan::lz77_scratch_bytes)
+            .sum()
+    }
+}
+
+impl HfCoefficientGroupExecutionPlan {
     #[must_use]
     pub fn status_bytes(&self) -> u64 {
         self.params.len() as u64 * HF_COEFFICIENT_STATUS_BYTES
@@ -237,7 +306,11 @@ impl HfCoefficientExecutionPlan {
 
     #[must_use]
     pub fn lz77_scratch_bytes(&self) -> u64 {
-        u64::from(self.lz77_scratch_words.max(1)) * 4
+        u64::from(self.lz77_scratch_words) * 4
+    }
+
+    pub(crate) fn global_group_indices(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.params.iter().map(|params| params.global_group_index)
     }
 }
 
@@ -249,6 +322,8 @@ pub enum HfCoefficientPlanError {
     Packet(#[from] crate::vardct_packet::BoundedVarDctPacketError),
     #[error("HF coefficient plan has {actual} pass groups; expected {expected}")]
     PassGroupCount { expected: u64, actual: u64 },
+    #[error("HF coefficient plan has {actual} LF groups; expected {expected}")]
+    LfGroupCount { expected: usize, actual: usize },
     #[error("HF coefficient plan arithmetic overflowed while computing {field}")]
     ArithmeticOverflow { field: &'static str },
 }

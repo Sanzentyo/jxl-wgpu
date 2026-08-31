@@ -135,6 +135,8 @@ impl VarDctResourceLayout {
 pub enum VarDctResourceError {
     #[error("VarDCT resource arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("LF output stride {actual} is smaller than required extent {required}")]
+    InvalidOutputStride { required: u32, actual: u32 },
     #[error("VarDCT resource preparation requires at least one quantization entry")]
     ZeroQuantizationEntries,
     #[error("failed to construct the normative default VarDCT dequantization matrices")]
@@ -159,6 +161,8 @@ impl VarDctResourceParams {
     pub fn new(
         blocks_x: u32,
         blocks_y: u32,
+        output_stride: u32,
+        output_origin: [u32; 2],
         global_scale: u32,
         quant_lf: u32,
         extra_precision: u8,
@@ -169,11 +173,28 @@ impl VarDctResourceParams {
                 .ok_or(VarDctResourceError::ArithmeticOverflow {
                     field: "LF preparation block count",
                 })?;
+        let output_right = output_origin[0].checked_add(blocks_x).ok_or(
+            VarDctResourceError::ArithmeticOverflow {
+                field: "LF output horizontal extent",
+            },
+        )?;
+        if output_stride < output_right {
+            return Err(VarDctResourceError::InvalidOutputStride {
+                required: output_right,
+                actual: output_stride,
+            });
+        }
+        let output_offset = output_origin[1]
+            .checked_mul(output_stride)
+            .and_then(|offset| offset.checked_add(output_origin[0]))
+            .ok_or(VarDctResourceError::ArithmeticOverflow {
+                field: "LF output origin",
+            })?;
         let denominator = global_scale as f32 * quant_lf as f32;
         let precision_divisor = (1u32 << extra_precision) as f32;
         Ok(Self {
-            geometry: [blocks_x, blocks_y, blocks, 0],
-            offsets: [0, blocks, 2 * blocks, 0],
+            geometry: [blocks_x, blocks_y, blocks, output_stride],
+            offsets: [0, blocks, 2 * blocks, output_offset],
             scales: [
                 16.0 / denominator / precision_divisor,
                 128.0 / denominator / precision_divisor,

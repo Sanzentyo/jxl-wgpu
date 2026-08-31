@@ -15,7 +15,7 @@ struct Params {
     lf_plane_stride_words: u32,
     lz77_window_base_words: u32,
     coeff_shift: u32,
-    _reserved: u32,
+    global_group_index: u32,
     block_context: HfBlockContextTables,
 };
 
@@ -278,7 +278,7 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
     statuses[status_base + 2u] = params.entropy.token_end;
     statuses[status_base + 3u] = entropy_decoded;
     statuses[status_base + 4u] = selected_preset;
-    statuses[status_base + 5u] = lane;
+    statuses[status_base + 5u] = params.global_group_index;
     statuses[status_base + 6u] = nonzero_coefficients;
     statuses[status_base + 7u] = hf_coefficient_error;
 }

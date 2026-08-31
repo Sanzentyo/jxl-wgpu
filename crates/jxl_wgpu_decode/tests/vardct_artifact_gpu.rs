@@ -58,10 +58,11 @@ fn config(raw_metadata_words: u64) -> HfMetadataArtifactConfig {
         hf_mul_offset_words: 5,
         raw_metadata_words,
         pass_group_dim_blocks: 32,
-        lf_stride: 5,
+        lf_stride: 13,
+        correlation_stride: 2,
         correlation_width: 1,
         correlation_height: 1,
-        destination_origin: [8, 16],
+        destination_origin: [64, 64],
         afv_basis_offset: 9_999,
         quant_offset: 0,
         correlation_offset: 0,
@@ -105,6 +106,7 @@ fn lower_topology(
         raw_metadata_words: raw.len() as u64,
         pass_group_dim_blocks,
         lf_stride: blocks[0],
+        correlation_stride: blocks[0].div_ceil(8),
         correlation_width: blocks[0].div_ceil(8),
         correlation_height: blocks[1].div_ceil(8),
         destination_origin: [0, 0],
@@ -303,6 +305,22 @@ fn artifact_layout_is_aligned_bounded_and_typed() {
         VarDctArtifactLayout::plan(&short_correlation, unbounded_limits()),
         Err(VarDctArtifactError::InvalidGeometry {
             field: "correlation grid does not cover the LF group",
+        })
+    );
+    let mut short_lf_stride = config;
+    short_lf_stride.lf_stride = 12;
+    assert_eq!(
+        VarDctArtifactLayout::plan(&short_lf_stride, unbounded_limits()),
+        Err(VarDctArtifactError::InvalidGeometry {
+            field: "global LF horizontal extent exceeds its stride",
+        })
+    );
+    let mut short_correlation_stride = config;
+    short_correlation_stride.correlation_stride = 1;
+    assert_eq!(
+        VarDctArtifactLayout::plan(&short_correlation_stride, unbounded_limits()),
+        Err(VarDctArtifactError::InvalidGeometry {
+            field: "global correlation horizontal extent exceeds its stride",
         })
     );
 
@@ -701,11 +719,11 @@ fn scatter_test(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     assert_eq!(tasks[3].scratch_or_basis_offset, 9_999);
     assert_eq!(
         (tasks[1].coefficient_origin_x, tasks[1].coefficient_origin_y),
-        (16, 16)
+        (72, 64)
     );
     assert_eq!(
         (tasks[1].destination_x_x, tasks[1].destination_y_x),
-        (16, 16)
+        (72, 64)
     );
     assert_eq!(tasks[1].matrix_offset, 1_000 + 7 * 64);
 

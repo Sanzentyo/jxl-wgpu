@@ -663,6 +663,33 @@ impl StandardVarDctProfile {
             self.group_count,
         )
     }
+
+    pub fn low_frequency_group_index_for_pass_group(
+        &self,
+        index: u64,
+    ) -> Result<u32, VarDctFrontendError> {
+        let pass = self.pass_group_rect(index)?;
+        let lf_dimension =
+            self.group_dimension
+                .checked_mul(8)
+                .ok_or(VarDctFrontendError::Unsupported {
+                    feature: UnsupportedVarDctFeature::ImageDimensions,
+                })?;
+        let lf_groups_per_row = self.width.div_ceil(lf_dimension);
+        let lf_index = (pass.y / lf_dimension)
+            .checked_mul(lf_groups_per_row)
+            .and_then(|row| row.checked_add(pass.x / lf_dimension))
+            .ok_or(VarDctFrontendError::Unsupported {
+                feature: UnsupportedVarDctFeature::ImageDimensions,
+            })?;
+        if u64::from(lf_index) >= self.low_frequency_group_count {
+            return Err(VarDctFrontendError::GroupIndexOutOfRange {
+                index: u64::from(lf_index),
+                group_count: self.low_frequency_group_count,
+            });
+        }
+        Ok(lf_index)
+    }
 }
 
 fn group_rect(

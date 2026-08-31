@@ -1,7 +1,7 @@
 //! Runtime-neutral GPU submission engine for the bounded standard VarDCT profile.
 //!
 //! The accepted codestream profile is intentionally bounded and authoritative: one still XYB
-//! frame, one LF group, GPU-decoded mixed strategy/quantization/correlation metadata, and
+//! frame, independently bounded LF groups, GPU-decoded mixed strategy/quantization/correlation metadata, and
 //! GPU-decoded single-pass AC coefficients for every JPEG XL VarDCT strategy. No pixel,
 //! coefficient, transform, quantization, residual, or entropy fallback runs on the CPU.
 
@@ -57,7 +57,8 @@ use crate::vardct_packet::{
 };
 use crate::vardct_pass_group::{
     GpuHfCoefficientError, GpuHfCoefficientStatus, HfCoefficientBuffers,
-    HfCoefficientExecutionPlan, HfCoefficientPipeline, HfCoefficientPlanError,
+    HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan, HfCoefficientPipeline,
+    HfCoefficientPlanError,
 };
 use crate::vardct_resource::{
     VarDctResourceBuffers, VarDctResourceError, VarDctResourceLayout, VarDctResourceParams,
@@ -71,7 +72,6 @@ use crate::{
 
 const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
 const ARTIFACT_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctArtifactStatus>() as u64;
-const BASE_VALIDATION_STAGING_BYTES: u64 = PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES;
 const ADAPTIVE_LF_WORKGROUP_BYTES: u64 = 18 * 18 * 16;
 const VAR_DCT_PARSE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -134,6 +134,12 @@ pub enum VarDctDecodeError {
     },
     #[error("mapped VarDCT validation status has an invalid {status} ABI")]
     StatusAbi { status: &'static str },
+    #[error("VarDCT {component} has {actual} LF-group plans; expected {expected}")]
+    GroupPlanCount {
+        component: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error("VarDCT GPU completion was consumed more than once")]
     CompletionConsumed,
     #[error("VarDCT kernel '{kernel}' configuration failed: {message}")]
@@ -204,10 +210,10 @@ impl VarDctDecodeMemoryStats {
         let VarDctDecodeMemoryInputs {
             codestream_len,
             packet,
-            control,
+            groups,
             resource,
-            artifact,
             hf_coefficients,
+            adaptive_lf_smoothing,
             restoration_scratch,
             gaborish,
             epf_sigma,
@@ -215,6 +221,16 @@ impl VarDctDecodeMemoryStats {
             resident,
             output,
         } = inputs;
+        fn checked_sum(
+            values: impl IntoIterator<Item = u64>,
+            field: &'static str,
+        ) -> Result<u64, VarDctDecodeError> {
+            values.into_iter().try_fold(0_u64, |total, value| {
+                total
+                    .checked_add(value)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow { field })
+            })
+        }
         let checked_words = |words: u64, field: &'static str| {
             words
                 .checked_mul(4)
@@ -233,28 +249,54 @@ impl VarDctDecodeMemoryStats {
             })?,
             "Modular metadata bytes",
         )?;
+        let mut reconstructed_words = Vec::with_capacity(packet.groups.len());
+        for group in &packet.groups {
+            reconstructed_words.push(u64::from(
+                group.reconstructed_words(packet.needs_self_correcting)?,
+            ));
+        }
         let reconstructed_bytes = checked_words(
-            u64::from(packet.reconstructed_words()?),
+            checked_sum(reconstructed_words, "LF reconstruction word total")?,
             "LF reconstruction bytes",
         )?;
-        let raw_metadata_bytes =
-            checked_words(u64::from(control.capacities[1]), "raw HF metadata bytes")?;
-        let coefficient_bytes =
-            checked_words(u64::from(packet.coefficient_words()), "coefficient bytes")?;
-        let packet_status_bytes = PACKET_STATUS_BYTES;
+        let raw_metadata_bytes = checked_words(
+            checked_sum(
+                groups
+                    .iter()
+                    .map(|group| u64::from(group.control.capacities[1])),
+                "raw HF metadata word total",
+            )?,
+            "raw HF metadata bytes",
+        )?;
+        let coefficient_bytes = checked_words(
+            u64::from(packet.total_coefficient_words()?),
+            "coefficient bytes",
+        )?;
+        let group_count =
+            u64::try_from(groups.len()).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group count",
+            })?;
+        let packet_status_bytes = group_count.checked_mul(PACKET_STATUS_BYTES).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "packet status bytes",
+            },
+        )?;
         let hf_entropy_bundle_bytes = hf_coefficients
             .map(|plan| checked_words(plan.entropy_words.len() as u64, "HF entropy bundle bytes"))
             .transpose()?
             .unwrap_or(0);
         let hf_params_bytes = hf_coefficients
             .map(|plan| {
-                (plan.params.len() as u64)
-                    .checked_mul(std::mem::size_of::<
-                        crate::vardct_pass_group::HfCoefficientPassParams,
-                    >() as u64)
-                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                        field: "HF parameter bytes",
-                    })
+                checked_sum(
+                    plan.groups.iter().map(|group| group.params.len() as u64),
+                    "HF parameter count",
+                )?
+                .checked_mul(
+                    std::mem::size_of::<crate::vardct_pass_group::HfCoefficientPassParams>() as u64,
+                )
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "HF parameter bytes",
+                })
             })
             .transpose()?
             .unwrap_or(0);
@@ -266,26 +308,72 @@ impl VarDctDecodeMemoryStats {
             .transpose()?
             .unwrap_or(0);
         let hf_sink_uniform_bytes = hf_coefficients
-            .map(|_| std::mem::size_of::<crate::vardct_artifact::HfCoefficientSinkParams>() as u64)
+            .map(|plan| {
+                (plan.groups.len() as u64)
+                    .checked_mul(
+                        std::mem::size_of::<crate::vardct_artifact::HfCoefficientSinkParams>()
+                            as u64,
+                    )
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF sink uniform bytes",
+                    })
+            })
+            .transpose()?
             .unwrap_or(0);
-        let validation_staging_bytes = BASE_VALIDATION_STAGING_BYTES
-            .checked_add(hf_status_bytes)
+        let artifact_status_bytes = group_count.checked_mul(ARTIFACT_STATUS_BYTES).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "artifact status bytes",
+            },
+        )?;
+        let validation_staging_bytes = packet_status_bytes
+            .checked_add(artifact_status_bytes)
+            .and_then(|bytes| bytes.checked_add(hf_status_bytes))
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "VarDCT validation staging bytes",
-        })?;
-        let packet_control_bytes = std::mem::size_of::<VarDctPacketControl>() as u64;
-        let modular_params_bytes = std::mem::size_of::<VarDctModularParams>() as u64;
+                field: "VarDCT validation staging bytes",
+            })?;
+        let packet_control_bytes = group_count
+            .checked_mul(std::mem::size_of::<VarDctPacketControl>() as u64)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "packet control bytes",
+            })?;
+        let modular_params_bytes = group_count
+            .checked_mul(std::mem::size_of::<VarDctModularParams>() as u64)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "Modular parameter bytes",
+            })?;
         let lf_temporary_bytes = u64::from(resource.block_count).checked_mul(16).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
                 field: "LF temporary bytes",
             },
         )?;
         let resource_bytes = resource.bytes();
-        let resource_uniform_bytes = std::mem::size_of::<VarDctResourceParams>() as u64;
-        let adaptive_lf_uniform_bytes = std::mem::size_of::<AdaptiveLfParams>() as u64;
-        let artifact_bytes = artifact.artifact_bytes;
-        let occupancy_bytes = artifact.occupancy_bytes;
-        let artifact_uniform_bytes = std::mem::size_of::<HfMetadataLoweringParams>() as u64;
+        let resource_uniform_bytes = group_count
+            .checked_mul(std::mem::size_of::<VarDctResourceParams>() as u64)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "resource uniform bytes",
+            })?;
+        let adaptive_lf_uniform_bytes = if adaptive_lf_smoothing {
+            std::mem::size_of::<AdaptiveLfParams>() as u64
+        } else {
+            0
+        };
+        let artifact_bytes = checked_sum(
+            groups
+                .iter()
+                .map(|group| group.artifact_layout.artifact_bytes),
+            "artifact byte total",
+        )?;
+        let occupancy_bytes = checked_sum(
+            groups
+                .iter()
+                .map(|group| group.artifact_layout.occupancy_bytes),
+            "occupancy byte total",
+        )?;
+        let artifact_uniform_bytes = group_count
+            .checked_mul(std::mem::size_of::<HfMetadataLoweringParams>() as u64)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "artifact uniform bytes",
+            })?;
         let [blocks_x, blocks_y] = packet.block_extent();
         let pixels = u64::from(blocks_x)
             .checked_mul(8)
@@ -314,13 +402,25 @@ impl VarDctDecodeMemoryStats {
             0
         };
         let epf_sigma_bytes = epf_sigma.map_or(0, |plan| plan.sigma_bytes);
-        let epf_sigma_uniform_bytes = epf_sigma.map_or(0, |plan| plan.uniform_bytes);
+        let epf_sigma_uniform_bytes = epf_sigma
+            .map(|plan| {
+                plan.uniform_bytes.checked_mul(group_count).ok_or(
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "EPF sigma uniform bytes",
+                    },
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
         let epf_filter_uniform_bytes = u64::from(epf_iterations)
             .checked_mul(ResidentEpfMemoryPlan::new().uniform_bytes)
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "EPF filter uniform bytes",
             })?;
-        let resident_transient_bytes = resident.total_bytes;
+        let resident_transient_bytes = checked_sum(
+            resident.iter().map(|plan| plan.total_bytes),
+            "resident VarDCT transient bytes",
+        )?;
         let output_uniform_bytes = output.memory.uniform_bytes;
         let output_lease_bytes = output.memory.output_storage_bytes;
         let transient_bytes = [
@@ -409,15 +509,15 @@ impl VarDctDecodeMemoryStats {
 struct VarDctDecodeMemoryInputs<'a> {
     codestream_len: usize,
     packet: &'a BoundedVarDctPacketPlan,
-    control: VarDctPacketControl,
+    groups: &'a [VarDctGroupSource],
     resource: VarDctResourceLayout,
-    artifact: VarDctArtifactLayout,
     hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
+    adaptive_lf_smoothing: bool,
     restoration_scratch: bool,
     gaborish: bool,
     epf_sigma: Option<EpfSigmaMemoryPlan>,
     epf_iterations: u32,
-    resident: ResidentVarDctMemoryPlan,
+    resident: &'a [ResidentVarDctMemoryPlan],
     output: VarDctOutputPlan,
 }
 
@@ -565,11 +665,8 @@ struct VarDctSource {
     codestream_storage: Arc<[u8]>,
     codestream_range: Range<usize>,
     packet: BoundedVarDctPacketPlan,
-    control: VarDctPacketControl,
+    groups: Vec<VarDctGroupSource>,
     resource_layout: VarDctResourceLayout,
-    resource_params: VarDctResourceParams,
-    artifact_layout: VarDctArtifactLayout,
-    artifact_params: HfMetadataLoweringParams,
     hf_coefficients: Option<HfCoefficientExecutionPlan>,
     gaborish: Option<ResidentGaborishWeights>,
     epf: Option<VarDctEpfPlan>,
@@ -579,6 +676,14 @@ struct VarDctSource {
     quant_biases: [f32; 4],
     frame_name: String,
     memory: VarDctDecodeMemoryStats,
+}
+
+struct VarDctGroupSource {
+    control: VarDctPacketControl,
+    resource_params: VarDctResourceParams,
+    artifact_layout: VarDctArtifactLayout,
+    artifact_params: HfMetadataLoweringParams,
+    quant_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -594,20 +699,17 @@ struct VarDctEpfHeader {
 
 #[derive(Clone, Debug, PartialEq)]
 struct VarDctEpfPlan {
-    sigma: EpfSigmaConfig,
+    sigma_groups: Vec<EpfSigmaConfig>,
     passes: Vec<ResidentEpfParameters>,
 }
 
 impl VarDctEpfHeader {
     fn plan(
         self,
-        blocks_x: u32,
-        blocks_y: u32,
-        task_count: u32,
-        sharpness_offset_words: u32,
-        artifact: VarDctArtifactLayout,
+        packet: &BoundedVarDctPacketPlan,
+        groups: &[VarDctGroupSource],
         global_scale: u32,
-    ) -> VarDctEpfPlan {
+    ) -> Result<VarDctEpfPlan, VarDctDecodeError> {
         let mut passes = Vec::with_capacity(self.iterations as usize);
         if self.iterations >= 3 {
             passes.push(ResidentEpfParameters {
@@ -634,20 +736,33 @@ impl VarDctEpfHeader {
             });
         }
         debug_assert_eq!(passes.len(), self.iterations as usize);
-        VarDctEpfPlan {
-            sigma: EpfSigmaConfig {
-                blocks_x,
-                blocks_y,
-                task_count,
-                sharpness_offset_words,
-                artifact_status_offset_words: artifact.status_offset_words,
-                task_metadata_offset_words: artifact.task_metadata_offset_words,
-                global_scale,
-                quant_mul: self.quant_mul,
-                sharp_lut: self.sharp_lut,
-            },
+        let [output_blocks_x, output_blocks_y] = packet.block_extent();
+        let sigma_groups = packet
+            .groups
+            .iter()
+            .zip(groups)
+            .map(|(packet_group, group)| {
+                let [blocks_x, blocks_y] = packet_group.block_extent();
+                Ok(EpfSigmaConfig {
+                    blocks_x,
+                    blocks_y,
+                    output_blocks_x,
+                    output_blocks_y,
+                    output_origin: [packet_group.rect.x / 8, packet_group.rect.y / 8],
+                    task_count: packet_group.task_capacity,
+                    sharpness_offset_words: group.control.expected[3],
+                    artifact_status_offset_words: group.artifact_layout.status_offset_words,
+                    task_metadata_offset_words: group.artifact_layout.task_metadata_offset_words,
+                    global_scale,
+                    quant_mul: self.quant_mul,
+                    sharp_lut: self.sharp_lut,
+                })
+            })
+            .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
+        Ok(VarDctEpfPlan {
+            sigma_groups,
             passes,
-        }
+        })
     }
 }
 
@@ -715,61 +830,96 @@ fn prepare_source(
         return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
     }
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
-    let control = packet.packet_control()?;
     let [blocks_x, blocks_y] = packet.block_extent();
-    let resource_layout = VarDctResourceLayout::new(blocks_x, blocks_y, packet.task_capacity)?;
-    let resource_params = VarDctResourceParams::new(
-        blocks_x,
-        blocks_y,
-        packet.global_scale,
-        packet.quant_lf,
-        packet.extra_precision,
-    )?;
+    let resource_layout =
+        VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;
     let correlation_width = packet.profile.width.div_ceil(64);
-    let correlation_height = packet.profile.height.div_ceil(64);
     let pass_group_dim_blocks = packet.profile.group_dimension.checked_div(8).ok_or(
         VarDctDecodeError::ArithmeticOverflow {
             field: "pass-group block dimension",
         },
     )?;
-    let artifact_config = HfMetadataArtifactConfig {
-        blocks_width: blocks_x,
-        blocks_height: blocks_y,
-        block_info_entries: packet.task_capacity,
-        strategy_offset_words: control.offsets[2],
-        hf_mul_offset_words: control.offsets[3],
-        raw_metadata_words: u64::from(control.capacities[1]),
-        pass_group_dim_blocks,
-        lf_stride: blocks_x,
-        correlation_width,
-        correlation_height,
-        destination_origin: [0, 0],
-        afv_basis_offset: resource_layout.afv_basis_offset,
-        quant_offset: resource_layout.quant_offset,
-        correlation_offset: resource_layout.correlation_offset,
-        global_scale: packet.global_scale,
-        matrix_offsets: resource_layout.matrix_offsets,
-    };
-    let artifact_layout = VarDctArtifactLayout::plan(
-        &artifact_config,
-        VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
-    )?;
-    let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
-    let epf = epf_header.map(|header| {
-        header.plan(
+    let mut quant_offset = resource_layout.quant_offset;
+    let mut groups = Vec::with_capacity(packet.groups.len());
+    for packet_group in &packet.groups {
+        let control = packet_group.packet_control(&packet)?;
+        let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
+        let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
+        let resource_params = VarDctResourceParams::new(
+            group_blocks_x,
+            group_blocks_y,
             blocks_x,
-            blocks_y,
-            packet.task_capacity,
-            control.expected[3],
-            artifact_layout,
+            block_origin,
             packet.global_scale,
-        )
-    });
-    let epf_sigma_memory = epf.as_ref().map(|plan| plan.sigma.plan()).transpose()?;
+            packet.quant_lf,
+            packet_group.extra_precision,
+        )?;
+        let group_correlation_width = packet_group.rect.width.div_ceil(64);
+        let group_correlation_height = packet_group.rect.height.div_ceil(64);
+        let correlation_origin = [packet_group.rect.x / 64, packet_group.rect.y / 64];
+        let correlation_offset = correlation_origin[1]
+            .checked_mul(correlation_width)
+            .and_then(|offset| offset.checked_add(correlation_origin[0]))
+            .and_then(|offset| resource_layout.correlation_offset.checked_add(offset))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group correlation resource offset",
+            })?;
+        let artifact_config = HfMetadataArtifactConfig {
+            blocks_width: group_blocks_x,
+            blocks_height: group_blocks_y,
+            block_info_entries: packet_group.task_capacity,
+            strategy_offset_words: control.offsets[2],
+            hf_mul_offset_words: control.offsets[3],
+            raw_metadata_words: u64::from(control.capacities[1]),
+            pass_group_dim_blocks,
+            lf_stride: blocks_x,
+            correlation_stride: correlation_width,
+            correlation_width: group_correlation_width,
+            correlation_height: group_correlation_height,
+            destination_origin: [packet_group.rect.x, packet_group.rect.y],
+            afv_basis_offset: resource_layout.afv_basis_offset,
+            quant_offset,
+            correlation_offset,
+            global_scale: packet.global_scale,
+            matrix_offsets: resource_layout.matrix_offsets,
+        };
+        let artifact_layout = VarDctArtifactLayout::plan(
+            &artifact_config,
+            VarDctArtifactDeviceLimits::from_wgpu(&backend.device().limits()),
+        )?;
+        let artifact_params = HfMetadataLoweringParams::new(&artifact_config, artifact_layout)?;
+        groups.push(VarDctGroupSource {
+            control,
+            resource_params,
+            artifact_layout,
+            artifact_params,
+            quant_offset,
+        });
+        quant_offset = quant_offset.checked_add(packet_group.task_capacity).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group quantization resource range",
+            },
+        )?;
+    }
+    debug_assert_eq!(quant_offset, resource_layout.correlation_offset);
+    let epf = epf_header
+        .map(|header| header.plan(&packet, &groups, packet.global_scale))
+        .transpose()?;
+    let epf_sigma_memory = epf
+        .as_ref()
+        .and_then(|plan| plan.sigma_groups.first())
+        .map(|config| config.plan())
+        .transpose()?;
     let hf_coefficients = packet
         .hf_coefficients
         .as_ref()
-        .map(|entropy| HfCoefficientExecutionPlan::new(&packet, entropy, artifact_layout))
+        .map(|entropy| {
+            let artifacts = groups
+                .iter()
+                .map(|group| group.artifact_layout)
+                .collect::<Vec<_>>();
+            HfCoefficientExecutionPlan::new(&packet, entropy, &artifacts)
+        })
         .transpose()?;
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
         packet.profile.width,
@@ -802,33 +952,39 @@ fn prepare_source(
         opsin.quant_bias[2].to_f32(),
         opsin.quant_bias_numerator.to_f32(),
     ];
-    let scratch_scalars = packet.coefficient_words();
-    let resident_memory = ResidentVarDctMemoryPlan::new(scratch_scalars)?;
+    let resident_memory = packet
+        .groups
+        .iter()
+        .map(|group| ResidentVarDctMemoryPlan::new(group.coefficient_words()))
+        .collect::<Result<Vec<_>, _>>()?;
     let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
         codestream_len: codestream.bytes().len(),
         packet: &packet,
-        control,
+        groups: &groups,
         resource: resource_layout,
-        artifact: artifact_layout,
         hf_coefficients: hf_coefficients.as_ref(),
+        adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
         restoration_scratch: gaborish.is_some() || epf.is_some(),
         gaborish: gaborish.is_some(),
         epf_sigma: epf_sigma_memory,
         epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
-        resident: resident_memory,
+        resident: &resident_memory,
         output: output_plan,
     })?;
-    validate_device_limits(backend.device(), memory)?;
+    validate_device_limits(
+        backend.device(),
+        memory,
+        &packet,
+        &groups,
+        hf_coefficients.as_ref(),
+    )?;
     let frame_name = packet.profile.frame_name.clone();
     Ok(VarDctSource {
         codestream_storage: codestream.shared_storage(),
         codestream_range: codestream.storage_range(),
         packet,
-        control,
+        groups,
         resource_layout,
-        resource_params,
-        artifact_layout,
-        artifact_params,
         hf_coefficients,
         gaborish,
         epf,
@@ -914,14 +1070,82 @@ fn restoration_config(
 fn validate_device_limits(
     device: &wgpu::Device,
     memory: VarDctDecodeMemoryStats,
+    packet: &BoundedVarDctPacketPlan,
+    groups: &[VarDctGroupSource],
+    hf_coefficients: Option<&HfCoefficientExecutionPlan>,
 ) -> Result<(), VarDctDecodeError> {
     let limits = device.limits();
-    let reconstruction_storage_bytes = memory
-        .reconstructed_bytes
-        .checked_add(memory.hf_lz77_scratch_bytes)
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "combined LF reconstruction and HF LZ77 bytes",
+    let group_count =
+        u64::try_from(groups.len()).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "LF-group device-limit count",
         })?;
+    if group_count == 0 {
+        return Err(VarDctDecodeError::GroupPlanCount {
+            component: "device-limit source",
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let mut reconstruction_storage_bytes = 0_u64;
+    for (index, group) in packet.groups.iter().enumerate() {
+        let reconstruction = u64::from(group.reconstructed_words(packet.needs_self_correcting)?)
+            .checked_mul(4)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group reconstruction binding bytes",
+            })?;
+        let lz77 = hf_coefficients
+            .and_then(|plan| plan.groups.get(index))
+            .map_or(0, HfCoefficientGroupExecutionPlan::lz77_scratch_bytes);
+        reconstruction_storage_bytes =
+            reconstruction_storage_bytes.max(reconstruction.checked_add(lz77).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group reconstruction binding bytes",
+                },
+            )?);
+    }
+    let raw_metadata_bytes = groups
+        .iter()
+        .map(|group| u64::from(group.control.capacities[1]) * 4)
+        .max()
+        .unwrap_or(0);
+    let coefficient_bytes = packet
+        .groups
+        .iter()
+        .map(|group| u64::from(group.coefficient_words()) * 4)
+        .max()
+        .unwrap_or(0);
+    let artifact_bytes = groups
+        .iter()
+        .map(|group| group.artifact_layout.artifact_bytes)
+        .max()
+        .unwrap_or(0);
+    let occupancy_bytes = groups
+        .iter()
+        .map(|group| group.artifact_layout.occupancy_bytes)
+        .max()
+        .unwrap_or(0);
+    let hf_params_bytes = hf_coefficients
+        .map(|plan| {
+            plan.groups
+                .iter()
+                .map(|group| {
+                    (group.params.len() as u64)
+                        * std::mem::size_of::<crate::vardct_pass_group::HfCoefficientPassParams>()
+                            as u64
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let hf_status_bytes = hf_coefficients
+        .map(|plan| {
+            plan.groups
+                .iter()
+                .map(HfCoefficientGroupExecutionPlan::status_bytes)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
     for (resource, required, storage) in [
         ("codestream upload", memory.codestream_bytes, true),
         ("Modular metadata", memory.modular_metadata_bytes, true),
@@ -930,17 +1154,22 @@ fn validate_device_limits(
             reconstruction_storage_bytes,
             true,
         ),
-        ("raw HF metadata", memory.raw_metadata_bytes, true),
-        ("coefficients", memory.coefficient_bytes, true),
-        ("packet status", memory.packet_status_bytes, true),
+        ("raw HF metadata", raw_metadata_bytes, true),
+        ("coefficients", coefficient_bytes, true),
+        ("packet status", PACKET_STATUS_BYTES, true),
+        (
+            "Modular parameters",
+            std::mem::size_of::<VarDctModularParams>() as u64,
+            true,
+        ),
         ("validation staging", memory.validation_staging_bytes, false),
         ("LF temporary", memory.lf_temporary_bytes, true),
         ("VarDCT resources", memory.resource_bytes, true),
-        ("VarDCT artifact", memory.artifact_bytes, true),
-        ("artifact occupancy", memory.occupancy_bytes, true),
+        ("VarDCT artifact", artifact_bytes, true),
+        ("artifact occupancy", occupancy_bytes, true),
         ("HF entropy bundle", memory.hf_entropy_bundle_bytes, true),
-        ("HF pass-group parameters", memory.hf_params_bytes, true),
-        ("HF pass-group status", memory.hf_status_bytes, true),
+        ("HF pass-group parameters", hf_params_bytes, true),
+        ("HF pass-group status", hf_status_bytes, true),
         (
             "HF coefficient order table",
             memory.hf_order_table_bytes,
@@ -960,14 +1189,35 @@ fn validate_device_limits(
             check_limit(resource, required, limits.max_storage_buffer_binding_size)?;
         }
     }
+    let epf_sigma_uniform_bytes = if memory.epf_sigma_uniform_bytes == 0 {
+        0
+    } else {
+        memory.epf_sigma_uniform_bytes / group_count
+    };
     for (resource, required) in [
-        ("packet control uniform", memory.packet_control_bytes),
-        ("LF resource uniform", memory.resource_uniform_bytes),
+        (
+            "packet control uniform",
+            std::mem::size_of::<VarDctPacketControl>() as u64,
+        ),
+        (
+            "LF resource uniform",
+            std::mem::size_of::<VarDctResourceParams>() as u64,
+        ),
         ("adaptive LF uniform", memory.adaptive_lf_uniform_bytes),
-        ("artifact uniform", memory.artifact_uniform_bytes),
-        ("HF coefficient sink uniform", memory.hf_sink_uniform_bytes),
+        (
+            "artifact uniform",
+            std::mem::size_of::<HfMetadataLoweringParams>() as u64,
+        ),
+        (
+            "HF coefficient sink uniform",
+            if hf_coefficients.is_some() {
+                std::mem::size_of::<crate::vardct_artifact::HfCoefficientSinkParams>() as u64
+            } else {
+                0
+            },
+        ),
         ("Gaborish uniform", memory.gaborish_uniform_bytes),
-        ("EPF sigma uniform", memory.epf_sigma_uniform_bytes),
+        ("EPF sigma uniform", epf_sigma_uniform_bytes),
         (
             "one EPF filter uniform",
             if memory.epf_filter_uniform_bytes == 0 {
@@ -1087,10 +1337,26 @@ struct VarDctMemoryPermits {
 
 struct HfCoefficientJobBuffers {
     entropy_bundle: wgpu::Buffer,
+    order_table: wgpu::Buffer,
+    groups: Vec<HfCoefficientGroupJobBuffers>,
+}
+
+struct HfCoefficientGroupJobBuffers {
     params: wgpu::Buffer,
     status: wgpu::Buffer,
-    order_table: wgpu::Buffer,
     sink_params: wgpu::Buffer,
+}
+
+struct VarDctGroupJobBuffers {
+    reconstructed: wgpu::Buffer,
+    raw_metadata: wgpu::Buffer,
+    coefficients: wgpu::Buffer,
+    packet_status: wgpu::Buffer,
+    packet_control: wgpu::Buffer,
+    modular_params: wgpu::Buffer,
+    artifact: wgpu::Buffer,
+    occupancy: wgpu::Buffer,
+    artifact_uniform: wgpu::Buffer,
 }
 
 struct RestorationCursor<'a> {
@@ -1131,7 +1397,7 @@ struct RestorationJobBuffers {
     _planes: [wgpu::Buffer; 3],
     _gaborish_uniform: Option<wgpu::Buffer>,
     _epf_sigma: Option<wgpu::Buffer>,
-    _epf_sigma_uniform: Option<wgpu::Buffer>,
+    _epf_sigma_uniforms: Vec<wgpu::Buffer>,
     _epf_uniforms: Vec<wgpu::Buffer>,
 }
 
@@ -1142,23 +1408,15 @@ struct VarDctJobLifetime {
     _transient_permit: MemoryPermit,
     _codestream: wgpu::Buffer,
     _modular_metadata: wgpu::Buffer,
-    _reconstructed: wgpu::Buffer,
-    _raw_metadata: wgpu::Buffer,
-    _coefficients: wgpu::Buffer,
-    _packet_status: wgpu::Buffer,
-    _packet_control: wgpu::Buffer,
-    _modular_params: wgpu::Buffer,
+    _groups: Vec<VarDctGroupJobBuffers>,
     _lf_temporary: wgpu::Buffer,
     _resources: wgpu::Buffer,
-    _resource_uniform: wgpu::Buffer,
-    _adaptive_lf_uniform: wgpu::Buffer,
-    _artifact: wgpu::Buffer,
-    _occupancy: wgpu::Buffer,
-    _artifact_uniform: wgpu::Buffer,
+    _resource_uniforms: Vec<wgpu::Buffer>,
+    _adaptive_lf_uniform: Option<wgpu::Buffer>,
     _hf_coefficients: Option<HfCoefficientJobBuffers>,
     _xyb_planes: [wgpu::Buffer; 3],
     _restoration: Option<RestorationJobBuffers>,
-    _resident_scratch: ResidentVarDctScratch,
+    _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: VarDctOutputScratch,
 }
 
@@ -1170,24 +1428,29 @@ impl Drop for VarDctJobLifetime {
     }
 }
 
-/// Submitted VarDCT frame awaiting one mapped packet/artifact validation record.
+#[derive(Clone, Debug)]
+struct VarDctGroupValidation {
+    uniform_transform: Option<TransformKind>,
+    expected_lf_samples: u32,
+    expected_coefficients: u32,
+    expected_blocks: u32,
+    correlation_samples: u32,
+    task_capacity: u32,
+    expected_global_scale: u32,
+    expected_quant_lf: u32,
+    expected_extra_precision: u8,
+}
+
+/// Submitted VarDCT frame awaiting one aggregate map of every LF/pass-group status record.
 pub struct VarDctPendingFrame {
     device: wgpu::Device,
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<MapCompletion>,
     token: SubmissionToken,
     layout: ImageLayout,
-    uniform_transform: Option<TransformKind>,
     frame_name: String,
-    expected_lf_samples: u32,
-    expected_coefficients: u32,
-    expected_blocks: u32,
-    correlation_samples: u32,
-    task_capacity: u32,
-    expected_hf_groups: u32,
-    expected_global_scale: u32,
-    expected_quant_lf: u32,
-    expected_extra_precision: u8,
+    expected_groups: Vec<VarDctGroupValidation>,
+    expected_hf_group_indices: Vec<u32>,
 }
 
 impl std::fmt::Debug for VarDctPendingFrame {
@@ -1196,7 +1459,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
             .debug_struct("VarDctPendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
-            .field("uniform_transform", &self.uniform_transform)
+            .field("lf_group_count", &self.expected_groups.len())
             .finish_non_exhaustive()
     }
 }
@@ -1232,84 +1495,107 @@ impl VarDctPendingFrame {
             .slice(..)
             .get_mapped_range()
             .map_err(DecodeError::backend)?;
-        let packet_status: GpuVarDctPacketStatus = mapped
-            .get(..PACKET_STATUS_BYTES as usize)
-            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
-            .ok_or(VarDctDecodeError::StatusAbi { status: "packet" })?;
-        let artifact: GpuVarDctArtifactStatus = mapped
-            .get(PACKET_STATUS_BYTES as usize..BASE_VALIDATION_STAGING_BYTES as usize)
-            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
-            .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
-        let packet = packet_status
-            .validate(VarDctPacketValidation {
-                expected_strategy: self.uniform_transform,
-                expected_lf_samples: self.expected_lf_samples,
-                block_count: self.expected_blocks,
-                correlation_samples: self.correlation_samples,
-                task_capacity: self.task_capacity,
-                expected_global_scale: self.expected_global_scale,
-                expected_quant_lf: self.expected_quant_lf,
-                expected_extra_precision: self.expected_extra_precision,
-            })
-            .map_err(VarDctDecodeError::from)?;
-        if packet_status.coefficient_words != self.expected_coefficients {
-            return Err(VarDctDecodeError::ArtifactStatus {
-                field: "packet coefficient_words",
-                expected: self.expected_coefficients,
-                actual: packet_status.coefficient_words,
+        let group_count = self.expected_groups.len();
+        let packet_bytes = group_count
+            .checked_mul(PACKET_STATUS_BYTES as usize)
+            .ok_or(VarDctDecodeError::StatusAbi {
+                status: "packet count",
+            })?;
+        let artifact_bytes = group_count
+            .checked_mul(ARTIFACT_STATUS_BYTES as usize)
+            .ok_or(VarDctDecodeError::StatusAbi {
+                status: "artifact count",
+            })?;
+        let hf_offset =
+            packet_bytes
+                .checked_add(artifact_bytes)
+                .ok_or(VarDctDecodeError::StatusAbi {
+                    status: "aggregate offset",
+                })?;
+        for (index, expected) in self.expected_groups.iter().enumerate() {
+            let packet_offset = index * PACKET_STATUS_BYTES as usize;
+            let packet_status: GpuVarDctPacketStatus = mapped
+                .get(packet_offset..packet_offset + PACKET_STATUS_BYTES as usize)
+                .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+                .ok_or(VarDctDecodeError::StatusAbi { status: "packet" })?;
+            let artifact_offset = packet_bytes + index * ARTIFACT_STATUS_BYTES as usize;
+            let artifact: GpuVarDctArtifactStatus = mapped
+                .get(artifact_offset..artifact_offset + ARTIFACT_STATUS_BYTES as usize)
+                .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+                .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
+            let packet = packet_status
+                .validate(VarDctPacketValidation {
+                    expected_strategy: expected.uniform_transform,
+                    expected_lf_samples: expected.expected_lf_samples,
+                    block_count: expected.expected_blocks,
+                    correlation_samples: expected.correlation_samples,
+                    task_capacity: expected.task_capacity,
+                    expected_global_scale: expected.expected_global_scale,
+                    expected_quant_lf: expected.expected_quant_lf,
+                    expected_extra_precision: expected.expected_extra_precision,
+                })
+                .map_err(VarDctDecodeError::from)?;
+            if packet_status.coefficient_words != expected.expected_coefficients {
+                return Err(VarDctDecodeError::ArtifactStatus {
+                    field: "packet coefficient_words",
+                    expected: expected.expected_coefficients,
+                    actual: packet_status.coefficient_words,
+                }
+                .into());
             }
-            .into());
+            artifact.validate().map_err(VarDctDecodeError::from)?;
+            for (field, expected, actual) in [
+                ("task_count", packet.first_blocks, artifact.task_count),
+                (
+                    "coefficient_words",
+                    expected.expected_coefficients,
+                    artifact.coefficient_words,
+                ),
+                (
+                    "covered_blocks",
+                    expected.expected_blocks,
+                    artifact.covered_blocks,
+                ),
+                (
+                    "consumed_block_info_entries",
+                    packet.first_blocks,
+                    artifact.consumed_block_info_entries,
+                ),
+                ("backend_requirements", 0, artifact.backend_requirements),
+            ] {
+                if actual != expected {
+                    return Err(VarDctDecodeError::ArtifactStatus {
+                        field,
+                        expected,
+                        actual,
+                    }
+                    .into());
+                }
+            }
         }
-        artifact.validate().map_err(VarDctDecodeError::from)?;
-        let hf_status_bytes = mapped.get(BASE_VALIDATION_STAGING_BYTES as usize..).ok_or(
-            VarDctDecodeError::StatusAbi {
+        let hf_status_bytes = mapped
+            .get(hf_offset..)
+            .ok_or(VarDctDecodeError::StatusAbi {
                 status: "HF coefficient",
-            },
-        )?;
+            })?;
         let hf_statuses = bytemuck::try_cast_slice::<u8, GpuHfCoefficientStatus>(hf_status_bytes)
             .map_err(|_| VarDctDecodeError::StatusAbi {
             status: "HF coefficient",
         })?;
-        if hf_statuses.len() != self.expected_hf_groups as usize {
+        if hf_statuses.len() != self.expected_hf_group_indices.len() {
             return Err(VarDctDecodeError::StatusAbi {
                 status: "HF coefficient count",
             }
             .into());
         }
-        for (group, status) in hf_statuses.iter().copied().enumerate() {
-            status
-                .validate(group as u32)
-                .map_err(VarDctDecodeError::from)?;
+        for (&group, status) in self
+            .expected_hf_group_indices
+            .iter()
+            .zip(hf_statuses.iter().copied())
+        {
+            status.validate(group).map_err(VarDctDecodeError::from)?;
         }
         drop(mapped);
-        for (field, expected, actual) in [
-            ("task_count", packet.first_blocks, artifact.task_count),
-            (
-                "coefficient_words",
-                self.expected_coefficients,
-                artifact.coefficient_words,
-            ),
-            (
-                "covered_blocks",
-                self.expected_blocks,
-                artifact.covered_blocks,
-            ),
-            (
-                "consumed_block_info_entries",
-                packet.first_blocks,
-                artifact.consumed_block_info_entries,
-            ),
-            ("backend_requirements", 0, artifact.backend_requirements),
-        ] {
-            if actual != expected {
-                return Err(VarDctDecodeError::ArtifactStatus {
-                    field,
-                    expected,
-                    actual,
-                }
-                .into());
-            }
-        }
         let output_id = OutputId(0);
         let mut regions = BTreeMap::new();
         regions.insert(
@@ -1459,71 +1745,113 @@ fn submit_vardct(
             mapped_at_creation: false,
         })
     };
-    let reconstructed_storage_bytes = source
-        .memory
-        .reconstructed_bytes
-        .checked_add(source.memory.hf_lz77_scratch_bytes)
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "combined LF reconstruction and HF LZ77 bytes",
-        })?;
-    let reconstructed = storage(
-        "jxl-wgpu VarDCT LF reconstruction",
-        reconstructed_storage_bytes,
-        wgpu::BufferUsages::COPY_DST,
-    );
-    let raw_metadata = storage(
-        "jxl-wgpu VarDCT raw HF metadata",
-        source.memory.raw_metadata_bytes,
-        wgpu::BufferUsages::COPY_DST,
-    );
-    let coefficients = storage(
-        "jxl-wgpu VarDCT coefficients",
-        source.memory.coefficient_bytes,
-        wgpu::BufferUsages::COPY_DST,
-    );
-    let packet_status = storage(
-        "jxl-wgpu VarDCT packet status",
-        PACKET_STATUS_BYTES,
-        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-    );
-    let packet_control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT packet control"),
-        contents: bytemuck::bytes_of(&source.control),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let params = VarDctModularParams::default()
-        .with_lz77_window(source.packet.lz77_window_words)
-        .with_self_correcting(source.packet.needs_self_correcting);
-    let modular_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT Modular params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    if source.groups.len() != source.packet.groups.len() {
+        return Err(VarDctDecodeError::GroupPlanCount {
+            component: "packet source",
+            expected: source.packet.groups.len(),
+            actual: source.groups.len(),
+        });
+    }
+    if let Some(plan) = &source.hf_coefficients
+        && plan.groups.len() != source.packet.groups.len()
+    {
+        return Err(VarDctDecodeError::GroupPlanCount {
+            component: "HF coefficient",
+            expected: source.packet.groups.len(),
+            actual: plan.groups.len(),
+        });
+    }
+    let mut group_buffers = Vec::with_capacity(source.groups.len());
+    for (index, (packet_group, group)) in
+        source.packet.groups.iter().zip(&source.groups).enumerate()
+    {
+        let reconstructed_bytes =
+            u64::from(packet_group.reconstructed_words(source.packet.needs_self_correcting)?)
+                .checked_mul(4)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group reconstruction bytes",
+                })?;
+        let hf_lz77_bytes = source
+            .hf_coefficients
+            .as_ref()
+            .and_then(|plan| plan.groups.get(index))
+            .map_or(0, HfCoefficientGroupExecutionPlan::lz77_scratch_bytes);
+        let reconstructed = storage(
+            "jxl-wgpu VarDCT LF-group reconstruction",
+            reconstructed_bytes.checked_add(hf_lz77_bytes).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group reconstruction and HF LZ77 bytes",
+                },
+            )?,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let raw_metadata = storage(
+            "jxl-wgpu VarDCT LF-group raw HF metadata",
+            u64::from(group.control.capacities[1]) * 4,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let coefficients = storage(
+            "jxl-wgpu VarDCT LF-group coefficients",
+            u64::from(packet_group.coefficient_words()) * 4,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let packet_status = storage(
+            "jxl-wgpu VarDCT LF-group packet status",
+            PACKET_STATUS_BYTES,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let packet_control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu VarDCT LF-group packet control"),
+            contents: bytemuck::bytes_of(&group.control),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let params = VarDctModularParams::default()
+            .with_lz77_window(packet_group.lz77_window_words)
+            .with_self_correcting(source.packet.needs_self_correcting);
+        let modular_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu VarDCT LF-group Modular params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let artifact = storage(
+            "jxl-wgpu VarDCT LF-group resident artifact",
+            group.artifact_layout.artifact_bytes,
+            wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        );
+        let occupancy = storage(
+            "jxl-wgpu VarDCT LF-group artifact occupancy",
+            group.artifact_layout.occupancy_bytes,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let artifact_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu VarDCT LF-group artifact params"),
+            contents: bytemuck::bytes_of(&group.artifact_params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        group_buffers.push(VarDctGroupJobBuffers {
+            reconstructed,
+            raw_metadata,
+            coefficients,
+            packet_status,
+            packet_control,
+            modular_params,
+            artifact,
+            occupancy,
+            artifact_uniform,
+        });
+    }
     let lf_temporary = storage(
         "jxl-wgpu VarDCT dequantized LF temporary",
         source.memory.lf_temporary_bytes,
-        wgpu::BufferUsages::COPY_DST,
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     );
     let resource_values = source.resource_layout.initial_values()?;
     let resources = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu VarDCT resource vectors"),
         contents: bytemuck::cast_slice(&resource_values),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let artifact = storage(
-        "jxl-wgpu VarDCT resident artifact",
-        source.artifact_layout.artifact_bytes,
-        wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-    );
-    let occupancy = storage(
-        "jxl-wgpu VarDCT artifact occupancy",
-        source.artifact_layout.occupancy_bytes,
-        wgpu::BufferUsages::COPY_DST,
-    );
-    let artifact_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu VarDCT artifact params"),
-        contents: bytemuck::bytes_of(&source.artifact_params),
-        usage: wgpu::BufferUsages::UNIFORM,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let hf_coefficient_buffers =
         source
@@ -1535,26 +1863,32 @@ fn submit_vardct(
                     contents: bytemuck::cast_slice(&plan.entropy_words),
                     usage: wgpu::BufferUsages::STORAGE,
                 }),
-                params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("jxl-wgpu HF pass-group params"),
-                    contents: bytemuck::cast_slice(&plan.params),
-                    usage: wgpu::BufferUsages::STORAGE,
-                }),
-                status: storage(
-                    "jxl-wgpu HF pass-group status",
-                    plan.status_bytes(),
-                    wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                ),
                 order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("jxl-wgpu HF natural-order table"),
                     contents: bytemuck::cast_slice(&plan.order_words),
                     usage: wgpu::BufferUsages::STORAGE,
                 }),
-                sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("jxl-wgpu HF coefficient sink params"),
-                    contents: bytemuck::bytes_of(&plan.sink_params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                }),
+                groups: plan
+                    .groups
+                    .iter()
+                    .map(|group| HfCoefficientGroupJobBuffers {
+                        params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("jxl-wgpu LF-group HF pass-group params"),
+                            contents: bytemuck::cast_slice(&group.params),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        }),
+                        status: storage(
+                            "jxl-wgpu LF-group HF pass-group status",
+                            group.status_bytes(),
+                            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        ),
+                        sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("jxl-wgpu LF-group HF coefficient sink params"),
+                            contents: bytemuck::bytes_of(&group.sink_params),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        }),
+                    })
+                    .collect(),
             });
     let plane_bytes = source.memory.xyb_plane_bytes / 3;
     let xyb_planes = [
@@ -1600,13 +1934,7 @@ fn submit_vardct(
         label: Some("jxl-wgpu bounded VarDCT decode"),
     });
     for buffer in [
-        &reconstructed,
-        &raw_metadata,
-        &coefficients,
-        &packet_status,
         &lf_temporary,
-        &artifact,
-        &occupancy,
         &xyb_planes[0],
         &xyb_planes[1],
         &xyb_planes[2],
@@ -1614,146 +1942,207 @@ fn submit_vardct(
     ] {
         commands.clear_buffer(buffer, 0, None);
     }
+    for group in &group_buffers {
+        for buffer in [
+            &group.reconstructed,
+            &group.raw_metadata,
+            &group.coefficients,
+            &group.packet_status,
+            &group.artifact,
+            &group.occupancy,
+        ] {
+            commands.clear_buffer(buffer, 0, None);
+        }
+    }
     if let Some(buffers) = &hf_coefficient_buffers {
-        commands.clear_buffer(&buffers.status, 0, None);
+        for group in &buffers.groups {
+            commands.clear_buffer(&group.status, 0, None);
+        }
     }
     if let Some(sigma) = &epf_sigma {
         commands.clear_buffer(sigma, 0, None);
     }
-    pipelines.packet.encode(
-        device,
-        &mut commands,
-        VarDctPacketBuffers {
-            codestream: &codestream_buffer,
-            modular_metadata: &modular_metadata,
-            reconstructed_lf: &reconstructed,
-            raw_hf_metadata: &raw_metadata,
-            coefficients: &coefficients,
-            status: &packet_status,
-            control: &packet_control,
-            modular_params: &modular_params,
-        },
-    );
-    let resource_uniform = pipelines.resource.encode(
-        device,
-        &mut commands,
-        VarDctResourceBuffers {
-            quantized_lf: &reconstructed,
-            dequantized_lf: &lf_temporary,
-        },
-        source.resource_params,
-    );
-    let adaptive_lf_uniform = pipelines.adaptive_lf.encode(
-        device,
-        &mut commands,
-        AdaptiveLfBuffers {
-            input: &lf_temporary,
-            output: &resources,
-        },
-        AdaptiveLfParams::new(
-            source.control.geometry[2],
-            source.control.geometry[3],
-            0,
-            source.resource_layout.lf_offset,
-            source.resource_params.smoothing_thresholds(),
-        ),
-    );
-    pipelines.artifact.encode(
-        device,
-        &mut commands,
-        HfMetadataLoweringBuffers {
-            raw_metadata: &raw_metadata,
-            artifact: &artifact,
-            occupancy: &occupancy,
-            resources: &resources,
-            params: &artifact_uniform,
-        },
-    );
-    let epf_sigma_uniform = match (source.epf.as_ref(), epf_sigma.as_ref()) {
-        (Some(plan), Some(sigma)) => Some(pipelines.epf_sigma.encode(
+    let mut resource_uniforms = Vec::with_capacity(source.groups.len());
+    for (group, buffers) in source.groups.iter().zip(&group_buffers) {
+        pipelines.packet.encode(
             device,
             &mut commands,
-            &raw_metadata,
-            &artifact,
-            sigma,
-            plan.sigma,
-        )?),
-        (None, None) => None,
-        _ => unreachable!("EPF plan and sigma buffer are constructed together"),
+            VarDctPacketBuffers {
+                codestream: &codestream_buffer,
+                modular_metadata: &modular_metadata,
+                reconstructed_lf: &buffers.reconstructed,
+                raw_hf_metadata: &buffers.raw_metadata,
+                coefficients: &buffers.coefficients,
+                status: &buffers.packet_status,
+                control: &buffers.packet_control,
+                modular_params: &buffers.modular_params,
+            },
+        );
+        resource_uniforms.push(pipelines.resource.encode(
+            device,
+            &mut commands,
+            VarDctResourceBuffers {
+                quantized_lf: &buffers.reconstructed,
+                dequantized_lf: &lf_temporary,
+            },
+            group.resource_params,
+        ));
+    }
+    let [blocks_x, blocks_y] = source.packet.block_extent();
+    let smoothing_thresholds = source
+        .groups
+        .first()
+        .ok_or(VarDctDecodeError::GroupPlanCount {
+            component: "packet source",
+            expected: 1,
+            actual: 0,
+        })?
+        .resource_params
+        .smoothing_thresholds();
+    let adaptive_lf_uniform = if source.packet.profile.adaptive_lf_smoothing {
+        Some(pipelines.adaptive_lf.encode(
+            device,
+            &mut commands,
+            AdaptiveLfBuffers {
+                input: &lf_temporary,
+                output: &resources,
+            },
+            AdaptiveLfParams::new(
+                blocks_x,
+                blocks_y,
+                0,
+                source.resource_layout.lf_offset,
+                smoothing_thresholds,
+            ),
+        ))
+    } else {
+        commands.copy_buffer_to_buffer(
+            &lf_temporary,
+            0,
+            &resources,
+            u64::from(source.resource_layout.lf_offset) * 16,
+            source.memory.lf_temporary_bytes,
+        );
+        None
     };
+    for buffers in &group_buffers {
+        pipelines.artifact.encode(
+            device,
+            &mut commands,
+            HfMetadataLoweringBuffers {
+                raw_metadata: &buffers.raw_metadata,
+                artifact: &buffers.artifact,
+                occupancy: &buffers.occupancy,
+                resources: &resources,
+                params: &buffers.artifact_uniform,
+            },
+        );
+    }
+    let mut epf_sigma_uniforms = Vec::new();
+    match (source.epf.as_ref(), epf_sigma.as_ref()) {
+        (Some(plan), Some(sigma)) => {
+            if plan.sigma_groups.len() != group_buffers.len() {
+                return Err(VarDctDecodeError::GroupPlanCount {
+                    component: "EPF sigma",
+                    expected: group_buffers.len(),
+                    actual: plan.sigma_groups.len(),
+                });
+            }
+            epf_sigma_uniforms.reserve(plan.sigma_groups.len());
+            for (&config, buffers) in plan.sigma_groups.iter().zip(&group_buffers) {
+                epf_sigma_uniforms.push(pipelines.epf_sigma.encode(
+                    device,
+                    &mut commands,
+                    &buffers.raw_metadata,
+                    &buffers.artifact,
+                    sigma,
+                    config,
+                )?);
+            }
+        }
+        (None, None) => {}
+        _ => unreachable!("EPF plan and sigma buffer are constructed together"),
+    }
     if let (Some(plan), Some(buffers)) = (
         source.hf_coefficients.as_ref(),
         hf_coefficient_buffers.as_ref(),
     ) {
-        pipelines.hf_coefficients.encode(
+        for ((group_plan, hf_buffers), group_buffers) in
+            plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
+        {
+            pipelines.hf_coefficients.encode(
+                device,
+                &mut commands,
+                HfCoefficientBuffers {
+                    codestream: &codestream_buffer,
+                    entropy_bundle: &buffers.entropy_bundle,
+                    reconstruction: &group_buffers.reconstructed,
+                    params: &hf_buffers.params,
+                    status: &hf_buffers.status,
+                    artifact: &group_buffers.artifact,
+                    order_table: &buffers.order_table,
+                    coefficients: &group_buffers.coefficients,
+                    sink_params: &hf_buffers.sink_params,
+                },
+                u32::try_from(group_plan.params.len()).map_err(|_| {
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-group HF pass-group dispatch count",
+                    }
+                })?,
+            );
+        }
+    }
+    let padded_width = blocks_x
+        .checked_mul(8)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "padded output width",
+        })?;
+    let padded_height = blocks_y
+        .checked_mul(8)
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "padded output height",
+        })?;
+    let correlation_width = source.packet.profile.width.div_ceil(64);
+    let correlation_height = source.packet.profile.height.div_ceil(64);
+    let mut resident_scratch = Vec::with_capacity(source.groups.len());
+    for ((packet_group, group), buffers) in source
+        .packet
+        .groups
+        .iter()
+        .zip(&source.groups)
+        .zip(&group_buffers)
+    {
+        resident_scratch.push(pipelines.renderer.encode(
             device,
             &mut commands,
-            HfCoefficientBuffers {
-                codestream: &codestream_buffer,
-                entropy_bundle: &buffers.entropy_bundle,
-                reconstruction: &reconstructed,
-                params: &buffers.params,
-                status: &buffers.status,
-                artifact: &artifact,
-                order_table: &buffers.order_table,
-                coefficients: &coefficients,
-                sink_params: &buffers.sink_params,
+            ResidentVarDctInputs {
+                coefficients: resident_binding(&buffers.coefficients)?,
+                artifact: resident_binding(&buffers.artifact)?,
+                resources: resident_binding(&resources)?,
+                outputs: resident_image_planes(
+                    &xyb_planes,
+                    padded_width,
+                    padded_height,
+                    padded_width,
+                )?,
+                indirect: &buffers.artifact,
+                indirect_base_offset: u64::from(group.artifact_layout.indirect_offset_words) * 4,
+                config: ResidentVarDctRenderConfig {
+                    task_capacity: packet_group.task_capacity,
+                    scratch_scalars: packet_group.coefficient_words(),
+                    task_word_offset: group.artifact_layout.tasks_offset_words,
+                    bucket_word_offset: group.artifact_layout.buckets_offset_words,
+                    quant_offset: group.quant_offset,
+                    correlation_offset: source.resource_layout.correlation_offset,
+                    lf_offset: source.resource_layout.lf_offset,
+                    lf_stride: blocks_x,
+                    correlation_width,
+                    correlation_height,
+                    quant_biases: source.quant_biases,
+                },
             },
-            u32::try_from(plan.params.len()).map_err(|_| {
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "HF pass-group dispatch count",
-                }
-            })?,
-        );
+        )?);
     }
-    let blocks = source.resource_layout.block_count;
-    let scratch_scalars = source.packet.coefficient_words();
-    let padded_width =
-        source.control.geometry[2]
-            .checked_mul(8)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "padded output width",
-            })?;
-    let padded_height =
-        source.control.geometry[3]
-            .checked_mul(8)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "padded output height",
-            })?;
-    let resident_outputs = xyb_planes.each_ref().map(|plane| {
-        resident_binding(plane).map(|storage| ResidentF32Plane {
-            storage,
-            width: padded_width,
-            height: padded_height,
-            stride: padded_width,
-        })
-    });
-    let [output_x, output_y, output_b] = resident_outputs;
-    let resident_scratch = pipelines.renderer.encode(
-        device,
-        &mut commands,
-        ResidentVarDctInputs {
-            coefficients: resident_binding(&coefficients)?,
-            artifact: resident_binding(&artifact)?,
-            resources: resident_binding(&resources)?,
-            outputs: [output_x?, output_y?, output_b?],
-            indirect: &artifact,
-            indirect_base_offset: u64::from(source.artifact_layout.indirect_offset_words) * 4,
-            config: ResidentVarDctRenderConfig {
-                task_capacity: source.packet.task_capacity,
-                scratch_scalars,
-                task_word_offset: source.artifact_layout.tasks_offset_words,
-                bucket_word_offset: source.artifact_layout.buckets_offset_words,
-                quant_offset: source.resource_layout.quant_offset,
-                correlation_offset: source.resource_layout.correlation_offset,
-                lf_offset: source.resource_layout.lf_offset,
-                lf_stride: source.control.geometry[2],
-                correlation_width: source.packet.profile.width.div_ceil(64),
-                correlation_height: source.packet.profile.height.div_ceil(64),
-                quant_biases: source.quant_biases,
-            },
-        },
-    )?;
     let image_width = source.packet.profile.width;
     let image_height = source.packet.profile.height;
     let mut restoration = restoration_planes
@@ -1797,9 +2186,9 @@ fn submit_vardct(
             .unwrap_or_else(|| unreachable!("EPF requires a sigma plane"));
         let sigma = ResidentF32Plane {
             storage: resident_binding(sigma_buffer)?,
-            width: epf.sigma.blocks_x,
-            height: epf.sigma.blocks_y,
-            stride: epf.sigma.blocks_x,
+            width: blocks_x,
+            height: blocks_y,
+            stride: blocks_x,
         };
         for &parameters in &epf.passes {
             let (input_buffers, output_buffers) = restoration.advance();
@@ -1859,25 +2248,56 @@ fn submit_vardct(
         _planes: planes,
         _gaborish_uniform: gaborish_uniform,
         _epf_sigma: epf_sigma,
-        _epf_sigma_uniform: epf_sigma_uniform,
+        _epf_sigma_uniforms: epf_sigma_uniforms,
         _epf_uniforms: epf_uniforms,
     });
-    commands.copy_buffer_to_buffer(&packet_status, 0, &status_staging, 0, PACKET_STATUS_BYTES);
-    commands.copy_buffer_to_buffer(
-        &artifact,
-        u64::from(source.artifact_layout.status_offset_words) * 4,
-        &status_staging,
-        PACKET_STATUS_BYTES,
-        ARTIFACT_STATUS_BYTES,
-    );
-    if let Some(buffers) = &hf_coefficient_buffers {
+    let packet_status_end = source.memory.packet_status_bytes;
+    let artifact_status_end = packet_status_end
+        .checked_add(
+            u64::try_from(group_buffers.len())
+                .map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group status count",
+                })?
+                .checked_mul(ARTIFACT_STATUS_BYTES)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "artifact status staging bytes",
+                })?,
+        )
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "artifact status staging end",
+        })?;
+    for (index, (group, buffers)) in source.groups.iter().zip(&group_buffers).enumerate() {
+        let index = u64::try_from(index).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "LF-group status index",
+        })?;
         commands.copy_buffer_to_buffer(
-            &buffers.status,
+            &buffers.packet_status,
             0,
             &status_staging,
-            BASE_VALIDATION_STAGING_BYTES,
-            source.memory.hf_status_bytes,
+            index * PACKET_STATUS_BYTES,
+            PACKET_STATUS_BYTES,
         );
+        commands.copy_buffer_to_buffer(
+            &buffers.artifact,
+            u64::from(group.artifact_layout.status_offset_words) * 4,
+            &status_staging,
+            packet_status_end + index * ARTIFACT_STATUS_BYTES,
+            ARTIFACT_STATUS_BYTES,
+        );
+    }
+    if let Some(buffers) = &hf_coefficient_buffers {
+        let mut offset = artifact_status_end;
+        for group in &buffers.groups {
+            let status_bytes = group.status.size();
+            commands.copy_buffer_to_buffer(&group.status, 0, &status_staging, offset, status_bytes);
+            offset =
+                offset
+                    .checked_add(status_bytes)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "HF status staging offset",
+                    })?;
+        }
+        debug_assert_eq!(offset, source.memory.validation_staging_bytes);
     }
 
     let completion = Arc::new(MapCompletion::default());
@@ -1888,19 +2308,11 @@ fn submit_vardct(
         _transient_permit: permits.transient,
         _codestream: codestream_buffer,
         _modular_metadata: modular_metadata,
-        _reconstructed: reconstructed,
-        _raw_metadata: raw_metadata,
-        _coefficients: coefficients,
-        _packet_status: packet_status,
-        _packet_control: packet_control,
-        _modular_params: modular_params,
+        _groups: group_buffers,
         _lf_temporary: lf_temporary,
         _resources: resources,
-        _resource_uniform: resource_uniform,
+        _resource_uniforms: resource_uniforms,
         _adaptive_lf_uniform: adaptive_lf_uniform,
-        _artifact: artifact,
-        _occupancy: occupancy,
-        _artifact_uniform: artifact_uniform,
         _hf_coefficients: hf_coefficient_buffers,
         _xyb_planes: xyb_planes,
         _restoration: restoration_buffers,
@@ -1932,36 +2344,53 @@ fn submit_vardct(
     }) {
         completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
     }
-    let correlations = source
-        .packet
-        .profile
-        .width
-        .div_ceil(64)
-        .checked_mul(source.packet.profile.height.div_ceil(64))
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "correlation samples",
-        })?;
+    let mut expected_groups = Vec::with_capacity(source.packet.groups.len());
+    for group in &source.packet.groups {
+        let [group_blocks_x, group_blocks_y] = group.block_extent();
+        let expected_blocks = group_blocks_x.checked_mul(group_blocks_y).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group validation block count",
+            },
+        )?;
+        let correlation_samples = group
+            .rect
+            .width
+            .div_ceil(64)
+            .checked_mul(group.rect.height.div_ceil(64))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group validation correlation samples",
+            })?;
+        expected_groups.push(VarDctGroupValidation {
+            uniform_transform: source.packet.uniform_transform,
+            expected_lf_samples: expected_blocks.checked_mul(3).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-group validation sample count",
+                },
+            )?,
+            expected_coefficients: group.coefficient_words(),
+            expected_blocks,
+            correlation_samples,
+            task_capacity: group.task_capacity,
+            expected_global_scale: source.packet.global_scale,
+            expected_quant_lf: source.packet.quant_lf,
+            expected_extra_precision: group.extra_precision,
+        });
+    }
+    let expected_hf_group_indices = source
+        .hf_coefficients
+        .iter()
+        .flat_map(|plan| &plan.groups)
+        .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
+        .collect();
     Ok(VarDctPendingFrame {
         device: device.clone(),
         lifetime: Some(lifetime),
         completion,
         token: SubmissionToken(1),
         layout: source.layout.clone(),
-        uniform_transform: source.packet.uniform_transform,
         frame_name: source.frame_name.clone(),
-        expected_lf_samples: blocks * 3,
-        expected_coefficients: source.packet.coefficient_words(),
-        expected_blocks: blocks,
-        correlation_samples: correlations,
-        task_capacity: source.packet.task_capacity,
-        expected_hf_groups: source
-            .hf_coefficients
-            .as_ref()
-            .map(|plan| plan.params.len() as u32)
-            .unwrap_or(0),
-        expected_global_scale: source.packet.global_scale,
-        expected_quant_lf: source.packet.quant_lf,
-        expected_extra_precision: source.packet.extra_precision,
+        expected_groups,
+        expected_hf_group_indices,
     })
 }
 

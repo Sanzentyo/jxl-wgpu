@@ -64,22 +64,25 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two bounded
 standard packet topologies. A one-entry zero-AC TOC retains the original single regular 8x8,
-16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC covers one LF
-group with a GPU-decoded mixed map of any of JPEG XL's 27 regular and special strategies across
-one or more 256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients
+16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC covers one or
+more independently bounded LF groups with GPU-decoded mixed maps of any of JPEG XL's 27 regular
+and special strategies across one or more 256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients
 using any of the 13 natural or entropy-coded custom coefficient-order families. Scanline and
 entropy-coded center-first TOC order are both accepted: inventory retains physical section ranges
 and the frontend normalizes them to logical group order before assigning pixel rectangles and
 per-group scratch. The explicit section topology removes the ambiguity with a one-entry
-single-transform packet. The sectioned form supports odd and asymmetric pixel extents through
-2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage.
+single-transform packet. The sectioned form supports odd and asymmetric pixel extents across LF
+group boundaries while keeping edge padding internal to GPU storage; 2056x256 is the checked
+two-LF-group boundary case.
 Both forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract
-additionally requires adaptive LF smoothing, frame quant-matrix scales X=3/B=2, default
+accepts either adaptive LF smoothing or its standard skip flag, frame quant-matrix scales X=3/B=2, default
 dequantization metadata, disabled/default/custom Gaborish, disabled/default/custom
 one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spectral pass.
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
 per-frequency-cell HF chroma correlation, MA
-properties 0 through 15, and weighted self-correcting prediction are read from the stream. The image header must declare the standard sRGB/D65
+properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
+current sectioned profile requires the LF-global MA tree; local MA trees embedded separately in LF
+quantization or HF-metadata substreams remain a typed rejection. The image header must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
@@ -87,7 +90,7 @@ typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes befor
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
 1-GiB parser ceiling.
 
-The host inventories bounded scalar headers, packs the MA-tree and coefficient entropy descriptors,
+The host inventories bounded scalar headers, packs the shared MA-tree and coefficient entropy descriptors,
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF
 image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
 dequantizes and smooths LF, lowers every non-overlapping first block into typed HF tasks, decodes
@@ -96,16 +99,20 @@ sink. The HF metadata channels retain their logical dimensions while addressing 
 storage, so the `hf_mul` row cannot alias the packed strategy row when the actual first-block count
 is below the allocation capacity. Block-context selection reads the resident quantized LF planes
 and each task's `hf_mul`; its variable tables share the entropy bundle, while per-group LZ history
-occupies a disjoint tail slice of the same reconstruction buffer so the pass remains within eight
-portable storage bindings. The artifact creates 27 compact strategy buckets and indirect dispatch
+occupies a disjoint tail slice of its LF group's reconstruction buffer so the pass remains within eight
+portable storage bindings. Each LF group owns independent reconstruction, raw-metadata,
+coefficient, packet-status, artifact, occupancy, and HF-status buffers. Dequantized LF and
+correlation values scatter into full-image resident atlases; adaptive LF smoothing runs once over
+the complete block grid, so the 2048-pixel LF boundary is not treated as an image edge. Each
+artifact carries global output/LF/correlation origins and creates 27 compact strategy buckets and indirect dispatch
 records. The submission executes every populated bucket through the resident regular or special
 VarDCT renderer using the normative default matrix for that strategy and an explicit regular/wide/
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
 and writes tightly packed RGB8 in the same GPU
-submission. Packet
-and artifact status plus one 32-byte record per pass group share one aggregate staging map; cleared downstream buffers and zeroed indirect
+submission. Every LF group's packet and artifact status plus one 32-byte record per pass group
+share one aggregate staging map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
@@ -158,6 +165,11 @@ EPF1/EPF2 or EPF0/EPF1/EPF2 without readback between stages, checks the exact sh
 sigma, and uniform reservations, and permits at most one RGB8 code of difference from both Rust
 `jxl` and `djxl`. A separate actual-GPU malformed-metadata test feeds sharpness 8 through the same
 WGSL validation function used by the packet decoder and requires the typed `Sharpness` error.
+Two deterministic 2056x256 standard fixtures contain a 2048x256 LF group followed by an 8x256
+tail group and nine pass groups. One enables whole-image adaptive LF smoothing and the other uses
+the standard skip flag. Their actual-adapter tests execute both groups, default Gaborish, EPF1, and
+RGB8 packing in one queue submission, validate every packet/artifact/pass-group record from one
+map, and match Rust `jxl` plus optional `djxl` within one RGB8 code.
 An actual-GPU block-context differential test covers negative and positive LF thresholds, exact
 threshold boundaries, multiple quant-field segments, all channel positions, and distinct order
 IDs against the normative scalar index formula. Naga semantic validation runs even without an
@@ -167,10 +179,9 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Multiple LF groups, multiple spectral/refinement passes, custom
+This is not full VarDCT coverage. Local per-substream MA trees, multiple spectral/refinement passes, custom
 quantization matrices, non-default LF channel-correlation metadata, Modular side images,
-alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, cross-LF-group restoration,
-crop/blend,
+alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

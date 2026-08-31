@@ -586,7 +586,9 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         let plan = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
         let blocks = extent.width.div_ceil(8) * extent.height.div_ceil(8);
         assert_eq!(plan.uniform_transform, None);
-        assert_eq!(plan.task_capacity, blocks);
+        assert_eq!(plan.groups.len(), 1);
+        let group = &plan.groups[0];
+        assert_eq!(group.task_capacity, blocks);
         assert!(plan.hf_global.is_some());
         assert!(plan.profile.group_count >= 2);
         let hf_coefficients = plan
@@ -602,7 +604,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         );
         assert!(hf_coefficients.metadata.len() >= 28);
         assert_eq!(hf_coefficients.lz77_window_words, 0);
-        let control = plan.packet_control().unwrap();
+        let control = group.packet_control(&plan).unwrap();
         let correlations = extent.width.div_ceil(64) * extent.height.div_ceil(64);
         assert_eq!(control.offsets[0], 0);
         assert_eq!(control.offsets[1], correlations);
@@ -830,8 +832,9 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
     let extent = Extent2d::new(plan.profile.width, plan.profile.height);
     assert_eq!(extent, Extent2d::new(257, 257));
     assert_eq!(plan.uniform_transform, None);
-    assert_eq!(plan.extra_precision, 1);
-    assert_eq!(plan.task_capacity, 33 * 33);
+    assert_eq!(plan.groups.len(), 1);
+    assert_eq!(plan.groups[0].extra_precision, 1);
+    assert_eq!(plan.groups[0].task_capacity, 33 * 33);
     let hf = plan.hf_coefficients.as_ref().unwrap();
     assert_eq!(hf.num_block_clusters, 3);
     let descriptors = bytemuck::cast_slice::<
@@ -869,6 +872,103 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
             "mixed-strategy GPU output diverges from djxl by {djxl_error}",
         );
     }
+}
+
+fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let parsed = jxl_gpu_bitstream::parse(encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    assert!(matches!(
+        inventory.frames[0].restoration_filter,
+        RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Default,
+            epf: EdgePreservingFilterInventory::Enabled { iterations: 1, .. },
+        }
+    ));
+    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+    let extent = Extent2d::new(plan.profile.width, plan.profile.height);
+    assert_eq!(extent, Extent2d::new(2056, 256));
+    assert_eq!(plan.profile.adaptive_lf_smoothing, adaptive_lf_smoothing);
+    assert_eq!(plan.profile.low_frequency_group_count, 2);
+    assert_eq!(plan.profile.group_count, 9);
+    assert_eq!(plan.groups.len(), 2);
+    assert_eq!(plan.groups[0].rect.x, 0);
+    assert_eq!(plan.groups[0].rect.width, 2048);
+    assert_eq!(plan.groups[1].rect.x, 2048);
+    assert_eq!(plan.groups[1].rect.width, 8);
+    assert_eq!(plan.groups[0].lf_stream_index, 1);
+    assert_eq!(plan.groups[1].lf_stream_index, 2);
+    assert_eq!(plan.groups[0].hf_stream_index, 5);
+    assert_eq!(plan.groups[1].hf_stream_index, 6);
+
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let vardct = session
+        .submission_session()
+        .vardct()
+        .expect("multiple LF groups select the VarDCT submission session");
+    let memory = vardct.memory_stats();
+    assert_eq!(vardct.submissions_per_frame(), 1);
+    assert_eq!(memory.packet_status_bytes, 2 * 64);
+    assert_eq!(memory.adaptive_lf_uniform_bytes != 0, adaptive_lf_smoothing,);
+    assert_eq!(
+        memory.validation_staging_bytes,
+        memory.packet_status_bytes
+            + 2 * std::mem::size_of::<jxl_wgpu_decode::vardct::artifact::GpuVarDctArtifactStatus>()
+                as u64
+            + memory.hf_status_bytes,
+    );
+
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    let rust_error = maximum_error(actual, &rust);
+    assert!(
+        rust_error <= 1,
+        "multiple-LF-group GPU output diverges from Rust jxl by {rust_error}",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        let djxl_error = maximum_error(actual, &djxl);
+        assert!(
+            djxl_error <= 1,
+            "multiple-LF-group GPU output diverges from djxl by {djxl_error}",
+        );
+    }
+}
+
+#[test]
+fn standard_multiple_lf_groups_share_one_resident_image_and_status_map() {
+    assert_multiple_lf_groups(common::testsrc_vardct_multi_lf(), true);
+}
+
+#[test]
+fn multiple_lf_groups_can_skip_adaptive_smoothing_without_a_cpu_copy() {
+    assert_multiple_lf_groups(common::testsrc_vardct_multi_lf_skip_smoothing(), false);
 }
 
 #[test]
@@ -991,7 +1091,7 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
         assert_eq!(memory.restoration_scratch_bytes, memory.xyb_plane_bytes);
         assert_eq!(memory.gaborish_uniform_bytes, 80);
         assert_eq!(memory.epf_sigma_bytes, 33 * 3 * 4);
-        assert_eq!(memory.epf_sigma_uniform_bytes, 64);
+        assert_eq!(memory.epf_sigma_uniform_bytes, 80);
         assert_eq!(memory.epf_filter_uniform_bytes, u64::from(iterations) * 80);
         assert_eq!(
             memory.transient_bytes + memory.output_lease_bytes,

@@ -94,3 +94,21 @@ pub fn green_queen_crop_vardct_epf3() -> &'static [u8] {
     });
     BYTES.as_slice()
 }
+
+pub fn testsrc_vardct_multi_lf() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_multi_lf.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn testsrc_vardct_multi_lf_skip_smoothing() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_multi_lf_skip_smoothing.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}

@@ -71,14 +71,18 @@ quantized LF planes and each pass group's LZ ring use non-overlapping slices of 
 buffer, preserving the portable eight-storage-buffer stage limit without a readback.
 
 For the bounded stock VarDCT profile, restoration remains in that same submission. The inverse
-transform writes padded resident XYB planes; an optional fused Gaborish dispatch reads only the
-actual image extent with mirrored image-edge sampling. When EPF is enabled, a separate linear
-kernel lowers per-transform `hf_mul` and per-block sharpness into the inverse-sigma plane, then the
+transform dispatches each independently bounded LF-group artifact into shared padded resident XYB
+planes. Group-local LF and correlation data first scatter into full-image atlases; adaptive LF
+smoothing runs once over that atlas, or the standard skip flag copies it resident-to-resident.
+An optional fused Gaborish dispatch reads only the actual image extent with mirrored image-edge
+sampling. When EPF is enabled, one linear dispatch per LF group lowers per-transform `hf_mul` and
+per-block sharpness into disjoint rectangles of the full-image inverse-sigma plane, then the
 signaled EPF0/EPF1/EPF2 sequence and Gaborish advance one shared restoration cursor between the
 resident image and one three-plane scratch set. The output packer consumes whichever set is current
-after the final pass. No coefficient or pixel crosses the host. The three F32 scratch planes,
-inverse-sigma plane, and exact 64/80-byte per-dispatch uniforms are included in the same backend
-byte admission as entropy, transform, output, and aggregate validation storage.
+after the final pass. Every LF group's packet and artifact status plus all pass-group status records
+are copied into one staging buffer and mapped once. No coefficient or pixel crosses the host. The
+three F32 scratch planes, inverse-sigma plane, and exact 80-byte restoration uniforms are included
+in the same backend byte admission as entropy, transform, output, and aggregate validation storage.
 
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode

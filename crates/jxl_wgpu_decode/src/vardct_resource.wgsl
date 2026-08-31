@@ -21,7 +21,9 @@ fn prepare_lf(@builtin(global_invocation_id) gid: vec3<u32>) {
     let raw_x = bitcast<i32>(quantized_lf[params.offsets.y + index]);
     let raw_b = bitcast<i32>(quantized_lf[params.offsets.z + index]);
     let y = f32(raw_y) * params.scales.y;
-    dequantized_lf[params.offsets.w + index] = vec4<f32>(
+    let x = index % params.geometry.x;
+    let row = index / params.geometry.x;
+    dequantized_lf[params.offsets.w + row * params.geometry.w + x] = vec4<f32>(
         f32(raw_x) * params.scales.x,
         y,
         f32(raw_b) * params.scales.z + y * params.scales.w,

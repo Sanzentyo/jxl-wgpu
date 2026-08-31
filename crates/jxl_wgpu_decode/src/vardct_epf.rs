@@ -11,6 +11,9 @@ const SHADER: &str = include_str!("vardct_epf.wgsl");
 pub struct EpfSigmaConfig {
     pub blocks_x: u32,
     pub blocks_y: u32,
+    pub output_blocks_x: u32,
+    pub output_blocks_y: u32,
+    pub output_origin: [u32; 2],
     pub task_count: u32,
     pub sharpness_offset_words: u32,
     pub artifact_status_offset_words: u32,
@@ -22,14 +25,32 @@ pub struct EpfSigmaConfig {
 
 impl EpfSigmaConfig {
     pub fn plan(self) -> Result<EpfSigmaMemoryPlan, EpfSigmaError> {
-        let sigma_bytes = u64::from(self.blocks_x)
-            .checked_mul(u64::from(self.blocks_y))
+        let sigma_bytes = u64::from(self.output_blocks_x)
+            .checked_mul(u64::from(self.output_blocks_y))
             .and_then(|blocks| blocks.checked_mul(4))
             .ok_or(EpfSigmaError::ArithmeticOverflow {
                 field: "sigma plane bytes",
             })?;
         if sigma_bytes == 0 {
             return Err(EpfSigmaError::EmptyBlockGrid);
+        }
+        let output_right = self.output_origin[0].checked_add(self.blocks_x).ok_or(
+            EpfSigmaError::ArithmeticOverflow {
+                field: "sigma horizontal destination extent",
+            },
+        )?;
+        let output_bottom = self.output_origin[1].checked_add(self.blocks_y).ok_or(
+            EpfSigmaError::ArithmeticOverflow {
+                field: "sigma vertical destination extent",
+            },
+        )?;
+        if output_right > self.output_blocks_x || output_bottom > self.output_blocks_y {
+            return Err(EpfSigmaError::DestinationOutsideOutput {
+                right: output_right,
+                bottom: output_bottom,
+                width: self.output_blocks_x,
+                height: self.output_blocks_y,
+            });
         }
         if self.task_count == 0 {
             return Err(EpfSigmaError::EmptyTaskSet);
@@ -64,6 +85,13 @@ pub enum EpfSigmaError {
     EmptyBlockGrid,
     #[error("EPF sigma construction requires at least one transform task")]
     EmptyTaskSet,
+    #[error("EPF sigma destination {right}x{bottom} exceeds output block grid {width}x{height}")]
+    DestinationOutsideOutput {
+        right: u32,
+        bottom: u32,
+        width: u32,
+        height: u32,
+    },
     #[error("EPF sigma construction requires a nonzero global quantizer scale")]
     ZeroGlobalScale,
     #[error("EPF sigma parameters contain a non-finite value")]
@@ -144,6 +172,12 @@ impl EpfSigmaPipeline {
                 config.task_count,
                 config.sharpness_offset_words,
             ],
+            destination: [
+                config.output_blocks_x,
+                config.output_blocks_y,
+                config.output_origin[0],
+                config.output_origin[1],
+            ],
             artifact_status_offset_words: config.artifact_status_offset_words,
             task_metadata_offset_words: config.task_metadata_offset_words,
             global_scale: config.global_scale,
@@ -184,6 +218,7 @@ impl EpfSigmaPipeline {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct EpfSigmaUniform {
     geometry: [u32; 4],
+    destination: [u32; 4],
     artifact_status_offset_words: u32,
     task_metadata_offset_words: u32,
     global_scale: u32,
@@ -199,14 +234,15 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<EpfSigmaUniform>() == 64);
+    assert!(std::mem::size_of::<EpfSigmaUniform>() == 80);
     assert!(std::mem::align_of::<EpfSigmaUniform>() == 16);
     assert!(std::mem::offset_of!(EpfSigmaUniform, geometry) == 0);
-    assert!(std::mem::offset_of!(EpfSigmaUniform, artifact_status_offset_words) == 16);
-    assert!(std::mem::offset_of!(EpfSigmaUniform, task_metadata_offset_words) == 20);
-    assert!(std::mem::offset_of!(EpfSigmaUniform, global_scale) == 24);
-    assert!(std::mem::offset_of!(EpfSigmaUniform, quant_mul) == 28);
-    assert!(std::mem::offset_of!(EpfSigmaUniform, sharp_lut) == 32);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, destination) == 16);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, artifact_status_offset_words) == 32);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, task_metadata_offset_words) == 36);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, global_scale) == 40);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, quant_mul) == 44);
+    assert!(std::mem::offset_of!(EpfSigmaUniform, sharp_lut) == 48);
 };
 
 #[cfg(test)]
@@ -218,6 +254,9 @@ mod tests {
         let config = EpfSigmaConfig {
             blocks_x: 3,
             blocks_y: 5,
+            output_blocks_x: 3,
+            output_blocks_y: 5,
+            output_origin: [0, 0],
             task_count: 15,
             sharpness_offset_words: 20,
             artifact_status_offset_words: 0,
@@ -239,7 +278,7 @@ mod tests {
             config.plan().unwrap(),
             EpfSigmaMemoryPlan {
                 sigma_bytes: 60,
-                uniform_bytes: 64,
+                uniform_bytes: 80,
             }
         );
         assert_eq!(

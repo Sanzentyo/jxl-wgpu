@@ -2,6 +2,7 @@ override wg_x: u32 = 64u;
 
 struct Params {
     geometry: vec4<u32>,
+    destination: vec4<u32>,
     artifact_status_offset_words: u32,
     task_metadata_offset_words: u32,
     global_scale: u32,
@@ -51,7 +52,9 @@ fn build_epf_sigma(@builtin(global_invocation_id) gid: vec3<u32>) {
                 7u,
             );
             let quantized = min(sigma_quant * sharpness_value(sharpness), -0.0001);
-            sigma[raster] = 1.0 / quantized;
+            let destination_x = params.destination.z + x;
+            let destination_y = params.destination.w + y;
+            sigma[destination_y * params.destination.x + destination_x] = 1.0 / quantized;
         }
     }
 }

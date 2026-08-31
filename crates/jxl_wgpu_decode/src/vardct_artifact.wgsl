@@ -203,7 +203,8 @@ fn write_task(
     artifact[task + 2u] = matrix_offset(strategy);
     artifact[task + 3u] = task_index;
     artifact[task + 4u] = destination_x;
-    artifact[task + 5u] = y * params.image.x + x;
+    artifact[task + 5u] = (params.image.z / 8u + y) * params.image.x
+        + params.image.y / 8u + x;
     artifact[task + 6u] = 7u;
     artifact[task + 7u] = destination_y;
     artifact[task + 8u] = destination_x;
@@ -245,7 +246,11 @@ fn lower_hf_metadata() {
     clear_workspace();
     let correlation_count = params.capacities.w * ((params.dimensions.y + 7u) / 8u);
     for (var index = 0u; index < correlation_count; index += 1u) {
-        resources[params.metadata_offsets.w + index] = vec4<f32>(
+        let correlation_x = index % params.capacities.w;
+        let correlation_y = index / params.capacities.w;
+        let destination = params.metadata_offsets.w
+            + correlation_y * params.source_offsets.w + correlation_x;
+        resources[destination] = vec4<f32>(
             f32(raw_metadata[index]) / HF_CORRELATION_BASE,
             1.0 + f32(raw_metadata[correlation_count + index]) / HF_CORRELATION_BASE,
             0.0,

@@ -101,6 +101,8 @@ pub struct HfMetadataArtifactConfig {
     /// for possible future codestream levels with a different group dimension.
     pub pass_group_dim_blocks: u32,
     pub lf_stride: u32,
+    /// Global resource-atlas row stride for the correlation grid.
+    pub correlation_stride: u32,
     pub correlation_width: u32,
     pub correlation_height: u32,
     pub destination_origin: [u32; 2],
@@ -154,6 +156,40 @@ impl VarDctArtifactLayout {
         if config.lf_stride < config.blocks_width {
             return Err(VarDctArtifactError::InvalidGeometry {
                 field: "LF stride is smaller than the block width",
+            });
+        }
+        if config.correlation_stride < config.correlation_width {
+            return Err(VarDctArtifactError::InvalidGeometry {
+                field: "correlation stride is smaller than the group correlation width",
+            });
+        }
+        if !config.destination_origin[0].is_multiple_of(64)
+            || !config.destination_origin[1].is_multiple_of(64)
+        {
+            return Err(VarDctArtifactError::InvalidGeometry {
+                field: "LF-group destination origin is not aligned to a correlation cell",
+            });
+        }
+        let lf_right = config.destination_origin[0]
+            .checked_div(8)
+            .and_then(|origin| origin.checked_add(config.blocks_width))
+            .ok_or(VarDctArtifactError::ArithmeticOverflow {
+                field: "global LF horizontal extent",
+            })?;
+        if lf_right > config.lf_stride {
+            return Err(VarDctArtifactError::InvalidGeometry {
+                field: "global LF horizontal extent exceeds its stride",
+            });
+        }
+        let correlation_right = config.destination_origin[0]
+            .checked_div(64)
+            .and_then(|origin| origin.checked_add(config.correlation_width))
+            .ok_or(VarDctArtifactError::ArithmeticOverflow {
+                field: "global correlation horizontal extent",
+            })?;
+        if correlation_right > config.correlation_stride {
+            return Err(VarDctArtifactError::InvalidGeometry {
+                field: "global correlation horizontal extent exceeds its stride",
             });
         }
         if config.correlation_width < config.blocks_width.div_ceil(8)
@@ -685,7 +721,7 @@ impl HfMetadataLoweringParams {
                 config.strategy_offset_words,
                 config.hf_mul_offset_words,
                 config.global_scale,
-                0,
+                config.correlation_stride,
             ],
             matrix_offsets,
         })

@@ -11,7 +11,7 @@ use crate::modular_tree::{
 };
 use crate::vardct_frontend::{
     HfBlockContextIr, HfGlobalPrefix, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
-    VarDctPacketError, VarDctSectionLayout,
+    VarDctGroupRect, VarDctPacketError, VarDctSectionLayout,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -27,14 +27,12 @@ const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
 /// A standard feature excluded from the deliberately bounded VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnsupportedVarDctPacketFeature {
-    #[error("the bounded tiled-VarDCT decoder requires exactly one LF group")]
-    MultipleLfGroups,
+    #[error("the combined one-entry VarDCT packet cannot address multiple LF groups")]
+    CombinedPacketMultipleLfGroups,
     #[error("the bounded VarDCT decoder currently accepts 8-bit samples")]
     BitDepth,
     #[error("the one-entry packet extent is not one implemented VarDCT transform")]
     TransformExtent,
-    #[error("the standard packet requests skip-adaptive-LF smoothing")]
-    SkipAdaptiveLfSmoothing,
     #[error(
         "the MA tree uses previous-channel property {property}; the heterogeneous VarDCT metadata layout is not implemented"
     )]
@@ -96,31 +94,40 @@ pub struct BoundedVarDctPacketPlan {
     /// A transform enforced for the single-entry packet form. Sectioned packets carry a
     /// GPU-decoded mixed-strategy topology and therefore have no host-assumed transform.
     pub uniform_transform: Option<TransformKind>,
-    /// Maximum number of non-overlapping first blocks reconstructed from HF metadata. The actual
-    /// count is decoded and reported by the GPU packet frontend.
-    pub task_capacity: u32,
-    coefficient_words: u32,
     /// LF-global packet containing the scalar quantizer fields and global MA descriptor.
     pub lf_global: BitRange,
-    /// LF-group packet containing quantized LF and HF-metadata Modular streams.
-    pub lf_group: BitRange,
     /// Separate HF-global packet, or `None` when all three packets share a single TOC entry.
     pub hf_global: Option<BitRange>,
     /// Descriptor end used as the LF-group start by the one-entry TOC form.
     pub entropy_bit_offset: u32,
-    pub lf_stream_index: u32,
-    pub hf_stream_index: u32,
     pub modular_metadata: Vec<u32>,
-    /// Physical power-of-two history ring used by both sequential Modular streams.
-    pub lz77_window_words: u32,
     /// Whether the shared MA tree requires the weighted self-correcting predictor workspace.
     pub needs_self_correcting: bool,
     pub global_scale: u32,
     pub quant_lf: u32,
-    pub extra_precision: u8,
+    /// One independently bounded LF quantization/HF-metadata packet in logical raster order.
+    pub groups: Vec<BoundedVarDctGroupPlan>,
     /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
     /// packets and are never expanded on the host.
     pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
+}
+
+/// One LF group's packet geometry and persistent decode contract.
+#[derive(Clone, Debug)]
+pub struct BoundedVarDctGroupPlan {
+    pub index: u32,
+    pub rect: VarDctGroupRect,
+    /// Maximum number of non-overlapping first blocks reconstructed from this group's HF
+    /// metadata. The actual count is decoded and reported by the GPU packet frontend.
+    pub task_capacity: u32,
+    coefficient_words: u32,
+    /// Packet containing this group's quantized LF and HF-metadata Modular streams.
+    pub lf_group: BitRange,
+    pub lf_stream_index: u32,
+    pub hf_stream_index: u32,
+    /// Physical power-of-two history ring reused by the group's two sequential Modular streams.
+    pub lz77_window_words: u32,
+    pub extra_precision: u8,
 }
 
 /// Host-packed entropy tables and untouched pass-group packets for one VarDCT AC pass.
@@ -155,53 +162,40 @@ impl BoundedVarDctPacketPlan {
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
         let profile = StandardVarDctProfile::negotiate(inventory)?;
-        if profile.low_frequency_group_count != 1 {
-            return Err(UnsupportedVarDctPacketFeature::MultipleLfGroups.into());
-        }
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
         }
-        if !profile.adaptive_lf_smoothing {
-            return Err(UnsupportedVarDctPacketFeature::SkipAdaptiveLfSmoothing.into());
-        }
-        let (uniform_transform, task_capacity, lf_global_packet, lf_group, hf_global, pass_groups) =
+        let (uniform_transform, lf_global_packet, lf_group_packets, hf_global, pass_groups) =
             match &profile.sections {
-                VarDctSectionLayout::Single { packet } => (
-                    Some(
-                        transform_for_extent(profile.width, profile.height)
-                            .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
-                    ),
-                    1,
-                    *packet,
-                    *packet,
-                    None,
-                    Vec::new(),
-                ),
+                VarDctSectionLayout::Single { packet } => {
+                    if profile.low_frequency_group_count != 1 {
+                        return Err(
+                            UnsupportedVarDctPacketFeature::CombinedPacketMultipleLfGroups.into(),
+                        );
+                    }
+                    (
+                        Some(
+                            transform_for_extent(profile.width, profile.height)
+                                .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                        ),
+                        *packet,
+                        vec![*packet],
+                        None,
+                        Vec::new(),
+                    )
+                }
                 VarDctSectionLayout::Sections {
                     lf_global,
                     lf_groups,
                     hf_global,
                     pass_groups,
-                } => {
-                    let lf_group = *lf_groups
-                        .first()
-                        .ok_or(UnsupportedVarDctPacketFeature::MultipleLfGroups)?;
-                    let blocks = profile
-                        .width
-                        .div_ceil(8)
-                        .checked_mul(profile.height.div_ceil(8))
-                        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                            field: "tiled DCT8 task count",
-                        })?;
-                    (
-                        None,
-                        blocks,
-                        *lf_global,
-                        lf_group,
-                        Some(*hf_global),
-                        pass_groups.clone(),
-                    )
-                }
+                } => (
+                    None,
+                    *lf_global,
+                    lf_groups.clone(),
+                    Some(*hf_global),
+                    pass_groups.clone(),
+                ),
             };
         let lf_global = LfGlobalPrefix::parse(codestream, lf_global_packet)?;
         let mut reader = BitReader::new(codestream);
@@ -242,53 +236,76 @@ impl BoundedVarDctPacketPlan {
                 field: "entropy bit offset",
             }
         })?;
-        let lf_entropy_bit_offset = if hf_global.is_some() {
-            lf_group.offset
-        } else {
-            descriptor_end
-        };
-        let mut lf_header = BitReader::new(codestream);
-        lf_header.skip_bits(lf_entropy_bit_offset)?;
-        let extra_precision = lf_header.read_bits(2)? as u8;
-        let blocks_x = profile.width.div_ceil(8);
-        let blocks_y = profile.height.div_ceil(8);
-        let block_count =
-            blocks_x
-                .checked_mul(blocks_y)
-                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "block count",
+        let groups = lf_group_packets
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, lf_group)| {
+                let index = u32::try_from(index).map_err(|_| {
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group index",
+                    }
                 })?;
-        let coefficient_words = block_count.checked_mul(8 * 8 * 3).ok_or(
-            BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "padded coefficient words",
-            },
-        )?;
-        let correlation_samples = profile
-            .width
-            .div_ceil(64)
-            .checked_mul(profile.height.div_ceil(64))
-            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "correlation sample count",
-            })?;
-        let decoded_symbol_limit = block_count
-            .checked_mul(4)
-            .and_then(|samples| {
-                task_capacity
-                    .checked_mul(2)
-                    .and_then(|tasks| samples.checked_add(tasks))
+                let rect = profile.low_frequency_group_rect(u64::from(index))?;
+                let blocks_x = rect.width.div_ceil(8);
+                let blocks_y = rect.height.div_ceil(8);
+                let block_count = blocks_x.checked_mul(blocks_y).ok_or(
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group block count",
+                    },
+                )?;
+                let coefficient_words = block_count.checked_mul(8 * 8 * 3).ok_or(
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group coefficient words",
+                    },
+                )?;
+                let correlation_samples = rect
+                    .width
+                    .div_ceil(64)
+                    .checked_mul(rect.height.div_ceil(64))
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group correlation sample count",
+                    })?;
+                let decoded_symbol_limit = block_count
+                    .checked_mul(4)
+                    .and_then(|samples| {
+                        block_count
+                            .checked_mul(2)
+                            .and_then(|tasks| samples.checked_add(tasks))
+                    })
+                    .and_then(|samples| {
+                        correlation_samples
+                            .checked_mul(2)
+                            .and_then(|correlations| samples.checked_add(correlations))
+                    })
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group decoded symbol limit",
+                    })?;
+                let lz77_window_words = ma_config
+                    .entropy
+                    .lz77_window_words(blocks_x.max(1), decoded_symbol_limit)
+                    .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+                let lf_entropy_bit_offset = if hf_global.is_some() {
+                    lf_group.offset
+                } else {
+                    descriptor_end
+                };
+                let mut lf_header = BitReader::new(codestream);
+                lf_header.skip_bits(lf_entropy_bit_offset)?;
+                let extra_precision = lf_header.read_bits(2)? as u8;
+                Ok(BoundedVarDctGroupPlan {
+                    index,
+                    rect,
+                    task_capacity: block_count,
+                    coefficient_words,
+                    lf_group,
+                    lf_stream_index: profile.lf_quant_stream_index(u64::from(index))?,
+                    hf_stream_index: profile.hf_metadata_stream_index(u64::from(index))?,
+                    lz77_window_words,
+                    extra_precision,
+                })
             })
-            .and_then(|samples| {
-                correlation_samples
-                    .checked_mul(2)
-                    .and_then(|correlations| samples.checked_add(correlations))
-            })
-            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "decoded symbol limit",
-            })?;
-        let lz77_window_words = ma_config
-            .entropy
-            .lz77_window_words(blocks_x.max(1), decoded_symbol_limit)
-            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+            .collect::<Result<Vec<_>, BoundedVarDctPacketError>>()?;
         let hf_coefficients = hf_global
             .map(|packet| {
                 let max_group_blocks = profile
@@ -318,29 +335,18 @@ impl BoundedVarDctPacketPlan {
             })
             .transpose()?;
         Ok(Self {
-            lf_stream_index: profile.lf_quant_stream_index(0)?,
-            hf_stream_index: profile.hf_metadata_stream_index(0)?,
             profile,
             uniform_transform,
-            task_capacity,
-            coefficient_words,
             lf_global: lf_global_packet,
-            lf_group,
             hf_global,
             entropy_bit_offset,
             modular_metadata: words,
-            lz77_window_words,
             needs_self_correcting: ma_config.needs_self_correcting(),
             global_scale: lf_global.global_scale,
             quant_lf: lf_global.quant_lf,
-            extra_precision,
+            groups,
             hf_coefficients,
         })
-    }
-
-    #[must_use]
-    pub fn coefficient_words(&self) -> u32 {
-        self.coefficient_words
     }
 
     #[must_use]
@@ -351,8 +357,43 @@ impl BoundedVarDctPacketPlan {
         ]
     }
 
+    pub fn total_task_capacity(&self) -> Result<u32, BoundedVarDctPacketError> {
+        self.groups.iter().try_fold(0u32, |total, group| {
+            total.checked_add(group.task_capacity).ok_or(
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "total LF-group task capacity",
+                },
+            )
+        })
+    }
+
+    pub fn total_coefficient_words(&self) -> Result<u32, BoundedVarDctPacketError> {
+        self.groups.iter().try_fold(0u32, |total, group| {
+            total.checked_add(group.coefficient_words()).ok_or(
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "total LF-group coefficient words",
+                },
+            )
+        })
+    }
+}
+
+impl BoundedVarDctGroupPlan {
+    #[must_use]
+    pub const fn coefficient_words(&self) -> u32 {
+        self.coefficient_words
+    }
+
+    #[must_use]
+    pub fn block_extent(&self) -> [u32; 2] {
+        [self.rect.width.div_ceil(8), self.rect.height.div_ceil(8)]
+    }
+
     /// U32 scratch words retaining LF samples, weighted-predictor rows, and the LZ history ring.
-    pub fn reconstructed_words(&self) -> Result<u32, BoundedVarDctPacketError> {
+    pub fn reconstructed_words(
+        &self,
+        needs_self_correcting: bool,
+    ) -> Result<u32, BoundedVarDctPacketError> {
         let [blocks_x, blocks_y] = self.block_extent();
         let blocks =
             blocks_x
@@ -377,7 +418,7 @@ impl BoundedVarDctPacketPlan {
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction samples",
             })?;
-        let predictor_words = if self.needs_self_correcting {
+        let predictor_words = if needs_self_correcting {
             self.predictor_width_capacity()?.checked_mul(5).ok_or(
                 BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "VarDCT weighted-predictor rows",
@@ -394,7 +435,10 @@ impl BoundedVarDctPacketPlan {
             })
     }
 
-    pub fn packet_control(&self) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
+    pub fn packet_control(
+        &self,
+        packet: &BoundedVarDctPacketPlan,
+    ) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
         let range = |value: u64, field: &'static str| {
             u32::try_from(value).map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow { field })
         };
@@ -405,7 +449,7 @@ impl BoundedVarDctPacketPlan {
                     field: "LF-group end",
                 })?;
         let (lf_start, lf_end, hf_start, hf_end, separate_sections) = if let Some(hf_global) =
-            self.hf_global
+            packet.hf_global
         {
             let hf_end = hf_global
                 .end()
@@ -421,7 +465,7 @@ impl BoundedVarDctPacketPlan {
             )
         } else {
             (
-                self.entropy_bit_offset,
+                packet.entropy_bit_offset,
                 range(lf_group_end, "combined packet end")?,
                 0,
                 range(lf_group_end, "combined packet end")?,
@@ -458,10 +502,10 @@ impl BoundedVarDctPacketPlan {
         )?;
         Ok(VarDctPacketControl {
             section_bits: [lf_start, lf_end, hf_start, hf_end],
-            geometry: [self.profile.width, self.profile.height, blocks_x, blocks_y],
+            geometry: [self.rect.width, self.rect.height, blocks_x, blocks_y],
             offsets: [0, correlation_samples, strategy_offset, hf_mul_offset],
             capacities: [
-                self.coefficient_words(),
+                self.coefficient_words,
                 raw_capacity,
                 block_count
                     .checked_next_power_of_two()
@@ -472,14 +516,14 @@ impl BoundedVarDctPacketPlan {
                 self.task_capacity,
             ],
             expected: [
-                self.uniform_transform.map_or(0, transform_id),
-                u32::from(self.uniform_transform.is_some()),
+                packet.uniform_transform.map_or(0, transform_id),
+                u32::from(packet.uniform_transform.is_some()),
                 ZERO_AC_HF_GLOBAL,
                 sharpness_offset,
             ],
             quantization: [
-                self.global_scale,
-                self.quant_lf,
+                packet.global_scale,
+                packet.quant_lf,
                 u32::from(self.extra_precision),
                 0,
             ],
@@ -487,7 +531,7 @@ impl BoundedVarDctPacketPlan {
                 self.lf_stream_index,
                 self.hf_stream_index,
                 separate_sections,
-                u32::try_from(self.profile.group_count).map_err(|_| {
+                u32::try_from(packet.profile.group_count).map_err(|_| {
                     BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "pass-group count",
                     }
@@ -501,14 +545,14 @@ impl BoundedVarDctPacketPlan {
         let [blocks_x, _] = self.block_extent();
         Ok(blocks_x
             .max(self.task_capacity)
-            .max(self.profile.width.div_ceil(64)))
+            .max(self.rect.width.div_ceil(64)))
     }
 
     fn correlation_samples(&self) -> Result<u32, BoundedVarDctPacketError> {
-        self.profile
+        self.rect
             .width
             .div_ceil(64)
-            .checked_mul(self.profile.height.div_ceil(64))
+            .checked_mul(self.rect.height.div_ceil(64))
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "correlation sample count",
             })
