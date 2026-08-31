@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -89,6 +89,14 @@ const ATOMIC_WRITE_FULL_WORD: &str = "atomicStore(&output_words[offset >> 2u], v
 const WORD_ALIGNED_WRITE_FULL_WORD: &str = "output_words[offset >> 2u] = value;";
 const STATUS_OK: u32 = 1;
 const STREAM_SENTINEL_BYTES: u64 = 4;
+// One complete output token consumes at most 94 bits: two 16-bit ANS refills and two 31-bit
+// hybrid payloads in the LZ length/distance path. Sixteen bytes still cover that token after the
+// maximum seven-bit group-start skew, while also giving the next segment the same overshoot.
+const STREAM_OVERLAP_BYTES: u64 = 16;
+// Sentinel + two overlaps + one aligned four-byte core.
+const MIN_STREAM_WINDOW_BYTES: u64 = 40;
+const ENTROPY_EXECUTION_STATE_WORDS: u64 = 8;
+const ENTROPY_EXECUTION_STATE_BYTES: u64 = ENTROPY_EXECUTION_STATE_WORDS * 4;
 const NATIVE_F64_DUMMY_WORD_BYTES: u64 = 4;
 const DEFAULT_MODULAR_GROUP_VARIANT: KernelVariant = KernelVariant::Lanes64;
 // Each lane is one serial reconstruction invocation which may process a full 256x256 group. Keep
@@ -112,6 +120,8 @@ pub struct WgpuDecodeMemoryStats {
     pub reconstruction_scratch_bytes: u64,
     /// Byte stride of one reconstruction lane.
     pub reconstruction_lane_stride_bytes: u64,
+    /// Per-lane 16-byte-aligned entropy/LZ77 resume record included in the lane stride.
+    pub entropy_execution_state_bytes_per_lane: u64,
     /// Largest decoded sample count represented by one logical group stream.
     pub max_logical_reconstruction_sample_words: u32,
     /// Largest sample workspace physically retained by one reconstruction lane.
@@ -201,6 +211,12 @@ pub struct WgpuDecodeCapabilities {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ShaderParams {
     entropy: EntropyStreamParams,
+    window_logical_start: u32,
+    window_upload_start: u32,
+    stream_token_end: u32,
+    window_yield_end: u32,
+    window_flags: u32,
+    entropy_state_offset: u32,
     width: u32,
     height: u32,
     origin_x: u32,
@@ -263,6 +279,20 @@ struct DispatchControl {
     _padding: u32,
 }
 
+/// Persistent per-lane state used to resume one entropy consumer after a bounded upload window.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct EntropyExecutionState {
+    bit_cursor: u32,
+    ans_state: u32,
+    copy_remaining: u32,
+    copy_position: u32,
+    entropy_decoded: u32,
+    last_value: u32,
+    consumer_decoded: u32,
+    error_code: u32,
+}
+
 /// Fixed storage-buffer status written by `lossless_gray8.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -276,8 +306,10 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 212);
+    assert!(std::mem::size_of::<ShaderParams>() == 236);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
+    assert!(std::mem::size_of::<EntropyExecutionState>() == 32);
+    assert!(std::mem::align_of::<EntropyExecutionState>() == 16);
     assert!(std::mem::size_of::<DecodeStatus>() == 16);
     assert!(std::mem::align_of::<DecodeStatus>() == 4);
 };
@@ -297,6 +329,7 @@ pub struct WgpuSubmissionEngine {
     native_f64_pipelines: Option<Arc<DecodePipelineCache>>,
     memory: MemoryBudget,
     buffers: Arc<DecodeBufferPool>,
+    stream_window_limit: Option<NonZeroU64>,
 }
 
 #[derive(Default)]
@@ -394,6 +427,7 @@ impl std::fmt::Debug for WgpuSubmissionEngine {
             .field("backend", &self.backend)
             .field("memory", &self.memory.snapshot())
             .field("buffer_pool", &self.buffers.stats())
+            .field("stream_window_limit", &self.stream_window_limit)
             .finish_non_exhaustive()
     }
 }
@@ -428,7 +462,26 @@ impl WgpuSubmissionEngine {
             native_f64_pipelines,
             memory: memory_budget,
             buffers,
+            stream_window_limit: None,
         }
+    }
+
+    /// Caps the reusable GPU upload used for Modular entropy streams.
+    ///
+    /// A legal channel-fixed Gradient group larger than this bound is split into ordered,
+    /// overlapping windows while its entropy and LZ77 state remains GPU-resident. Device limits
+    /// and the shared byte budget may resolve a smaller effective bound. An undersized value is
+    /// rejected with [`Error::StreamWindowTooSmall`] when a session is opened.
+    #[must_use]
+    pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
+        self.stream_window_limit = Some(limit);
+        self
+    }
+
+    /// Returns the caller-supplied Modular stream-window cap, if one was configured.
+    #[must_use]
+    pub const fn stream_window_limit(&self) -> Option<NonZeroU64> {
+        self.stream_window_limit
     }
 
     #[must_use]
@@ -532,6 +585,7 @@ impl WgpuSubmissionEngine {
                 requested_frame_slots: request.max_frame_slots().get(),
                 memory_limit_bytes,
                 kernel_variant,
+                stream_window_limit: self.stream_window_limit,
             },
         )?;
         let memory_stats = validate_device_limits(
@@ -950,14 +1004,14 @@ impl WgpuPendingFrame {
                 || status.decoded_samples != expected_samples
                 || status.cursor != status.expected_cursor
             {
-                return Err(Error::backend(format!(
-                    "Modular GPU group {group_index} rejected entropy stream: status={}, decoded={}/{}, cursor={}/{}",
-                    status.code,
-                    status.decoded_samples,
+                return Err(Error::ModularEntropyRejected {
+                    group_index,
+                    status: status.code,
+                    decoded_samples: status.decoded_samples,
                     expected_samples,
-                    status.cursor,
-                    status.expected_cursor
-                )));
+                    cursor: status.cursor,
+                    expected_cursor: status.expected_cursor,
+                });
             }
         }
 
@@ -1086,8 +1140,8 @@ struct GroupDispatchLayout {
     max_lz77_scratch_words: u32,
     parallel_group_lanes: usize,
     reconstructed_bytes: u64,
-    stream_windows: Arc<[GroupStreamWindow]>,
-    stream_batches: Arc<[std::ops::Range<usize>]>,
+    stream_segments: Arc<[GroupStreamSegment]>,
+    stream_batches: Arc<[StreamBatch]>,
     stream_bytes: u64,
     status_stride: u64,
     status_bytes: u64,
@@ -1103,6 +1157,7 @@ struct GroupDispatchOptions {
     requested_frame_slots: usize,
     memory_limit_bytes: u64,
     kernel_variant: KernelVariant,
+    stream_window_limit: Option<NonZeroU64>,
 }
 
 #[repr(u32)]
@@ -1114,12 +1169,29 @@ enum FixedGradientOutputMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GroupStreamWindow {
+struct GroupStreamSegment {
+    group_index: usize,
     input_start: usize,
     input_end: usize,
     upload_offset: usize,
-    token_start: u32,
-    token_end: u32,
+    window_logical_start: u32,
+    window_upload_start: u32,
+    available_token_end: u32,
+    stream_token_end: u32,
+    window_yield_end: u32,
+    flags: u32,
+}
+
+impl GroupStreamSegment {
+    const FIRST: u32 = 1 << 0;
+    const FINAL: u32 = 1 << 1;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamBatch {
+    segments: std::ops::Range<usize>,
+    first_group: usize,
+    group_count: usize,
 }
 
 impl GroupDispatchLayout {
@@ -1182,9 +1254,20 @@ impl GroupDispatchLayout {
         if reconstruction_lane_stride == 0 {
             return Err(Error::backend("Modular reconstruction lane is empty"));
         }
-        let stream_limit = limits
+        let device_stream_limit = limits
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size);
+        let stream_limit = options
+            .stream_window_limit
+            .map_or(device_stream_limit, |limit| {
+                device_stream_limit.min(limit.get())
+            });
+        if stream_limit < MIN_STREAM_WINDOW_BYTES {
+            return Err(Error::StreamWindowTooSmall {
+                limit_bytes: stream_limit,
+                minimum_bytes: MIN_STREAM_WINDOW_BYTES,
+            });
+        }
         let group_count = u64::try_from(profile.groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
         let status_stride = STATUS_BYTES;
@@ -1232,25 +1315,41 @@ impl GroupDispatchLayout {
         let requested_slots = u64::try_from(options.requested_frame_slots.max(1))
             .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
         let requested_target = options.memory_limit_bytes / requested_slots;
+        let allow_intra_group_windows = matches!(
+            reconstruction_specialization,
+            ModularReconstructionSpecialization::ChannelFixed {
+                predictor: ModularPredictor::Gradient,
+                ..
+            }
+        );
         let selected = match select_parallel_group_layout(
             codestream,
             &profile.groups,
-            stream_limit,
-            lane_cap,
-            reconstruction_lane_stride,
-            fixed_bytes,
-            requested_target,
-        )? {
-            Some(selected) => Some(selected),
-            None => select_parallel_group_layout(
-                codestream,
-                &profile.groups,
+            ParallelGroupLimits {
                 stream_limit,
                 lane_cap,
-                reconstruction_lane_stride,
+                lane_stride: reconstruction_lane_stride,
                 fixed_bytes,
-                options.memory_limit_bytes,
-            )?,
+                per_frame_target: requested_target,
+                allow_intra_group_windows,
+            },
+        ) {
+            Ok(Some(selected)) => Some(selected),
+            Ok(None) | Err(Error::IntraGroupStreamingUnsupported { .. }) => {
+                select_parallel_group_layout(
+                    codestream,
+                    &profile.groups,
+                    ParallelGroupLimits {
+                        stream_limit,
+                        lane_cap,
+                        lane_stride: reconstruction_lane_stride,
+                        fixed_bytes,
+                        per_frame_target: options.memory_limit_bytes,
+                        allow_intra_group_windows,
+                    },
+                )?
+            }
+            Err(error) => return Err(error),
         }
         .ok_or_else(|| {
             Error::backend(format!(
@@ -1258,7 +1357,7 @@ impl GroupDispatchLayout {
                 options.memory_limit_bytes
             ))
         })?;
-        let (parallel_group_lanes, stream_windows, stream_batches, stream_bytes) = selected;
+        let (parallel_group_lanes, stream_segments, stream_batches, stream_bytes) = selected;
         let reconstructed_bytes = reconstruction_lane_stride
             .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
@@ -1271,7 +1370,7 @@ impl GroupDispatchLayout {
             max_lz77_scratch_words,
             parallel_group_lanes,
             reconstructed_bytes,
-            stream_windows: stream_windows.into(),
+            stream_segments: stream_segments.into(),
             stream_batches: stream_batches.into(),
             stream_bytes,
             status_stride,
@@ -1290,23 +1389,51 @@ fn build_stream_batches(
     groups: &[ModularGroup],
     stream_limit: u64,
     max_groups_per_batch: usize,
-) -> Result<(Vec<GroupStreamWindow>, Vec<std::ops::Range<usize>>, u64)> {
+    allow_intra_group_windows: bool,
+) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
     if max_groups_per_batch == 0 {
         return Err(Error::backend(
             "bounded Modular stream batch has zero group lanes",
         ));
     }
-    if stream_limit < STREAM_SENTINEL_BYTES + 4 {
-        return Err(Error::backend(
-            "device storage limit is too small for a bounded Modular stream window",
-        ));
+    if stream_limit < MIN_STREAM_WINDOW_BYTES {
+        return Err(Error::StreamWindowTooSmall {
+            limit_bytes: stream_limit,
+            minimum_bytes: MIN_STREAM_WINDOW_BYTES,
+        });
     }
-    let mut windows = Vec::with_capacity(groups.len());
+    let mut segments = Vec::with_capacity(groups.len());
     let mut batches = Vec::new();
-    let mut batch_start = 0usize;
+    let mut batch_start_segment = 0usize;
+    let mut batch_first_group = 0usize;
+    let mut batch_group_count = 0usize;
     let mut upload_cursor = 0u64;
     let mut maximum_batch_bytes = 0u64;
-    for (index, group) in groups.iter().copied().enumerate() {
+
+    let flush_batch = |segments: &[GroupStreamSegment],
+                       batches: &mut Vec<StreamBatch>,
+                       batch_start_segment: usize,
+                       batch_first_group: usize,
+                       batch_group_count: usize,
+                       upload_cursor: u64,
+                       maximum_batch_bytes: &mut u64|
+     -> Result<()> {
+        if batch_group_count == 0 {
+            return Ok(());
+        }
+        let bytes = align4(upload_cursor)?
+            .checked_add(STREAM_SENTINEL_BYTES)
+            .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
+        *maximum_batch_bytes = (*maximum_batch_bytes).max(bytes);
+        batches.push(StreamBatch {
+            segments: batch_start_segment..segments.len(),
+            first_group: batch_first_group,
+            group_count: batch_group_count,
+        });
+        Ok(())
+    };
+
+    for (group_index, group) in groups.iter().copied().enumerate() {
         let input_start = usize::try_from(group.token_bit_offset / 8)
             .map_err(|_| Error::backend("group stream start exceeds host address space"))?;
         let input_end = usize::try_from(
@@ -1322,106 +1449,243 @@ fn build_stream_batches(
             .ok_or_else(|| Error::backend("group stream window exceeds the codestream"))?;
         let packet_bytes = u64::try_from(input.len())
             .map_err(|_| Error::backend("group stream size exceeds u64"))?;
+        let group_packet_bytes = align4(packet_bytes)?
+            .checked_add(STREAM_SENTINEL_BYTES)
+            .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
+        let token_length = group
+            .token_bit_end
+            .checked_sub(group.token_bit_offset)
+            .and_then(|bits| u32::try_from(bits).ok())
+            .ok_or_else(|| Error::backend("group stream length exceeds WGSL u32"))?;
+        let leading_bits = u32::try_from(group.token_bit_offset & 7)
+            .map_err(|_| Error::backend("group leading-bit count exceeds WGSL u32"))?;
+
+        if group_packet_bytes > stream_limit {
+            flush_batch(
+                &segments,
+                &mut batches,
+                batch_start_segment,
+                batch_first_group,
+                batch_group_count,
+                upload_cursor,
+                &mut maximum_batch_bytes,
+            )?;
+            batch_group_count = 0;
+            upload_cursor = 0;
+            if !allow_intra_group_windows {
+                return Err(Error::IntraGroupStreamingUnsupported {
+                    group_index,
+                    required_bytes: group_packet_bytes,
+                    window_bytes: stream_limit,
+                });
+            }
+
+            let maximum_input_bytes = ((stream_limit - STREAM_SENTINEL_BYTES) / 4) * 4;
+            let core_bytes = maximum_input_bytes
+                .checked_sub(2 * STREAM_OVERLAP_BYTES)
+                .ok_or(Error::StreamWindowTooSmall {
+                    limit_bytes: stream_limit,
+                    minimum_bytes: MIN_STREAM_WINDOW_BYTES,
+                })?;
+            let mut core_start = 0u64;
+            while core_start < packet_bytes {
+                let core_end = core_start.saturating_add(core_bytes).min(packet_bytes);
+                let relative_input_start = core_start.saturating_sub(STREAM_OVERLAP_BYTES);
+                let relative_input_end = core_end
+                    .saturating_add(STREAM_OVERLAP_BYTES)
+                    .min(packet_bytes);
+                let input_len = relative_input_end - relative_input_start;
+                let uploaded_bytes = align4(input_len)?
+                    .checked_add(STREAM_SENTINEL_BYTES)
+                    .ok_or_else(|| Error::backend("group stream segment size overflow"))?;
+                if uploaded_bytes > stream_limit {
+                    return Err(Error::backend(
+                        "bounded Modular overlap exceeded the resolved stream window",
+                    ));
+                }
+                let logical_start = relative_input_start
+                    .checked_mul(8)
+                    .and_then(|bits| u32::try_from(bits).ok())
+                    .ok_or_else(|| Error::backend("stream segment start exceeds WGSL u32"))?;
+                let available_bits = input_len
+                    .checked_mul(8)
+                    .and_then(|bits| bits.checked_sub(u64::from(leading_bits)))
+                    .and_then(|bits| bits.checked_add(u64::from(logical_start)))
+                    .and_then(|bits| u32::try_from(bits).ok())
+                    .ok_or_else(|| Error::backend("stream segment end exceeds WGSL u32"))?;
+                let yield_end = core_end
+                    .checked_mul(8)
+                    .and_then(|bits| u32::try_from(bits).ok())
+                    .ok_or_else(|| Error::backend("stream yield boundary exceeds WGSL u32"))?
+                    .min(token_length);
+                let is_first = core_start == 0;
+                let is_final = core_end == packet_bytes;
+                let segment_index = segments.len();
+                segments.push(GroupStreamSegment {
+                    group_index,
+                    input_start: input_start
+                        .checked_add(usize::try_from(relative_input_start).map_err(|_| {
+                            Error::backend("stream segment start exceeds host address space")
+                        })?)
+                        .ok_or_else(|| Error::backend("stream segment start overflow"))?,
+                    input_end: input_start
+                        .checked_add(usize::try_from(relative_input_end).map_err(|_| {
+                            Error::backend("stream segment end exceeds host address space")
+                        })?)
+                        .ok_or_else(|| Error::backend("stream segment end overflow"))?,
+                    upload_offset: 0,
+                    window_logical_start: logical_start,
+                    window_upload_start: leading_bits,
+                    available_token_end: available_bits.min(token_length),
+                    stream_token_end: token_length,
+                    window_yield_end: yield_end,
+                    flags: (u32::from(is_first) * GroupStreamSegment::FIRST)
+                        | (u32::from(is_final) * GroupStreamSegment::FINAL),
+                });
+                batches.push(StreamBatch {
+                    segments: segment_index..segment_index + 1,
+                    first_group: group_index,
+                    group_count: 1,
+                });
+                maximum_batch_bytes = maximum_batch_bytes.max(uploaded_bytes);
+                core_start = core_end;
+            }
+            batch_start_segment = segments.len();
+            continue;
+        }
+
         let mut segment_start = align4(upload_cursor)?;
-        let mut batch_bytes = segment_start
+        let batch_bytes = segment_start
             .checked_add(packet_bytes)
             .and_then(|bytes| align4(bytes).ok())
             .and_then(|bytes| bytes.checked_add(STREAM_SENTINEL_BYTES))
             .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
-        if index != batch_start
-            && (batch_bytes > stream_limit || index - batch_start >= max_groups_per_batch)
+        if batch_group_count != 0
+            && (batch_bytes > stream_limit || batch_group_count >= max_groups_per_batch)
         {
-            batches.push(batch_start..index);
-            maximum_batch_bytes = maximum_batch_bytes.max(
-                align4(upload_cursor)?
-                    .checked_add(STREAM_SENTINEL_BYTES)
-                    .ok_or_else(|| Error::backend("group stream batch size overflow"))?,
-            );
-            batch_start = index;
+            flush_batch(
+                &segments,
+                &mut batches,
+                batch_start_segment,
+                batch_first_group,
+                batch_group_count,
+                upload_cursor,
+                &mut maximum_batch_bytes,
+            )?;
+            batch_start_segment = segments.len();
+            batch_first_group = group_index;
+            batch_group_count = 0;
             segment_start = 0;
-            batch_bytes = align4(packet_bytes)?
-                .checked_add(STREAM_SENTINEL_BYTES)
-                .ok_or_else(|| Error::backend("group stream batch size overflow"))?;
         }
-        if batch_bytes > stream_limit {
-            return Err(Error::backend(format!(
-                "one Modular group stream requires {batch_bytes} bytes, exceeding the bounded {stream_limit}-byte GPU window"
-            )));
+        if batch_group_count == 0 {
+            batch_start_segment = segments.len();
+            batch_first_group = group_index;
         }
         let segment_start_bits = segment_start
             .checked_mul(8)
             .ok_or_else(|| Error::backend("group stream bit offset overflow"))?;
-        let leading_bits = group.token_bit_offset & 7;
-        let token_start = segment_start_bits
-            .checked_add(leading_bits)
+        let window_upload_start = segment_start_bits
+            .checked_add(u64::from(leading_bits))
             .and_then(|bits| u32::try_from(bits).ok())
             .ok_or_else(|| Error::backend("group stream start exceeds WGSL u32"))?;
-        let token_end = u64::from(token_start)
-            .checked_add(group.token_bit_end - group.token_bit_offset)
-            .and_then(|bits| u32::try_from(bits).ok())
-            .ok_or_else(|| Error::backend("group stream end exceeds WGSL u32"))?;
-        windows.push(GroupStreamWindow {
+        segments.push(GroupStreamSegment {
+            group_index,
             input_start,
             input_end,
             upload_offset: usize::try_from(segment_start)
                 .map_err(|_| Error::backend("group upload offset exceeds host address space"))?,
-            token_start,
-            token_end,
+            window_logical_start: 0,
+            window_upload_start,
+            available_token_end: token_length,
+            stream_token_end: token_length,
+            window_yield_end: token_length,
+            flags: GroupStreamSegment::FIRST | GroupStreamSegment::FINAL,
         });
+        batch_group_count += 1;
         upload_cursor = segment_start
             .checked_add(packet_bytes)
             .ok_or_else(|| Error::backend("group stream batch cursor overflow"))?;
     }
-    if batch_start < groups.len() {
-        batches.push(batch_start..groups.len());
-        maximum_batch_bytes = maximum_batch_bytes.max(
-            align4(upload_cursor)?
-                .checked_add(STREAM_SENTINEL_BYTES)
-                .ok_or_else(|| Error::backend("group stream batch size overflow"))?,
-        );
-    }
-    if windows.len() != groups.len() || batches.is_empty() || maximum_batch_bytes == 0 {
+    flush_batch(
+        &segments,
+        &mut batches,
+        batch_start_segment,
+        batch_first_group,
+        batch_group_count,
+        upload_cursor,
+        &mut maximum_batch_bytes,
+    )?;
+    if segments.len() < groups.len() || batches.is_empty() || maximum_batch_bytes == 0 {
         return Err(Error::backend("Modular stream batch layout is empty"));
     }
-    Ok((windows, batches, maximum_batch_bytes))
+    Ok((segments, batches, maximum_batch_bytes))
 }
 
-type ParallelGroupLayout = (
-    usize,
-    Vec<GroupStreamWindow>,
-    Vec<std::ops::Range<usize>>,
-    u64,
-);
+type ParallelGroupLayout = (usize, Vec<GroupStreamSegment>, Vec<StreamBatch>, u64);
 
-fn select_parallel_group_layout(
-    codestream: &[u8],
-    groups: &[ModularGroup],
+#[derive(Clone, Copy, Debug)]
+struct ParallelGroupLimits {
     stream_limit: u64,
     lane_cap: usize,
     lane_stride: u64,
     fixed_bytes: u64,
     per_frame_target: u64,
+    allow_intra_group_windows: bool,
+}
+
+fn select_parallel_group_layout(
+    codestream: &[u8],
+    groups: &[ModularGroup],
+    limits: ParallelGroupLimits,
 ) -> Result<Option<ParallelGroupLayout>> {
-    let available = match per_frame_target.checked_sub(fixed_bytes) {
+    let available = match limits.per_frame_target.checked_sub(limits.fixed_bytes) {
         Some(available) => available,
         None => return Ok(None),
     };
-    let budget_lane_cap = usize::try_from(available / lane_stride).unwrap_or(usize::MAX);
-    let mut lanes = lane_cap.min(budget_lane_cap);
+    let budget_lane_cap = usize::try_from(available / limits.lane_stride).unwrap_or(usize::MAX);
+    let mut lanes = limits.lane_cap.min(budget_lane_cap);
+    let mut unsupported = None;
     while lanes != 0 {
-        let (windows, batches, stream_bytes) =
-            build_stream_batches(codestream, groups, stream_limit, lanes)?;
-        let scratch_bytes = lane_stride
+        let scratch_bytes = limits
+            .lane_stride
             .checked_mul(u64::try_from(lanes).unwrap_or(u64::MAX))
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
-        let required = fixed_bytes
+        let Some(stream_budget) = available.checked_sub(scratch_bytes) else {
+            lanes -= 1;
+            continue;
+        };
+        let effective_stream_limit = limits.stream_limit.min(stream_budget);
+        if effective_stream_limit < MIN_STREAM_WINDOW_BYTES {
+            lanes -= 1;
+            continue;
+        }
+        let (segments, batches, stream_bytes) = match build_stream_batches(
+            codestream,
+            groups,
+            effective_stream_limit,
+            lanes,
+            limits.allow_intra_group_windows,
+        ) {
+            Ok(layout) => layout,
+            Err(error @ Error::IntraGroupStreamingUnsupported { .. }) => {
+                unsupported = Some(error);
+                lanes -= 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let required = limits
+            .fixed_bytes
             .checked_add(stream_bytes)
             .and_then(|bytes| bytes.checked_add(scratch_bytes))
             .ok_or_else(|| Error::backend("parallel Modular memory target overflow"))?;
-        if required <= per_frame_target {
-            return Ok(Some((lanes, windows, batches, stream_bytes)));
+        if required <= limits.per_frame_target {
+            return Ok(Some((lanes, segments, batches, stream_bytes)));
         }
         lanes -= 1;
+    }
+    if let Some(error) = unsupported {
+        return Err(error);
     }
     Ok(None)
 }
@@ -1451,11 +1715,41 @@ fn group_reconstructed_bytes(
         group,
         decoded_symbol_count,
     )?));
+    let working_bytes = u64::from(physical_sample_words)
+        .checked_add(predictor_words)
+        .and_then(|words| words.checked_add(entropy_words))
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))?;
+    align16(working_bytes)?
+        .checked_add(ENTROPY_EXECUTION_STATE_BYTES)
+        .ok_or_else(|| Error::backend("group entropy execution state size overflow"))
+}
+
+fn group_entropy_state_offset_words(
+    profile: &StandardModularProfile,
+    group: ModularGroup,
+    decoded_symbol_count: u32,
+    physical_sample_words: u32,
+) -> Result<u32> {
+    let predictor_words = if profile.ma_config.needs_self_correcting() {
+        u64::from(group.width)
+            .checked_mul(5)
+            .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
+    } else {
+        0
+    };
+    let entropy_words = u64::from(lz77_scratch_words(group_lz77_window_words(
+        profile,
+        group,
+        decoded_symbol_count,
+    )?));
     u64::from(physical_sample_words)
         .checked_add(predictor_words)
         .and_then(|words| words.checked_add(entropy_words))
         .and_then(|words| words.checked_mul(4))
-        .ok_or_else(|| Error::backend("group reconstruction workspace size overflow"))
+        .and_then(|bytes| align16(bytes).ok())
+        .and_then(|bytes| u32::try_from(bytes / 4).ok())
+        .ok_or_else(|| Error::backend("group entropy execution state offset exceeds WGSL u32"))
 }
 
 fn fixed_gradient_output_mode(
@@ -2049,7 +2343,7 @@ fn validate_device_limits(
             .stream_batches
             .iter()
             .try_fold(0u32, |maximum, batch| {
-                u32::try_from(batch.len())
+                u32::try_from(batch.group_count)
                     .map(|groups| maximum.max(groups.div_ceil(dispatch.group_workgroup_size)))
                     .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
             })?;
@@ -2065,6 +2359,7 @@ fn validate_device_limits(
         stream_window_bytes: dispatch.stream_bytes,
         reconstruction_scratch_bytes: dispatch.reconstructed_bytes,
         reconstruction_lane_stride_bytes: dispatch.reconstruction_lane_stride,
+        entropy_execution_state_bytes_per_lane: ENTROPY_EXECUTION_STATE_BYTES,
         max_logical_reconstruction_sample_words: dispatch.max_logical_reconstruction_sample_words,
         max_physical_reconstruction_sample_words: dispatch.max_physical_reconstruction_sample_words,
         max_lz77_window_words: dispatch.max_lz77_window_words,
@@ -2173,47 +2468,6 @@ fn submit_decode(
         params_usage,
         std::mem::align_of::<u32>() as u64,
     );
-    let mut params_upload = vec![
-        0u8;
-        usize::try_from(source.dispatch_layout.params_bytes).map_err(
-            |_| Error::backend("group parameter upload exceeds host address space")
-        )?
-    ];
-    for (index, (&group, window)) in source
-        .profile
-        .groups
-        .iter()
-        .zip(source.dispatch_layout.stream_windows.iter())
-        .enumerate()
-    {
-        let status_index = u32::try_from(index)
-            .map_err(|_| Error::backend("group status index exceeds WGSL u32"))?;
-        let params = build_params(
-            group,
-            *window,
-            status_index,
-            &source.profile,
-            &source.output,
-            source.dispatch_layout.reconstruction_specialization,
-            index == 0,
-        )?;
-        let offset = u64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
-            .and_then(|offset| usize::try_from(offset).ok())
-            .ok_or_else(|| Error::backend("group parameter offset overflow"))?;
-        let end = offset
-            .checked_add(std::mem::size_of::<ShaderParams>())
-            .ok_or_else(|| Error::backend("group parameter range overflow"))?;
-        params_upload
-            .get_mut(offset..end)
-            .ok_or_else(|| Error::backend("group parameter buffer is truncated"))?
-            .copy_from_slice(bytemuck::bytes_of(&params));
-    }
-    backend
-        .queue()
-        .write_buffer(params_buffer.buffer(), 0, &params_upload);
-
     let dispatch_control = buffers.checkout(
         "jxl-wgpu decode Modular dispatch control",
         std::mem::size_of::<DispatchControl>() as u64,
@@ -2286,29 +2540,63 @@ fn submit_decode(
     let mut final_submission = None;
     for (batch_index, batch) in source.dispatch_layout.stream_batches.iter().enumerate() {
         stream_upload.fill(0);
-        for group_index in batch.clone() {
-            let window = source
+        for segment_index in batch.segments.clone() {
+            let segment = source
                 .dispatch_layout
-                .stream_windows
-                .get(group_index)
-                .ok_or_else(|| Error::backend("group stream window is missing"))?;
+                .stream_segments
+                .get(segment_index)
+                .copied()
+                .ok_or_else(|| Error::backend("group stream segment is missing"))?;
             let input = codestream
-                .get(window.input_start..window.input_end)
+                .get(segment.input_start..segment.input_end)
                 .ok_or_else(|| Error::backend("group stream input range is truncated"))?;
-            let end = window
+            let end = segment
                 .upload_offset
                 .checked_add(input.len())
                 .ok_or_else(|| Error::backend("group stream upload range overflow"))?;
             stream_upload
-                .get_mut(window.upload_offset..end)
+                .get_mut(segment.upload_offset..end)
                 .ok_or_else(|| Error::backend("group stream upload range is truncated"))?
                 .copy_from_slice(input);
+
+            let group = source
+                .profile
+                .groups
+                .get(segment.group_index)
+                .copied()
+                .ok_or_else(|| Error::backend("stream segment group index is invalid"))?;
+            let status_index = u32::try_from(segment.group_index)
+                .map_err(|_| Error::backend("group status index exceeds WGSL u32"))?;
+            let params = build_params(
+                group,
+                segment,
+                status_index,
+                &source.profile,
+                &source.output,
+                source.dispatch_layout.reconstruction_specialization,
+                segment.group_index == 0,
+            )?;
+            let params_offset = u64::try_from(segment.group_index)
+                .ok()
+                .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
+                .ok_or_else(|| Error::backend("group parameter offset overflow"))?;
+            let params_end = params_offset
+                .checked_add(std::mem::size_of::<ShaderParams>() as u64)
+                .ok_or_else(|| Error::backend("group parameter range overflow"))?;
+            if params_end > source.dispatch_layout.params_bytes {
+                return Err(Error::backend("group parameter buffer is truncated"));
+            }
+            backend.queue().write_buffer(
+                lifetime._params.buffer(),
+                params_offset,
+                bytemuck::bytes_of(&params),
+            );
         }
         backend.queue().write_buffer(&stream, 0, &stream_upload);
         let control = DispatchControl {
-            first_group: u32::try_from(batch.start)
+            first_group: u32::try_from(batch.first_group)
                 .map_err(|_| Error::backend("batch group index exceeds WGSL u32"))?,
-            group_count: u32::try_from(batch.len())
+            group_count: u32::try_from(batch.group_count)
                 .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))?,
             lane_stride_words: u32::try_from(source.dispatch_layout.reconstruction_lane_stride / 4)
                 .map_err(|_| Error::backend("reconstruction lane stride exceeds WGSL u32"))?,
@@ -2418,7 +2706,7 @@ fn submit_decode(
 
 fn build_params(
     group: ModularGroup,
-    stream_window: GroupStreamWindow,
+    stream_segment: GroupStreamSegment,
     status_index: u32,
     profile: &StandardModularProfile,
     output: &OutputPlan,
@@ -2468,12 +2756,30 @@ fn build_params(
         ),
         lz77_window_words,
     );
+    let physical_sample_words =
+        if fixed_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
+            compact_gray8_sample_words(group)?
+        } else {
+            decoded_symbol_count
+        };
+    let entropy_state_offset = group_entropy_state_offset_words(
+        profile,
+        group,
+        decoded_symbol_count,
+        physical_sample_words,
+    )?;
     Ok(ShaderParams {
         entropy: EntropyStreamParams {
-            token_start: stream_window.token_start,
-            token_end: stream_window.token_end,
+            token_start: 0,
+            token_end: stream_segment.available_token_end,
             lz77_window_mask: lz77_window_words.saturating_sub(1),
         },
+        window_logical_start: stream_segment.window_logical_start,
+        window_upload_start: stream_segment.window_upload_start,
+        stream_token_end: stream_segment.stream_token_end,
+        window_yield_end: stream_segment.window_yield_end,
+        window_flags: stream_segment.flags,
+        entropy_state_offset,
         width: group.width,
         height: group.height,
         origin_x: group.x,
@@ -2531,6 +2837,13 @@ fn align4(value: u64) -> Result<u64> {
     value
         .checked_add(3)
         .map(|value| value & !3)
+        .ok_or_else(|| Error::backend("GPU buffer size overflow"))
+}
+
+fn align16(value: u64) -> Result<u64> {
+    value
+        .checked_add(15)
+        .map(|value| value & !15)
         .ok_or_else(|| Error::backend("GPU buffer size overflow"))
 }
 
@@ -2642,20 +2955,36 @@ mod tests {
             stream_index: 0,
         };
         let groups = [group(3, 67), group(75, 139), group(147, 211)];
-        let (windows, batches, peak) =
-            build_stream_batches(&codestream, &groups, 20, usize::MAX).unwrap();
-        assert_eq!(batches, [0..1, 1..2, 2..3]);
+        let (segments, batches, peak) =
+            build_stream_batches(&codestream, &groups, 40, 1, false).unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| (batch.first_group, batch.group_count))
+                .collect::<Vec<_>>(),
+            [(0, 1), (1, 1), (2, 1)]
+        );
         assert_eq!(peak, 16);
-        for (window, original) in windows.iter().zip(groups) {
-            assert_eq!(window.upload_offset, 0);
-            assert_eq!(window.token_start, (original.token_bit_offset & 7) as u32);
+        for (segment, original) in segments.iter().zip(groups) {
+            assert_eq!(segment.upload_offset, 0);
             assert_eq!(
-                window.token_end - window.token_start,
+                segment.window_upload_start,
+                (original.token_bit_offset & 7) as u32
+            );
+            assert_eq!(segment.window_logical_start, 0);
+            assert_eq!(
+                segment.stream_token_end,
                 u32::try_from(original.token_bit_end - original.token_bit_offset).unwrap()
             );
-            assert_eq!(window.input_start, (original.token_bit_offset / 8) as usize);
+            assert_eq!(segment.available_token_end, segment.stream_token_end);
+            assert_ne!(segment.flags & GroupStreamSegment::FIRST, 0);
+            assert_ne!(segment.flags & GroupStreamSegment::FINAL, 0);
             assert_eq!(
-                window.input_end,
+                segment.input_start,
+                (original.token_bit_offset / 8) as usize
+            );
+            assert_eq!(
+                segment.input_end,
                 original.token_bit_end.div_ceil(8) as usize
             );
         }
@@ -2675,11 +3004,91 @@ mod tests {
                 stream_index: index as u32,
             })
             .collect::<Vec<_>>();
-        let (windows, batches, _) = build_stream_batches(&codestream, &groups, 1024, 2).unwrap();
-        assert_eq!(batches, [0..2, 2..4, 4..5]);
-        assert_eq!(windows[0].upload_offset, 0);
-        assert_eq!(windows[2].upload_offset, 0);
-        assert_eq!(windows[4].upload_offset, 0);
+        let (segments, batches, _) =
+            build_stream_batches(&codestream, &groups, 1024, 2, false).unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| (batch.first_group, batch.group_count))
+                .collect::<Vec<_>>(),
+            [(0, 2), (2, 2), (4, 1)]
+        );
+        assert_eq!(segments[0].upload_offset, 0);
+        assert_eq!(segments[2].upload_offset, 0);
+        assert_eq!(segments[4].upload_offset, 0);
+    }
+
+    #[test]
+    fn oversized_unaligned_group_is_split_with_overlap_and_single_lane_batches() {
+        let codestream = vec![0u8; 256];
+        let groups = [ModularGroup {
+            token_bit_offset: 3,
+            token_bit_end: 1603,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            stream_index: 0,
+        }];
+        let (segments, batches, peak) =
+            build_stream_batches(&codestream, &groups, 64, 8, true).unwrap();
+        assert!(segments.len() > 2);
+        assert_eq!(segments.len(), batches.len());
+        assert_eq!(peak, 64);
+        assert_ne!(segments[0].flags & GroupStreamSegment::FIRST, 0);
+        assert_eq!(segments[0].flags & GroupStreamSegment::FINAL, 0);
+        assert_eq!(
+            segments.last().unwrap().flags & GroupStreamSegment::FIRST,
+            0
+        );
+        assert_ne!(
+            segments.last().unwrap().flags & GroupStreamSegment::FINAL,
+            0
+        );
+        assert_eq!(segments.last().unwrap().available_token_end, 1600);
+        assert_eq!(segments.last().unwrap().stream_token_end, 1600);
+        for (index, (segment, batch)) in segments.iter().zip(&batches).enumerate() {
+            assert_eq!(segment.group_index, 0);
+            assert_eq!(segment.window_upload_start, 3);
+            assert!(segment.input_end - segment.input_start <= 60);
+            assert_eq!(batch.first_group, 0);
+            assert_eq!(batch.group_count, 1);
+            assert_eq!(batch.segments, index..index + 1);
+        }
+        for adjacent in segments.windows(2) {
+            assert!(adjacent[1].window_logical_start < adjacent[0].window_yield_end);
+            assert!(adjacent[0].available_token_end > adjacent[0].window_yield_end);
+            assert!(adjacent[1].window_yield_end > adjacent[0].window_yield_end);
+        }
+    }
+
+    #[test]
+    fn oversized_generic_group_reports_typed_resume_error() {
+        let codestream = vec![0u8; 256];
+        let groups = [ModularGroup {
+            token_bit_offset: 0,
+            token_bit_end: 1600,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            stream_index: 0,
+        }];
+        assert!(matches!(
+            build_stream_batches(&codestream, &groups, 64, 1, false),
+            Err(Error::IntraGroupStreamingUnsupported {
+                group_index: 0,
+                required_bytes: 204,
+                window_bytes: 64,
+            })
+        ));
+        assert!(matches!(
+            build_stream_batches(&codestream, &groups, 39, 1, true),
+            Err(Error::StreamWindowTooSmall {
+                limit_bytes: 39,
+                minimum_bytes: 40,
+            })
+        ));
     }
 
     #[test]
@@ -2696,22 +3105,43 @@ mod tests {
                 stream_index: index as u32,
             })
             .collect::<Vec<_>>();
-        let (lanes, _, batches, peak) =
-            select_parallel_group_layout(&codestream, &groups, 64 * 1024, 8, 4096, 1024, 64 * 1024)
-                .unwrap()
-                .unwrap();
+        let (lanes, _, batches, peak) = select_parallel_group_layout(
+            &codestream,
+            &groups,
+            ParallelGroupLimits {
+                stream_limit: 64 * 1024,
+                lane_cap: 8,
+                lane_stride: 4096,
+                fixed_bytes: 1024,
+                per_frame_target: 64 * 1024,
+                allow_intra_group_windows: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(lanes, 8);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0], 0..8);
+        assert_eq!(batches[0].first_group, 0);
+        assert_eq!(batches[0].group_count, 8);
         assert_eq!(peak, 8 * 1024 + STREAM_SENTINEL_BYTES);
 
-        let (lanes, _, batches, peak) =
-            select_parallel_group_layout(&codestream, &groups, 64 * 1024, 8, 4096, 1024, 20 * 1024)
-                .unwrap()
-                .unwrap();
-        assert_eq!(lanes, 3);
-        assert_eq!(batches, [0..3, 3..6, 6..8]);
-        assert_eq!(peak, 3 * 1024 + STREAM_SENTINEL_BYTES);
+        let (lanes, _, batches, peak) = select_parallel_group_layout(
+            &codestream,
+            &groups,
+            ParallelGroupLimits {
+                stream_limit: 64 * 1024,
+                lane_cap: 8,
+                lane_stride: 4096,
+                fixed_bytes: 1024,
+                per_frame_target: 20 * 1024,
+                allow_intra_group_windows: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lanes, 4);
+        assert!(batches.iter().all(|batch| batch.group_count == 2));
+        assert_eq!(peak, 2 * 1024 + STREAM_SENTINEL_BYTES);
     }
 
     #[test]
@@ -3282,7 +3712,12 @@ mod tests {
 
     #[test]
     fn shader_abi_and_stream_sentinel_are_explicit() {
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 212);
+        assert_eq!(STREAM_OVERLAP_BYTES, 16);
+        assert_eq!(STREAM_SENTINEL_BYTES, 4);
+        assert_eq!(MIN_STREAM_WINDOW_BYTES, 40);
+        assert_eq!(align16(1).unwrap(), 16);
+        assert_eq!(align16(16).unwrap(), 16);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 236);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             entropy: EntropyStreamParams {
@@ -3290,64 +3725,86 @@ mod tests {
                 token_end: 2,
                 lz77_window_mask: 3,
             },
-            width: 4,
-            height: 5,
-            origin_x: 6,
-            origin_y: 7,
-            sample_count: 8,
-            initialize_chroma: 9,
-            source_channels: 10,
-            source_bits: 11,
-            source_mask: 12,
-            needs_self_correcting: 13,
-            output_kind: 14,
-            transfer: 15,
-            limited_range: 16,
-            channels: 17,
-            order: 18,
-            bits: 19,
-            storage_bits: 20,
-            plane0_offset: 21,
-            plane0_stride: 22,
-            plane1_offset: 23,
-            plane1_stride: 24,
-            plane2_offset: 25,
-            plane2_stride: 26,
-            plane3_offset: 27,
-            plane3_stride: 28,
-            chroma_width: 29,
-            chroma_height: 30,
-            logical_size: 31,
-            numeric_mapping: 32,
-            status_index: 33,
-            stream_index: 34,
-            fixed_leaf_predictor: 35,
-            fixed_leaf_offset: 36,
-            fixed_leaf_multiplier: 37,
-            fixed_leaf_cluster0: 38,
-            fixed_leaf_cluster1: 39,
-            fixed_leaf_cluster2: 40,
-            fixed_leaf_cluster3: 41,
-            fixed_output_mode: 42,
-            wp_p1: 43,
-            wp_p2: 44,
-            wp_p3a: 45,
-            wp_p3b: 46,
-            wp_p3c: 47,
-            wp_p3d: 48,
-            wp_p3e: 49,
-            wp_w0: 50,
-            wp_w1: 51,
-            wp_w2: 52,
-            wp_w3: 53,
+            window_logical_start: 4,
+            window_upload_start: 5,
+            stream_token_end: 6,
+            window_yield_end: 7,
+            window_flags: 8,
+            entropy_state_offset: 9,
+            width: 10,
+            height: 11,
+            origin_x: 12,
+            origin_y: 13,
+            sample_count: 14,
+            initialize_chroma: 15,
+            source_channels: 16,
+            source_bits: 17,
+            source_mask: 18,
+            needs_self_correcting: 19,
+            output_kind: 20,
+            transfer: 21,
+            limited_range: 22,
+            channels: 23,
+            order: 24,
+            bits: 25,
+            storage_bits: 26,
+            plane0_offset: 27,
+            plane0_stride: 28,
+            plane1_offset: 29,
+            plane1_stride: 30,
+            plane2_offset: 31,
+            plane2_stride: 32,
+            plane3_offset: 33,
+            plane3_stride: 34,
+            chroma_width: 35,
+            chroma_height: 36,
+            logical_size: 37,
+            numeric_mapping: 38,
+            status_index: 39,
+            stream_index: 40,
+            fixed_leaf_predictor: 41,
+            fixed_leaf_offset: 42,
+            fixed_leaf_multiplier: 43,
+            fixed_leaf_cluster0: 44,
+            fixed_leaf_cluster1: 45,
+            fixed_leaf_cluster2: 46,
+            fixed_leaf_cluster3: 47,
+            fixed_output_mode: 48,
+            wp_p1: 49,
+            wp_p2: 50,
+            wp_p3a: 51,
+            wp_p3b: 52,
+            wp_p3c: 53,
+            wp_p3d: 54,
+            wp_p3e: 55,
+            wp_w0: 56,
+            wp_w1: 57,
+            wp_w2: 58,
+            wp_w3: 59,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 53]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 59]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45, 46, 47, 48, 49, 50, 51, 52, 53,
+                45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
             ]
+        );
+        assert_eq!(std::mem::size_of::<EntropyExecutionState>(), 32);
+        assert_eq!(std::mem::align_of::<EntropyExecutionState>(), 16);
+        let execution = EntropyExecutionState {
+            bit_cursor: 1,
+            ans_state: 2,
+            copy_remaining: 3,
+            copy_position: 4,
+            entropy_decoded: 5,
+            last_value: 6,
+            consumer_decoded: 7,
+            error_code: 8,
+        };
+        assert_eq!(
+            bytemuck::cast::<EntropyExecutionState, [u32; 8]>(execution),
+            [1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert_eq!(std::mem::size_of::<DispatchControl>(), 16);
         assert_eq!(std::mem::align_of::<DispatchControl>(), 4);

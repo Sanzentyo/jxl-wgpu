@@ -59,7 +59,7 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 | Area | State | Authoritative current boundary |
 |---|---|---|
 | Raw/`jxlc`/`jxlp` transport and header inventory | **Partial** | Bounded still-image transport, frame/TOC inventory, ICC reconstruction, and feature metadata exist; streaming box delivery and the complete container API do not. |
-| Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. |
+| Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one pass, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. Channel-fixed Gradient groups can resume within one entropy stream through bounded overlapping GPU uploads. |
 | VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers mixed maps containing all 27 regular and special transform strategies, single-pass nonzero AC, all 13 natural/custom coefficient-order families, stream-defined block contexts, non-default LF dequantization and LF/HF chroma correlation, every normative default strategy matrix and 3-bit X/B scale, scanline or entropy-permuted center-first pass groups, multiple LF groups with shared or per-substream local MA trees, resident Gaborish plus one-to-three-iteration EPF, and a checked 2056×256 LF-boundary extent. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
 | VarDCT encode | **Partial** | All 27 strategy identifiers execute in fixed-transform form. The fixed distance-25 LF-only profile serializes validated default or explicit LF dequantization and LF/HF chroma-correlation metadata; tiled DCT8 emits multiple LF/AC groups, resets prediction per LF group, and accepts checked axes through 16K. Every AC coefficient is still quantized to zero and image-wide mixed strategy selection is absent. |
@@ -106,7 +106,7 @@ correctness. Dependencies name other item IDs in this document.
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `ENT-D01` | P0 | **Partial** | The bounded Modular, VarDCT packet, and DCT8 pass-group paths share a typed 12-byte Rust/WGSL `EntropyStreamParams` prefix for token bounds and the LZ ring mask while preserving consumer-specific records and bindings. Whole-range consumers also share exact ANS-state and zero-padding termination. The VarDCT frame engine represents an absent global MA tree, host-packs each LF-local descriptor, executes LF entropy on GPU, maps only aggregate cursor/status records, parses each following HF-local descriptor, and resumes through a separate GPU entry point without host image entropy. Its runtime-neutral pending state owns both submissions and maps. An actual-GPU 2056×256 ordinary-`cjxl` test covers two LF groups through blocking and async completion. Completion requires every remaining LF/HF consumer, recursive LF frames, and windowed entropy execution. | `FRONT-02` |
-| `ENT-D02` | P0 | **Partial** | Decode arbitrarily large legal group streams through bounded windows while retaining enough history for LZ77 and context state. Prove exact results across window boundaries and cancellation. | `ENT-D01` |
+| `ENT-D02` | P0 | **Partial** | The production channel-fixed Gradient Modular path now splits a single oversized group into ordered GPU submissions over one reusable upload. Adjacent segments carry 16-byte backward/forward overlap and yield only between complete output tokens; a 16-byte-aligned 32-byte per-lane POD record preserves the logical bit cursor, ANS state, LZ77 copy cursor/count/history position, decoded counts, last value, and the first failure. The stream cap is caller-configurable and further bounded by the device and shared per-frame byte budget. Host scheduling tests cover unaligned starts, overlap mapping, lane isolation, budget adaptation, undersized caps, and typed refusal for an oversized generic profile. An actual-adapter 193×97 Prefix+RLE/LZ77 stream is forced through a 256-byte cap and must equal its source and Rust `jxl` oracle through blocking and runtime-neutral async completion; abandoning the multi-submission pending frame must release its reservation after GPU completion. A separate multi-group test damages group 1 only after the first two capped uploads and requires a typed group-1 GPU entropy failure from the final aggregate map. Completion still requires intra-group resume for generic MA, VarDCT LF/HF consumers and recursive streams, a production ANS cross-window fixture, and targeted noninitial-window truncation plus broader fuzz coverage. | `ENT-D01` |
 | `ENT-E01` | P1 | **Partial** | Add GPU ANS token serialization, histogram clustering, context clustering, hybrid-uint selection, general LZ77 search/distances, and canonical entropy metadata. `djxl`/`jxl` must accept every generated family. | — |
 | `ENT-E02` | P2 | **Missing** | Select entropy configurations by effort and workload with deterministic modes. Report density and speed independently; no heuristic may change lossless pixels. | `ENT-E01`, `QA-05` |
 
@@ -243,12 +243,13 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
-The coding-mode selector, shared typed entropy-stream ABI, nonzero-AC mixed/multi-group decode,
+The coding-mode selector, shared typed entropy-stream ABI, fixed-Gradient intra-group stream resume,
+nonzero-AC mixed/multi-group decode,
 local per-substream MA-tree frame execution, non-default LF dequantization/correlation, bounded
 resident Gaborish/EPF restoration chain, logical/physical TOC-order normalization, and the
 multi-LF-group tiled-DCT8 LF-only encoder are implemented. The immediate P0 gap returns to the
-common frontend and entropy work in `FRONT-01/02` and `ENT-D01/02`, including true bounded
-within-stream delivery rather than whole-input retention. In parallel, `VDCT-E02` must emit real
+common frontend and entropy work in `FRONT-01` and `ENT-D01/02`, including generic/VarDCT
+within-stream delivery and incremental input rather than whole-input retention. In parallel, `VDCT-E02` must emit real
 nonzero AC coefficients and the remaining `VDCT-E01` work must select mixed image-wide strategies;
 broader render-graph composition remains required beside those format-completeness gates.
 

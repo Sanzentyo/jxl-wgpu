@@ -131,6 +131,32 @@ pub enum Error {
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
+    #[error(
+        "the bounded Modular stream window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
+    )]
+    StreamWindowTooSmall {
+        limit_bytes: u64,
+        minimum_bytes: u64,
+    },
+    #[error(
+        "Modular group {group_index} requires {required_bytes} stream bytes, exceeding the {window_bytes}-byte window; intra-group resume is not available for its reconstruction profile"
+    )]
+    IntraGroupStreamingUnsupported {
+        group_index: usize,
+        required_bytes: u64,
+        window_bytes: u64,
+    },
+    #[error(
+        "Modular GPU group {group_index} rejected entropy stream: status={status}, decoded={decoded_samples}/{expected_samples}, cursor={cursor}/{expected_cursor}"
+    )]
+    ModularEntropyRejected {
+        group_index: usize,
+        status: u32,
+        decoded_samples: u32,
+        expected_samples: u32,
+        cursor: u32,
+        expected_cursor: u32,
+    },
     #[error("GPU decode memory backpressure: {0}")]
     MemoryBackpressure(#[from] jxl_wgpu::MemoryBudgetError),
     #[error("GPU decode submission-poll backpressure: {0}")]

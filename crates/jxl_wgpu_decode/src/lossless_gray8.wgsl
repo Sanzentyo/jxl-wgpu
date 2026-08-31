@@ -5,6 +5,12 @@ override wg_y: u32 = 1u;
 
 struct Params {
     entropy: EntropyStreamParams,
+    window_logical_start: u32,
+    window_upload_start: u32,
+    stream_token_end: u32,
+    window_yield_end: u32,
+    window_flags: u32,
+    entropy_state_offset: u32,
     width: u32,
     height: u32,
     origin_x: u32,
@@ -76,10 +82,12 @@ struct DispatchControl {
 var<private> bit_cursor: u32;
 var<private> decode_error: u32;
 var<private> current_channel: u32;
+var<private> consumer_decoded: u32;
 var<private> reconstruction_base: u32;
 var<private> params: Params;
 
 const STATUS_OK: u32 = 1u;
+const STATUS_IN_PROGRESS: u32 = 14u;
 const ERROR_TRUNCATED_BITS: u32 = 2u;
 const ERROR_PREFIX: u32 = 3u;
 const ERROR_RAW_TOKEN: u32 = 4u;
@@ -92,6 +100,9 @@ const ERROR_ANS_STATE: u32 = 10u;
 const ERROR_ENTROPY_CLUSTER: u32 = 11u;
 const ERROR_MA_TREE: u32 = 12u;
 const ERROR_PREDICTOR: u32 = 13u;
+
+const WINDOW_FIRST: u32 = 1u;
+const WINDOW_FINAL: u32 = 2u;
 
 const FIXED_OUTPUT_DIRECT_NORMALIZED_GRAY8: u32 = 1u;
 const FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8: u32 = 2u;
@@ -123,8 +134,18 @@ fn peek_bits(count: u32) -> u32 {
     if count == 0u {
         return 0u;
     }
-    let word_index = bit_cursor >> 5u;
-    let word_shift = bit_cursor & 31u;
+    if bit_cursor < params.window_logical_start {
+        decode_error = ERROR_TRUNCATED_BITS;
+        return 0u;
+    }
+    let relative_cursor = bit_cursor - params.window_logical_start;
+    if relative_cursor > 0xffffffffu - params.window_upload_start {
+        decode_error = ERROR_TRUNCATED_BITS;
+        return 0u;
+    }
+    let physical_cursor = params.window_upload_start + relative_cursor;
+    let word_index = physical_cursor >> 5u;
+    let word_shift = physical_cursor & 31u;
     var value = codestream[word_index] >> word_shift;
     if word_shift + count > 32u {
         value = value | (codestream[word_index + 1u] << (32u - word_shift));
@@ -136,7 +157,8 @@ fn read_bits(count: u32) -> u32 {
     if decode_error != 0u {
         return 0u;
     }
-    if count > 32u || bit_cursor > params.entropy.token_end
+    if count > 32u || bit_cursor < params.window_logical_start
+        || bit_cursor > params.entropy.token_end
         || count > params.entropy.token_end - bit_cursor {
         decode_error = ERROR_TRUNCATED_BITS;
         return 0u;
@@ -147,6 +169,42 @@ fn read_bits(count: u32) -> u32 {
 }
 
 /*__JXL_MODULAR_ENTROPY__*/
+
+fn window_is_first() -> bool {
+    return (params.window_flags & WINDOW_FIRST) != 0u;
+}
+
+fn window_is_final() -> bool {
+    return (params.window_flags & WINDOW_FINAL) != 0u;
+}
+
+fn window_should_pause() -> bool {
+    return !window_is_final() && bit_cursor >= params.window_yield_end;
+}
+
+fn load_entropy_execution_state() {
+    let base = params.entropy_state_offset;
+    bit_cursor = reconstruction_load(base);
+    entropy_ans_state = reconstruction_load(base + 1u);
+    entropy_copy_remaining = reconstruction_load(base + 2u);
+    entropy_copy_position = reconstruction_load(base + 3u);
+    entropy_decoded = reconstruction_load(base + 4u);
+    entropy_last_value = reconstruction_load(base + 5u);
+    consumer_decoded = reconstruction_load(base + 6u);
+    decode_error = reconstruction_load(base + 7u);
+}
+
+fn save_entropy_execution_state(error_code: u32) {
+    let base = params.entropy_state_offset;
+    reconstruction_store(base, bit_cursor);
+    reconstruction_store(base + 1u, entropy_ans_state);
+    reconstruction_store(base + 2u, entropy_copy_remaining);
+    reconstruction_store(base + 3u, entropy_copy_position);
+    reconstruction_store(base + 4u, entropy_decoded);
+    reconstruction_store(base + 5u, entropy_last_value);
+    reconstruction_store(base + 6u, consumer_decoded);
+    reconstruction_store(base + 7u, error_code);
+}
 
 fn unpack_signed(value: u32) -> i32 {
     if (value & 1u) == 0u {
@@ -526,27 +584,59 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let group_index = dispatch_control.first_group + lane_index;
     params = params_table[group_index];
     reconstruction_base = lane_index * dispatch_control.lane_stride_words;
-    bit_cursor = params.entropy.token_start;
     decode_error = 0u;
-    current_channel = 0u;
-    var decoded = 0u;
-    entropy_begin();
+    if window_is_first() {
+        bit_cursor = params.entropy.token_start;
+        consumer_decoded = 0u;
+        entropy_begin();
+    } else {
+        load_entropy_execution_state();
+    }
+    current_channel = consumer_decoded / params.sample_count;
 
-    while current_channel < params.source_channels && decode_error == 0u {
-        decoded += decode_adaptive_channel();
+    while current_channel < params.source_channels && decode_error == 0u
+        && !window_should_pause() {
+        let decoded = decode_adaptive_channel();
+        consumer_decoded += decoded;
+        if decode_error != 0u || window_should_pause() {
+            break;
+        }
+        if consumer_decoded != (current_channel + 1u) * params.sample_count {
+            decode_error = ERROR_RAW_TOKEN;
+            break;
+        }
         current_channel += 1u;
     }
-    entropy_finish_exact();
-    if decode_error == 0u && params.fixed_output_mode == 0u {
-        finalize_output();
+    let expected_samples = params.sample_count * params.source_channels;
+    var status_code = decode_error;
+    if decode_error != 0u {
+        if !window_is_final() {
+            save_entropy_execution_state(decode_error);
+        }
+    } else if consumer_decoded != expected_samples {
+        if window_is_final() {
+            status_code = ERROR_TRUNCATED_BITS;
+        } else {
+            save_entropy_execution_state(0u);
+            status_code = STATUS_IN_PROGRESS;
+        }
+    } else if !window_is_final() {
+        save_entropy_execution_state(0u);
+        status_code = STATUS_IN_PROGRESS;
+    } else {
+        entropy_finish_exact();
+        status_code = decode_error;
+        if decode_error == 0u && params.fixed_output_mode == 0u {
+            finalize_output();
+            status_code = decode_error;
+        }
     }
     let status_base = params.status_index * 4u;
-    if decode_error == 0u {
-        status[status_base] = STATUS_OK;
-    } else {
-        status[status_base] = decode_error;
+    if status_code == 0u {
+        status_code = STATUS_OK;
     }
-    status[status_base + 1u] = decoded;
+    status[status_base] = status_code;
+    status[status_base + 1u] = consumer_decoded;
     status[status_base + 2u] = bit_cursor;
-    status[status_base + 3u] = params.entropy.token_end;
+    status[status_base + 3u] = params.stream_token_end;
 }

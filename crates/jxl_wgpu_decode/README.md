@@ -29,7 +29,12 @@ validates every bit and output bound, applies LZ77, walks the MA tree, reconstru
 and reverses YCoCg for RGB(A). Up to 512 budget- and device-resolved scratch lanes decode independent
 groups in one `dispatch_workgroups` wave; 64 logical group invocations are packed into each portable
 compute workgroup and their canvas rectangles do not overlap. Large frames use ordered batches backed
-by one reusable stream window instead of binding the full codestream. One
+by one reusable stream window instead of binding the full codestream. If one channel-fixed Gradient
+group itself exceeds the resolved window, it resumes over ordered segments with 16-byte backward
+and forward overlap. The logical cursor, Prefix/ANS state, LZ77 copy state, decoded count, last value,
+and first error remain in a 16-byte-aligned 32-byte record at the end of the same scratch lane. A
+generic MA group that cannot fit one resolved window returns a typed
+`IntraGroupStreamingUnsupported` error until its larger predictor/context state is resumable. One
 aggregate status staging buffer is mapped once after the last batch, and every four-word group
 status is checked before the frame is reported. No reconstructed sample is produced on the CPU.
 Output pipeline selection is also per frame. When every plane offset and row stride is four-byte
@@ -315,26 +320,34 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 212-byte `repr(C)` POD. Its first 12 bytes are the
+The CPU/WGSL per-group parameter ABI is a checked 236-byte `repr(C)` POD. Its first 12 bytes are the
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
 same typed prefix starts the 208-byte VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
 remain consumer-specific. Consumers whose entropy owns the complete token range also call one
 shared terminator for the ANS final-state and at most seven zero-padding bits; VarDCT packet streams
 followed by fixed metadata finalize ANS first and validate the enclosing section after that tail.
-The Modular suffix carries four plane offset/stride pairs, exact output
+The Modular suffix begins with six window fields: logical segment start, physical upload start,
+full stream end, yield boundary, first/final flags, and the aligned entropy-state offset. It then
+carries four plane offset/stride pairs, exact output
 channel/order/depth/range/transfer codes, the resolved numeric mapping, global status index, MA
 stream index, the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, the
 output traversal mode, weighted-predictor header, and shader-visible logical size. Records are a
 tightly packed read-only storage array; a separate 16-byte uniform selects the global group range and local
 scratch-lane stride for each wave.
 Codestream segments are rounded to four bytes and include a zero sentinel word for bounded
-cross-word peeks. Token offsets are rebased to their window rather than requiring a
-full-codestream storage binding. The peak window grows only when a larger batch fits the actual
-per-slot shared byte budget and device storage-binding limit, allowing a large still image to
-coalesce submissions without compromising concurrent small-frame admission.
+cross-word peeks. A caller may set an additional cap with
+`WgpuSubmissionEngine::with_stream_window_limit`; device limits and the shared per-slot byte budget
+can only reduce it. Whole-group token offsets are rebased to their upload. Split groups instead keep
+one group-relative logical cursor and map it into each upload through the segment fields. A token
+may finish past a yield boundary inside the 16-byte forward overlap; the following segment includes
+the same bytes as backward overlap and resumes only after the completed output value. Final ANS and
+zero-padding validation runs only on the final segment. The peak window grows only when a larger
+batch fits the actual per-slot shared byte budget and device storage-binding limit, allowing a large
+still image to coalesce submissions without compromising concurrent small-frame admission.
 
-Entropy metadata, bounded lane scratch, aggregate status/readback, parameters, dispatch control,
+Entropy metadata, bounded lane scratch including the 32-byte resume record, aggregate
+status/readback, parameters, dispatch control,
 output, and peak stream-window sizes are overflow-checked against storage, uniform, and device
 buffer limits. Lane count is the minimum of the 512-lane watchdog cap, group count, device workgroup/storage
 limits, and the scratch plus actual peak stream space affordable per requested frame slot. The LZ
@@ -345,7 +358,7 @@ no reconstruction storage; wider histories retain the descriptor-sized storage r
 not affordable but one complete frame is, the prepared backend narrows it and propagates the
 resolved bound into the actual session limiter and prefetch validation. `WgpuDecodeSession::memory_stats`
 reports complete per-frame, output-lease, transient, peak-window, resolved-slot, logical/physical
-LZ sizes, logical/physical reconstruction-sample workspace, selected output-write/output-traversal
+LZ sizes, logical/physical reconstruction-sample workspace, per-lane entropy-state bytes, selected output-write/output-traversal
 and reconstruction-specialization paths, lane/workgroup counts, stream batches, and actual
 submission counts. Concurrent jobs opened through an engine or its
 clones use the `WgpuBackend`'s shared
@@ -367,7 +380,7 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for e
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while metadata and packed 212-byte
+aligned spans directly from the shared input storage, while metadata and packed 236-byte
 `ShaderParams` records (including the 12-byte shared entropy prefix) use `Queue::write_buffer`; no
 second full-codestream host `Vec` is created.
 

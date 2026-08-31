@@ -177,6 +177,36 @@ normal consumption or cancellation at the LF stage. The effort-7 stream also exe
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Bounded Modular stream-window matrix
+
+`wgpu_gray8::fixed_gradient_group_resumes_across_bounded_gpu_stream_windows` creates a standard
+193×97 lossless Gray8 codestream with alternating long runs and high-entropy regions through the
+production GPU encoder. Rust `jxl` must reproduce the source first. The production decoder is then
+given an explicit 256-byte stream-window cap, forcing one channel-fixed Gradient group through
+multiple ordered submissions. Its blocking and runtime-neutral async results must both be byte
+identical to the source, the reported peak stream allocation must not exceed the cap, and the
+submission count must prove that more than one segment executed. A third submission is abandoned;
+after a queue fence and callback polling, the shared byte reservation must return to zero.
+
+`wgpu_gray8::every_multigroup_gpu_status_is_validated_from_one_map` uses the same 256-byte cap on a
+513×257 multi-group stream, leaves the first 512 bytes of group 1 intact, and corrupts its remaining
+entropy bytes. Bounded host metadata must still open; the final aggregate status map must return the
+typed `ModularEntropyRejected { group_index: 1, .. }` error. Later segment dispatches therefore
+cannot overwrite an earlier sticky GPU failure with a successful status.
+
+Host scheduling tests independently use an unaligned three-bit group start and a 64-byte cap to
+verify physical/logical mapping, first/final flags, 16-byte overlap, monotonic yield boundaries,
+one-lane scratch isolation, and exact peak bytes. Budget tests show that lane count and stream peak
+trade against the same per-frame target. A cap below the 40-byte minimum and an oversized generic
+MA group produce distinct typed errors. Rust/WGSL full-record word casts pin the 236-byte parameter
+record and the 32-byte, 16-byte-aligned resume state. Every composed shader variant is parsed and
+semantically validated with Naga; no shader-source substring assertion is used.
+
+This is Prefix+RLE/LZ77 production evidence. The common differential matrix below covers ANS
+execution and termination without crossing production windows. A production ANS split fixture,
+generic-MA and VarDCT intra-stream resume, targeted noninitial-window truncation, and broader
+corruption fuzzing are still required before `ENT-D02` can be marked done.
+
 ## Common entropy differential matrix
 
 The `jxl_wgpu_decode` unit suite assembles the same `modular_entropy.wgsl` fragment used by the

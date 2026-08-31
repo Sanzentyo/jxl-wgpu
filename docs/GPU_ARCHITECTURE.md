@@ -56,7 +56,7 @@ bounded VarDCT profile limitations do not become a common entropy or frame abstr
 
 The entropy executor has a narrower shared boundary than either submission pipeline. Rust and WGSL
 both define a 12-byte, four-byte-aligned `EntropyStreamParams` prefix for token start/end bounds and
-the LZ77 ring mask. It is the first field of the 212-byte Modular parameter record and the 208-byte
+the LZ77 ring mask. It is the first field of the 236-byte Modular parameter record and the 208-byte
 VarDCT packet record. The shared entropy fragment consumes that prefix plus consumer-provided
 storage access and LZ scratch-base functions. Geometry, prediction/output, and VarDCT
 metadata/coefficient state retain separate suffixes and bindings. This preserves one checked
@@ -69,6 +69,20 @@ The HF pass-group consumer also applies the stream's quant-field and signed X/Y/
 GPU. Its context-map and threshold words follow the entropy tables in one storage bundle. Raw
 quantized LF planes and each pass group's LZ ring use non-overlapping slices of the reconstruction
 buffer, preserving the portable eight-storage-buffer stage limit without a readback.
+
+The channel-fixed Gradient Modular specialization additionally supports intra-group streaming.
+The planner resolves one upload cap from the caller policy, storage binding limit, and shared
+per-frame byte budget. A group that exceeds it is divided into ordered core ranges with 16-byte
+backward/forward overlap; a dispatch finishes the current output token before yielding, so no
+partial Prefix/ANS/hybrid/LZ token becomes host-visible state. The 236-byte record maps the one
+group-relative cursor into the current physical upload and identifies first/final segments. A
+16-byte-aligned 32-byte tail in each reconstruction lane retains the bit cursor, ANS state, LZ77
+copy and last-value state, consumer progress, and a sticky error while the descriptor-sized history
+ring remains resident in the same lane. Every segment reuses one stream buffer and lane through
+queue ordering. Only the final segment performs exact entropy termination and only the last frame
+batch maps the aggregate group-status buffer. Generic MA and VarDCT consumers still require one
+complete entropy range and return a typed error if a configured/budget-derived Modular window is
+too small for a generic group.
 
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local

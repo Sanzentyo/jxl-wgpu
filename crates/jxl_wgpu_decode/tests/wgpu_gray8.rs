@@ -208,6 +208,20 @@ fn patterned_pixels(width: u32, height: u32) -> Vec<u8> {
         .collect()
 }
 
+fn run_and_noise_pixels(width: u32, height: u32) -> Vec<u8> {
+    (0..u64::from(width) * u64::from(height))
+        .map(|index| {
+            let x = index % u64::from(width);
+            let y = index / u64::from(width);
+            if x % 64 < 40 {
+                (((y / 3) * 29) & 255) as u8
+            } else {
+                ((x * 131 + y * 197 + (x ^ (y * 17)) * 23) & 255) as u8
+            }
+        })
+        .collect()
+}
+
 fn encode_standard_gray8(
     backend: &WgpuBackend,
     width: u32,
@@ -776,7 +790,8 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert_eq!(stats.max_lz77_scratch_words, 0);
             assert_eq!(stats.max_logical_reconstruction_sample_words, 256 * 256);
             assert_eq!(stats.max_physical_reconstruction_sample_words, 256 * 2);
-            assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4);
+            assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4 + 32);
+            assert_eq!(stats.entropy_execution_state_bytes_per_lane, 32);
             assert_eq!(
                 stats.output_specialization,
                 jxl_wgpu_decode::ModularOutputSpecialization::DirectNormalizedGray8
@@ -826,6 +841,83 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             "{width}x{height} container={container}"
         );
     }
+}
+
+#[test]
+fn fixed_gradient_group_resumes_across_bounded_gpu_stream_windows() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping bounded intra-group stream test: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (193, 97);
+    let expected = run_and_noise_pixels(width, height);
+    let encoded = encode_standard_gray8(&backend, width, height, &expected, false);
+    let (oracle_extent, oracle) = rust_jxl_decode_gray8(&encoded)
+        .unwrap_or_else(|error| panic!("bounded-window Rust jxl oracle failed: {error}"));
+    assert_eq!(oracle_extent, (width as usize, height as usize));
+    assert_eq!(oracle, expected);
+
+    let engine = WgpuSubmissionEngine::new(backend.clone())
+        .with_stream_window_limit(NonZeroU64::new(256).unwrap());
+    assert_eq!(engine.stream_window_limit().unwrap().get(), 256);
+    let decoder = GpuDecoder::new(engine);
+    let request = || {
+        GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+            NumericSampleMapping::NormalizedGray8,
+        )
+        .unwrap()
+    };
+
+    let mut blocking = decoder.open(&encoded, request()).unwrap();
+    let stats = blocking.submission_session().memory_stats();
+    assert!(stats.stream_window_bytes <= 256);
+    assert!(stats.stream_batch_count > 1);
+    assert_eq!(stats.submissions_per_frame, stats.stream_batch_count);
+    assert_eq!(stats.parallel_group_lanes, 1);
+    assert_eq!(stats.max_lz77_window_words, 1);
+    let frame = blocking.next_frame().unwrap().unwrap();
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(blocking);
+
+    let mut asynchronous = decoder.open(&encoded, request()).unwrap();
+    let frame = pollster::block_on(asynchronous.next_frame_async())
+        .expect("runtime-neutral bounded-window decode succeeds")
+        .expect("one bounded-window frame is returned");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(asynchronous);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder.open(&encoded, request()).unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let commands = backend
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bounded-window abandonment completion fence"),
+        });
+    let fence = backend.queue().submit([commands.finish()]);
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .expect("abandoned bounded-window submissions complete");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend
+            .device()
+            .poll(wgpu::PollType::Poll)
+            .expect("drive abandoned bounded-window callback");
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
 #[test]
@@ -1064,10 +1156,14 @@ fn every_multigroup_gpu_status_is_validated_from_one_map() {
         .bytes;
     let start = usize::try_from(damaged.offset).unwrap();
     let end = usize::try_from(damaged.end().unwrap()).unwrap();
-    encoded[start] &= 0x0f;
-    encoded[start + 1..end].fill(0);
+    assert!(end - start > 1024, "second group must span several windows");
+    let damage_start = start + 512;
+    encoded[damage_start] &= 0x0f;
+    encoded[damage_start + 1..end].fill(0);
 
-    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let decoder = GpuDecoder::new(
+        WgpuSubmissionEngine::new(backend).with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+    );
     let request = GpuOutputRequest::numeric(
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
         NumericSampleMapping::NormalizedGray8,
@@ -1080,9 +1176,10 @@ fn every_multigroup_gpu_status_is_validated_from_one_map() {
         .next_frame()
         .expect_err("damaged second group must fail GPU status validation");
     assert!(
-        error
-            .to_string()
-            .contains("group 1 rejected entropy stream"),
+        matches!(
+            &error,
+            jxl_wgpu_decode::Error::ModularEntropyRejected { group_index: 1, .. }
+        ),
         "unexpected aggregate status error: {error}"
     );
 }

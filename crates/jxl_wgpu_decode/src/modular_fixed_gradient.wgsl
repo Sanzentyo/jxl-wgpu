@@ -36,60 +36,68 @@ fn decode_adaptive_channel() -> u32 {
     let maximum = i32(params.source_mask);
     let signed_transform_channel = params.source_channels >= 3u
         && (current_channel == 1u || current_channel == 2u);
-    var decoded = 0u;
-    for (var y = 0u; y < params.height && decode_error == 0u; y += 1u) {
+    let channel_start = current_channel * params.sample_count;
+    var decoded = consumer_decoded - channel_start;
+    let initial_decoded = decoded;
+    while decoded < params.sample_count && decode_error == 0u {
+        if window_should_pause() {
+            break;
+        }
+        let y = decoded / params.width;
+        let x = decoded - y * params.width;
         let row_base = y * params.width;
         var reconstruction_row_base = row_base;
         if params.fixed_output_mode == FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8 {
             reconstruction_row_base = (y & 1u) * params.width;
         }
+        let index = row_base + x;
+        let reconstruction_index = reconstruction_row_base + x;
         var west = 0i;
-        for (var x = 0u; x < params.width && decode_error == 0u; x += 1u) {
-            let index = row_base + x;
-            let reconstruction_index = reconstruction_row_base + x;
-            var north = west;
-            var north_west = west;
-            if y != 0u {
-                var north_index = index - params.width;
-                if params.fixed_output_mode == FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8 {
-                    north_index = ((y - 1u) & 1u) * params.width + x;
-                }
-                north = bitcast<i32>(reconstruction_load(channel_base + north_index));
-                north_west = north;
-                if x != 0u {
-                    north_west = bitcast<i32>(
-                        reconstruction_load(channel_base + north_index - 1u)
-                    );
-                }
+        if x != 0u {
+            west = bitcast<i32>(
+                reconstruction_load(channel_base + reconstruction_index - 1u)
+            );
+        }
+        var north = west;
+        var north_west = west;
+        if y != 0u {
+            var north_index = index - params.width;
+            if params.fixed_output_mode == FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8 {
+                north_index = ((y - 1u) & 1u) * params.width + x;
             }
-            if x == 0u {
+            north = bitcast<i32>(reconstruction_load(channel_base + north_index));
+            north_west = north;
+            if x != 0u {
+                north_west = bitcast<i32>(
+                    reconstruction_load(channel_base + north_index - 1u)
+                );
+            } else {
                 west = north;
             }
-            let packed = entropy_read_varint(cluster, params.width);
-            if decode_error != 0u {
-                break;
-            }
-            let residual = unpack_signed(packed);
-            let prediction = fixed_gradient_i32(north, west, north_west);
-            let sample = bitcast<i32>(bitcast<u32>(residual) + bitcast<u32>(prediction));
-            if (!signed_transform_channel && (sample < 0i || sample > maximum))
-                || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
-                decode_error = ERROR_RAW_TOKEN;
-                break;
-            }
-            reconstruction_store(channel_base + reconstruction_index, bitcast<u32>(sample));
-            if params.fixed_output_mode != 0u {
-                write_byte(
-                    params.plane0_offset
-                        + (params.origin_y + y) * params.plane0_stride
-                        + params.origin_x
-                        + x,
-                    bitcast<u32>(sample),
-                );
-            }
-            west = sample;
-            decoded += 1u;
         }
+        let packed = entropy_read_varint(cluster, params.width);
+        if decode_error != 0u {
+            break;
+        }
+        let residual = unpack_signed(packed);
+        let prediction = fixed_gradient_i32(north, west, north_west);
+        let sample = bitcast<i32>(bitcast<u32>(residual) + bitcast<u32>(prediction));
+        if (!signed_transform_channel && (sample < 0i || sample > maximum))
+            || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
+            decode_error = ERROR_RAW_TOKEN;
+            break;
+        }
+        reconstruction_store(channel_base + reconstruction_index, bitcast<u32>(sample));
+        if params.fixed_output_mode != 0u {
+            write_byte(
+                params.plane0_offset
+                    + (params.origin_y + y) * params.plane0_stride
+                    + params.origin_x
+                    + x,
+                bitcast<u32>(sample),
+            );
+        }
+        decoded += 1u;
     }
-    return decoded;
+    return decoded - initial_decoded;
 }
