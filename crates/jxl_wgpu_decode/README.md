@@ -267,7 +267,10 @@ The CPU/WGSL per-group parameter ABI is a checked 212-byte `repr(C)` POD. Its fi
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
 same typed prefix starts the 208-byte VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
-remain consumer-specific. The Modular suffix carries four plane offset/stride pairs, exact output
+remain consumer-specific. Consumers whose entropy owns the complete token range also call one
+shared terminator for the ANS final-state and at most seven zero-padding bits; VarDCT packet streams
+followed by fixed metadata finalize ANS first and validate the enclosing section after that tail.
+The Modular suffix carries four plane offset/stride pairs, exact output
 channel/order/depth/range/transfer codes, the resolved numeric mapping, global status index, MA
 stream index, the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, the
 output traversal mode, weighted-predictor header, and shader-visible logical size. Records are a

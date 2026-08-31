@@ -536,16 +536,7 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         decoded += decode_adaptive_channel();
         current_channel += 1u;
     }
-    entropy_finalize();
-
-    if decode_error == 0u && bit_cursor != params.entropy.token_end {
-        let padding_bits = params.entropy.token_end - bit_cursor;
-        if padding_bits > 7u || peek_bits(padding_bits) != 0u {
-            decode_error = ERROR_TRAILING_BITS;
-        } else {
-            bit_cursor = params.entropy.token_end;
-        }
-    }
+    entropy_finish_exact();
     if decode_error == 0u && params.fixed_output_mode == 0u {
         finalize_output();
     }

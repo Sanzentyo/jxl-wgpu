@@ -61,7 +61,10 @@ VarDCT packet record. The shared entropy fragment consumes that prefix plus cons
 storage access and LZ scratch-base functions. Geometry, prediction/output, and VarDCT
 metadata/coefficient state retain separate suffixes and bindings. This preserves one checked
 executor ABI while allowing the VarDCT pass-group consumer to decode nonzero coefficients without
-turning coefficient placement into a common stream type.
+turning coefficient placement into a common stream type. The fragment also owns exact-range
+termination: it validates the ANS signature, rejects more than seven trailing bits or any nonzero
+padding, and advances to the declared token end. Consumers with fixed fields after entropy retain
+the narrower ANS finalizer and validate the complete enclosing section after reading their tail.
 
 For the bounded stock VarDCT profile, restoration remains in that same submission. The inverse
 transform writes padded resident XYB planes; an optional fused Gaborish dispatch reads only the

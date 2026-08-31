@@ -3,7 +3,9 @@
 //! Required caller ABI: `modular_metadata`; `params.entropy`; private `bit_cursor` and
 //! `decode_error`; `read_bits`, `peek_bits`, `reconstruction_load`, `reconstruction_store`, and
 //! `entropy_window_base`; plus the shared `ERROR_*` constants. Call `entropy_begin`,
-//! `entropy_read_varint`, then `entropy_finalize` once per logical stream.
+//! `entropy_read_varint`, then `entropy_finish_exact` when the entropy stream owns the complete
+//! token range. Consumers followed by non-entropy fields call `entropy_finalize` instead and
+//! validate their enclosing section after reading those fields.
 
 const META_NODE_COUNT: u32 = 0u;
 const META_MAX_DEPTH: u32 = 1u;
@@ -48,6 +50,21 @@ fn entropy_finalize() {
         && entropy_ans_state != 0x00130000u {
         decode_error = ERROR_ANS_STATE;
     }
+}
+
+fn entropy_finish_exact() {
+    entropy_finalize();
+    if decode_error != 0u { return; }
+    if bit_cursor > params.entropy.token_end {
+        decode_error = ERROR_TRUNCATED_BITS;
+        return;
+    }
+    let remaining = params.entropy.token_end - bit_cursor;
+    if remaining > 7u || peek_bits(remaining) != 0u {
+        decode_error = ERROR_TRAILING_BITS;
+        return;
+    }
+    bit_cursor = params.entropy.token_end;
 }
 
 fn entropy_read_prefix_symbol(cluster: u32) -> u32 {

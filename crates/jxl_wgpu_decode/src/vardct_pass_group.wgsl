@@ -133,21 +133,6 @@ fn channel_index(order_channel: u32) -> u32 {
     return 2u;
 }
 
-fn finish_entropy_section() {
-    entropy_finalize();
-    if decode_error != 0u { return; }
-    if bit_cursor > params.entropy.token_end {
-        fail(ERROR_TRUNCATED_BITS);
-        return;
-    }
-    let remaining = params.entropy.token_end - bit_cursor;
-    if remaining > 7u || peek_bits(remaining) != 0u {
-        fail(ERROR_TRAILING_BITS);
-        return;
-    }
-    bit_cursor = params.entropy.token_end;
-}
-
 @compute @workgroup_size(1, 1, 1)
 fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
     let lane = workgroup.x;
@@ -261,7 +246,7 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
             }
         }
     }
-    finish_entropy_section();
+    entropy_finish_exact();
     statuses[status_base] = select(decode_error, STATUS_OK, decode_error == 0u);
     statuses[status_base + 1u] = bit_cursor;
     statuses[status_base + 2u] = params.entropy.token_end;

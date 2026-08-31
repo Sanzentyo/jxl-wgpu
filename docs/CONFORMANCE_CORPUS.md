@@ -99,6 +99,17 @@ cjxl /tmp/green_queen_crop.ppm green_queen_crop_vardct_epf3.jxl -d 2 -e 1 -m 0 \
   --dots=0 --patches=0 --noise=0 --quiet
 ```
 
+## Common entropy differential matrix
+
+The `jxl_wgpu_decode` unit suite assembles the same `modular_entropy.wgsl` fragment used by the
+stock Modular, VarDCT packet, and HF pass-group pipelines into a test-only actual-GPU probe. It
+compares decoded values with the Rust metadata entropy cursor for canonical Prefix codes and all
+four standard ANS histogram encodings (unary, binary, flat, and compressed), exercising both direct
+and alias-table buckets, hybrid integers, and LZ77 copies. Negative GPU cases require the exact
+truncated-input, invalid-final-ANS-state, nonzero-padding, and overlong-padding status codes. The
+probe shader is parsed and semantically validated by Naga even when an adapter is unavailable; no
+shader-source substring assertion is used.
+
 ## Deterministic source contract
 
 Every case describes:

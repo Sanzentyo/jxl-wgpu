@@ -1571,6 +1571,9 @@ impl<'a> MetadataEntropyCursor<'a> {
                 let histogram = histograms
                     .get(usize::from(cluster))
                     .ok_or_else(|| invalid_entropy_error("prefix cluster is missing"))?;
+                if let Some(symbol) = histogram.single_symbol {
+                    return Ok(symbol);
+                }
                 read_prefix_symbol(reader, &histogram.entries)
             }
             EntropyCoderIr::Ans {
@@ -2000,8 +2003,8 @@ fn invalid_tree_error(reason: &'static str) -> ModularTreeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsBucketIr, EntropyCoderIr, EntropyDecoderIr, HybridIntegerConfigIr, PrefixHistogramIr,
-        add_log2_ceil, unpack_signed,
+        AnsBucketIr, EntropyCoderIr, EntropyDecoderIr, HybridIntegerConfigIr,
+        MetadataEntropyCursor, PrefixHistogramIr, add_log2_ceil, unpack_signed,
     };
 
     #[test]
@@ -2152,4 +2155,27 @@ mod tests {
         assert_eq!(packed.words[6], 28);
         assert_eq!(packed.words[27], 4);
     }
+
+    #[test]
+    fn nonzero_single_prefix_symbol_consumes_no_bits() {
+        let descriptor = EntropyDecoderIr {
+            lz77: None,
+            context_to_cluster: vec![0],
+            configs: vec![HybridIntegerConfigIr {
+                split_exponent: 4,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            }],
+            coder: EntropyCoderIr::Prefix(vec![PrefixHistogramIr::single(5).unwrap()]),
+        };
+        let mut reader = jxl_gpu_bitstream::BitReader::new(&[]);
+        let mut cursor = MetadataEntropyCursor::new(&descriptor, 1);
+        cursor.begin(&mut reader).unwrap();
+        assert_eq!(cursor.read_varint(&mut reader, 0, 0).unwrap(), 5);
+        cursor.finalize().unwrap();
+        assert_eq!(reader.bit_offset(), 0);
+    }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_tests;
