@@ -1,5 +1,9 @@
 # Encode/decode conformance corpus
 
+The required feature matrix and the conditions for changing a capability from partial to complete
+are defined in [`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). This file records only the
+corpus that is actually checked in and executable.
+
 `tools/jxl_gpu_harness/conformance-corpus.toml` is the source of truth for multi-aspect-ratio and
 multi-resolution image coverage. Every case defines an explicit expectation supported by the schema:
 

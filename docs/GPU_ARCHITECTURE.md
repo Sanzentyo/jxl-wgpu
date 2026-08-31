@@ -1,5 +1,9 @@
 # GPU architecture
 
+The canonical current capability table, full JPEG XL backlog, dependencies, and acceptance gates
+are maintained in [`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). This document describes the
+backend architecture and invariants, not a broader support claim.
+
 ## Repository boundary
 
 This repository is a standalone Cargo workspace. Production codec crates do not vendor, patch, or

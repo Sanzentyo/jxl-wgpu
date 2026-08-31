@@ -5,6 +5,10 @@ encoder or a CPU fallback. `LosslessModularEncoder` reads packed Gray, RGB, or R
 integer pitch-linear storage directly on the GPU and emits a standards-compatible lossless
 Modular codestream or `jxlc` container.
 
+The complete encoder backlog, dependencies, and acceptance gates are tracked in
+[`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md). This README describes only the
+currently executable profiles.
+
 ## Lossless Modular profile
 
 - Extents are `1..2^30` on each axis, further bounded by the selected WebGPU device's storage

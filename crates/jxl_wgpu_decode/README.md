@@ -1,7 +1,8 @@
 # jxl_wgpu_decode
 
-GPU-required JPEG XL decode orchestration. Production execution uses the stock WGSL submission
-engine and has no dependency on the published `jxl` decoder.
+GPU-required JPEG XL decode orchestration. Production execution uses the stock WGSL engines and has
+no dependency on the published `jxl` decoder. The complete-format backlog and acceptance gates are
+tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 
 ## Executable profile
 
@@ -52,9 +53,11 @@ the complete logical reconstruction workspace and finalize through the generic o
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
 
-For the stock `WgpuSubmissionEngine`, VarDCT, multiple passes, palette/squeeze and non-YCoCg
-transforms, non-alpha extra channels, patches, splines, noise, and reference-frame animation
-remain typed unsupported profiles.
+For the lossless-Modular `WgpuSubmissionEngine`, VarDCT, multiple passes, palette/squeeze and
+non-YCoCg transforms, non-alpha extra channels, patches, splines, noise, and reference-frame
+animation remain typed unsupported profiles. `GpuDecoder::vardct_wgpu` is the separate bounded
+VarDCT production path described next; the public frontend does not yet select both modes through a
+single coding-mode-neutral engine.
 
 ### Bounded standard VarDCT engine
 

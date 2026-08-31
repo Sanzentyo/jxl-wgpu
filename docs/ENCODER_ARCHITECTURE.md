@@ -4,6 +4,10 @@ Status: executable lossless Modular profile, experimental VarDCT profile, plus p
 orchestration API. Concrete backends advertise only implemented profiles and stages; unsupported
 formats or features are rejected through typed capability errors.
 
+The cross-codec capability source of truth and complete encoder backlog are in
+[`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). This document records the encoder design and
+implemented ABI details; it must not independently broaden the advertised profile.
+
 ## Non-negotiable boundary
 
 The production encoder may use the host for bitstream/container orchestration, validation, job
@@ -323,21 +327,14 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
   prefix/histogram assembly in an LF-only fixed distance-25 profile that quantizes AC coefficients
   to zero.
 
-### Remaining slices
+### Remaining work
 
-1. **Parallel token kernel (Slice 1)**: Replace the `@workgroup_size(1)` kernel with row/tile
-   predictor scans, parallel token compaction, and hierarchical histogram reduction while
-   preserving the artifact contract.
-2. **Batched multi-image scheduling (Slice 2)**: Add batched small-image scheduling so dispatch
-   and readback overhead is amortized across independent images; measure isolated, sequential,
-   concurrent, and animation workloads separately.
-3. **YUV/NV12 ingestion (Slice 4 half)**: Add native pitch-linear YUV/NV12-family ingestion through
-   GPU color transforms. CUDA-only and block-linear layouts remain outside portable `wgpu` scope.
-4. **General VarDCT quality and rate control (Slice 5 remainder)**: Extend VarDCT beyond the fixed
-   LF-only profile to include full AC quantization, adaptive rate control, progressive coefficient
-   splitting, and multi-LF-group frames (>2048 per axis).
-5. **Advanced performance profiling (Slice 7)**: Extend the harness with GPU timestamps, queue
-   latency tracking, peak driver allocation metrics, and lossy quality metrics.
+The authoritative encoder items, dependencies, priorities, and acceptance gates are the `MOD-E`,
+`VDCT-E`, `ENT-E`, `ENC`, and encoder-facing `IO` rows in
+[`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). The nearest work remains parallel Modular token
+production, native YUV/NV12-family ingestion, real nonzero VarDCT AC coding, and the rate/quality
+control built on top of it. Batched codec submission and advanced performance instrumentation stay
+separate from format-completeness claims.
 
-Until a slice is implemented and validated, capability negotiation must reject it. Benchmarks,
+Until an item is implemented and validated, capability negotiation must reject it. Benchmarks,
 wrappers, and CPU oracles do not expand the advertised production capability.

@@ -48,8 +48,8 @@ The checked-in paths are interoperable but are not yet a complete JPEG XL implem
 
 | Direction | Stock `wgpu` implementation | Current limits |
 |---|---|---|
-| Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills, crops/references/blending animation, plus an experimental 18-strategy VarDCT RGB8 still profile | Modular uses one pass and the implemented predictor/entropy set; VarDCT currently uses the documented fixed quality profile |
-| Decode | GPU prefix/hybrid entropy, LZ77, MA prediction, residual reconstruction, reversible color transform, and requested output conversion from ordinary raw/`jxlc`/`jxlp` streams | the executable path is one-pass lossless Modular still; VarDCT parsing/LF kernels are being integrated but are not yet an authoritative output path |
+| Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills, crops/references/blending animation, plus an experimental all-27-strategy VarDCT RGB8 still profile | Modular uses one pass and the implemented predictor/entropy set; VarDCT is a fixed distance-25 LF-only profile that quantizes every AC coefficient to zero |
+| Decode | One-pass lossless Modular stills through GPU Prefix/ANS entropy, LZ77, MA prediction, residual reconstruction, reversible color transform, and requested output conversion; a separate authoritative bounded VarDCT engine decodes nine regular zero-AC strategies and tiled DCT8 through 2048×2048 | Modular lacks Palette/Squeeze/multiple passes; VarDCT is limited to one LF group, empty pass groups, fixed quantization metadata, RGB8 output, and no restoration or composition features |
 | Output | GPU-resident native integer Gray/RGB/RGBA plus all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts | numeric normalization is explicit; F64 requires a native-or-exact-widening precision policy |
 | Presentation | Same-queue buffer-to-linear-BT.709 RGBA display pipeline | explicit unvalidated handoff can enqueue display/readback/custom GPU work before the 16-byte validation map completes; derived results are discarded if validation later fails |
 | CPU transport | Explicit mapped readback after GPU completion | transport only; it never selects a host codec |
@@ -66,6 +66,10 @@ Frame leases, timing, timecodes, loop metadata, and reference slots remain expli
 implements standard Modular animation. Decoder animation, progressive Modular, non-alpha extra
 channels, complete VarDCT reconstruction, arbitrary ICC transforms, patches, splines, and noise
 remain typed rejections until their GPU paths and conformance coverage land.
+
+[`docs/FULL_JPEG_XL_ROADMAP.md`](docs/FULL_JPEG_XL_ROADMAP.md) is the canonical capability table,
+full-format implementation backlog, dependency order, and acceptance contract. Capability-changing
+commits must update it together with this summary and the affected crate documentation.
 
 ## Formats and display
 
