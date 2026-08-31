@@ -4,7 +4,7 @@ use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu_decode::vardct::packet::{
-    FixedVarDctPacketPlan, GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers,
+    BoundedVarDctPacketPlan, GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers,
     VarDctPacketPipeline,
 };
 use jxl_wgpu_encode::{
@@ -78,7 +78,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
             ..InventoryLimits::default()
         })
         .unwrap();
-    let plan = FixedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
     let control = plan.packet_control().unwrap();
 
     let mut stream_bytes = codestream.clone();

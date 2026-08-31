@@ -25,13 +25,13 @@ const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
 /// A standard feature excluded from the deliberately bounded regular-VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnsupportedVarDctPacketFeature {
-    #[error("the bounded regular-VarDCT decoder requires a one-entry TOC")]
-    MultiSectionToc,
-    #[error("the bounded regular-VarDCT decoder requires exactly one LF group and one pass group")]
-    MultipleGroups,
+    #[error("the bounded tiled-VarDCT decoder requires exactly one LF group")]
+    MultipleLfGroups,
+    #[error("pass group {group} contains {bits} AC payload bits; the bounded profile is zero-AC")]
+    NonEmptyPassGroup { group: u32, bits: u64 },
     #[error("the bounded regular-VarDCT decoder currently accepts 8-bit samples")]
     BitDepth,
-    #[error("the image extent is not one implemented regular VarDCT transform")]
+    #[error("the one-entry packet extent is not one implemented regular VarDCT transform")]
     TransformExtent,
     #[error("the standard packet requests skip-adaptive-LF smoothing")]
     SkipAdaptiveLfSmoothing,
@@ -45,7 +45,7 @@ pub enum UnsupportedVarDctPacketFeature {
 
 /// Host-side failure before image entropy is submitted to the GPU.
 #[derive(Debug, Error)]
-pub enum FixedVarDctPacketError {
+pub enum BoundedVarDctPacketError {
     #[error(transparent)]
     Frontend(#[from] VarDctFrontendError),
     #[error(transparent)]
@@ -69,7 +69,7 @@ pub enum GpuVarDctPacketError {
     Entropy { code: u32, cursor: u32, end: u32 },
     #[error("GPU VarDCT packet has invalid LF local header")]
     LfHeader,
-    #[error("GPU VarDCT packet declares more than one first HF block")]
+    #[error("GPU VarDCT packet does not declare the negotiated bounded first-block count")]
     FirstBlock,
     #[error("GPU VarDCT packet has invalid HF metadata local header")]
     HfHeader,
@@ -89,10 +89,20 @@ pub enum GpuVarDctPacketError {
 
 /// Parsed host metadata and untouched image entropy for one strict packet.
 #[derive(Clone, Debug)]
-pub struct FixedVarDctPacketPlan {
+pub struct BoundedVarDctPacketPlan {
     pub profile: StandardVarDctProfile,
+    /// Regular transform shared by every first block in this bounded packet.
     pub transform: TransformKind,
-    pub packet: BitRange,
+    /// Number of non-overlapping first blocks reconstructed from HF metadata.
+    pub task_count: u32,
+    coefficient_words: u32,
+    /// LF-global packet containing the scalar quantizer fields and global MA descriptor.
+    pub lf_global: BitRange,
+    /// LF-group packet containing quantized LF and HF-metadata Modular streams.
+    pub lf_group: BitRange,
+    /// Separate HF-global packet, or `None` when all three packets share a single TOC entry.
+    pub hf_global: Option<BitRange>,
+    /// Descriptor end used as the LF-group start by the one-entry TOC form.
     pub entropy_bit_offset: u32,
     pub lf_stream_index: u32,
     pub hf_stream_index: u32,
@@ -101,15 +111,15 @@ pub struct FixedVarDctPacketPlan {
     pub lz77_window_words: u32,
 }
 
-impl FixedVarDctPacketPlan {
+impl BoundedVarDctPacketPlan {
     /// Parses bounded scalar metadata only. Image symbols remain encoded for the GPU.
     pub fn parse(
         codestream: &[u8],
         inventory: &CodestreamInventory,
-    ) -> Result<Self, FixedVarDctPacketError> {
+    ) -> Result<Self, BoundedVarDctPacketError> {
         let profile = StandardVarDctProfile::negotiate(inventory)?;
-        if profile.group_count != 1 || profile.low_frequency_group_count != 1 {
-            return Err(UnsupportedVarDctPacketFeature::MultipleGroups.into());
+        if profile.low_frequency_group_count != 1 {
+            return Err(UnsupportedVarDctPacketFeature::MultipleLfGroups.into());
         }
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
@@ -117,22 +127,76 @@ impl FixedVarDctPacketPlan {
         if !profile.adaptive_lf_smoothing {
             return Err(UnsupportedVarDctPacketFeature::SkipAdaptiveLfSmoothing.into());
         }
-        let transform = transform_for_extent(profile.width, profile.height)
-            .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?;
-        let packet = match &profile.sections {
-            VarDctSectionLayout::Single { packet } => *packet,
-            VarDctSectionLayout::Sections { .. } => {
-                return Err(UnsupportedVarDctPacketFeature::MultiSectionToc.into());
+        let (transform, task_count, lf_global_packet, lf_group, hf_global) = match &profile.sections
+        {
+            VarDctSectionLayout::Single { packet } => (
+                transform_for_extent(profile.width, profile.height)
+                    .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                1,
+                *packet,
+                *packet,
+                None,
+            ),
+            VarDctSectionLayout::Sections {
+                lf_global,
+                lf_groups,
+                hf_global,
+                pass_groups,
+            } => {
+                let lf_group = *lf_groups
+                    .first()
+                    .ok_or(UnsupportedVarDctPacketFeature::MultipleLfGroups)?;
+                for (group, packet) in pass_groups.iter().copied().enumerate() {
+                    if packet.length != 0 {
+                        return Err(UnsupportedVarDctPacketFeature::NonEmptyPassGroup {
+                            group: u32::try_from(group).map_err(|_| {
+                                BoundedVarDctPacketError::ArithmeticOverflow {
+                                    field: "pass-group index",
+                                }
+                            })?,
+                            bits: packet.length,
+                        }
+                        .into());
+                    }
+                }
+                let blocks = profile
+                    .width
+                    .div_ceil(8)
+                    .checked_mul(profile.height.div_ceil(8))
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "tiled DCT8 task count",
+                    })?;
+                (
+                    TransformKind::Dct8,
+                    blocks,
+                    *lf_global,
+                    lf_group,
+                    Some(*hf_global),
+                )
             }
         };
-        let lf_global = LfGlobalPrefix::parse(codestream, packet)?;
+        let lf_global = LfGlobalPrefix::parse(codestream, lf_global_packet)?;
         if lf_global.global_scale != GLOBAL_SCALE || lf_global.quant_lf != QUANT_LF {
             return Err(UnsupportedVarDctPacketFeature::Quantization.into());
         }
         let mut reader = BitReader::new(codestream);
         reader.skip_bits(lf_global.ma_tree_bit_offset)?;
         let ma_config = parse_ma_config(&mut reader, MaTreeLimits::default())
-            .map_err(|error| FixedVarDctPacketError::ModularTree(error.to_string()))?;
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let descriptor_end = reader.bit_offset();
+        let lf_global_end =
+            lf_global_packet
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-global end",
+                })?;
+        if descriptor_end > lf_global_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: descriptor_end,
+                packet_end: lf_global_end,
+            }
+            .into());
+        }
         if ma_config.needs_self_correcting() {
             return Err(UnsupportedVarDctPacketFeature::SelfCorrectingPredictor.into());
         }
@@ -145,12 +209,12 @@ impl FixedVarDctPacketPlan {
         }
         let PackedModularMetadata { words } = ma_config
             .pack_gpu_metadata()
-            .map_err(|error| FixedVarDctPacketError::ModularTree(error.to_string()))?;
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
         if words.len() <= 9 {
-            return Err(FixedVarDctPacketError::PackedMetadata);
+            return Err(BoundedVarDctPacketError::PackedMetadata);
         }
-        let entropy_bit_offset = u32::try_from(reader.bit_offset()).map_err(|_| {
-            FixedVarDctPacketError::ArithmeticOverflow {
+        let entropy_bit_offset = u32::try_from(descriptor_end).map_err(|_| {
+            BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "entropy bit offset",
             }
         })?;
@@ -159,25 +223,50 @@ impl FixedVarDctPacketPlan {
         let block_count =
             blocks_x
                 .checked_mul(blocks_y)
-                .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "block count",
                 })?;
+        let coefficient_words = block_count.checked_mul(8 * 8 * 3).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "padded coefficient words",
+            },
+        )?;
+        let correlation_samples = profile
+            .width
+            .div_ceil(64)
+            .checked_mul(profile.height.div_ceil(64))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "correlation sample count",
+            })?;
         let decoded_symbol_limit = block_count
-            .checked_mul(3)
-            .and_then(|lf| lf.checked_add(block_count + 4))
-            .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
+            .checked_mul(4)
+            .and_then(|samples| {
+                task_count
+                    .checked_mul(2)
+                    .and_then(|tasks| samples.checked_add(tasks))
+            })
+            .and_then(|samples| {
+                correlation_samples
+                    .checked_mul(2)
+                    .and_then(|correlations| samples.checked_add(correlations))
+            })
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "decoded symbol limit",
             })?;
         let lz77_window_words = ma_config
             .entropy
             .lz77_window_words(blocks_x.max(1), decoded_symbol_limit)
-            .map_err(|error| FixedVarDctPacketError::ModularTree(error.to_string()))?;
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
         Ok(Self {
             lf_stream_index: profile.lf_quant_stream_index(0)?,
             hf_stream_index: profile.hf_metadata_stream_index(0)?,
             profile,
             transform,
-            packet,
+            task_count,
+            coefficient_words,
+            lf_global: lf_global_packet,
+            lf_group,
+            hf_global,
             entropy_bit_offset,
             modular_metadata: words,
             lz77_window_words,
@@ -186,7 +275,7 @@ impl FixedVarDctPacketPlan {
 
     #[must_use]
     pub fn coefficient_words(&self) -> u32 {
-        self.profile.width * self.profile.height * 3
+        self.coefficient_words
     }
 
     #[must_use]
@@ -198,75 +287,144 @@ impl FixedVarDctPacketPlan {
     }
 
     /// U32 scratch words retaining LF samples plus the conservative LZ history ring.
-    pub fn reconstructed_words(&self) -> Result<u32, FixedVarDctPacketError> {
+    pub fn reconstructed_words(&self) -> Result<u32, BoundedVarDctPacketError> {
         let [blocks_x, blocks_y] = self.block_extent();
         let blocks =
             blocks_x
                 .checked_mul(blocks_y)
-                .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "block count",
                 })?;
+        let correlations = self.correlation_samples()?;
+        let hf_samples = self
+            .task_count
+            .checked_mul(2)
+            .and_then(|tasks| blocks.checked_add(tasks))
+            .and_then(|samples| {
+                correlations
+                    .checked_mul(2)
+                    .and_then(|cfl| samples.checked_add(cfl))
+            });
         let samples = blocks
             .checked_mul(3)
-            .zip(blocks.checked_add(4))
+            .zip(hf_samples)
             .map(|(lf, hf)| lf.max(hf))
-            .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction samples",
             })?;
         samples.checked_add(self.lz77_window_words).ok_or(
-            FixedVarDctPacketError::ArithmeticOverflow {
+            BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction scratch",
             },
         )
     }
 
-    pub fn packet_control(&self) -> Result<VarDctPacketControl, FixedVarDctPacketError> {
-        let packet_end = self
-            .packet
-            .end()
-            .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
-                field: "packet end",
-            })?;
-        let packet_end =
-            u32::try_from(packet_end).map_err(|_| FixedVarDctPacketError::ArithmeticOverflow {
-                field: "packet end",
-            })?;
+    pub fn packet_control(&self) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
+        let range = |value: u64, field: &'static str| {
+            u32::try_from(value).map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow { field })
+        };
+        let lf_group_end =
+            self.lf_group
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-group end",
+                })?;
+        let (lf_start, lf_end, hf_start, hf_end, separate_sections) = if let Some(hf_global) =
+            self.hf_global
+        {
+            let hf_end = hf_global
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF-global end",
+                })?;
+            (
+                range(self.lf_group.offset, "LF-group start")?,
+                range(lf_group_end, "LF-group end")?,
+                range(hf_global.offset, "HF-global start")?,
+                range(hf_end, "HF-global end")?,
+                1,
+            )
+        } else {
+            (
+                self.entropy_bit_offset,
+                range(lf_group_end, "combined packet end")?,
+                0,
+                range(lf_group_end, "combined packet end")?,
+                0,
+            )
+        };
         let [blocks_x, blocks_y] = self.block_extent();
         let block_count =
             blocks_x
                 .checked_mul(blocks_y)
-                .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "block count",
                 })?;
+        let correlation_samples = self.correlation_samples()?;
+        let strategy_offset = correlation_samples.checked_mul(2).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "strategy offset",
+            },
+        )?;
+        let hf_mul_offset = strategy_offset.checked_add(self.task_count).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF multiplier offset",
+            },
+        )?;
+        let sharpness_offset = hf_mul_offset.checked_add(self.task_count).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "sharpness offset",
+            },
+        )?;
+        let raw_capacity = sharpness_offset.checked_add(block_count).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "raw metadata capacity",
+            },
+        )?;
         Ok(VarDctPacketControl {
-            packet_bits: [
-                self.entropy_bit_offset,
-                packet_end,
-                self.lf_stream_index,
-                self.hf_stream_index,
-            ],
+            section_bits: [lf_start, lf_end, hf_start, hf_end],
             geometry: [self.profile.width, self.profile.height, blocks_x, blocks_y],
-            offsets: [0, 1, 2, 4],
+            offsets: [0, correlation_samples, strategy_offset, hf_mul_offset],
             capacities: [
                 self.coefficient_words(),
+                raw_capacity,
                 block_count
-                    .checked_add(4)
-                    .ok_or(FixedVarDctPacketError::ArithmeticOverflow {
-                        field: "raw metadata capacity",
-                    })?,
-                block_count.next_power_of_two().trailing_zeros(),
-                0,
+                    .checked_next_power_of_two()
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "first-block field width",
+                    })?
+                    .trailing_zeros(),
+                self.task_count,
             ],
             expected: [
                 transform_id(self.transform),
                 RAW_HF_MULTIPLIER,
                 ZERO_AC_HF_GLOBAL,
-                0,
+                sharpness_offset,
             ],
             quantization: [GLOBAL_SCALE, QUANT_LF, 0, 0],
-            _reserved0: [0; 4],
+            streams: [
+                self.lf_stream_index,
+                self.hf_stream_index,
+                separate_sections,
+                u32::try_from(self.profile.group_count).map_err(|_| {
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "pass-group count",
+                    }
+                })?,
+            ],
             _reserved1: [0; 4],
         })
+    }
+
+    fn correlation_samples(&self) -> Result<u32, BoundedVarDctPacketError> {
+        self.profile
+            .width
+            .div_ceil(64)
+            .checked_mul(self.profile.height.div_ceil(64))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "correlation sample count",
+            })
     }
 }
 
@@ -274,13 +432,13 @@ impl FixedVarDctPacketPlan {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct VarDctPacketControl {
-    pub packet_bits: [u32; 4],
+    pub section_bits: [u32; 4],
     pub geometry: [u32; 4],
     pub offsets: [u32; 4],
     pub capacities: [u32; 4],
     pub expected: [u32; 4],
     pub quantization: [u32; 4],
-    pub _reserved0: [u32; 4],
+    pub streams: [u32; 4],
     pub _reserved1: [u32; 4],
 }
 
@@ -518,10 +676,8 @@ mod tests {
     }
 
     #[test]
-    fn regular_extent_mapping_is_unambiguous() {
-        assert_eq!(transform_for_extent(8, 8), Some(TransformKind::Dct8));
-        assert_eq!(transform_for_extent(8, 16), Some(TransformKind::Dct16x8));
-        assert_eq!(transform_for_extent(16, 8), Some(TransformKind::Dct8x16));
-        assert_eq!(transform_for_extent(64, 64), None);
+    fn tiled_profile_uses_the_standard_dct8_strategy_id() {
+        assert_eq!(transform_id(TransformKind::Dct8), 0);
+        assert_eq!(transform_for_extent(16, 32), Some(TransformKind::Dct32x16));
     }
 }

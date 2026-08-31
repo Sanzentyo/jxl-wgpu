@@ -46,7 +46,7 @@ use crate::vardct_output::{
     VarDctOutputPacker, VarDctOutputPlan, VarDctOutputPlane, VarDctOutputScratch,
 };
 use crate::vardct_packet::{
-    FixedVarDctPacketError, FixedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
+    BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
     VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline,
 };
 use crate::vardct_resource::{
@@ -84,7 +84,7 @@ pub enum VarDctDecodeError {
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
     #[error(transparent)]
-    Packet(#[from] FixedVarDctPacketError),
+    Packet(#[from] BoundedVarDctPacketError),
     #[error(transparent)]
     PacketGpu(#[from] GpuVarDctPacketError),
     #[error(transparent)]
@@ -167,7 +167,7 @@ pub struct VarDctDecodeMemoryStats {
 impl VarDctDecodeMemoryStats {
     fn plan(
         codestream_len: usize,
-        packet: &FixedVarDctPacketPlan,
+        packet: &BoundedVarDctPacketPlan,
         control: VarDctPacketControl,
         resource: VarDctResourceLayout,
         artifact: VarDctArtifactLayout,
@@ -215,8 +215,14 @@ impl VarDctDecodeMemoryStats {
         let artifact_bytes = artifact.artifact_bytes;
         let occupancy_bytes = artifact.occupancy_bytes;
         let artifact_uniform_bytes = std::mem::size_of::<HfMetadataLoweringParams>() as u64;
-        let pixels = u64::from(packet.profile.width)
-            .checked_mul(u64::from(packet.profile.height))
+        let [blocks_x, blocks_y] = packet.block_extent();
+        let pixels = u64::from(blocks_x)
+            .checked_mul(8)
+            .and_then(|width| {
+                u64::from(blocks_y)
+                    .checked_mul(8)
+                    .and_then(|height| width.checked_mul(height))
+            })
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "XYB pixel count",
             })?;
@@ -362,7 +368,7 @@ impl std::fmt::Debug for VarDctSubmissionEngine {
 struct VarDctSource {
     codestream_storage: Arc<[u8]>,
     codestream_range: Range<usize>,
-    packet: FixedVarDctPacketPlan,
+    packet: BoundedVarDctPacketPlan,
     control: VarDctPacketControl,
     resource_layout: VarDctResourceLayout,
     resource_params: VarDctResourceParams,
@@ -464,7 +470,7 @@ fn prepare_source(
     if frame.x_qm_scale != 3 || frame.b_qm_scale != 2 {
         return Err(VarDctDecodeError::UnsupportedQuantMatrixScale);
     }
-    let packet = FixedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
+    let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
     let control = packet.packet_control()?;
     let [blocks_x, blocks_y] = packet.block_extent();
     let transform_extent = packet.transform.pixel_extent();
@@ -483,17 +489,24 @@ fn prepare_source(
             field: "regular transform index",
         })?;
     let matrix_offsets = [resource_layout.matrix_offset; VAR_DCT_STRATEGY_COUNT];
+    let correlation_width = packet.profile.width.div_ceil(64);
+    let correlation_height = packet.profile.height.div_ceil(64);
+    let pass_group_dim_blocks = packet.profile.group_dimension.checked_div(8).ok_or(
+        VarDctDecodeError::ArithmeticOverflow {
+            field: "pass-group block dimension",
+        },
+    )?;
     let artifact_config = HfMetadataArtifactConfig {
         blocks_width: blocks_x,
         blocks_height: blocks_y,
-        block_info_entries: 1,
+        block_info_entries: packet.task_count,
         strategy_offset_words: control.offsets[2],
         hf_mul_offset_words: control.offsets[3],
         raw_metadata_words: u64::from(control.capacities[1]),
-        pass_group_dim_blocks: 32,
+        pass_group_dim_blocks,
         lf_stride: blocks_x,
-        correlation_width: 1,
-        correlation_height: 1,
+        correlation_width,
+        correlation_height,
         destination_origin: [0, 0],
         afv_basis_offset: resource_layout.matrix_offset,
         matrix_offsets,
@@ -533,12 +546,12 @@ fn prepare_source(
         opsin.quant_bias[2].to_f32(),
         opsin.quant_bias_numerator.to_f32(),
     ];
-    let scratch_scalars =
-        transform_area
-            .checked_mul(3)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "resident transform scratch scalars",
-            })?;
+    let scratch_scalars = transform_area
+        .checked_mul(packet.task_count)
+        .and_then(|area| area.checked_mul(3))
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "resident transform scratch scalars",
+        })?;
     let resident_memory = ResidentVarDctMemoryPlan::new(scratch_scalars)?;
     let memory = VarDctDecodeMemoryStats::plan(
         codestream.bytes().len(),
@@ -750,6 +763,7 @@ pub struct VarDctPendingFrame {
     expected_hf_samples: u32,
     expected_coefficients: u32,
     expected_blocks: u32,
+    expected_tasks: u32,
 }
 
 impl std::fmt::Debug for VarDctPendingFrame {
@@ -823,7 +837,7 @@ impl VarDctPendingFrame {
         }
         artifact.validate().map_err(VarDctDecodeError::from)?;
         for (field, expected, actual) in [
-            ("task_count", 1, artifact.task_count),
+            ("task_count", self.expected_tasks, artifact.task_count),
             (
                 "coefficient_words",
                 self.expected_coefficients,
@@ -836,7 +850,7 @@ impl VarDctPendingFrame {
             ),
             (
                 "consumed_block_info_entries",
-                1,
+                self.expected_tasks,
                 artifact.consumed_block_info_entries,
             ),
             ("backend_requirements", 0, artifact.backend_requirements),
@@ -1131,9 +1145,11 @@ fn submit_vardct(
             .ok_or(ResidentVarDctError::EmptyBinding { role: "task" })?,
     };
     let extent = source.packet.transform.pixel_extent();
+    let blocks = source.resource_layout.block_count;
     let scratch_scalars = extent
         .width
         .checked_mul(extent.height)
+        .and_then(|area| area.checked_mul(source.packet.task_count))
         .and_then(|area| area.checked_mul(3))
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "resident scratch scalars",
@@ -1158,12 +1174,24 @@ fn submit_vardct(
                 field: "vertical indirect offset",
             })?,
     ];
+    let padded_width =
+        source.control.geometry[2]
+            .checked_mul(8)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "padded output width",
+            })?;
+    let padded_height =
+        source.control.geometry[3]
+            .checked_mul(8)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "padded output height",
+            })?;
     let resident_outputs = xyb_planes.each_ref().map(|plane| {
         resident_binding(plane).map(|storage| ResidentVarDctOutputPlane {
             storage,
-            width: source.packet.profile.width,
-            height: source.packet.profile.height,
-            stride: source.packet.profile.width,
+            width: padded_width,
+            height: padded_height,
+            stride: padded_width,
         })
     });
     let [output_x, output_y, output_b] = resident_outputs;
@@ -1180,13 +1208,13 @@ fn submit_vardct(
             config: ResidentVarDctRenderConfig {
                 transform: source.packet.transform,
                 task_base: 0,
-                task_capacity: 1,
+                task_capacity: source.packet.task_count,
                 scratch_scalars,
                 quant_offset: source.resource_layout.quant_offset,
                 correlation_offset: source.resource_layout.correlation_offset,
                 lf_offset: source.resource_layout.lf_offset,
-                correlation_width: 1,
-                correlation_height: 1,
+                correlation_width: source.packet.profile.width.div_ceil(64),
+                correlation_height: source.packet.profile.height.div_ceil(64),
                 quant_biases: source.quant_biases,
             },
         },
@@ -1198,15 +1226,15 @@ fn submit_vardct(
             planes: [
                 VarDctOutputPlane {
                     storage: resident_binding(&xyb_planes[0])?,
-                    stride: source.packet.profile.width,
+                    stride: padded_width,
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&xyb_planes[1])?,
-                    stride: source.packet.profile.width,
+                    stride: padded_width,
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&xyb_planes[2])?,
-                    stride: source.packet.profile.width,
+                    stride: padded_width,
                 },
             ],
             output: resident_binding(&output)?,
@@ -1278,7 +1306,28 @@ fn submit_vardct(
     }) {
         completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
     }
-    let blocks = source.resource_layout.block_count;
+    let correlations = source
+        .packet
+        .profile
+        .width
+        .div_ceil(64)
+        .checked_mul(source.packet.profile.height.div_ceil(64))
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "correlation samples",
+        })?;
+    let expected_hf_samples = source
+        .packet
+        .task_count
+        .checked_mul(2)
+        .and_then(|tasks| blocks.checked_add(tasks))
+        .and_then(|samples| {
+            correlations
+                .checked_mul(2)
+                .and_then(|cfl| samples.checked_add(cfl))
+        })
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "HF metadata sample count",
+        })?;
     Ok(VarDctPendingFrame {
         device: device.clone(),
         lifetime: Some(lifetime),
@@ -1288,9 +1337,10 @@ fn submit_vardct(
         transform: source.packet.transform,
         frame_name: source.frame_name.clone(),
         expected_lf_samples: blocks * 3,
-        expected_hf_samples: blocks + 4,
+        expected_hf_samples,
         expected_coefficients: source.packet.coefficient_words(),
         expected_blocks: blocks,
+        expected_tasks: source.packet.task_count,
     })
 }
 

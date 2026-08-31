@@ -58,10 +58,14 @@ remain typed unsupported profiles.
 
 ### Bounded standard VarDCT engine
 
-`GpuDecoder::vardct_wgpu` selects a separate production engine for one deliberately narrow,
-standard VarDCT profile. It accepts exactly one final 8-bit XYB still frame, one LF group, one pass
-group, and a one-entry TOC. The complete image must be one regular 8x8, 16x16, 32x32, 16x8,
-8x16, 32x8, 8x32, 32x16, or 16x32 transform. The current packet contract additionally requires
+`GpuDecoder::vardct_wgpu` selects a separate production engine for two deliberately narrow,
+standard zero-AC VarDCT packet topologies. A one-entry TOC retains the original single regular
+8x8, 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC may instead
+cover one LF group with one independent DCT8 first block per padded 8x8 image block and at least two
+256-pixel pass groups; every pass-group packet must be empty. The explicit section topology removes
+the ambiguity with a one-entry single-transform packet. This tiled form supports odd and asymmetric
+pixel extents through 2048x2048 when at least one axis exceeds 256, while keeping edge padding internal to GPU storage. Both
+forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract additionally requires
 adaptive LF smoothing, `global_scale=8813`, `quant_lf=10`, frame quant-matrix scales X=3/B=2,
 default dequantization metadata, disabled Gaborish/EPF, zero chroma correlation and sharpness, and
 the standard zero-AC HF-global bundle. The image header must declare the standard sRGB/D65
@@ -74,7 +78,7 @@ payload can be reassembled; this is an engine limit, not a late profile check af
 
 The host inventories bounded scalar headers and packs the MA-tree descriptor, but does not decode
 an image entropy symbol. One GPU submission decodes and validates LF/HF metadata, dequantizes and
-smooths LF, lowers one typed HF artifact and coefficient sink, runs the existing resident regular
+smooths LF, lowers every non-overlapping first block into typed HF tasks and a coefficient sink, runs the existing resident regular
 VarDCT renderer, applies inverse opsin plus sRGB transfer, and writes tightly packed RGB8. Packet
 and artifact status share one 128-byte staging map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
@@ -93,7 +97,8 @@ carries authoritative metadata and changed regions. Native blocking and runtime-
 poll/future completion use the common decoder session API, and the engine compiles for browser
 WebGPU without a Tokio or async-std dependency.
 
-The actual-adapter matrix covers all nine accepted regular transform extents. It GPU-encodes each
+The actual-adapter matrix covers all nine accepted single regular transform extents plus tiled,
+odd/asymmetric multi-task and multi-pass-group frames. It GPU-encodes each
 standard packet, executes the complete resident decode, reads the result back explicitly, and,
 when `djxl` is installed, compares it with that independent decoder (at most one RGB8 code of
 rounding difference for the covered solid-image cases). The Dct8 case also exercises the
@@ -103,8 +108,8 @@ then fails packet-status validation before authoritative metadata is returned. T
 verifies that readback releases its shared reservation while the last decode-output buffer clone
 continues to own the exact output bytes.
 
-This is not full VarDCT coverage. Nonzero AC/HF coefficient entropy, multiple transforms or
-groups, special transform strategies, custom quantization matrices and HF orders/presets,
+This is not full VarDCT coverage. Nonzero AC/HF coefficient entropy, multiple LF groups, mixed
+transform strategies, nonempty pass groups, special transform strategies, custom quantization matrices and HF orders/presets,
 Gaborish/EPF, alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

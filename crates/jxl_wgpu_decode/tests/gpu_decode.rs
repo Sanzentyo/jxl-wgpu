@@ -82,6 +82,7 @@ impl ReadyPending {
 impl GpuPendingFrame for ReadyPending {
     type Frame = MockGpuFrame;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         self.take()
     }
@@ -268,6 +269,7 @@ fn frame_presentation_ticks_must_equal_accumulated_durations() {
 struct PendingControl {
     ready: AtomicBool,
     waker: Mutex<Option<Waker>>,
+    #[cfg(not(target_arch = "wasm32"))]
     wait_lock: Mutex<()>,
     condition: Condvar,
 }
@@ -281,6 +283,7 @@ impl PendingControl {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(&self) {
         let mut guard = self.wait_lock.lock().unwrap();
         while !self.ready.load(Ordering::Acquire) {
@@ -306,6 +309,7 @@ impl ControlledPending {
 impl GpuPendingFrame for ControlledPending {
     type Frame = MockGpuFrame;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         self.control.wait();
         self.take()

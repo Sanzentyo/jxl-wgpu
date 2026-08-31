@@ -3,7 +3,10 @@
 use std::num::NonZeroUsize;
 use std::sync::{Arc, mpsc};
 
-use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
+use jxl::api::{
+    JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
+};
+use jxl_gpu_bitstream::{FrameSectionKind, InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
@@ -11,10 +14,14 @@ use jxl_wgpu::{
     ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
-use jxl_wgpu_decode::vardct::packet::{FixedVarDctPacketPlan, GpuVarDctPacketError};
+use jxl_wgpu_decode::vardct::packet::{
+    BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
+    UnsupportedVarDctPacketFeature,
+};
 use jxl_wgpu_decode::{Error as DecodeError, GpuDecoder, GpuOutputRequest, VarDctDecodeError};
 use jxl_wgpu_encode::{
-    BufferImageSource, VarDctColorEncoding, VarDctEncoder, VarDctStrategy, WgpuContext,
+    BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
+    WgpuContext,
 };
 use wgpu::util::DeviceExt;
 
@@ -71,6 +78,84 @@ fn solid_source(
             }),
     );
     BufferImageSource::new(buffer, layout).unwrap()
+}
+
+fn tiled_source(context: &WgpuContext, extent: Extent2d) -> BufferImageSource {
+    let mut bytes = Vec::with_capacity(extent.area().unwrap() * 3);
+    for y in 0..extent.height {
+        for x in 0..extent.width {
+            bytes.extend_from_slice(&[
+                ((x * 17 + y * 3) & 255) as u8,
+                ((y * 29 + x * 5) & 255) as u8,
+                (((x + y) * 11) & 255) as u8,
+            ]);
+        }
+    }
+    let layout = ImageLayout::from_planes(
+        extent,
+        VarDctColorEncoding::SrgbD65.pixel_format(),
+        vec![PitchLinearPlaneLayout {
+            plane_index: 0,
+            offset: 0,
+            row_stride: u64::from(extent.width) * 3,
+            sample_extent: extent,
+            row_bytes: u64::from(extent.width) * 3,
+        }],
+    )
+    .unwrap();
+    let buffer = Arc::new(
+        context
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("odd tiled VarDCT decoder oracle source"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    );
+    BufferImageSource::new(buffer, layout).unwrap()
+}
+
+fn rust_jxl_rgb8(codestream: &[u8], extent: Extent2d) -> Vec<u8> {
+    let mut input = codestream;
+    let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let mut decoder = loop {
+        match decoder.process(&mut input, None).unwrap() {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => decoder = fallback,
+        }
+    };
+    assert_eq!(
+        decoder.basic_info().size,
+        (extent.width as usize, extent.height as usize)
+    );
+    decoder.set_pixel_format(JxlPixelFormat::rgb8(0));
+    let mut frame = loop {
+        match decoder.process(&mut input, None).unwrap() {
+            ProcessingResult::Complete { result } => break result,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => decoder = fallback,
+        }
+    };
+    let mut pixels = vec![0u8; extent.area().unwrap() * 3];
+    let mut buffers = [JxlOutputBuffer::new(
+        &mut pixels,
+        extent.height as usize,
+        extent.width as usize * 3,
+    )];
+    loop {
+        match frame.process(&mut input, &mut buffers, None).unwrap() {
+            ProcessingResult::Complete { .. } => break,
+            ProcessingResult::NeedsMoreInput { fallback, .. } => frame = fallback,
+        }
+    }
+    pixels
+}
+
+fn maximum_error(left: &[u8], right: &[u8]) -> u8 {
+    left.iter()
+        .zip(right)
+        .map(|(&left, &right)| left.abs_diff(right))
+        .max()
+        .unwrap_or(0)
 }
 
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
@@ -386,7 +471,7 @@ fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
             ..InventoryLimits::default()
         })
         .unwrap();
-    let packet = FixedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
     let entropy_bit = usize::try_from(packet.entropy_bit_offset).unwrap();
     corrupted[entropy_bit / 8] ^= 1 << (entropy_bit % 8);
 
@@ -419,4 +504,128 @@ fn all_bounded_regular_packets_reach_display_and_reject_corrupt_entropy() {
     drop(unvalidated);
     drop(rejected);
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+}
+
+#[test]
+fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        eprintln!("skipping tiled VarDCT engine oracle: no adapter");
+        return;
+    };
+    let context = WgpuContext::new(Arc::new(device.clone()), Arc::new(queue.clone())).unwrap();
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::vardct_wgpu(backend.clone());
+    let encoder = TiledVarDctEncoder::new(context.clone()).unwrap();
+
+    for extent in [Extent2d::new(257, 17), Extent2d::new(513, 259)] {
+        let encoded = encoder.encode(tiled_source(&context, extent)).unwrap();
+        let parsed = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(InventoryLimits {
+                max_frames: 1,
+                max_total_section_bytes: encoded.len() as u64,
+                ..InventoryLimits::default()
+            })
+            .unwrap();
+        let plan = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
+        let blocks = extent.width.div_ceil(8) * extent.height.div_ceil(8);
+        assert_eq!(plan.transform, jxl_gpu_protocol::TransformKind::Dct8);
+        assert_eq!(plan.task_count, blocks);
+        assert!(plan.hf_global.is_some());
+        assert!(plan.profile.group_count >= 2);
+        let control = plan.packet_control().unwrap();
+        let correlations = extent.width.div_ceil(64) * extent.height.div_ceil(64);
+        assert_eq!(control.offsets[0], 0);
+        assert_eq!(control.offsets[1], correlations);
+        assert_eq!(control.offsets[2], 2 * correlations);
+        assert_eq!(control.offsets[3], 2 * correlations + blocks);
+        assert_eq!(control.capacities[0], blocks * 8 * 8 * 3);
+        assert_eq!(control.capacities[1], 2 * correlations + 3 * blocks);
+        assert_eq!(control.capacities[3], blocks);
+
+        let mut nonempty_ac = inventory.clone();
+        let mut malformed_codestream = parsed.codestream().to_vec();
+        malformed_codestream.push(0);
+        nonempty_ac.codestream_bytes = malformed_codestream.len() as u64;
+        let pass_group = nonempty_ac.frames[0]
+            .sections
+            .iter_mut()
+            .find(|section| matches!(section.kind, FrameSectionKind::PassGroup { .. }))
+            .unwrap();
+        pass_group.bits.length = 1;
+        assert!(matches!(
+            BoundedVarDctPacketPlan::parse(&malformed_codestream, &nonempty_ac),
+            Err(BoundedVarDctPacketError::Unsupported(
+                UnsupportedVarDctPacketFeature::NonEmptyPassGroup { bits: 1, .. }
+            ))
+        ));
+
+        let mut session = decoder
+            .open(
+                &encoded,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let memory = session.submission_session().memory_stats();
+        assert_eq!(
+            memory.xyb_plane_bytes,
+            u64::from(extent.width.div_ceil(8) * 8) * u64::from(extent.height.div_ceil(8) * 8) * 12,
+        );
+        assert_eq!(
+            memory.resident_transient_bytes,
+            2 * u64::from(blocks * 8 * 8 * 3) * std::mem::size_of::<f32>() as u64 + 112,
+        );
+        let frame = if extent.width == 257 {
+            pollster::block_on(session.next_frame_async())
+                .unwrap()
+                .unwrap()
+        } else {
+            session.next_frame().unwrap().unwrap()
+        };
+        let retained = (extent.width == 257).then(|| frame.output().outputs[0].buffer.clone());
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let actual = &readback.frame.outputs[0].bytes;
+        assert_eq!(actual.len(), extent.area().unwrap() * 3);
+
+        let rust = rust_jxl_rgb8(&encoded, extent);
+        assert!(
+            maximum_error(actual, &rust) <= 1,
+            "{}x{} tiled GPU output diverges from Rust jxl",
+            extent.width,
+            extent.height,
+        );
+        if let Some(djxl) = djxl_ppm(&encoded, extent) {
+            assert!(
+                maximum_error(actual, &djxl) <= 1,
+                "{}x{} tiled GPU output diverges from djxl",
+                extent.width,
+                extent.height,
+            );
+        }
+        drop(readback);
+        drop(frame);
+        drop(session);
+        if let Some(retained) = retained {
+            assert_eq!(
+                decoder.engine().in_flight_memory_stats().reserved_bytes,
+                memory.output_lease_bytes,
+                "the tiled output reservation follows the final GPU buffer clone",
+            );
+            drop(retained);
+        }
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
 }

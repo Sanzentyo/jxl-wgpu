@@ -54,13 +54,13 @@ struct Params {
 };
 
 struct PacketControl {
-    packet_bits: vec4<u32>,
+    section_bits: vec4<u32>,
     geometry: vec4<u32>,
     offsets: vec4<u32>,
     capacities: vec4<u32>,
     expected: vec4<u32>,
     quantization: vec4<u32>,
-    _reserved0: vec4<u32>,
+    streams: vec4<u32>,
     _reserved1: vec4<u32>,
 };
 
@@ -228,19 +228,33 @@ fn validate_zero_range(offset: u32, count: u32, code: u32) {
     }
 }
 
+fn finish_section(expected_end: u32) {
+    if decode_error != 0u { return; }
+    if bit_cursor > expected_end {
+        reject(ERROR_TRAILING_BITS, bit_cursor - expected_end);
+        return;
+    }
+    let remaining = expected_end - bit_cursor;
+    if remaining > 7u || peek_bits(remaining) != 0u {
+        reject(ERROR_TRAILING_BITS, remaining);
+        return;
+    }
+    bit_cursor = expected_end;
+}
+
 @compute @workgroup_size(1, 1, 1)
 fn decode_vardct_packet() {
     params = params_input[0];
     reconstruction_base = 0u;
     decode_error = 0u;
-    bit_cursor = control.packet_bits.x;
+    bit_cursor = control.section_bits.x;
     params.token_start = bit_cursor;
-    params.token_end = control.packet_bits.y;
+    params.token_end = control.section_bits.y;
     params.source_channels = 3u;
     params.source_mask = 0x7fffffffu;
     params.needs_self_correcting = 0u;
     params.lz77_window_mask = 0u;
-    params.stream_index = control.packet_bits.z;
+    params.stream_index = control.streams.x;
 
     if read_bits(2u) != 0u || read_bits(4u) != 3u {
         reject(ERROR_LF_HEADER, bit_cursor);
@@ -261,48 +275,79 @@ fn decode_vardct_packet() {
     entropy_finalize();
 
     let first_block_bits = control.capacities.z;
-    if read_bits(first_block_bits) != 0u {
-        reject(ERROR_FIRST_BLOCK, bit_cursor);
+    let first_blocks = read_bits(first_block_bits) + 1u;
+    if first_blocks != control.capacities.w {
+        reject(ERROR_FIRST_BLOCK, first_blocks);
     }
     if read_bits(4u) != 3u {
         reject(ERROR_HF_HEADER, bit_cursor);
     }
 
-    params.stream_index = control.packet_bits.w;
-    params.sample_count = max(3u * block_count, block_count + 4u);
+    params.stream_index = control.streams.y;
+    let correlation_width = (control.geometry.x + 63u) / 64u;
+    let correlation_height = (control.geometry.y + 63u) / 64u;
+    let correlation_samples = correlation_width * correlation_height;
+    let hf_samples = 2u * correlation_samples + 2u * first_blocks + block_count;
+    params.sample_count = max(3u * block_count, hf_samples);
     params.source_channels = 1u;
     var hf_decoded = 0u;
     entropy_begin();
     current_channel = 0u;
-    hf_decoded += decode_channel(1u, 1u, control.offsets.x, 1u);
+    hf_decoded += decode_channel(
+        correlation_width,
+        correlation_height,
+        control.offsets.x,
+        1u,
+    );
     current_channel = 1u;
-    hf_decoded += decode_channel(1u, 1u, control.offsets.y, 1u);
+    hf_decoded += decode_channel(
+        correlation_width,
+        correlation_height,
+        control.offsets.y,
+        1u,
+    );
     current_channel = 2u;
-    hf_decoded += decode_channel(1u, 2u, control.offsets.z, 1u);
+    hf_decoded += decode_channel(first_blocks, 2u, control.offsets.z, 1u);
     current_channel = 3u;
-    hf_decoded += decode_channel(control.geometry.z, control.geometry.w, control.offsets.w, 1u);
+    hf_decoded += decode_channel(
+        control.geometry.z,
+        control.geometry.w,
+        control.expected.w,
+        1u,
+    );
     entropy_finalize();
 
-    validate_zero_range(control.offsets.x, 2u, ERROR_CORRELATION);
-    if raw_metadata[control.offsets.z] != control.expected.x {
-        reject(ERROR_STRATEGY, raw_metadata[control.offsets.z]);
-    }
-    if raw_metadata[control.offsets.z + 1u] != control.expected.y {
-        reject(ERROR_HF_MULTIPLIER, raw_metadata[control.offsets.z + 1u]);
-    }
-    validate_zero_range(control.offsets.w, block_count, ERROR_SHARPNESS);
-
-    if read_bits(18u) != control.expected.z {
-        reject(ERROR_HF_GLOBAL, bit_cursor);
-    }
-    if decode_error == 0u && bit_cursor != params.token_end {
-        let remaining = params.token_end - bit_cursor;
-        if remaining > 7u || peek_bits(remaining) != 0u {
-            reject(ERROR_TRAILING_BITS, remaining);
-        } else {
-            bit_cursor = params.token_end;
+    validate_zero_range(control.offsets.x, 2u * correlation_samples, ERROR_CORRELATION);
+    for (var index = 0u; index < first_blocks && decode_error == 0u; index += 1u) {
+        if raw_metadata[control.offsets.z + index] != control.expected.x {
+            reject(ERROR_STRATEGY, raw_metadata[control.offsets.z + index]);
+        }
+        if raw_metadata[control.offsets.w + index] != control.expected.y {
+            reject(ERROR_HF_MULTIPLIER, raw_metadata[control.offsets.w + index]);
         }
     }
+    validate_zero_range(control.expected.w, block_count, ERROR_SHARPNESS);
+
+    if control.streams.z != 0u {
+        finish_section(control.section_bits.y);
+        bit_cursor = control.section_bits.z;
+        params.token_start = bit_cursor;
+        params.token_end = control.section_bits.w;
+    }
+    let preset_bits = select(
+        0u,
+        32u - countLeadingZeros(control.streams.w - 1u),
+        control.streams.w > 1u,
+    );
+    let default_matrix = read_bits(1u);
+    let preset = read_bits(preset_bits);
+    let fixed_hf_tail = read_bits(17u);
+    if default_matrix != (control.expected.z & 1u)
+        || preset != 0u
+        || fixed_hf_tail != (control.expected.z >> 1u) {
+        reject(ERROR_HF_GLOBAL, bit_cursor);
+    }
+    finish_section(params.token_end);
 
     if decode_error == 0u {
         for (var index = 0u; index < control.capacities.x; index += 1u) {
@@ -317,7 +362,7 @@ fn decode_vardct_packet() {
     status[3] = lf_decoded;
     status[4] = hf_decoded;
     status[5] = raw_metadata[control.offsets.z];
-    status[6] = raw_metadata[control.offsets.z + 1u] + 1u;
+    status[6] = raw_metadata[control.offsets.w] + 1u;
     status[7] = control.capacities.x;
     status[9] = control.quantization.x;
     status[10] = control.quantization.y;

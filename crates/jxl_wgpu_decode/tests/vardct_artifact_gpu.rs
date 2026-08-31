@@ -6,11 +6,11 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
 use jxl_wgpu_decode::vardct::artifact::{
     BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID, GpuDispatchIndirectArgs, GpuGeneralVarDctTask,
-    GpuHfTaskMetadata, GpuVarDctArtifactStatus, GpuVarDctBucket, HF_COEFFICIENT_SINK_SHADER,
-    HfCoefficientSinkParams, HfDispatchStage, HfMetadataArtifactConfig, HfMetadataLoweringBuffers,
-    HfMetadataLoweringParams, HfMetadataLoweringPipeline, HfOrderTableLayout,
-    VAR_DCT_ARTIFACT_SHADER, VAR_DCT_STRATEGY_COUNT, VarDctArtifactDeviceLimits,
-    VarDctArtifactError, VarDctArtifactLayout,
+    GpuHfTaskMetadata, GpuVarDctArtifactStatus, GpuVarDctBucket, GpuVarDctLoweringError,
+    HF_COEFFICIENT_SINK_SHADER, HfCoefficientSinkParams, HfDispatchStage, HfMetadataArtifactConfig,
+    HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
+    HfOrderTableLayout, VAR_DCT_ARTIFACT_SHADER, VAR_DCT_STRATEGY_COUNT,
+    VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
 };
 use wgpu::util::DeviceExt;
 
@@ -81,6 +81,104 @@ fn align_256(value: u64) -> u64 {
 
 fn cast_one<T: Pod>(bytes: &[u8], offset: usize) -> T {
     *bytemuck::from_bytes(&bytes[offset..offset + std::mem::size_of::<T>()])
+}
+
+fn lower_topology(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    blocks: [u32; 2],
+    strategies: &[i32],
+    pass_group_dim_blocks: u32,
+) -> GpuVarDctArtifactStatus {
+    let entries = strategies.len() as u32;
+    let mut raw = strategies.to_vec();
+    raw.extend(std::iter::repeat_n(5, strategies.len()));
+    let config = HfMetadataArtifactConfig {
+        blocks_width: blocks[0],
+        blocks_height: blocks[1],
+        block_info_entries: entries,
+        strategy_offset_words: 0,
+        hf_mul_offset_words: entries,
+        raw_metadata_words: raw.len() as u64,
+        pass_group_dim_blocks,
+        lf_stride: blocks[0],
+        correlation_width: blocks[0].div_ceil(8),
+        correlation_height: blocks[1].div_ceil(8),
+        destination_origin: [0, 0],
+        afv_basis_offset: 0,
+        matrix_offsets: [0; VAR_DCT_STRATEGY_COUNT],
+    };
+    let layout = VarDctArtifactLayout::plan(
+        &config,
+        VarDctArtifactDeviceLimits::from_wgpu(&device.limits()),
+    )
+    .unwrap();
+    let params = HfMetadataLoweringParams::new(&config, layout).unwrap();
+    let raw = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("malformed VarDCT topology"),
+        contents: bytemuck::cast_slice(&raw),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let artifact = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT topology artifact"),
+        size: layout.artifact_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let occupancy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT topology occupancy"),
+        size: layout.occupancy_bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("malformed VarDCT topology params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("malformed VarDCT topology status"),
+        size: std::mem::size_of::<GpuVarDctArtifactStatus>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let lowering = HfMetadataLoweringPipeline::new(device);
+    let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("malformed VarDCT topology validation"),
+    });
+    lowering.encode(
+        device,
+        &mut commands,
+        HfMetadataLoweringBuffers {
+            raw_metadata: &raw,
+            artifact: &artifact,
+            occupancy: &occupancy,
+            params: &params,
+        },
+    );
+    commands.copy_buffer_to_buffer(
+        &artifact,
+        u64::from(layout.status_offset_words) * 4,
+        &staging,
+        0,
+        std::mem::size_of::<GpuVarDctArtifactStatus>() as u64,
+    );
+    let submission = queue.submit([commands.finish()]);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = staging.slice(..).get_mapped_range().unwrap();
+    bytemuck::pod_read_unaligned(&mapped)
 }
 
 #[test]
@@ -229,6 +327,40 @@ fn custom_order_layout_covers_every_channel_without_aliasing() {
     assert_eq!(cursor, layout.coordinate_words);
     assert_eq!(layout.descriptor(13, 0), None);
     assert_eq!(layout.descriptor(0, 3), None);
+}
+
+#[test]
+fn malformed_varblock_overlap_and_pass_group_crossing_are_gpu_rejected() {
+    let Some((device, queue)) = request_device() else {
+        eprintln!("skipping malformed VarDCT topology GPU test: no adapter is available");
+        return;
+    };
+
+    // DCT8 at (0,0), tall DCT16x8 at (1,0), then wide DCT8x16 at (0,1).
+    // The final transform covers the already occupied (1,1) block.
+    let overlap = lower_topology(&device, &queue, [2, 2], &[0, 6, 7], 32);
+    assert_eq!(
+        overlap.validate(),
+        Err(GpuVarDctLoweringError::TransformOverlap {
+            x: 1,
+            y: 1,
+            strategy: 7,
+        })
+    );
+
+    // Thirty-one DCT8 blocks leave x=31 as the next anchor. A two-block-wide transform fits the
+    // 33-block LF group but crosses the standard 32-block pass-group boundary.
+    let mut crossing = vec![0; 32];
+    crossing[31] = 7;
+    let crossing = lower_topology(&device, &queue, [33, 1], &crossing, 32);
+    assert_eq!(
+        crossing.validate(),
+        Err(GpuVarDctLoweringError::PassGroupCrossing {
+            x: 31,
+            y: 0,
+            strategy: 7,
+        })
+    );
 }
 
 #[test]

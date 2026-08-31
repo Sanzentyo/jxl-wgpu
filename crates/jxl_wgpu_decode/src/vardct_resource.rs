@@ -18,6 +18,7 @@ pub struct VarDctResourceLayout {
     pub matrix_offset: u32,
     pub vector_count: u32,
     pub block_count: u32,
+    pub correlation_count: u32,
     pub transform_area: u32,
 }
 
@@ -33,9 +34,19 @@ impl VarDctResourceLayout {
                 .ok_or(VarDctResourceError::ArithmeticOverflow {
                     field: "LF block count",
                 })?;
+        let correlation_count = blocks_x
+            .div_ceil(8)
+            .checked_mul(blocks_y.div_ceil(8))
+            .ok_or(VarDctResourceError::ArithmeticOverflow {
+                field: "correlation cell count",
+            })?;
         let quant_offset = 0_u32;
         let correlation_offset = 1_u32;
-        let lf_offset = 2_u32;
+        let lf_offset = correlation_offset.checked_add(correlation_count).ok_or(
+            VarDctResourceError::ArithmeticOverflow {
+                field: "LF resource offset",
+            },
+        )?;
         let matrix_offset =
             lf_offset
                 .checked_add(block_count)
@@ -54,6 +65,7 @@ impl VarDctResourceLayout {
             matrix_offset,
             vector_count,
             block_count,
+            correlation_count,
             transform_area,
         })
     }
@@ -77,7 +89,9 @@ impl VarDctResourceLayout {
             0.8 * 65_536.0 / (GLOBAL_SCALE * HF_MUL),
             0.0,
         ];
-        values[self.correlation_offset as usize] = [0.0, 1.0, 0.0, 0.0];
+        let correlation_end = self.correlation_offset + self.correlation_count;
+        values[self.correlation_offset as usize..correlation_end as usize]
+            .fill([0.0, 1.0, 0.0, 0.0]);
         values[self.matrix_offset as usize..].fill([1.0, 1.0, 1.0, 0.0]);
         values
     }
@@ -212,6 +226,7 @@ mod tests {
     #[test]
     fn layout_and_shader_are_bounded() {
         let layout = VarDctResourceLayout::new(4, 2, 256).unwrap();
+        assert_eq!(layout.correlation_count, 1);
         assert_eq!(layout.lf_offset, 2);
         assert_eq!(layout.matrix_offset, 10);
         assert_eq!(layout.vector_count, 266);
@@ -224,5 +239,15 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+
+    #[test]
+    fn correlation_grid_scales_past_one_frequency_cell() {
+        let layout = VarDctResourceLayout::new(17, 9, 64).unwrap();
+        assert_eq!(layout.correlation_count, 6);
+        assert_eq!(layout.correlation_offset, 1);
+        assert_eq!(layout.lf_offset, 7);
+        let values = layout.initial_values();
+        assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
 }

@@ -23,8 +23,9 @@ pub enum DecodeProfile {
     },
     /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer.
     ///
-    /// The transform is the single regular strategy covering the complete image in the current
-    /// deliberately bounded production profile.
+    /// `transform` is shared by every first block in the negotiated bounded profile. A legacy
+    /// one-entry packet has one image-sized regular task; the tiled profile has one DCT8 task per
+    /// padded 8x8 block and may span several normatively empty zero-AC pass groups.
     VarDctRegular {
         bits_per_sample: u8,
         transform: TransformKind,
