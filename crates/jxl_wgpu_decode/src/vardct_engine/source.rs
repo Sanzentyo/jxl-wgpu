@@ -331,7 +331,7 @@ pub(super) fn prepare_source(
                 .flatten();
             let combined_packet_windows = (!staged_local_trees
                 && !packet.profile.uses_lf_frame
-                && deferred_hf.is_none())
+                && packet.pending_raw_hf_dequant_side_image().is_none())
             .then(|| {
                 CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
             })
