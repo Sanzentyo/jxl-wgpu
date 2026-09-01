@@ -128,11 +128,13 @@ kernel test.
 Two adjacent `cjxl` gates cover the cross-group path. The 515×259 Gray Palette fixture must decode
 nonzero DC-global samples, report one frame-resident arena and exactly one Palette dispatch, execute
 one 144-byte finalizer, and match both its source and the Rust `jxl` oracle byte-for-byte. The
-2051×259 `--responsive=1` Squeeze fixture exercises a DC-local MA configuration when no outer global
-tree exists, schedules two nonempty LF-group streams before its pass groups, requires nonzero
-DC-global samples and inverse jobs with no Palette dispatch, and is also byte-exact. Together they
-prove global entropy, LF/pass-subimage plane assembly, and one frame-wide inverse; they do not cover
-progressive frame dependencies.
+2051×259 `--progressive --responsive=1` Squeeze fixture declares two passes with a 2× downsampling
+boundary after pass 0, exercises a DC-local MA configuration when no outer global tree exists, and
+schedules two nonempty LF-group streams before its pass streams. It must report two passes, require
+nonzero DC-global samples and inverse jobs with no Palette dispatch, and match source plus Rust
+`jxl` byte-for-byte. Together the fixtures prove global entropy, LF/pass-subimage plane assembly,
+multi-pass final reconstruction, and one frame-wide inverse; they do not cover intermediate pass
+presentation or progressive frame dependencies.
 
 `wgpu_gray8::local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust` uses the public
 `LosslessModularTreeMode::LocalPerGroup` encoder policy to produce a 515×259, six-pass-group stream.

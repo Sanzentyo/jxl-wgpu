@@ -19,6 +19,7 @@ use crate::{
 };
 
 const MIN_GROUP_DIMENSION: u32 = 128;
+const MAX_MODULAR_PASSES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularGroup {
@@ -51,6 +52,7 @@ pub(crate) struct StandardModularProfile {
     pub height: u32,
     pub bits_per_sample: u8,
     pub channels: ModularChannels,
+    pub pass_count: u32,
     pub group_columns: u32,
     pub group_rows: u32,
     /// Canvas pass groups exposed by the decoded frame profile.
@@ -286,7 +288,6 @@ pub(crate) fn parse_standard_modular_profile(
         || frame.jpeg_upsampling != [0; 3]
         || frame.upsampling != 1
         || frame.group_size_shift > 3
-        || frame.num_passes != 1
         || frame.have_crop
         || frame.x0 != 0
         || frame.y0 != 0
@@ -305,6 +306,15 @@ pub(crate) fn parse_standard_modular_profile(
             "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references",
         );
     }
+    if !(1..=MAX_MODULAR_PASSES).contains(&frame.num_passes) {
+        return Err(UnsupportedProfile::new(
+            UnsupportedCodestreamFeature::MultiplePasses,
+            format!(
+                "the lossless Modular GPU frontend accepts one through {MAX_MODULAR_PASSES} passes"
+            ),
+        )
+        .into());
+    }
 
     let group_dimension = MIN_GROUP_DIMENSION
         .checked_shl(frame.group_size_shift)
@@ -318,7 +328,8 @@ pub(crate) fn parse_standard_modular_profile(
         return unsupported("frame inventory group count does not match the Modular canvas");
     }
 
-    let dc_global = if expected_group_count == 1 {
+    let single_entry = expected_group_count == 1 && frame.num_passes == 1;
+    let dc_global = if single_entry {
         frame
             .sections
             .iter()
@@ -349,101 +360,108 @@ pub(crate) fn parse_standard_modular_profile(
         return unsupported("Modular DC-global metadata exceeds its TOC section");
     }
 
-    let (groups, entropy_groups, concrete_transform_plans, frame_plan_seed) =
-        if expected_group_count == 1 {
-            validate_stock_modular_transform_plan(
-                channels,
-                image.width,
-                image.height,
-                u32::from(bits_per_sample),
-                &transform_plan,
-            )?;
-            let groups = vec![ModularGroup {
-                token_bit_offset: reader.bit_offset(),
-                token_bit_end: dc_end,
-                x: 0,
-                y: 0,
-                width: image.width,
-                height: image.height,
-                stream_index: 0,
-            }];
-            (
-                groups.clone(),
-                groups,
-                vec![(transform_plan.clone(), wp_header, dc_ma_config.clone())],
-                None,
-            )
-        } else {
-            validate_stock_modular_transform_plan(
-                channels,
-                image.width,
-                image.height,
-                u32::from(bits_per_sample),
-                &transform_plan,
-            )?;
-            validate_modular_section_structure(codestream, frame)?;
-            let limits = ModularTransformLimits::default();
-            let requires_frame_arena = transform_plan
-                .transforms
-                .iter()
-                .any(|transform| !matches!(transform, ModularTransformIr::Rct(_)));
-            let global_channel_count =
-                global_subimage_channel_count(&transform_plan.topology, group_dimension);
-            let has_lf_group_channels = transform_plan.topology.channels()[global_channel_count..]
-                .iter()
-                .any(|channel| channel.hshift >= 3 && channel.vshift >= 3);
-            let lf_group_dimension = group_dimension
-                .checked_mul(8)
-                .ok_or_else(|| unsupported_error("Modular LF-group dimension overflow"))?;
-            let lf_group_columns = image.width.div_ceil(lf_group_dimension);
-            let lf_group_rows = image.height.div_ceil(lf_group_dimension);
-            let expected_lf_group_count = u64::from(lf_group_columns)
-                .checked_mul(u64::from(lf_group_rows))
-                .ok_or_else(|| unsupported_error("Modular LF-group grid overflow"))?;
-            if frame.low_frequency_group_count != expected_lf_group_count {
+    let (
+        groups,
+        entropy_groups,
+        low_frequency_entropy_group_count,
+        concrete_transform_plans,
+        frame_plan_seed,
+    ) = if single_entry {
+        validate_stock_modular_transform_plan(
+            channels,
+            image.width,
+            image.height,
+            u32::from(bits_per_sample),
+            &transform_plan,
+        )?;
+        let groups = vec![ModularGroup {
+            token_bit_offset: reader.bit_offset(),
+            token_bit_end: dc_end,
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height,
+            stream_index: 0,
+        }];
+        (
+            groups.clone(),
+            groups,
+            0,
+            vec![(transform_plan.clone(), wp_header, dc_ma_config.clone())],
+            None,
+        )
+    } else {
+        validate_stock_modular_transform_plan(
+            channels,
+            image.width,
+            image.height,
+            u32::from(bits_per_sample),
+            &transform_plan,
+        )?;
+        validate_modular_section_structure(codestream, frame)?;
+        let limits = ModularTransformLimits::default();
+        let pass_ranges = build_modular_pass_shift_ranges(
+            frame.num_passes,
+            &frame.progressive_passes.downsampling,
+            &frame.progressive_passes.last_pass,
+        )?;
+        let requires_frame_arena = transform_plan
+            .transforms
+            .iter()
+            .any(|transform| !matches!(transform, ModularTransformIr::Rct(_)));
+        let global_channel_count =
+            global_subimage_channel_count(&transform_plan.topology, group_dimension);
+        for channel in &transform_plan.topology.channels()[global_channel_count..] {
+            let (Ok(hshift), Ok(vshift)) =
+                (u32::try_from(channel.hshift), u32::try_from(channel.vshift))
+            else {
+                return unsupported("a Modular channel shift is negative");
+            };
+            if (hshift < 3 || vshift < 3)
+                && modular_pass_for_channel(hshift, vshift, &pass_ranges).is_none()
+            {
                 return unsupported(
-                    "frame inventory LF-group count does not match the Modular canvas",
+                    "the Modular progressive-pass ranges do not cover a transformed channel",
                 );
             }
-            let global_topology = ModularChannelTopology::new(
-                transform_plan.topology.channels()[..global_channel_count].to_vec(),
-                transform_plan
-                    .topology
-                    .meta_channel_count()
-                    .min(global_channel_count),
-                limits,
-            )?;
-            let global_channel_metadata = global_topology
-                .gpu_entropy_channels(dc_ma_config.resolve(&ma_config).maximum_tree_property())?;
-            let frame_inverse_plan = plan_modular_inverse(&transform_plan)?;
-            let frame_entropy_layout = transform_plan.topology.gpu_layout()?;
-            let group_count = usize::try_from(expected_group_count)
-                .map_err(|_| unsupported_error("Modular group count exceeds host address space"))?;
-            let mut groups = vec![None; group_count];
-            let mut concrete_transform_plans = vec![None; group_count];
-            let mut group_plane_targets = vec![None; group_count];
-            for section in &frame.sections {
-                let FrameSectionKind::PassGroup {
-                    pass_index: 0,
-                    group_index,
-                } = section.kind
-                else {
-                    continue;
-                };
-                let index = usize::try_from(group_index).map_err(|_| {
-                    unsupported_error("Modular group index exceeds host address space")
-                })?;
-                let slot = groups.get_mut(index).ok_or_else(|| {
-                    unsupported_error("Modular pass-group index exceeds the frame grid")
-                })?;
-                if slot.is_some() {
-                    return unsupported(
-                        "the Modular frame contains a duplicate pass-group section",
-                    );
-                }
-                let column = u32::try_from(group_index % u64::from(group_columns))
+        }
+        let has_lf_group_channels = transform_plan.topology.channels()[global_channel_count..]
+            .iter()
+            .any(|channel| channel.hshift >= 3 && channel.vshift >= 3);
+        let lf_group_dimension = group_dimension
+            .checked_mul(8)
+            .ok_or_else(|| unsupported_error("Modular LF-group dimension overflow"))?;
+        let lf_group_columns = image.width.div_ceil(lf_group_dimension);
+        let lf_group_rows = image.height.div_ceil(lf_group_dimension);
+        let expected_lf_group_count = u64::from(lf_group_columns)
+            .checked_mul(u64::from(lf_group_rows))
+            .ok_or_else(|| unsupported_error("Modular LF-group grid overflow"))?;
+        if frame.low_frequency_group_count != expected_lf_group_count {
+            return unsupported("frame inventory LF-group count does not match the Modular canvas");
+        }
+        let global_topology = ModularChannelTopology::new(
+            transform_plan.topology.channels()[..global_channel_count].to_vec(),
+            transform_plan
+                .topology
+                .meta_channel_count()
+                .min(global_channel_count),
+            limits,
+        )?;
+        let global_channel_metadata = global_topology
+            .gpu_entropy_channels(dc_ma_config.resolve(&ma_config).maximum_tree_property())?;
+        let frame_inverse_plan = plan_modular_inverse(&transform_plan)?;
+        let frame_entropy_layout = transform_plan.topology.gpu_layout()?;
+        let group_count = usize::try_from(expected_group_count)
+            .map_err(|_| unsupported_error("Modular group count exceeds host address space"))?;
+        let pass_count = usize::try_from(frame.num_passes)
+            .map_err(|_| unsupported_error("Modular pass count exceeds host address space"))?;
+        let canvas_groups = (0..group_count)
+            .map(|group_index| {
+                let group_index_u64 = u64::try_from(group_index)
+                    .map_err(|_| unsupported_error("Modular group index exceeds u64"))?;
+                let column = u32::try_from(group_index_u64 % u64::from(group_columns))
                     .map_err(|_| unsupported_error("Modular group column overflow"))?;
-                let row = u32::try_from(group_index / u64::from(group_columns))
+                let row = u32::try_from(group_index_u64 / u64::from(group_columns))
                     .map_err(|_| unsupported_error("Modular group row overflow"))?;
                 let x = column
                     .checked_mul(group_dimension)
@@ -451,32 +469,108 @@ pub(crate) fn parse_standard_modular_profile(
                 let y = row
                     .checked_mul(group_dimension)
                     .ok_or_else(|| unsupported_error("Modular group y origin overflow"))?;
-                let group_width = image.width.saturating_sub(x).min(group_dimension);
-                let group_height = image.height.saturating_sub(y).min(group_dimension);
-                let (source_topology, plane_targets) = if requires_frame_arena {
-                    grouped_subimage_topology(
-                        &transform_plan.topology,
-                        &frame_entropy_layout,
-                        global_channel_count,
-                        ModularSubimageRegion {
-                            kind: ModularSubimageKind::PassGroup,
-                            column,
-                            row,
-                            group_dimension,
-                        },
+                let width = image.width.saturating_sub(x).min(group_dimension);
+                let height = image.height.saturating_sub(y).min(group_dimension);
+                Ok(ModularGroup {
+                    token_bit_offset: 0,
+                    token_bit_end: 0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    // Canvas groups have no entropy section; expose the final-pass stream ID
+                    // as their stable public stream identity.
+                    stream_index: modular_pass_stream_index(
+                        frame.low_frequency_group_count,
+                        expected_group_count,
+                        u64::from(frame.num_passes - 1),
+                        group_index_u64,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut pass_sections = (0..pass_count)
+            .map(|_| (0..group_count).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<Vec<Option<jxl_gpu_bitstream::FrameSection>>>>();
+        for section in &frame.sections {
+            let FrameSectionKind::PassGroup {
+                pass_index,
+                group_index,
+            } = section.kind
+            else {
+                continue;
+            };
+            let pass_index = usize::try_from(pass_index)
+                .map_err(|_| unsupported_error("Modular pass index exceeds host address space"))?;
+            let group_index = usize::try_from(group_index)
+                .map_err(|_| unsupported_error("Modular group index exceeds host address space"))?;
+            let slot = pass_sections
+                .get_mut(pass_index)
+                .and_then(|groups| groups.get_mut(group_index))
+                .ok_or_else(|| {
+                    unsupported_error("Modular pass-group index exceeds the frame grid")
+                })?;
+            if slot.is_some() {
+                return unsupported("the Modular frame contains a duplicate pass-group section");
+            }
+            *slot = Some(*section);
+        }
+
+        let mut pass_groups = (0..pass_count)
+            .map(|_| (0..group_count).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<Vec<Option<ModularGroup>>>>();
+        let mut pass_transform_plans = (0..pass_count)
+            .map(|_| (0..group_count).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<Vec<Option<(ModularTransformPlan, WpHeaderIr, ModularMaConfig)>>>>();
+        let mut pass_plane_targets = (0..pass_count)
+            .map(|_| (0..group_count).map(|_| None).collect::<Vec<_>>())
+            .collect::<Vec<Vec<Option<Vec<GpuModularChannelLayout>>>>>();
+        for (pass_index, pass_groups_for_pass) in pass_groups.iter_mut().enumerate() {
+            let pass_range = pass_ranges[pass_index];
+            for (group_index, group_slot) in pass_groups_for_pass.iter_mut().enumerate() {
+                let section = pass_sections[pass_index][group_index].ok_or_else(|| {
+                    unsupported_error(format!(
+                        "the Modular frame is missing pass-group {pass_index}/{group_index}"
+                    ))
+                })?;
+                let canvas_group = canvas_groups[group_index];
+                let column = group_index as u32 % group_columns;
+                let row = group_index as u32 / group_columns;
+                let (assigned_topology, plane_targets) = grouped_subimage_topology(
+                    &transform_plan.topology,
+                    &frame_entropy_layout,
+                    global_channel_count,
+                    ModularSubimageRegion {
+                        kind: ModularSubimageKind::PassGroup,
+                        column,
+                        row,
+                        group_dimension,
+                    },
+                    pass_range,
+                    limits,
+                )?;
+                if assigned_topology.channels().is_empty() {
+                    validate_empty_pass_group_section(
+                        codestream,
+                        section,
+                        pass_index,
+                        group_index,
+                    )?;
+                    continue;
+                }
+                let group_width = canvas_group.width;
+                let group_height = canvas_group.height;
+                let source_topology = if requires_frame_arena {
+                    assigned_topology
+                } else {
+                    ModularChannelTopology::full_resolution(
+                        group_width,
+                        group_height,
+                        u32::from(bits_per_sample),
+                        channels.count(),
                         limits,
                     )?
-                } else {
-                    (
-                        ModularChannelTopology::full_resolution(
-                            group_width,
-                            group_height,
-                            u32::from(bits_per_sample),
-                            channels.count(),
-                            limits,
-                        )?,
-                        Vec::new(),
-                    )
                 };
                 let mut group_reader = codestream.reader();
                 group_reader.skip_bits(section.bits.offset)?;
@@ -529,198 +623,166 @@ pub(crate) fn parse_standard_modular_profile(
                     .bits
                     .end()
                     .ok_or_else(|| unsupported_error("Modular pass-group bit range overflow"))?;
+                *group_slot = Some(ModularGroup {
+                    token_bit_offset: group_reader.bit_offset(),
+                    token_bit_end,
+                    x: canvas_group.x,
+                    y: canvas_group.y,
+                    width: group_width,
+                    height: group_height,
+                    stream_index: modular_pass_stream_index(
+                        frame.low_frequency_group_count,
+                        expected_group_count,
+                        u64::try_from(pass_index)
+                            .map_err(|_| unsupported_error("Modular pass index exceeds u64"))?,
+                        u64::try_from(group_index)
+                            .map_err(|_| unsupported_error("Modular group index exceeds u64"))?,
+                    )?,
+                });
+                pass_transform_plans[pass_index][group_index] =
+                    Some((concrete_transform, local_wp_header, group_ma_config));
+                pass_plane_targets[pass_index][group_index] = Some(plane_targets);
+            }
+        }
+
+        let (lf_groups, lf_transform_plans, lf_plane_targets) = if has_lf_group_channels {
+            let lf_group_count = usize::try_from(expected_lf_group_count).map_err(|_| {
+                unsupported_error("Modular LF-group count exceeds host address space")
+            })?;
+            let mut lf_groups = vec![None; lf_group_count];
+            let mut lf_transform_plans = vec![None; lf_group_count];
+            let mut lf_plane_targets = vec![None; lf_group_count];
+            for section in &frame.sections {
+                let FrameSectionKind::LowFrequencyGroup { group_index } = section.kind else {
+                    continue;
+                };
+                let index = usize::try_from(group_index).map_err(|_| {
+                    unsupported_error("Modular LF-group index exceeds host address space")
+                })?;
+                let slot = lf_groups.get_mut(index).ok_or_else(|| {
+                    unsupported_error("Modular LF-group index exceeds the frame grid")
+                })?;
+                if slot.is_some() {
+                    return unsupported("the Modular frame contains a duplicate LF-group section");
+                }
+                let column = u32::try_from(group_index % u64::from(lf_group_columns))
+                    .map_err(|_| unsupported_error("Modular LF-group column overflow"))?;
+                let row = u32::try_from(group_index / u64::from(lf_group_columns))
+                    .map_err(|_| unsupported_error("Modular LF-group row overflow"))?;
+                let x = column
+                    .checked_mul(lf_group_dimension)
+                    .ok_or_else(|| unsupported_error("Modular LF-group x origin overflow"))?;
+                let y = row
+                    .checked_mul(lf_group_dimension)
+                    .ok_or_else(|| unsupported_error("Modular LF-group y origin overflow"))?;
+                let width = image.width.saturating_sub(x).min(lf_group_dimension);
+                let height = image.height.saturating_sub(y).min(lf_group_dimension);
+                let (source_topology, plane_targets) = grouped_subimage_topology(
+                    &transform_plan.topology,
+                    &frame_entropy_layout,
+                    global_channel_count,
+                    ModularSubimageRegion {
+                        kind: ModularSubimageKind::LowFrequencyGroup,
+                        column,
+                        row,
+                        group_dimension,
+                    },
+                    None,
+                    limits,
+                )?;
+                if source_topology.channels().is_empty() {
+                    return Err(Error::EngineContract(
+                        "a scheduled Modular LF group has no transformed channels",
+                    ));
+                }
+                let mut group_reader = codestream.reader();
+                group_reader.skip_bits(section.bits.offset)?;
+                let use_global_tree = group_reader.read_bits(1)? != 0;
+                let local_wp_header = WpHeaderIr::parse(&mut group_reader)?;
+                let local_transform =
+                    parse_modular_transforms(&mut group_reader, source_topology, limits)?;
+                let group_ma_config = if use_global_tree {
+                    if !has_global_ma_config {
+                        return unsupported(
+                            "a Modular LF group selects a global MA tree that is absent",
+                        );
+                    }
+                    ModularMaConfig::Global
+                } else {
+                    ModularMaConfig::Local(parse_ma_config(
+                        &mut group_reader,
+                        MaTreeLimits::default(),
+                    )?)
+                };
+                let token_bit_end = section
+                    .bits
+                    .end()
+                    .ok_or_else(|| unsupported_error("Modular LF-group bit range overflow"))?;
                 *slot = Some(ModularGroup {
                     token_bit_offset: group_reader.bit_offset(),
                     token_bit_end,
                     x,
                     y,
-                    width: group_width,
-                    height: group_height,
+                    width,
+                    height,
                     stream_index: u32::try_from(
-                        18u64
-                            .checked_add(
-                                frame.low_frequency_group_count.checked_mul(3).ok_or_else(
-                                    || unsupported_error("Modular stream index overflow"),
-                                )?,
-                            )
+                        1u64.checked_add(frame.low_frequency_group_count)
                             .and_then(|value| value.checked_add(group_index))
-                            .ok_or_else(|| unsupported_error("Modular stream index overflow"))?,
+                            .ok_or_else(|| unsupported_error("Modular LF stream index overflow"))?,
                     )
-                    .map_err(|_| unsupported_error("Modular stream index exceeds u32"))?,
+                    .map_err(|_| unsupported_error("Modular LF stream index exceeds u32"))?,
                 });
-                concrete_transform_plans[index] =
-                    Some((concrete_transform, local_wp_header, group_ma_config));
-                group_plane_targets[index] = Some(plane_targets);
+                lf_transform_plans[index] =
+                    Some((local_transform, local_wp_header, group_ma_config));
+                lf_plane_targets[index] = Some(plane_targets);
             }
-            let groups = groups
-                .into_iter()
-                .enumerate()
-                .map(|(index, group)| {
-                    group.ok_or_else(|| {
-                        unsupported_error(format!(
-                            "the Modular frame is missing pass-group {index}"
-                        ))
-                        .into()
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let concrete_transform_plans = concrete_transform_plans
-                .into_iter()
-                .enumerate()
-                .map(|(index, plan)| {
-                    plan.ok_or_else(|| {
-                        unsupported_error(format!(
-                            "the Modular frame is missing transform metadata for pass-group {index}"
-                        ))
-                        .into()
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let group_plane_targets = group_plane_targets
-            .into_iter()
-            .enumerate()
-            .map(|(index, targets)| {
-                targets.ok_or_else(|| {
-                    unsupported_error(format!(
-                        "the Modular frame is missing transformed-plane targets for pass-group {index}"
-                    ))
-                    .into()
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-            let (lf_groups, lf_transform_plans, lf_plane_targets) = if has_lf_group_channels {
-                let lf_group_count = usize::try_from(expected_lf_group_count).map_err(|_| {
-                    unsupported_error("Modular LF-group count exceeds host address space")
-                })?;
-                let mut lf_groups = vec![None; lf_group_count];
-                let mut lf_transform_plans = vec![None; lf_group_count];
-                let mut lf_plane_targets = vec![None; lf_group_count];
-                for section in &frame.sections {
-                    let FrameSectionKind::LowFrequencyGroup { group_index } = section.kind else {
-                        continue;
-                    };
-                    let index = usize::try_from(group_index).map_err(|_| {
-                        unsupported_error("Modular LF-group index exceeds host address space")
-                    })?;
-                    let slot = lf_groups.get_mut(index).ok_or_else(|| {
-                        unsupported_error("Modular LF-group index exceeds the frame grid")
-                    })?;
-                    if slot.is_some() {
-                        return unsupported(
-                            "the Modular frame contains a duplicate LF-group section",
-                        );
-                    }
-                    let column = u32::try_from(group_index % u64::from(lf_group_columns))
-                        .map_err(|_| unsupported_error("Modular LF-group column overflow"))?;
-                    let row = u32::try_from(group_index / u64::from(lf_group_columns))
-                        .map_err(|_| unsupported_error("Modular LF-group row overflow"))?;
-                    let x = column
-                        .checked_mul(lf_group_dimension)
-                        .ok_or_else(|| unsupported_error("Modular LF-group x origin overflow"))?;
-                    let y = row
-                        .checked_mul(lf_group_dimension)
-                        .ok_or_else(|| unsupported_error("Modular LF-group y origin overflow"))?;
-                    let width = image.width.saturating_sub(x).min(lf_group_dimension);
-                    let height = image.height.saturating_sub(y).min(lf_group_dimension);
-                    let (source_topology, plane_targets) = grouped_subimage_topology(
-                        &transform_plan.topology,
-                        &frame_entropy_layout,
-                        global_channel_count,
-                        ModularSubimageRegion {
-                            kind: ModularSubimageKind::LowFrequencyGroup,
-                            column,
-                            row,
-                            group_dimension,
-                        },
-                        limits,
-                    )?;
-                    if source_topology.channels().is_empty() {
-                        return Err(Error::EngineContract(
-                            "a scheduled Modular LF group has no transformed channels",
-                        ));
-                    }
-                    let mut group_reader = codestream.reader();
-                    group_reader.skip_bits(section.bits.offset)?;
-                    let use_global_tree = group_reader.read_bits(1)? != 0;
-                    let local_wp_header = WpHeaderIr::parse(&mut group_reader)?;
-                    let local_transform =
-                        parse_modular_transforms(&mut group_reader, source_topology, limits)?;
-                    let group_ma_config = if use_global_tree {
-                        if !has_global_ma_config {
-                            return unsupported(
-                                "a Modular LF group selects a global MA tree that is absent",
-                            );
-                        }
-                        ModularMaConfig::Global
-                    } else {
-                        ModularMaConfig::Local(parse_ma_config(
-                            &mut group_reader,
-                            MaTreeLimits::default(),
-                        )?)
-                    };
-                    let token_bit_end = section
-                        .bits
-                        .end()
-                        .ok_or_else(|| unsupported_error("Modular LF-group bit range overflow"))?;
-                    *slot = Some(ModularGroup {
-                        token_bit_offset: group_reader.bit_offset(),
-                        token_bit_end,
-                        x,
-                        y,
-                        width,
-                        height,
-                        stream_index: u32::try_from(
-                            1u64.checked_add(frame.low_frequency_group_count)
-                                .and_then(|value| value.checked_add(group_index))
-                                .ok_or_else(|| {
-                                    unsupported_error("Modular LF stream index overflow")
-                                })?,
-                        )
-                        .map_err(|_| unsupported_error("Modular LF stream index exceeds u32"))?,
-                    });
-                    lf_transform_plans[index] =
-                        Some((local_transform, local_wp_header, group_ma_config));
-                    lf_plane_targets[index] = Some(plane_targets);
-                }
-                (
-                    collect_required_entries(lf_groups, "LF-group stream")?,
-                    collect_required_entries(lf_transform_plans, "LF-group transform plan")?,
-                    collect_required_entries(lf_plane_targets, "LF-group plane targets")?,
-                )
-            } else {
-                validate_empty_lf_group_sections(codestream, frame)?;
-                (Vec::new(), Vec::new(), Vec::new())
-            };
-
-            let mut entropy_groups = lf_groups;
-            entropy_groups.extend_from_slice(&groups);
-            let mut entropy_transform_plans = lf_transform_plans;
-            entropy_transform_plans.extend(concrete_transform_plans);
-            let mut subimage_plane_targets = lf_plane_targets;
-            subimage_plane_targets.extend(group_plane_targets);
-            let frame_plan_seed = requires_frame_arena.then_some((
-                wp_header,
-                dc_ma_config,
-                global_channel_metadata,
-                frame_inverse_plan,
-                subimage_plane_targets,
-            ));
             (
-                groups,
-                entropy_groups,
-                entropy_transform_plans,
-                frame_plan_seed,
+                collect_required_entries(lf_groups, "LF-group stream")?,
+                collect_required_entries(lf_transform_plans, "LF-group transform plan")?,
+                collect_required_entries(lf_plane_targets, "LF-group plane targets")?,
             )
+        } else {
+            validate_empty_lf_group_sections(codestream, frame)?;
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
-    let low_frequency_entropy_group_count =
-        entropy_groups
-            .len()
-            .checked_sub(groups.len())
-            .ok_or(Error::EngineContract(
-                "Modular entropy groups do not contain the pass-group suffix",
-            ))?;
+        let groups = canvas_groups;
+        let mut entropy_groups = lf_groups;
+        let low_frequency_entropy_group_count = entropy_groups.len();
+        let mut entropy_transform_plans = lf_transform_plans;
+        let mut subimage_plane_targets = lf_plane_targets;
+        for pass_index in 0..pass_count {
+            for group_index in 0..group_count {
+                if let Some(group) = pass_groups[pass_index][group_index].take() {
+                    entropy_groups.push(group);
+                    entropy_transform_plans.push(
+                        pass_transform_plans[pass_index][group_index].take().ok_or(
+                            Error::EngineContract("Modular pass-group transform plan is missing"),
+                        )?,
+                    );
+                    subimage_plane_targets.push(
+                        pass_plane_targets[pass_index][group_index].take().ok_or(
+                            Error::EngineContract("Modular pass-group plane targets are missing"),
+                        )?,
+                    );
+                }
+            }
+        }
+        let frame_plan_seed = requires_frame_arena.then_some((
+            wp_header,
+            dc_ma_config,
+            global_channel_metadata,
+            frame_inverse_plan,
+            subimage_plane_targets,
+        ));
+        (
+            groups,
+            entropy_groups,
+            low_frequency_entropy_group_count,
+            entropy_transform_plans,
+            frame_plan_seed,
+        )
+    };
     let codestream_bits = codestream.logical_bits()?;
     for group in &entropy_groups {
         if group.width == 0
@@ -792,7 +854,7 @@ pub(crate) fn parse_standard_modular_profile(
         .and_then(|plan| plan.channel_metadata.channels.last())
         .map_or(0, |channel| channel.decoded_end);
     let global_stream = should_schedule_global_modular_stream(
-        expected_group_count != 1,
+        !single_entry,
         reader.bit_offset(),
         dc_end,
         global_decoded_words,
@@ -807,6 +869,7 @@ pub(crate) fn parse_standard_modular_profile(
         height: image.height,
         bits_per_sample,
         channels,
+        pass_count: frame.num_passes,
         group_columns,
         group_rows,
         groups,
@@ -827,6 +890,47 @@ const fn should_schedule_global_modular_stream(
     decoded_words: u32,
 ) -> bool {
     multi_group && (token_bit_offset < token_bit_end || decoded_words != 0)
+}
+
+fn modular_pass_stream_index(
+    low_frequency_group_count: u64,
+    group_count: u64,
+    pass_index: u64,
+    group_index: u64,
+) -> Result<u32> {
+    let stream_index = 18u64
+        .checked_add(
+            low_frequency_group_count
+                .checked_mul(3)
+                .ok_or_else(|| unsupported_error("Modular stream index overflow"))?,
+        )
+        .and_then(|value| {
+            pass_index
+                .checked_mul(group_count)
+                .and_then(|pass_offset| value.checked_add(pass_offset))
+        })
+        .and_then(|value| value.checked_add(group_index))
+        .ok_or_else(|| unsupported_error("Modular stream index overflow"))?;
+    u32::try_from(stream_index)
+        .map_err(|_| unsupported_error("Modular stream index exceeds u32").into())
+}
+
+fn validate_empty_pass_group_section(
+    codestream: &GpuCodestream,
+    section: jxl_gpu_bitstream::FrameSection,
+    pass_index: usize,
+    group_index: usize,
+) -> Result<()> {
+    let end = section
+        .bits
+        .end()
+        .ok_or_else(|| unsupported_error("Modular pass-group bit range overflow"))?;
+    if !codestream.bits_are_zero(section.bits.offset, end)? {
+        return unsupported(format!(
+            "the Modular pass-group {pass_index}/{group_index} has no assigned channels but is nonempty"
+        ));
+    }
+    Ok(())
 }
 
 fn collect_required_entries<T>(entries: Vec<Option<T>>, name: &'static str) -> Result<Vec<T>> {
@@ -884,11 +988,91 @@ struct ModularSubimageRegion {
     group_dimension: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModularPassShiftRange {
+    min_shift: u32,
+    max_shift: u32,
+}
+
+impl ModularPassShiftRange {
+    fn contains(self, shift: u32) -> bool {
+        (self.min_shift..self.max_shift).contains(&shift)
+    }
+}
+
+/// Builds the shift brackets used by `jxl-modular`'s `prepare_groups`.
+///
+/// A missing entry denotes a pass with no shift bracket. Such a pass still has a physical
+/// PassGroup section, but the section must be empty. The final pass is always assigned the
+/// remaining `[0, max_shift)` bracket, including when that bracket is empty.
+fn build_modular_pass_shift_ranges(
+    pass_count: u32,
+    downsampling: &[u32],
+    last_pass: &[u32],
+) -> Result<Vec<Option<ModularPassShiftRange>>> {
+    if pass_count == 0 {
+        return unsupported("the Modular frame declares zero progressive passes");
+    }
+    if downsampling.len() != last_pass.len()
+        || downsampling.len() >= usize::try_from(pass_count).unwrap_or(usize::MAX)
+    {
+        return unsupported("the Modular frame has inconsistent progressive-pass metadata");
+    }
+
+    let pass_count = usize::try_from(pass_count)
+        .map_err(|_| unsupported_error("Modular pass count exceeds host address space"))?;
+    let mut ranges = vec![None; pass_count];
+    let mut max_shift = 3;
+    for (&downsample, &pass) in downsampling.iter().zip(last_pass) {
+        if downsample == 0 {
+            return unsupported("the Modular frame has a zero progressive downsampling factor");
+        }
+        let pass = usize::try_from(pass).map_err(|_| {
+            unsupported_error("Modular progressive-pass index exceeds host address space")
+        })?;
+        let range = ranges.get_mut(pass).ok_or_else(|| {
+            unsupported_error("Modular progressive-pass index exceeds the pass count")
+        })?;
+        if range.is_some() {
+            return unsupported("the Modular frame has duplicate progressive-pass boundaries");
+        }
+        let min_shift = downsample.trailing_zeros();
+        if min_shift > max_shift {
+            return unsupported("the Modular frame has non-monotonic progressive downsampling");
+        }
+        *range = Some(ModularPassShiftRange {
+            min_shift,
+            max_shift,
+        });
+        max_shift = min_shift;
+    }
+    ranges[pass_count - 1] = Some(ModularPassShiftRange {
+        min_shift: 0,
+        max_shift,
+    });
+    Ok(ranges)
+}
+
+fn modular_pass_for_channel(
+    hshift: u32,
+    vshift: u32,
+    pass_ranges: &[Option<ModularPassShiftRange>],
+) -> Option<usize> {
+    if hshift >= 3 && vshift >= 3 {
+        return None;
+    }
+    let shift = hshift.min(vshift);
+    pass_ranges
+        .iter()
+        .position(|range| range.is_some_and(|range| range.contains(shift)))
+}
+
 fn grouped_subimage_topology(
     frame_topology: &ModularChannelTopology,
     frame_layout: &[GpuModularChannelLayout],
     global_channel_count: usize,
     region: ModularSubimageRegion,
+    pass_range: Option<ModularPassShiftRange>,
     limits: ModularTransformLimits,
 ) -> Result<(ModularChannelTopology, Vec<GpuModularChannelLayout>)> {
     if frame_topology.channels().len() != frame_layout.len()
@@ -914,6 +1098,11 @@ fn grouped_subimage_topology(
         };
         let low_frequency = hshift >= 3 && vshift >= 3;
         if low_frequency != (region.kind == ModularSubimageKind::LowFrequencyGroup) {
+            continue;
+        }
+        if region.kind == ModularSubimageKind::PassGroup
+            && !pass_range.is_some_and(|range| range.contains(hshift.min(vshift)))
+        {
             continue;
         }
         let (tile_hshift, tile_vshift) = if low_frequency {
@@ -1175,26 +1364,16 @@ fn validate_modular_section_structure(
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<()> {
     for section in &frame.sections {
-        match section.kind {
-            FrameSectionKind::HighFrequencyGlobal => {
-                let end = section
-                    .bits
-                    .end()
-                    .ok_or_else(|| unsupported_error("Modular section bit range overflow"))?;
-                if !codestream.bits_are_zero(section.bits.offset, end)? {
-                    return unsupported(
-                        "the lossless Modular profile requires an empty HF-global section",
-                    );
-                }
+        if section.kind == FrameSectionKind::HighFrequencyGlobal {
+            let end = section
+                .bits
+                .end()
+                .ok_or_else(|| unsupported_error("Modular section bit range overflow"))?;
+            if !codestream.bits_are_zero(section.bits.offset, end)? {
+                return unsupported(
+                    "the lossless Modular profile requires an empty HF-global section",
+                );
             }
-            FrameSectionKind::PassGroup { pass_index, .. } if pass_index != 0 => {
-                return Err(UnsupportedProfile::new(
-                    UnsupportedCodestreamFeature::MultiplePasses,
-                    "the lossless Modular GPU frontend accepts exactly one pass",
-                )
-                .into());
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -1246,7 +1425,8 @@ mod tests {
     use std::sync::Arc;
 
     use jxl_gpu_bitstream::{
-        FrameEncoding, FrameType, InventoryLimits, ParseLimits, StreamSlice, parse,
+        BitRange, FrameEncoding, FrameSection, FrameSectionKind, FrameType, InventoryLimits,
+        ParseLimits, StreamSlice, parse,
     };
 
     use super::*;
@@ -1256,6 +1436,105 @@ mod tests {
         assert!(should_schedule_global_modular_stream(true, 91, 91, 1));
         assert!(!should_schedule_global_modular_stream(true, 91, 91, 0));
         assert!(!should_schedule_global_modular_stream(false, 91, 92, 1));
+    }
+
+    #[test]
+    fn progressive_pass_ranges_match_jxl_modular_and_assign_asymmetric_shifts() {
+        let ranges = build_modular_pass_shift_ranges(3, &[8, 4], &[0, 1]).unwrap();
+        assert_eq!(
+            ranges,
+            vec![
+                Some(ModularPassShiftRange {
+                    min_shift: 3,
+                    max_shift: 3,
+                }),
+                Some(ModularPassShiftRange {
+                    min_shift: 2,
+                    max_shift: 3,
+                }),
+                Some(ModularPassShiftRange {
+                    min_shift: 0,
+                    max_shift: 2,
+                }),
+            ]
+        );
+        assert_eq!(modular_pass_for_channel(4, 0, &ranges), Some(2));
+        assert_eq!(modular_pass_for_channel(2, 4, &ranges), Some(1));
+        assert_eq!(modular_pass_for_channel(1, 1, &ranges), Some(2));
+        assert_eq!(modular_pass_for_channel(3, 3, &ranges), None);
+    }
+
+    #[test]
+    fn progressive_pass_ranges_keep_declared_empty_passes_empty() {
+        let ranges = build_modular_pass_shift_ranges(3, &[8], &[1]).unwrap();
+        assert_eq!(ranges[0], None);
+        assert_eq!(
+            ranges[1],
+            Some(ModularPassShiftRange {
+                min_shift: 3,
+                max_shift: 3,
+            })
+        );
+        assert_eq!(
+            ranges[2],
+            Some(ModularPassShiftRange {
+                min_shift: 0,
+                max_shift: 3,
+            })
+        );
+        assert_eq!(modular_pass_for_channel(2, 4, &ranges), Some(2));
+        assert_eq!(modular_pass_for_channel(0, 4, &ranges), Some(2));
+        assert_eq!(modular_pass_for_channel(3, 3, &ranges), None);
+
+        let limits = ModularTransformLimits::default();
+        let topology = ModularChannelTopology::new(
+            vec![ModularChannelGeometry::new(64, 16, 2, 4, 8)],
+            0,
+            limits,
+        )
+        .unwrap();
+        let layout = topology.gpu_layout().unwrap();
+        let (empty, targets) = grouped_subimage_topology(
+            &topology,
+            &layout,
+            0,
+            ModularSubimageRegion {
+                kind: ModularSubimageKind::PassGroup,
+                column: 0,
+                row: 0,
+                group_dimension: 256,
+            },
+            ranges[0],
+            limits,
+        )
+        .unwrap();
+        assert!(empty.channels().is_empty());
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn empty_pass_section_must_contain_only_zero_bits() {
+        let section = |bits: u64| FrameSection {
+            bitstream_index: 0,
+            toc_index: 0,
+            kind: FrameSectionKind::PassGroup {
+                pass_index: 0,
+                group_index: 0,
+            },
+            bytes: Default::default(),
+            bits: BitRange {
+                offset: 0,
+                length: bits,
+            },
+        };
+        let zero = GpuCodestream::from_spans([(0, StreamSlice::from_shared(Arc::from(vec![0u8])))])
+            .unwrap();
+        validate_empty_pass_group_section(&zero, section(8), 0, 0).unwrap();
+
+        let nonzero =
+            GpuCodestream::from_spans([(0, StreamSlice::from_shared(Arc::from(vec![0x80u8])))])
+                .unwrap();
+        assert!(validate_empty_pass_group_section(&nonzero, section(8), 0, 0).is_err());
     }
 
     #[test]
@@ -1281,6 +1560,10 @@ mod tests {
                 row: 0,
                 group_dimension: 256,
             },
+            Some(ModularPassShiftRange {
+                min_shift: 0,
+                max_shift: 3,
+            }),
             limits,
         )
         .unwrap();
@@ -1300,6 +1583,7 @@ mod tests {
                 row: 0,
                 group_dimension: 256,
             },
+            None,
             limits,
         )
         .unwrap();

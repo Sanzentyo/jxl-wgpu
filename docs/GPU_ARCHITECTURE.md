@@ -226,7 +226,11 @@ disjoint full-frame views. One shared inverse plan and one 144-byte finalizer th
 pass group. The frame arena, all subimage entropy/predictor state, inverse uniforms, and finalizer
 uniform share the same byte admission and device binding checks. Zero- and nonzero-sample DC-global
 Prefix/ANS ranges use the same exact termination logic; one map validates their status with every
-LF/pass subimage.
+LF/pass subimage. A one-to-three-pass frame uses the header's downsampling/last-pass brackets to
+assign every non-LF channel by `min(hshift, vshift)`. Empty passes retain their TOC sections but
+schedule no GPU entropy; nonempty streams execute in pass/group order before the one frame-wide
+inverse. This produces only the final image today, not an intermediate presentation after each
+pass.
 Each pass-group header independently selects the global MA configuration or supplies a bounded
 local tree, entropy tables, hybrid configs, context map, LZ77 parameters, and weighted-predictor
 header. Host lowering packs the global descriptor first, appends and rebases distinct locals,

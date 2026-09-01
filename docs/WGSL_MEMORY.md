@@ -325,8 +325,11 @@ by the same transient permit. `global_reconstruction_sample_words` exposes the D
 prefix separately. Channels with both shifts at least three use LF-group streams; channels with
 either shift below three use pass-group streams, including asymmetric shifts. The LF streams are
 scheduled first and share the same scratch lanes, bounded uploads, metadata inventory, and aggregate
-status map with the pass streams. Global/LF/HF image-frame streams remain unsupported because they
-require a recursive frame scheduler distinct from this subimage LF-group scheduler.
+status map with the pass streams. One through three declared passes assign channels through the
+header's shift brackets, schedule only nonempty subimages, and expose `progressive_pass_count`; empty
+physical sections are zero-validated without allocating a lane. Global/LF/HF image-frame streams
+remain unsupported because they require a recursive frame scheduler distinct from this subimage
+LF-group and intra-frame pass scheduler.
 
 ## Shader write bounds fixed by this audit
 

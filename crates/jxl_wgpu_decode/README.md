@@ -11,7 +11,7 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
 - one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
-  bounded 128/256/512/1024-pixel pass-group grid and one pass;
+  bounded 128/256/512/1024-pixel pass-group grid and one through three passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
   entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
@@ -22,7 +22,10 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
 Before submission the decoder inventories the standard image header, frame header, and TOC with
 explicit limits. It parses only the bounded DC-global and selected LF-group/pass-group-local MA trees,
 histogram descriptors, hybrid integer configuration, context maps, ordered Modular transform
-metadata, and pass-group ranges needed to build typed GPU metadata. RCT, Palette, and explicit or
+metadata, and pass-group ranges needed to build typed GPU metadata. The progressive schedule maps
+each non-LF transformed channel to exactly one pass through the normative
+`min(hshift, vshift)`/downsampling brackets; declared empty passes are retained in the public
+profile and their physical sections must contain only zero bits. RCT, Palette, and explicit or
 default Squeeze are meta-applied
 to an exact entropy-visible channel topology without decoding pixels. This accounts odd average/
 residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
@@ -121,18 +124,19 @@ proves that LZ history is invocation-private, the reconstruction lane retains on
 previous rows (512 physical words versus 65,536 logical sample words for a full 256x256 group).
 Wider LZ histories, native Modular output, RGB(A), and every other VPI mapping keep
 the complete logical reconstruction workspace and finalize through the generic output contract.
-`DecodeProfile::ModularLossless` reports this as `ModularPredictionProfile::MetaAdaptive` with
-exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
-engines use the distinct `Fixed` variant.
+`DecodeProfile::ModularLossless` reports the declared pass count and this specialization as
+`ModularPredictionProfile::MetaAdaptive` with exact node/decision/leaf counts, maximum depth, and
+self-correcting usage; custom synthetic engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
 channel topology are parsed, local MA trees select per-stream metadata bases, and resident
 RCT/Palette/Squeeze stacks execute for single- and multi-group streams. Multi-group DC-global
 Palette/Squeeze sample data is reconstructed in a frame arena. LF-group streams own exactly the
 channels whose horizontal and vertical transformed shifts are both at least three; pass groups own
-the remaining channels, including asymmetric shifts. LF streams execute before pass streams, all
-use the same bounded-window executor and aggregate status map, and one global inverse/finalizer runs
-after assembly. Global/LF/HF image streams, multiple passes, lossy/XYB Modular, non-alpha extra channels,
+the remaining channels, including asymmetric shifts. LF streams execute before nonempty pass
+streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
+one global inverse/finalizer runs after assembly. One through three passes produce an exact final
+image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular, non-alpha extra channels,
 patches, splines, noise, and
 reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from

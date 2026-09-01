@@ -172,6 +172,8 @@ pub struct WgpuDecodeMemoryStats {
     pub global_reconstruction_sample_words: u32,
     /// Nonempty LF-group Modular entropy streams scheduled before pass groups.
     pub low_frequency_group_stream_count: usize,
+    /// Progressive Modular passes declared by the frame header, including empty passes.
+    pub progressive_pass_count: u32,
     /// Number of ordered inverse RCT/Palette/Squeeze dispatches after entropy reconstruction.
     pub inverse_transform_count: usize,
     /// Palette dispatches included in `inverse_transform_count`, including bounded serial chunks.
@@ -983,6 +985,7 @@ impl WgpuSubmissionEngine {
                         rows: profile.group_rows,
                     }
                 },
+                passes: profile.pass_count,
             },
             AnimationMetadata::still(extent),
             WgpuDecodeSession {
@@ -1623,6 +1626,7 @@ struct GroupDispatchLayout {
     frame_modular_arena_bytes: u64,
     global_reconstruction_sample_words: u32,
     low_frequency_group_stream_count: usize,
+    progressive_pass_count: u32,
     inverse_transform_count: usize,
     palette_dispatch_count: usize,
     inverse_transform_uniform_bytes: u64,
@@ -2019,6 +2023,7 @@ impl GroupDispatchLayout {
             frame_modular_arena_bytes,
             global_reconstruction_sample_words,
             low_frequency_group_stream_count: profile.low_frequency_entropy_group_count,
+            progressive_pass_count: profile.pass_count,
             inverse_transform_count,
             palette_dispatch_count,
             inverse_transform_uniform_bytes,
@@ -3033,6 +3038,7 @@ fn validate_device_limits(
         frame_modular_arena_bytes: dispatch.frame_modular_arena_bytes,
         global_reconstruction_sample_words: dispatch.global_reconstruction_sample_words,
         low_frequency_group_stream_count: dispatch.low_frequency_group_stream_count,
+        progressive_pass_count: dispatch.progressive_pass_count,
         inverse_transform_count: dispatch.inverse_transform_count,
         palette_dispatch_count: dispatch.palette_dispatch_count,
         inverse_transform_uniform_bytes: dispatch.inverse_transform_uniform_bytes,

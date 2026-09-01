@@ -1163,6 +1163,7 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
     match profile {
         DecodeProfile::ModularLossless {
             bits_per_sample: 1..=16,
+            passes: 1..=3,
             prediction,
             ..
         } => match prediction {
@@ -1185,7 +1186,7 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
             )),
         },
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
-            "lossless Modular profile must use 1 through 16 bits per sample",
+            "lossless Modular profile must use 1 through 16 bits per sample and 1 through 3 passes",
         )),
         DecodeProfile::VarDct { bits_per_sample: 8 } => Ok(()),
         DecodeProfile::VarDct { .. } => Err(Error::EngineContract(
@@ -1265,5 +1266,23 @@ mod tests {
         );
         assert!(validate_total_input_size(17, engine).is_err());
         assert!(validate_total_input_size(16, engine).is_ok());
+    }
+
+    #[test]
+    fn modular_profile_accepts_only_the_negotiated_progressive_pass_range() {
+        let profile = |passes| DecodeProfile::ModularLossless {
+            bits_per_sample: 8,
+            channels: crate::ModularChannels::Gray,
+            prediction: crate::ModularPredictionProfile::Fixed {
+                predictor: crate::ModularPredictor::Gradient,
+            },
+            grouping: crate::ModularGrouping::SingleGroup,
+            passes,
+        };
+        for passes in 1..=3 {
+            validate_profile(profile(passes)).unwrap();
+        }
+        assert!(validate_profile(profile(0)).is_err());
+        assert!(validate_profile(profile(4)).is_err());
     }
 }

@@ -1260,7 +1260,7 @@ fn cjxl_multigroup_global_palette_is_exact_through_frame_resident_inverse() {
 }
 
 #[test]
-fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
+fn cjxl_progressive_multigroup_squeeze_is_exact_through_frame_resident_inverse() {
     if Command::new("cjxl").arg("--version").output().is_err() {
         eprintln!("skipping cjxl global Squeeze conformance: cjxl is not installed");
         return;
@@ -1304,6 +1304,7 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
             "1",
             "-e",
             "9",
+            "-p",
             "-R",
             "1",
             "-x",
@@ -1317,6 +1318,14 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
         String::from_utf8_lossy(&command.stderr)
     );
     let encoded = std::fs::read(&encoded_path).expect("read cjxl global Squeeze codestream");
+    let inventory = jxl_gpu_bitstream::parse(&encoded, Default::default())
+        .expect("parse progressive Squeeze container")
+        .codestream_inventory(jxl_gpu_bitstream::InventoryLimits::default())
+        .expect("inventory progressive Squeeze codestream");
+    assert_eq!(inventory.frames.len(), 1);
+    assert_eq!(inventory.frames[0].num_passes, 2);
+    assert_eq!(inventory.frames[0].progressive_passes.downsampling, [2]);
+    assert_eq!(inventory.frames[0].progressive_passes.last_pass, [0]);
     let (oracle_extent, oracle) =
         rust_jxl_decode_gray8(&encoded).expect("Rust jxl decodes global Squeeze fixture");
     assert_eq!(oracle_extent, (width as usize, height as usize));
@@ -1330,7 +1339,11 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
     .unwrap();
     let mut session = decoder
         .open(&encoded, request)
-        .expect("GPU decoder accepts the cjxl global Squeeze transform");
+        .expect("GPU decoder accepts the cjxl progressive Squeeze transform");
+    assert!(matches!(
+        session.profile(),
+        jxl_wgpu_decode::DecodeProfile::ModularLossless { passes: 2, .. }
+    ));
     let stats = session
         .submission_session()
         .modular()
@@ -1339,6 +1352,7 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
     assert!(stats.global_reconstruction_sample_words > 0);
     assert!(stats.frame_modular_arena_bytes > 0);
     assert_eq!(stats.low_frequency_group_stream_count, 2);
+    assert_eq!(stats.progressive_pass_count, 2);
     assert_eq!(stats.palette_dispatch_count, 0);
     assert!(stats.inverse_transform_count > 0);
     let frame = session

@@ -52,6 +52,7 @@ fn fixed_profile(bits_per_sample: u8, predictor: ModularPredictor) -> DecodeProf
         channels: ModularChannels::Gray,
         prediction: ModularPredictionProfile::Fixed { predictor },
         grouping: ModularGrouping::SingleGroup,
+        passes: 1,
     }
 }
 
