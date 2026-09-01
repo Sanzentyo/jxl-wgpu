@@ -90,6 +90,11 @@ var<private> target_kind: u32;
 var<private> target_offset: u32;
 var<private> target_stride: u32;
 var<private> consumer_decoded: u32;
+var<private> packet_phase: u32;
+var<private> packet_lf_decoded: u32;
+var<private> packet_hf_decoded: u32;
+var<private> packet_first_blocks: u32;
+var<private> packet_extra_precision: u32;
 
 const STATUS_OK: u32 = 1u;
 const STATUS_IN_PROGRESS: u32 = 14u;
@@ -115,6 +120,8 @@ const STATUS_LF_READY: u32 = 30u;
 const WINDOW_FIRST: u32 = 1u;
 const WINDOW_FINAL: u32 = 2u;
 const WINDOW_ENABLED: u32 = 4u;
+const PACKET_PHASE_LF: u32 = 1u;
+const PACKET_PHASE_HF: u32 = 2u;
 
 fn reconstruction_load(index: u32) -> u32 {
     return reconstructed[reconstruction_base + index];
@@ -197,6 +204,11 @@ fn load_packet_execution_state() {
     entropy_last_value = reconstruction_load(base + 5u);
     consumer_decoded = reconstruction_load(base + 6u);
     decode_error = reconstruction_load(base + 7u);
+    packet_phase = reconstruction_load(base + 8u);
+    packet_lf_decoded = reconstruction_load(base + 9u);
+    packet_hf_decoded = reconstruction_load(base + 10u);
+    packet_first_blocks = reconstruction_load(base + 11u);
+    packet_extra_precision = reconstruction_load(base + 12u);
     predictor_prev_grad = bitcast<i32>(reconstruction_load(base + 13u));
     if params.needs_self_correcting == 0u {
         return;
@@ -222,8 +234,11 @@ fn save_packet_execution_state(error_code: u32) {
     reconstruction_store(base + 5u, entropy_last_value);
     reconstruction_store(base + 6u, consumer_decoded);
     reconstruction_store(base + 7u, error_code);
-    // Words 8..12 are reserved for the combined LF/HF phase state introduced by the next
-    // packet-resume stage. Keeping them in this ABI avoids another layout transition.
+    reconstruction_store(base + 8u, packet_phase);
+    reconstruction_store(base + 9u, packet_lf_decoded);
+    reconstruction_store(base + 10u, packet_hf_decoded);
+    reconstruction_store(base + 11u, packet_first_blocks);
+    reconstruction_store(base + 12u, packet_extra_precision);
     reconstruction_store(base + 13u, bitcast<u32>(predictor_prev_grad));
     if params.needs_self_correcting == 0u {
         return;
@@ -397,20 +412,17 @@ fn decode_lf_channels() -> u32 {
     return decoded;
 }
 
-fn decode_lf_channels_bounded() -> u32 {
+fn configure_lf_channels() {
     let block_count = control.geometry.z * control.geometry.w;
     params.sample_count = block_count;
     params.source_channels = 3u;
     params.width = control.geometry.z;
     params.height = control.geometry.w;
-    if window_is_first() {
-        bit_cursor = params.entropy.token_start;
-        consumer_decoded = 0u;
-        decode_error = 0u;
-        entropy_begin();
-    } else {
-        load_packet_execution_state();
-    }
+}
+
+fn continue_lf_channels_bounded() -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    configure_lf_channels();
     current_channel = consumer_decoded / block_count;
     while current_channel < 3u && decode_error == 0u && !window_should_pause() {
         let channel_start = current_channel * block_count;
@@ -434,6 +446,19 @@ fn decode_lf_channels_bounded() -> u32 {
         current_channel += 1u;
     }
     return consumer_decoded;
+}
+
+fn decode_lf_channels_bounded() -> u32 {
+    configure_lf_channels();
+    if window_is_first() {
+        bit_cursor = params.entropy.token_start;
+        consumer_decoded = 0u;
+        decode_error = 0u;
+        entropy_begin();
+    } else {
+        load_packet_execution_state();
+    }
+    return continue_lf_channels_bounded();
 }
 
 fn finish_bounded_lf(lf_decoded: u32) -> u32 {
@@ -526,7 +551,7 @@ fn decode_hf_channels(first_blocks: u32) -> u32 {
     return decoded;
 }
 
-fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
+fn configure_hf_channels(first_blocks: u32) {
     let block_count = control.geometry.z * control.geometry.w;
     let correlation_width = (control.geometry.x + 63u) / 64u;
     let correlation_height = (control.geometry.y + 63u) / 64u;
@@ -536,14 +561,14 @@ fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
     params.source_channels = 1u;
     params.width = correlation_width;
     params.height = correlation_height;
-    if window_is_first() {
-        bit_cursor = params.entropy.token_start;
-        consumer_decoded = 0u;
-        decode_error = 0u;
-        entropy_begin();
-    } else {
-        load_packet_execution_state();
-    }
+}
+
+fn continue_hf_channels_bounded(first_blocks: u32) -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    let correlation_width = (control.geometry.x + 63u) / 64u;
+    let correlation_height = (control.geometry.y + 63u) / 64u;
+    let correlation_samples = correlation_width * correlation_height;
+    configure_hf_channels(first_blocks);
     if first_blocks == 0u || first_blocks > control.capacities.w {
         reject(ERROR_FIRST_BLOCK, first_blocks);
         return consumer_decoded;
@@ -592,6 +617,19 @@ fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
         current_channel += 1u;
     }
     return consumer_decoded;
+}
+
+fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
+    configure_hf_channels(first_blocks);
+    if window_is_first() {
+        bit_cursor = params.entropy.token_start;
+        consumer_decoded = 0u;
+        decode_error = 0u;
+        entropy_begin();
+    } else {
+        load_packet_execution_state();
+    }
+    return continue_hf_channels_bounded(first_blocks);
 }
 
 fn validate_hf_values(first_blocks: u32) {
@@ -710,6 +748,128 @@ fn clear_coefficients() {
     }
 }
 
+fn save_bounded_packet_error() -> u32 {
+    if !window_is_final() {
+        save_packet_execution_state(decode_error);
+    }
+    return decode_error;
+}
+
+fn pause_bounded_packet() -> u32 {
+    if window_is_final() {
+        return ERROR_TRUNCATED_BITS;
+    }
+    save_packet_execution_state(0u);
+    return STATUS_IN_PROGRESS;
+}
+
+fn decode_combined_packet_bounded() -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    let expected_lf_samples = 3u * block_count;
+    if window_is_first() {
+        bit_cursor = params.entropy.token_start;
+        decode_error = 0u;
+        consumer_decoded = 0u;
+        packet_phase = PACKET_PHASE_LF;
+        packet_lf_decoded = 0u;
+        packet_hf_decoded = 0u;
+        packet_first_blocks = 0u;
+        packet_extra_precision = read_bits(2u);
+        if read_bits(4u) != 3u {
+            reject(ERROR_LF_HEADER, bit_cursor);
+        }
+        params.stream_index = control.streams.x;
+        configure_lf_channels();
+        entropy_begin();
+    } else {
+        load_packet_execution_state();
+    }
+    if decode_error != 0u {
+        return save_bounded_packet_error();
+    }
+
+    if packet_phase == PACKET_PHASE_LF {
+        params.stream_index = control.streams.x;
+        packet_lf_decoded = continue_lf_channels_bounded();
+        if decode_error != 0u {
+            return save_bounded_packet_error();
+        }
+        if packet_lf_decoded != expected_lf_samples {
+            return pause_bounded_packet();
+        }
+        entropy_finalize();
+        if decode_error != 0u {
+            return save_bounded_packet_error();
+        }
+
+        packet_first_blocks = read_bits(control.capacities.z) + 1u;
+        if packet_first_blocks > control.capacities.w {
+            reject(ERROR_FIRST_BLOCK, packet_first_blocks);
+        }
+        if read_bits(4u) != 3u {
+            reject(ERROR_HF_HEADER, bit_cursor);
+        }
+        if decode_error != 0u {
+            return save_bounded_packet_error();
+        }
+        packet_phase = PACKET_PHASE_HF;
+        packet_hf_decoded = 0u;
+        consumer_decoded = 0u;
+        params.stream_index = control.streams.y;
+        configure_hf_channels(packet_first_blocks);
+        entropy_begin();
+        if decode_error != 0u {
+            return save_bounded_packet_error();
+        }
+    }
+
+    if packet_phase != PACKET_PHASE_HF {
+        reject(ERROR_RAW_TOKEN, packet_phase);
+        return save_bounded_packet_error();
+    }
+    params.stream_index = control.streams.y;
+    packet_hf_decoded = continue_hf_channels_bounded(packet_first_blocks);
+    if decode_error != 0u {
+        return save_bounded_packet_error();
+    }
+    let correlation_samples = ((control.geometry.x + 63u) / 64u)
+        * ((control.geometry.y + 63u) / 64u);
+    let expected_hf_samples = 2u * correlation_samples
+        + 2u * packet_first_blocks
+        + block_count;
+    if packet_hf_decoded != expected_hf_samples {
+        return pause_bounded_packet();
+    }
+    if !window_is_final() {
+        return pause_bounded_packet();
+    }
+    entropy_finalize();
+    validate_hf_values(packet_first_blocks);
+    finish_bounded_hf_packet();
+    clear_coefficients();
+    return select(STATUS_OK, decode_error, decode_error != 0u);
+}
+
+fn write_bounded_combined_status(status_code: u32) {
+    status[0] = status_code;
+    status[1] = params.stream_base_bit + bit_cursor;
+    status[2] = params.stream_base_bit + params.stream_token_end;
+    if control.streams.z != 0u && status_code == STATUS_OK {
+        status[1] = control.section_bits.w;
+        status[2] = control.section_bits.w;
+    }
+    status[3] = packet_lf_decoded;
+    status[4] = packet_hf_decoded;
+    status[5] = raw_metadata[control.offsets.z];
+    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[7] = control.capacities.x;
+    status[8] = select(status[8], 0u, status_code == STATUS_OK);
+    status[9] = control.quantization.x;
+    status[10] = control.quantization.y;
+    status[11] = packet_first_blocks;
+    status[12] = packet_extra_precision;
+}
+
 @compute @workgroup_size(1, 1, 1)
 fn decode_vardct_lf() {
     params = params_input[0];
@@ -775,6 +935,13 @@ fn decode_vardct_hf() {
 
 @compute @workgroup_size(1, 1, 1)
 fn decode_vardct_packet() {
+    params = params_input[0];
+    reconstruction_base = 0u;
+    if bounded_window_enabled() {
+        params.source_mask = 0x7fffffffu;
+        write_bounded_combined_status(decode_combined_packet_bounded());
+        return;
+    }
     initialize_packet(control.section_bits.x, control.section_bits.y, control.streams.x);
     params.source_channels = 3u;
 

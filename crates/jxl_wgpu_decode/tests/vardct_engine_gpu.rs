@@ -11,7 +11,7 @@ use jxl_gpu_bitstream::{
     RestorationFilterInventory,
 };
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
     ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
@@ -541,6 +541,142 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
 }
 
 #[test]
+fn combined_single_packet_resumes_across_bounded_gpu_windows() {
+    let Some((info, device, queue)) = device() else {
+        eprintln!("skipping combined VarDCT packet oracle: no adapter");
+        return;
+    };
+    let context = WgpuContext::new(Arc::new(device.clone()), Arc::new(queue.clone())).unwrap();
+    let extent = Extent2d::new(32, 32);
+    let encoded = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct32x32)
+        .unwrap()
+        .encode(tiled_source(&context, extent))
+        .unwrap();
+    let parsed = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+    assert_eq!(plan.uniform_transform, Some(TransformKind::Dct32x32));
+    assert!(plan.hf_global.is_none());
+    assert!(!plan.requires_local_tree_staging());
+
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::new(
+        WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
+    );
+    let mut session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let vardct = session.submission_session().vardct().unwrap();
+    let memory = vardct.memory_stats();
+    assert!(!memory.deferred_hf_modular_metadata);
+    assert!(memory.packet_stream_window_bytes > 0);
+    assert!(memory.packet_stream_window_bytes <= 40);
+    assert!(memory.packet_stream_batch_count > 2);
+    assert_eq!(
+        vardct.submissions_per_frame(),
+        memory.packet_stream_batch_count
+    );
+
+    let frame = pollster::block_on(session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(&encoded, extent);
+    assert!(maximum_error(actual, &rust) <= 1);
+    if let Some(djxl) = djxl_ppm(&encoded, extent) {
+        assert!(maximum_error(actual, &djxl) <= 1);
+    }
+    drop(readback);
+    drop(frame);
+    drop(session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend.device().poll(wgpu::PollType::Poll).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let group = plan.groups.first().unwrap();
+    let stream_start = u64::from(plan.entropy_bit_offset);
+    let stream_end = group.lf_group.end().unwrap();
+    let damage_bit = stream_start + (stream_end - stream_start) * 17 / 20;
+    let damage_start = usize::try_from(damage_bit / 8).unwrap();
+    let damage_end = (damage_start + 8).min(usize::try_from(stream_end.div_ceil(8)).unwrap());
+    let mut damaged = encoded.clone();
+    for byte in &mut damaged[damage_start..damage_end] {
+        *byte ^= 0xa5;
+    }
+    let mut damaged_session = decoder
+        .open(
+            &damaged,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let error = damaged_session.next_frame().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            DecodeError::VarDct(VarDctDecodeError::PacketGpu(
+                GpuVarDctPacketError::Entropy { .. }
+            ))
+        ),
+        "unexpected combined-packet corruption error: {error:?}"
+    );
+    drop(damaged_session);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+}
+
+#[test]
 fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
     let Some((info, device, queue)) = device() else {
         eprintln!("skipping tiled VarDCT engine oracle: no adapter");
@@ -729,7 +865,7 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
 }
 
 #[test]
-fn nonzero_ac_resumes_across_bounded_gpu_stream_windows() {
+fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let Some((info, device, queue)) = device() else {
         return;
     };
@@ -759,12 +895,15 @@ fn nonzero_ac_resumes_across_bounded_gpu_stream_windows() {
         .unwrap();
     let vardct = session.submission_session().vardct().unwrap();
     let memory = vardct.memory_stats();
+    assert!(memory.packet_stream_window_bytes > 0);
+    assert!(memory.packet_stream_window_bytes <= 256);
+    assert!(memory.packet_stream_batch_count > 1);
     assert!(memory.hf_stream_window_bytes > 0);
     assert!(memory.hf_stream_window_bytes <= 256);
     assert!(memory.hf_stream_batch_count > 6);
     assert_eq!(
         vardct.submissions_per_frame(),
-        memory.hf_stream_batch_count + 2
+        memory.packet_stream_batch_count - 1 + memory.hf_stream_batch_count + 2
     );
     let frame = session.next_frame().unwrap().unwrap();
     let readback = ImageReadbackPipeline::new(&backend)
@@ -992,7 +1131,11 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
     }
 }
 
-fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
+fn assert_multiple_lf_groups(
+    encoded: &[u8],
+    adaptive_lf_smoothing: bool,
+    stream_window_limit: Option<NonZeroU64>,
+) {
     let Some((info, device, queue)) = device() else {
         return;
     };
@@ -1033,7 +1176,12 @@ fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    let engine = match stream_window_limit {
+        Some(limit) => engine.with_stream_window_limit(limit),
+        None => engine,
+    };
+    let decoder = GpuDecoder::new(engine);
     let mut session = decoder
         .open(
             encoded,
@@ -1045,7 +1193,23 @@ fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
         .vardct()
         .expect("multiple LF groups select the VarDCT submission session");
     let memory = vardct.memory_stats();
-    assert_eq!(vardct.submissions_per_frame(), 1);
+    if let Some(stream_window_limit) = stream_window_limit {
+        assert!(!memory.deferred_hf_modular_metadata);
+        assert!(memory.packet_stream_window_bytes > 0);
+        assert!(memory.packet_stream_window_bytes <= stream_window_limit.get());
+        assert!(memory.packet_stream_batch_count > 2);
+        let downstream_submissions = if memory.hf_stream_window_bytes == 0 {
+            1
+        } else {
+            memory.hf_stream_batch_count + 2
+        };
+        assert_eq!(
+            vardct.submissions_per_frame(),
+            memory.packet_stream_batch_count - 1 + downstream_submissions,
+        );
+    } else {
+        assert_eq!(vardct.submissions_per_frame(), 1);
+    }
     assert_eq!(memory.packet_status_bytes, 2 * 64);
     assert_eq!(memory.adaptive_lf_uniform_bytes != 0, adaptive_lf_smoothing,);
     assert_eq!(
@@ -1056,7 +1220,13 @@ fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
             + memory.hf_status_bytes,
     );
 
-    let frame = session.next_frame().unwrap().unwrap();
+    let frame = if stream_window_limit.is_some() {
+        pollster::block_on(session.next_frame_async())
+            .unwrap()
+            .unwrap()
+    } else {
+        session.next_frame().unwrap().unwrap()
+    };
     let readback = ImageReadbackPipeline::new(&backend)
         .submit(frame.output())
         .unwrap()
@@ -1081,7 +1251,16 @@ fn assert_multiple_lf_groups(encoded: &[u8], adaptive_lf_smoothing: bool) {
 
 #[test]
 fn standard_multiple_lf_groups_share_one_resident_image_and_status_map() {
-    assert_multiple_lf_groups(common::testsrc_vardct_multi_lf(), true);
+    assert_multiple_lf_groups(common::testsrc_vardct_multi_lf(), true, None);
+}
+
+#[test]
+fn shared_global_tree_packets_resume_across_bounded_gpu_windows() {
+    assert_multiple_lf_groups(
+        common::testsrc_vardct_multi_lf(),
+        true,
+        NonZeroU64::new(256),
+    );
 }
 
 #[test]
@@ -1123,14 +1302,14 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     assert!(memory.deferred_hf_modular_metadata);
     assert!(memory.packet_stream_window_bytes > 0);
     assert!(memory.packet_stream_window_bytes <= 256);
-    assert!(memory.lf_packet_stream_batch_count > 2);
+    assert!(memory.packet_stream_batch_count > 2);
     assert_eq!(memory.packet_execution_state_bytes, 2 * 128);
     let downstream_submissions = if memory.hf_stream_window_bytes == 0 {
         1
     } else {
         memory.hf_stream_batch_count + 2
     };
-    let submissions_before_hf_plan = memory.lf_packet_stream_batch_count + downstream_submissions;
+    let submissions_before_hf_plan = memory.packet_stream_batch_count + downstream_submissions;
     assert_eq!(vardct.submissions_per_frame(), submissions_before_hf_plan);
 
     session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
@@ -1272,7 +1451,11 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
 
 #[test]
 fn multiple_lf_groups_can_skip_adaptive_smoothing_without_a_cpu_copy() {
-    assert_multiple_lf_groups(common::testsrc_vardct_multi_lf_skip_smoothing(), false);
+    assert_multiple_lf_groups(
+        common::testsrc_vardct_multi_lf_skip_smoothing(),
+        false,
+        None,
+    );
 }
 
 #[test]

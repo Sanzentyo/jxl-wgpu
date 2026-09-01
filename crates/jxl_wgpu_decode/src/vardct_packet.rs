@@ -1587,6 +1587,12 @@ const _: () = {
     assert!(std::mem::align_of::<VarDctModularParams>() == 16);
     assert!(std::mem::size_of::<PacketExecutionStatePrefix>() == 56);
     assert!(std::mem::align_of::<PacketExecutionStatePrefix>() == 4);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, packet_phase) == 32);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, lf_decoded) == 36);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, hf_decoded) == 40);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, first_blocks) == 44);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, extra_precision) == 48);
+    assert!(std::mem::offset_of!(PacketExecutionStatePrefix, predictor_prev_grad) == 52);
     assert!(std::mem::size_of::<GenericPacketExecutionState>() == 64);
     assert!(std::mem::align_of::<GenericPacketExecutionState>() == 16);
     assert!(std::mem::size_of::<WeightedPacketExecutionState>() == 128);

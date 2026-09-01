@@ -74,8 +74,8 @@ Every accepted stock Modular reconstruction specialization supports intra-group 
 A consumer-neutral entropy-window planner owns byte-range validation, four-byte packing, sentinel
 space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
 their own resume records and dispatch ordering. The Modular engine, VarDCT AC pass-group consumer,
-and staged local-tree VarDCT LF/HF packet consumers use it in production; combined/global-tree
-packets and recursive streams remain `ENT-D02` work. The planner resolves one upload cap from the
+and combined/global-tree plus staged local-tree VarDCT packet consumers use it in production;
+recursive streams remain `ENT-D02` work. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
@@ -101,8 +101,11 @@ After the aggregate LF cursor map, the host packs each HF descriptor and builds 
 against the same retained codestream and shared packet upload. HF reuses the packet state
 sequentially, persists progress across its two correlation maps, strategy/quantizer plane, and
 sharpness plane, and performs fixed-tail validation only on its final segment. The last HF command
-shares the first downstream queue submission. Combined/global-tree packet consumers still require
-one complete entropy range.
+shares the first downstream queue submission. Combined single-entry and shared-global-tree packets
+need no cursor map: their known range starts at `section_bits.x`, including extra precision and the
+LF local header. Five words in the same state retain LF/HF phase, both decoded counts, first-block
+count, and extra precision across the three LF and four HF channels. Only the final segment validates
+the packet tail, and its command shares the first downstream queue submission.
 
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local

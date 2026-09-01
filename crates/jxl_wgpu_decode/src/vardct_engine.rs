@@ -206,8 +206,9 @@ pub struct VarDctDecodeMemoryStats {
     /// Reusable upload shared by staged local-tree LF and HF packet entropy. Zero when every
     /// packet binds the retained whole codestream.
     pub packet_stream_window_bytes: u64,
-    /// Ordered staged-LF submissions when the reusable packet upload is active.
-    pub lf_packet_stream_batch_count: usize,
+    /// Ordered initial packet batches. For local trees this is the staged-LF count; for a
+    /// combined/global-tree packet it covers the complete LF/HF packet.
+    pub packet_stream_batch_count: usize,
     /// Resume records included in `reconstructed_bytes`, reported separately for ABI auditing.
     pub packet_execution_state_bytes: u64,
     pub lf_temporary_bytes: u64,
@@ -250,6 +251,7 @@ impl VarDctDecodeMemoryStats {
             packet,
             groups,
             lf_packet_windows,
+            combined_packet_windows,
             resource,
             hf_coefficients,
             adaptive_lf_smoothing,
@@ -412,9 +414,15 @@ impl VarDctDecodeMemoryStats {
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "Modular parameter bytes",
             })?;
-        let packet_stream_window_bytes = lf_packet_windows.map_or(0, |plan| plan.stream_bytes);
-        let lf_packet_stream_batch_count =
-            lf_packet_windows.map_or(0, LfPacketWindowExecutionPlan::batch_count);
+        debug_assert!(lf_packet_windows.is_none() || combined_packet_windows.is_none());
+        let packet_stream_window_bytes = lf_packet_windows
+            .map(|plan| plan.stream_bytes)
+            .or_else(|| combined_packet_windows.map(|plan| plan.stream_bytes))
+            .unwrap_or(0);
+        let packet_stream_batch_count = lf_packet_windows
+            .map(LfPacketWindowExecutionPlan::batch_count)
+            .or_else(|| combined_packet_windows.map(CombinedPacketWindowExecutionPlan::batch_count))
+            .unwrap_or(0);
         let packet_execution_state_bytes = packet
             .groups
             .iter()
@@ -568,7 +576,7 @@ impl VarDctDecodeMemoryStats {
             packet_control_bytes,
             modular_params_bytes,
             packet_stream_window_bytes,
-            lf_packet_stream_batch_count,
+            packet_stream_batch_count,
             packet_execution_state_bytes,
             lf_temporary_bytes,
             resource_bytes,
@@ -606,6 +614,7 @@ struct VarDctDecodeMemoryInputs<'a> {
     packet: &'a BoundedVarDctPacketPlan,
     groups: &'a [VarDctGroupSource],
     lf_packet_windows: Option<&'a LfPacketWindowExecutionPlan>,
+    combined_packet_windows: Option<&'a CombinedPacketWindowExecutionPlan>,
     resource: VarDctResourceLayout,
     hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
     adaptive_lf_smoothing: bool,
@@ -711,8 +720,8 @@ impl VarDctSubmissionEngine {
 
     /// Caps reusable VarDCT entropy uploads.
     ///
-    /// AC pass groups and staged local-tree LF/HF packets enforce this cap. Combined/global-tree
-    /// consumers will adopt the same policy as their resume state machines land.
+    /// Combined/global-tree packets, staged local-tree LF/HF packets, and AC pass groups enforce
+    /// this cap. Recursive entropy streams will adopt the same policy with their resume state.
     #[must_use]
     pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
         self.stream_window_limit = Some(limit);
@@ -787,6 +796,7 @@ struct VarDctSource {
     packet: BoundedVarDctPacketPlan,
     groups: Vec<VarDctGroupSource>,
     lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
+    combined_packet_windows: Option<CombinedPacketWindowExecutionPlan>,
     stream_limit: u64,
     resource_layout: VarDctResourceLayout,
     hf_coefficients: Option<HfCoefficientExecutionPlan>,
@@ -802,6 +812,14 @@ struct VarDctSource {
 
 #[derive(Clone, Debug)]
 struct LfPacketWindowExecutionPlan {
+    stream_segments: Arc<[GroupStreamSegment]>,
+    stream_batches: Arc<[StreamBatch]>,
+    segment_params: Arc<[VarDctModularParams]>,
+    stream_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CombinedPacketWindowExecutionPlan {
     stream_segments: Arc<[GroupStreamSegment]>,
     stream_batches: Arc<[StreamBatch]>,
     segment_params: Arc<[VarDctModularParams]>,
@@ -893,6 +911,74 @@ impl LfPacketWindowExecutionPlan {
     }
 }
 
+impl CombinedPacketWindowExecutionPlan {
+    fn new(
+        codestream: &[u8],
+        packet: &BoundedVarDctPacketPlan,
+        stream_limit: u64,
+    ) -> Result<Option<Self>, VarDctDecodeError> {
+        let mut stream_bases = Vec::with_capacity(packet.groups.len());
+        let ranges = packet
+            .groups
+            .iter()
+            .map(|group| {
+                let control = group.packet_control(packet)?;
+                let token_bit_offset = u64::from(control.section_bits[0]);
+                let token_bit_end = u64::from(control.section_bits[1]);
+                stream_bases.push(control.section_bits[0]);
+                Ok(GroupEntropyRange {
+                    token_bit_offset,
+                    token_bit_end,
+                })
+            })
+            .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
+        let (segments, batches, stream_bytes) = build_stream_batches(
+            codestream,
+            &ranges,
+            stream_limit,
+            packet.groups.len().max(1),
+        )
+        .map_err(map_packet_window_plan_error)?;
+        let uses_windows = segments.iter().any(|segment| {
+            segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
+        });
+        if !uses_windows {
+            return Ok(None);
+        }
+        let mut segment_params = Vec::with_capacity(segments.len());
+        for &segment in &segments {
+            let group = packet.groups.get(segment.group_index).ok_or(
+                VarDctDecodeError::EntropyWindowContract {
+                    detail: "combined packet segment references an absent group",
+                },
+            )?;
+            let stream_base_bit = *stream_bases.get(segment.group_index).ok_or(
+                VarDctDecodeError::EntropyWindowContract {
+                    detail: "combined packet segment has no stream base",
+                },
+            )?;
+            let state_offset =
+                group.packet_execution_state_offset_words(packet.needs_self_correcting)?;
+            segment_params.push(
+                VarDctModularParams::default()
+                    .with_lz77_window(group.lz77_window_words)
+                    .with_self_correcting(packet.needs_self_correcting)
+                    .with_stream_segment(segment, stream_base_bit, state_offset),
+            );
+        }
+        Ok(Some(Self {
+            stream_segments: segments.into(),
+            stream_batches: batches.into(),
+            segment_params: segment_params.into(),
+            stream_bytes,
+        }))
+    }
+
+    fn batch_count(&self) -> usize {
+        self.stream_batches.len()
+    }
+}
+
 impl HfPacketWindowExecutionPlan {
     fn new(
         codestream: &[u8],
@@ -976,15 +1062,19 @@ impl VarDctSource {
         } else {
             0
         };
+        let combined_packet_extra = self
+            .combined_packet_windows
+            .as_ref()
+            .map_or(0, |plan| plan.batch_count().saturating_sub(1));
         if let Some(coefficients) = &self.hf_coefficients
             && coefficients.uses_bounded_stream_windows()
         {
             // Packet/pre-coefficient work, one ordered submission per reusable upload, then the
             // resident inverse-transform/render/status tail. Local-tree frames additionally map
             // their LF cursors before this sequence.
-            local_lf + 2 + coefficients.stream_batch_count()
+            local_lf + combined_packet_extra + 2 + coefficients.stream_batch_count()
         } else {
-            local_lf + 1
+            local_lf + combined_packet_extra + 1
         }
     }
 }
@@ -1160,6 +1250,10 @@ fn prepare_source(
         .then(|| LfPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit))
         .transpose()?
         .flatten();
+    let combined_packet_windows = (!staged_local_trees)
+        .then(|| CombinedPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit))
+        .transpose()?
+        .flatten();
     let [blocks_x, blocks_y] = packet.block_extent();
     let resource_layout =
         VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;
@@ -1308,6 +1402,7 @@ fn prepare_source(
         packet: &packet,
         groups: &groups,
         lf_packet_windows: lf_packet_windows.as_ref(),
+        combined_packet_windows: combined_packet_windows.as_ref(),
         resource: resource_layout,
         hf_coefficients: hf_coefficients.as_ref(),
         adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
@@ -1332,6 +1427,7 @@ fn prepare_source(
         packet,
         groups,
         lf_packet_windows,
+        combined_packet_windows,
         stream_limit,
         resource_layout,
         hf_coefficients,
@@ -1756,6 +1852,17 @@ struct LfPacketBatchSubmission {
     commands: wgpu::CommandBuffer,
 }
 
+struct CombinedPacketGroupUpload {
+    group_index: usize,
+    params: VarDctModularParams,
+}
+
+struct CombinedPacketBatchSubmission {
+    stream_upload: Box<[u8]>,
+    groups: Box<[CombinedPacketGroupUpload]>,
+    commands: wgpu::CommandBuffer,
+}
+
 struct HfPacketGroupUpload {
     group_index: usize,
     control: VarDctPacketControl,
@@ -1811,6 +1918,48 @@ fn submit_lf_packet_commands(
             })
         }
     }
+}
+
+fn write_combined_packet_batch(
+    queue: &wgpu::Queue,
+    stream: &wgpu::Buffer,
+    batch: &CombinedPacketBatchSubmission,
+    lifetime: &VarDctJobLifetime,
+) -> Result<(), VarDctDecodeError> {
+    queue.write_buffer(stream, 0, &batch.stream_upload);
+    for upload in &batch.groups {
+        let group = lifetime._groups.get(upload.group_index).ok_or(
+            VarDctDecodeError::EntropyWindowContract {
+                detail: "windowed combined packet batch references an absent group",
+            },
+        )?;
+        queue.write_buffer(&group.modular_params, 0, bytemuck::bytes_of(&upload.params));
+    }
+    Ok(())
+}
+
+fn submit_combined_packet_commands(
+    queue: &wgpu::Queue,
+    mut batches: Vec<CombinedPacketBatchSubmission>,
+    downstream: VarDctDownstreamCommands,
+    lifetime: &VarDctJobLifetime,
+) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
+    let stream = lifetime._packet_stream_window.as_ref().ok_or(
+        VarDctDecodeError::EntropyWindowContract {
+            detail: "windowed combined packet commands have no retained stream upload",
+        },
+    )?;
+    let final_batch = batches
+        .pop()
+        .ok_or(VarDctDecodeError::EntropyWindowContract {
+            detail: "windowed combined packet execution has no batches",
+        })?;
+    for batch in batches {
+        write_combined_packet_batch(queue, stream, &batch, lifetime)?;
+        queue.submit([batch.commands]);
+    }
+    write_combined_packet_batch(queue, stream, &final_batch, lifetime)?;
+    submit_vardct_downstream(queue, vec![final_batch.commands], downstream, lifetime)
 }
 
 fn write_hf_packet_batch(
@@ -2740,10 +2889,20 @@ fn submit_vardct(
             mapped_at_creation: false,
         })
     };
-    let packet_stream_window = source.lf_packet_windows.as_ref().map(|plan| {
+    let packet_stream_window_bytes = source
+        .lf_packet_windows
+        .as_ref()
+        .map(|plan| plan.stream_bytes)
+        .or_else(|| {
+            source
+                .combined_packet_windows
+                .as_ref()
+                .map(|plan| plan.stream_bytes)
+        });
+    let packet_stream_window = packet_stream_window_bytes.map(|bytes| {
         storage(
-            "jxl-wgpu reusable local-tree packet entropy stream window",
-            plan.stream_bytes,
+            "jxl-wgpu reusable packet entropy stream window",
+            bytes,
             wgpu::BufferUsages::COPY_DST,
         )
     });
@@ -2994,7 +3153,9 @@ fn submit_vardct(
     if let Some(sigma) = &epf_sigma {
         packet_commands.clear_buffer(sigma, 0, None);
     }
-    let (lf_stage_commands, mut commands) = if let Some(plan) = &source.lf_packet_windows {
+    let (lf_stage_commands, combined_packet_batches, mut commands) = if let Some(plan) =
+        &source.lf_packet_windows
+    {
         if !staged_local_trees {
             return Err(VarDctDecodeError::EntropyWindowContract {
                 detail: "LF packet windows require staged local trees",
@@ -3112,6 +3273,120 @@ fn submit_vardct(
         }
         (
             Some(LfPacketCommands::Windowed(submissions)),
+            None,
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu bounded VarDCT downstream stage"),
+            }),
+        )
+    } else if let Some(plan) = &source.combined_packet_windows {
+        if staged_local_trees {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "combined packet windows cannot stage local trees",
+            });
+        }
+        let stream =
+            packet_stream_window
+                .as_ref()
+                .ok_or(VarDctDecodeError::EntropyWindowContract {
+                    detail: "windowed combined packet plan has no stream buffer",
+                })?;
+        let metadata = modular_metadata
+            .first()
+            .ok_or(VarDctDecodeError::GroupPlanCount {
+                component: "global Modular metadata",
+                expected: 1,
+                actual: 0,
+            })?;
+        let upload_len = usize::try_from(plan.stream_bytes).map_err(|_| {
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "combined packet stream window host length",
+            }
+        })?;
+        let mut first_commands = Some(packet_commands);
+        let mut submissions = Vec::with_capacity(plan.stream_batches.len());
+        for batch in plan.stream_batches.iter() {
+            if batch.group_count == 0 || batch.segments.is_empty() {
+                return Err(VarDctDecodeError::EntropyWindowContract {
+                    detail: "combined packet batch contains no segment",
+                });
+            }
+            let mut encoder = first_commands.take().unwrap_or_else(|| {
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu bounded combined packet stream batch"),
+                })
+            });
+            let mut stream_upload = vec![0_u8; upload_len];
+            let mut group_uploads = Vec::with_capacity(batch.group_count);
+            for segment_index in batch.segments.clone() {
+                let segment = *plan.stream_segments.get(segment_index).ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "combined packet batch references an absent segment",
+                    },
+                )?;
+                let buffers = group_buffers.get(segment.group_index).ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "combined packet segment references an absent GPU group",
+                    },
+                )?;
+                let params = *plan.segment_params.get(segment_index).ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "combined packet segment has no parameter record",
+                    },
+                )?;
+                let input = codestream
+                    .get(segment.input_start..segment.input_end)
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "combined packet segment exceeds the retained codestream",
+                    })?;
+                let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "combined packet stream upload end",
+                    },
+                )?;
+                stream_upload
+                    .get_mut(segment.upload_offset..output_end)
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "combined packet segment exceeds the reusable upload",
+                    })?
+                    .copy_from_slice(input);
+                pipelines.packet.encode(
+                    device,
+                    &mut encoder,
+                    VarDctPacketBuffers {
+                        codestream: stream,
+                        modular_metadata: metadata,
+                        reconstructed_lf: &buffers.reconstructed,
+                        raw_hf_metadata: &buffers.raw_metadata,
+                        coefficients: &buffers.coefficients,
+                        status: &buffers.packet_status,
+                        control: &buffers.packet_control,
+                        modular_params: &buffers.modular_params,
+                    },
+                );
+                group_uploads.push(CombinedPacketGroupUpload {
+                    group_index: segment.group_index,
+                    params,
+                });
+            }
+            if group_uploads.len() != batch.group_count {
+                return Err(VarDctDecodeError::EntropyWindowContract {
+                    detail: "combined packet batch group count disagrees with its segments",
+                });
+            }
+            submissions.push(CombinedPacketBatchSubmission {
+                stream_upload: stream_upload.into_boxed_slice(),
+                groups: group_uploads.into_boxed_slice(),
+                commands: encoder.finish(),
+            });
+        }
+        if first_commands.is_some() || submissions.is_empty() {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "windowed combined packet execution has no dispatch",
+            });
+        }
+        (
+            None,
+            Some(submissions),
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu bounded VarDCT downstream stage"),
             }),
@@ -3171,12 +3446,13 @@ fn submit_vardct(
         if staged_local_trees {
             (
                 Some(LfPacketCommands::Whole(packet_commands.finish())),
+                None,
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu bounded VarDCT downstream stage"),
                 }),
             )
         } else {
-            (None, packet_commands)
+            (None, None, packet_commands)
         }
     };
     let mut resource_uniforms = Vec::with_capacity(source.groups.len());
@@ -3630,6 +3906,16 @@ fn submit_vardct(
         (
             submit_lf_packet_commands(backend.queue(), lf_stage_commands, &lifetime)?,
             Some(downstream_commands),
+        )
+    } else if let Some(batches) = combined_packet_batches {
+        (
+            submit_combined_packet_commands(
+                backend.queue(),
+                batches,
+                downstream_commands,
+                &lifetime,
+            )?,
+            None,
         )
     } else {
         (

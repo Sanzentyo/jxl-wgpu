@@ -56,13 +56,23 @@ test compares GPU RGB8 against Rust `jxl` and, when installed, `djxl`, with a ma
 difference of one code per channel. This fixture is decoder evidence; it is not counted among the
 24 exact Modular GPU encode/decode round trips.
 
-`vardct_engine_gpu::nonzero_ac_resumes_across_bounded_gpu_stream_windows` reuses this production
-fixture with a 256-byte cap. The six AC pass groups expand into multiple ordered uploads backed by
-one stream and one parameter buffer. Blocking and runtime-neutral async results stay within one
-RGB8 code of Rust `jxl`; a late mutation in the largest pass group must return typed
-`HfCoefficientGpu`, and abandoning a prefetched decode must release the shared reservation after
-the final queue fence. Reported stream bytes may not exceed the cap, and the submission count must
-equal the planned AC batches plus the pre/post resident stages.
+`vardct_engine_gpu::global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows` reuses
+this production fixture with a 256-byte cap. Its global-tree LF/HF packet and six AC pass groups
+expand into multiple ordered uploads backed by one packet stream, one AC stream, and their parameter
+buffers. Blocking and runtime-neutral async results stay within one RGB8 code of Rust `jxl`; a late
+mutation in the largest pass group must return typed `HfCoefficientGpu`, and abandoning a prefetched
+decode must release the shared reservation after the final queue fence. Reported packet and AC
+stream bytes may not exceed the cap, and the submission count must equal the initial packet batches,
+planned AC batches, and resident pre/post stages without double-counting the co-submitted final
+packet command.
+
+`vardct_engine_gpu::combined_single_packet_resumes_across_bounded_gpu_windows` generates a patterned
+32×32 DCT32x32 stream through the GPU encoder and forces its single combined LF/HF packet through a
+40-byte cap. More than two windows share the same 64/128-byte state across the LF-to-HF transition;
+there is no intermediate status map and the final packet command shares the first downstream
+submission. Runtime-neutral async decode/readback must agree with Rust `jxl` and optional `djxl`
+within one RGB8 code, abandoning a prefetched decode must drain the byte budget, and late-window
+damage must return typed `PacketGpu(Entropy { .. })` from the final aggregate map.
 
 The decoded fixture SHA-256 is
 `95c3cd9a0769da10c1a8c0d4f903d0723bc760eebdd8023d8b7f81af5b73faa2`. It is reproduced from the
@@ -160,6 +170,13 @@ LF smoothing; the second sets `SKIP_ADAPTIVE_LF_SMOOTHING`. Actual-adapter tests
 aggregate packet/artifact/pass-group status map, and at most one RGB8 code of difference from Rust
 `jxl` and optional `djxl`.
 
+`vardct_engine_gpu::shared_global_tree_packets_resume_across_bounded_gpu_windows` applies a
+256-byte cap to the first fixture. Both LF groups must expand into more than two ordered packet
+batches over one reusable upload and their shared global MA tree, without an intermediate map. The
+last packet command shares the first downstream submission; exact submission accounting, the one
+final aggregate status map, runtime-neutral async completion, and Rust-`jxl`/optional-`djxl`
+agreement within one RGB8 code are required.
+
 The source is the `jxl-encoder` `test_multi_group` example with `(w, h) = (2056, 256)` and its
 deterministic RGB gradient unchanged. Unmodified `FrameHeader::lossy()` produces the skip fixture.
 For the smoothing fixture, the development checkout changes only that constructor's `flags` field
@@ -245,10 +262,10 @@ every oversized accepted Modular group is segmented. Rust/WGSL full-record word 
 shader variant is parsed and semantically validated with Naga; no shader-source substring
 assertion is used.
 
-Together these are Prefix+RLE/LZ77, production ANS+Weighted, staged local-tree VarDCT LF/HF packets,
-and nonzero/custom-order VarDCT AC cross-window evidence. Combined/global-tree VarDCT packets and
-recursive entropy consumers still need the same bounded resume contract, and broader
-corruption/truncation fuzzing is still required before `ENT-D02` can be marked done.
+Together these are Prefix+RLE/LZ77, production ANS+Weighted, combined single-entry,
+shared-global-tree and staged local-tree VarDCT LF/HF packets, and nonzero/custom-order VarDCT AC
+cross-window evidence. Recursive entropy consumers still need the same bounded resume contract,
+and broader corruption/truncation fuzzing is still required before `ENT-D02` can be marked done.
 
 ## Common entropy differential matrix
 

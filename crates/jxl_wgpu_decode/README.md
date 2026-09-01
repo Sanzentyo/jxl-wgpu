@@ -89,6 +89,9 @@ one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spect
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
 per-frequency-cell HF chroma correlation, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
+combined single-entry and shared-global-tree packet forms resume across the shared bounded-window
+planner without an intermediate map. Their 64/128-byte `Pod` state records the active LF/HF phase,
+both decoded counts, first-block count, extra precision, ANS/LZ state, and predictor state. The
 packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,
 executes LF image entropy on GPU, maps the aggregate end cursors, then parses and packs the following
 HF-local trees without decoding host image symbols. Oversized LF-local ranges use the shared
@@ -131,10 +134,11 @@ VarDCT renderer using the normative default matrix for that strategy and an expl
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
-and writes tightly packed RGB8 without an intermediate image readback. When every AC pass group
-fits the resolved entropy cap, global-tree frames retain the one-submission path. An oversized AC
-range instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/parameter pair,
-and ordered queue submissions. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
+and writes tightly packed RGB8 without an intermediate image readback. Combined/global packet and
+AC pass-group ranges that fit the resolved entropy cap retain the one-submission path. Either
+oversized consumer instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/
+parameter pair, and ordered queue submissions. The final combined/global packet command shares the
+first downstream submission. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
 state, nested block/channel/order progress, coefficient-sink error, and the 96-word nonzero context
 grid; only the final window validates exact ANS/padding termination. Local-tree frames first run one
 or more bounded LF submissions and map one aggregate LF cursor record, host-pack the HF descriptors,
@@ -163,15 +167,17 @@ carries authoritative metadata and changed regions. Native blocking and runtime-
 poll/future completion use the common decoder session API, and the engine compiles for browser
 WebGPU without a Tokio or async-std dependency.
 
-`VarDctDecodeMemoryStats` separately reports the shared local-tree packet stream peak, LF packet
-batch count, reusable AC stream peak and batch count, reusable parameter bytes, LZ scratch, and
-execution-state total. HF packet descriptors are host-discovered after the LF map, so
+`VarDctDecodeMemoryStats` separately reports the shared packet stream peak, initial packet batch
+count, reusable AC stream peak and batch count, reusable parameter bytes, LZ scratch, and
+execution-state total. For combined/global packets the initial count covers the complete packet;
+for local trees it covers LF. HF packet descriptors are host-discovered after the LF map, so
 `hf_packet_stream_batch_count()` and `submissions_per_frame()` become exact when that dynamic plan is
 installed; performance harnesses sample them after frame completion. Applying
 `WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines and governs
-local-tree LF/HF packets plus AC pass groups. Forced 256-byte actual-adapter runs cover blocking and
-runtime-neutral async decode, late-window typed corruption, and cancellation-driven reservation
-release for packet and nonzero-AC fixtures.
+combined/global packets, local-tree LF/HF packets, and AC pass groups. Actual-adapter runs force a
+40-byte 32x32 combined packet and 256-byte shared-global/local-tree/nonzero-AC paths through
+blocking or runtime-neutral async decode, typed corruption, and cancellation-driven reservation
+release.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27
@@ -354,9 +360,10 @@ The VarDCT AC parameter record is a separate 144-byte aligned `Pod`. Its window 
 logical/upload starts, available/full ends, the yield boundary, first/final flags, a 464-byte
 execution-state offset, and the canonical status index. The VarDCT packet record has its own seven
 window fields, including a bounded-mode bit independent of FIRST/FINAL and a stream-base bit offset.
-Staged local-tree LF and HF packets use those fields with 64-byte generic or 128-byte
-SelfCorrecting state; the two sequential stages reuse one state allocation. Combined/global-tree
-packet records remain whole-range consumers.
+Combined/global-tree packets use those fields with 64-byte generic or 128-byte SelfCorrecting state;
+five explicit words retain phase, LF/HF counts, first blocks, and extra precision. Staged local-tree
+LF and HF packets use the same state sizes and reuse one allocation across their two sequential
+stages.
 The Modular suffix begins with six window fields: logical segment start, physical upload start,
 full stream end, yield boundary, first/final flags, and the aligned entropy-state offset. It then
 carries four plane offset/stride pairs, exact output
