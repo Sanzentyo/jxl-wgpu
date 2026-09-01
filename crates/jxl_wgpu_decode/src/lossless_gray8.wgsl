@@ -18,6 +18,7 @@ struct Params {
     sample_count: u32,
     initialize_chroma: u32,
     source_channels: u32,
+    channel_layout_offset: u32,
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,

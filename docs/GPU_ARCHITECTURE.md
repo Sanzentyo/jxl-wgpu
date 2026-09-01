@@ -202,6 +202,13 @@ orders use the same logical-plane table. A composed two-parameter case is execut
 inside one command encoder with only the final readback, while the 13-parameter progressive-DC root
 is preflighted as 37 jobs. The planner returns a typed address-space, topology-state, free-list, or
 unsupported-transform error before backend allocation.
+The entropy boundary now also has an explicit per-channel ABI. Each 32-byte descriptor stores its
+arena word offset, row stride, width/height, cumulative decoded start/end, and a range into flattened
+prior-channel indices. Host lowering groups previous channels by exact width, height, horizontal
+shift, and vertical shift, then emits at most the 60 newest matches addressable by MA properties
+16..255. The descriptor table and references are appended to the existing immutable metadata and a
+240-byte group parameter carries their offset for single-group streams. Existing multi-group decode
+continues to use its group-local fixed geometry until per-stream descriptors are built.
 
 ## Protocol execution
 

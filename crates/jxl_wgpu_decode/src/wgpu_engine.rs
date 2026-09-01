@@ -243,6 +243,7 @@ struct ShaderParams {
     sample_count: u32,
     initialize_chroma: u32,
     source_channels: u32,
+    channel_layout_offset: u32,
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
@@ -350,7 +351,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 236);
+    assert!(std::mem::size_of::<ShaderParams>() == 240);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<EntropyExecutionState>() == 32);
     assert!(std::mem::align_of::<EntropyExecutionState>() == 16);
@@ -597,7 +598,13 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
-        let modular_metadata: Arc<[u32]> = profile.ma_config.pack_gpu_metadata()?.words.into();
+        let mut modular_metadata = profile.ma_config.pack_gpu_metadata()?.words;
+        let channel_layout_offset = if profile.groups.len() == 1 {
+            profile.channel_metadata.append_to(&mut modular_metadata)?
+        } else {
+            0
+        };
+        let modular_metadata: Arc<[u32]> = modular_metadata.into();
         let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(
             extent,
@@ -702,6 +709,7 @@ impl WgpuSubmissionEngine {
                     profile,
                     dispatch_layout,
                     modular_metadata,
+                    channel_layout_offset,
                     output,
                 }),
                 memory_stats,
@@ -1159,6 +1167,7 @@ struct DecodeSource {
     // Immutable within the session. All independently decoded groups share the standard
     // DC-global MA/entropy descriptor without sharing mutable GPU transient allocations.
     modular_metadata: Arc<[u32]>,
+    channel_layout_offset: u32,
     output: OutputPlan,
 }
 
@@ -2399,8 +2408,7 @@ fn submit_decode(
                 group,
                 segment,
                 status_index,
-                &source.profile,
-                &source.output,
+                source,
                 source.dispatch_layout.reconstruction_specialization,
                 segment.group_index == 0,
             )?;
@@ -2536,8 +2544,7 @@ fn build_params(
     group: ModularGroup,
     stream_segment: GroupStreamSegment,
     status_index: u32,
-    profile: &StandardModularProfile,
-    output: &OutputPlan,
+    source: &DecodeSource,
     reconstruction_specialization: ModularReconstructionSpecialization,
     initialize_chroma: bool,
 ) -> Result<ShaderParams> {
@@ -2545,18 +2552,22 @@ fn build_params(
         u32::try_from(value).map_err(|_| Error::backend(format!("{name} exceeds WGSL u32")))
     };
     let plane = |index: usize| -> Result<(u32, u32)> {
-        output.layout.plane(index).map_or(Ok((0, 0)), |plane| {
-            Ok((
-                to_u32(plane.offset, "plane offset")?,
-                to_u32(plane.row_stride, "plane row stride")?,
-            ))
-        })
+        source
+            .output
+            .layout
+            .plane(index)
+            .map_or(Ok((0, 0)), |plane| {
+                Ok((
+                    to_u32(plane.offset, "plane offset")?,
+                    to_u32(plane.row_stride, "plane row stride")?,
+                ))
+            })
     };
     let (plane0_offset, plane0_stride) = plane(0)?;
     let (plane1_offset, plane1_stride) = plane(1)?;
     let (plane2_offset, plane2_stride) = plane(2)?;
     let (plane3_offset, plane3_stride) = plane(3)?;
-    let chroma = output.layout.plane(1);
+    let chroma = source.output.layout.plane(1);
     let (fixed_leaf_predictor, fixed_leaf_offset, fixed_leaf_multiplier, fixed_leaf_clusters) =
         match reconstruction_specialization {
             ModularReconstructionSpecialization::ChannelFixed {
@@ -2573,13 +2584,13 @@ fn build_params(
             ),
             ModularReconstructionSpecialization::GenericMetaAdaptive => (0, 0, 0, [0; 4]),
         };
-    let decoded_symbol_count = group_decoded_symbol_count(profile, group)?;
-    let lz77_window_words = group_lz77_window_words(profile, group, decoded_symbol_count)?;
+    let decoded_symbol_count = group_decoded_symbol_count(&source.profile, group)?;
+    let lz77_window_words = group_lz77_window_words(&source.profile, group, decoded_symbol_count)?;
     let fixed_output_mode = refine_fixed_gradient_output_mode(
         fixed_gradient_output_mode(
-            profile.channels.count(),
-            profile.bits_per_sample,
-            output,
+            source.profile.channels.count(),
+            source.profile.bits_per_sample,
+            &source.output,
             reconstruction_specialization,
         ),
         lz77_window_words,
@@ -2591,7 +2602,7 @@ fn build_params(
             decoded_symbol_count
         };
     let entropy_state_offset = group_entropy_state_offset_words(
-        profile,
+        &source.profile,
         group,
         decoded_symbol_count,
         physical_sample_words,
@@ -2614,17 +2625,18 @@ fn build_params(
         origin_y: group.y,
         sample_count: group.sample_count()?,
         initialize_chroma: u32::from(initialize_chroma),
-        source_channels: profile.channels.count(),
-        source_bits: u32::from(profile.bits_per_sample),
-        source_mask: (1u32 << profile.bits_per_sample) - 1,
-        needs_self_correcting: u32::from(profile.ma_config.needs_self_correcting()),
-        output_kind: output.kind as u32,
-        transfer: output.transfer,
-        limited_range: u32::from(output.limited_range),
-        channels: output.channels,
-        order: output.order,
-        bits: output.bits,
-        storage_bits: output.storage_bits,
+        source_channels: source.profile.channels.count(),
+        channel_layout_offset: source.channel_layout_offset,
+        source_bits: u32::from(source.profile.bits_per_sample),
+        source_mask: (1u32 << source.profile.bits_per_sample) - 1,
+        needs_self_correcting: u32::from(source.profile.ma_config.needs_self_correcting()),
+        output_kind: source.output.kind as u32,
+        transfer: source.output.transfer,
+        limited_range: u32::from(source.output.limited_range),
+        channels: source.output.channels,
+        order: source.output.order,
+        bits: source.output.bits,
+        storage_bits: source.output.storage_bits,
         plane0_offset,
         plane0_stride,
         plane1_offset,
@@ -2635,8 +2647,8 @@ fn build_params(
         plane3_stride,
         chroma_width: chroma.map_or(0, |plane| plane.sample_extent.width),
         chroma_height: chroma.map_or(0, |plane| plane.sample_extent.height),
-        logical_size: to_u32(output.layout.logical_size, "output logical size")?,
-        numeric_mapping: output.numeric_mapping,
+        logical_size: to_u32(source.output.layout.logical_size, "output logical size")?,
+        numeric_mapping: source.output.numeric_mapping,
         status_index,
         stream_index: group.stream_index,
         fixed_leaf_predictor,
@@ -2647,17 +2659,17 @@ fn build_params(
         fixed_leaf_cluster2: fixed_leaf_clusters[2],
         fixed_leaf_cluster3: fixed_leaf_clusters[3],
         fixed_output_mode: fixed_output_mode as u32,
-        wp_p1: profile.wp_header.p1,
-        wp_p2: profile.wp_header.p2,
-        wp_p3a: profile.wp_header.p3a,
-        wp_p3b: profile.wp_header.p3b,
-        wp_p3c: profile.wp_header.p3c,
-        wp_p3d: profile.wp_header.p3d,
-        wp_p3e: profile.wp_header.p3e,
-        wp_w0: profile.wp_header.w0,
-        wp_w1: profile.wp_header.w1,
-        wp_w2: profile.wp_header.w2,
-        wp_w3: profile.wp_header.w3,
+        wp_p1: source.profile.wp_header.p1,
+        wp_p2: source.profile.wp_header.p2,
+        wp_p3a: source.profile.wp_header.p3a,
+        wp_p3b: source.profile.wp_header.p3b,
+        wp_p3c: source.profile.wp_header.p3c,
+        wp_p3d: source.profile.wp_header.p3d,
+        wp_p3e: source.profile.wp_header.p3e,
+        wp_w0: source.profile.wp_header.w0,
+        wp_w1: source.profile.wp_header.w1,
+        wp_w2: source.profile.wp_header.w2,
+        wp_w3: source.profile.wp_header.w3,
     })
 }
 
@@ -3540,7 +3552,7 @@ mod tests {
         assert_eq!(MIN_STREAM_WINDOW_BYTES, 40);
         assert_eq!(align16(1).unwrap(), 16);
         assert_eq!(align16(16).unwrap(), 16);
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 236);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 240);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             entropy: EntropyStreamParams {
@@ -3561,56 +3573,57 @@ mod tests {
             sample_count: 14,
             initialize_chroma: 15,
             source_channels: 16,
-            source_bits: 17,
-            source_mask: 18,
-            needs_self_correcting: 19,
-            output_kind: 20,
-            transfer: 21,
-            limited_range: 22,
-            channels: 23,
-            order: 24,
-            bits: 25,
-            storage_bits: 26,
-            plane0_offset: 27,
-            plane0_stride: 28,
-            plane1_offset: 29,
-            plane1_stride: 30,
-            plane2_offset: 31,
-            plane2_stride: 32,
-            plane3_offset: 33,
-            plane3_stride: 34,
-            chroma_width: 35,
-            chroma_height: 36,
-            logical_size: 37,
-            numeric_mapping: 38,
-            status_index: 39,
-            stream_index: 40,
-            fixed_leaf_predictor: 41,
-            fixed_leaf_offset: 42,
-            fixed_leaf_multiplier: 43,
-            fixed_leaf_cluster0: 44,
-            fixed_leaf_cluster1: 45,
-            fixed_leaf_cluster2: 46,
-            fixed_leaf_cluster3: 47,
-            fixed_output_mode: 48,
-            wp_p1: 49,
-            wp_p2: 50,
-            wp_p3a: 51,
-            wp_p3b: 52,
-            wp_p3c: 53,
-            wp_p3d: 54,
-            wp_p3e: 55,
-            wp_w0: 56,
-            wp_w1: 57,
-            wp_w2: 58,
-            wp_w3: 59,
+            channel_layout_offset: 17,
+            source_bits: 18,
+            source_mask: 19,
+            needs_self_correcting: 20,
+            output_kind: 21,
+            transfer: 22,
+            limited_range: 23,
+            channels: 24,
+            order: 25,
+            bits: 26,
+            storage_bits: 27,
+            plane0_offset: 28,
+            plane0_stride: 29,
+            plane1_offset: 30,
+            plane1_stride: 31,
+            plane2_offset: 32,
+            plane2_stride: 33,
+            plane3_offset: 34,
+            plane3_stride: 35,
+            chroma_width: 36,
+            chroma_height: 37,
+            logical_size: 38,
+            numeric_mapping: 39,
+            status_index: 40,
+            stream_index: 41,
+            fixed_leaf_predictor: 42,
+            fixed_leaf_offset: 43,
+            fixed_leaf_multiplier: 44,
+            fixed_leaf_cluster0: 45,
+            fixed_leaf_cluster1: 46,
+            fixed_leaf_cluster2: 47,
+            fixed_leaf_cluster3: 48,
+            fixed_output_mode: 49,
+            wp_p1: 50,
+            wp_p2: 51,
+            wp_p3a: 52,
+            wp_p3b: 53,
+            wp_p3c: 54,
+            wp_p3d: 55,
+            wp_p3e: 56,
+            wp_w0: 57,
+            wp_w1: 58,
+            wp_w2: 59,
+            wp_w3: 60,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 59]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 60]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+                45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
             ]
         );
         assert_eq!(std::mem::size_of::<EntropyExecutionState>(), 32);

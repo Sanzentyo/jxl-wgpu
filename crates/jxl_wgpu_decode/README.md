@@ -26,6 +26,13 @@ to an exact entropy-visible channel topology without decoding pixels. This accou
 residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
 prefix under bounded transform/channel/squeeze limits. A portable 32-byte `Pod` descriptor then
 proves every packed channel offset fits WGSL `u32` addressing before backend allocation.
+For single-group streams a second 32-byte `Pod` record is appended to the immutable entropy metadata
+for each transformed channel. It carries arena offset/stride, dimensions, cumulative decoded sample
+range, and an absolute range into a flattened reference-channel list. That list contains only prior
+channels whose dimensions and horizontal/vertical shifts match, newest first, as properties 16+
+require. A geometry-keyed map bounds construction by channel count times the at-most-60 references
+addressable by the 8-bit MA property space. The 240-byte per-group parameter record now exposes the
+descriptor-table offset; WGSL consumption and per-stream multi-group descriptors are the next step.
 Inverse planning walks the stack and each Squeeze parameter in reverse while retaining only the
 current and immediately restored topology, rather than materializing a channel table for every
 transform. The parser also charges the cumulative topology work, so a bounded channel count cannot
@@ -473,7 +480,7 @@ reconstruction, status, status-staging, and POD parameter buffers (plus the nati
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
 only each planned bounded range from a checked table of shared input spans, even when the range
-crosses physical chunks, while metadata and packed 236-byte `ShaderParams` records (including the
+crosses physical chunks, while metadata and packed 240-byte `ShaderParams` records (including the
 12-byte shared entropy prefix) use `Queue::write_buffer`; no second full-codestream host `Vec` is
 created.
 

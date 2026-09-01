@@ -1038,6 +1038,7 @@ pub(crate) fn parse_ma_config(
         nodes_left -= 1;
         let property = metadata.read_varint(reader, 1, 0)?;
         if let Some(property) = property.checked_sub(1) {
+            let property = validate_tree_property(property)?;
             let threshold = unpack_signed(metadata.read_varint(reader, 0, 0)?);
             folding.push(FoldingNode::Decision {
                 property,
@@ -1090,7 +1091,24 @@ pub(crate) fn parse_ma_config(
     })
 }
 
+fn validate_tree_property(property: u32) -> Result<u32> {
+    if property > 255 {
+        return Err(ModularTreeError::InvalidProperty { property }.into());
+    }
+    Ok(property)
+}
+
 impl MaConfigIr {
+    pub(crate) fn maximum_tree_property(&self) -> Option<u32> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match node {
+                MaTreeNodeIr::Decision { property, .. } => Some(*property),
+                MaTreeNodeIr::Leaf { .. } => None,
+            })
+            .max()
+    }
+
     pub(crate) fn needs_self_correcting(&self) -> bool {
         self.nodes.iter().any(|node| match node {
             MaTreeNodeIr::Decision { property, .. } => *property == 15,
@@ -2020,6 +2038,7 @@ mod tests {
     use super::{
         AnsBucketIr, EntropyCoderIr, EntropyDecoderIr, HybridIntegerConfigIr,
         MetadataEntropyCursor, PrefixHistogramIr, add_log2_ceil, unpack_signed,
+        validate_tree_property,
     };
 
     #[test]
@@ -2042,6 +2061,15 @@ mod tests {
         assert_eq!(unpack_signed(2), 1);
         assert_eq!(unpack_signed(3), -2);
         assert_eq!(add_log2_ceil(15), 4);
+    }
+
+    #[test]
+    fn ma_tree_property_rejects_values_outside_the_byte_domain() {
+        assert_eq!(validate_tree_property(255).unwrap(), 255);
+        assert!(matches!(
+            validate_tree_property(256).unwrap_err(),
+            crate::Error::ModularTree(crate::ModularTreeError::InvalidProperty { property: 256 })
+        ));
     }
 
     #[test]

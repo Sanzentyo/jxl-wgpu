@@ -101,6 +101,12 @@ two-sided free-span coalescing, and typed overlap rejection. When `cjxl` is inst
 13 default parameters must lower to 37 jobs and three full-resolution final plane views within a
 two-times arena bound. These tests still initialize decoded entropy samples directly; connection to
 the production entropy executor remains a distinct gate.
+The generalized entropy descriptor matrix fixes the 32-byte `Pod` layout, cumulative decoded ranges,
+and absolute metadata rebasing. A four-channel topology with one shift-mismatched plane proves that
+MA references skip incompatible predecessors and retain newest-first order; property 23 emits two
+reference slots while property 15 emits none. Existing every-chunk-split profile tests also compare
+the appended descriptor metadata, and the full `ShaderParams` word-order test fixes its new 240-byte
+storage stride and channel-layout offset without inspecting shader source text.
 
 ## Procedural VarDCT encoder matrix
 

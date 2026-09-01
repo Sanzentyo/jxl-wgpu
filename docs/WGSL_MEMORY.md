@@ -29,6 +29,12 @@ other driver-private allocations cannot be measured portably and are not include
   Reverse planning retains two such channel vectors at a time; it does not allocate a topology per
   transform. A separate cumulative topology-work limit rejects legal-looking metadata that would
   otherwise force quadratic host planning before GPU admission.
+- Generalized Modular entropy adds a separate 32-byte `GpuModularEntropyChannel` storage record:
+  `word_offset,row_stride,width,height,decoded_start,decoded_end,reference_offset,reference_count`.
+  Records and their flattened `u32` reference indices are appended to the immutable MA/entropy
+  metadata. Reference offsets are rebased to absolute metadata words with checked arithmetic.
+  Reference-list construction is keyed by exact geometry and shifts and emits at most 60 prior
+  channels per descriptor, avoiding adversarial quadratic scans.
 - `ModularSqueezeParams` is one 64-byte, 16-byte-aligned `Pod` uniform containing three
   `width,height,row_stride,word_offset` views and one direction/reserved record. All views address a
   single read-write storage binding and their complete row footprints must be pairwise disjoint.
@@ -94,7 +100,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8ArtifactHeader` / `output_words[0..53]` | `event_count, raw_counts[19], lz77_counts[33]` | 212 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Event` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
-| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | token range, dimensions/sample count, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma dimensions, logical size, numeric mapping | 96 | 4 | uniform |
+| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields | 240 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 
 ### Values that intentionally are not `Pod`
@@ -187,7 +193,7 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
 | `vardct_epf` (decoder, `epf0`/`epf1`/`epf2`) | resident X/Y/B/sigma RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual extent, padded plane strides/ranges, sigma block-grid coverage, finite parameters, binding/device limits, and mirrored whole-image neighbors |
-| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, 236-byte parameter records RO, 16-byte dispatch U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, prefix table, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane; channel-fixed Gradient groups may resume through 16-byte-overlapped stream segments using one aligned 32-byte state record per lane |
+| decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, 240-byte parameter records RO, 16-byte dispatch U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, prefix/channel-layout tables, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane; channel-fixed Gradient groups may resume through 16-byte-overlapped stream segments using one aligned 32-byte state record per lane |
 | encoder `vardct_encode_bounded` | source RO, parameters RO, artifact RW | 256x1 | Tier C (`KernelVariant` 1-D) | one workgroup cooperatively loads and transforms at most 1,024 pixels; fixed 16 KiB workgroup storage is validated before pipeline creation |
 | encoder `vardct_encode_quantize` | source RO, parameters RO, artifact RW | 64x1 | Tier C (`KernelVariant` 1-D) | one workgroup per checked 8x8 block; lanes stride over exactly 64 samples and use fixed 1 KiB workgroup storage |
 | encoder VarDCT `serialize_control` | parameters RO, artifact RW | 1x1 | Tier B (fixed) | a separate pass establishes global visibility; one invocation performs sequential DC prediction and bit-offset serialization |
@@ -197,7 +203,7 @@ The table below states the default workgroup configuration for each entry point:
 
 The decoder entropy shaders share a nested host/WGSL ABI rather than duplicating an untyped word
 prefix. `EntropyStreamParams` is a 12-byte, four-byte-aligned `repr(C)`/`Pod` record of three `u32`
-values: token start/end bounds and the LZ77 ring mask. It begins the 236-byte Modular
+values: token start/end bounds and the LZ77 ring mask. It begins the 240-byte Modular
 `ShaderParams` storage record and the 240-byte, 16-byte-aligned VarDCT packet parameter record. Consumers supply
 storage access and LZ scratch-base functions; their
 geometry, prediction, output, and coefficient suffixes are not forced into one binding layout.

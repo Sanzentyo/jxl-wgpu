@@ -6,7 +6,7 @@ use jxl_gpu_bitstream::{
 use crate::modular_inverse::plan_modular_inverse;
 use crate::modular_transform::{
     ModularChannelTopology, ModularRct, ModularTransformIr, ModularTransformLimits,
-    ModularTransformPlan, parse_modular_transforms,
+    ModularTransformPlan, PackedModularChannelMetadata, parse_modular_transforms,
 };
 use crate::modular_tree::BitInput;
 use crate::{
@@ -50,6 +50,7 @@ pub(crate) struct StandardModularProfile {
     pub ma_config: MaConfigIr,
     pub wp_header: WpHeaderIr,
     pub transform_plan: ModularTransformPlan,
+    pub channel_metadata: PackedModularChannelMetadata,
 }
 
 fn validate_image_header(
@@ -292,6 +293,9 @@ pub(crate) fn parse_standard_modular_profile(
         u32::from(bits_per_sample),
         &transform_plan,
     )?;
+    let channel_metadata = transform_plan
+        .topology
+        .gpu_entropy_channels(ma_config.maximum_tree_property())?;
     let dc_end = dc_global
         .bits
         .end()
@@ -409,6 +413,7 @@ pub(crate) fn parse_standard_modular_profile(
         ma_config,
         wp_header,
         transform_plan,
+        channel_metadata,
     })
 }
 

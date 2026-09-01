@@ -47,6 +47,8 @@ pub enum ModularTreeError {
     },
     #[error("invalid Modular MA tree: {reason}")]
     InvalidTree { reason: &'static str },
+    #[error("Modular MA tree property {property} is outside 0 through 255")]
+    InvalidProperty { property: u32 },
     #[error("Modular MA tree predictor index {predictor} is outside 0 through 13")]
     InvalidPredictor { predictor: u32 },
     #[error("Modular MA tree depth {depth} exceeds the bounded limit {limit}")]
@@ -95,6 +97,8 @@ pub enum ModularTransformError {
     PaletteDimensionOverflow,
     #[error("Modular transformed sample storage exceeds the portable WGSL u32 address space")]
     GpuAddressSpaceOverflow,
+    #[error("invalid Modular entropy-channel metadata: {reason}")]
+    InvalidEntropyChannelMetadata { reason: &'static str },
     #[error("cannot reverse {transform} topology: {reason}")]
     InvalidInverseTopology {
         transform: &'static str,
