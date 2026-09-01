@@ -12,15 +12,15 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
   metadata requirement;
 - one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
   bounded 128/256/512/1024-pixel pass-group grid and one pass;
-- bounded DC-global or pass-group-local MA trees with all JPEG XL Modular predictors, including
+- bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
   entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
-- shared DC-global RCT/Palette/Squeeze and per-pass-group RCT/Palette/Squeeze stacks, including
+- shared DC-global RCT/Palette/Squeeze and per-LF/pass-subimage RCT/Palette/Squeeze stacks, including
   nonempty DC-global sample channels, group-edge geometry, and one full-resolution unassociated
   alpha channel for RGBA; no restoration filters, other extra channels, or references.
 
 Before submission the decoder inventories the standard image header, frame header, and TOC with
-explicit limits. It parses only the bounded DC-global and selected pass-group-local MA trees,
+explicit limits. It parses only the bounded DC-global and selected LF-group/pass-group-local MA trees,
 histogram descriptors, hybrid integer configuration, context maps, ordered Modular transform
 metadata, and pass-group ranges needed to build typed GPU metadata. RCT, Palette, and explicit or
 default Squeeze are meta-applied
@@ -69,9 +69,12 @@ parameters to 37 jobs and three final full-resolution planes within twice its en
 An RCT/Squeeze/RCT test emits five ordered jobs and executes them in one command encoder, copying all
 three noncontiguous final planes into one staging map. Production scheduling applies a concrete
 group-local inverse plan and a 144-byte region-aware finalizer as soon as each group's final entropy
-segment finishes when no cross-group transform is present. For DC-global Palette/Squeeze, the final
-local planes are instead copied row-wise into one frame-resident transformed arena before the
-scratch lane is reused; one frame-wide inverse plan and one finalizer run after the last group.
+segment finishes when no cross-group transform is present. For DC-global Palette/Squeeze, channels
+with both transformed shifts at least three are decoded by LF-group subimages first; channels with
+either shift below three are decoded by pass-group subimages. Each subimage finishes its local
+inverse plan, then its final planes are copied row-wise into one frame-resident transformed arena
+before the scratch lane is reused. One frame-wide inverse plan and one finalizer run after the last
+pass group.
 Palette continuation state remains GPU-resident.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
@@ -98,7 +101,7 @@ predictor state. State and LZ allocation use the maximum requirement across all 
 descriptors, and mixed Prefix/ANS frames are reported explicitly. Multi-group streams also execute
 the DC-global Prefix/ANS stream through the same descriptor kernel and exact termination contract,
 whether it reconstructs zero or nonzero samples. One aggregate status staging buffer is mapped once
-after the last batch, and its four-word record plus every pass-group record is checked before the
+after the last batch, and its four-word record plus every LF/pass-subimage record is checked before the
 frame is reported. No reconstructed sample is produced on the CPU.
 Output pipeline selection is also per frame. When every plane offset and row stride is four-byte
 aligned and every actual internal group edge ends on a distinct storage word, the shader uses
@@ -123,11 +126,13 @@ exact node/decision/leaf counts, maximum depth, and self-correcting usage; custo
 engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
-channel topology are parsed, local MA trees select per-group metadata bases, and resident
+channel topology are parsed, local MA trees select per-stream metadata bases, and resident
 RCT/Palette/Squeeze stacks execute for single- and multi-group streams. Multi-group DC-global
-Palette/Squeeze sample data is reconstructed in a frame arena for pass-group channels whose
-horizontal and vertical shifts are below three. LF-group scheduling for more highly shifted
-channels, Global/LF/HF image streams, multiple passes, lossy/XYB Modular, non-alpha extra channels,
+Palette/Squeeze sample data is reconstructed in a frame arena. LF-group streams own exactly the
+channels whose horizontal and vertical transformed shifts are both at least three; pass groups own
+the remaining channels, including asymmetric shifts. LF streams execute before pass streams, all
+use the same bounded-window executor and aggregate status map, and one global inverse/finalizer runs
+after assembly. Global/LF/HF image streams, multiple passes, lossy/XYB Modular, non-alpha extra channels,
 patches, splines, noise, and
 reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from

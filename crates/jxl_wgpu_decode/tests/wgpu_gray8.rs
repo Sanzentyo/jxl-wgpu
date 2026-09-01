@@ -1269,7 +1269,7 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
         eprintln!("skipping cjxl global Squeeze conformance: no wgpu adapter");
         return;
     };
-    let (width, height) = (515u32, 259u32);
+    let (width, height) = (2051u32, 259u32);
     let expected = (0..u64::from(width) * u64::from(height))
         .map(|index| {
             let x = index % u64::from(width);
@@ -1338,6 +1338,7 @@ fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
         .memory_stats();
     assert!(stats.global_reconstruction_sample_words > 0);
     assert!(stats.frame_modular_arena_bytes > 0);
+    assert_eq!(stats.low_frequency_group_stream_count, 2);
     assert_eq!(stats.palette_dispatch_count, 0);
     assert!(stats.inverse_transform_count > 0);
     let frame = session
@@ -1771,7 +1772,7 @@ fn local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust() {
         .modular()
         .expect("local-MA input selects the Modular engine")
         .memory_stats();
-    assert_eq!(stats.local_ma_group_count, 6);
+    assert_eq!(stats.local_ma_stream_count, 6);
     assert_eq!(stats.unique_ma_config_count, 2);
     assert!(stats.modular_metadata_bytes > 0);
     assert_eq!(

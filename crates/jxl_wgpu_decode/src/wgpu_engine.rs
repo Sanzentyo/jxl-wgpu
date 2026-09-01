@@ -135,8 +135,8 @@ pub struct WgpuDecodeMemoryStats {
     pub per_frame_bytes: u64,
     /// Packed global and deduplicated local MA/entropy descriptors retained on the GPU.
     pub modular_metadata_bytes: u64,
-    /// Pass groups that select a local rather than the DC-global MA configuration.
-    pub local_ma_group_count: usize,
+    /// LF/pass subimage streams that select a local rather than the outer global MA configuration.
+    pub local_ma_stream_count: usize,
     /// Distinct MA configurations resident in `modular_metadata_bytes`, including the global one.
     pub unique_ma_config_count: usize,
     /// Bytes that remain reserved with the caller-owned output buffer.
@@ -166,10 +166,12 @@ pub struct WgpuDecodeMemoryStats {
     pub max_physical_reconstruction_sample_words: u32,
     /// Resident transformed-sample arena contained in one generalized reconstruction lane.
     pub resident_modular_arena_bytes: u64,
-    /// Frame-resident transformed arena and entropy state retained across all pass-group batches.
+    /// Frame-resident transformed arena and entropy state retained across all LF/pass batches.
     pub frame_modular_arena_bytes: u64,
-    /// Samples reconstructed from the DC-global stream before pass-group assembly.
+    /// Samples reconstructed from the DC-global stream before LF/pass-subimage assembly.
     pub global_reconstruction_sample_words: u32,
+    /// Nonempty LF-group Modular entropy streams scheduled before pass groups.
+    pub low_frequency_group_stream_count: usize,
     /// Number of ordered inverse RCT/Palette/Squeeze dispatches after entropy reconstruction.
     pub inverse_transform_count: usize,
     /// Palette dispatches included in `inverse_transform_count`, including bounded serial chunks.
@@ -472,7 +474,7 @@ fn reconstruction_specialization(
     if uses_generalized_channel_layout(profile) {
         return ModularReconstructionSpecialization::DescriptorMetaAdaptive;
     }
-    let mut candidates = profile.resident_group_plans.iter().map(|plan| {
+    let mut candidates = profile.resident_entropy_plans.iter().map(|plan| {
         let ma_config = plan.ma_config.resolve(&profile.ma_config);
         channel_fixed_gradient_specialization(
             &ma_config.nodes,
@@ -694,9 +696,9 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
-        if profile.resident_group_plans.len() != profile.groups.len() {
+        if profile.resident_entropy_plans.len() != profile.entropy_groups.len() {
             return Err(Error::EngineContract(
-                "Modular group plans do not match the frame grid",
+                "Modular entropy plans do not match the LF/pass stream inventory",
             ));
         }
         let mut modular_metadata = Vec::new();
@@ -711,7 +713,7 @@ impl WgpuSubmissionEngine {
         }
         let mut unique_local_metadata = Vec::<(crate::modular_tree::MaConfigIr, u32)>::new();
         let ma_metadata_offsets: Arc<[u32]> = profile
-            .resident_group_plans
+            .resident_entropy_plans
             .iter()
             .map(|plan| match &plan.ma_config {
                 crate::profile::ModularMaConfig::Global => Ok::<u32, Error>(0),
@@ -751,7 +753,7 @@ impl WgpuSubmissionEngine {
                 }
             })
             .transpose()?;
-        let local_ma_group_count = ma_metadata_offsets
+        let local_ma_stream_count = ma_metadata_offsets
             .iter()
             .filter(|&&offset| offset != global_metadata_offset)
             .count();
@@ -760,16 +762,16 @@ impl WgpuSubmissionEngine {
             .checked_add(1)
             .ok_or_else(|| Error::backend("Modular MA configuration count overflow"))?;
         let metadata_inventory = ModularMetadataInventory {
-            local_ma_group_count,
+            local_ma_stream_count,
             unique_ma_config_count,
         };
         let generalized_channels = uses_generalized_channel_layout(&profile);
         let channel_layout_offsets: Arc<[u32]> = if generalized_channels {
             let mut unique = Vec::<(usize, u32)>::new();
-            let mut offsets = Vec::with_capacity(profile.resident_group_plans.len());
-            for (group_index, plan) in profile.resident_group_plans.iter().enumerate() {
+            let mut offsets = Vec::with_capacity(profile.resident_entropy_plans.len());
+            for (group_index, plan) in profile.resident_entropy_plans.iter().enumerate() {
                 if let Some((_, offset)) = unique.iter().find(|(candidate_index, _)| {
-                    let candidate = &profile.resident_group_plans[*candidate_index];
+                    let candidate = &profile.resident_entropy_plans[*candidate_index];
                     candidate.channel_metadata == plan.channel_metadata
                         && candidate.inverse_plan == plan.inverse_plan
                 }) {
@@ -833,7 +835,7 @@ impl WgpuSubmissionEngine {
         let inverse_pipelines = generalized_channels
             .then(|| {
                 let needs_squeeze = profile
-                    .resident_group_plans
+                    .resident_entropy_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
                     .chain(
@@ -844,7 +846,7 @@ impl WgpuSubmissionEngine {
                     )
                     .any(|job| matches!(job, ModularInverseJob::Squeeze { .. }));
                 let needs_rct = profile
-                    .resident_group_plans
+                    .resident_entropy_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
                     .chain(
@@ -855,7 +857,7 @@ impl WgpuSubmissionEngine {
                     )
                     .any(|job| matches!(job, ModularInverseJob::Rct { .. }));
                 let needs_palette = profile
-                    .resident_group_plans
+                    .resident_entropy_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
                     .chain(
@@ -927,7 +929,7 @@ impl WgpuSubmissionEngine {
         let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
             .expect("device admission always resolves at least one frame slot");
         let reported_ma_config = profile
-            .resident_group_plans
+            .resident_entropy_plans
             .iter()
             .map(|plan| plan.ma_config.resolve(&profile.ma_config))
             .chain(
@@ -1620,6 +1622,7 @@ struct GroupDispatchLayout {
     resident_modular_arena_bytes: u64,
     frame_modular_arena_bytes: u64,
     global_reconstruction_sample_words: u32,
+    low_frequency_group_stream_count: usize,
     inverse_transform_count: usize,
     palette_dispatch_count: usize,
     inverse_transform_uniform_bytes: u64,
@@ -1674,7 +1677,7 @@ impl GroupDispatchLayout {
             output.write_path_for_groups(&profile.groups)?
         };
         let reconstruction_specialization = reconstruction_specialization(profile);
-        let needs_self_correcting = profile.resident_group_plans.iter().any(|plan| {
+        let needs_self_correcting = profile.resident_entropy_plans.iter().any(|plan| {
             plan.ma_config
                 .resolve(&profile.ma_config)
                 .needs_self_correcting()
@@ -1688,7 +1691,7 @@ impl GroupDispatchLayout {
             modular_execution_state_bytes(reconstruction_specialization, needs_self_correcting);
         let mut saw_prefix = false;
         let mut saw_ans = false;
-        for plan in &profile.resident_group_plans {
+        for plan in &profile.resident_entropy_plans {
             match plan.ma_config.resolve(&profile.ma_config).entropy.coder {
                 EntropyCoderIr::Prefix(_) => saw_prefix = true,
                 EntropyCoderIr::Ans { .. } => saw_ans = true,
@@ -1739,7 +1742,7 @@ impl GroupDispatchLayout {
         };
         let resident_modular_arena_bytes = if generalized_channels {
             profile
-                .resident_group_plans
+                .resident_entropy_plans
                 .iter()
                 .map(|plan| plan.inverse_plan.arena_bytes())
                 .max()
@@ -1757,7 +1760,7 @@ impl GroupDispatchLayout {
             frame_workspace.map_or(0, |workspace| workspace.decoded_words);
         let inverse_transform_count = if generalized_channels {
             profile
-                .resident_group_plans
+                .resident_entropy_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
                 .chain(
@@ -1779,7 +1782,7 @@ impl GroupDispatchLayout {
         };
         let palette_dispatch_count = if generalized_channels {
             profile
-                .resident_group_plans
+                .resident_entropy_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
                 .chain(
@@ -1801,7 +1804,7 @@ impl GroupDispatchLayout {
         };
         let inverse_transform_uniform_bytes = if generalized_channels {
             profile
-                .resident_group_plans
+                .resident_entropy_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
                 .chain(
@@ -1842,7 +1845,7 @@ impl GroupDispatchLayout {
         } else {
             0
         };
-        for (group_index, group) in profile.groups.iter().copied().enumerate() {
+        for (group_index, group) in profile.entropy_groups.iter().copied().enumerate() {
             let decoded_symbol_count = group_decoded_symbol_count(profile, group_index, group)?;
             let lz77_window_words =
                 group_lz77_window_words(profile, group_index, group, decoded_symbol_count)?;
@@ -1853,7 +1856,7 @@ impl GroupDispatchLayout {
                 if group_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
                     compact_gray8_sample_words(group)?
                 } else if uses_generalized_channel_layout(profile) {
-                    resident_group_plan(profile, group_index)?
+                    resident_entropy_plan(profile, group_index)?
                         .inverse_plan
                         .arena_words()
                 } else {
@@ -1873,7 +1876,7 @@ impl GroupDispatchLayout {
                 physical_sample_words,
                 execution_state_bytes_per_lane,
             )?;
-            let lane_alignment = if generalized_channels && profile.groups.len() > 1 {
+            let lane_alignment = if generalized_channels && profile.entropy_groups.len() > 1 {
                 u64::from(limits.min_storage_buffer_offset_alignment).max(4)
             } else {
                 4
@@ -1901,7 +1904,7 @@ impl GroupDispatchLayout {
                 minimum_bytes: MIN_STREAM_WINDOW_BYTES,
             });
         }
-        let group_count = u64::try_from(profile.groups.len())
+        let group_count = u64::try_from(profile.entropy_groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
         let (global_stream_segments, global_stream_batches, global_stream_bytes) =
             profile.global_stream.map_or_else(
@@ -1958,7 +1961,7 @@ impl GroupDispatchLayout {
             .and_then(|lanes| usize::try_from(lanes).ok())
             .unwrap_or(usize::MAX);
         let lane_cap = WATCHDOG_PARALLEL_GROUP_LANE_CAP
-            .min(profile.groups.len())
+            .min(profile.entropy_groups.len())
             .min(device_lane_cap)
             .min(workgroup_cap);
         if lane_cap == 0 {
@@ -1971,7 +1974,7 @@ impl GroupDispatchLayout {
         let requested_target = options.memory_limit_bytes / requested_slots;
         let selected = match select_parallel_group_layout(
             codestream_bytes,
-            &profile.groups,
+            &profile.entropy_groups,
             ParallelGroupLimits {
                 stream_limit,
                 lane_cap,
@@ -1983,7 +1986,7 @@ impl GroupDispatchLayout {
             Ok(Some(selected)) => Some(selected),
             Ok(None) => select_parallel_group_layout(
                 codestream_bytes,
-                &profile.groups,
+                &profile.entropy_groups,
                 ParallelGroupLimits {
                     stream_limit,
                     lane_cap,
@@ -2015,6 +2018,7 @@ impl GroupDispatchLayout {
             resident_modular_arena_bytes,
             frame_modular_arena_bytes,
             global_reconstruction_sample_words,
+            low_frequency_group_stream_count: profile.low_frequency_entropy_group_count,
             inverse_transform_count,
             palette_dispatch_count,
             inverse_transform_uniform_bytes,
@@ -2312,7 +2316,7 @@ fn group_decoded_symbol_count(
     group: ModularGroup,
 ) -> Result<u32> {
     if uses_generalized_channel_layout(profile) {
-        return Ok(resident_group_plan(profile, group_index)?
+        return Ok(resident_entropy_plan(profile, group_index)?
             .inverse_plan
             .entropy_words());
     }
@@ -2330,7 +2334,7 @@ fn group_maximum_channel_width(
     if !uses_generalized_channel_layout(profile) {
         return Ok(group.width);
     }
-    resident_group_plan(profile, group_index)?
+    resident_entropy_plan(profile, group_index)?
         .channel_metadata
         .channels
         .iter()
@@ -2358,20 +2362,20 @@ fn group_ma_config(
     profile: &StandardModularProfile,
     group_index: usize,
 ) -> Result<&crate::modular_tree::MaConfigIr> {
-    Ok(resident_group_plan(profile, group_index)?
+    Ok(resident_entropy_plan(profile, group_index)?
         .ma_config
         .resolve(&profile.ma_config))
 }
 
-fn resident_group_plan(
+fn resident_entropy_plan(
     profile: &StandardModularProfile,
     group_index: usize,
 ) -> Result<&ResidentModularGroupPlan> {
     profile
-        .resident_group_plans
+        .resident_entropy_plans
         .get(group_index)
         .ok_or(Error::EngineContract(
-            "resident Modular group plan is missing",
+            "resident Modular entropy plan is missing",
         ))
 }
 
@@ -2393,7 +2397,7 @@ fn modular_finalize_params(
     group: ModularGroup,
 ) -> Result<ModularFinalizeParams> {
     let finalize_output = modular_finalize_output(output)?;
-    let resident = resident_group_plan(profile, group_index)?;
+    let resident = resident_entropy_plan(profile, group_index)?;
     ModularFinalizeParams::new(
         ModularFinalizeRegion {
             source_extent: Extent2d::new(group.width, group.height),
@@ -2417,7 +2421,7 @@ fn modular_frame_finalize_params(
     frame_plan: &ResidentModularFramePlan,
 ) -> Result<ModularFinalizeParams> {
     let status_index = if profile.global_stream.is_some() {
-        u32::try_from(profile.groups.len())
+        u32::try_from(profile.entropy_groups.len())
             .map_err(|_| Error::backend("DC-global finalizer status index exceeds u32"))?
     } else {
         0
@@ -2902,7 +2906,7 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
 
 #[derive(Clone, Copy, Debug)]
 struct ModularMetadataInventory {
-    local_ma_group_count: usize,
+    local_ma_stream_count: usize,
     unique_ma_config_count: usize,
 }
 
@@ -3012,7 +3016,7 @@ fn validate_device_limits(
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
         modular_metadata_bytes: metadata_bytes,
-        local_ma_group_count: metadata_inventory.local_ma_group_count,
+        local_ma_stream_count: metadata_inventory.local_ma_stream_count,
         unique_ma_config_count: metadata_inventory.unique_ma_config_count,
         output_lease_bytes: output_bytes,
         transient_bytes,
@@ -3028,6 +3032,7 @@ fn validate_device_limits(
         resident_modular_arena_bytes: dispatch.resident_modular_arena_bytes,
         frame_modular_arena_bytes: dispatch.frame_modular_arena_bytes,
         global_reconstruction_sample_words: dispatch.global_reconstruction_sample_words,
+        low_frequency_group_stream_count: dispatch.low_frequency_group_stream_count,
         inverse_transform_count: dispatch.inverse_transform_count,
         palette_dispatch_count: dispatch.palette_dispatch_count,
         inverse_transform_uniform_bytes: dispatch.inverse_transform_uniform_bytes,
@@ -3063,7 +3068,7 @@ fn submit_decode(
     poll_permit: SubmissionPollPermit,
 ) -> Result<WgpuPendingFrame> {
     let device = backend.device();
-    // Only a bounded batch of pass-group packets is storage-bound at once. The host keeps the
+    // Only a bounded batch of LF/pass-subimage packets is storage-bound at once. The host keeps the
     // validated shared span table, while queue ordering lets every batch reuse this one GPU
     // window. Cross-chunk ranges are copied directly into that bounded upload, never into a
     // whole-codestream allocation.
@@ -3272,7 +3277,7 @@ fn submit_decode(
     let mut final_submission = None;
     let has_global_stream = !source.dispatch_layout.global_stream_batches.is_empty();
     if has_global_stream {
-        let global_record_index = source.profile.groups.len();
+        let global_record_index = source.profile.entropy_groups.len();
         let global_record_index_u32 = u32::try_from(global_record_index)
             .map_err(|_| Error::backend("DC-global status index exceeds WGSL u32"))?;
         let global_params_offset = u64::try_from(global_record_index)
@@ -3362,7 +3367,7 @@ fn submit_decode(
 
             let group = source
                 .profile
-                .groups
+                .entropy_groups
                 .get(segment.group_index)
                 .copied()
                 .ok_or_else(|| Error::backend("stream segment group index is invalid"))?;
@@ -3473,7 +3478,7 @@ fn submit_decode(
                     lane_index,
                 )?);
                 if source.profile.resident_frame_plan.is_some() {
-                    encode_group_plane_copies(
+                    encode_subimage_plane_copies(
                         &mut commands,
                         source,
                         lifetime._reconstructed.buffer(),
@@ -3481,7 +3486,7 @@ fn submit_decode(
                             ._frame_arena
                             .as_ref()
                             .ok_or(Error::EngineContract(
-                                "pass-group assembly is missing its frame arena",
+                                "Modular subimage assembly is missing its frame arena",
                             ))?
                             .buffer(),
                         segment.group_index,
@@ -3586,7 +3591,7 @@ fn submit_decode(
         stream_sample_counts: {
             let mut expected = source
                 .profile
-                .groups
+                .entropy_groups
                 .iter()
                 .copied()
                 .enumerate()
@@ -3723,7 +3728,7 @@ fn encode_modular_inverse(
     group_index: usize,
     lane_index: usize,
 ) -> Result<Vec<wgpu::Buffer>> {
-    let plan = resident_group_plan(&source.profile, group_index)?;
+    let plan = resident_entropy_plan(&source.profile, group_index)?;
     let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
         Error::EngineContract("descriptor reconstruction produced an empty resident arena"),
     )?;
@@ -3814,7 +3819,7 @@ fn encode_modular_inverse_jobs(
     Ok(uniforms)
 }
 
-fn encode_group_plane_copies(
+fn encode_subimage_plane_copies(
     encoder: &mut wgpu::CommandEncoder,
     source: &DecodeSource,
     group_arena: &wgpu::Buffer,
@@ -3827,40 +3832,42 @@ fn encode_group_plane_copies(
         .resident_frame_plan
         .as_ref()
         .ok_or(Error::EngineContract(
-            "pass-group plane assembly is missing its frame plan",
+            "Modular subimage assembly is missing its frame plan",
         ))?;
     let copies = frame_plan
-        .group_plane_copies
+        .subimage_plane_copies
         .get(group_index)
         .ok_or(Error::EngineContract(
-            "pass-group plane assembly is missing its copy plan",
+            "Modular subimage assembly is missing its copy plan",
         ))?;
     let lane_offset = u64::try_from(lane_index)
         .ok()
         .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
-        .ok_or_else(|| Error::backend("pass-group copy lane offset overflow"))?;
+        .ok_or_else(|| Error::backend("Modular subimage copy lane offset overflow"))?;
     for copy in copies {
         if copy.source.width != copy.destination.width
             || copy.source.height != copy.destination.height
             || copy.source.bit_depth != copy.destination.bit_depth
         {
             return Err(Error::EngineContract(
-                "pass-group source and frame-arena destination geometries disagree",
+                "Modular subimage source and frame-arena destination geometries disagree",
             ));
         }
         let row_bytes = u64::from(copy.source.width)
             .checked_mul(4)
-            .ok_or_else(|| Error::backend("pass-group copy row size overflow"))?;
+            .ok_or_else(|| Error::backend("Modular subimage copy row size overflow"))?;
         for row in 0..copy.source.height {
             let source_offset = u64::from(copy.source.word_offset)
                 .checked_add(u64::from(row) * u64::from(copy.source.row_stride_words))
                 .and_then(|words| words.checked_mul(4))
                 .and_then(|bytes| lane_offset.checked_add(bytes))
-                .ok_or_else(|| Error::backend("pass-group copy source offset overflow"))?;
+                .ok_or_else(|| Error::backend("Modular subimage copy source offset overflow"))?;
             let destination_offset = u64::from(copy.destination.word_offset)
                 .checked_add(u64::from(row) * u64::from(copy.destination.row_stride_words))
                 .and_then(|words| words.checked_mul(4))
-                .ok_or_else(|| Error::backend("pass-group copy destination offset overflow"))?;
+                .ok_or_else(|| {
+                    Error::backend("Modular subimage copy destination offset overflow")
+                })?;
             if source_offset
                 .checked_add(row_bytes)
                 .is_none_or(|end| end > group_arena.size())
@@ -3869,7 +3876,7 @@ fn encode_group_plane_copies(
                     .is_none_or(|end| end > frame_arena.size())
             {
                 return Err(Error::EngineContract(
-                    "pass-group plane copy exceeds a resident GPU arena",
+                    "Modular subimage plane copy exceeds a resident GPU arena",
                 ));
             }
             encoder.copy_buffer_to_buffer(
@@ -3900,7 +3907,7 @@ fn encode_modular_finalize(
         .ok_or(Error::EngineContract(
             "descriptor reconstruction is missing final-output parameters",
         ))?;
-    let plan = resident_group_plan(&source.profile, group_index)?;
+    let plan = resident_entropy_plan(&source.profile, group_index)?;
     let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
         Error::EngineContract("descriptor reconstruction produced an empty resident arena"),
     )?;
@@ -4097,7 +4104,7 @@ fn build_params(
         if fixed_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
             compact_gray8_sample_words(group)?
         } else if uses_generalized_channel_layout(&source.profile) {
-            resident_group_plan(&source.profile, group_index)?
+            resident_entropy_plan(&source.profile, group_index)?
                 .inverse_plan
                 .arena_words()
         } else {
@@ -4110,7 +4117,7 @@ fn build_params(
         decoded_symbol_count,
         physical_sample_words,
     )?;
-    let group_plan = resident_group_plan(&source.profile, group_index)?;
+    let group_plan = resident_entropy_plan(&source.profile, group_index)?;
     let wp_header = group_plan.wp_header;
     let ma_config = group_plan.ma_config.resolve(&source.profile.ma_config);
     Ok(ShaderParams {

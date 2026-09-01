@@ -218,13 +218,15 @@ that pass group's local RCT/Palette/Squeeze sequence. Identical concrete plans s
 descriptor ranges. Each lane is aligned to the device's storage-offset requirement; after a group's
 final entropy segment, its inverse jobs and 144-byte region-aware finalizer run against that lane
 before the next batch can reuse it. For DC-global Palette/Squeeze, global entropy instead writes its
-meta/small-channel prefix into a separate frame-resident arena. Pass groups reconstruct the remaining
-shift-below-three transformed rectangles in reusable lanes, run local inverse jobs, and copy their
-final rows into disjoint full-frame views. One shared inverse plan and one 144-byte finalizer then run
-after the last group. The frame arena, its entropy/predictor state, inverse uniforms, and finalizer
+meta/small-channel prefix into a separate frame-resident arena. LF groups first reconstruct channels
+whose horizontal and vertical transformed shifts are both at least three. Pass groups then
+reconstruct every remaining channel, including asymmetric shifts where only one axis reaches three.
+Both subimage kinds use reusable lanes, run their local inverse jobs, and copy final rows into
+disjoint full-frame views. One shared inverse plan and one 144-byte finalizer then run after the last
+pass group. The frame arena, all subimage entropy/predictor state, inverse uniforms, and finalizer
 uniform share the same byte admission and device binding checks. Zero- and nonzero-sample DC-global
 Prefix/ANS ranges use the same exact termination logic; one map validates their status with every
-pass group.
+LF/pass subimage.
 Each pass-group header independently selects the global MA configuration or supplies a bounded
 local tree, entropy tables, hybrid configs, context map, LZ77 parameters, and weighted-predictor
 header. Host lowering packs the global descriptor first, appends and rebases distinct locals,
@@ -232,8 +234,8 @@ deduplicates equal locals, and stores the selected word base in the group's 244-
 The scheduler sizes lane state and LZ history for the maximum resolved group contract and only
 keeps a fixed reconstruction specialization when every group proves the same leaf mapping; mixed
 Prefix/ANS groups use the common generic allocation and are exposed as `ModularEntropyCoding::Mixed`.
-`WgpuDecodeMemoryStats` reports exact descriptor bytes, local-group count, and unique resident
-configuration count.
+`WgpuDecodeMemoryStats` reports exact descriptor bytes, local-stream count, LF-group stream count,
+and unique resident configuration count.
 
 ## Protocol execution
 
