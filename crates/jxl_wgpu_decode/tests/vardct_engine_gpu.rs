@@ -1891,7 +1891,7 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
 }
 
 #[test]
-fn multi_level_progressive_dc_rejects_the_remaining_single_packet_gap_before_submit() {
+fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
     let Some(encoded) = common::cjxl_progressive_dc_codestream(2) else {
         return;
     };
@@ -1900,16 +1900,113 @@ fn multi_level_progressive_dc_rejects_the_remaining_single_packet_gap_before_sub
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
-    let decoder = GpuDecoder::wgpu(backend).unwrap();
-    let error = match decoder.open(
-        &encoded,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-    ) {
-        Ok(_) => panic!("multi-level progressive-DC unexpectedly opened"),
-        Err(error) => error,
-    };
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
-        error,
-        DecodeError::VarDct(VarDctDecodeError::UnsupportedProgressiveDcIntermediatePacket)
+        session.submission_session(),
+        WgpuDecodeSubmissionSession::ProgressiveDc(_)
     ));
+    assert_eq!(session.submission_session().submissions_per_frame(), 4);
+    session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(matches!(
+        session
+            .front_pending_frame()
+            .unwrap()
+            .unvalidated_gpu_frame(),
+        Err(DecodeError::VarDct(
+            VarDctDecodeError::UnvalidatedOutputNotSubmitted
+        ))
+    ));
+    let frame = session.next_frame().unwrap().unwrap();
+    assert!(session.next_frame().unwrap().is_none());
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let expected = rust_jxl_rgb8(&encoded, Extent2d::new(1_024, 128));
+    assert_eq!(actual.len(), expected.len());
+    let error = maximum_error(actual, &expected);
+    assert!(
+        error <= 1,
+        "multi-level GPU-resident progressive-DC output diverges from Rust jxl by {error}",
+    );
+
+    let mut async_session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let async_frame = pollster::block_on(async_session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    assert!(async_session.next_frame().unwrap().is_none());
+    let async_readback = ImageReadbackPipeline::new(&backend)
+        .submit(async_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        async_readback.frame.outputs[0].bytes.as_slice(),
+        actual.as_slice()
+    );
+    drop(async_readback);
+    drop(async_frame);
+    drop(async_session);
+    drop(readback);
+    drop(frame);
+    drop(session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let probe_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut probe = probe_decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    probe.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    let initial_reservation = probe_decoder
+        .engine()
+        .in_flight_memory_stats()
+        .reserved_bytes;
+    assert!(initial_reservation > 0);
+    let snapshot = backend.transient_memory_stats();
+    let budget_blocker = backend
+        .transient_memory_budget()
+        .try_reserve(snapshot.limit_bytes - snapshot.reserved_bytes)
+        .unwrap();
+    assert!(matches!(
+        probe.next_frame(),
+        Err(DecodeError::MemoryBackpressure(
+            MemoryBudgetError::Exhausted {
+                requested_bytes,
+                ..
+            }
+        )) if requested_bytes > 0
+    ));
+    drop(budget_blocker);
+    drop(probe);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    assert_eq!(
+        probe_decoder
+            .engine()
+            .in_flight_memory_stats()
+            .reserved_bytes,
+        0
+    );
 }

@@ -267,6 +267,16 @@ impl HfGlobalPrefix {
     ) -> Result<Self, VarDctPacketError> {
         let mut reader = BoundedBitInput::new(reader, packet_end);
         metadata_require_default(&mut reader, "HF dequantization matrices")?;
+        Self::parse_after_dequant_reader(&mut reader, packet_end, group_count)
+    }
+
+    /// Parses the suffix after a caller has consumed the complete dequant-matrix set.
+    pub(crate) fn parse_after_dequant_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+        group_count: u32,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
 
         let preset_bits = if group_count <= 1 {
             0
@@ -1443,7 +1453,7 @@ impl MetadataU32Part {
     }
 }
 
-fn metadata_bits(
+pub(crate) fn metadata_bits(
     reader: &mut impl BitInput,
     stage: &'static str,
     count: u8,
@@ -1453,7 +1463,7 @@ fn metadata_bits(
         .map_err(|source| metadata_error(stage, source))
 }
 
-fn metadata_bool(
+pub(crate) fn metadata_bool(
     reader: &mut impl BitInput,
     stage: &'static str,
 ) -> Result<bool, VarDctPacketError> {
@@ -1473,7 +1483,10 @@ fn metadata_u32(
     u32::try_from(value).map_err(|_| VarDctPacketError::PacketRangeOverflow)
 }
 
-fn metadata_f16(reader: &mut impl BitInput, stage: &'static str) -> Result<f32, VarDctPacketError> {
+pub(crate) fn metadata_f16(
+    reader: &mut impl BitInput,
+    stage: &'static str,
+) -> Result<f32, VarDctPacketError> {
     let value = metadata_bits(reader, stage, 16)? as u32;
     let neg_bit = (value & 0x8000) << 16;
     if value & 0x7fff == 0 {

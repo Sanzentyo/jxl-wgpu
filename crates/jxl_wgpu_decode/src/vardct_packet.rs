@@ -3,6 +3,8 @@
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
 use jxl_gpu_protocol::TransformKind;
+use jxl_oxide_common::Bundle;
+use jxl_vardct::{DequantMatrixSet, DequantMatrixSetParams};
 use thiserror::Error;
 
 use crate::GpuCodestream;
@@ -17,8 +19,8 @@ use crate::vardct_frontend::{
     BoundedBitInput, HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation,
     LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
     VarDctGroupRect, VarDctMetadataReaderError, VarDctPacketError, VarDctSectionLayout,
-    map_metadata_reader_error, parse_hf_metadata_header_reader, parse_lf_group_header_reader,
-    validate_packet_end_bits,
+    map_metadata_reader_error, metadata_bits, metadata_bool, metadata_f16,
+    parse_hf_metadata_header_reader, parse_lf_group_header_reader, validate_packet_end_bits,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -82,6 +84,12 @@ pub enum BoundedVarDctPacketError {
     HfGlobalTrailingBits { bits: u64 },
     #[error("HF block-context map has {actual} entries; expected {expected}")]
     HfBlockContextMapLength { expected: usize, actual: usize },
+    #[error("HF dequantization matrix {matrix} uses raw Modular encoding")]
+    RawHfDequantMatrix { matrix: usize },
+    #[error("HF dequantization matrix {matrix} uses invalid encoding mode {encoding}")]
+    HfDequantMatrixEncoding { matrix: usize, encoding: u8 },
+    #[error("HF dequantization matrix {matrix} is invalid: {reason}")]
+    HfDequantMatrixValue { matrix: usize, reason: &'static str },
 }
 
 /// GPU-reported validation failure. No output is authoritative after this error.
@@ -141,6 +149,7 @@ pub struct BoundedVarDctPacketPlan {
     /// Descriptor-only HF coefficient entropy plan. Coefficient symbols remain in pass-group
     /// packets and are never expanded on the host.
     pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
+    hf_block_context: HfBlockContextIr,
     global_ma_config: Option<MaConfigIr>,
 }
 
@@ -207,6 +216,8 @@ pub struct HfCoefficientEntropyPlan {
     pub pass_groups: Vec<BitRange>,
     /// Per-pass-group power-of-two history capacity for the common GPU entropy executor.
     pub lz77_window_words: u32,
+    /// Complete matrix resource region as F32 bit patterns when HF-global overrides defaults.
+    pub dequant_matrix_words: Option<Vec<[u32; 4]>>,
 }
 
 fn parse_ma_config_at_reader(
@@ -694,6 +705,7 @@ impl BoundedVarDctPacketPlan {
             lf_correlation: lf_global.lf_correlation,
             groups,
             hf_coefficients,
+            hf_block_context: lf_global.hf_block_context,
             global_ma_config,
         })
     }
@@ -730,6 +742,13 @@ impl BoundedVarDctPacketPlan {
     #[must_use]
     pub const fn requires_local_tree_staging(&self) -> bool {
         !self.profile.uses_lf_frame && self.global_ma_config.is_none()
+    }
+
+    /// Whether HF metadata must stop at a GPU-discovered HF-global boundary in a single packet.
+    #[must_use]
+    pub const fn requires_hf_global_staging(&self) -> bool {
+        self.profile.uses_lf_frame
+            && matches!(&self.profile.sections, VarDctSectionLayout::Single { .. })
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
@@ -826,6 +845,60 @@ impl BoundedVarDctPacketPlan {
             block_count: prefix.block_count,
             modular: pack_modular_plan(&config, distance_multiplier, decoded_symbol_limit)?,
         })
+    }
+
+    /// Parses the general HF-global descriptor and the sole pass-group tail of a single-entry
+    /// progressive-DC packet after the GPU reports the HF-metadata entropy cursor.
+    pub(crate) fn parse_single_hf_global_continuation_source(
+        &self,
+        source: &GpuCodestream,
+        hf_metadata_end: u32,
+    ) -> Result<HfCoefficientEntropyPlan, BoundedVarDctPacketError> {
+        if !self.profile.uses_lf_frame || self.groups.len() != 1 {
+            return Err(BoundedVarDctPacketError::PackedMetadata);
+        }
+        let VarDctSectionLayout::Single { packet } = &self.profile.sections else {
+            return Err(BoundedVarDctPacketError::PackedMetadata);
+        };
+        let packet_end = packet
+            .end()
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "single-entry progressive-DC packet end",
+            })?;
+        if u64::from(hf_metadata_end) > packet_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: u64::from(hf_metadata_end),
+                packet_end,
+            }
+            .into());
+        }
+        let max_group_blocks = self
+            .profile
+            .group_dimension
+            .div_ceil(8)
+            .checked_mul(self.profile.group_dimension.div_ceil(8))
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "single-entry pass-group block count",
+            })?;
+        let decoded_symbol_limit = max_group_blocks.checked_mul(3 * 64).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "single-entry pass-group coefficient symbol limit",
+            },
+        )?;
+        HfCoefficientEntropyPlan::parse_single_tail_inner(
+            PacketSource::Spans(source),
+            BitRange {
+                offset: u64::from(hf_metadata_end),
+                length: packet_end - u64::from(hf_metadata_end),
+            },
+            u32::try_from(self.profile.group_count).map_err(|_| {
+                BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "single-entry pass-group count",
+                }
+            })?,
+            &self.hf_block_context,
+            decoded_symbol_limit,
+        )
     }
 }
 
@@ -1055,6 +1128,480 @@ impl BoundedVarDctGroupPlan {
     }
 }
 
+#[derive(Clone, Debug)]
+enum HfDequantMatrixEncoding {
+    Default,
+    Hornuss([[f32; 3]; 3]),
+    Dct2([[f32; 6]; 3]),
+    Dct4 {
+        params: [[f32; 2]; 3],
+        dct_params: [Vec<f32>; 3],
+    },
+    Dct4x8 {
+        params: [[f32; 1]; 3],
+        dct_params: [Vec<f32>; 3],
+    },
+    Afv {
+        params: [[f32; 9]; 3],
+        dct_params: [Vec<f32>; 3],
+        dct4x4_params: [Vec<f32>; 3],
+    },
+    Dct([Vec<f32>; 3]),
+}
+
+fn parse_hf_dequant_matrices(
+    reader: &mut impl BitInput,
+) -> Result<Option<Vec<[u32; 4]>>, BoundedVarDctPacketError> {
+    if metadata_bool(reader, "HF dequantization matrix defaults")? {
+        return Ok(None);
+    }
+
+    fn read_fixed<const N: usize>(
+        reader: &mut impl BitInput,
+        matrix: usize,
+    ) -> Result<[[f32; N]; 3], BoundedVarDctPacketError> {
+        let mut output = [[0.0; N]; 3];
+        for value in output.iter_mut().flatten() {
+            *value = metadata_f16(reader, "HF dequantization matrix parameter")?;
+            if !value.is_finite() {
+                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                    matrix,
+                    reason: "parameter is not finite",
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    fn read_dct_params(
+        reader: &mut impl BitInput,
+        matrix: usize,
+    ) -> Result<[Vec<f32>; 3], BoundedVarDctPacketError> {
+        let count = usize::try_from(metadata_bits(reader, "HF dequantization band count", 4)?)
+            .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF dequantization band count",
+            })?
+            .checked_add(1)
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF dequantization band count",
+            })?;
+        let mut params = std::array::from_fn(|_| vec![0.0; count]);
+        for value in params.iter_mut().flatten() {
+            *value = metadata_f16(reader, "HF dequantization DCT band")?;
+            if !value.is_finite() {
+                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                    matrix,
+                    reason: "DCT band is not finite",
+                });
+            }
+        }
+        for first in params.iter_mut().filter_map(|values| values.first_mut()) {
+            *first *= 64.0;
+        }
+        Ok(params)
+    }
+
+    let mut encodings = Vec::with_capacity(17);
+    for matrix in 0..17 {
+        let encoding = u8::try_from(metadata_bits(
+            reader,
+            "HF dequantization matrix encoding",
+            3,
+        )?)
+        .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+            field: "HF dequantization matrix encoding",
+        })?;
+        if (1..=5).contains(&encoding) && !matches!(matrix, 0 | 1 | 2 | 3 | 9 | 10) {
+            return Err(BoundedVarDctPacketError::HfDequantMatrixEncoding { matrix, encoding });
+        }
+        let encoding = match encoding {
+            0 => HfDequantMatrixEncoding::Default,
+            1 => HfDequantMatrixEncoding::Hornuss(read_fixed(reader, matrix)?),
+            2 => HfDequantMatrixEncoding::Dct2(read_fixed(reader, matrix)?),
+            3 => HfDequantMatrixEncoding::Dct4 {
+                params: read_fixed(reader, matrix)?,
+                dct_params: read_dct_params(reader, matrix)?,
+            },
+            4 => HfDequantMatrixEncoding::Dct4x8 {
+                params: read_fixed(reader, matrix)?,
+                dct_params: read_dct_params(reader, matrix)?,
+            },
+            5 => {
+                let mut params = read_fixed::<9>(reader, matrix)?;
+                for channel in &mut params {
+                    for value in &mut channel[..6] {
+                        *value *= 64.0;
+                    }
+                }
+                HfDequantMatrixEncoding::Afv {
+                    params,
+                    dct_params: read_dct_params(reader, matrix)?,
+                    dct4x4_params: read_dct_params(reader, matrix)?,
+                }
+            }
+            6 => HfDequantMatrixEncoding::Dct(read_dct_params(reader, matrix)?),
+            7 => return Err(BoundedVarDctPacketError::RawHfDequantMatrix { matrix }),
+            _ => unreachable!("three-bit encoding is in 0..=7"),
+        };
+        encodings.push(encoding);
+    }
+    expand_hf_dequant_matrices(&encodings).map(Some)
+}
+
+fn expand_hf_dequant_matrices(
+    encodings: &[HfDequantMatrixEncoding],
+) -> Result<Vec<[u32; 4]>, BoundedVarDctPacketError> {
+    fn matrix_param_index(transform: TransformKind) -> usize {
+        match transform {
+            TransformKind::Dct8 => 0,
+            TransformKind::Hornuss => 1,
+            TransformKind::Dct2x2 => 2,
+            TransformKind::Dct4x4 => 3,
+            TransformKind::Dct16x16 => 4,
+            TransformKind::Dct32x32 => 5,
+            TransformKind::Dct16x8 | TransformKind::Dct8x16 => 6,
+            TransformKind::Dct32x8 | TransformKind::Dct8x32 => 7,
+            TransformKind::Dct32x16 | TransformKind::Dct16x32 => 8,
+            TransformKind::Dct4x8 | TransformKind::Dct8x4 => 9,
+            TransformKind::Afv0
+            | TransformKind::Afv1
+            | TransformKind::Afv2
+            | TransformKind::Afv3 => 10,
+            TransformKind::Dct64x64 => 11,
+            TransformKind::Dct64x32 | TransformKind::Dct32x64 => 12,
+            TransformKind::Dct128x128 => 13,
+            TransformKind::Dct128x64 | TransformKind::Dct64x128 => 14,
+            TransformKind::Dct256x256 => 15,
+            TransformKind::Dct256x128 | TransformKind::Dct128x256 => 16,
+        }
+    }
+
+    fn representative(index: usize) -> TransformKind {
+        [
+            TransformKind::Dct8,
+            TransformKind::Hornuss,
+            TransformKind::Dct2x2,
+            TransformKind::Dct4x4,
+            TransformKind::Dct16x16,
+            TransformKind::Dct32x32,
+            TransformKind::Dct8x16,
+            TransformKind::Dct8x32,
+            TransformKind::Dct16x32,
+            TransformKind::Dct4x8,
+            TransformKind::Afv0,
+            TransformKind::Dct64x64,
+            TransformKind::Dct32x64,
+            TransformKind::Dct128x128,
+            TransformKind::Dct64x128,
+            TransformKind::Dct256x256,
+            TransformKind::Dct128x256,
+        ][index]
+    }
+
+    fn interpolate(pos: f32, max: f32, bands: &[f32]) -> f32 {
+        if let [value] = bands {
+            return *value;
+        }
+        let scaled = pos * (bands.len() - 1) as f32 / max;
+        let index = (scaled as usize).min(bands.len() - 2);
+        let fraction = scaled - index as f32;
+        let left = bands[index];
+        let right = bands[index + 1];
+        left * (right / left).powf(fraction)
+    }
+
+    fn multiplier(value: f32) -> f32 {
+        if value > 0.0 {
+            1.0 + value
+        } else {
+            1.0 / (1.0 - value)
+        }
+    }
+
+    fn dct_weights(
+        params: &[f32],
+        width: u32,
+        height: u32,
+        matrix: usize,
+    ) -> Result<Vec<f32>, BoundedVarDctPacketError> {
+        let mut bands = Vec::with_capacity(params.len());
+        let mut last = *params
+            .first()
+            .ok_or(BoundedVarDctPacketError::HfDequantMatrixValue {
+                matrix,
+                reason: "DCT matrix has no bands",
+            })?;
+        bands.push(last);
+        for &value in &params[1..] {
+            last *= multiplier(value);
+            if !last.is_finite() || last <= 0.0 {
+                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                    matrix,
+                    reason: "DCT band is non-positive or non-finite",
+                });
+            }
+            bands.push(last);
+        }
+        let mut output = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 / (width - 1) as f32;
+                let dy = y as f32 / (height - 1) as f32;
+                output.push(interpolate(
+                    (dx * dx + dy * dy).sqrt(),
+                    std::f32::consts::SQRT_2 + 1e-6,
+                    &bands,
+                ));
+            }
+        }
+        Ok(output)
+    }
+
+    fn expand(
+        encoding: &HfDequantMatrixEncoding,
+        transform: TransformKind,
+        matrix: usize,
+    ) -> Result<[Vec<f32>; 3], BoundedVarDctPacketError> {
+        let output = match encoding {
+            HfDequantMatrixEncoding::Default => unreachable!("defaults are expanded separately"),
+            HfDequantMatrixEncoding::Dct(params) => {
+                let extent = transform.pixel_extent();
+                [
+                    dct_weights(&params[0], extent.width, extent.height, matrix)?,
+                    dct_weights(&params[1], extent.width, extent.height, matrix)?,
+                    dct_weights(&params[2], extent.width, extent.height, matrix)?,
+                ]
+            }
+            HfDequantMatrixEncoding::Hornuss(params) => params.map(|params| {
+                let mut values = vec![params[0]; 64];
+                values[0] = 1.0;
+                values[1] = params[1];
+                values[8] = params[1];
+                values[9] = params[2];
+                values
+            }),
+            HfDequantMatrixEncoding::Dct2(params) => params.map(|params| {
+                let mut values = vec![0.0; 64];
+                values[0] = 1.0;
+                for (index, value) in params.into_iter().enumerate() {
+                    let shift = index / 2;
+                    let dimension = 1_usize << shift;
+                    if index % 2 == 0 {
+                        for y in 0..dimension {
+                            for x in dimension..dimension * 2 {
+                                values[y * 8 + x] = value;
+                                values[x * 8 + y] = value;
+                            }
+                        }
+                    } else {
+                        for y in dimension..dimension * 2 {
+                            for x in dimension..dimension * 2 {
+                                values[y * 8 + x] = value;
+                            }
+                        }
+                    }
+                }
+                values
+            }),
+            HfDequantMatrixEncoding::Dct4 { params, dct_params } => {
+                let mut output = [Vec::new(), Vec::new(), Vec::new()];
+                for (output, (params, dct)) in output.iter_mut().zip(params.iter().zip(dct_params))
+                {
+                    let matrix = dct_weights(dct, 4, 4, matrix)?;
+                    *output = vec![0.0; 64];
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            output[y * 16 + x * 2] = matrix[y * 4 + x];
+                            output[y * 16 + x * 2 + 1] = matrix[y * 4 + x];
+                            output[(y * 2 + 1) * 8 + x * 2] = matrix[y * 4 + x];
+                            output[(y * 2 + 1) * 8 + x * 2 + 1] = matrix[y * 4 + x];
+                        }
+                    }
+                    output[1] /= params[0];
+                    output[8] /= params[0];
+                    output[9] /= params[1];
+                }
+                output
+            }
+            HfDequantMatrixEncoding::Dct4x8 { params, dct_params } => {
+                let mut output = [Vec::new(), Vec::new(), Vec::new()];
+                for (output, (params, dct)) in output.iter_mut().zip(params.iter().zip(dct_params))
+                {
+                    let matrix = dct_weights(dct, 8, 4, matrix)?;
+                    *output = matrix
+                        .chunks_exact(8)
+                        .flat_map(|row| [row, row])
+                        .flatten()
+                        .copied()
+                        .collect();
+                    output[8] /= params[0];
+                }
+                output
+            }
+            HfDequantMatrixEncoding::Afv {
+                params,
+                dct_params,
+                dct4x4_params,
+            } => {
+                const FREQUENCIES: [f32; 16] = [
+                    0.0, 0.0, 0.8517779, 5.3777843, 0.0, 0.0, 4.734748, 5.4492455, 1.659827, 4.0,
+                    7.275749, 10.423227, 2.6629324, 7.6306577, 8.962389, 12.971662,
+                ];
+                let mut output = [Vec::new(), Vec::new(), Vec::new()];
+                for (output, ((params, dct), dct4)) in output
+                    .iter_mut()
+                    .zip(params.iter().zip(dct_params).zip(dct4x4_params))
+                {
+                    let weights_4x8 = dct_weights(dct, 8, 4, matrix)?;
+                    let weights_4x4 = dct_weights(dct4, 4, 4, matrix)?;
+                    let mut bands = [params[5], 0.0, 0.0, 0.0];
+                    for index in 1..4 {
+                        bands[index] = bands[index - 1] * multiplier(params[index + 5]);
+                    }
+                    *output = vec![0.0; 64];
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            output[16 * y + 2 * x] = match (x, y) {
+                                (0, 0) => 1.0,
+                                (0, 1) => params[2],
+                                (1, 0) => params[3],
+                                (1, 1) => params[4],
+                                _ => interpolate(
+                                    FREQUENCIES[y * 4 + x] - FREQUENCIES[2],
+                                    FREQUENCIES[15] - FREQUENCIES[2] + 1e-6,
+                                    &bands,
+                                ),
+                            };
+                        }
+                    }
+                    for (y, ((rows, weights_8), weights_4)) in output
+                        .chunks_exact_mut(16)
+                        .zip(weights_4x8.chunks_exact(8))
+                        .zip(weights_4x4.chunks_exact(4))
+                        .enumerate()
+                    {
+                        let (row0, row1) = rows.split_at_mut(8);
+                        for (x, (value, &weight)) in row1.iter_mut().zip(weights_8).enumerate() {
+                            *value = if y == 0 && x == 0 { params[0] } else { weight };
+                        }
+                        for (x, (pair, &weight)) in
+                            row0.chunks_exact_mut(2).zip(weights_4).enumerate()
+                        {
+                            pair[1] = if y == 0 && x == 0 { params[1] } else { weight };
+                        }
+                    }
+                }
+                output
+            }
+        };
+        let mut output = output;
+        for value in output.iter_mut().flatten() {
+            *value = 1.0 / *value;
+            if !value.is_finite() || *value <= 0.0 || *value >= 1e8 {
+                return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                    matrix,
+                    reason: "expanded value is non-positive, non-finite, or too large",
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    fn transpose(channels: &[Vec<f32>; 3], width: u32, height: u32) -> [Vec<f32>; 3] {
+        std::array::from_fn(|channel| {
+            let mut output = vec![0.0; channels[channel].len()];
+            for y in 0..height {
+                for x in 0..width {
+                    output[(x * height + y) as usize] = channels[channel][(y * width + x) as usize];
+                }
+            }
+            output
+        })
+    }
+
+    let encoded_default = [1_u8];
+    let mut default_bits = jxl_bitstream::Bitstream::new(&encoded_default);
+    let pool = jxl_threadpool::JxlThreadPool::none();
+    let defaults = DequantMatrixSet::parse(
+        &mut default_bits,
+        DequantMatrixSetParams::new(8, 1, None, None, &pool),
+    )
+    .map_err(|_| BoundedVarDctPacketError::HfDequantMatrixValue {
+        matrix: 0,
+        reason: "normative defaults could not be constructed",
+    })?;
+    let mut packed = Vec::new();
+    for transform in TransformKind::ALL {
+        let index = matrix_param_index(transform);
+        let extent = transform.pixel_extent();
+        let channels = match &encodings[index] {
+            HfDequantMatrixEncoding::Default => {
+                let transform_type = crate::vardct_resource::vardct_transform_type(transform);
+                std::array::from_fn(|channel| {
+                    if transform.needs_transpose() {
+                        defaults.get_transposed(channel, transform_type).to_vec()
+                    } else {
+                        defaults.get(channel, transform_type).to_vec()
+                    }
+                })
+            }
+            encoding => {
+                let representative = representative(index);
+                let channels = expand(encoding, representative, index)?;
+                if transform.needs_transpose() {
+                    let representative_extent = representative.pixel_extent();
+                    transpose(
+                        &channels,
+                        representative_extent.width,
+                        representative_extent.height,
+                    )
+                } else {
+                    channels
+                }
+            }
+        };
+        let matrix_len = usize::try_from(extent.width.checked_mul(extent.height).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF dequantization matrix area",
+            },
+        )?)
+        .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+            field: "HF dequantization matrix area",
+        })?;
+        if channels.iter().any(|channel| channel.len() != matrix_len) {
+            return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                matrix: index,
+                reason: "expanded matrix dimensions do not match the transform",
+            });
+        }
+        let base = packed.len();
+        packed.resize(
+            base.checked_add(matrix_len)
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "HF dequantization matrix packing",
+                })?,
+            [0; 4],
+        );
+        for frequency_y in 0..extent.height {
+            for frequency_x in 0..extent.width {
+                let raster = (frequency_y * extent.width + frequency_x) as usize;
+                let backend_index = if transform.is_special() || extent.height < extent.width {
+                    frequency_y * extent.width + frequency_x
+                } else {
+                    frequency_x * extent.height + frequency_y
+                } as usize;
+                packed[base + backend_index] = [
+                    channels[0][raster].to_bits(),
+                    channels[1][raster].to_bits(),
+                    channels[2][raster].to_bits(),
+                    0,
+                ];
+            }
+        }
+    }
+    Ok(packed)
+}
+
 impl HfCoefficientEntropyPlan {
     /// Parses HF-global tables without consuming a coefficient symbol. Pass-group ranges remain
     /// exact views into the caller-owned codestream for the GPU executor.
@@ -1085,6 +1632,44 @@ impl HfCoefficientEntropyPlan {
         pass_groups: Vec<BitRange>,
         decoded_symbol_limit: u32,
     ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner_with_tail(
+            source,
+            packet,
+            group_count,
+            block_context,
+            pass_groups,
+            decoded_symbol_limit,
+            false,
+        )
+    }
+
+    fn parse_single_tail_inner(
+        source: PacketSource<'_>,
+        packet: BitRange,
+        group_count: u32,
+        block_context: &HfBlockContextIr,
+        decoded_symbol_limit: u32,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner_with_tail(
+            source,
+            packet,
+            group_count,
+            block_context,
+            Vec::new(),
+            decoded_symbol_limit,
+            true,
+        )
+    }
+
+    fn parse_inner_with_tail(
+        source: PacketSource<'_>,
+        packet: BitRange,
+        group_count: u32,
+        block_context: &HfBlockContextIr,
+        mut pass_groups: Vec<BitRange>,
+        decoded_symbol_limit: u32,
+        trailing_pass_group: bool,
+    ) -> Result<Self, BoundedVarDctPacketError> {
         let packet_end = packet
             .end()
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
@@ -1092,7 +1677,10 @@ impl HfCoefficientEntropyPlan {
             })?;
         validate_source_packet_end(source, packet_end)?;
         let mut reader = source_reader_at(source, packet.offset)?;
-        let prefix = HfGlobalPrefix::parse_reader(&mut reader, packet_end, group_count)?;
+        let mut reader = BoundedBitInput::new(&mut reader, packet_end);
+        let dequant_matrix_words = parse_hf_dequant_matrices(&mut reader)?;
+        let prefix =
+            HfGlobalPrefix::parse_after_dequant_reader(&mut reader, packet_end, group_count)?;
         let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
             parse_coefficient_orders_reader(&mut reader, prefix, packet_end)?;
         let lf_context_count = block_context
@@ -1149,7 +1737,12 @@ impl HfCoefficientEntropyPlan {
             .into());
         }
         let remaining = packet_end - descriptor_end;
-        if remaining > 7
+        if trailing_pass_group {
+            pass_groups.push(BitRange {
+                offset: descriptor_end,
+                length: remaining,
+            });
+        } else if remaining > 7
             || descriptor_reader
                 .read_bits(remaining as u8)
                 .map_err(map_modular_reader_error)?
@@ -1187,6 +1780,7 @@ impl HfCoefficientEntropyPlan {
             order_coordinate_offset_words,
             pass_groups,
             lz77_window_words,
+            dequant_matrix_words,
         })
     }
 }
@@ -1594,6 +2188,57 @@ impl GpuVarDctPacketStatus {
         }
     }
 
+    /// Validates a progressive-DC HF-metadata stage and returns its following HF-global cursor.
+    pub fn validate_hf_metadata_stage(
+        self,
+        expected: VarDctPacketValidation,
+    ) -> Result<u32, GpuVarDctPacketError> {
+        let expected_hf_samples = self
+            .first_blocks
+            .checked_mul(2)
+            .and_then(|tasks| expected.block_count.checked_add(tasks))
+            .and_then(|samples| {
+                expected
+                    .correlation_samples
+                    .checked_mul(2)
+                    .and_then(|cfl| samples.checked_add(cfl))
+            });
+        let strategy_matches = expected
+            .expected_strategy
+            .map(|strategy| self.strategy == transform_id(strategy))
+            .unwrap_or(true);
+        match self.code {
+            31 if self.cursor < self.expected_end
+                && self.lf_decoded == 0
+                && Some(self.hf_decoded) == expected_hf_samples
+                && self.first_blocks != 0
+                && self.first_blocks <= expected.task_capacity
+                && strategy_matches
+                && self.hf_mul > 0
+                && self.global_scale == expected.expected_global_scale
+                && self.quant_lf == expected.expected_quant_lf
+                && self.extra_precision == u32::from(expected.expected_extra_precision) =>
+            {
+                Ok(self.cursor)
+            }
+            31 | 2..=13 => Err(GpuVarDctPacketError::Entropy {
+                code: self.code,
+                cursor: self.cursor,
+                end: self.expected_end,
+                lf_decoded: self.lf_decoded,
+                hf_decoded: self.hf_decoded,
+                detail: self.detail,
+            }),
+            21 => Err(GpuVarDctPacketError::FirstBlock),
+            24 => Err(GpuVarDctPacketError::Strategy {
+                actual: self.detail,
+                expected: expected.expected_strategy.map_or(u32::MAX, transform_id),
+            }),
+            25 => Err(GpuVarDctPacketError::Sharpness { value: self.detail }),
+            code => Err(GpuVarDctPacketError::Unknown { code }),
+        }
+    }
+
     pub fn validate(
         self,
         expected: VarDctPacketValidation,
@@ -1676,6 +2321,7 @@ pub struct VarDctPacketPipeline {
     combined: wgpu::ComputePipeline,
     lf: wgpu::ComputePipeline,
     hf: wgpu::ComputePipeline,
+    hf_metadata: wgpu::ComputePipeline,
 }
 
 impl VarDctPacketPipeline {
@@ -1741,6 +2387,10 @@ impl VarDctPacketPipeline {
             ),
             lf: pipeline("jxl-wgpu bounded VarDCT LF frontend", "decode_vardct_lf"),
             hf: pipeline("jxl-wgpu bounded VarDCT HF frontend", "decode_vardct_hf"),
+            hf_metadata: pipeline(
+                "jxl-wgpu bounded VarDCT HF-metadata frontend",
+                "decode_vardct_hf_metadata",
+            ),
         }
     }
 
@@ -1772,6 +2422,16 @@ impl VarDctPacketPipeline {
         buffers: VarDctPacketBuffers<'_>,
     ) {
         self.encode_stage(device, encoder, buffers, &self.hf);
+    }
+
+    /// Decodes and validates HF metadata, then stops at the following HF-global boundary.
+    pub fn encode_hf_metadata(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffers: VarDctPacketBuffers<'_>,
+    ) {
+        self.encode_stage(device, encoder, buffers, &self.hf_metadata);
     }
 
     fn encode_stage(
@@ -1882,7 +2542,7 @@ const _: () = {
 mod tests {
     use std::sync::Arc;
 
-    use jxl_gpu_bitstream::StreamSlice;
+    use jxl_gpu_bitstream::{BitWriter, StreamSlice};
 
     use super::*;
 
@@ -1989,6 +2649,124 @@ mod tests {
             naga::valid::Capabilities::empty(),
         );
         validator.validate(&module).unwrap();
+    }
+
+    #[test]
+    fn every_parametric_hf_matrix_mode_matches_the_jxl_vardct_oracle() {
+        fn write_f16_ones(writer: &mut BitWriter, count: usize) {
+            for _ in 0..count {
+                writer.write_bits(0x3c00, 16).unwrap();
+            }
+        }
+
+        fn write_dct_params(writer: &mut BitWriter) {
+            writer.write_bits(0, 4).unwrap(); // one band per channel
+            write_f16_ones(writer, 3);
+        }
+
+        let modes = [1, 2, 3, 4, 6, 0, 6, 6, 6, 5, 6, 6, 6, 6, 6, 6, 6];
+        let mut writer = BitWriter::new();
+        writer.write_bits(0, 1).unwrap(); // custom matrix set
+        for mode in modes {
+            writer.write_bits(mode, 3).unwrap();
+            match mode {
+                0 => {}
+                1 => write_f16_ones(&mut writer, 3 * 3),
+                2 => write_f16_ones(&mut writer, 3 * 6),
+                3 => {
+                    write_f16_ones(&mut writer, 3 * 2);
+                    write_dct_params(&mut writer);
+                }
+                4 => {
+                    write_f16_ones(&mut writer, 3);
+                    write_dct_params(&mut writer);
+                }
+                5 => {
+                    write_f16_ones(&mut writer, 3 * 9);
+                    write_dct_params(&mut writer);
+                    write_dct_params(&mut writer);
+                }
+                6 => write_dct_params(&mut writer),
+                _ => unreachable!("test matrix mode is in 0..=6"),
+            }
+        }
+        let bytes = writer.into_bytes();
+        let mut reader = jxl_gpu_bitstream::BitReader::new(&bytes);
+
+        let words = parse_hf_dequant_matrices(&mut reader)
+            .unwrap()
+            .expect("custom set produces an explicit resource payload");
+        let layout = crate::vardct_resource::VarDctResourceLayout::new(1, 1, 1).unwrap();
+        layout.validate_dequant_matrix_words(&words).unwrap();
+
+        let mut oracle_bits = jxl_bitstream::Bitstream::new(&bytes);
+        let pool = jxl_threadpool::JxlThreadPool::none();
+        let oracle = DequantMatrixSet::parse(
+            &mut oracle_bits,
+            DequantMatrixSetParams::new(8, 1, None, None, &pool),
+        )
+        .unwrap();
+        let mut expected = Vec::with_capacity(words.len());
+        for transform in TransformKind::ALL {
+            let transform_type = crate::vardct_resource::vardct_transform_type(transform);
+            let channels: [&[f32]; 3] = std::array::from_fn(|channel| {
+                if transform.needs_transpose() {
+                    oracle.get_transposed(channel, transform_type)
+                } else {
+                    oracle.get(channel, transform_type)
+                }
+            });
+            let extent = transform.pixel_extent();
+            let area = usize::try_from(extent.width * extent.height).unwrap();
+            let base = expected.len();
+            expected.resize(base + area, [0; 4]);
+            for y in 0..extent.height {
+                for x in 0..extent.width {
+                    let raster = (y * extent.width + x) as usize;
+                    let backend_index = if transform.is_special() || extent.height < extent.width {
+                        y * extent.width + x
+                    } else {
+                        x * extent.height + y
+                    } as usize;
+                    expected[base + backend_index] = [
+                        channels[0][raster].to_bits(),
+                        channels[1][raster].to_bits(),
+                        channels[2][raster].to_bits(),
+                        0,
+                    ];
+                }
+            }
+        }
+        assert_eq!(words, expected);
+    }
+
+    #[test]
+    fn raw_and_transform_incompatible_hf_matrices_have_typed_errors() {
+        let mut raw = BitWriter::new();
+        raw.write_bits(0, 1).unwrap();
+        raw.write_bits(7, 3).unwrap();
+        let raw_bytes = raw.into_bytes();
+        let mut raw_reader = jxl_gpu_bitstream::BitReader::new(&raw_bytes);
+        assert!(matches!(
+            parse_hf_dequant_matrices(&mut raw_reader),
+            Err(BoundedVarDctPacketError::RawHfDequantMatrix { matrix: 0 })
+        ));
+
+        let mut incompatible = BitWriter::new();
+        incompatible.write_bits(0, 1).unwrap();
+        for _ in 0..4 {
+            incompatible.write_bits(0, 3).unwrap();
+        }
+        incompatible.write_bits(1, 3).unwrap();
+        let incompatible_bytes = incompatible.into_bytes();
+        let mut incompatible_reader = jxl_gpu_bitstream::BitReader::new(&incompatible_bytes);
+        assert!(matches!(
+            parse_hf_dequant_matrices(&mut incompatible_reader),
+            Err(BoundedVarDctPacketError::HfDequantMatrixEncoding {
+                matrix: 4,
+                encoding: 1
+            })
+        ));
     }
 
     #[test]

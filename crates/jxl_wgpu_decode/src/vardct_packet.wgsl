@@ -117,6 +117,7 @@ const ERROR_STRATEGY: u32 = 24u;
 const ERROR_SHARPNESS: u32 = 25u;
 const ERROR_HF_GLOBAL: u32 = 27u;
 const STATUS_LF_READY: u32 = 30u;
+const STATUS_HF_READY: u32 = 31u;
 const WINDOW_FIRST: u32 = 1u;
 const WINDOW_FINAL: u32 = 2u;
 const WINDOW_ENABLED: u32 = 4u;
@@ -726,6 +727,37 @@ fn finish_bounded_hf(hf_decoded: u32, first_blocks: u32) -> u32 {
     return status_code;
 }
 
+fn finish_bounded_hf_metadata(hf_decoded: u32, first_blocks: u32) -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    let correlation_samples = ((control.geometry.x + 63u) / 64u)
+        * ((control.geometry.y + 63u) / 64u);
+    let expected_samples = 2u * correlation_samples + 2u * first_blocks + block_count;
+    var status_code = decode_error;
+    if decode_error != 0u {
+        if !window_is_final() {
+            save_packet_execution_state(decode_error);
+        }
+    } else if hf_decoded != expected_samples {
+        if window_is_final() {
+            status_code = ERROR_TRUNCATED_BITS;
+        } else {
+            save_packet_execution_state(0u);
+            status_code = STATUS_IN_PROGRESS;
+        }
+    } else if !window_is_final() {
+        save_packet_execution_state(0u);
+        status_code = STATUS_IN_PROGRESS;
+    } else {
+        entropy_finalize();
+        validate_hf_values(first_blocks);
+        status_code = decode_error;
+        if decode_error == 0u {
+            status_code = STATUS_HF_READY;
+        }
+    }
+    return status_code;
+}
+
 fn write_bounded_hf_status(status_code: u32, hf_decoded: u32, first_blocks: u32) {
     status[0] = status_code;
     status[1] = params.stream_base_bit + bit_cursor;
@@ -925,6 +957,42 @@ fn decode_vardct_hf() {
     finish_hf_packet();
     clear_coefficients();
     status[0] = select(STATUS_OK, decode_error, decode_error != 0u);
+    status[1] = bit_cursor;
+    status[2] = params.entropy.token_end;
+    status[4] = hf_decoded;
+    status[5] = raw_metadata[control.offsets.z];
+    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[7] = control.capacities.x;
+    status[8] = select(status[8], 0u, decode_error == 0u);
+    status[9] = control.quantization.x;
+    status[10] = control.quantization.y;
+    status[11] = first_blocks;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn decode_vardct_hf_metadata() {
+    params = params_input[0];
+    reconstruction_base = 0u;
+    let first_blocks = control.quantization.w;
+    if bounded_window_enabled() {
+        params.source_mask = 0x7fffffffu;
+        params.stream_index = control.streams.y;
+        let hf_decoded = decode_hf_channels_bounded(first_blocks);
+        write_bounded_hf_status(
+            finish_bounded_hf_metadata(hf_decoded, first_blocks),
+            hf_decoded,
+            first_blocks,
+        );
+        return;
+    }
+    initialize_packet(control.section_bits.z, control.section_bits.y, control.streams.y);
+    if first_blocks == 0u || first_blocks > control.capacities.w {
+        reject(ERROR_FIRST_BLOCK, first_blocks);
+    }
+    let hf_decoded = decode_hf_channels(first_blocks);
+    entropy_finalize();
+    validate_hf_values(first_blocks);
+    status[0] = select(STATUS_HF_READY, decode_error, decode_error != 0u);
     status[1] = bit_cursor;
     status[2] = params.entropy.token_end;
     status[4] = hf_decoded;

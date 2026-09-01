@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use jxl_gpu_bitstream::{
@@ -327,7 +328,7 @@ impl WgpuDecodeEngine {
             metadata,
             WgpuDecodeSubmissionSession::ProgressiveDc(Box::new(ProgressiveDcSubmissionSession {
                 stages: Some(stages),
-                submissions_per_frame,
+                submissions_per_frame: Arc::new(AtomicUsize::new(submissions_per_frame)),
             })),
         )
         .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
@@ -448,7 +449,7 @@ enum ProgressiveDcStageSession {
 
 pub struct ProgressiveDcSubmissionSession {
     stages: Option<Vec<ProgressiveDcStageSession>>,
-    submissions_per_frame: usize,
+    submissions_per_frame: Arc<AtomicUsize>,
 }
 
 impl WgpuDecodeSubmissionSession {
@@ -468,15 +469,15 @@ impl WgpuDecodeSubmissionSession {
         }
     }
 
-    /// Number of queue submissions issued for one visible frame in the selected mode. A staged
-    /// VarDCT local-tree session updates this count after its LF cursor map determines the exact HF
-    /// packet window plan.
+    /// Number of queue submissions issued for one visible frame in the selected mode. Staged
+    /// VarDCT and recursive progressive-DC sessions update this count after a cursor map determines
+    /// the exact packet or AC window plan.
     #[must_use]
     pub fn submissions_per_frame(&self) -> usize {
         match self {
             Self::Modular(session) => session.memory_stats().submissions_per_frame,
             Self::VarDct(session) => session.submissions_per_frame(),
-            Self::ProgressiveDc(session) => session.submissions_per_frame,
+            Self::ProgressiveDc(session) => session.submissions_per_frame.load(Ordering::Acquire),
         }
     }
 }
@@ -489,7 +490,10 @@ impl std::fmt::Debug for WgpuDecodeSubmissionSession {
             Self::ProgressiveDc(session) => formatter
                 .debug_struct("ProgressiveDc")
                 .field("submitted", &session.stages.is_none())
-                .field("submissions_per_frame", &session.submissions_per_frame)
+                .field(
+                    "submissions_per_frame",
+                    &session.submissions_per_frame.load(Ordering::Acquire),
+                )
                 .finish(),
         }
     }
@@ -518,54 +522,34 @@ impl ProgressiveDcSubmissionSession {
             return Ok(None);
         };
         let stage_count = stages.len();
-        let mut dependency = None;
-        let mut hidden = VecDeque::with_capacity(stage_count.saturating_sub(1));
-        let mut final_pending = None;
-        for (index, stage) in stages.into_iter().enumerate() {
-            let is_final = index + 1 == stage_count;
-            match stage {
-                ProgressiveDcStageSession::Modular(mut session) => {
-                    if dependency.is_some() {
-                        return Err(Error::EngineContract(
-                            "a Modular progressive-DC stage unexpectedly has an LF dependency",
-                        ));
-                    }
-                    let pending = session.submit_next()?.ok_or(Error::EngineContract(
-                        "progressive-DC Modular stage produced no submission",
-                    ))?;
-                    if is_final {
-                        return Err(Error::EngineContract(
-                            "a progressive-DC presentation stage cannot be Modular",
-                        ));
-                    }
-                    dependency = Some(pending.progressive_dc_planes()?);
-                    hidden.push_back(ProgressiveDcPhysicalPending::Modular(pending));
-                }
-                ProgressiveDcStageSession::VarDct(mut session) => {
-                    let source = dependency.take().ok_or(Error::EngineContract(
-                        "a progressive-DC VarDCT stage has no resident LF dependency",
-                    ))?;
-                    session.set_progressive_dc_source(source)?;
-                    let pending = session.submit_next()?.ok_or(Error::EngineContract(
-                        "progressive-DC VarDCT stage produced no submission",
-                    ))?;
-                    if is_final {
-                        final_pending = Some(pending);
-                    } else {
-                        dependency = Some(pending.progressive_dc_planes()?);
-                        hidden.push_back(ProgressiveDcPhysicalPending::VarDct(Box::new(pending)));
-                    }
-                }
-            }
-        }
-        let final_pending = final_pending.ok_or(Error::EngineContract(
-            "progressive-DC chain did not submit a final presentation frame",
+        let mut remaining = VecDeque::from(stages);
+        let root = remaining
+            .pop_front()
+            .ok_or(Error::EngineContract("progressive-DC plan has no stages"))?;
+        let ProgressiveDcStageSession::Modular(mut root) = root else {
+            return Err(Error::EngineContract(
+                "a progressive-DC plan must start with a Modular LF producer",
+            ));
+        };
+        let root_pending = root.submit_next()?.ok_or(Error::EngineContract(
+            "progressive-DC Modular stage produced no submission",
         ))?;
+        let dependency = root_pending.progressive_dc_planes()?;
+        let mut pending = ProgressiveDcPendingFrame {
+            hidden: VecDeque::with_capacity(stage_count.saturating_sub(1)),
+            active_dependency: None,
+            remaining,
+            final_pending: None,
+            final_planned_submissions: None,
+            final_submission_counter: None,
+            submissions_per_frame: Arc::clone(&self.submissions_per_frame),
+        };
+        pending
+            .hidden
+            .push_back(ProgressiveDcPhysicalPending::Modular(root_pending));
+        pending.submit_ready_stages(dependency)?;
         Ok(Some(WgpuDecodePendingFrame::ProgressiveDc(Box::new(
-            ProgressiveDcPendingFrame {
-                hidden,
-                final_pending: Some(Box::new(final_pending)),
-            },
+            pending,
         ))))
     }
 }
@@ -584,7 +568,126 @@ enum ProgressiveDcPhysicalPending {
 
 pub struct ProgressiveDcPendingFrame {
     hidden: VecDeque<ProgressiveDcPhysicalPending>,
+    active_dependency: Option<ProgressiveDcActiveDependency>,
+    remaining: VecDeque<ProgressiveDcStageSession>,
     final_pending: Option<Box<VarDctPendingFrame>>,
+    final_planned_submissions: Option<usize>,
+    final_submission_counter: Option<Arc<AtomicUsize>>,
+    submissions_per_frame: Arc<AtomicUsize>,
+}
+
+struct ProgressiveDcActiveDependency {
+    pending: Box<VarDctPendingFrame>,
+    planned_submissions: usize,
+}
+
+impl ProgressiveDcPendingFrame {
+    fn submit_ready_stages(
+        &mut self,
+        mut dependency: crate::progressive_dc::ProgressiveDcXybPlanes,
+    ) -> Result<()> {
+        while let Some(stage) = self.remaining.pop_front() {
+            let is_final = self.remaining.is_empty();
+            let ProgressiveDcStageSession::VarDct(mut session) = stage else {
+                return Err(Error::EngineContract(
+                    "only the root progressive-DC stage may use Modular encoding",
+                ));
+            };
+            let planned_submissions = session.submissions_per_frame();
+            session.set_progressive_dc_source(dependency)?;
+            let pending = session.submit_next()?.ok_or(Error::EngineContract(
+                "progressive-DC VarDCT stage produced no submission",
+            ))?;
+            if is_final {
+                self.final_submission_counter = Some(pending.submissions_per_frame_counter());
+                self.final_planned_submissions = Some(planned_submissions);
+                self.final_pending = Some(Box::new(pending));
+                return Ok(());
+            }
+            if pending.dependency_submission_ready() {
+                self.reconcile_submission_count(
+                    planned_submissions,
+                    pending
+                        .submissions_per_frame_counter()
+                        .load(Ordering::Acquire),
+                )?;
+                dependency = pending.progressive_dc_planes()?;
+                self.hidden
+                    .push_back(ProgressiveDcPhysicalPending::VarDct(Box::new(pending)));
+            } else {
+                self.active_dependency = Some(ProgressiveDcActiveDependency {
+                    pending: Box::new(pending),
+                    planned_submissions,
+                });
+                return Ok(());
+            }
+        }
+        Err(Error::EngineContract(
+            "progressive-DC chain did not submit a final presentation frame",
+        ))
+    }
+
+    fn reconcile_submission_count(&self, planned: usize, actual: usize) -> Result<()> {
+        self.submissions_per_frame
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(planned)?.checked_add(actual)
+            })
+            .map(|_| ())
+            .map_err(|_| Error::EngineContract("progressive-DC submission count update overflowed"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn submit_deferred_dependencies_blocking(&mut self) -> Result<()> {
+        while let Some(mut active) = self.active_dependency.take() {
+            active.pending.wait_until_dependency_submitted()?;
+            self.reconcile_submission_count(
+                active.planned_submissions,
+                active
+                    .pending
+                    .submissions_per_frame_counter()
+                    .load(Ordering::Acquire),
+            )?;
+            let dependency = active.pending.progressive_dc_planes()?;
+            self.hidden
+                .push_back(ProgressiveDcPhysicalPending::VarDct(active.pending));
+            self.submit_ready_stages(dependency)?;
+        }
+        Ok(())
+    }
+
+    fn poll_deferred_dependencies(&mut self, context: &mut Context<'_>) -> Poll<Result<()>> {
+        while let Some(active) = self.active_dependency.as_mut() {
+            match active.pending.poll_until_dependency_submitted(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+            let Some(active) = self.active_dependency.take() else {
+                return Poll::Ready(Err(Error::EngineContract(
+                    "progressive-DC active dependency disappeared while being progressed",
+                )));
+            };
+            if let Err(error) = self.reconcile_submission_count(
+                active.planned_submissions,
+                active
+                    .pending
+                    .submissions_per_frame_counter()
+                    .load(Ordering::Acquire),
+            ) {
+                return Poll::Ready(Err(error));
+            }
+            let dependency = match active.pending.progressive_dc_planes() {
+                Ok(dependency) => dependency,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
+            self.hidden
+                .push_back(ProgressiveDcPhysicalPending::VarDct(active.pending));
+            if let Err(error) = self.submit_ready_stages(dependency) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl WgpuDecodePendingFrame {
@@ -596,9 +699,7 @@ impl WgpuDecodePendingFrame {
             Self::ProgressiveDc(pending) => pending
                 .final_pending
                 .as_ref()
-                .ok_or(Error::EngineContract(
-                    "progressive-DC final frame completion was already consumed",
-                ))?
+                .ok_or(crate::vardct_engine::VarDctDecodeError::UnvalidatedOutputNotSubmitted)?
                 .unvalidated_gpu_frame(),
         }
     }
@@ -612,6 +713,11 @@ impl std::fmt::Debug for WgpuDecodePendingFrame {
             Self::ProgressiveDc(pending) => formatter
                 .debug_struct("ProgressiveDc")
                 .field("hidden_pending", &pending.hidden.len())
+                .field(
+                    "has_active_dependency",
+                    &pending.active_dependency.is_some(),
+                )
+                .field("remaining_stages", &pending.remaining.len())
                 .field("has_final", &pending.final_pending.is_some())
                 .finish(),
         }
@@ -663,6 +769,7 @@ impl GpuPendingFrame for ProgressiveDcPendingFrame {
     type Frame = GpuImageFrame;
 
     fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
+        self.submit_deferred_dependencies_blocking()?;
         while let Some(pending) = self.hidden.pop_front() {
             match pending {
                 ProgressiveDcPhysicalPending::Modular(pending) => {
@@ -673,12 +780,25 @@ impl GpuPendingFrame for ProgressiveDcPendingFrame {
                 }
             }
         }
-        self.final_pending
+        let final_pending = self.final_pending.take().ok_or(Error::EngineContract(
+            "progressive-DC final frame completion was already consumed",
+        ))?;
+        let result = final_pending.wait();
+        let planned = self
+            .final_planned_submissions
             .take()
             .ok_or(Error::EngineContract(
-                "progressive-DC final frame completion was already consumed",
+                "progressive-DC final frame has no planned submission count",
+            ))?;
+        let actual = self
+            .final_submission_counter
+            .take()
+            .ok_or(Error::EngineContract(
+                "progressive-DC final frame has no submission counter",
             ))?
-            .wait()
+            .load(Ordering::Acquire);
+        self.reconcile_submission_count(planned, actual)?;
+        result
     }
 
     fn poll_complete(
@@ -705,6 +825,11 @@ fn poll_progressive_dc(
     pending: &mut ProgressiveDcPendingFrame,
     context: &mut Context<'_>,
 ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
+    match pending.poll_deferred_dependencies(context) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        Poll::Ready(Ok(())) => {}
+    }
     while let Some(front) = pending.hidden.front_mut() {
         let result = match front {
             ProgressiveDcPhysicalPending::Modular(frame) => Pin::new(frame).poll_complete(context),
@@ -729,6 +854,21 @@ fn poll_progressive_dc(
     let result = Pin::new(final_pending.as_mut()).poll_complete(context);
     if result.is_ready() {
         pending.final_pending = None;
+        let Some(planned) = pending.final_planned_submissions.take() else {
+            return Poll::Ready(Err(Error::EngineContract(
+                "progressive-DC final frame has no planned submission count",
+            )));
+        };
+        let Some(counter) = pending.final_submission_counter.take() else {
+            return Poll::Ready(Err(Error::EngineContract(
+                "progressive-DC final frame has no submission counter",
+            )));
+        };
+        if let Err(error) =
+            pending.reconcile_submission_count(planned, counter.load(Ordering::Acquire))
+        {
+            return Poll::Ready(Err(error));
+        }
     }
     result
 }

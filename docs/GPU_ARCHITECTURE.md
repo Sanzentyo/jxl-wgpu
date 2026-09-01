@@ -113,9 +113,12 @@ The common inventory resolves progressive-DC reads to exact earlier LF producer 
 normative slots for both contiguous and incremental input. The stock scheduler now projects each
 physical frame without rewriting absolute ranges, converts a Modular LF producer's signed final
 planes to dequantized resident XYB, and packs those planes into the next VarDCT LF resource atlas on
-the same queue. Hidden physical outputs are validated but never published. This is complete for one
-producer plus the final sectioned VarDCT frame; general HF-global/AC in a single-entry intermediate
-LF frame remains `ENT-D01` work. The planner resolves one upload cap from the
+the same queue. For each single-entry intermediate VarDCT frame, a dedicated GPU entry point stops
+after HF metadata and returns a validated HF-global cursor. The runtime-neutral pending state then
+parses bounded scalar HF-global tables, submits general AC and resident reconstruction, and only
+then exposes those XYB planes to the next physical dependency. Hidden physical outputs are
+validated but never published. The checked `--progressive_dc=2` chain therefore executes root,
+intermediate, and final frames as one logical blocking/poll/Future result. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
@@ -146,6 +149,13 @@ need no cursor map: their known range starts at `section_bits.x`, including extr
 LF local header. Five words in the same state retain LF/HF phase, both decoded counts, first-block
 count, and extra precision across the three LF and four HF channels. Only the final segment validates
 the packet tail, and its command shares the first downstream queue submission.
+Single-entry progressive intermediates instead stop with packet status 31 after HF metadata. Their
+resource plan reserves a worst-case power-of-two AC LZ ring, 464-byte resume state per pass group,
+status, parameters, and sink uniforms before the first submission. After the cursor map, exact
+entropy/order/window buffers are admitted against the same byte budget and retained through final
+validation. Parametric dequantization modes 0 through 6 are expanded from bounded scalar metadata
+and uploaded over the existing matrix region before AC/render commands; raw mode 7 remains a typed
+unsupported Modular side-image path.
 
 For VarDCT, the caller/device cap is first evaluated against exact packet, AC, render, validation,
 and output bytes. If that frame would exceed the shared budget's total capacity, the planner
@@ -154,7 +164,9 @@ fits. The resolved cap is recorded in `VarDctDecodeMemoryStats`; an impossible m
 typed pre-submission error. Planning deliberately does not use momentary live headroom: concurrent
 jobs race only at non-blocking `MemoryBudget` admission and report retryable backpressure. A staged
 local tree reuses its already planned packet upload for host-discovered HF entropy; only a larger
-HF metadata allocation requests its exact difference after the LF cursor map.
+HF metadata allocation requests its exact difference after the LF cursor map. A staged HF-global
+intermediate likewise admits only its exact late entropy/order/window bytes after the metadata
+cursor map; its conservative fixed AC buffers were already charged to the frame.
 
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local

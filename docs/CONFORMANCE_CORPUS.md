@@ -57,9 +57,19 @@ return `InventoryError::MissingLowFrequencyFrame` before any engine sees the cod
 A separate actual-adapter `--progressive_dc=1` fixture uses a 1024×128 patterned RGB source. It
 must select the logical progressive-DC session, issue exactly two physical submissions, expose only
 one visible frame through runtime-neutral async completion, and agree with Rust `jxl` within one
-RGB8 code after explicit readback. The deeper `--progressive_dc=2` fixture remains a parser and
-planning oracle until general HF-global/AC decoding is implemented for its single-entry
-intermediate LF frame; it is not recursive pixel-conformance evidence.
+RGB8 code after explicit readback. The deeper `--progressive_dc=2` fixture is also actual-adapter
+pixel-conformance evidence: it executes the Modular root, a single-entry intermediate VarDCT
+HF-metadata/HF-global/AC continuation, and the final VarDCT frame as four physical submissions under
+one logical session. Blocking and runtime-neutral async completion expose only the final frame and
+must produce identical bytes within one RGB8 code of Rust `jxl`. Its non-default mode-6 DCT matrix
+also proves that bounded parametric metadata replaces the resident matrix region before AC/render.
+The same adapter test fills the shared byte budget after the initial staged submission and requires
+the cursor-discovered entropy/order/window reservation to fail as typed `MemoryBackpressure`, then
+verifies that cancellation releases every retained reservation.
+A bit-level unit oracle exercises every parametric mode 0 through 6 across all 27 backend strategy
+regions and compares every expanded channel value bit-for-bit with `jxl-vardct`; separate cases
+require typed rejection of raw mode 7 and a transform-incompatible encoding. Shader coverage
+remains Naga semantic validation and actual GPU execution; it does not inspect WGSL source strings.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

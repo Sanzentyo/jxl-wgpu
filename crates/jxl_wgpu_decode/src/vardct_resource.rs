@@ -129,6 +129,54 @@ impl VarDctResourceLayout {
         }
         Ok(values)
     }
+
+    pub(crate) fn install_dequant_matrix_words(
+        self,
+        values: &mut [[f32; 4]],
+        words: &[[u32; 4]],
+    ) -> Result<(), VarDctResourceError> {
+        self.validate_dequant_matrix_words(words)?;
+        let start = self.matrix_offsets[0] as usize;
+        let end = self.afv_basis_offset as usize;
+        let destination =
+            values
+                .get_mut(start..end)
+                .ok_or(VarDctResourceError::ArithmeticOverflow {
+                    field: "dequant matrix resource range",
+                })?;
+        for (destination, source) in destination.iter_mut().zip(words) {
+            *destination = source.map(f32::from_bits);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_dequant_matrix_words(
+        self,
+        words: &[[u32; 4]],
+    ) -> Result<(), VarDctResourceError> {
+        let expected = usize::try_from(
+            self.afv_basis_offset
+                .checked_sub(self.matrix_offsets[0])
+                .ok_or(VarDctResourceError::ArithmeticOverflow {
+                    field: "dequant matrix resource length",
+                })?,
+        )
+        .map_err(|_| VarDctResourceError::ArithmeticOverflow {
+            field: "dequant matrix resource length",
+        })?;
+        if words.len() != expected {
+            return Err(VarDctResourceError::DequantMatrixVectorCount {
+                expected,
+                actual: words.len(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn dequant_matrix_byte_offset(self) -> u64 {
+        self.matrix_offsets[0] as u64 * 16
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -141,6 +189,10 @@ pub enum VarDctResourceError {
     ZeroQuantizationEntries,
     #[error("failed to construct the normative default VarDCT dequantization matrices")]
     DefaultDequantMatrices,
+    #[error(
+        "VarDCT dequantization matrix payload has {actual} vectors; expected exactly {expected}"
+    )]
+    DequantMatrixVectorCount { expected: usize, actual: usize },
     #[error("VarDCT resource preparation requires a linear workgroup, got {variant:?}")]
     WorkgroupShape { variant: KernelVariant },
     #[error("VarDCT resource workgroup variant {variant:?} exceeds device limits")]
@@ -280,7 +332,7 @@ fn default_dequant_matrices() -> Result<DefaultDequantMatrices, VarDctResourceEr
         .map_err(|_| VarDctResourceError::DefaultDequantMatrices)
 }
 
-const fn vardct_transform_type(transform: TransformKind) -> TransformType {
+pub(crate) const fn vardct_transform_type(transform: TransformKind) -> TransformType {
     match transform {
         TransformKind::Dct8 => TransformType::Dct8,
         TransformKind::Hornuss => TransformType::Hornuss,

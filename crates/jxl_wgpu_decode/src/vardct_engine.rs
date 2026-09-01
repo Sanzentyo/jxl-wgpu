@@ -63,9 +63,9 @@ use crate::vardct_packet::{
     packet_execution_state_bytes,
 };
 use crate::vardct_pass_group::{
-    GpuHfCoefficientError, GpuHfCoefficientStatus, HfCoefficientBuffers,
-    HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan, HfCoefficientPipeline,
-    HfCoefficientPlanError,
+    GpuHfCoefficientError, GpuHfCoefficientStatus, HF_COEFFICIENT_EXECUTION_STATE_BYTES,
+    HF_COEFFICIENT_STATUS_BYTES, HfCoefficientBuffers, HfCoefficientExecutionPlan,
+    HfCoefficientGroupExecutionPlan, HfCoefficientPipeline, HfCoefficientPlanError,
 };
 use crate::vardct_resource::{
     VarDctResourceBuffers, VarDctResourceConfig, VarDctResourceError, VarDctResourceLayout,
@@ -135,10 +135,6 @@ pub enum VarDctDecodeError {
     UnexpectedProgressiveDcSource,
     #[error("VarDCT engine contract failed: {detail}")]
     EngineContract { detail: &'static str },
-    #[error(
-        "multi-level progressive-DC requires general HF-global/AC decoding in a single-entry intermediate LF frame"
-    )]
-    UnsupportedProgressiveDcIntermediatePacket,
     #[error(
         "the bounded VarDCT entropy window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
     )]
@@ -230,6 +226,10 @@ pub struct VarDctDecodeMemoryStats {
     /// reservation covers all LF-local metadata; a larger HF peak is admitted through the same
     /// shared byte budget before the second submission.
     pub deferred_hf_modular_metadata: bool,
+    /// True when a single-entry progressive-DC packet discovers HF-global after a GPU metadata
+    /// stage. Fixed scratch/status capacity is admitted up front; descriptor/order uploads are
+    /// admitted from the same budget after the cursor map.
+    pub deferred_hf_coefficients: bool,
     pub reconstructed_bytes: u64,
     pub raw_metadata_bytes: u64,
     pub coefficient_bytes: u64,
@@ -290,6 +290,7 @@ impl VarDctDecodeMemoryStats {
             combined_packet_windows,
             resource,
             hf_coefficients,
+            deferred_hf,
             adaptive_lf_smoothing,
             restoration_scratch,
             gaborish,
@@ -408,11 +409,18 @@ impl VarDctDecodeMemoryStats {
                 .transpose()?
                 .unwrap_or(0)
         };
-        let hf_lz77_scratch_bytes =
-            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::lz77_scratch_bytes);
-        let hf_execution_state_bytes =
-            hf_coefficients.map_or(0, HfCoefficientExecutionPlan::execution_state_bytes);
-        let hf_status_bytes = hf_coefficients.map_or(0, HfCoefficientExecutionPlan::status_bytes);
+        let hf_lz77_scratch_bytes = hf_coefficients.map_or_else(
+            || deferred_hf.map_or(0, |plan| plan.lz77_scratch_bytes),
+            HfCoefficientExecutionPlan::lz77_scratch_bytes,
+        );
+        let hf_execution_state_bytes = hf_coefficients.map_or_else(
+            || deferred_hf.map_or(0, |plan| plan.execution_state_bytes),
+            HfCoefficientExecutionPlan::execution_state_bytes,
+        );
+        let hf_status_bytes = hf_coefficients.map_or_else(
+            || deferred_hf.map_or(0, |plan| plan.status_bytes),
+            HfCoefficientExecutionPlan::status_bytes,
+        );
         let hf_order_table_bytes = hf_coefficients
             .map(|plan| checked_words(plan.order_words.len() as u64, "HF order-table bytes"))
             .transpose()?
@@ -429,7 +437,12 @@ impl VarDctDecodeMemoryStats {
                     })
             })
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or_else(|| deferred_hf.map_or(0, |plan| plan.sink_uniform_bytes));
+        let hf_params_bytes = if hf_coefficients.is_none() {
+            deferred_hf.map_or(hf_params_bytes, |plan| plan.params_bytes)
+        } else {
+            hf_params_bytes
+        };
         let artifact_status_bytes = group_count.checked_mul(ARTIFACT_STATUS_BYTES).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
                 field: "artifact status bytes",
@@ -621,6 +634,7 @@ impl VarDctDecodeMemoryStats {
             codestream_bytes,
             modular_metadata_bytes,
             deferred_hf_modular_metadata: packet.requires_local_tree_staging(),
+            deferred_hf_coefficients: deferred_hf.is_some(),
             reconstructed_bytes,
             raw_metadata_bytes,
             coefficient_bytes,
@@ -672,6 +686,7 @@ struct VarDctDecodeMemoryInputs<'a> {
     combined_packet_windows: Option<&'a CombinedPacketWindowExecutionPlan>,
     resource: VarDctResourceLayout,
     hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
+    deferred_hf: Option<&'a DeferredHfCoefficientLayout>,
     adaptive_lf_smoothing: bool,
     restoration_scratch: bool,
     gaborish: bool,
@@ -679,6 +694,134 @@ struct VarDctDecodeMemoryInputs<'a> {
     epf_iterations: u32,
     resident: &'a [ResidentVarDctMemoryPlan],
     output: VarDctOutputPlan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeferredHfCoefficientGroupLayout {
+    lz77_scratch_bytes: u64,
+    execution_state_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredHfCoefficientLayout {
+    groups: Vec<DeferredHfCoefficientGroupLayout>,
+    lz77_scratch_bytes: u64,
+    execution_state_bytes: u64,
+    status_bytes: u64,
+    params_bytes: u64,
+    sink_uniform_bytes: u64,
+}
+
+impl DeferredHfCoefficientLayout {
+    fn plan(packet: &BoundedVarDctPacketPlan) -> Result<Option<Self>, VarDctDecodeError> {
+        if !packet.requires_hf_global_staging() {
+            return Ok(None);
+        }
+        let pass_group_count = usize::try_from(packet.profile.group_count).map_err(|_| {
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF pass-group count",
+            }
+        })?;
+        let mut local_counts = vec![0_u64; packet.groups.len()];
+        for global_group_index in 0..packet.profile.group_count {
+            let lf_group = packet
+                .profile
+                .low_frequency_group_index_for_pass_group(global_group_index)
+                .map_err(HfCoefficientPlanError::from)?;
+            let lf_group =
+                usize::try_from(lf_group).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF LF-group index",
+                })?;
+            let count =
+                local_counts
+                    .get_mut(lf_group)
+                    .ok_or(VarDctDecodeError::GroupPlanCount {
+                        component: "deferred HF coefficient",
+                        expected: packet.groups.len(),
+                        actual: lf_group.saturating_add(1),
+                    })?;
+            *count = count
+                .checked_add(1)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF local pass-group count",
+                })?;
+        }
+        let max_group_blocks = packet
+            .profile
+            .group_dimension
+            .div_ceil(8)
+            .checked_mul(packet.profile.group_dimension.div_ceil(8))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF pass-group block count",
+            })?;
+        let max_lz77_words = max_group_blocks
+            .checked_mul(3 * 64)
+            .and_then(u32::checked_next_power_of_two)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF LZ77 capacity",
+            })?;
+        let mut groups = Vec::with_capacity(local_counts.len());
+        let mut lz77_scratch_bytes = 0_u64;
+        let mut execution_state_bytes = 0_u64;
+        for count in local_counts {
+            let lz77 = count
+                .checked_mul(u64::from(max_lz77_words))
+                .and_then(|words| words.checked_mul(4))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF LZ77 bytes",
+                })?;
+            let execution = count
+                .checked_mul(HF_COEFFICIENT_EXECUTION_STATE_BYTES)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF execution-state bytes",
+                })?;
+            lz77_scratch_bytes = lz77_scratch_bytes.checked_add(lz77).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF LZ77 total",
+                },
+            )?;
+            execution_state_bytes = execution_state_bytes.checked_add(execution).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF execution-state total",
+                },
+            )?;
+            groups.push(DeferredHfCoefficientGroupLayout {
+                lz77_scratch_bytes: lz77,
+                execution_state_bytes: execution,
+            });
+        }
+        let pass_group_count =
+            u64::try_from(pass_group_count).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF pass-group byte count",
+            })?;
+        Ok(Some(Self {
+            groups,
+            lz77_scratch_bytes,
+            execution_state_bytes,
+            status_bytes: pass_group_count
+                .checked_mul(HF_COEFFICIENT_STATUS_BYTES)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF status bytes",
+                })?,
+            params_bytes: pass_group_count
+                .checked_mul(
+                    std::mem::size_of::<crate::vardct_pass_group::HfCoefficientPassParams>() as u64,
+                )
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF parameter bytes",
+                })?,
+            sink_uniform_bytes: u64::try_from(packet.groups.len())
+                .ok()
+                .and_then(|groups| {
+                    groups.checked_mul(std::mem::size_of::<
+                        crate::vardct_artifact::HfCoefficientSinkParams,
+                    >() as u64)
+                })
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF sink uniform bytes",
+                })?,
+        }))
+    }
 }
 
 struct VarDctPipelines {
@@ -864,7 +1007,7 @@ impl VarDctSubmissionEngine {
         let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
         let submissions_per_frame = source.submissions_per_frame();
         let runtime_stats = Arc::new(VarDctRuntimeStats {
-            submissions_per_frame: AtomicUsize::new(submissions_per_frame),
+            submissions_per_frame: Arc::new(AtomicUsize::new(submissions_per_frame)),
             hf_packet_stream_batch_count: AtomicUsize::new(0),
         });
         Ok(PreparedGpuSession::new(
@@ -902,6 +1045,7 @@ struct VarDctSource {
     stream_limit: u64,
     resource_layout: VarDctResourceLayout,
     hf_coefficients: Option<HfCoefficientExecutionPlan>,
+    deferred_hf: Option<DeferredHfCoefficientLayout>,
     gaborish: Option<ResidentGaborishWeights>,
     epf: Option<VarDctEpfPlan>,
     output_plan: VarDctOutputPlan,
@@ -1296,6 +1440,9 @@ impl HfPacketWindowExecutionPlan {
 
 impl VarDctSource {
     fn submissions_per_frame(&self) -> usize {
+        if self.deferred_hf.is_some() {
+            return 2;
+        }
         let local_lf = if self.packet.requires_local_tree_staging() {
             self.lf_packet_windows
                 .as_ref()
@@ -1489,14 +1636,7 @@ fn prepare_source(
             BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
         },
     )?;
-    if options.progressive_dc_final == Some(false)
-        && matches!(
-            packet.profile.sections,
-            crate::vardct_frontend::VarDctSectionLayout::Single { .. }
-        )
-    {
-        return Err(VarDctDecodeError::UnsupportedProgressiveDcIntermediatePacket);
-    }
+    let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
         usize::try_from(codestream_bytes).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
@@ -1681,6 +1821,7 @@ fn prepare_source(
                 combined_packet_windows: combined_packet_windows.as_ref(),
                 resource: resource_layout,
                 hf_coefficients: hf_coefficients.as_ref(),
+                deferred_hf: deferred_hf.as_ref(),
                 adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
                 restoration_scratch: gaborish.is_some() || epf.is_some(),
                 gaborish: gaborish.is_some(),
@@ -1735,6 +1876,7 @@ fn prepare_source(
         stream_limit,
         resource_layout,
         hf_coefficients,
+        deferred_hf,
         gaborish,
         epf,
         output_plan,
@@ -2049,7 +2191,7 @@ pub struct VarDctDecodeSession {
 
 #[derive(Debug)]
 struct VarDctRuntimeStats {
-    submissions_per_frame: AtomicUsize,
+    submissions_per_frame: Arc<AtomicUsize>,
     hf_packet_stream_batch_count: AtomicUsize,
 }
 
@@ -2173,6 +2315,70 @@ struct HfCoefficientGroupJobBuffers {
     sink_params: wgpu::Buffer,
 }
 
+fn create_hf_coefficient_job_buffers(
+    device: &wgpu::Device,
+    plan: &HfCoefficientExecutionPlan,
+) -> HfCoefficientJobBuffers {
+    let windowed = plan.uses_bounded_stream_windows();
+    let storage = |label, size, extra| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | extra,
+            mapped_at_creation: false,
+        })
+    };
+    HfCoefficientJobBuffers {
+        entropy_bundle: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu HF entropy bundle"),
+            contents: bytemuck::cast_slice(&plan.entropy_words),
+            usage: wgpu::BufferUsages::STORAGE,
+        }),
+        order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu HF natural-order table"),
+            contents: bytemuck::cast_slice(&plan.order_words),
+            usage: wgpu::BufferUsages::STORAGE,
+        }),
+        stream_window: windowed.then(|| {
+            storage(
+                "jxl-wgpu reusable HF coefficient stream window",
+                plan.stream_window_bytes(),
+                wgpu::BufferUsages::COPY_DST,
+            )
+        }),
+        params_window: windowed.then(|| {
+            storage(
+                "jxl-wgpu reusable HF coefficient parameter window",
+                plan.reusable_params_bytes(),
+                wgpu::BufferUsages::COPY_DST,
+            )
+        }),
+        groups: plan
+            .groups
+            .iter()
+            .map(|group| HfCoefficientGroupJobBuffers {
+                params: (!windowed).then(|| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("jxl-wgpu LF-group HF pass-group params"),
+                        contents: bytemuck::cast_slice(&group.params),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+                }),
+                status: storage(
+                    "jxl-wgpu LF-group HF pass-group status",
+                    group.status_bytes(),
+                    wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                ),
+                sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("jxl-wgpu LF-group HF coefficient sink params"),
+                    contents: bytemuck::bytes_of(&group.sink_params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                }),
+            })
+            .collect(),
+    }
+}
+
 struct HfCoefficientBatchSubmission {
     stream_upload: Box<[u8]>,
     params_upload: Box<[u8]>,
@@ -2220,6 +2426,22 @@ enum VarDctDownstreamCommands {
         before_coefficients: wgpu::CommandBuffer,
         coefficient_batches: Vec<HfCoefficientBatchSubmission>,
         after_coefficients: wgpu::CommandBuffer,
+    },
+}
+
+struct DeferredHfGlobalCommands {
+    before_coefficients: wgpu::CommandBuffer,
+    after_coefficients: wgpu::CommandBuffer,
+}
+
+enum VarDctPendingContinuation {
+    LocalLf {
+        source: Box<VarDctSource>,
+        downstream: VarDctDownstreamCommands,
+    },
+    HfGlobal {
+        source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
     },
 }
 
@@ -2361,11 +2583,12 @@ fn submit_vardct_downstream(
         } => {
             prefix.push(before_coefficients);
             queue.submit(prefix);
-            let buffers = lifetime._hf_coefficients.as_ref().ok_or(
-                VarDctDecodeError::EntropyWindowContract {
+            let retained = lock_unpoisoned(&lifetime._hf_coefficients);
+            let buffers = retained
+                .as_ref()
+                .ok_or(VarDctDecodeError::EntropyWindowContract {
                     detail: "windowed AC commands have no retained coefficient buffers",
-                },
-            )?;
+                })?;
             let stream =
                 buffers
                     .stream_window
@@ -2459,7 +2682,7 @@ struct VarDctJobLifetime {
     _adaptive_lf_uniform: Option<wgpu::Buffer>,
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
-    _hf_coefficients: Option<HfCoefficientJobBuffers>,
+    _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _xyb_planes: [wgpu::Buffer; 3],
     _restoration: Option<RestorationJobBuffers>,
     _resident_scratch: Vec<ResidentVarDctScratch>,
@@ -2500,6 +2723,7 @@ pub struct VarDctPendingFrame {
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
     expected_hf_group_indices: Vec<u32>,
+    deferred_hf_global: bool,
     progressive_dc_extent: Extent2d,
     progressive_dc_stride: u32,
 }
@@ -2509,6 +2733,11 @@ enum VarDctPendingStage {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
         downstream: Option<VarDctDownstreamCommands>,
+    },
+    HfGlobal {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+        commands: Option<DeferredHfGlobalCommands>,
     },
     Final {
         completion: Arc<MapCompletion>,
@@ -2526,6 +2755,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
                 "stage",
                 &match &self.stage {
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
+                    VarDctPendingStage::HfGlobal { .. } => "hf-global",
                     VarDctPendingStage::Final { .. } => "final",
                 },
             )
@@ -2534,10 +2764,22 @@ impl std::fmt::Debug for VarDctPendingFrame {
 }
 
 impl VarDctPendingFrame {
+    pub(crate) fn submissions_per_frame_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.runtime_stats.submissions_per_frame)
+    }
+
+    #[must_use]
+    pub(crate) fn dependency_submission_ready(&self) -> bool {
+        matches!(self.stage, VarDctPendingStage::Final { .. })
+    }
+
     pub(crate) fn progressive_dc_planes(
         &self,
     ) -> Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
-        if matches!(self.stage, VarDctPendingStage::LocalLf { .. }) {
+        if matches!(
+            self.stage,
+            VarDctPendingStage::LocalLf { .. } | VarDctPendingStage::HfGlobal { .. }
+        ) {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted);
         }
         let lifetime = self
@@ -2555,7 +2797,10 @@ impl VarDctPendingFrame {
 
     /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
     pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
-        if matches!(self.stage, VarDctPendingStage::LocalLf { .. }) {
+        if matches!(
+            self.stage,
+            VarDctPendingStage::LocalLf { .. } | VarDctPendingStage::HfGlobal { .. }
+        ) {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted.into());
         }
         let lifetime = self
@@ -2575,11 +2820,12 @@ impl VarDctPendingFrame {
     fn stage_completion(&self) -> Arc<MapCompletion> {
         match &self.stage {
             VarDctPendingStage::LocalLf { completion, .. }
+            | VarDctPendingStage::HfGlobal { completion, .. }
             | VarDctPendingStage::Final { completion } => Arc::clone(completion),
         }
     }
 
-    fn take_local_stage(&mut self) -> Option<(Box<VarDctSource>, VarDctDownstreamCommands)> {
+    fn take_staged_packet(&mut self) -> Option<VarDctPendingContinuation> {
         let placeholder = VarDctPendingStage::Final {
             completion: Arc::new(MapCompletion::default()),
         };
@@ -2589,10 +2835,67 @@ impl VarDctPendingFrame {
                 source,
                 mut downstream,
                 ..
-            } => downstream.take().map(|commands| (source, commands)),
+            } => downstream
+                .take()
+                .map(|downstream| VarDctPendingContinuation::LocalLf { source, downstream }),
+            VarDctPendingStage::HfGlobal {
+                source,
+                mut commands,
+                ..
+            } => commands
+                .take()
+                .map(|commands| VarDctPendingContinuation::HfGlobal { source, commands }),
             final_stage @ VarDctPendingStage::Final { .. } => {
                 self.stage = final_stage;
                 None
+            }
+        }
+    }
+
+    fn advance_staged_packet(&mut self, mapping: Result<(), String>) -> DecodeResult<bool> {
+        match self.take_staged_packet() {
+            Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
+                self.submit_hf_stage(mapping, source, downstream)?;
+                Ok(true)
+            }
+            Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
+                self.submit_hf_global_stage(mapping, source, commands)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn wait_until_dependency_submitted(&mut self) -> DecodeResult<()> {
+        while !matches!(self.stage, VarDctPendingStage::Final { .. }) {
+            let mapping = self.stage_completion().wait();
+            if !self.advance_staged_packet(mapping)? {
+                return Err(VarDctDecodeError::EngineContract {
+                    detail: "VarDCT dependency stage made no progress",
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poll_until_dependency_submitted(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<DecodeResult<()>> {
+        loop {
+            if matches!(self.stage, VarDctPendingStage::Final { .. }) {
+                return Poll::Ready(Ok(()));
+            }
+            if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
+                return Poll::Ready(Err(DecodeError::backend(error)));
+            }
+            let Some(mapping) = self.stage_completion().poll(context) else {
+                return Poll::Pending;
+            };
+            if let Err(error) = self.advance_staged_packet(mapping) {
+                return Poll::Ready(Err(error));
             }
         }
     }
@@ -2924,6 +3227,430 @@ impl VarDctPendingFrame {
         Ok(())
     }
 
+    fn submit_hf_global_stage(
+        &mut self,
+        mapping: Result<(), String>,
+        source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
+    ) -> DecodeResult<()> {
+        mapping.map_err(DecodeError::backend)?;
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        if self.expected_groups.len() != 1 {
+            return Err(VarDctDecodeError::GroupPlanCount {
+                component: "single-entry progressive-DC packet",
+                expected: 1,
+                actual: self.expected_groups.len(),
+            }
+            .into());
+        }
+        let mapped = lifetime
+            .status_staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(DecodeError::backend)?;
+        let status: GpuVarDctPacketStatus = mapped
+            .get(..PACKET_STATUS_BYTES as usize)
+            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+            .ok_or(VarDctDecodeError::StatusAbi {
+                status: "HF-global cursor",
+            })?;
+        let expected = &self.expected_groups[0];
+        let cursor = status.validate_hf_metadata_stage(VarDctPacketValidation {
+            expected_strategy: expected.uniform_transform,
+            expected_lf_samples: expected.expected_lf_samples,
+            block_count: expected.expected_blocks,
+            correlation_samples: expected.correlation_samples,
+            task_capacity: expected.task_capacity,
+            expected_global_scale: expected.expected_global_scale,
+            expected_quant_lf: expected.expected_quant_lf,
+            expected_extra_precision: expected.expected_extra_precision,
+        });
+        drop(mapped);
+        lifetime.status_staging.unmap();
+        lifetime.status_mapped.store(false, Ordering::Release);
+        let cursor = cursor.map_err(VarDctDecodeError::from)?;
+
+        let entropy = source
+            .packet
+            .parse_single_hf_global_continuation_source(&source.codestream, cursor)
+            .map_err(VarDctDecodeError::from)?;
+        let artifacts = source
+            .groups
+            .iter()
+            .map(|group| group.artifact_layout)
+            .collect::<Vec<_>>();
+        let plan = HfCoefficientExecutionPlan::new(
+            &source.packet,
+            &entropy,
+            &artifacts,
+            source.codestream.logical_bytes(),
+            source.stream_limit,
+        )
+        .map_err(VarDctDecodeError::from)?;
+        if let Some(words) = &entropy.dequant_matrix_words {
+            source
+                .resource_layout
+                .validate_dequant_matrix_words(words)
+                .map_err(VarDctDecodeError::from)?;
+            self.backend.queue().write_buffer(
+                &lifetime._resources,
+                source.resource_layout.dequant_matrix_byte_offset(),
+                bytemuck::cast_slice(words),
+            );
+        }
+        let deferred = source
+            .deferred_hf
+            .as_ref()
+            .ok_or(VarDctDecodeError::EngineContract {
+                detail: "deferred HF-global stage has no admitted scratch layout",
+            })?;
+        if plan.groups.len() != deferred.groups.len() {
+            return Err(VarDctDecodeError::GroupPlanCount {
+                component: "deferred HF coefficient",
+                expected: deferred.groups.len(),
+                actual: plan.groups.len(),
+            }
+            .into());
+        }
+        for (actual, admitted) in plan.groups.iter().zip(&deferred.groups) {
+            if actual.lz77_scratch_bytes() > admitted.lz77_scratch_bytes
+                || actual.execution_state_bytes() > admitted.execution_state_bytes
+            {
+                return Err(VarDctDecodeError::EngineContract {
+                    detail: "deferred HF coefficient scratch exceeded its conservative admission",
+                }
+                .into());
+            }
+        }
+        if plan.status_bytes() > deferred.status_bytes {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "deferred HF coefficient status exceeded its conservative admission",
+            }
+            .into());
+        }
+        let checked_words = |words: usize, field: &'static str| {
+            u64::try_from(words)
+                .ok()
+                .and_then(|words| words.checked_mul(4))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow { field })
+        };
+        let entropy_bytes = checked_words(plan.entropy_words.len(), "deferred HF entropy bytes")?;
+        let order_bytes = checked_words(plan.order_words.len(), "deferred HF order bytes")?;
+        let stream_bytes = if plan.uses_bounded_stream_windows() {
+            plan.stream_window_bytes()
+        } else {
+            0
+        };
+        let params_bytes = if plan.uses_bounded_stream_windows() {
+            plan.reusable_params_bytes()
+        } else {
+            plan.groups.iter().try_fold(0_u64, |total, group| {
+                u64::try_from(group.params.len())
+                    .ok()
+                    .and_then(|count| {
+                        count.checked_mul(std::mem::size_of::<
+                            crate::vardct_pass_group::HfCoefficientPassParams,
+                        >() as u64)
+                    })
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "deferred HF parameter bytes",
+                    })
+            })?
+        };
+        if params_bytes > deferred.params_bytes {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "deferred HF parameters exceeded their conservative admission",
+            }
+            .into());
+        }
+        let sink_bytes = u64::try_from(plan.groups.len())
+            .ok()
+            .and_then(|groups| {
+                groups.checked_mul(std::mem::size_of::<
+                    crate::vardct_artifact::HfCoefficientSinkParams,
+                >() as u64)
+            })
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF sink bytes",
+            })?;
+        if sink_bytes > deferred.sink_uniform_bytes {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "deferred HF sink uniforms exceeded their conservative admission",
+            }
+            .into());
+        }
+        let dynamic_bytes = entropy_bytes
+            .checked_add(order_bytes)
+            .and_then(|bytes| bytes.checked_add(stream_bytes))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF dynamic bytes",
+            })?;
+        let dynamic_permit = self.memory.try_reserve(dynamic_bytes)?;
+        let limits = self.backend.device().limits();
+        for (resource, required, storage) in [
+            ("deferred HF entropy bundle", entropy_bytes, true),
+            ("deferred HF order table", order_bytes, true),
+            ("deferred HF stream window", stream_bytes, true),
+            ("deferred HF parameters", params_bytes, true),
+            ("deferred HF status", plan.status_bytes(), true),
+            ("deferred HF sink uniform", sink_bytes, false),
+        ] {
+            check_limit(resource, required, limits.max_buffer_size)?;
+            if storage {
+                check_limit(resource, required, limits.max_storage_buffer_binding_size)?;
+            } else {
+                check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
+            }
+        }
+        let poll_permit = self
+            .backend
+            .submission_poller()
+            .try_reserve()
+            .map_err(DecodeError::PollBackpressure)?;
+        let device = self.backend.device();
+        let buffers = create_hf_coefficient_job_buffers(device, &plan);
+        let mut coefficient_batches = Vec::new();
+        let mut whole_coefficients = None;
+        if plan.uses_bounded_stream_windows() {
+            let upload_len = usize::try_from(plan.stream_window_bytes()).map_err(|_| {
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF stream window host length",
+                }
+            })?;
+            for ((group_plan, hf_buffers), group_buffers) in plan
+                .groups
+                .iter()
+                .zip(&buffers.groups)
+                .zip(&lifetime._groups)
+            {
+                for batch in &group_plan.stream_batches {
+                    let mut stream_upload = vec![0_u8; upload_len];
+                    for segment in &group_plan.stream_segments[batch.segments.clone()] {
+                        copy_stream_segment(
+                            &source.codestream,
+                            *segment,
+                            &mut stream_upload,
+                            "deferred HF stream segment exceeds the source or reusable upload",
+                        )?;
+                    }
+                    let params_upload =
+                        bytemuck::cast_slice(&group_plan.segment_params[batch.segments.clone()])
+                            .to_vec()
+                            .into_boxed_slice();
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("jxl-wgpu deferred HF coefficient stream batch"),
+                        });
+                    self.pipelines.hf_coefficients.encode(
+                        device,
+                        &mut encoder,
+                        HfCoefficientBuffers {
+                            codestream: buffers.stream_window.as_ref().ok_or(
+                                VarDctDecodeError::EntropyWindowContract {
+                                    detail: "deferred HF plan has no stream window",
+                                },
+                            )?,
+                            entropy_bundle: &buffers.entropy_bundle,
+                            reconstruction: &group_buffers.reconstructed,
+                            params: buffers.params_window.as_ref().ok_or(
+                                VarDctDecodeError::EntropyWindowContract {
+                                    detail: "deferred HF plan has no parameter window",
+                                },
+                            )?,
+                            status: &hf_buffers.status,
+                            artifact: &group_buffers.artifact,
+                            order_table: &buffers.order_table,
+                            coefficients: &group_buffers.coefficients,
+                            sink_params: &hf_buffers.sink_params,
+                        },
+                        u32::try_from(batch.group_count).map_err(|_| {
+                            VarDctDecodeError::ArithmeticOverflow {
+                                field: "deferred HF batch dispatch count",
+                            }
+                        })?,
+                    );
+                    coefficient_batches.push(HfCoefficientBatchSubmission {
+                        stream_upload: stream_upload.into_boxed_slice(),
+                        params_upload,
+                        commands: encoder.finish(),
+                    });
+                }
+            }
+        } else {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu deferred whole-range HF coefficients"),
+            });
+            for ((group_plan, hf_buffers), group_buffers) in plan
+                .groups
+                .iter()
+                .zip(&buffers.groups)
+                .zip(&lifetime._groups)
+            {
+                let params =
+                    hf_buffers
+                        .params
+                        .as_ref()
+                        .ok_or(VarDctDecodeError::EntropyWindowContract {
+                            detail: "deferred whole-range HF plan has no parameters",
+                        })?;
+                self.pipelines.hf_coefficients.encode(
+                    device,
+                    &mut encoder,
+                    HfCoefficientBuffers {
+                        codestream: &lifetime._codestream,
+                        entropy_bundle: &buffers.entropy_bundle,
+                        reconstruction: &group_buffers.reconstructed,
+                        params,
+                        status: &hf_buffers.status,
+                        artifact: &group_buffers.artifact,
+                        order_table: &buffers.order_table,
+                        coefficients: &group_buffers.coefficients,
+                        sink_params: &hf_buffers.sink_params,
+                    },
+                    u32::try_from(group_plan.params.len()).map_err(|_| {
+                        VarDctDecodeError::ArithmeticOverflow {
+                            field: "deferred HF dispatch count",
+                        }
+                    })?,
+                );
+            }
+            whole_coefficients = Some(encoder.finish());
+        }
+        let mut status_commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu deferred HF status aggregation"),
+        });
+        let group_count = u64::try_from(lifetime._groups.len()).map_err(|_| {
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF status group count",
+            }
+        })?;
+        let mut status_offset = group_count
+            .checked_mul(PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "deferred HF status offset",
+            })?;
+        for group in &buffers.groups {
+            let bytes = group.status.size();
+            status_commands.copy_buffer_to_buffer(
+                &group.status,
+                0,
+                &lifetime.status_staging,
+                status_offset,
+                bytes,
+            );
+            status_offset =
+                status_offset
+                    .checked_add(bytes)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "deferred HF status end",
+                    })?;
+        }
+        if status_offset != source.memory.validation_staging_bytes {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "deferred HF status aggregation disagrees with admitted staging",
+            }
+            .into());
+        }
+        self.expected_hf_group_indices = plan
+            .groups
+            .iter()
+            .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
+            .collect();
+        {
+            let mut retained = lock_unpoisoned(&lifetime._hf_coefficients);
+            if retained.is_some() {
+                return Err(VarDctDecodeError::EngineContract {
+                    detail: "deferred HF coefficient buffers were already installed",
+                }
+                .into());
+            }
+            *retained = Some(buffers);
+        }
+        lock_unpoisoned(&lifetime._transient_permits).push(dynamic_permit);
+
+        let submission =
+            if let Some(whole_coefficients) = whole_coefficients {
+                self.backend.queue().submit([
+                    commands.before_coefficients,
+                    whole_coefficients,
+                    commands.after_coefficients,
+                    status_commands.finish(),
+                ])
+            } else {
+                let retained = lock_unpoisoned(&lifetime._hf_coefficients);
+                let buffers = retained.as_ref().ok_or(VarDctDecodeError::EngineContract {
+                    detail: "deferred HF coefficient buffers disappeared before submission",
+                })?;
+                let stream = buffers.stream_window.as_ref().ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "deferred HF coefficient buffers have no stream window",
+                    },
+                )?;
+                let params = buffers.params_window.as_ref().ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "deferred HF coefficient buffers have no parameter window",
+                    },
+                )?;
+                let mut batches = coefficient_batches.into_iter();
+                let first = batches
+                    .next()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "deferred windowed HF plan has no batches",
+                    })?;
+                self.backend
+                    .queue()
+                    .write_buffer(stream, 0, &first.stream_upload);
+                self.backend
+                    .queue()
+                    .write_buffer(params, 0, &first.params_upload);
+                self.backend
+                    .queue()
+                    .submit([commands.before_coefficients, first.commands]);
+                let mut batch_count = 1_usize;
+                for batch in batches {
+                    self.backend
+                        .queue()
+                        .write_buffer(stream, 0, &batch.stream_upload);
+                    self.backend
+                        .queue()
+                        .write_buffer(params, 0, &batch.params_upload);
+                    self.backend.queue().submit([batch.commands]);
+                    batch_count = batch_count.checked_add(1).ok_or(
+                        VarDctDecodeError::ArithmeticOverflow {
+                            field: "deferred HF batch count",
+                        },
+                    )?;
+                }
+                self.runtime_stats
+                    .submissions_per_frame
+                    .store(batch_count + 2, Ordering::Release);
+                drop(retained);
+                self.backend
+                    .queue()
+                    .submit([commands.after_coefficients, status_commands.finish()])
+            };
+        let completion = Arc::new(MapCompletion::default());
+        arm_status_map(
+            lifetime,
+            &completion,
+            "VarDCT deferred HF validation mapping",
+        );
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission, move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!(
+                "VarDCT deferred HF GPU poll registration failed: {error}"
+            )));
+        }
+        self.stage = VarDctPendingStage::Final { completion };
+        Ok(())
+    }
+
     fn finish(
         &mut self,
         mapping: Result<(), String>,
@@ -2966,18 +3693,27 @@ impl VarDctPendingFrame {
                 .get(artifact_offset..artifact_offset + ARTIFACT_STATUS_BYTES as usize)
                 .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
                 .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
-            let packet = packet_status
-                .validate(VarDctPacketValidation {
-                    expected_strategy: expected.uniform_transform,
-                    expected_lf_samples: expected.expected_lf_samples,
-                    block_count: expected.expected_blocks,
-                    correlation_samples: expected.correlation_samples,
-                    task_capacity: expected.task_capacity,
-                    expected_global_scale: expected.expected_global_scale,
-                    expected_quant_lf: expected.expected_quant_lf,
-                    expected_extra_precision: expected.expected_extra_precision,
-                })
-                .map_err(VarDctDecodeError::from)?;
+            let validation = VarDctPacketValidation {
+                expected_strategy: expected.uniform_transform,
+                expected_lf_samples: expected.expected_lf_samples,
+                block_count: expected.expected_blocks,
+                correlation_samples: expected.correlation_samples,
+                task_capacity: expected.task_capacity,
+                expected_global_scale: expected.expected_global_scale,
+                expected_quant_lf: expected.expected_quant_lf,
+                expected_extra_precision: expected.expected_extra_precision,
+            };
+            let first_blocks = if self.deferred_hf_global {
+                packet_status
+                    .validate_hf_metadata_stage(validation)
+                    .map_err(VarDctDecodeError::from)?;
+                packet_status.first_blocks
+            } else {
+                packet_status
+                    .validate(validation)
+                    .map_err(VarDctDecodeError::from)?
+                    .first_blocks
+            };
             if packet_status.coefficient_words != expected.expected_coefficients {
                 return Err(VarDctDecodeError::ArtifactStatus {
                     field: "packet coefficient_words",
@@ -2988,7 +3724,7 @@ impl VarDctPendingFrame {
             }
             artifact.validate().map_err(VarDctDecodeError::from)?;
             for (field, expected, actual) in [
-                ("task_count", packet.first_blocks, artifact.task_count),
+                ("task_count", first_blocks, artifact.task_count),
                 (
                     "coefficient_words",
                     expected.expected_coefficients,
@@ -3001,7 +3737,7 @@ impl VarDctPendingFrame {
                 ),
                 (
                     "consumed_block_info_entries",
-                    packet.first_blocks,
+                    first_blocks,
                     artifact.consumed_block_info_entries,
                 ),
                 ("backend_requirements", 0, artifact.backend_requirements),
@@ -3080,10 +3816,14 @@ impl GpuPendingFrame for VarDctPendingFrame {
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
         loop {
             let mapping = self.stage_completion().wait();
-            if let Some((source, downstream)) = self.take_local_stage() {
-                self.submit_hf_stage(mapping, source, downstream)?;
-            } else {
-                return self.finish(mapping);
+            match self.take_staged_packet() {
+                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
+                    self.submit_hf_stage(mapping, source, downstream)?;
+                }
+                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
+                    self.submit_hf_global_stage(mapping, source, commands)?;
+                }
+                None => return self.finish(mapping),
             }
         }
     }
@@ -3099,12 +3839,18 @@ impl GpuPendingFrame for VarDctPendingFrame {
             let Some(mapping) = self.stage_completion().poll(context) else {
                 return Poll::Pending;
             };
-            if let Some((source, downstream)) = self.take_local_stage() {
-                if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
-                    return Poll::Ready(Err(error));
+            match self.take_staged_packet() {
+                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
+                    if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                        return Poll::Ready(Err(error));
+                    }
                 }
-            } else {
-                return Poll::Ready(self.finish(mapping));
+                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
+                    if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                None => return Poll::Ready(self.finish(mapping)),
             }
         }
     }
@@ -3125,12 +3871,18 @@ impl GpuPendingFrame for VarDctPendingFrame {
             let Some(mapping) = self.stage_completion().poll(context) else {
                 return Poll::Pending;
             };
-            if let Some((source, downstream)) = self.take_local_stage() {
-                if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
-                    return Poll::Ready(Err(error));
+            match self.take_staged_packet() {
+                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
+                    if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                        return Poll::Ready(Err(error));
+                    }
                 }
-            } else {
-                return Poll::Ready(self.finish(mapping));
+                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
+                    if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                None => return Poll::Ready(self.finish(mapping)),
             }
         }
     }
@@ -3244,6 +3996,8 @@ fn submit_vardct(
         source.memory.codestream_bytes,
     )?;
     let staged_local_trees = source.packet.requires_local_tree_staging();
+    let staged_hf_global = source.packet.requires_hf_global_staging();
+    debug_assert!(!(staged_local_trees && staged_hf_global));
     let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame;
     let modular_metadata = if group_specific_metadata {
         source
@@ -3322,12 +4076,28 @@ fn submit_vardct(
             .hf_coefficients
             .as_ref()
             .and_then(|plan| plan.groups.get(index))
-            .map_or(0, HfCoefficientGroupExecutionPlan::lz77_scratch_bytes);
+            .map(HfCoefficientGroupExecutionPlan::lz77_scratch_bytes)
+            .or_else(|| {
+                source
+                    .deferred_hf
+                    .as_ref()
+                    .and_then(|plan| plan.groups.get(index))
+                    .map(|group| group.lz77_scratch_bytes)
+            })
+            .unwrap_or(0);
         let hf_execution_state_bytes = source
             .hf_coefficients
             .as_ref()
             .and_then(|plan| plan.groups.get(index))
-            .map_or(0, HfCoefficientGroupExecutionPlan::execution_state_bytes);
+            .map(HfCoefficientGroupExecutionPlan::execution_state_bytes)
+            .or_else(|| {
+                source
+                    .deferred_hf
+                    .as_ref()
+                    .and_then(|plan| plan.groups.get(index))
+                    .map(|group| group.execution_state_bytes)
+            })
+            .unwrap_or(0);
         let reconstructed = storage(
             "jxl-wgpu VarDCT LF-group reconstruction",
             reconstructed_bytes
@@ -3411,64 +4181,26 @@ fn submit_vardct(
             wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )
     });
-    let resource_values = source.resource_layout.initial_values()?;
+    let mut resource_values = source.resource_layout.initial_values()?;
+    if let Some(words) = source
+        .packet
+        .hf_coefficients
+        .as_ref()
+        .and_then(|entropy| entropy.dequant_matrix_words.as_deref())
+    {
+        source
+            .resource_layout
+            .install_dequant_matrix_words(&mut resource_values, words)?;
+    }
     let resources = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu VarDCT resource vectors"),
         contents: bytemuck::cast_slice(&resource_values),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let hf_coefficient_buffers = source.hf_coefficients.as_ref().map(|plan| {
-        let windowed = plan.uses_bounded_stream_windows();
-        HfCoefficientJobBuffers {
-            entropy_bundle: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("jxl-wgpu HF entropy bundle"),
-                contents: bytemuck::cast_slice(&plan.entropy_words),
-                usage: wgpu::BufferUsages::STORAGE,
-            }),
-            order_table: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("jxl-wgpu HF natural-order table"),
-                contents: bytemuck::cast_slice(&plan.order_words),
-                usage: wgpu::BufferUsages::STORAGE,
-            }),
-            stream_window: windowed.then(|| {
-                storage(
-                    "jxl-wgpu reusable HF coefficient stream window",
-                    plan.stream_window_bytes(),
-                    wgpu::BufferUsages::COPY_DST,
-                )
-            }),
-            params_window: windowed.then(|| {
-                storage(
-                    "jxl-wgpu reusable HF coefficient parameter window",
-                    plan.reusable_params_bytes(),
-                    wgpu::BufferUsages::COPY_DST,
-                )
-            }),
-            groups: plan
-                .groups
-                .iter()
-                .map(|group| HfCoefficientGroupJobBuffers {
-                    params: (!windowed).then(|| {
-                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("jxl-wgpu LF-group HF pass-group params"),
-                            contents: bytemuck::cast_slice(&group.params),
-                            usage: wgpu::BufferUsages::STORAGE,
-                        })
-                    }),
-                    status: storage(
-                        "jxl-wgpu LF-group HF pass-group status",
-                        group.status_bytes(),
-                        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    ),
-                    sink_params: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("jxl-wgpu LF-group HF coefficient sink params"),
-                        contents: bytemuck::bytes_of(&group.sink_params),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    }),
-                })
-                .collect(),
-        }
-    });
+    let hf_coefficient_buffers = source
+        .hf_coefficients
+        .as_ref()
+        .map(|plan| create_hf_coefficient_job_buffers(device, plan));
     let plane_bytes = source.memory.xyb_plane_bytes / 3;
     let xyb_planes = [
         "jxl-wgpu VarDCT X plane",
@@ -3543,7 +4275,7 @@ fn submit_vardct(
     if let Some(sigma) = &epf_sigma {
         packet_commands.clear_buffer(sigma, 0, None);
     }
-    let (lf_stage_commands, combined_packet_batches, mut commands) = if let Some(plan) =
+    let (packet_stage_commands, combined_packet_batches, mut commands) = if let Some(plan) =
         &source.lf_packet_windows
     {
         if !staged_local_trees {
@@ -3791,9 +4523,15 @@ fn submit_vardct(
                 modular_params: &buffers.modular_params,
             };
             if source.packet.profile.uses_lf_frame {
-                pipelines
-                    .packet
-                    .encode_hf(device, &mut packet_commands, buffers);
+                if staged_hf_global {
+                    pipelines
+                        .packet
+                        .encode_hf_metadata(device, &mut packet_commands, buffers);
+                } else {
+                    pipelines
+                        .packet
+                        .encode_hf(device, &mut packet_commands, buffers);
+                }
             } else if staged_local_trees {
                 pipelines
                     .packet
@@ -3804,20 +4542,20 @@ fn submit_vardct(
                     .encode(device, &mut packet_commands, buffers);
             }
         }
-        if staged_local_trees {
+        if staged_local_trees || staged_hf_global {
             for (index, buffers) in group_buffers.iter().enumerate() {
                 packet_commands.copy_buffer_to_buffer(
                     &buffers.packet_status,
                     0,
                     &status_staging,
                     u64::try_from(index).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF staging status index",
+                        field: "staged packet status index",
                     })? * PACKET_STATUS_BYTES,
                     PACKET_STATUS_BYTES,
                 );
             }
         }
-        if staged_local_trees {
+        if staged_local_trees || staged_hf_global {
             (
                 Some(LfPacketCommands::Whole(packet_commands.finish())),
                 None,
@@ -3941,6 +4679,15 @@ fn submit_vardct(
         (None, None) => {}
         _ => unreachable!("EPF plan and sigma buffer are constructed together"),
     }
+    let deferred_before_coefficients = if staged_hf_global {
+        let before = commands.finish();
+        commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu deferred HF-global post-coefficient stage"),
+        });
+        Some(before)
+    } else {
+        None
+    };
     let mut windowed_before_coefficients = None;
     let mut windowed_coefficient_batches = Vec::new();
     if let (Some(plan), Some(buffers)) = (
@@ -4262,15 +5009,29 @@ fn submit_vardct(
     }
 
     let after_coefficients = commands.finish();
-    let downstream_commands = if let Some(before_coefficients) = windowed_before_coefficients {
-        VarDctDownstreamCommands::Windowed {
-            before_coefficients,
-            coefficient_batches: windowed_coefficient_batches,
-            after_coefficients,
-        }
-    } else {
-        VarDctDownstreamCommands::Whole(after_coefficients)
-    };
+    let (downstream_commands, deferred_commands) =
+        if let Some(before_coefficients) = deferred_before_coefficients {
+            debug_assert!(windowed_before_coefficients.is_none());
+            debug_assert!(windowed_coefficient_batches.is_empty());
+            (
+                None,
+                Some(DeferredHfGlobalCommands {
+                    before_coefficients,
+                    after_coefficients,
+                }),
+            )
+        } else {
+            let downstream = if let Some(before_coefficients) = windowed_before_coefficients {
+                VarDctDownstreamCommands::Windowed {
+                    before_coefficients,
+                    coefficient_batches: windowed_coefficient_batches,
+                    after_coefficients,
+                }
+            } else {
+                VarDctDownstreamCommands::Whole(after_coefficients)
+            };
+            (Some(downstream), None)
+        };
     let lifetime = Arc::new(VarDctJobLifetime {
         output: GpuBufferLease::from_tracked(output.as_ref().clone(), permits.output),
         status_staging,
@@ -4286,39 +5047,48 @@ fn submit_vardct(
         _adaptive_lf_uniform: adaptive_lf_uniform,
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
-        _hf_coefficients: hf_coefficient_buffers,
+        _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _xyb_planes: xyb_planes,
         _restoration: restoration_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
     let completion = Arc::new(MapCompletion::default());
-    let (submission, downstream) = if let Some(lf_stage_commands) = lf_stage_commands {
-        (
-            submit_lf_packet_commands(backend.queue(), lf_stage_commands, &lifetime)?,
-            Some(downstream_commands),
-        )
-    } else if let Some(batches) = combined_packet_batches {
-        (
-            submit_combined_packet_commands(
-                backend.queue(),
-                batches,
-                downstream_commands,
-                &lifetime,
-            )?,
-            None,
-        )
-    } else {
-        (
-            submit_vardct_downstream(backend.queue(), Vec::new(), downstream_commands, &lifetime)?,
-            None,
-        )
-    };
+    let (submission, local_downstream, deferred_commands) =
+        if let Some(packet_stage_commands) = packet_stage_commands {
+            let submission =
+                submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
+            if staged_hf_global {
+                (submission, None, deferred_commands)
+            } else {
+                (submission, downstream_commands, None)
+            }
+        } else if let Some(batches) = combined_packet_batches {
+            let downstream = downstream_commands.ok_or(VarDctDecodeError::EngineContract {
+                detail: "combined packet execution is missing downstream commands",
+            })?;
+            (
+                submit_combined_packet_commands(backend.queue(), batches, downstream, &lifetime)?,
+                None,
+                None,
+            )
+        } else {
+            let downstream = downstream_commands.ok_or(VarDctDecodeError::EngineContract {
+                detail: "VarDCT execution is missing downstream commands",
+            })?;
+            (
+                submit_vardct_downstream(backend.queue(), Vec::new(), downstream, &lifetime)?,
+                None,
+                None,
+            )
+        };
     arm_status_map(
         &lifetime,
         &completion,
         if staged_local_trees {
             "VarDCT LF cursor mapping"
+        } else if staged_hf_global {
+            "VarDCT HF-global cursor mapping"
         } else {
             "VarDCT validation mapping"
         },
@@ -4377,11 +5147,17 @@ fn submit_vardct(
         width: source.packet.profile.width,
         height: source.packet.profile.height,
     };
-    let stage = if let Some(downstream) = downstream {
+    let stage = if let Some(downstream) = local_downstream {
         VarDctPendingStage::LocalLf {
             completion,
             source: Box::new(source),
             downstream: Some(downstream),
+        }
+    } else if let Some(commands) = deferred_commands {
+        VarDctPendingStage::HfGlobal {
+            completion,
+            source: Box::new(source),
+            commands: Some(commands),
         }
     } else {
         VarDctPendingStage::Final { completion }
@@ -4398,6 +5174,7 @@ fn submit_vardct(
         frame_name,
         expected_groups,
         expected_hf_group_indices,
+        deferred_hf_global: staged_hf_global,
         progressive_dc_extent,
         progressive_dc_stride: padded_width,
     })
