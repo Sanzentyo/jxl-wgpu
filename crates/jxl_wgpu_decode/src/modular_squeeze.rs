@@ -468,6 +468,12 @@ impl<'a> ModularSqueezeArena<'a> {
             },
         })
     }
+
+    /// Wraps a checked subrange of a storage buffer as the arena binding.
+    #[must_use]
+    pub const fn from_storage(storage: ResidentStorageBinding<'a>) -> Self {
+        Self { storage }
+    }
 }
 
 /// Host-side dispatch geometry after checking one inverse Squeeze operation.

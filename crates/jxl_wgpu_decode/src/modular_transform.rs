@@ -391,16 +391,39 @@ impl ModularTransformPlan {
         parameters: Vec<ModularSqueezeParameter>,
         limits: ModularTransformLimits,
     ) -> Result<Self> {
-        let mut topology = source_topology.clone();
-        for parameter in &parameters {
-            apply_squeeze(&mut topology, *parameter, limits)?;
-        }
-        Ok(Self {
+        Self::from_transforms_for_test(
             source_topology,
-            transforms: vec![ModularTransformIr::Squeeze {
+            vec![ModularTransformIr::Squeeze {
                 used_default_parameters: false,
                 parameters,
             }],
+            limits,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_transforms_for_test(
+        source_topology: ModularChannelTopology,
+        transforms: Vec<ModularTransformIr>,
+        limits: ModularTransformLimits,
+    ) -> Result<Self> {
+        let mut topology = source_topology.clone();
+        for transform in &transforms {
+            match transform {
+                ModularTransformIr::Rct(rct) => apply_rct(&topology, *rct)?,
+                ModularTransformIr::Palette(palette) => {
+                    apply_palette(&mut topology, *palette, limits)?;
+                }
+                ModularTransformIr::Squeeze { parameters, .. } => {
+                    for parameter in parameters {
+                        apply_squeeze(&mut topology, *parameter, limits)?;
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            source_topology,
+            transforms,
             topology,
         })
     }

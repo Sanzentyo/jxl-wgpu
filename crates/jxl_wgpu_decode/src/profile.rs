@@ -511,19 +511,27 @@ fn validate_stock_modular_transform_plan(
             );
         }
         (_, transforms) => {
-            if transforms
-                .iter()
-                .all(|transform| matches!(transform, ModularTransformIr::Squeeze { .. }))
-            {
+            if transforms.iter().all(|transform| {
+                matches!(
+                    transform,
+                    ModularTransformIr::Rct(_) | ModularTransformIr::Squeeze { .. }
+                )
+            }) {
                 let inverse = plan_modular_inverse(transform_plan)?;
-                let expected_jobs = transforms.iter().try_fold(0usize, |total, transform| {
-                    let ModularTransformIr::Squeeze { parameters, .. } = transform else {
-                        unreachable!("the Squeeze-only predicate was checked above");
-                    };
-                    parameters.iter().try_fold(total, |total, parameter| {
-                        total.checked_add(parameter.channel_count as usize)
-                    })
-                });
+                let expected_jobs =
+                    transforms
+                        .iter()
+                        .try_fold(0usize, |total, transform| match transform {
+                            ModularTransformIr::Rct(_) => total.checked_add(1),
+                            ModularTransformIr::Squeeze { parameters, .. } => {
+                                parameters.iter().try_fold(total, |total, parameter| {
+                                    total.checked_add(parameter.channel_count as usize)
+                                })
+                            }
+                            ModularTransformIr::Palette(_) => {
+                                unreachable!("the RCT/Squeeze predicate was checked above")
+                            }
+                        });
                 if inverse.arena_words() < inverse.entropy_words()
                     || inverse.arena_bytes() != u64::from(inverse.arena_words()) * 4
                     || Some(inverse.jobs().len()) != expected_jobs
@@ -531,7 +539,7 @@ fn validate_stock_modular_transform_plan(
                         != transform_plan.source_topology().channels().len()
                 {
                     return Err(crate::ModularInversePlanError::TopologyState {
-                        reason: "Squeeze-only transform produced inconsistent resident requirements",
+                        reason: "RCT/Squeeze transform produced inconsistent resident requirements",
                     }
                     .into());
                 }

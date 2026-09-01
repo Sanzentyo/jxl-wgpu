@@ -121,6 +121,8 @@ pub enum ModularInversePlanError {
     FreeListOverlap,
     #[error(transparent)]
     Squeeze(#[from] crate::modular_squeeze::ModularSqueezeError),
+    #[error(transparent)]
+    Rct(#[from] crate::modular_rct::ModularRctError),
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

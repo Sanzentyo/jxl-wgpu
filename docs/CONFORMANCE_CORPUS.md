@@ -98,10 +98,11 @@ overlapping, zero-size, out-of-range, and non-linear configurations. Concrete sc
 all seven operations and six permutations. One actual-adapter differential executes all 42 types
 over odd dimensions, padded strides, nonzero offsets, and `i32` extremes without shader-source text
 inspection. Scheduler composition and production entropy input remain separate gates.
-Scheduler conformance composes an in-place horizontal split with a vertical split over both derived
-channels. Reverse lowering produces vertical, vertical, then horizontal jobs, and an actual adapter
-executes all three in one encoder before the sole final map. The final 9×5 plane is word-exact against
-the scalar schedule even when entropy planes contain signed extremes. Separate tests cover
+Scheduler conformance first composes an in-place horizontal split with a vertical split over both
+derived channels and fixes the reverse order as vertical, vertical, horizontal. A stronger
+RCT/Squeeze/RCT plan lowers to RCT type 41, three horizontal jobs, then RCT type 5. An actual adapter
+executes those five jobs in one encoder and copies three noncontiguous final 9×5 planes into the sole
+map; every word matches the scalar schedule with signed-extreme entropy inputs. Separate tests cover
 tail-appended residual placement, a zero-width residual for a one-column image, best-fit reuse,
 two-sided free-span coalescing, and typed overlap rejection. When `cjxl` is installed, the LF2 root's
 13 default parameters must lower to 37 jobs and three full-resolution final plane views within a

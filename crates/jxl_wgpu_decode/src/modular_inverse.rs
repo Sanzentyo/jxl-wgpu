@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ModularInversePlanError, ModularTransformFeature, Result,
+    modular_rct::{ModularRctParams, ModularRctPlane},
     modular_squeeze::{ModularSqueezeDirection, ModularSqueezeParams, ModularSqueezePlane},
     modular_transform::{
-        ModularChannelGeometry, ModularChannelTopology, ModularInverseTransform,
+        ModularChannelGeometry, ModularChannelTopology, ModularInverseTransform, ModularRct,
         ModularSqueezeParameter, ModularTransformPlan,
     },
 };
@@ -48,19 +49,29 @@ impl ModularArenaPlane {
             offset_words: self.offset_words,
         }
     }
+
+    const fn rct_view(self) -> ModularRctPlane {
+        ModularRctPlane {
+            width: self.geometry.width,
+            height: self.geometry.height,
+            stride: self.geometry.width,
+            offset_words: self.offset_words,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModularInverseSqueezeJob {
-    pub params: ModularSqueezeParams,
+pub(crate) enum ModularInverseJob {
+    Squeeze { params: ModularSqueezeParams },
+    Rct { params: ModularRctParams },
 }
 
-/// Complete Squeeze-only reverse schedule over one storage arena.
+/// Complete reverse schedule over one storage arena.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModularInversePlan {
     entropy_words: u32,
     arena_words: u32,
-    jobs: Vec<ModularInverseSqueezeJob>,
+    jobs: Vec<ModularInverseJob>,
     final_planes: Vec<ModularArenaPlane>,
 }
 
@@ -77,7 +88,7 @@ impl ModularInversePlan {
         self.arena_words as u64 * 4
     }
 
-    pub(crate) fn jobs(&self) -> &[ModularInverseSqueezeJob] {
+    pub(crate) fn jobs(&self) -> &[ModularInverseJob] {
         &self.jobs
     }
 
@@ -86,7 +97,7 @@ impl ModularInversePlan {
     }
 }
 
-/// Lowers a transform plan containing only Squeeze operations into a resident lifetime schedule.
+/// Lowers RCT/Squeeze operations into a resident lifetime schedule.
 pub(crate) fn plan_modular_inverse(
     transform_plan: &ModularTransformPlan,
 ) -> Result<ModularInversePlan> {
@@ -117,15 +128,7 @@ pub(crate) fn plan_modular_inverse(
                 &mut allocator,
                 &mut jobs,
             )?,
-            ModularInverseTransform::Rct(rct) => {
-                return Err(ModularInversePlanError::UnsupportedTransform {
-                    feature: ModularTransformFeature::ReversibleColor {
-                        begin_channel: rct.begin_channel,
-                        rct_type: rct.rct_type,
-                    },
-                }
-                .into());
-            }
+            ModularInverseTransform::Rct(rct) => lower_rct(rct, &live, &mut jobs)?,
             ModularInverseTransform::Palette(_) => {
                 return Err(ModularInversePlanError::UnsupportedTransform {
                     feature: ModularTransformFeature::Palette,
@@ -151,7 +154,7 @@ fn lower_squeeze(
     destination: &ModularChannelTopology,
     live: &mut Vec<ModularArenaPlane>,
     allocator: &mut WordAllocator,
-    jobs: &mut Vec<ModularInverseSqueezeJob>,
+    jobs: &mut Vec<ModularInverseJob>,
 ) -> Result<()> {
     let average_start = usize::try_from(parameter.begin_channel).map_err(|_| {
         ModularInversePlanError::TopologyState {
@@ -210,7 +213,7 @@ fn lower_squeeze(
         } else {
             ModularSqueezeDirection::Vertical
         };
-        jobs.push(ModularInverseSqueezeJob {
+        jobs.push(ModularInverseJob::Squeeze {
             params: ModularSqueezeParams::new(
                 direction,
                 average.squeeze_view(),
@@ -223,6 +226,42 @@ fn lower_squeeze(
         allocator.release(residual.span()?)?;
     }
     live.drain(residual_start..residual_end);
+    Ok(())
+}
+
+fn lower_rct(
+    rct: ModularRct,
+    live: &[ModularArenaPlane],
+    jobs: &mut Vec<ModularInverseJob>,
+) -> Result<()> {
+    let begin =
+        usize::try_from(rct.begin_channel).map_err(|_| ModularInversePlanError::TopologyState {
+            reason: "RCT begin channel exceeds host space",
+        })?;
+    let end = begin
+        .checked_add(3)
+        .ok_or(ModularInversePlanError::TopologyState {
+            reason: "RCT channel range overflows",
+        })?;
+    let planes = live
+        .get(begin..end)
+        .ok_or(ModularInversePlanError::TopologyState {
+            reason: "RCT channel range exceeds live planes",
+        })?;
+    let [first, second, third] = planes else {
+        return Err(ModularInversePlanError::TopologyState {
+            reason: "RCT did not resolve exactly three live planes",
+        }
+        .into());
+    };
+    jobs.push(ModularInverseJob::Rct {
+        params: ModularRctParams::new(
+            rct.rct_type,
+            first.rct_view(),
+            second.rct_view(),
+            third.rct_view(),
+        ),
+    });
     Ok(())
 }
 
@@ -356,10 +395,12 @@ impl WordAllocator {
 mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
+    use crate::modular_rct::{ModularRctArena, ModularRctPipeline};
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezePipeline};
     use crate::modular_transform::{
-        ModularChannelTopology, ModularSqueezeParameter, ModularTransformLimits,
-        ModularTransformPlan,
+        ModularChannelTopology, ModularRct, ModularSqueezeParameter, ModularTransformIr,
+        ModularTransformLimits, ModularTransformPlan,
     };
 
     fn nested_squeeze_plan() -> ModularInversePlan {
@@ -399,6 +440,36 @@ mod tests {
                 .unwrap();
         let transform =
             ModularTransformPlan::squeeze_only_for_test(topology, vec![parameter], limits).unwrap();
+        plan_modular_inverse(&transform).unwrap()
+    }
+
+    fn mixed_rct_squeeze_plan() -> ModularInversePlan {
+        let limits = ModularTransformLimits::default();
+        let topology = ModularChannelTopology::full_resolution(9, 5, 8, 3, limits).unwrap();
+        let transform = ModularTransformPlan::from_transforms_for_test(
+            topology,
+            vec![
+                ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 5,
+                }),
+                ModularTransformIr::Squeeze {
+                    used_default_parameters: false,
+                    parameters: vec![ModularSqueezeParameter {
+                        horizontal: true,
+                        in_place: true,
+                        begin_channel: 0,
+                        channel_count: 3,
+                    }],
+                },
+                ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 41,
+                }),
+            ],
+            limits,
+        )
+        .unwrap();
         plan_modular_inverse(&transform).unwrap()
     }
 
@@ -452,7 +523,10 @@ mod tests {
         assert_eq!(
             plan.jobs()
                 .iter()
-                .map(|job| job.params.direction())
+                .map(|job| match job {
+                    ModularInverseJob::Squeeze { params } => params.direction(),
+                    ModularInverseJob::Rct { .. } => panic!("Squeeze-only plan contains RCT"),
+                })
                 .collect::<Vec<_>>(),
             vec![
                 ModularSqueezeDirection::Vertical,
@@ -500,9 +574,33 @@ mod tests {
         );
         assert_eq!(single_column.entropy_words(), 7);
         assert_eq!(single_column.arena_words(), 14);
-        assert_eq!(single_column.jobs()[0].params.residual_plane().width, 0);
+        let ModularInverseJob::Squeeze { params } = single_column.jobs()[0] else {
+            panic!("single Squeeze plan contains RCT");
+        };
+        assert_eq!(params.residual_plane().width, 0);
         assert_eq!(single_column.final_planes()[0].geometry.width, 1);
         assert_eq!(single_column.final_planes()[0].geometry.height, 7);
+    }
+
+    #[test]
+    fn mixed_schedule_preserves_rct_and_squeeze_inverse_order() {
+        let plan = mixed_rct_squeeze_plan();
+        assert_eq!(plan.entropy_words(), 135);
+        assert_eq!(plan.jobs().len(), 5);
+        assert!(matches!(
+            plan.jobs(),
+            [
+                ModularInverseJob::Rct { params: first },
+                ModularInverseJob::Squeeze { .. },
+                ModularInverseJob::Squeeze { .. },
+                ModularInverseJob::Squeeze { .. },
+                ModularInverseJob::Rct { params: last },
+            ] if first.rct_type() == 41 && last.rct_type() == 5
+        ));
+        assert_eq!(plan.final_planes().len(), 3);
+        assert!(plan.final_planes().iter().all(|plane| {
+            plane.geometry.width == 9 && plane.geometry.height == 5 && plane.geometry.bit_depth == 8
+        }));
     }
 
     fn scalar_tendency(previous: i32, average: i32, next: i32) -> i64 {
@@ -536,7 +634,7 @@ mod tests {
         (first as i32, (first - difference) as i32)
     }
 
-    fn execute_scalar_job(arena: &mut [i32], params: ModularSqueezeParams) {
+    fn execute_scalar_squeeze(arena: &mut [i32], params: ModularSqueezeParams) {
         let average = params.average_plane();
         let residual = params.residual_plane();
         let output = params.output_plane();
@@ -601,6 +699,71 @@ mod tests {
         }
     }
 
+    fn wrapping_rct(first: i32, second: i32, third: i32, rct_type: u32) -> [i32; 3] {
+        let values = match rct_type % 7 {
+            0 => [first, second, third],
+            1 => [first, second, third.wrapping_add(first)],
+            2 => [first, second.wrapping_add(first), third],
+            3 => [first, second.wrapping_add(first), third.wrapping_add(first)],
+            4 => [
+                first,
+                second.wrapping_add(first.wrapping_add(third) >> 1),
+                third,
+            ],
+            5 => {
+                let third = first.wrapping_add(third);
+                [
+                    first,
+                    second.wrapping_add(first.wrapping_add(third) >> 1),
+                    third,
+                ]
+            }
+            6 => {
+                let y = first.wrapping_sub(third >> 1);
+                let green = third.wrapping_add(y);
+                let y = y.wrapping_sub(second >> 1);
+                [y.wrapping_add(second), green, y]
+            }
+            _ => unreachable!(),
+        };
+        match rct_type / 7 {
+            0 => values,
+            1 => [values[2], values[0], values[1]],
+            2 => [values[1], values[2], values[0]],
+            3 => [values[0], values[2], values[1]],
+            4 => [values[1], values[0], values[2]],
+            5 => [values[2], values[1], values[0]],
+            _ => unreachable!(),
+        }
+    }
+
+    fn execute_scalar_rct(arena: &mut [i32], params: ModularRctParams) {
+        let [first, second, third] = params.planes();
+        for y in 0..first.height {
+            for x in 0..first.width {
+                let indices = [first, second, third].map(|plane| {
+                    usize::try_from(plane.offset_words + y * plane.stride + x).unwrap()
+                });
+                let values = wrapping_rct(
+                    arena[indices[0]],
+                    arena[indices[1]],
+                    arena[indices[2]],
+                    params.rct_type(),
+                );
+                for (index, value) in indices.into_iter().zip(values) {
+                    arena[index] = value;
+                }
+            }
+        }
+    }
+
+    fn execute_scalar_job(arena: &mut [i32], job: ModularInverseJob) {
+        match job {
+            ModularInverseJob::Squeeze { params } => execute_scalar_squeeze(arena, params),
+            ModularInverseJob::Rct { params } => execute_scalar_rct(arena, params),
+        }
+    }
+
     fn entropy_value(index: usize) -> i32 {
         match index % 9 {
             0 => i32::MIN,
@@ -617,7 +780,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn actual_adapter_executes_nested_schedule_without_intermediate_map() {
+    fn actual_adapter_executes_mixed_schedule_without_intermediate_map() {
         use std::sync::mpsc;
 
         use wgpu::util::DeviceExt;
@@ -648,19 +811,27 @@ mod tests {
             return;
         };
 
-        let plan = nested_squeeze_plan();
+        let plan = mixed_rct_squeeze_plan();
         let mut initial = (0..plan.entropy_words() as usize)
             .map(entropy_value)
             .collect::<Vec<_>>();
         initial.resize(plan.arena_words() as usize, 0);
         let mut expected = initial.clone();
-        for job in plan.jobs() {
-            execute_scalar_job(&mut expected, job.params);
+        for &job in plan.jobs() {
+            execute_scalar_job(&mut expected, job);
         }
-        let final_plane = plan.final_planes()[0];
-        let final_words = final_plane.span().unwrap();
-        let expected =
-            expected[final_words.offset as usize..final_words.end().unwrap() as usize].to_vec();
+        let final_spans = plan
+            .final_planes()
+            .iter()
+            .copied()
+            .map(ModularArenaPlane::span)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let expected = final_spans
+            .iter()
+            .flat_map(|span| expected[span.offset as usize..span.end().unwrap() as usize].iter())
+            .copied()
+            .collect::<Vec<_>>();
 
         let arena = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Modular inverse scheduled arena"),
@@ -669,33 +840,53 @@ mod tests {
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Modular inverse scheduled readback"),
-            size: u64::from(final_words.length) * 4,
+            size: expected.len() as u64 * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let pipeline =
+        let squeeze_pipeline =
             ModularSqueezePipeline::with_variant(&device, jxl_wgpu::KernelVariant::Lanes128)
                 .unwrap();
+        let rct_pipeline =
+            ModularRctPipeline::with_variant(&device, jxl_wgpu::KernelVariant::Lanes128).unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Modular inverse scheduled encoder"),
         });
-        let arena_binding = ModularSqueezeArena::entire(&arena).unwrap();
+        let arena_binding = ModularSqueezeArena::entire(&arena).unwrap().storage;
         let uniforms = plan
             .jobs()
             .iter()
-            .map(|job| {
-                pipeline
-                    .encode(&device, &mut encoder, arena_binding, job.params)
-                    .unwrap()
+            .map(|job| match *job {
+                ModularInverseJob::Squeeze { params } => squeeze_pipeline
+                    .encode(
+                        &device,
+                        &mut encoder,
+                        ModularSqueezeArena::from_storage(arena_binding),
+                        params,
+                    )
+                    .unwrap(),
+                ModularInverseJob::Rct { params } => rct_pipeline
+                    .encode(
+                        &device,
+                        &mut encoder,
+                        ModularRctArena::from_storage(arena_binding),
+                        params,
+                    )
+                    .unwrap(),
             })
             .collect::<Vec<_>>();
-        encoder.copy_buffer_to_buffer(
-            &arena,
-            u64::from(final_words.offset) * 4,
-            &staging,
-            0,
-            u64::from(final_words.length) * 4,
-        );
+        let mut staging_offset = 0u64;
+        for span in final_spans {
+            let bytes = u64::from(span.length) * 4;
+            encoder.copy_buffer_to_buffer(
+                &arena,
+                u64::from(span.offset) * 4,
+                &staging,
+                staging_offset,
+                bytes,
+            );
+            staging_offset += bytes;
+        }
         queue.submit(Some(encoder.finish()));
         drop(uniforms);
 

@@ -188,26 +188,25 @@ previous reconstructed odd sample is a normative dependency; linear 1/32/64/128/
 parallelize independent lines. Portable two-word signed arithmetic preserves the scalar `i64`
 smooth-tendency calculation over the complete `i32` input domain. The stock executor still rejects
 non-direct topologies until generalized entropy output targets the inverse arena and Palette plus
-mixed inverse scheduling exist.
+production inverse submission exist.
 A second standalone resident primitive applies all 42 inverse RCT types in place. Three equal-size
 planes are disjoint views of the same read-write arena; each invocation loads all inputs before any
 permuted store, so operation and permutation never require an intermediate allocation. Unsigned
 bit-pattern add/sub and explicit arithmetic shift reproduce wrapping signed semantics. The pass has
-Scalar/32/64/128/256-lane policy variants and no workgroup storage. It is not yet an ordered job in
-the inverse lifetime plan, so its existence alone does not expand the accepted stock profile.
+Scalar/32/64/128/256-lane policy variants and no workgroup storage.
 Inverse lowering does not retain one full channel table per transform. It starts from the final
 entropy topology, reverses each Squeeze parameter and transform, invokes the lowering callback with
 only the current/restored pair, and verifies that the source topology is recovered exactly. A
 cumulative topology-work budget bounds repeated vector insertion/removal independently of transform
 and final-channel count limits.
-For Squeeze-only stacks, lowering now continues into an executable lifetime schedule. Entropy-visible
-planes begin as tightly packed ranges in one storage arena. Before each channel dispatch a best-fit
-allocator reserves a non-overlapping restored range; after that ordered dispatch its average and
-residual ranges become reusable and adjacent holes are coalesced. In-place and tail-appended residual
-orders use the same logical-plane table. A composed two-parameter case is executed as three GPU jobs
-inside one command encoder with only the final readback, while the 13-parameter progressive-DC root
-is preflighted as 37 jobs. The planner returns a typed address-space, topology-state, free-list, or
-unsupported-transform error before backend allocation.
+For arbitrary RCT/Squeeze stacks, lowering now continues into one ordered lifetime schedule.
+Entropy-visible planes begin as tightly packed ranges in one storage arena. RCT records the current
+three views without allocation; before each Squeeze channel dispatch a best-fit allocator reserves a
+non-overlapping restored range, then releases its average/residual ranges and coalesces adjacent
+holes. In-place and tail-appended residual orders use the same logical-plane table. A five-job
+RCT/Squeeze/RCT case executes in one encoder and maps all three noncontiguous final planes once; the
+13-parameter progressive-DC root remains 37 jobs. The planner returns a typed address-space,
+topology-state, free-list, or unsupported-Palette error before backend allocation.
 The entropy boundary now also has an explicit per-channel ABI. Each 32-byte descriptor stores its
 arena word offset, row stride, width/height, cumulative decoded start/end, and a range into flattened
 prior-channel indices. Host lowering groups previous channels by exact width, height, horizontal

@@ -47,13 +47,14 @@ other driver-private allocations cannot be measured portably and are not include
   footprints are pairwise non-overlapping views of one read-write arena binding. Every invocation
   loads all three words before storing the in-place permutation, uses no workgroup storage, and
   preserves signed wrapping through `u32` bit-pattern arithmetic.
-- The Squeeze reverse planner uses one word-addressed arena rather than one buffer per intermediate
-  channel. Initial entropy planes occupy a checked packed prefix. A best-fit free list indexed by
-  both size and offset allocates each destination before its dispatch, then releases its two source
-  ranges and coalesces neighbors in logarithmic time. This ordering proves that a job never aliases
-  its own inputs while allowing later jobs to overwrite dead entropy or intermediate data. The
-  nested 9×5 conformance plan has 45 live entropy words and a 90-word arena peak; the real 1024×128
-  progressive-DC root is asserted not to exceed twice its 393,216-word entropy storage.
+- The Modular inverse planner uses one word-addressed arena rather than one buffer per intermediate
+  channel. Initial entropy planes occupy a checked packed prefix. RCT jobs reference three current
+  spans without allocation. For Squeeze, a best-fit free list indexed by size and offset allocates
+  each destination before dispatch, then releases its two source ranges and coalesces neighbors in
+  logarithmic time. This ordering proves that a job never aliases its own inputs while allowing
+  later jobs to overwrite dead entropy or intermediate data. The nested 9×5 Squeeze plan has 45 live
+  entropy words and a 90-word peak; an RCT/Squeeze/RCT plan preserves five-job order over three
+  planes; the real 1024×128 progressive-DC root stays within twice its 393,216-word entropy storage.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size
