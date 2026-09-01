@@ -514,12 +514,13 @@ fn validate_stock_modular_transform_plan(
             );
         }
         (_, transforms) => {
-            if transforms.iter().all(|transform| {
+            let gpu_resident = transforms.iter().all(|transform| {
                 matches!(
                     transform,
                     ModularTransformIr::Rct(_) | ModularTransformIr::Squeeze { .. }
                 )
-            }) {
+            });
+            if gpu_resident {
                 let inverse = plan_modular_inverse(transform_plan)?;
                 let expected_jobs =
                     transforms
@@ -546,24 +547,29 @@ fn validate_stock_modular_transform_plan(
                     }
                     .into());
                 }
+            } else {
+                let feature = transforms
+                    .iter()
+                    .find_map(|transform| match transform {
+                        ModularTransformIr::Rct(rct)
+                            if rct.begin_channel == 0 && rct.rct_type == 6 =>
+                        {
+                            None
+                        }
+                        ModularTransformIr::Rct(rct) => {
+                            Some(ModularTransformFeature::ReversibleColor {
+                                begin_channel: rct.begin_channel,
+                                rct_type: rct.rct_type,
+                            })
+                        }
+                        ModularTransformIr::Palette(_) => Some(ModularTransformFeature::Palette),
+                        ModularTransformIr::Squeeze { .. } => {
+                            Some(ModularTransformFeature::Squeeze)
+                        }
+                    })
+                    .unwrap_or(ModularTransformFeature::Invalid);
+                return unsupported_transform(feature);
             }
-            let feature = transforms
-                .iter()
-                .find_map(|transform| match transform {
-                    ModularTransformIr::Rct(rct) if rct.begin_channel == 0 && rct.rct_type == 6 => {
-                        None
-                    }
-                    ModularTransformIr::Rct(rct) => {
-                        Some(ModularTransformFeature::ReversibleColor {
-                            begin_channel: rct.begin_channel,
-                            rct_type: rct.rct_type,
-                        })
-                    }
-                    ModularTransformIr::Palette(_) => Some(ModularTransformFeature::Palette),
-                    ModularTransformIr::Squeeze { .. } => Some(ModularTransformFeature::Squeeze),
-                })
-                .unwrap_or(ModularTransformFeature::Invalid);
-            return unsupported_transform(feature);
         }
     }
     transform_plan.visit_inverse(|_, source, destination| {
@@ -642,6 +648,44 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn stock_profile_admits_gpu_resident_squeeze_and_noncanonical_rct() {
+        let limits = ModularTransformLimits::default();
+        let gray_source = ModularChannelTopology::full_resolution(9, 5, 8, 1, limits).unwrap();
+        let squeeze = ModularTransformPlan::squeeze_only_for_test(
+            gray_source,
+            vec![crate::modular_transform::ModularSqueezeParameter {
+                horizontal: true,
+                in_place: true,
+                begin_channel: 0,
+                channel_count: 1,
+            }],
+            limits,
+        )
+        .unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Gray, 9, 5, 8, &squeeze).unwrap();
+        let squeeze_inverse = plan_modular_inverse(&squeeze).unwrap();
+        assert_eq!(squeeze_inverse.entropy_words(), 45);
+        assert_eq!(squeeze_inverse.jobs().len(), 1);
+        assert_eq!(squeeze_inverse.final_planes().len(), 1);
+
+        let rgb_source = ModularChannelTopology::full_resolution(7, 3, 8, 3, limits).unwrap();
+        let rct = ModularTransformPlan::from_transforms_for_test(
+            rgb_source,
+            vec![ModularTransformIr::Rct(ModularRct {
+                begin_channel: 0,
+                rct_type: 41,
+            })],
+            limits,
+        )
+        .unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Rgb, 7, 3, 8, &rct).unwrap();
+        let rct_inverse = plan_modular_inverse(&rct).unwrap();
+        assert_eq!(rct_inverse.entropy_words(), 63);
+        assert_eq!(rct_inverse.jobs().len(), 1);
+        assert_eq!(rct_inverse.final_planes().len(), 3);
+    }
 
     #[test]
     fn modular_profile_is_identical_across_every_shared_chunk_split() {

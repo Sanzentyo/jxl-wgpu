@@ -791,6 +791,10 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert_eq!(stats.max_lz77_scratch_words, 0);
             assert_eq!(stats.max_logical_reconstruction_sample_words, 256 * 256);
             assert_eq!(stats.max_physical_reconstruction_sample_words, 256 * 2);
+            assert_eq!(stats.resident_modular_arena_bytes, 0);
+            assert_eq!(stats.inverse_transform_count, 0);
+            assert_eq!(stats.inverse_transform_uniform_bytes, 0);
+            assert_eq!(stats.final_output_uniform_bytes, 0);
             assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4 + 32);
             assert_eq!(stats.execution_state_bytes_per_lane, 32);
             assert_eq!(

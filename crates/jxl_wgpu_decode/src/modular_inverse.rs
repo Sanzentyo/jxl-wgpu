@@ -416,6 +416,11 @@ impl WordAllocator {
 mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
+    use crate::modular_finalize::{
+        ModularFinalizeBindings, ModularFinalizeF64Path, ModularFinalizeOutput,
+        ModularFinalizeParams, ModularFinalizePipeline,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::modular_rct::{ModularRctArena, ModularRctPipeline};
     #[cfg(not(target_arch = "wasm32"))]
     use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezePipeline};
@@ -785,20 +790,6 @@ mod tests {
         }
     }
 
-    fn entropy_value(index: usize) -> i32 {
-        match index % 9 {
-            0 => i32::MIN,
-            1 => i32::MAX,
-            2 => index as i32 * 17,
-            3 => -(index as i32) * 31,
-            4 => 0,
-            5 => 1,
-            6 => -1,
-            7 => 0x1234_5678,
-            _ => -0x1234_5678,
-        }
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn actual_adapter_executes_mixed_schedule_without_intermediate_map() {
@@ -833,10 +824,19 @@ mod tests {
         };
 
         let plan = mixed_rct_squeeze_plan();
-        let mut initial = (0..plan.entropy_words() as usize)
-            .map(entropy_value)
-            .collect::<Vec<_>>();
-        initial.resize(plan.arena_words() as usize, 0);
+        // Component-kernel tests separately pin wrapping-i32 extremes. This combined schedule
+        // must finish into legal native 8-bit pixels: RCT41 maps [32, 0, 0] to three constant
+        // averages, zero Squeeze residuals preserve them, and the final RCT5 stays in range.
+        let mut initial = vec![0; plan.arena_words() as usize];
+        let ModularInverseJob::Rct { params: first_rct } = plan.jobs()[0] else {
+            panic!("mixed schedule does not start with RCT")
+        };
+        let first_average = first_rct.planes()[0];
+        for y in 0..first_average.height {
+            for x in 0..first_average.width {
+                initial[(first_average.offset_words + y * first_average.stride + x) as usize] = 32;
+            }
+        }
         let mut expected = initial.clone();
         for &job in plan.jobs() {
             execute_scalar_job(&mut expected, job);
@@ -848,10 +848,19 @@ mod tests {
             .map(ModularArenaPlane::span)
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        let expected = final_spans
+        let expected_planes = final_spans
             .iter()
             .flat_map(|span| expected[span.offset as usize..span.end().unwrap() as usize].iter())
             .copied()
+            .collect::<Vec<_>>();
+        let plane_samples = 9 * 5;
+        let expected_interleaved = (0..plane_samples)
+            .flat_map(|index| {
+                (0..3).map({
+                    let expected_planes = &expected_planes;
+                    move |channel| (expected_planes[channel * plane_samples + index] as u32) as u8
+                })
+            })
             .collect::<Vec<_>>();
 
         let arena = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -861,15 +870,34 @@ mod tests {
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Modular inverse scheduled readback"),
-            size: expected.len() as u64 * 4,
+            size: expected_planes.len() as u64 * 4 + 136,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
+        });
+        let packed = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Modular inverse scheduled RGB8 output"),
+            size: 136,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let status = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Modular inverse scheduled finalizer status"),
+            contents: bytemuck::cast_slice(&[1u32, 0, 0, 0]),
+            usage: wgpu::BufferUsages::STORAGE,
         });
         let squeeze_pipeline =
             ModularSqueezePipeline::with_variant(&device, jxl_wgpu::KernelVariant::Lanes128)
                 .unwrap();
         let rct_pipeline =
             ModularRctPipeline::with_variant(&device, jxl_wgpu::KernelVariant::Lanes128).unwrap();
+        let finalize_pipeline = ModularFinalizePipeline::with_variant(
+            &device,
+            jxl_wgpu::KernelVariant::Lanes128,
+            ModularFinalizeF64Path::ExactF32Widening,
+        )
+        .unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Modular inverse scheduled encoder"),
         });
@@ -896,6 +924,48 @@ mod tests {
                     .unwrap(),
             })
             .collect::<Vec<_>>();
+        encoder.clear_buffer(&packed, 0, None);
+        let finalize_uniform = finalize_pipeline
+            .encode(
+                &device,
+                &mut encoder,
+                ModularFinalizeBindings {
+                    arena: arena_binding,
+                    output_words: jxl_wgpu::ResidentStorageBinding {
+                        buffer: &packed,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(packed.size()).unwrap(),
+                    },
+                    status: jxl_wgpu::ResidentStorageBinding {
+                        buffer: &status,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(status.size()).unwrap(),
+                    },
+                    output_f64: None,
+                },
+                ModularFinalizeParams::new(
+                    jxl_gpu_protocol::Extent2d::new(9, 5),
+                    8,
+                    &plan.final_gpu_layouts(),
+                    plan.arena_words(),
+                    ModularFinalizeOutput {
+                        kind: 9,
+                        transfer: 0,
+                        limited_range: false,
+                        channels: 3,
+                        order: 0,
+                        bits: 8,
+                        storage_bits: 8,
+                        numeric_mapping: 3,
+                        plane_offsets: [0; 4],
+                        plane_strides: [27, 0, 0, 0],
+                        logical_size: 135,
+                        chroma_extent: jxl_gpu_protocol::Extent2d::new(0, 0),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut staging_offset = 0u64;
         for span in final_spans {
             let bytes = u64::from(span.length) * 4;
@@ -908,8 +978,9 @@ mod tests {
             );
             staging_offset += bytes;
         }
+        encoder.copy_buffer_to_buffer(&packed, 0, &staging, staging_offset, 136);
         queue.submit(Some(encoder.finish()));
-        drop(uniforms);
+        drop((uniforms, finalize_uniform));
 
         let slice = staging.slice(..);
         let (sender, receiver) = mpsc::channel();
@@ -921,9 +992,13 @@ mod tests {
         let mapped = slice
             .get_mapped_range()
             .expect("mapped Modular inverse output");
-        let actual = bytemuck::cast_slice::<u8, i32>(&mapped).to_vec();
+        let plane_bytes = expected_planes.len() * 4;
+        let actual_planes = bytemuck::cast_slice::<u8, i32>(&mapped[..plane_bytes]).to_vec();
+        let actual_interleaved =
+            mapped[plane_bytes..plane_bytes + expected_interleaved.len()].to_vec();
         drop(mapped);
         staging.unmap();
-        assert_eq!(actual, expected);
+        assert_eq!(actual_planes, expected_planes);
+        assert_eq!(actual_interleaved, expected_interleaved);
     }
 }

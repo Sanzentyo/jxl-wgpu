@@ -208,6 +208,8 @@ pub enum Error {
     #[error(transparent)]
     ModularInversePlan(#[from] ModularInversePlanError),
     #[error(transparent)]
+    ModularFinalize(#[from] crate::modular_finalize::ModularFinalizeError),
+    #[error(transparent)]
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),

@@ -3,7 +3,8 @@
 //! This crate has no production CPU pixel/entropy decoder and no fallback policy. The stock
 //! [`WgpuSubmissionEngine`] inventories standard JPEG XL frame sections, parses only bounded
 //! Modular prefix metadata, and decodes single- or multi-group lossless 1-16-bit Gray/RGB/RGBA
-//! token streams in WGSL.
+//! token streams in WGSL. Single-root-group streams may use arbitrary resident RCT/Squeeze stacks;
+//! no decoded sample crosses a CPU or mapped-buffer boundary.
 //! It returns GPU-resident frames in the requested generic [`PixelFormat`]; no private sidecar box
 //! is required. Unsupported profiles and incomplete generic frontend stages are typed errors.
 //! Submission and completion are separate: sessions can prefetch an ordered bounded queue of
@@ -32,6 +33,7 @@ mod error;
 mod inflight;
 mod input_budget;
 mod model;
+mod modular_finalize;
 mod modular_inverse;
 pub mod modular_rct;
 pub mod modular_squeeze;
@@ -75,6 +77,7 @@ pub use model::{
     GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping, ModularPredictionProfile,
     ModularPredictor, NumericSampleMapping,
 };
+pub use modular_finalize::ModularFinalizeError;
 pub use session::{
     GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,
     GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure,
