@@ -1439,9 +1439,32 @@ impl HfPacketWindowExecutionPlan {
 }
 
 impl VarDctSource {
+    fn staged_lf_submission_count(&self) -> usize {
+        if self.packet.profile.uses_lf_frame {
+            0
+        } else {
+            self.lf_packet_windows
+                .as_ref()
+                .map_or(1, LfPacketWindowExecutionPlan::batch_count)
+        }
+    }
+
     fn submissions_per_frame(&self) -> usize {
         if self.deferred_hf.is_some() {
-            return 2;
+            if self.packet.profile.uses_lf_frame {
+                return 2;
+            }
+            let coefficient_batches = self.hf_coefficients.as_ref().map_or(0, |coefficients| {
+                if coefficients.uses_bounded_stream_windows() {
+                    coefficients.stream_batch_count()
+                } else {
+                    0
+                }
+            });
+            return self
+                .staged_lf_submission_count()
+                .saturating_add(coefficient_batches)
+                .saturating_add(2);
         }
         let local_lf = if self.packet.requires_local_tree_staging() {
             self.lf_packet_windows
@@ -1812,6 +1835,11 @@ fn prepare_source(
                     )
                 })
                 .transpose()?;
+            let deferred_hf_plan = if combined_packet_windows.is_some() {
+                None
+            } else {
+                deferred_hf.as_ref()
+            };
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
                 stream_limit,
                 codestream_len,
@@ -1821,7 +1849,7 @@ fn prepare_source(
                 combined_packet_windows: combined_packet_windows.as_ref(),
                 resource: resource_layout,
                 hf_coefficients: hf_coefficients.as_ref(),
-                deferred_hf: deferred_hf.as_ref(),
+                deferred_hf: deferred_hf_plan,
                 adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
                 restoration_scratch: gaborish.is_some() || epf.is_some(),
                 gaborish: gaborish.is_some(),
@@ -1859,6 +1887,19 @@ fn prepare_source(
         hf_coefficients,
         memory,
     } = entropy_plan;
+    let deferred_hf = if combined_packet_windows.is_some() {
+        None
+    } else {
+        deferred_hf
+    };
+    if packet.requires_hf_global_staging()
+        && combined_packet_windows.is_none()
+        && !packet.profile.uses_lf_frame
+    {
+        for (packet_group, group) in packet.groups.iter().zip(&mut groups) {
+            group.control = packet_group.lf_stage_control(&packet)?;
+        }
+    }
     validate_device_limits(
         backend.device(),
         memory,
@@ -2434,10 +2475,15 @@ struct DeferredHfGlobalCommands {
     after_coefficients: wgpu::CommandBuffer,
 }
 
+enum PostLfCommands {
+    Direct(VarDctDownstreamCommands),
+    DeferredHfGlobal(DeferredHfGlobalCommands),
+}
+
 enum VarDctPendingContinuation {
     LocalLf {
         source: Box<VarDctSource>,
-        downstream: VarDctDownstreamCommands,
+        commands: PostLfCommands,
     },
     HfGlobal {
         source: Box<VarDctSource>,
@@ -2732,7 +2778,7 @@ enum VarDctPendingStage {
     LocalLf {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
-        downstream: Option<VarDctDownstreamCommands>,
+        commands: Option<PostLfCommands>,
     },
     HfGlobal {
         completion: Arc<MapCompletion>,
@@ -2833,11 +2879,11 @@ impl VarDctPendingFrame {
         match stage {
             VarDctPendingStage::LocalLf {
                 source,
-                mut downstream,
+                mut commands,
                 ..
-            } => downstream
+            } => commands
                 .take()
-                .map(|downstream| VarDctPendingContinuation::LocalLf { source, downstream }),
+                .map(|commands| VarDctPendingContinuation::LocalLf { source, commands }),
             VarDctPendingStage::HfGlobal {
                 source,
                 mut commands,
@@ -2854,8 +2900,8 @@ impl VarDctPendingFrame {
 
     fn advance_staged_packet(&mut self, mapping: Result<(), String>) -> DecodeResult<bool> {
         match self.take_staged_packet() {
-            Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
-                self.submit_hf_stage(mapping, source, downstream)?;
+            Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
+                self.submit_hf_stage(mapping, source, commands)?;
                 Ok(true)
             }
             Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
@@ -2904,7 +2950,7 @@ impl VarDctPendingFrame {
         &mut self,
         mapping: Result<(), String>,
         source: Box<VarDctSource>,
-        downstream: VarDctDownstreamCommands,
+        post_lf: PostLfCommands,
     ) -> DecodeResult<()> {
         mapping.map_err(DecodeError::backend)?;
         let lifetime = self
@@ -3053,6 +3099,14 @@ impl VarDctPendingFrame {
             })
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
 
+        let deferred_hf_global = matches!(&post_lf, PostLfCommands::DeferredHfGlobal(_));
+        if deferred_hf_global && hf_packet_windows.is_some() {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "deferred fused HF metadata does not yet support bounded stream windows",
+            }
+            .into());
+        }
+
         let windowed_batches = if let Some(plan) = &hf_packet_windows {
             let stream = lifetime._packet_stream_window.as_ref().ok_or(
                 VarDctDecodeError::EntropyWindowContract {
@@ -3146,7 +3200,7 @@ impl VarDctPendingFrame {
             None
         };
         let completion = Arc::new(MapCompletion::default());
-        let submission = if let Some(batches) = windowed_batches {
+        let (submission, deferred_commands) = if let Some(batches) = windowed_batches {
             let batch_count = batches.len();
             let additional_submissions =
                 batch_count
@@ -3169,7 +3223,13 @@ impl VarDctPendingFrame {
             self.runtime_stats
                 .submissions_per_frame
                 .store(total_submissions, Ordering::Release);
-            submit_hf_packet_commands(self.backend.queue(), batches, downstream, lifetime)?
+            let PostLfCommands::Direct(downstream) = post_lf else {
+                unreachable!("deferred HF-global windows were rejected above")
+            };
+            (
+                submit_hf_packet_commands(self.backend.queue(), batches, downstream, lifetime)?,
+                None,
+            )
         } else {
             let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu bounded VarDCT HF-local stage"),
@@ -3194,36 +3254,81 @@ impl VarDctPendingFrame {
                     0,
                     bytemuck::bytes_of(&params),
                 );
-                self.pipelines.packet.encode_hf(
-                    device,
-                    &mut commands,
-                    VarDctPacketBuffers {
-                        codestream: &lifetime._codestream,
-                        modular_metadata: metadata,
-                        reconstructed_lf: &buffers.reconstructed,
-                        raw_hf_metadata: &buffers.raw_metadata,
-                        coefficients: &buffers.coefficients,
-                        status: &buffers.packet_status,
-                        control: &buffers.packet_control,
-                        modular_params: &buffers.modular_params,
-                    },
-                );
+                let packet_buffers = VarDctPacketBuffers {
+                    codestream: &lifetime._codestream,
+                    modular_metadata: metadata,
+                    reconstructed_lf: &buffers.reconstructed,
+                    raw_hf_metadata: &buffers.raw_metadata,
+                    coefficients: &buffers.coefficients,
+                    status: &buffers.packet_status,
+                    control: &buffers.packet_control,
+                    modular_params: &buffers.modular_params,
+                };
+                if deferred_hf_global {
+                    self.pipelines
+                        .packet
+                        .encode_hf_metadata(device, &mut commands, packet_buffers);
+                } else {
+                    self.pipelines
+                        .packet
+                        .encode_hf(device, &mut commands, packet_buffers);
+                }
             }
-            submit_vardct_downstream(
-                self.backend.queue(),
-                vec![commands.finish()],
-                downstream,
-                lifetime,
-            )?
+            if deferred_hf_global {
+                for (index, buffers) in lifetime._groups.iter().enumerate() {
+                    commands.copy_buffer_to_buffer(
+                        &buffers.packet_status,
+                        0,
+                        &lifetime.status_staging,
+                        u64::try_from(index).map_err(|_| {
+                            VarDctDecodeError::ArithmeticOverflow {
+                                field: "deferred HF metadata status index",
+                            }
+                        })? * PACKET_STATUS_BYTES,
+                        PACKET_STATUS_BYTES,
+                    );
+                }
+            }
+            match post_lf {
+                PostLfCommands::Direct(downstream) => (
+                    submit_vardct_downstream(
+                        self.backend.queue(),
+                        vec![commands.finish()],
+                        downstream,
+                        lifetime,
+                    )?,
+                    None,
+                ),
+                PostLfCommands::DeferredHfGlobal(deferred) => (
+                    self.backend.queue().submit([commands.finish()]),
+                    Some(deferred),
+                ),
+            }
         };
-        arm_status_map(lifetime, &completion, "VarDCT final validation mapping");
+        arm_status_map(
+            lifetime,
+            &completion,
+            if deferred_commands.is_some() {
+                "VarDCT HF-global cursor mapping"
+            } else {
+                "VarDCT final validation mapping"
+            },
+        );
         let poll_completion = Arc::clone(&completion);
         if let Err(error) = poll_permit.register(submission, move |error| {
             poll_completion.complete(Err(error));
         }) {
             completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
         }
-        self.stage = VarDctPendingStage::Final { completion };
+        self.stage = if let Some(commands) = deferred_commands {
+            VarDctPendingStage::HfGlobal {
+                completion,
+                source,
+                commands: Some(commands),
+            }
+        } else {
+            VarDctPendingStage::Final { completion }
+        };
         Ok(())
     }
 
@@ -3625,9 +3730,16 @@ impl VarDctPendingFrame {
                         },
                     )?;
                 }
+                let total_submissions = source
+                    .staged_lf_submission_count()
+                    .checked_add(batch_count)
+                    .and_then(|count| count.checked_add(2))
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "deferred HF submission count",
+                    })?;
                 self.runtime_stats
                     .submissions_per_frame
-                    .store(batch_count + 2, Ordering::Release);
+                    .store(total_submissions, Ordering::Release);
                 drop(retained);
                 self.backend
                     .queue()
@@ -3817,8 +3929,8 @@ impl GpuPendingFrame for VarDctPendingFrame {
         loop {
             let mapping = self.stage_completion().wait();
             match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
-                    self.submit_hf_stage(mapping, source, downstream)?;
+                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
+                    self.submit_hf_stage(mapping, source, commands)?;
                 }
                 Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
                     self.submit_hf_global_stage(mapping, source, commands)?;
@@ -3840,8 +3952,8 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 return Poll::Pending;
             };
             match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
-                    if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
+                    if let Err(error) = self.submit_hf_stage(mapping, source, commands) {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -3872,8 +3984,8 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 return Poll::Pending;
             };
             match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, downstream }) => {
-                    if let Err(error) = self.submit_hf_stage(mapping, source, downstream) {
+                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
+                    if let Err(error) = self.submit_hf_stage(mapping, source, commands) {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -3996,8 +4108,8 @@ fn submit_vardct(
         source.memory.codestream_bytes,
     )?;
     let staged_local_trees = source.packet.requires_local_tree_staging();
-    let staged_hf_global = source.packet.requires_hf_global_staging();
-    debug_assert!(!(staged_local_trees && staged_hf_global));
+    let staged_hf_global =
+        source.packet.requires_hf_global_staging() && source.combined_packet_windows.is_none();
     let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame;
     let modular_metadata = if group_specific_metadata {
         source
@@ -4532,7 +4644,7 @@ fn submit_vardct(
                         .packet
                         .encode_hf(device, &mut packet_commands, buffers);
                 }
-            } else if staged_local_trees {
+            } else if staged_local_trees || staged_hf_global {
                 pipelines
                     .packet
                     .encode_lf(device, &mut packet_commands, buffers);
@@ -5054,14 +5166,29 @@ fn submit_vardct(
         _output_scratch: output_scratch,
     });
     let completion = Arc::new(MapCompletion::default());
-    let (submission, local_downstream, deferred_commands) =
+    let (submission, local_commands, deferred_commands) =
         if let Some(packet_stage_commands) = packet_stage_commands {
             let submission =
                 submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
             if staged_hf_global {
-                (submission, None, deferred_commands)
+                if source.packet.profile.uses_lf_frame {
+                    (submission, None, deferred_commands)
+                } else {
+                    let deferred = deferred_commands.ok_or(VarDctDecodeError::EngineContract {
+                        detail: "regular fused packet has no deferred HF-global commands",
+                    })?;
+                    (
+                        submission,
+                        Some(PostLfCommands::DeferredHfGlobal(deferred)),
+                        None,
+                    )
+                }
             } else {
-                (submission, downstream_commands, None)
+                (
+                    submission,
+                    downstream_commands.map(PostLfCommands::Direct),
+                    None,
+                )
             }
         } else if let Some(batches) = combined_packet_batches {
             let downstream = downstream_commands.ok_or(VarDctDecodeError::EngineContract {
@@ -5147,11 +5274,11 @@ fn submit_vardct(
         width: source.packet.profile.width,
         height: source.packet.profile.height,
     };
-    let stage = if let Some(downstream) = local_downstream {
+    let stage = if let Some(commands) = local_commands {
         VarDctPendingStage::LocalLf {
             completion,
             source: Box::new(source),
-            downstream: Some(downstream),
+            commands: Some(commands),
         }
     } else if let Some(commands) = deferred_commands {
         VarDctPendingStage::HfGlobal {

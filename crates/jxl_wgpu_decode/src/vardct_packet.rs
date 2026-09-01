@@ -745,10 +745,14 @@ impl BoundedVarDctPacketPlan {
     }
 
     /// Whether HF metadata must stop at a GPU-discovered HF-global boundary in a single packet.
+    ///
+    /// A fused TOC entry does not expose the end of LF or HF-metadata entropy to the host.  The
+    /// decoder therefore stages every single-entry packet instead of assuming the historical
+    /// zero-AC HF-global bit pattern. This also covers ordinary frames without a progressive-DC
+    /// dependency and allows the same continuation parser to accept general coefficient entropy.
     #[must_use]
     pub const fn requires_hf_global_staging(&self) -> bool {
-        self.profile.uses_lf_frame
-            && matches!(&self.profile.sections, VarDctSectionLayout::Single { .. })
+        matches!(&self.profile.sections, VarDctSectionLayout::Single { .. })
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
@@ -848,13 +852,13 @@ impl BoundedVarDctPacketPlan {
     }
 
     /// Parses the general HF-global descriptor and the sole pass-group tail of a single-entry
-    /// progressive-DC packet after the GPU reports the HF-metadata entropy cursor.
+    /// packet after the GPU reports the HF-metadata entropy cursor.
     pub(crate) fn parse_single_hf_global_continuation_source(
         &self,
         source: &GpuCodestream,
         hf_metadata_end: u32,
     ) -> Result<HfCoefficientEntropyPlan, BoundedVarDctPacketError> {
-        if !self.profile.uses_lf_frame || self.groups.len() != 1 {
+        if self.groups.len() != 1 {
             return Err(BoundedVarDctPacketError::PackedMetadata);
         }
         let VarDctSectionLayout::Single { packet } = &self.profile.sections else {
@@ -863,7 +867,7 @@ impl BoundedVarDctPacketPlan {
         let packet_end = packet
             .end()
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "single-entry progressive-DC packet end",
+                field: "single-entry packet end",
             })?;
         if u64::from(hf_metadata_end) > packet_end {
             return Err(VarDctPacketError::PacketBoundary {
@@ -2188,7 +2192,7 @@ impl GpuVarDctPacketStatus {
         }
     }
 
-    /// Validates a progressive-DC HF-metadata stage and returns its following HF-global cursor.
+    /// Validates an HF-metadata stage and returns its following HF-global cursor.
     pub fn validate_hf_metadata_stage(
         self,
         expected: VarDctPacketValidation,
@@ -2209,7 +2213,7 @@ impl GpuVarDctPacketStatus {
             .unwrap_or(true);
         match self.code {
             31 if self.cursor < self.expected_end
-                && self.lf_decoded == 0
+                && self.lf_decoded == expected.expected_lf_samples
                 && Some(self.hf_decoded) == expected_hf_samples
                 && self.first_blocks != 0
                 && self.first_blocks <= expected.task_capacity

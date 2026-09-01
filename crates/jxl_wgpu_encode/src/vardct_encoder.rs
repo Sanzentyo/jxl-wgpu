@@ -36,6 +36,15 @@ const MAX_BLOCKS: usize = 16;
 const MAX_COEFFICIENTS: usize = 32 * 32;
 const MAX_DC_SAMPLES: usize = 3 * MAX_BLOCKS;
 const MAX_DC_FRAGMENT_WORDS: usize = 64;
+const MAX_AC_FRAGMENT_WORDS: usize = 256;
+const DCT8_COEFFICIENTS: usize = 8 * 8;
+const MAX_HF_QUANTIZED_MAGNITUDE: i32 = 131_071;
+const HF_QUANTIZATION: [f32; 3] = [1.25, 1.0, 1.0];
+const DCT8_NATURAL_ORDER: [usize; DCT8_COEFFICIENTS] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
 const SHADER: &str = include_str!("vardct_encoder.wgsl");
 const LARGE_SHADER: &str = include_str!("vardct_large_encoder.wgsl");
 const PROFILE_DISTANCE: f32 = 25.0;
@@ -155,6 +164,10 @@ impl VarDctLfMetadata {
             base[1] + f32::from(self.lf_factors[1]) * inverse_colour_factor,
         ];
         (inverse_dequantization, correlation)
+    }
+
+    fn hf_correlation(self) -> [f32; 2] {
+        self.base_correlation.map(FiniteF16::to_f32)
     }
 }
 
@@ -429,7 +442,7 @@ impl VarDctStrategy {
 /// GPU artifact implementation selected for a VarDCT memory plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarDctKernelLayout {
-    /// Fixed 25 KiB diagnostic artifact used through 32x32.
+    /// Fixed 26.25 KiB coefficient and entropy artifact used through 32x32.
     Bounded,
     /// Runtime-sized artifact and 8x8-block reduction used above 32x32.
     Scalable,
@@ -502,10 +515,13 @@ struct VarDctKernelParams {
     strategy: u32,
     global_scale: u32,
     quant_lf: u32,
-    raw_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    dc_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
+    hf_prefix: [GpuPrefixEntry; RAW_SYMBOLS],
     lf_quantization: [f32; 3],
     lf_correlation: [f32; 2],
-    padding: [u32; 12],
+    hf_correlation: [f32; 2],
+    hf_quantization: [f32; 3],
+    padding: [u32; 33],
 }
 
 #[repr(C)]
@@ -528,7 +544,12 @@ struct VarDctKernelArtifact {
     block_count: u32,
     strategy: u32,
     raw_histogram: [u32; RAW_SYMBOLS],
-    padding: [u32; 9],
+    dc_padding: [u32; 9],
+    ac_fragment_words: [u32; MAX_AC_FRAGMENT_WORDS],
+    ac_fragment_bit_len: u32,
+    ac_token_count: u32,
+    ac_histogram: [u32; RAW_SYMBOLS],
+    ac_padding: [u32; 43],
     forward_xyb_bits: [u32; 3 * MAX_COEFFICIENTS],
     quantized_xyb: [i32; 3 * MAX_COEFFICIENTS],
 }
@@ -606,9 +627,9 @@ struct ScalableDcFragmentDescriptor {
 const _: () = {
     assert!(std::mem::size_of::<GpuPrefixEntry>() == 8);
     assert!(std::mem::align_of::<GpuPrefixEntry>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelParams>() == 256);
+    assert!(std::mem::size_of::<VarDctKernelParams>() == 512);
     assert!(std::mem::align_of::<VarDctKernelParams>() == 4);
-    assert!(std::mem::size_of::<VarDctKernelArtifact>() == 25_600);
+    assert!(std::mem::size_of::<VarDctKernelArtifact>() == 26_880);
     assert!(std::mem::align_of::<VarDctKernelArtifact>() == 4);
     assert!(std::mem::size_of::<ScalableVarDctKernelParams>() == 256);
     assert!(std::mem::align_of::<ScalableVarDctKernelParams>() == 4);
@@ -620,6 +641,80 @@ const _: () = {
 
 fn fixed_prefix_code() -> Result<PrefixCode, EncodeError> {
     PrefixCode::from_aggregated_counts(&[0; RAW_SYMBOLS], &[0; LZ77_SYMBOLS], RAW_SYMBOLS - 1, true)
+}
+
+/// Entropy policy shared by HF-global metadata and the GPU pass-group serializer.
+///
+/// Stage 1 deliberately maps every legal coefficient context to one prefix distribution. The
+/// plan boundary is permanent: adaptive context clustering and ANS can add plan variants without
+/// changing the GPU fragment contract or moving coefficient scans to the host.
+#[derive(Clone, Debug)]
+struct HfEntropyPlan {
+    code: PrefixCode,
+}
+
+impl HfEntropyPlan {
+    fn single_cluster_prefix() -> Result<Self, EncodeError> {
+        Ok(Self {
+            code: PrefixCode::from_raw_counts(&[1; RAW_SYMBOLS])?,
+        })
+    }
+
+    fn gpu_entries(&self) -> [GpuPrefixEntry; RAW_SYMBOLS] {
+        prefix_entries(&self.code)
+    }
+
+    fn write_block_context(
+        &self,
+        output: &mut BitWriter,
+        coefficient_payload: bool,
+    ) -> Result<(), EncodeError> {
+        if !coefficient_payload {
+            output.write_bits(1, 1)?; // standard 15-cluster shortcut used by zero-HF streams
+            return Ok(());
+        }
+
+        output.write_bits(0, 1)?; // explicit HF block-context model
+        output.write_bits(0, 4)?; // no X LF thresholds
+        output.write_bits(0, 4)?; // no Y LF thresholds
+        output.write_bits(0, 4)?; // no B LF thresholds
+        output.write_bits(0, 4)?; // no HF quant-field thresholds
+        output.write_bits(1, 1)?; // simple context clustering
+        output.write_bits(0, 2)?; // zero-bit cluster IDs: all 39 block contexts map to cluster 0
+        Ok(())
+    }
+
+    fn write_global(
+        &self,
+        output: &mut BitWriter,
+        ac_groups: u32,
+        coefficient_payload: bool,
+    ) -> Result<(), EncodeError> {
+        if !coefficient_payload {
+            // Default matrices, natural order, and the historical single-symbol-zero decoder.
+            // Prefix single-symbol distributions consume no pass-group payload bits.
+            output.write_bits(1, 1)?;
+            let histogram_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
+            output.write_bits(0, histogram_bits)?;
+            output.write_bits(0x124a, 17)?;
+            return Ok(());
+        }
+
+        output.write_bits(1, 1)?; // all default dequantization matrices
+        let preset_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
+        output.write_bits(0, preset_bits)?; // one HF preset
+        output.write_bits(2, 2)?; // used_orders = 0: natural coefficient order
+
+        output.write_bits(0, 1)?; // LZ77 disabled
+        output.write_bits(1, 1)?; // simple distribution clustering
+        output.write_bits(0, 2)?; // all 495 coefficient contexts map to cluster 0
+        output.write_bits(1, 1)?; // prefix code
+        output.write_bits(0, 4)?; // hybrid integer split exponent zero
+        output.write_bits(1, 1)?; // explicit alphabet size
+        output.write_bits(4, 4)?;
+        output.write_bits(2, 4)?; // 1 + 2^4 + 2 = 19 symbols
+        self.code.write_raw_tree(output)
+    }
 }
 
 fn prefix_entries(code: &PrefixCode) -> [GpuPrefixEntry; RAW_SYMBOLS] {
@@ -1054,6 +1149,8 @@ fn write_global_ma_config(
 fn write_lf_global(
     output: &mut BitWriter,
     code: &PrefixCode,
+    hf_entropy: &HfEntropyPlan,
+    coefficient_payload: bool,
     lf_metadata: VarDctLfMetadata,
 ) -> Result<(), EncodeError> {
     output.write_bits(u64::from(lf_metadata.has_default_dequantization()), 1)?;
@@ -1068,7 +1165,7 @@ fn write_lf_global(
         [(1, 11), (2_049, 11), (4_097, 12), (8_193, 16)],
     )?;
     write_u32(output, QUANT_LF, [(16, 0), (1, 5), (1, 8), (1, 16)])?;
-    output.write_bits(1, 1)?; // default HF block contexts
+    hf_entropy.write_block_context(output, coefficient_payload)?;
     output.write_bits(u64::from(lf_metadata.has_default_correlation()), 1)?;
     if !lf_metadata.has_default_correlation() {
         write_u32(
@@ -1123,9 +1220,15 @@ struct VarDctArtifactData<'a> {
     dc_fragment_words: &'a [u32],
     dc_fragment_bit_len: u32,
     dc_fragment_descriptors: &'a [ScalableDcFragmentDescriptor],
+    ac_fragment_words: &'a [u32],
+    ac_fragment_bit_len: u32,
 }
 
 impl VarDctArtifactData<'_> {
+    const fn has_ac_payload(self) -> bool {
+        self.ac_fragment_bit_len != 0
+    }
+
     fn dc_fragment_descriptor(
         self,
         group: u32,
@@ -1163,6 +1266,46 @@ fn append_gpu_dc_fragment(
         return Err(EncodeError::Backend(
             "GPU DC fragment exceeds its artifact allocation".into(),
         ));
+    }
+    for source_bit in bit_offset..bit_end {
+        let word = fragment_words[source_bit / 32];
+        output.write_bits(u64::from((word >> (source_bit % 32)) & 1), 1)?;
+    }
+    Ok(())
+}
+
+fn append_gpu_ac_fragment(
+    output: &mut BitWriter,
+    artifact: VarDctArtifactData<'_>,
+) -> Result<(), EncodeError> {
+    append_gpu_fragment(
+        output,
+        artifact.ac_fragment_words,
+        0,
+        artifact.ac_fragment_bit_len,
+    )
+}
+
+fn append_gpu_fragment(
+    output: &mut BitWriter,
+    fragment_words: &[u32],
+    bit_offset: u32,
+    bit_len: u32,
+) -> Result<(), EncodeError> {
+    let bit_offset = usize::try_from(bit_offset)
+        .map_err(|_| BackendError::Invariant("GPU entropy fragment offset overflow"))?;
+    let bit_len = usize::try_from(bit_len)
+        .map_err(|_| BackendError::Invariant("GPU entropy fragment length overflow"))?;
+    let bit_end = bit_offset
+        .checked_add(bit_len)
+        .ok_or(BackendError::Invariant(
+            "GPU entropy fragment range overflow",
+        ))?;
+    if bit_end > fragment_words.len() * 32 {
+        return Err(BackendError::Invariant(
+            "GPU entropy fragment exceeds its artifact allocation",
+        )
+        .into());
     }
     for source_bit in bit_offset..bit_end {
         let word = fragment_words[source_bit / 32];
@@ -1220,33 +1363,28 @@ fn write_lf_group(
     Ok(())
 }
 
-fn write_hf_global(output: &mut BitWriter, ac_groups: u32) -> Result<(), EncodeError> {
-    // Default dequant matrices, natural coefficient order, and a single-token
-    // HF decoder whose only symbol is zero. All AC coefficients are zero in
-    // this LF-first strategy profile, so the pass group has no
-    // payload bits. The historical one-group bundle is 0x2495/18 bits. Its
-    // first bit precedes a ceil(log2(ac_groups))-wide histogram selector, so
-    // split it explicitly when a frame has multiple pass groups.
-    output.write_bits(1, 1)?;
-    let histogram_bits = ac_groups.next_power_of_two().trailing_zeros() as u8;
-    output.write_bits(0, histogram_bits)?;
-    output.write_bits(0x124a, 17)?;
-    Ok(())
-}
-
 fn build_frame_packet(
     artifact: VarDctArtifactData<'_>,
     code: &PrefixCode,
+    hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
     lf_metadata: VarDctLfMetadata,
 ) -> Result<FramePacketSet, EncodeError> {
     let ac_groups = frame.ac_group_count()?;
     let lf_groups = frame.lf_group_count()?;
+    let coefficient_payload = artifact.has_ac_payload();
     if ac_groups == 1 && lf_groups == 1 {
         let mut group = BitWriter::new();
-        write_lf_global(&mut group, code, lf_metadata)?;
+        write_lf_global(
+            &mut group,
+            code,
+            hf_entropy,
+            coefficient_payload,
+            lf_metadata,
+        )?;
         write_lf_group(&mut group, code, artifact, frame, 0)?;
-        write_hf_global(&mut group, ac_groups)?;
+        hf_entropy.write_global(&mut group, ac_groups, coefficient_payload)?;
+        append_gpu_ac_fragment(&mut group, artifact)?;
         group.align_to_byte()?;
         return Ok(FramePacketSet::new(
             frame_header()?,
@@ -1259,10 +1397,16 @@ fn build_frame_packet(
     }
 
     let mut dc_global = BitWriter::new();
-    write_lf_global(&mut dc_global, code, lf_metadata)?;
+    write_lf_global(
+        &mut dc_global,
+        code,
+        hf_entropy,
+        coefficient_payload,
+        lf_metadata,
+    )?;
     dc_global.align_to_byte()?;
     let mut ac_global = BitWriter::new();
-    write_hf_global(&mut ac_global, ac_groups)?;
+    hf_entropy.write_global(&mut ac_global, ac_groups, coefficient_payload)?;
     ac_global.align_to_byte()?;
 
     let mut packets = Vec::with_capacity(
@@ -1335,6 +1479,7 @@ pub struct VarDctBackend {
     pipelines: VarDctPipelines,
     workgroup_variant: KernelVariant,
     code: PrefixCode,
+    hf_entropy: HfEntropyPlan,
     topology: VarDctTopology,
     lf_metadata: VarDctLfMetadata,
     capabilities: EncoderCapabilities,
@@ -1390,6 +1535,7 @@ impl VarDctBackend {
         lf_metadata: VarDctLfMetadata,
     ) -> Result<Self, EncodeError> {
         let code = fixed_prefix_code()?;
+        let hf_entropy = HfEntropyPlan::single_cluster_prefix()?;
         let limits = context.device().limits();
         let (kernel_key, default_variant, workgroup_storage_bytes) =
             if topology.uses_scalable_kernel() {
@@ -1470,6 +1616,7 @@ impl VarDctBackend {
             pipelines,
             workgroup_variant,
             code,
+            hf_entropy,
             topology,
             lf_metadata,
             capabilities: EncoderCapabilities {
@@ -1607,6 +1754,7 @@ impl VarDctBackend {
         let blocks_x = frame.blocks_x;
         let blocks_y = frame.blocks_y;
         let (lf_quantization, lf_correlation) = self.lf_metadata.forward_quantization();
+        let hf_correlation = self.lf_metadata.hf_correlation();
         let common_strategy = u32::from(frame.topology.strategy().codestream_id());
         let (kernel, memory) = if frame.topology.uses_scalable_kernel() {
             let layout = match frame.topology {
@@ -1694,10 +1842,13 @@ impl VarDctBackend {
                     strategy: common_strategy,
                     global_scale: GLOBAL_SCALE,
                     quant_lf: QUANT_LF,
-                    raw_prefix: prefix_entries(&self.code),
+                    dc_prefix: prefix_entries(&self.code),
+                    hf_prefix: self.hf_entropy.gpu_entries(),
                     lf_quantization,
                     lf_correlation,
-                    padding: [0; 12],
+                    hf_correlation,
+                    hf_quantization: HF_QUANTIZATION,
+                    padding: [0; 33],
                 }),
                 VarDctMemoryPlan::fixed(source_binding_bytes),
             )
@@ -2000,6 +2151,7 @@ impl GpuEncodeBackend for VarDctBackend {
             lifetime: Some(lifetime),
             completion,
             code: self.code.clone(),
+            hf_entropy: self.hf_entropy.clone(),
             lf_metadata: self.lf_metadata,
             frame_layout: plan.frame,
             artifact_layout: job_layout,
@@ -2097,6 +2249,7 @@ pub struct VarDctJob {
     lifetime: Option<Arc<VarDctJobLifetime>>,
     completion: Arc<VarDctMapCompletion>,
     code: PrefixCode,
+    hf_entropy: HfEntropyPlan,
     lf_metadata: VarDctLfMetadata,
     frame_layout: VarDctFrameLayout,
     artifact_layout: VarDctJobLayout,
@@ -2128,7 +2281,7 @@ impl VarDctJob {
                         .map_err(|_| {
                             BackendError::InvalidArtifact("VarDCT ABI size or alignment")
                         })?;
-                    validate_artifact(artifact, &self.code, self.frame_layout)?
+                    validate_artifact(artifact, &self.code, &self.hf_entropy, self.frame_layout)?
                 }
                 VarDctJobLayout::Scalable(layout) => {
                     validate_scalable_artifact(&mapped, layout, &self.code, self.frame_layout)?
@@ -2140,6 +2293,7 @@ impl VarDctJob {
                 packets: build_frame_packet(
                     artifact,
                     &self.code,
+                    &self.hf_entropy,
                     self.frame_layout,
                     self.lf_metadata,
                 )?,
@@ -2185,6 +2339,7 @@ impl GpuEncodeJob for VarDctJob {
 fn validate_artifact<'a>(
     artifact: &'a VarDctKernelArtifact,
     code: &PrefixCode,
+    hf_entropy: &HfEntropyPlan,
     frame: VarDctFrameLayout,
 ) -> Result<VarDctArtifactData<'a>, BackendError> {
     let VarDctTopology::SingleTransform(strategy) = frame.topology else {
@@ -2219,6 +2374,11 @@ fn validate_artifact<'a>(
 
     let coefficient_count =
         usize::from(strategy.block_extent().0) * usize::from(strategy.block_extent().1);
+    let quantized_live_end = if strategy == VarDctStrategy::Dct8 {
+        DCT8_COEFFICIENTS
+    } else {
+        block_count
+    };
     let xyb_channels = [1usize, 0, 2];
     for (dc_channel, &xyb_channel) in xyb_channels.iter().enumerate() {
         let dc_base = dc_channel * MAX_BLOCKS;
@@ -2236,12 +2396,12 @@ fn validate_artifact<'a>(
             .iter()
             .any(|&value| value != 0)
             || artifact.quantized_xyb
-                [coefficient_base + block_count..coefficient_base + MAX_COEFFICIENTS]
+                [coefficient_base + quantized_live_end..coefficient_base + MAX_COEFFICIENTS]
                 .iter()
                 .any(|&value| value != 0)
         {
             return Err(BackendError::InvalidArtifact(
-                "the VarDCT profile produced a nonzero AC or padding token",
+                "the VarDCT profile produced a nonzero coefficient padding token",
             ));
         }
     }
@@ -2329,7 +2489,164 @@ fn validate_artifact<'a>(
             "VarDCT GPU entropy fragment length or histogram mismatch",
         ));
     }
+    validate_fixed_ac_artifact(artifact, &hf_entropy.code, strategy)?;
     Ok(fixed_artifact_data(artifact))
+}
+
+fn validate_fixed_ac_artifact(
+    artifact: &VarDctKernelArtifact,
+    code: &PrefixCode,
+    strategy: VarDctStrategy,
+) -> Result<(), BackendError> {
+    if artifact.dc_padding.iter().any(|&word| word != 0)
+        || artifact.ac_padding.iter().any(|&word| word != 0)
+    {
+        return Err(BackendError::InvalidArtifact(
+            "bounded VarDCT artifact padding is nonzero",
+        ));
+    }
+    if strategy != VarDctStrategy::Dct8 {
+        if artifact.ac_fragment_bit_len != 0
+            || artifact.ac_token_count != 0
+            || artifact.ac_histogram.iter().any(|&count| count != 0)
+            || artifact.ac_fragment_words.iter().any(|&word| word != 0)
+        {
+            return Err(BackendError::InvalidArtifact(
+                "bounded non-DCT8 artifact contains an AC entropy fragment",
+            ));
+        }
+        return Ok(());
+    }
+    let coefficient_nonzero =
+        artifact
+            .quantized_xyb
+            .chunks_exact(MAX_COEFFICIENTS)
+            .any(|channel| {
+                channel[1..DCT8_COEFFICIENTS]
+                    .iter()
+                    .any(|&value| value != 0)
+            });
+    if !coefficient_nonzero {
+        if artifact.ac_fragment_bit_len != 0
+            || artifact.ac_token_count != 0
+            || artifact.ac_histogram.iter().any(|&count| count != 0)
+            || artifact.ac_fragment_words.iter().any(|&word| word != 0)
+        {
+            return Err(BackendError::InvalidArtifact(
+                "zero-HF VarDCT artifact contains an AC entropy fragment",
+            ));
+        }
+        return Ok(());
+    }
+    if artifact.ac_fragment_bit_len == 0
+        || artifact.ac_fragment_bit_len
+            > u32::try_from(MAX_AC_FRAGMENT_WORDS * 32).expect("bounded AC artifact fits u32")
+    {
+        return Err(BackendError::InvalidArtifact(
+            "bounded VarDCT AC fragment length is invalid",
+        ));
+    }
+
+    let entries = code.raw_entries();
+    let mut expected_histogram = [0u32; RAW_SYMBOLS];
+    let mut bit_offset = 0u32;
+    let mut token_count = 0u32;
+    for &xyb_channel in &[1usize, 0, 2] {
+        let coefficient_base = xyb_channel * MAX_COEFFICIENTS;
+        let nonzero_count = DCT8_NATURAL_ORDER[1..]
+            .iter()
+            .filter(|&&offset| artifact.quantized_xyb[coefficient_base + offset] != 0)
+            .count();
+        validate_ac_token(
+            artifact,
+            &entries,
+            &mut expected_histogram,
+            &mut bit_offset,
+            u32::try_from(nonzero_count)
+                .map_err(|_| BackendError::InvalidArtifact("DCT8 nonzero count exceeds u32"))?,
+        )?;
+        token_count += 1;
+        if nonzero_count == 0 {
+            continue;
+        }
+
+        let mut remaining = nonzero_count;
+        for &offset in &DCT8_NATURAL_ORDER[1..] {
+            let coefficient = artifact.quantized_xyb[coefficient_base + offset];
+            if coefficient.unsigned_abs() > MAX_HF_QUANTIZED_MAGNITUDE as u32 {
+                return Err(BackendError::InvalidArtifact(
+                    "DCT8 coefficient exceeds the fixed HF token alphabet",
+                ));
+            }
+            let packed = pack_signed_control(coefficient);
+            validate_ac_token(
+                artifact,
+                &entries,
+                &mut expected_histogram,
+                &mut bit_offset,
+                packed,
+            )?;
+            token_count += 1;
+            if coefficient != 0 {
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    if bit_offset != artifact.ac_fragment_bit_len
+        || token_count != artifact.ac_token_count
+        || expected_histogram != artifact.ac_histogram
+    {
+        return Err(BackendError::InvalidArtifact(
+            "bounded VarDCT AC fragment length, token count, or histogram mismatch",
+        ));
+    }
+    validate_fragment_padding(&artifact.ac_fragment_words, artifact.ac_fragment_bit_len)
+}
+
+fn validate_ac_token(
+    artifact: &VarDctKernelArtifact,
+    entries: &[PrefixCodeEntry; RAW_SYMBOLS],
+    histogram: &mut [u32; RAW_SYMBOLS],
+    bit_offset: &mut u32,
+    value: u32,
+) -> Result<(), BackendError> {
+    let (token, extra_bit_count, extra) = unsigned_token(value)?;
+    let token_index = usize::try_from(token)
+        .map_err(|_| BackendError::InvalidArtifact("VarDCT AC token index does not fit usize"))?;
+    let entry = entries
+        .get(token_index)
+        .ok_or(BackendError::InvalidArtifact(
+            "VarDCT AC token exceeds the fixed entropy alphabet",
+        ))?;
+    if read_fragment_slice(
+        &artifact.ac_fragment_words,
+        artifact.ac_fragment_bit_len,
+        *bit_offset,
+        u32::from(entry.bit_len),
+    )? != u32::from(entry.bits)
+    {
+        return Err(BackendError::InvalidArtifact(
+            "VarDCT AC prefix fragment does not match its token",
+        ));
+    }
+    *bit_offset += u32::from(entry.bit_len);
+    if read_fragment_slice(
+        &artifact.ac_fragment_words,
+        artifact.ac_fragment_bit_len,
+        *bit_offset,
+        extra_bit_count,
+    )? != extra
+    {
+        return Err(BackendError::InvalidArtifact(
+            "VarDCT AC extra-bit fragment does not match its token",
+        ));
+    }
+    *bit_offset += extra_bit_count;
+    histogram[token_index] += 1;
+    Ok(())
 }
 
 fn fixed_artifact_data(artifact: &VarDctKernelArtifact) -> VarDctArtifactData<'_> {
@@ -2338,6 +2655,8 @@ fn fixed_artifact_data(artifact: &VarDctKernelArtifact) -> VarDctArtifactData<'_
         dc_fragment_words: &artifact.dc_fragment_words,
         dc_fragment_bit_len: artifact.dc_fragment_bit_len,
         dc_fragment_descriptors: &[],
+        ac_fragment_words: &artifact.ac_fragment_words,
+        ac_fragment_bit_len: artifact.ac_fragment_bit_len,
     }
 }
 
@@ -2604,6 +2923,8 @@ fn validate_scalable_artifact<'a>(
         dc_fragment_words: fragment_words,
         dc_fragment_bit_len: header.dc_fragment_bit_len,
         dc_fragment_descriptors: fragment_descriptors,
+        ac_fragment_words: &[],
+        ac_fragment_bit_len: 0,
     })
 }
 
@@ -2719,17 +3040,21 @@ fn signed_token(value: i32) -> Result<(u32, u32, u32), BackendError> {
     let packed = u32::try_from(packed).map_err(|_| {
         BackendError::InvalidArtifact("VarDCT signed coefficient exceeds the token alphabet")
     })?;
-    if packed == 0 {
+    unsigned_token(packed)
+}
+
+fn unsigned_token(value: u32) -> Result<(u32, u32, u32), BackendError> {
+    if value == 0 {
         return Ok((0, 0, 0));
     }
-    let extra_bit_count = 31 - packed.leading_zeros();
+    let extra_bit_count = 31 - value.leading_zeros();
     let token = extra_bit_count + 1;
     if token as usize >= RAW_SYMBOLS {
         return Err(BackendError::InvalidArtifact(
-            "VarDCT DC token exceeds the fixed entropy alphabet",
+            "VarDCT token exceeds the fixed entropy alphabet",
         ));
     }
-    Ok((token, extra_bit_count, packed - (1 << extra_bit_count)))
+    Ok((token, extra_bit_count, value - (1 << extra_bit_count)))
 }
 
 fn read_fragment_bits(
@@ -3105,7 +3430,12 @@ fn cpu_test_artifact(q_yxb: [i32; 3], code: &PrefixCode) -> VarDctKernelArtifact
         block_count: 1,
         strategy: 0,
         raw_histogram: histogram,
-        padding: [0; 9],
+        dc_padding: [0; 9],
+        ac_fragment_words: [0; MAX_AC_FRAGMENT_WORDS],
+        ac_fragment_bit_len: 0,
+        ac_token_count: 0,
+        ac_histogram: [0; RAW_SYMBOLS],
+        ac_padding: [0; 43],
         forward_xyb_bits: [0; 3 * MAX_COEFFICIENTS],
         quantized_xyb,
     }
@@ -3369,12 +3699,14 @@ mod tests {
     #[test]
     fn fixed_control_plane_decodes_as_standard_black_vardct() {
         let code = fixed_prefix_code().unwrap();
+        let hf_entropy = HfEntropyPlan::single_cluster_prefix().unwrap();
         assert!(prefix_entries(&code).iter().all(|entry| entry.bit_len > 0));
         let artifact = cpu_test_artifact([0, 0, 0], &code);
         let frame = assemble_frame(
             build_frame_packet(
                 fixed_artifact_data(&artifact),
                 &code,
+                &hf_entropy,
                 VarDctFrameLayout::single(VarDctStrategy::Dct8),
                 VarDctLfMetadata::default(),
             )
@@ -3390,6 +3722,7 @@ mod tests {
     #[test]
     fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
         let code = fixed_prefix_code().unwrap();
+        let hf_entropy = HfEntropyPlan::single_cluster_prefix().unwrap();
         // libjxl's DCT8 oracle quantizes a solid red block close to these
         // Y/X/(B-Y) values with this profile's global DC scale.
         let artifact = cpu_test_artifact([332, 153, -6], &code);
@@ -3397,6 +3730,7 @@ mod tests {
             build_frame_packet(
                 fixed_artifact_data(&artifact),
                 &code,
+                &hf_entropy,
                 VarDctFrameLayout::single(VarDctStrategy::Dct8),
                 VarDctLfMetadata::default(),
             )
@@ -3417,11 +3751,13 @@ mod tests {
     fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
         let metadata = custom_lf_metadata();
         let code = fixed_prefix_code().unwrap();
+        let hf_entropy = HfEntropyPlan::single_cluster_prefix().unwrap();
         let artifact = cpu_test_artifact([332, 153, -6], &code);
         let frame = assemble_frame(
             build_frame_packet(
                 fixed_artifact_data(&artifact),
                 &code,
+                &hf_entropy,
                 VarDctFrameLayout::single(VarDctStrategy::Dct8),
                 metadata,
             )
@@ -3489,8 +3825,8 @@ mod tests {
         assert_pod::<ScalableVarDctKernelParams>();
         assert_pod::<ScalableVarDctArtifactHeader>();
         assert_pod::<ScalableDcFragmentDescriptor>();
-        assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 256);
-        assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 25_600);
+        assert_eq!(std::mem::size_of::<VarDctKernelParams>(), 512);
+        assert_eq!(std::mem::size_of::<VarDctKernelArtifact>(), 26_880);
         assert_eq!(std::mem::align_of::<VarDctKernelArtifact>(), 4);
         assert_eq!(std::mem::size_of::<ScalableVarDctKernelParams>(), 256);
         assert_eq!(std::mem::size_of::<ScalableVarDctArtifactHeader>(), 256);
@@ -3630,10 +3966,10 @@ mod tests {
         let plan = encoder.memory_plan(&source).unwrap();
         assert_eq!(plan.kernel_layout, VarDctKernelLayout::Bounded);
         assert_eq!(plan.source_binding_bytes, 232);
-        assert_eq!(plan.parameter_storage_bytes, 256);
-        assert_eq!(plan.artifact_storage_bytes, 25_600);
-        assert_eq!(plan.readback_bytes, 25_600);
-        assert_eq!(plan.owned_bytes_per_job, 51_456);
+        assert_eq!(plan.parameter_storage_bytes, 512);
+        assert_eq!(plan.artifact_storage_bytes, 26_880);
+        assert_eq!(plan.readback_bytes, 26_880);
+        assert_eq!(plan.owned_bytes_per_job, 54_272);
         assert_eq!(encoder.in_flight_memory_stats().reserved_bytes, 0);
 
         let codestream = encoder.encode(source).unwrap();

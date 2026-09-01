@@ -321,23 +321,27 @@ cargo clippy -p jxl_wgpu_encode --all-targets -- -D warnings
 - **Lossless Modular animation (Slice 6)**: Multi-frame `LosslessModularAnimationSession` supporting
   standard timebases, exact durations and timecodes, signed crop rectangles, all 5 blend modes,
   alpha blending, and 4 reference slots with runtime-neutral in-flight futures.
-- **LF-only VarDCT baseline (Slice 5 partial)**: `VarDctEncoder` executes all 27 standard
-  strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with checked axes
-  through 16K. The GPU executes sRGB linearization, XYB conversion, LF quantization, group-local
-  clamped-gradient DC prediction, prefix/histogram assembly, and per-LF-group bit-range emission in
-  an LF-only fixed distance-25 profile that quantizes AC coefficients to zero. Both frontends can
-  serialize validated exact-binary16 LF dequantization plus LF/HF chroma-correlation metadata; the
-  bounded and scalable kernels use the same bundle for forward LF decorrelation and quantization.
-  The host writes only this bounded control bundle and never receives image pixels or coefficients.
+- **VarDCT baseline plus bounded DCT8 AC (Slice 5 partial)**: `VarDctEncoder` executes all 27
+  standard strategies, and `TiledVarDctEncoder` supports multi-LF/multi-AC-group DCT8 grids with
+  checked axes through 16K. Both frontends serialize validated exact-binary16 LF dequantization plus
+  LF/HF chroma-correlation metadata. The bounded DCT8 kernel additionally performs the forward DCT,
+  default-matrix quantization, natural-order coefficient scan, signed token generation, histogram
+  construction, and AC bit-fragment serialization without exposing pixels or coefficients to the
+  host. Its `HfEntropyPlan` currently selects one prefix cluster for all 495 coefficient contexts,
+  disables LZ77, and emits one pass. That plan is a stable policy boundary rather than a temporary
+  wire format: future adaptive clustering, ANS/LZ, coefficient orders, and pass selection can use
+  different plans while retaining the GPU artifact contract. The scalable/tiled path and non-DCT8
+  strategies still quantize AC to zero.
 
 ### Remaining work
 
 The authoritative encoder items, dependencies, priorities, and acceptance gates are the `MOD-E`,
 `VDCT-E`, `ENT-E`, `ENC`, and encoder-facing `IO` rows in
-[`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). The nearest work remains parallel Modular token
-production, native YUV/NV12-family ingestion, real nonzero VarDCT AC coding, and the rate/quality
-control built on top of it. Batched codec submission and advanced performance instrumentation stay
-separate from format-completeness claims.
+[`FULL_JPEG_XL_ROADMAP.md`](FULL_JPEG_XL_ROADMAP.md). After the structural-refactoring gate, the
+nearest work remains parallel Modular token production, native YUV/NV12-family ingestion, scalable
+and strategy-complete nonzero VarDCT AC coding, and the rate/quality control built on top of it.
+Batched codec submission and advanced performance instrumentation stay separate from
+format-completeness claims.
 
 Until an item is implemented and validated, capability negotiation must reject it. Benchmarks,
 wrappers, and CPU oracles do not expand the advertised production capability.

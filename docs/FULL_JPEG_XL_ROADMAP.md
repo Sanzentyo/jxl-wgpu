@@ -62,7 +62,7 @@ contract. Aspirational performance and unexecuted test cases are never reported 
 | Lossless Modular decode | **Partial** | One final Gray/RGB/RGBA integer still, 1–16 bits, one through three passes, standard YCoCg, Prefix/ANS, LZ77, and bounded MA prediction. Every accepted stock MA profile, including Weighted/SelfCorrecting prediction, can resume within one entropy stream through bounded overlapping GPU uploads. Multi-group DC-global Palette/Squeeze reconstructs nonempty global samples into a frame arena, schedules channels with both shifts at least three through LF groups before the header-assigned nonempty pass streams, and executes one frame-wide inverse/finalizer. |
 | VarDCT decode | **Partial** | A separate authoritative 8-bit XYB engine covers mixed maps containing all 27 regular and special transform strategies, single-pass nonzero AC, all 13 natural/custom coefficient-order families, stream-defined block contexts, non-default LF dequantization and LF/HF chroma correlation, every normative default and parametric custom strategy matrix, all 3-bit X/B scales, scanline or entropy-permuted center-first pass groups, multiple LF groups with shared or per-substream local MA trees, recursive progressive-DC dependencies, resident Gaborish plus one-to-three-iteration EPF, and a checked 2056×256 LF-boundary extent. Raw Modular matrix images remain unsupported. |
 | Lossless Modular encode | **Partial** | Gray/RGB/RGBA integer input, 1–16 bits, 256×256 groups, one pass, fixed Gradient/YCoCg and prefix+RLE/LZ77 profile; standard animation is implemented. |
-| VarDCT encode | **Partial** | All 27 strategy identifiers execute in fixed-transform form. The fixed distance-25 LF-only profile serializes validated default or explicit LF dequantization and LF/HF chroma-correlation metadata; tiled DCT8 emits multiple LF/AC groups, resets prediction per LF group, and accepts checked axes through 16K. Every AC coefficient is still quantized to zero and image-wide mixed strategy selection is absent. |
+| VarDCT encode | **Partial** | All 27 strategy identifiers execute in fixed-transform form. The fixed distance-25 bounded DCT8 path performs the forward transform, default-matrix quantization, natural-order tokenization, and nonzero AC bit-fragment emission on the GPU. Its current HF entropy policy maps all 495 coefficient contexts to one prefix cluster with LZ77 disabled. Tiled/scalable DCT8 and non-DCT8 strategies remain LF-only; image-wide mixed strategy selection and rate control are absent. |
 | Restoration/render graph | **Partial** | Reusable upsampling, Gaborish, EPF, blend, color, and display kernels exist in `jxl_wgpu`; the bounded stock VarDCT decoder constructs one full-image sigma plane and routes Gaborish plus signaled EPF0/EPF1/EPF2 across LF-group boundaries through one resident ping-pong scratch set in the same submission. Upsampling, composition, and the rest of the legal graph remain disconnected. |
 | Output formats | **Partial** | Native integer Gray/RGB/RGBA and 30 portable VPI pitch-linear outputs exist for the lossless Gray8 conversion path; VarDCT currently returns packed RGB8 only. |
 | Async/concurrency/memory | **Partial** | Native blocking and runtime-neutral futures, browser compilation, one shared byte budget, leased output lifetime, true aggregate readback, bounded pools, and deterministic budget-adaptive Modular/VarDCT entropy windows exist; codec submission is not yet coalesced across images. |
@@ -158,7 +158,7 @@ passes, preview integration, and broader recursive corruption coverage.
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `VDCT-E01` | P0 | **Partial** | All 27 fixed-transform identifiers and the arbitrary-extent tiled DCT8 subset execute. The serializer and both GPU LF-quantization kernels accept validated exact-binary16 LF dequantization and LF/HF chroma-correlation metadata in default or explicit form. Tiled DCT8 emits every 2048-pixel LF group and 256-pixel AC group, resets GPU Gradient prediction at LF boundaries, records checked per-group bit ranges, and uses a 2-D block dispatch. Actual-GPU 2056×256 and 256×2056 outputs decode with Rust `jxl`, `djxl`, and the stock GPU decoder/readback within one code; exact-black 16384×1 and 1×16384 exercise eight LF groups and 64 AC groups. Completion still requires mixed strategy maps over arbitrary images, non-DCT8 edge transforms, and forward/inverse scalar oracles for every strategy in that image-wide path. | `VDCT-D04` |
-| `VDCT-E02` | P0 | **Missing** | Quantize and serialize real nonzero AC coefficients with correct orders, contexts, signs, histograms, and pass groups. Generated streams must decode with libjxl across all strategies and group boundaries. | `ENT-E01`, `VDCT-E01`, `VDCT-D03` |
+| `VDCT-E02` | P0 | **Partial** | The bounded DCT8 kernel quantizes real nonzero AC coefficients against the normative default matrix, emits natural-order signed tokens and a validated GPU-owned prefix fragment, and uses one legal cluster for all 495 coefficient contexts with LZ77 disabled. Rust `jxl`, installed `djxl`, and the stock GPU decoder validate the generated stream. Completion requires scalable/multi-group nonzero AC, every strategy/order, adaptive clustering or ANS/LZ policy, multiple passes, and group-boundary coverage. | `ENT-E01`, `VDCT-E01`, `VDCT-D03` |
 | `VDCT-E03` | P1 | **Missing** | Implement adaptive quant fields, distance/quality control, DC/LF/AC quant selection, quant bias, chroma-from-luma search, and a bounded rate-control loop. Report size and quality distributions, not only one fixture. | `VDCT-E02`, `QA-05` |
 | `VDCT-E04` | P1 | **Missing** | Select strategy maps and coefficient orders by content and effort, including all special transforms. Decisions must be deterministic when requested and must improve a declared objective over DCT8-only. | `VDCT-E02`, `VDCT-D02` |
 | `VDCT-E05` | P1 | **Missing** | Encode spectral, quantized, and DC progressive modes plus center-first/saliency group ordering. Every partial stream must remain decodable at its declared progression point. | `VDCT-E02`, `VDCT-D06` |
@@ -254,19 +254,36 @@ stage. Performance work continues only where it does not freeze an incomplete pa
 9. **Close conformance and performance gates**: `QA-01..06`, `PERF-01..04` across native and
    browser adapters.
 
+### Structural refactoring gate
+
+After the first bounded DCT8 nonzero-AC milestone, feature additions pause until the five largest
+implementation units are split by responsibility. The layout uses Rust 2018+ `name.rs` plus
+`name/` submodules and never introduces `mod.rs`. Internal visibility is minimized; preserving an
+awkward public boundary is not a goal, so workspace call sites are migrated when a clearer API
+requires a breaking change. Each split must independently pass formatting, warning-free
+`cargo clippy --all-targets`, and the complete test suite before the next feature slice.
+
+- `lossless_modular.rs`: types, grid, memory, dispatch, streaming, serializer, tests.
+- `vardct_engine.rs`: types, pipeline, window planning, source, restoration, execution, tests.
+- `wgpu_engine.rs`: types, pipeline, session, lifetime, execution, tests.
+- `vardct_encoder.rs`: types, entropy, bitstream, dispatch, tests.
+- `scheduler.rs`: validation, pipeline, color/filter/blend/I/O nodes, tests.
+
 The coding-mode selector, shared typed entropy-stream ABI, bounded Modular/VarDCT-AC/staged-LF/HF
 stream resume, nonzero-AC mixed/multi-group decode,
 local per-substream MA-tree frame execution, non-default LF dequantization/correlation, bounded
 resident Gaborish/EPF restoration chain, logical/physical TOC-order normalization, and the
-multi-LF-group tiled-DCT8 LF-only encoder are implemented. Incremental transport, bounded
+multi-LF-group tiled-DCT8 LF-only encoder are implemented. The separate bounded DCT8 path now emits
+real GPU-generated AC coefficients using its deliberately simple one-cluster prefix policy.
+Incremental transport, bounded
 image/frame/TOC inventory, public event-fed decode, shared-span metadata/upload paths, and
 source-lifetime admission now connect through the same engine boundary without whole-input
 assembly. Recursive progressive-DC HF-global/AC resume and parametric custom matrices now use that
 engine boundary. The immediate P0 gap remains the common frontend and entropy work in `FRONT-01`
 and `ENT-D01/02`: lower the remaining side-image and frame consumers into one bounded
-backend-neutral execution graph. In
-parallel, `VDCT-E02` must emit real
-nonzero AC coefficients and the remaining `VDCT-E01` work must select mixed image-wide strategies;
+backend-neutral execution graph. In parallel, the remaining `VDCT-E02` work must extend nonzero AC
+to scalable groups, strategies, orders, and entropy policies, while `VDCT-E01` must select mixed
+image-wide strategies;
 broader render-graph composition remains required beside those format-completeness gates.
 
 ## Claims explicitly prohibited before their gates pass
@@ -275,8 +292,9 @@ broader render-graph composition remains required beside those format-completene
   quant fields, mixed strategies, and passes remain missing.
 - Executing all MA predictors and resident transforms is not full Modular support while transformed
   multi-group, Global/LF/HF, lossy/XYB, and progressive streams remain missing.
-- Emitting one standards-compatible fixed Gradient or zero-AC stream is not a production-complete
-  encoder; normative output ability and quality/rate-control search are separate gates.
+- Emitting one standards-compatible fixed Gradient stream or one single-cluster DCT8 AC stream is
+  not a production-complete encoder; broad normative output ability and quality/rate-control search
+  are separate gates.
 - Parsing `jxlc`/`jxlp` is not complete container support without metadata, `brob`, `jxli`, streaming,
   unknown-box policy, and JPEG reconstruction.
 - Having blend kernels and animation metadata types is not decoder animation support without GPU

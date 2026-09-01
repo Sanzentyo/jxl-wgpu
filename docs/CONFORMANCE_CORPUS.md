@@ -199,6 +199,13 @@ validated fragment descriptor per group and resets the clamped-Gradient predicto
 Rust `jxl` and installed `djxl` must decode each emitted codestream, while the stock GPU decoder plus
 explicit readback must differ from Rust `jxl` by at most one RGB8 code.
 
+The bounded 8x8 patterned DCT8 case is also a nonzero-AC gate. The actual GPU performs the forward
+transform and default-matrix quantization, emits natural-order signed tokens through one prefix
+cluster shared by all 495 coefficient contexts, and supplies the AC fragment consumed by the host
+packet assembler. The test requires a nonempty validated fragment and agreement among Rust `jxl`,
+installed `djxl`, and the stock GPU decoder. This is evidence for the bounded one-pass DCT8 policy;
+it does not cover the still-zero-AC scalable path, other strategies, adaptive clustering, or LZ77.
+
 An additional generated 8x8 patterned case serializes non-default exact-binary16 LF
 dequantization, colour factor 256, non-default X/B base correlations, and signed LF factors. The
 stock frontend must recover every field exactly. The synchronous encoder and runtime-neutral

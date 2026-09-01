@@ -37,6 +37,31 @@ pub(crate) struct PrefixCode {
 }
 
 impl PrefixCode {
+    pub(crate) fn from_raw_counts(raw_counts: &[u64; RAW_SYMBOLS]) -> Result<Self, EncodeError> {
+        if raw_counts.contains(&0) {
+            return Err(EncodeError::InvalidConfiguration(
+                "raw-only prefix alphabets must assign every GPU token",
+            ));
+        }
+
+        let mut raw_nbits = [0; RAW_SYMBOLS];
+        compute_code_lengths(
+            raw_counts,
+            RAW_SYMBOLS,
+            &[0; RAW_SYMBOLS],
+            &[15; RAW_SYMBOLS],
+            &mut raw_nbits,
+        );
+        let mut raw_bits = [0; RAW_SYMBOLS];
+        compute_canonical_code(&raw_nbits, &mut raw_bits, &[], &mut []);
+        Ok(Self {
+            raw_nbits,
+            raw_bits,
+            lz77_nbits: [0; LZ77_SYMBOLS],
+            lz77_bits: [0; LZ77_SYMBOLS],
+        })
+    }
+
     pub(crate) fn from_aggregated_counts(
         raw_gpu: &[u64; RAW_SYMBOLS],
         lz77_gpu: &[u64; LZ77_SYMBOLS],
@@ -222,6 +247,51 @@ impl PrefixCode {
             writer.write_bits(repeated_bits, 3)?;
         }
         for &length in &self.lz77_nbits[..num_lz77] {
+            writer.write_bits(
+                u64::from(code_length_bits[usize::from(length)]),
+                code_length_nbits[usize::from(length)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Writes a prefix histogram containing only the raw hybrid-uint alphabet.
+    ///
+    /// The Modular profile combines raw and LZ77 symbols in one histogram. VarDCT HF
+    /// coefficient streams disable LZ77 and therefore use an independently constructed raw-only
+    /// code. The serialized tree and GPU table must come from the same code because removing the
+    /// LZ77 leaves changes canonical bit assignments even when the raw code lengths are unchanged.
+    pub(crate) fn write_raw_tree(&self, writer: &mut BitWriter) -> Result<(), EncodeError> {
+        let mut code_length_counts = [0u64; 18];
+        for &length in &self.raw_nbits {
+            code_length_counts[usize::from(length)] += 1;
+        }
+
+        let mut code_length_nbits = [0u8; 18];
+        compute_code_lengths(
+            &code_length_counts,
+            18,
+            &[0; 18],
+            &[5; 18],
+            &mut code_length_nbits,
+        );
+        writer.write_bits(0, 2)?;
+
+        const ORDER: [u8; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        const LENGTH_NBITS: [u8; 6] = [2, 4, 3, 2, 2, 4];
+        const LENGTH_BITS: [u64; 6] = [0, 7, 3, 2, 1, 15];
+        let mut num_code_lengths = ORDER.len();
+        while code_length_nbits[usize::from(ORDER[num_code_lengths - 1])] == 0 {
+            num_code_lengths -= 1;
+        }
+        for &ordered in &ORDER[..num_code_lengths] {
+            let symbol = usize::from(code_length_nbits[usize::from(ordered)]);
+            writer.write_bits(LENGTH_BITS[symbol], LENGTH_NBITS[symbol])?;
+        }
+
+        let mut code_length_bits = [0u16; 18];
+        compute_canonical_code(&[], &mut [], &code_length_nbits, &mut code_length_bits);
+        for &length in &self.raw_nbits {
             writer.write_bits(
                 u64::from(code_length_bits[usize::from(length)]),
                 code_length_nbits[usize::from(length)],
