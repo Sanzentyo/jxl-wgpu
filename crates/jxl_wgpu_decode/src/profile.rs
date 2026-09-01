@@ -17,7 +17,7 @@ use crate::{
     modular_tree::{MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config},
 };
 
-const GROUP_DIMENSION: u32 = 256;
+const MIN_GROUP_DIMENSION: u32 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularGroup {
@@ -235,7 +235,7 @@ pub(crate) fn parse_standard_modular_profile(
         || frame.do_ycbcr
         || frame.jpeg_upsampling != [0; 3]
         || frame.upsampling != 1
-        || frame.group_size_shift != 1
+        || frame.group_size_shift > 3
         || frame.num_passes != 1
         || frame.have_crop
         || frame.x0 != 0
@@ -256,8 +256,11 @@ pub(crate) fn parse_standard_modular_profile(
         );
     }
 
-    let group_columns = image.width.div_ceil(GROUP_DIMENSION);
-    let group_rows = image.height.div_ceil(GROUP_DIMENSION);
+    let group_dimension = MIN_GROUP_DIMENSION
+        .checked_shl(frame.group_size_shift)
+        .ok_or_else(|| unsupported_error("Modular group dimension overflows u32"))?;
+    let group_columns = image.width.div_ceil(group_dimension);
+    let group_rows = image.height.div_ceil(group_dimension);
     let expected_group_count = u64::from(group_columns)
         .checked_mul(u64::from(group_rows))
         .ok_or_else(|| unsupported_error("Modular group grid overflow"))?;
@@ -350,10 +353,10 @@ pub(crate) fn parse_standard_modular_profile(
             let row = u32::try_from(group_index / u64::from(group_columns))
                 .map_err(|_| unsupported_error("Modular group row overflow"))?;
             let x = column
-                .checked_mul(GROUP_DIMENSION)
+                .checked_mul(group_dimension)
                 .ok_or_else(|| unsupported_error("Modular group x origin overflow"))?;
             let y = row
-                .checked_mul(GROUP_DIMENSION)
+                .checked_mul(group_dimension)
                 .ok_or_else(|| unsupported_error("Modular group y origin overflow"))?;
             let token_bit_end = section
                 .bits
@@ -365,8 +368,8 @@ pub(crate) fn parse_standard_modular_profile(
                     token_bit_end,
                     x,
                     y,
-                    width: image.width.saturating_sub(x).min(GROUP_DIMENSION),
-                    height: image.height.saturating_sub(y).min(GROUP_DIMENSION),
+                    width: image.width.saturating_sub(x).min(group_dimension),
+                    height: image.height.saturating_sub(y).min(group_dimension),
                     stream_index: u32::try_from(
                         18u64
                             .checked_add(
@@ -517,7 +520,9 @@ fn validate_stock_modular_transform_plan(
             let gpu_resident = transforms.iter().all(|transform| {
                 matches!(
                     transform,
-                    ModularTransformIr::Rct(_) | ModularTransformIr::Squeeze { .. }
+                    ModularTransformIr::Rct(_)
+                        | ModularTransformIr::Palette(_)
+                        | ModularTransformIr::Squeeze { .. }
                 )
             });
             if gpu_resident {
@@ -532,8 +537,8 @@ fn validate_stock_modular_transform_plan(
                                     total.checked_add(parameter.channel_count as usize)
                                 })
                             }
-                            ModularTransformIr::Palette(_) => {
-                                unreachable!("the RCT/Squeeze predicate was checked above")
+                            ModularTransformIr::Palette(palette) => {
+                                total.checked_add(palette.channel_count as usize)
                             }
                         });
                 if inverse.arena_words() < inverse.entropy_words()
@@ -543,7 +548,7 @@ fn validate_stock_modular_transform_plan(
                         != transform_plan.source_topology().channels().len()
                 {
                     return Err(crate::ModularInversePlanError::TopologyState {
-                        reason: "RCT/Squeeze transform produced inconsistent resident requirements",
+                        reason: "Modular transform produced inconsistent resident requirements",
                     }
                     .into());
                 }
@@ -650,7 +655,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stock_profile_admits_gpu_resident_squeeze_and_noncanonical_rct() {
+    fn stock_profile_admits_gpu_resident_palette_squeeze_and_noncanonical_rct() {
         let limits = ModularTransformLimits::default();
         let gray_source = ModularChannelTopology::full_resolution(9, 5, 8, 1, limits).unwrap();
         let squeeze = ModularTransformPlan::squeeze_only_for_test(
@@ -685,6 +690,27 @@ mod tests {
         assert_eq!(rct_inverse.entropy_words(), 63);
         assert_eq!(rct_inverse.jobs().len(), 1);
         assert_eq!(rct_inverse.final_planes().len(), 3);
+
+        let palette_source = ModularChannelTopology::full_resolution(11, 7, 8, 3, limits).unwrap();
+        let palette = ModularTransformPlan::from_transforms_for_test(
+            palette_source,
+            vec![ModularTransformIr::Palette(
+                crate::modular_transform::ModularPalette {
+                    begin_channel: 0,
+                    channel_count: 3,
+                    color_count: 4,
+                    delta_count: 2,
+                    predictor: 4,
+                },
+            )],
+            limits,
+        )
+        .unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Rgb, 11, 7, 8, &palette).unwrap();
+        let palette_inverse = plan_modular_inverse(&palette).unwrap();
+        assert_eq!(palette_inverse.jobs().len(), 3);
+        assert_eq!(palette_inverse.final_planes().len(), 3);
+        assert!(palette_inverse.arena_words() > palette_inverse.entropy_words());
     }
 
     #[test]

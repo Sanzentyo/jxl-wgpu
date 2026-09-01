@@ -3,12 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ModularInversePlanError, ModularTransformFeature, Result,
+    ModularInversePlanError, Result,
+    modular_palette::{
+        ModularPaletteJob, ModularPaletteMetadata, ModularPalettePlane, ModularPaletteScratch,
+        palette_scratch_words,
+    },
     modular_rct::{ModularRctParams, ModularRctPlane},
     modular_squeeze::{ModularSqueezeDirection, ModularSqueezeParams, ModularSqueezePlane},
     modular_transform::{
         GpuModularChannelLayout, ModularChannelGeometry, ModularChannelTopology,
-        ModularInverseTransform, ModularRct, ModularSqueezeParameter, ModularTransformPlan,
+        ModularInverseTransform, ModularPalette, ModularRct, ModularSqueezeParameter,
+        ModularTransformPlan,
     },
 };
 
@@ -59,6 +64,15 @@ impl ModularArenaPlane {
         }
     }
 
+    const fn palette_view(self) -> ModularPalettePlane {
+        ModularPalettePlane {
+            width: self.geometry.width,
+            height: self.geometry.height,
+            stride: self.geometry.width,
+            offset_words: self.offset_words,
+        }
+    }
+
     const fn gpu_layout(self) -> GpuModularChannelLayout {
         GpuModularChannelLayout {
             word_offset: self.offset_words,
@@ -77,6 +91,7 @@ impl ModularArenaPlane {
 pub(crate) enum ModularInverseJob {
     Squeeze { params: ModularSqueezeParams },
     Rct { params: ModularRctParams },
+    Palette { job: ModularPaletteJob },
 }
 
 /// Complete reverse schedule over one storage arena.
@@ -118,7 +133,7 @@ impl ModularInversePlan {
     }
 }
 
-/// Lowers RCT/Squeeze operations into a resident lifetime schedule.
+/// Lowers RCT/Palette/Squeeze operations into a resident lifetime schedule.
 pub(crate) fn plan_modular_inverse(
     transform_plan: &ModularTransformPlan,
 ) -> Result<ModularInversePlan> {
@@ -150,12 +165,14 @@ pub(crate) fn plan_modular_inverse(
                 &mut jobs,
             )?,
             ModularInverseTransform::Rct(rct) => lower_rct(rct, &live, &mut jobs)?,
-            ModularInverseTransform::Palette(_) => {
-                return Err(ModularInversePlanError::UnsupportedTransform {
-                    feature: ModularTransformFeature::Palette,
-                }
-                .into());
-            }
+            ModularInverseTransform::Palette(palette) => lower_palette(
+                palette,
+                source,
+                destination,
+                &mut live,
+                &mut allocator,
+                &mut jobs,
+            )?,
         }
         ensure_live_topology(&live, destination)
     })?;
@@ -167,6 +184,112 @@ pub(crate) fn plan_modular_inverse(
         jobs,
         final_planes: live,
     })
+}
+
+fn lower_palette(
+    palette: ModularPalette,
+    source: &ModularChannelTopology,
+    destination: &ModularChannelTopology,
+    live: &mut Vec<ModularArenaPlane>,
+    allocator: &mut WordAllocator,
+    jobs: &mut Vec<ModularInverseJob>,
+) -> Result<()> {
+    let begin = usize::try_from(palette.begin_channel).map_err(|_| {
+        ModularInversePlanError::TopologyState {
+            reason: "Palette begin channel exceeds host space",
+        }
+    })?;
+    let channel_count = usize::try_from(palette.channel_count).map_err(|_| {
+        ModularInversePlanError::TopologyState {
+            reason: "Palette channel count exceeds host space",
+        }
+    })?;
+    let source_index = begin
+        .checked_add(1)
+        .ok_or(ModularInversePlanError::TopologyState {
+            reason: "Palette index channel overflows host space",
+        })?;
+    let palette_plane = live
+        .first()
+        .copied()
+        .ok_or(ModularInversePlanError::TopologyState {
+            reason: "Palette meta channel is absent from the resident arena",
+        })?;
+    let index_plane =
+        live.get(source_index)
+            .copied()
+            .ok_or(ModularInversePlanError::TopologyState {
+                reason: "Palette index channel is absent from the resident arena",
+            })?;
+    let destination_end =
+        begin
+            .checked_add(channel_count)
+            .ok_or(ModularInversePlanError::TopologyState {
+                reason: "Palette destination channel range overflows",
+            })?;
+    let destination_geometries = destination.channels().get(begin..destination_end).ok_or(
+        ModularInversePlanError::TopologyState {
+            reason: "Palette destination channel range exceeds its topology",
+        },
+    )?;
+    if channel_count == 0
+        || palette_plane.geometry.width
+            != palette
+                .color_count
+                .checked_add(palette.delta_count)
+                .ok_or(ModularInversePlanError::ArenaAddressSpace)?
+        || palette_plane.geometry.height != palette.channel_count
+        || source.channels().len() + channel_count != destination.channels().len() + 2
+    {
+        return Err(ModularInversePlanError::TopologyState {
+            reason: "Palette source and destination topology are inconsistent",
+        }
+        .into());
+    }
+
+    let mut outputs = Vec::with_capacity(channel_count);
+    for &geometry in destination_geometries {
+        let span = allocator.allocate(geometry_words(geometry)?)?;
+        outputs.push(ModularArenaPlane {
+            geometry,
+            offset_words: span.offset,
+        });
+    }
+    let scratch_words = palette_scratch_words(index_plane.geometry.width, palette.predictor)?;
+    let scratch = allocator.allocate(scratch_words)?;
+    for (channel, output) in outputs.iter().copied().enumerate() {
+        jobs.push(ModularInverseJob::Palette {
+            job: ModularPaletteJob::new(
+                palette_plane.palette_view(),
+                index_plane.palette_view(),
+                output.palette_view(),
+                ModularPaletteMetadata {
+                    palette_channel: u32::try_from(channel).map_err(|_| {
+                        ModularInversePlanError::TopologyState {
+                            reason: "Palette output channel exceeds WGSL u32",
+                        }
+                    })?,
+                    color_count: palette.color_count,
+                    delta_count: palette.delta_count,
+                    predictor: palette.predictor,
+                    bit_depth: output.geometry.bit_depth,
+                },
+                ModularPaletteScratch {
+                    offset_words: scratch.offset,
+                    words: scratch.length,
+                },
+            )?,
+        });
+    }
+
+    allocator.release(scratch)?;
+    allocator.release(palette_plane.span()?)?;
+    allocator.release(index_plane.span()?)?;
+    let mut next = live.clone();
+    next.remove(0);
+    next.splice(begin..=begin, outputs);
+    *live = next;
+    Ok(())
 }
 
 fn lower_squeeze(
@@ -499,6 +622,30 @@ mod tests {
         plan_modular_inverse(&transform).unwrap()
     }
 
+    fn palette_rct_plan(predictor: u32, delta_count: u32) -> ModularInversePlan {
+        let limits = ModularTransformLimits::default();
+        let topology = ModularChannelTopology::full_resolution(9, 5, 8, 3, limits).unwrap();
+        let transform = ModularTransformPlan::from_transforms_for_test(
+            topology,
+            vec![
+                ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 5,
+                }),
+                ModularTransformIr::Palette(ModularPalette {
+                    begin_channel: 0,
+                    channel_count: 3,
+                    color_count: 4,
+                    delta_count,
+                    predictor,
+                }),
+            ],
+            limits,
+        )
+        .unwrap();
+        plan_modular_inverse(&transform).unwrap()
+    }
+
     #[test]
     fn best_fit_allocator_merges_both_neighbors_and_rejects_overlap() {
         let mut allocator = WordAllocator::new(100);
@@ -552,6 +699,9 @@ mod tests {
                 .map(|job| match job {
                     ModularInverseJob::Squeeze { params } => params.direction(),
                     ModularInverseJob::Rct { .. } => panic!("Squeeze-only plan contains RCT"),
+                    ModularInverseJob::Palette { .. } => {
+                        panic!("Squeeze-only plan contains Palette")
+                    }
                 })
                 .collect::<Vec<_>>(),
             vec![
@@ -627,6 +777,44 @@ mod tests {
         assert!(plan.final_planes().iter().all(|plane| {
             plane.geometry.width == 9 && plane.geometry.height == 5 && plane.geometry.bit_depth == 8
         }));
+    }
+
+    #[test]
+    fn palette_outputs_keep_inputs_live_and_compose_before_rct() {
+        let simple = palette_rct_plan(0, 0);
+        assert_eq!(simple.entropy_words(), 57);
+        assert_eq!(simple.arena_words(), 192);
+        assert_eq!(simple.jobs().len(), 4);
+        assert!(matches!(
+            simple.jobs(),
+            [
+                ModularInverseJob::Palette { .. },
+                ModularInverseJob::Palette { .. },
+                ModularInverseJob::Palette { .. },
+                ModularInverseJob::Rct { params },
+            ] if params.rct_type() == 5
+        ));
+        assert_eq!(simple.final_planes().len(), 3);
+        assert!(
+            simple
+                .final_planes()
+                .iter()
+                .all(|plane| { plane.geometry.width == 9 && plane.geometry.height == 5 })
+        );
+
+        let weighted = palette_rct_plan(6, 2);
+        assert_eq!(weighted.entropy_words(), 63);
+        assert_eq!(weighted.jobs().len(), 4);
+        let expected_scratch = palette_scratch_words(9, 6).unwrap();
+        assert!(weighted.arena_words() >= 63 + 3 * 45 + expected_scratch);
+        for (channel, job) in weighted.jobs()[..3].iter().enumerate() {
+            let ModularInverseJob::Palette { job } = job else {
+                panic!("Palette plan contains a non-Palette channel job")
+            };
+            assert_eq!(job.palette_channel, channel as u32);
+            assert_eq!(job.scratch_words, expected_scratch);
+            assert_eq!(job.predictor, 6);
+        }
     }
 
     fn scalar_tendency(previous: i32, average: i32, next: i32) -> i64 {
@@ -787,6 +975,9 @@ mod tests {
         match job {
             ModularInverseJob::Squeeze { params } => execute_scalar_squeeze(arena, params),
             ModularInverseJob::Rct { params } => execute_scalar_rct(arena, params),
+            ModularInverseJob::Palette { .. } => {
+                panic!("mixed RCT/Squeeze schedule contains Palette")
+            }
         }
     }
 
@@ -922,6 +1113,9 @@ mod tests {
                         params,
                     )
                     .unwrap(),
+                ModularInverseJob::Palette { .. } => {
+                    panic!("mixed RCT/Squeeze schedule contains Palette")
+                }
             })
             .collect::<Vec<_>>();
         encoder.clear_buffer(&packed, 0, None);

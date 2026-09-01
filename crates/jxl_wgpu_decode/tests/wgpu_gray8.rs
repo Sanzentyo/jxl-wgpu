@@ -793,6 +793,7 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
             assert_eq!(stats.max_physical_reconstruction_sample_words, 256 * 2);
             assert_eq!(stats.resident_modular_arena_bytes, 0);
             assert_eq!(stats.inverse_transform_count, 0);
+            assert_eq!(stats.palette_dispatch_count, 0);
             assert_eq!(stats.inverse_transform_uniform_bytes, 0);
             assert_eq!(stats.final_output_uniform_bytes, 0);
             assert_eq!(stats.reconstruction_lane_stride_bytes, 256 * 2 * 4 + 32);
@@ -1046,6 +1047,100 @@ fn weighted_ma_groups_resume_across_bounded_gpu_stream_windows() {
     );
     drop(damaged_session);
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+}
+
+#[test]
+fn cjxl_palette_transform_is_exact_through_resident_inverse_and_finalize() {
+    if Command::new("cjxl").arg("--version").output().is_err() {
+        eprintln!("skipping cjxl Palette conformance: cjxl is not installed");
+        return;
+    }
+    let Some(backend) = backend() else {
+        eprintln!("skipping cjxl Palette conformance: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (37u32, 23u32);
+    let colors = [3u8, 240, 31, 199];
+    let expected = (0..u64::from(width) * u64::from(height))
+        .map(|index| {
+            let x = index % u64::from(width);
+            let y = index / u64::from(width);
+            colors[((x / 3 + y / 2 + (x * y) % 3) % colors.len() as u64) as usize]
+        })
+        .collect::<Vec<_>>();
+    let unique = format!(
+        "jxl-wgpu-palette-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir().join(unique);
+    std::fs::create_dir(&directory).expect("create cjxl Palette fixture directory");
+    let input = directory.join("palette.pgm");
+    let encoded_path = directory.join("palette.jxl");
+    let mut pgm = format!("P5\n{width} {height}\n255\n").into_bytes();
+    pgm.extend_from_slice(&expected);
+    std::fs::write(&input, pgm).expect("write cjxl Palette source");
+    let command = Command::new("cjxl")
+        .arg(&input)
+        .arg(&encoded_path)
+        .args([
+            "-d",
+            "0",
+            "-m",
+            "1",
+            "-e",
+            "9",
+            "-x",
+            "color_space=Gra_D65_Rel_SRG",
+        ])
+        .output()
+        .expect("run cjxl Palette encoder");
+    assert!(
+        command.status.success(),
+        "cjxl Palette encoding failed: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let encoded = std::fs::read(&encoded_path).expect("read cjxl Palette codestream");
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let request = GpuOutputRequest::numeric(
+        LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+        NumericSampleMapping::NativeUnsigned,
+    )
+    .unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("GPU decoder accepts the cjxl Palette transform");
+    let stats = session
+        .submission_session()
+        .modular()
+        .expect("cjxl Palette selects the Modular engine")
+        .memory_stats();
+    assert!(
+        stats.resident_modular_arena_bytes
+            > stats.max_logical_reconstruction_sample_words as u64 * 4
+    );
+    assert!(stats.inverse_transform_count >= 1);
+    assert!(stats.palette_dispatch_count >= 1);
+    assert!(stats.inverse_transform_uniform_bytes >= 128);
+    assert_eq!(stats.final_output_uniform_bytes, 128);
+    assert_eq!(
+        stats.reconstruction_specialization,
+        ModularReconstructionSpecialization::DescriptorMetaAdaptive
+    );
+    let frame = session
+        .next_frame()
+        .expect("cjxl Palette GPU decode succeeds")
+        .expect("cjxl Palette returns one frame");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(session);
+
+    std::fs::remove_file(&input).expect("remove cjxl Palette source");
+    std::fs::remove_file(&encoded_path).expect("remove cjxl Palette codestream");
+    std::fs::remove_dir(&directory).expect("remove cjxl Palette fixture directory");
 }
 
 #[test]

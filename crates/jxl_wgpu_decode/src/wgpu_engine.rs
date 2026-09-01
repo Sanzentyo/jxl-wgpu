@@ -34,6 +34,10 @@ use crate::modular_finalize::{
     ModularFinalizeF64Path, ModularFinalizeOutput, ModularFinalizeParams, ModularFinalizePipeline,
 };
 use crate::modular_inverse::ModularInverseJob;
+use crate::modular_palette::{
+    DEFAULT_MODULAR_PALETTE_VARIANT, MODULAR_PALETTE_KERNEL_KEY, ModularPalettePipeline,
+    ModularPaletteWeightedParams,
+};
 use crate::modular_rct::{
     DEFAULT_MODULAR_RCT_VARIANT, MODULAR_RCT_KERNEL_KEY, ModularRctArena, ModularRctParams,
     ModularRctPipeline,
@@ -153,8 +157,10 @@ pub struct WgpuDecodeMemoryStats {
     pub max_physical_reconstruction_sample_words: u32,
     /// Resident transformed-sample arena contained in one generalized reconstruction lane.
     pub resident_modular_arena_bytes: u64,
-    /// Number of ordered inverse RCT/Squeeze passes recorded after entropy reconstruction.
+    /// Number of ordered inverse RCT/Palette/Squeeze dispatches after entropy reconstruction.
     pub inverse_transform_count: usize,
+    /// Palette dispatches included in `inverse_transform_count`, including bounded serial chunks.
+    pub palette_dispatch_count: usize,
     /// Aggregate per-dispatch uniform allocation retained through inverse submission.
     pub inverse_transform_uniform_bytes: u64,
     /// Final source-plane packing uniform retained through the same submission.
@@ -416,6 +422,12 @@ struct DecodePipelineCache {
 
 #[derive(Default)]
 struct ModularInversePipelineCache {
+    palette: OnceLock<
+        std::result::Result<
+            Arc<ModularPalettePipeline>,
+            crate::modular_palette::ModularPaletteError,
+        >,
+    >,
     squeeze: OnceLock<
         std::result::Result<
             Arc<ModularSqueezePipeline>,
@@ -431,6 +443,7 @@ struct ModularInversePipelineCache {
 }
 
 struct ModularInversePipelines {
+    palette: Option<Arc<ModularPalettePipeline>>,
     squeeze: Option<Arc<ModularSqueezePipeline>>,
     rct: Option<Arc<ModularRctPipeline>>,
     finalize: Arc<ModularFinalizePipeline>,
@@ -729,9 +742,15 @@ impl WgpuSubmissionEngine {
                     .jobs()
                     .iter()
                     .any(|job| matches!(job, ModularInverseJob::Rct { .. }));
+                let needs_palette = profile
+                    .inverse_plan
+                    .jobs()
+                    .iter()
+                    .any(|job| matches!(job, ModularInverseJob::Palette { .. }));
                 self.inverse_pipelines.get(
                     &self.backend,
                     pipeline_f64_path,
+                    needs_palette,
                     needs_squeeze,
                     needs_rct,
                 )
@@ -838,9 +857,25 @@ impl ModularInversePipelineCache {
         &self,
         backend: &WgpuBackend,
         f64_path: F64OutputPath,
+        needs_palette: bool,
         needs_squeeze: bool,
         needs_rct: bool,
     ) -> Result<Arc<ModularInversePipelines>> {
+        let palette = if needs_palette {
+            let variant = backend
+                .kernel_policy()
+                .variant_for(MODULAR_PALETTE_KERNEL_KEY, DEFAULT_MODULAR_PALETTE_VARIANT)?;
+            Some(
+                match self.palette.get_or_init(|| {
+                    ModularPalettePipeline::with_variant(backend.device(), variant).map(Arc::new)
+                }) {
+                    Ok(pipeline) => Arc::clone(pipeline),
+                    Err(error) => return Err(error.clone().into()),
+                },
+            )
+        } else {
+            None
+        };
         let squeeze = if needs_squeeze {
             let variant = backend
                 .kernel_policy()
@@ -897,6 +932,7 @@ impl ModularInversePipelineCache {
             Err(error) => return Err(error.clone().into()),
         };
         Ok(Arc::new(ModularInversePipelines {
+            palette,
             squeeze,
             rct,
             finalize,
@@ -1422,6 +1458,7 @@ struct GroupDispatchLayout {
     max_physical_reconstruction_sample_words: u32,
     resident_modular_arena_bytes: u64,
     inverse_transform_count: usize,
+    palette_dispatch_count: usize,
     inverse_transform_uniform_bytes: u64,
     final_output_uniform_bytes: u64,
     max_lz77_window_words: u32,
@@ -1506,7 +1543,34 @@ impl GroupDispatchLayout {
             0
         };
         let inverse_transform_count = if generalized_channels {
-            profile.inverse_plan.jobs().len()
+            profile
+                .inverse_plan
+                .jobs()
+                .iter()
+                .try_fold(0usize, |total, job| {
+                    let dispatches = match job {
+                        ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
+                        ModularInverseJob::Squeeze { .. } | ModularInverseJob::Rct { .. } => 1,
+                    };
+                    total.checked_add(dispatches)
+                })
+                .ok_or_else(|| Error::backend("Modular inverse dispatch count overflow"))?
+        } else {
+            0
+        };
+        let palette_dispatch_count = if generalized_channels {
+            profile
+                .inverse_plan
+                .jobs()
+                .iter()
+                .try_fold(0usize, |total, job| {
+                    let dispatches = match job {
+                        ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
+                        ModularInverseJob::Squeeze { .. } | ModularInverseJob::Rct { .. } => 0,
+                    };
+                    total.checked_add(dispatches)
+                })
+                .ok_or_else(|| Error::backend("Modular Palette dispatch count overflow"))?
         } else {
             0
         };
@@ -1523,6 +1587,7 @@ impl GroupDispatchLayout {
                         ModularInverseJob::Rct { .. } => {
                             std::mem::size_of::<ModularRctParams>() as u64
                         }
+                        ModularInverseJob::Palette { job } => job.uniform_bytes(),
                     };
                     total.checked_add(bytes)
                 })
@@ -1674,6 +1739,7 @@ impl GroupDispatchLayout {
             max_physical_reconstruction_sample_words,
             resident_modular_arena_bytes,
             inverse_transform_count,
+            palette_dispatch_count,
             inverse_transform_uniform_bytes,
             final_output_uniform_bytes,
             max_lz77_window_words,
@@ -2525,6 +2591,7 @@ fn validate_device_limits(
         max_physical_reconstruction_sample_words: dispatch.max_physical_reconstruction_sample_words,
         resident_modular_arena_bytes: dispatch.resident_modular_arena_bytes,
         inverse_transform_count: dispatch.inverse_transform_count,
+        palette_dispatch_count: dispatch.palette_dispatch_count,
         inverse_transform_uniform_bytes: dispatch.inverse_transform_uniform_bytes,
         final_output_uniform_bytes: dispatch.final_output_uniform_bytes,
         max_lz77_window_words: dispatch.max_lz77_window_words,
@@ -2909,42 +2976,56 @@ fn encode_modular_inverse(
         offset: 0,
         size: arena_size,
     };
-    source
-        .profile
-        .inverse_plan
-        .jobs()
-        .iter()
-        .map(|job| match *job {
+    let mut uniforms = Vec::new();
+    for job in source.profile.inverse_plan.jobs() {
+        match *job {
             ModularInverseJob::Squeeze { params } => {
                 let pipeline = pipelines.squeeze.as_ref().ok_or(Error::EngineContract(
                     "resident Modular Squeeze job is missing its pipeline",
                 ))?;
-                pipeline
-                    .encode(
-                        device,
-                        encoder,
-                        ModularSqueezeArena::from_storage(storage),
-                        params,
-                    )
-                    .map_err(crate::ModularInversePlanError::from)
-                    .map_err(Error::from)
+                uniforms.push(
+                    pipeline
+                        .encode(
+                            device,
+                            encoder,
+                            ModularSqueezeArena::from_storage(storage),
+                            params,
+                        )
+                        .map_err(crate::ModularInversePlanError::from)
+                        .map_err(Error::from)?,
+                );
             }
             ModularInverseJob::Rct { params } => {
                 let pipeline = pipelines.rct.as_ref().ok_or(Error::EngineContract(
                     "resident Modular RCT job is missing its pipeline",
                 ))?;
-                pipeline
-                    .encode(
-                        device,
-                        encoder,
-                        ModularRctArena::from_storage(storage),
-                        params,
-                    )
-                    .map_err(crate::ModularInversePlanError::from)
-                    .map_err(Error::from)
+                uniforms.push(
+                    pipeline
+                        .encode(
+                            device,
+                            encoder,
+                            ModularRctArena::from_storage(storage),
+                            params,
+                        )
+                        .map_err(crate::ModularInversePlanError::from)
+                        .map_err(Error::from)?,
+                );
             }
-        })
-        .collect()
+            ModularInverseJob::Palette { job } => {
+                let pipeline = pipelines.palette.as_ref().ok_or(Error::EngineContract(
+                    "resident Modular Palette job is missing its pipeline",
+                ))?;
+                uniforms.extend(pipeline.encode(
+                    device,
+                    encoder,
+                    storage,
+                    job,
+                    ModularPaletteWeightedParams::from(source.profile.wp_header),
+                )?);
+            }
+        }
+    }
+    Ok(uniforms)
 }
 
 fn encode_modular_finalize(
