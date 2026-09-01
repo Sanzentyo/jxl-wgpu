@@ -186,8 +186,8 @@ cursor-dependent HF descriptors, and then submit one or more bounded HF windows 
 buffer. The inverse transform dispatches each independently bounded LF-group artifact into shared
 padded resident planes. XYB groups use coalesced full-image LF storage and chroma-from-luma. The
 bounded JPEG-reconstruction path instead retains exact component-sized LF/AC grids in Cb/Y/Cr
-order; each task carries a channel mask, component destination, and LF offset so 4:2:0 chroma never
-expands before final output. Group-local LF and correlation data first scatter into their resident
+order; each task carries a channel mask, component destination, and LF offset so 4:2:2, 4:4:0, and
+4:2:0 chroma never expands before final output. Group-local LF and correlation data first scatter into their resident
 atlases; adaptive LF smoothing runs once over an XYB atlas, or the standard skip flag writes LF
 directly to the transform input.
 An optional fused Gaborish dispatch reads only the actual image extent with mirrored image-edge

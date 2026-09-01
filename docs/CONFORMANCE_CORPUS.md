@@ -73,12 +73,18 @@ JPEG-transcode fixture fixes raw mode 7's general Modular header and entropy cur
 actual-adapter test decodes its 192 DCT8 samples, runs the resident inverse schedule, checks the
 16-byte status and exact packet end, then reads back the resource table to require bit-exact
 `[chroma, luma, chroma] / 2040` values for all 64 raster positions and a real replacement of the
-normative default matrix. A second public-decoder actual-adapter test consumes the complete 264x64
-4:2:0 frame, including exact 17x4/34x8/17x4 LF component grids, channel-masked AC traversal,
+normative default matrix. A second public-decoder actual-adapter test consumes complete 264x64
+4:4:4, 4:2:2, 4:4:0, and 4:2:0 cjpeg streams. It checks the exact physical component-plane bytes,
+including the 4:2:0 fixture's 17x4/34x8/17x4 LF grids, channel-masked AC traversal,
 component-specific resident destinations, quarter/three-quarter edge-replicating upsampling, and
-encoded BT.601 YCbCr conversion. Its packed RGB8 result must remain within one code of Rust `jxl`
+encoded BT.601 YCbCr conversion. Each packed RGB8 result must remain within one code of Rust `jxl`
 and optional `djxl`; there is no intermediate pixel readback. Shader coverage remains Naga
 semantic validation and actual GPU execution; it does not inspect WGSL source strings.
+The three additional sampling fixtures were deterministically derived from the decoded 4:2:0
+source with libjpeg-turbo 3.2.0 `cjpeg -quality 90 -sample` values `1x1,1x1,1x1`,
+`2x1,1x1,1x1`, and `1x2,1x1,1x1`, then losslessly transcoded by `cjxl` 0.12.0. Their containers
+retain `jbrd` reconstruction data, but this decoder assertion covers the `jxlc` pixels rather than
+claiming bit-identical JPEG reconstruction.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

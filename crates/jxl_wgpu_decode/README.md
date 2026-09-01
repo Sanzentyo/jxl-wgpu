@@ -203,12 +203,13 @@ finite weights into each aliased strategy-matrix target before AC/render. A real
 JPEG-transcode stream covers that primitive on an actual adapter. Local-tree packets now complete
 their LF cursor and every HF-local metadata window before entering the same repeated raw-matrix
 state; each raw stage copies only its four-byte-aligned HF-global packet range into a dedicated
-storage binding and rebases the mapped cursor. The same 264x64 4:2:0 fixture now runs through the
-public decoder: LF/AC entropy uses exact per-component dimensions, tasks carry three LF offsets and
-component destinations, and the packed output kernel applies separable quarter/three-quarter JPEG
-upsampling with replicated edges followed by encoded BT.601 YCbCr-to-RGB conversion. Actual-GPU
-RGB8 differs from Rust `jxl` and optional `djxl` by at most one code. A local-tree raw conformance
-fixture and subsampled restoration remain gaps.
+storage binding and rebases the mapped cursor. Four 264x64 cjpeg fixtures cover 4:4:4, 4:2:2,
+4:4:0, and 4:2:0 through the public decoder: LF/AC entropy uses exact per-component dimensions,
+tasks carry three LF offsets and component destinations, and the packed output kernel applies
+separable quarter/three-quarter JPEG upsampling with replicated edges followed by encoded BT.601
+YCbCr-to-RGB conversion. Actual-GPU RGB8 differs from Rust `jxl` and optional `djxl` by at most one
+code. A local-tree raw conformance fixture, uncommon asymmetric component sampling, and subsampled
+restoration remain gaps.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
@@ -361,7 +362,7 @@ operation.
 
 This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF/restoration,
-broader JPEG component layouts and other Modular side images,
+uncommon asymmetric JPEG component layouts and other Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

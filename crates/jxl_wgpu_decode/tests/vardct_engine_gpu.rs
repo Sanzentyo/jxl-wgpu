@@ -193,11 +193,10 @@ fn maximum_error(left: &[u8], right: &[u8]) -> u8 {
 }
 
 #[test]
-fn jpeg_transcode_ycbcr_420_raw_matrix_matches_reference_on_gpu() {
+fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
     let Some((info, device, queue)) = device() else {
         return;
     };
-    let encoded = common::jpeg_transcode_raw_matrix();
     let extent = Extent2d::new(264, 64);
     let backend = WgpuBackend::from_device(
         device,
@@ -210,39 +209,67 @@ fn jpeg_transcode_ycbcr_420_raw_matrix_matches_reference_on_gpu() {
     )
     .unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-    let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .unwrap();
-    let memory = session
-        .submission_session()
-        .vardct()
-        .expect("JPEG reconstruction selects the VarDCT submission session")
-        .memory_stats();
-    assert_eq!(memory.resident_plane_bytes, [17_408, 69_632, 17_408]);
-    assert_eq!(memory.resident_image_bytes, 104_448);
-    let frame = session.next_frame().unwrap().unwrap();
-    let readback = ImageReadbackPipeline::new(&backend)
-        .submit(frame.output())
-        .unwrap()
-        .wait()
-        .unwrap();
-    let actual = &readback.frame.outputs[0].bytes;
-    let rust = rust_jxl_rgb8(encoded, extent);
-    assert_eq!(actual.len(), rust.len());
-    let rust_error = maximum_error(actual, &rust);
-    assert!(
-        rust_error <= 1,
-        "JPEG-transcode GPU output diverges from Rust jxl by {rust_error}",
-    );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
-        let djxl_error = maximum_error(actual, &djxl);
-        assert!(
-            djxl_error <= 1,
-            "JPEG-transcode GPU output diverges from djxl by {djxl_error}",
+    let cases = [
+        (
+            "4:4:4",
+            common::jpeg_transcode_444(),
+            [67_584, 67_584, 67_584],
+        ),
+        (
+            "4:2:2",
+            common::jpeg_transcode_422(),
+            [34_816, 69_632, 34_816],
+        ),
+        (
+            "4:4:0",
+            common::jpeg_transcode_440(),
+            [33_792, 67_584, 33_792],
+        ),
+        (
+            "4:2:0",
+            common::jpeg_transcode_raw_matrix(),
+            [17_408, 69_632, 17_408],
+        ),
+    ];
+    for (name, encoded, resident_plane_bytes) in cases {
+        let mut session = decoder
+            .open(
+                encoded,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let memory = session
+            .submission_session()
+            .vardct()
+            .expect("JPEG reconstruction selects the VarDCT submission session")
+            .memory_stats();
+        assert_eq!(memory.resident_plane_bytes, resident_plane_bytes, "{name}");
+        assert_eq!(
+            memory.resident_image_bytes,
+            resident_plane_bytes.into_iter().sum::<u64>(),
+            "{name}",
         );
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let actual = &readback.frame.outputs[0].bytes;
+        let rust = rust_jxl_rgb8(encoded, extent);
+        assert_eq!(actual.len(), rust.len(), "{name}");
+        let rust_error = maximum_error(actual, &rust);
+        assert!(
+            rust_error <= 1,
+            "{name} JPEG-transcode GPU output diverges from Rust jxl by {rust_error}",
+        );
+        if let Some(djxl) = djxl_ppm(encoded, extent) {
+            let djxl_error = maximum_error(actual, &djxl);
+            assert!(
+                djxl_error <= 1,
+                "{name} JPEG-transcode GPU output diverges from djxl by {djxl_error}",
+            );
+        }
     }
 }
 

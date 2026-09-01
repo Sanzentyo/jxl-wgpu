@@ -231,3 +231,21 @@ pub fn jpeg_transcode_raw_matrix() -> &'static [u8] {
     });
     BYTES.as_slice()
 }
+
+pub fn jpeg_transcode_444() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_444.jxl.hex")));
+    BYTES.as_slice()
+}
+
+pub fn jpeg_transcode_422() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_422.jxl.hex")));
+    BYTES.as_slice()
+}
+
+pub fn jpeg_transcode_440() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_440.jxl.hex")));
+    BYTES.as_slice()
+}
