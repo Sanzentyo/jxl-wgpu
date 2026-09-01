@@ -20,6 +20,12 @@ other driver-private allocations cannot be measured portably and are not include
   `#[repr(C, align(16))]`.
 - Storage arrays use the same element stride on both sides: `GpuTask`/`Task` is 28 bytes and
   `GpuResourceVector`/`vec4<f32>` is 16 bytes with 16-byte alignment.
+- Modular transform planning uses two 32-byte, four-byte-aligned `repr(C)`/`Pod` records.
+  `ModularChannelGeometry` carries width, height, signed horizontal/vertical shifts, bit depth, and
+  three zero words while meta-applying the transform stack. `GpuModularChannelLayout` replaces the
+  padding with packed word offset and row stride for storage-buffer execution. All offsets and the
+  final sample end are checked against WGSL `u32` before allocation. These records are not bound by
+  the current direct-topology kernel yet; documenting the ABI does not claim inverse execution.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size

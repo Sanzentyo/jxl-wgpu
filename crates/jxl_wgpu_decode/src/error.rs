@@ -53,6 +53,48 @@ pub enum ModularTreeError {
     TreeDepthExceeded { depth: usize, limit: usize },
 }
 
+/// Invalid or resource-exhausting JPEG XL Modular transform metadata.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ModularTransformError {
+    #[error("Modular transform count {actual} exceeds the bounded limit {limit}")]
+    TransformLimitExceeded { actual: usize, limit: usize },
+    #[error("Modular transformed channel count {actual} exceeds the bounded limit {limit}")]
+    ChannelLimitExceeded { actual: usize, limit: usize },
+    #[error("Modular squeeze parameter count {actual} exceeds the bounded limit {limit}")]
+    SqueezeLimitExceeded { actual: usize, limit: usize },
+    #[error("invalid Modular transform id {id}")]
+    InvalidTransformId { id: u32 },
+    #[error("invalid Modular RCT type {rct_type}; valid types are 0 through 41")]
+    InvalidRctType { rct_type: u32 },
+    #[error("invalid Modular palette predictor {predictor}; valid predictors are 0 through 13")]
+    InvalidPalettePredictor { predictor: u32 },
+    #[error(
+        "{transform} channel range {begin}..{end} exceeds the {available} transformed channels"
+    )]
+    ChannelRange {
+        transform: &'static str,
+        begin: u32,
+        end: u32,
+        available: usize,
+    },
+    #[error("{transform} cannot mix meta and non-meta channels")]
+    MixedMetaChannels { transform: &'static str },
+    #[error("{transform} requires channels with identical geometry and bit depth")]
+    UnequalChannels { transform: &'static str },
+    #[error("a Modular squeeze of meta channels must place residuals in-place")]
+    MetaSqueezeRequiresInPlace,
+    #[error("default Modular squeeze requires at least one non-meta channel")]
+    MissingDataChannel,
+    #[error("Modular channel {channel} has zero extent before a squeeze operation")]
+    ZeroSizedSqueezeChannel { channel: usize },
+    #[error("Modular channel {channel} has exceeded the maximum squeeze shift of 30")]
+    TooManySqueezes { channel: usize },
+    #[error("Modular palette dimensions overflow the GPU address space")]
+    PaletteDimensionOverflow,
+    #[error("Modular transformed sample storage exceeds the portable WGSL u32 address space")]
+    GpuAddressSpaceOverflow,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("unsupported GPU decode profile feature {feature:?}: {detail}")]
 pub struct UnsupportedProfile {
@@ -131,6 +173,8 @@ pub enum Error {
     FrontendIncomplete(#[from] FrontendIncomplete),
     #[error(transparent)]
     ModularTree(#[from] ModularTreeError),
+    #[error(transparent)]
+    ModularTransform(#[from] ModularTransformError),
     #[error(transparent)]
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]

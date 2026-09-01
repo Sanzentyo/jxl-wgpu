@@ -3,6 +3,10 @@ use jxl_gpu_bitstream::{
     ImageHeaderInventory, SampleBitDepth,
 };
 
+use crate::modular_transform::{
+    ModularChannelTopology, ModularRct, ModularTransformIr, ModularTransformLimits,
+    ModularTransformPlan, parse_modular_transforms,
+};
 use crate::modular_tree::BitInput;
 use crate::{
     GpuCodestream, ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile,
@@ -44,6 +48,7 @@ pub(crate) struct StandardModularProfile {
     pub groups: Vec<ModularGroup>,
     pub ma_config: MaConfigIr,
     pub wp_header: WpHeaderIr,
+    pub transform_plan: ModularTransformPlan,
 }
 
 fn validate_image_header(
@@ -272,7 +277,13 @@ pub(crate) fn parse_standard_modular_profile(
     let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
     parse_lf_channel_dequantization(&mut reader)?;
-    let (ma_config, wp_header) = parse_dc_global_ir(&mut reader, channels)?;
+    let (ma_config, wp_header, transform_plan) = parse_dc_global_ir(
+        &mut reader,
+        channels,
+        image.width,
+        image.height,
+        u32::from(bits_per_sample),
+    )?;
     let dc_end = dc_global
         .bits
         .end()
@@ -389,6 +400,7 @@ pub(crate) fn parse_standard_modular_profile(
         groups,
         ma_config,
         wp_header,
+        transform_plan,
     })
 }
 
@@ -412,50 +424,77 @@ fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<()> {
 fn parse_dc_global_ir(
     reader: &mut impl BitInput,
     channels: ModularChannels,
-) -> Result<(MaConfigIr, WpHeaderIr)> {
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+) -> Result<(MaConfigIr, WpHeaderIr, ModularTransformPlan)> {
     expect(reader, 1, 1, "global Modular MA tree")?;
     let ma_config = parse_ma_config(reader, MaTreeLimits::default())?;
     expect(reader, 1, 1, "global Modular tree selection")?;
     let wp_header = WpHeaderIr::parse(reader)?;
-    let transform_count = read_u32_selector(reader, [(0, 0), (1, 0), (2, 4), (18, 8)])?;
-    match (channels, transform_count) {
-        (ModularChannels::Gray, 0) => {}
-        (ModularChannels::Rgb | ModularChannels::Rgba, 1) => {
-            let transform_id = reader.read_bits(2)?;
-            if transform_id != 0 {
-                return unsupported_transform(match transform_id {
-                    1 => ModularTransformFeature::Palette,
-                    2 => ModularTransformFeature::Squeeze,
-                    _ => ModularTransformFeature::Invalid,
-                });
-            }
-            let begin_channel = read_u32_selector(reader, [(0, 3), (8, 6), (72, 10), (1096, 13)])?;
-            let rct_type = read_u32_selector(reader, [(6, 0), (0, 2), (2, 4), (10, 6)])?;
-            if begin_channel != 0 || rct_type != 6 {
-                return unsupported_transform(ModularTransformFeature::ReversibleColor {
-                    begin_channel,
-                    rct_type,
-                });
-            }
-        }
-        (_, 0) => {
+    let limits = ModularTransformLimits::default();
+    let topology = ModularChannelTopology::full_resolution(
+        width,
+        height,
+        bit_depth,
+        channels.count(),
+        limits,
+    )?;
+    let transform_plan = parse_modular_transforms(reader, topology, limits)?;
+    let expected_sample_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|samples| samples.checked_mul(u64::from(channels.count())))
+        .ok_or_else(|| unsupported_error("Modular source sample count overflows"))?;
+    let topology_is_direct = transform_plan.topology.meta_channel_count() == 0
+        && transform_plan.topology.sample_count() == Some(expected_sample_count)
+        && transform_plan.topology.channels().len() == channels.count() as usize
+        && transform_plan.topology.channels().iter().all(|channel| {
+            channel.width == width
+                && channel.height == height
+                && channel.hshift == 0
+                && channel.vshift == 0
+                && channel.bit_depth == bit_depth
+        });
+    // This proves that every entropy-visible channel has a portable u32 WGSL address before any
+    // backend allocation. The generalized transformed-channel executor will retain this table.
+    let _gpu_channel_layout = transform_plan.topology.gpu_layout()?;
+    match (channels, transform_plan.transforms.as_slice()) {
+        (ModularChannels::Gray, []) if topology_is_direct => {}
+        (
+            ModularChannels::Rgb | ModularChannels::Rgba,
+            [
+                ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 6,
+                }),
+            ],
+        ) if topology_is_direct => {}
+        (ModularChannels::Rgb | ModularChannels::Rgba, []) => {
             return unsupported(
                 "the standard Modular color profile requires its reversible color transform",
             );
         }
-        _ => return unsupported_transform(ModularTransformFeature::Invalid),
+        (_, transforms) => {
+            let feature = transforms
+                .iter()
+                .find_map(|transform| match transform {
+                    ModularTransformIr::Rct(rct) if rct.begin_channel == 0 && rct.rct_type == 6 => {
+                        None
+                    }
+                    ModularTransformIr::Rct(rct) => {
+                        Some(ModularTransformFeature::ReversibleColor {
+                            begin_channel: rct.begin_channel,
+                            rct_type: rct.rct_type,
+                        })
+                    }
+                    ModularTransformIr::Palette(_) => Some(ModularTransformFeature::Palette),
+                    ModularTransformIr::Squeeze { .. } => Some(ModularTransformFeature::Squeeze),
+                })
+                .unwrap_or(ModularTransformFeature::Invalid);
+            return unsupported_transform(feature);
+        }
     }
-    Ok((ma_config, wp_header))
-}
-
-fn read_u32_selector(reader: &mut impl BitInput, variants: [(u32, u8); 4]) -> Result<u32> {
-    let selector = usize::try_from(reader.read_bits(2)?)
-        .map_err(|_| unsupported_error("U32 selector exceeds host address space"))?;
-    let (base, bits) = variants[selector];
-    let extra = u32::try_from(reader.read_bits(bits)?)
-        .map_err(|_| unsupported_error("U32 field exceeds u32"))?;
-    base.checked_add(extra)
-        .ok_or_else(|| unsupported_error("U32 field overflows").into())
+    Ok((ma_config, wp_header, transform_plan))
 }
 
 fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {

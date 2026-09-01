@@ -20,7 +20,12 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
 
 Before submission the decoder inventories the standard image header, frame header, and TOC with
 explicit limits. It parses only the bounded DC-global MA tree, histogram descriptors, hybrid
-integer configuration, context maps, and pass-group ranges needed to build typed GPU metadata.
+integer configuration, context maps, ordered Modular transform metadata, and pass-group ranges
+needed to build typed GPU metadata. RCT, Palette, and explicit or default Squeeze are meta-applied
+to an exact entropy-visible channel topology without decoding pixels. This accounts odd average/
+residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
+prefix under bounded transform/channel/squeeze limits. A portable 32-byte `Pod` descriptor then
+proves every packed channel offset fits WGSL `u32` addressing before backend allocation.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
@@ -66,9 +71,10 @@ the complete logical reconstruction workspace and finalize through the generic o
 exact node/decision/leaf counts, maximum depth, and self-correcting usage; custom synthetic
 engines use the distinct `Fixed` variant.
 
-For the lossless-Modular `WgpuSubmissionEngine`, multiple passes, palette/squeeze and non-YCoCg
-transforms, non-alpha extra channels, patches, splines, noise, and reference-frame animation remain
-typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
+channel topology are parsed, but multiple passes, Palette/Squeeze and non-YCoCg inverse execution,
+non-alpha extra channels, patches, splines, noise, and reference-frame animation remain typed
+unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.

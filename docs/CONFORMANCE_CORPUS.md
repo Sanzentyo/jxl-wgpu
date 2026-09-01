@@ -73,6 +73,13 @@ the existing output oracles. When `cjxl` is available, the staged local-tree tes
 that source admission survives the LF map, releases after final HF submission, and releases
 immediately when its pending session is abandoned. These gates complete `FRONT-03`.
 
+The transform-metadata matrix independently covers all 42 normative RCT types, rejects type 42
+with a typed error, and verifies Palette collapse/delta storage, explicit in-place Squeeze ordering,
+default odd-size Squeeze expansion, meta/non-meta crossing, and portable-address overflow. One
+composed RCT/Palette/Squeeze header is decoded by both the production parser and the Rust `jxl`
+metadata oracle, with every wire field compared. These are parser/topology gates only; they are not
+counted as GPU inverse-transform or pixel-conformance evidence for `MOD-D03`.
+
 ## Procedural VarDCT encoder matrix
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than

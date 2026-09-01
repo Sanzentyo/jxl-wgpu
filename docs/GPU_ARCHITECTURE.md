@@ -176,6 +176,14 @@ may decode the result in tests, but oracle code cannot be reached from a product
 session. The initial interoperable target is a deliberately narrow single-group lossless Modular
 profile; capabilities expand only with valid-bitstream round trips and conformance evidence.
 
+Before that capability gate, the Modular frontend now lowers every RCT, Palette, and Squeeze wire
+record into a bounded transform plan. Meta-application computes the entropy-visible channel list in
+codestream order, including the default Squeeze expansion, odd average/residual extents, accumulated
+shifts, Palette/delta storage at the meta prefix, and transforms that target existing meta channels.
+The plan contains no host pixel data. A checked packed-channel layout proves its complete sample
+address space fits portable WGSL `u32`; the current executor still rejects non-direct topologies
+until their resident inverse passes and lifetime allocation are connected.
+
 ## Protocol execution
 
 For capture/replay tests and codec frontends, `jxl_gpu_protocol` describes planes, resources,

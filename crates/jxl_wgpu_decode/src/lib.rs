@@ -32,6 +32,7 @@ mod error;
 mod inflight;
 mod input_budget;
 mod model;
+mod modular_transform;
 mod modular_tree;
 mod profile;
 mod session;
@@ -55,8 +56,8 @@ pub use buffer_pool::{
 pub use codec_engine::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
 pub use codestream_data::GpuCodestream;
 pub use error::{
-    Error, FrontendIncomplete, FrontendStage, ModularTransformFeature, ModularTreeError, Result,
-    UnsupportedCodestreamFeature, UnsupportedProfile,
+    Error, FrontendIncomplete, FrontendStage, ModularTransformError, ModularTransformFeature,
+    ModularTreeError, Result, UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
