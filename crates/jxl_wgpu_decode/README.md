@@ -30,6 +30,13 @@ Inverse planning walks the stack and each Squeeze parameter in reverse while ret
 current and immediately restored topology, rather than materializing a channel table for every
 transform. The parser also charges the cumulative topology work, so a bounded channel count cannot
 be combined with an adversarially quadratic transform sequence.
+A standalone `ModularSqueezePipeline` executes one horizontal or vertical inverse parameter without
+leaving GPU storage. Average, residual, and destination are checked non-overlapping views of one
+read-write arena, which removes storage-binding alias ambiguity and permits later lifetime reuse.
+Its portable WGSL emulates the required signed 64-bit smooth-tendency intermediate with two `u32`
+words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
+even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
+does not yet schedule this pipeline from the transform plan.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
@@ -76,7 +83,7 @@ exact node/decision/leaf counts, maximum depth, and self-correcting usage; custo
 engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
-channel topology are parsed, but multiple passes, Palette/Squeeze and non-YCoCg inverse execution,
+channel topology are parsed, but multiple passes, Palette, scheduled Squeeze, and non-YCoCg inverse execution,
 non-alpha extra channels, patches, splines, noise, and reference-frame animation remain typed
 unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from

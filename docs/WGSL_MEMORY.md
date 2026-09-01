@@ -29,6 +29,13 @@ other driver-private allocations cannot be measured portably and are not include
   Reverse planning retains two such channel vectors at a time; it does not allocate a topology per
   transform. A separate cumulative topology-work limit rejects legal-looking metadata that would
   otherwise force quadratic host planning before GPU admission.
+- `ModularSqueezeParams` is one 64-byte, 16-byte-aligned `Pod` uniform containing three
+  `width,height,row_stride,word_offset` views and one direction/reserved record. All views address a
+  single read-write storage binding and their complete row footprints must be pairwise disjoint.
+  This avoids binding the same physical `wgpu::Buffer` simultaneously as separate read-only and
+  read-write resources. The kernel uses no workgroup storage; each invocation serially owns one row
+  or column and therefore needs no inter-invocation barrier. Smooth tendency uses two-word integer
+  temporaries because portable WGSL has no `i64`.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size
@@ -50,6 +57,7 @@ name shown in parentheses.
 | `jxl_wgpu/gaborish_rgb.wgsl` | `GaborishRgbUniform` or `ResidentGaborishParams` / `Params` | dimensions/6 strides, then four values for each of X, Y and B: `weight0, weight1, weight2, pad` | 80 | 4 / 16 | uniform |
 | `jxl_wgpu/epf.wgsl` | `EpfUniform` or `ResidentEpfUniform` / `Params` | dimensions/6 image strides, sigma dimensions/stride/kind, 6 filter floats, `_pad0, _pad1` | 80 | 4 / 16 | uniform |
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
+| `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu/upsample.wgsl` | `UpsampleUniform` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, factor, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/xyb_to_rgb.wgsl` | `XybUniform` / `Params` | dimensions/6 strides, three padded inverse-opsin rows, padded cube-root bias, padded scaled bias, `intensity_scale`, 3 pads | 128 | 4 | uniform |

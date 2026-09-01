@@ -85,6 +85,13 @@ channels, leading 8×8/4×4/4×4 planes, no RCT, and a sample count equal to the
 planes. Reverse-topology tests recover data- and meta-Palette selections plus odd Squeeze sources;
 an explicit work-limit case prevents repeated transforms from turning bounded channel metadata into
 unbounded quadratic planning.
+The inverse-Squeeze kernel has separate semantic and execution gates. Naga parses and validates the
+WGSL module without inspecting source substrings. An actual adapter compares horizontal and vertical
+odd extents plus single-pixel axes against a scalar oracle containing `i32::MIN`, `i32::MAX`, smooth
+monotone runs, and wrapping reconstruction. The ABI test fixes the 64-byte/16-byte-aligned `Pod`
+uniform, while malformed arena views must fail with typed geometry, reserved-word, or overlap errors.
+This establishes the primitive itself, not stock-decoder scheduling or complete `MOD-D03` pixel
+conformance.
 
 ## Procedural VarDCT encoder matrix
 

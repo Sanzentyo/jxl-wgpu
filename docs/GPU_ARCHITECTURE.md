@@ -181,8 +181,13 @@ record into a bounded transform plan. Meta-application computes the entropy-visi
 codestream order, including the default Squeeze expansion, odd average/residual extents, accumulated
 shifts, Palette/delta storage at the meta prefix, and transforms that target existing meta channels.
 The plan contains no host pixel data. A checked packed-channel layout proves its complete sample
-address space fits portable WGSL `u32`; the current executor still rejects non-direct topologies
-until their resident inverse passes and lifetime allocation are connected.
+address space fits portable WGSL `u32`. The first resident inverse primitive reconstructs one
+horizontal or vertical Squeeze parameter from pairwise non-overlapping average, residual, and output
+views of one read-write storage arena. One invocation owns a complete row or column because the
+previous reconstructed odd sample is a normative dependency; linear 1/32/64/128/256-lane variants
+parallelize independent lines. Portable two-word signed arithmetic preserves the scalar `i64`
+smooth-tendency calculation over the complete `i32` input domain. The stock executor still rejects
+non-direct topologies until lifetime allocation schedules this primitive and the Palette/RCT passes.
 Inverse lowering does not retain one full channel table per transform. It starts from the final
 entropy topology, reverses each Squeeze parameter and transform, invokes the lowering callback with
 only the current/restored pair, and verifies that the source topology is recovered exactly. A

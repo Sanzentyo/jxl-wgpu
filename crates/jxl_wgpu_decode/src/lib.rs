@@ -32,6 +32,7 @@ mod error;
 mod inflight;
 mod input_budget;
 mod model;
+pub mod modular_squeeze;
 mod modular_transform;
 mod modular_tree;
 mod profile;
