@@ -7,7 +7,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::inventory::{
-    ImageContext, InventoryProgress, ParsedFramePrefix, parse_frame_prefix, parse_image_header,
+    ImageContext, InventoryProgress, LowFrequencyFrameTracker, ParsedFramePrefix,
+    parse_frame_prefix, parse_image_header,
 };
 use crate::{
     BitReader, ContainerStreamEvent, Error as BitReaderError, FrameInventory, FrameSection,
@@ -172,6 +173,7 @@ pub struct CodestreamStreamScanner {
     image_context: Option<ImageContext>,
     is_preview: bool,
     progress: InventoryProgress,
+    lf_frames: LowFrequencyFrameTracker,
     active_frame: Option<ActiveFrame>,
     next_offset: u64,
     frame_count: u32,
@@ -209,6 +211,7 @@ impl CodestreamStreamScanner {
                 total_toc_entries: 0,
                 total_section_bytes: 0,
             },
+            lf_frames: LowFrequencyFrameTracker::new(),
             active_frame: None,
             next_offset: 0,
             frame_count: 0,
@@ -584,7 +587,7 @@ impl CodestreamStreamScanner {
             ))?
             .frame_context(self.is_preview)?;
         let ParsedFramePrefix {
-            frame,
+            mut frame,
             section_start_byte,
             section_end_byte,
             progress,
@@ -597,6 +600,7 @@ impl CodestreamStreamScanner {
             self.limits.inventory,
             self.progress,
         )?;
+        self.lf_frames.resolve(&mut frame)?;
         let frame = Arc::new(frame);
         self.progress = progress;
         self.frame_count = self
@@ -776,6 +780,7 @@ impl CodestreamStreamScanner {
         if active.frame.is_last {
             if active.frame.is_preview {
                 self.is_preview = false;
+                self.lf_frames.clear();
                 self.phase = Phase::FramePrefix;
             } else {
                 self.phase = Phase::AwaitEnd;
@@ -982,6 +987,29 @@ mod tests {
             let (actual, _) = scan_transport(&input, [0..split, split..input.len()]);
             actual.assert_matches(&expected, parsed.codestream());
         }
+    }
+
+    #[test]
+    fn one_byte_progressive_dc_stream_matches_the_resolved_contiguous_chain() {
+        let Some(input) = crate::test_fixtures::cjxl_progressive_dc() else {
+            return;
+        };
+        let parsed = parse(&input, ParseLimits::default()).unwrap();
+        let expected = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let (collected, stats) = scan_transport(&input, (0..input.len()).map(|i| i..i + 1));
+        collected.assert_matches(&expected, parsed.codestream());
+        assert_eq!(stats.frames_started, 3);
+        assert_eq!(stats.frames_completed, 3);
+        assert_eq!(
+            collected
+                .frames
+                .iter()
+                .map(|frame| frame.lf_source_frame)
+                .collect::<Vec<_>>(),
+            vec![None, Some(0), Some(1)]
+        );
     }
 
     #[test]

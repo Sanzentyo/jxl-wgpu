@@ -108,8 +108,10 @@ Every accepted stock Modular reconstruction specialization supports intra-group 
 A consumer-neutral entropy-window planner owns byte-range validation, four-byte packing, sentinel
 space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
 their own resume records and dispatch ordering. The Modular engine, VarDCT AC pass-group consumer,
-and combined/global-tree plus staged local-tree VarDCT packet consumers use it in production;
-recursive streams remain `ENT-D02` work. The planner resolves one upload cap from the
+and combined/global-tree plus staged local-tree VarDCT packet consumers use it in production.
+The common inventory already resolves progressive-DC reads to exact earlier LF producer frames in
+the four normative slots for both contiguous and incremental input; rendering those producers into
+resident LF slots and consuming them without readback remains `ENT-D02` work. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no

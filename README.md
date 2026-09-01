@@ -55,7 +55,10 @@ Both engines copy bounded GPU upload ranges across physical chunk boundaries; Va
 initializes its temporary whole-codestream GPU buffer directly from those spans without a second
 host-sized `Vec`. All Modular and VarDCT scalar metadata bit parsing is span-native, including
 VarDCT block-context maps, custom coefficient-order permutations, MA descriptors, and
-cursor-dependent local-HF headers.
+cursor-dependent local-HF headers. Inventory also resolves each `USE_LF_FRAME` read to its exact
+earlier progressive-DC producer across the four normative LF slots. Missing producers are rejected
+before submission; GPU-resident execution of those dependencies remains the next VarDCT frontend
+step.
 
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.

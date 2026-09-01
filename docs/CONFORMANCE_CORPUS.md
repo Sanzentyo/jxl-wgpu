@@ -50,6 +50,10 @@ section is compared byte-for-byte with its declared absolute range and logical T
 VarDCT fixture proves that payload after the bounded metadata probe still shares caller `Arc`
 storage and that peak prefix retention is sublinear in codestream size. Typed prefix/offset/trailing
 errors, same-call statistics rollback, poisoning, and every truncated basic prefix are covered.
+A libjxl-generated `--progressive_dc=2` VarDCT oracle additionally produces LF level 2, LF level 1,
+and the regular frame. Both contiguous inventory and one-byte event delivery must resolve its
+producer chain exactly as `[None, frame 0, frame 1]`; a synthetic missing level-1 producer must
+return `InventoryError::MissingLowFrequencyFrame` before any engine sees the codestream.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

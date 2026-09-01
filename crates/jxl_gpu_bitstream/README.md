@@ -26,15 +26,19 @@ than reparsing every byte; logical live/peak and cumulative copied-prefix bytes 
 Section payload following the probe retains its `StreamSlice` backing, while a small probe
 overshoot remains backed by the bounded prefix allocation. Byte-drip animation, entropy-permuted
 TOC, version-1 fragment reorder, caller-`Arc` section identity, truncation, rollback, and poisoned
-state tests match the contiguous inventory. Direct GPU-window consumption remains the next layer;
-neither stock decode engine calls this streaming path yet.
+state tests match the contiguous inventory. `GpuDecoder::stream` consumes this event path directly
+and hands its shared spans to the same stock engines used by contiguous input.
 
 After transport validation, `ParsedJxl::codestream_inventory` extracts the standard image header,
 enumerated/ICC color and tone-mapping metadata, typed extra channels, animation timing, complete
 color and extra-channel blending contracts, per-channel upsampling, XYB quant-matrix scales,
 resolved opsin inverse parameters and 2x/4x/8x upsampling weights, progressive-pass schedules,
 exact Gaborish/EPF restoration parameters, frame headers, TOC sizes, and byte/bit ranges for every
-physical frame section. It never decodes image samples or frame-section entropy.
+physical frame section. Progressive-DC inventory records each LF frame's exact level and resolves
+every `USE_LF_FRAME` read to the earlier producer frame in the corresponding one of four normative
+slots; a missing producer is a typed error before GPU submission. The same resolver runs in the
+contiguous and incremental scanners, with a libjxl `--progressive_dc=2` chain checked under
+one-byte delivery. It never decodes image samples or frame-section entropy.
 
 The image-header grammar comes from the lightweight `jxl-image` crate. Frame-header and TOC-size
 grammar is parsed locally with explicit limits. Entropy-coded TOC permutations use the published

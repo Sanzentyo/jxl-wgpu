@@ -530,6 +530,14 @@ pub struct FrameInventory {
     pub frame_type: FrameType,
     pub encoding: FrameEncoding,
     pub flags: u64,
+    /// Progressive-DC level produced by an LF frame (`1..=4`), or zero for every other frame.
+    pub lf_level: u32,
+    /// Earlier frame whose progressive-DC output supplies this frame's LF image.
+    ///
+    /// The referenced level is `lf_level + 1`: a regular frame (`lf_level == 0`) consumes level
+    /// 1, while an LF level-3 frame consumes level 4. `None` means the frame carries its own LF
+    /// image entropy.
+    pub lf_source_frame: Option<u32>,
     pub do_ycbcr: bool,
     pub jpeg_upsampling: [u32; 3],
     pub upsampling: u32,
@@ -560,6 +568,24 @@ pub struct FrameInventory {
     pub sections: Vec<FrameSection>,
 }
 
+impl FrameInventory {
+    /// Whether this frame reads the next coarser progressive-DC level from an earlier LF frame.
+    #[must_use]
+    pub const fn uses_lf_frame(&self) -> bool {
+        self.flags & FLAG_USE_LF_FRAME != 0
+    }
+
+    /// Progressive-DC level read by this frame, if any.
+    #[must_use]
+    pub const fn lf_source_level(&self) -> Option<u32> {
+        if self.uses_lf_frame() {
+            self.lf_level.checked_add(1)
+        } else {
+            None
+        }
+    }
+}
+
 /// Standard codestream metadata and physical frame section ranges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodestreamInventory {
@@ -581,6 +607,10 @@ pub enum InventoryError {
     InvalidEnum { name: &'static str, value: u32 },
     #[error("invalid frame header: {0}")]
     InvalidFrame(&'static str),
+    #[error(
+        "frame {frame_index} references LF level {lf_level}, but no earlier frame produced that level"
+    )]
+    MissingLowFrequencyFrame { frame_index: u32, lf_level: u32 },
     #[error("embedded ICC profile is invalid: {0}")]
     InvalidIcc(String),
     #[error("inventory resource limit exceeded for {0}")]
@@ -638,6 +668,58 @@ pub(crate) struct ParsedFramePrefix {
     pub(crate) progress: InventoryProgress,
 }
 
+/// Resolves JPEG XL's four progressive-DC slots while frames are inventoried in bitstream order.
+///
+/// An LF frame at level `n` writes slot `n - 1`. A frame carrying `USE_LF_FRAME` reads slot
+/// `lf_level`, so the read always names the next coarser level. Keeping producer frame indices in
+/// the inventory makes the eventual GPU-resident dependency graph explicit without retaining
+/// pixels or decoding entropy on the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LowFrequencyFrameTracker {
+    producers: [Option<u32>; 4],
+}
+
+impl LowFrequencyFrameTracker {
+    pub(crate) const fn new() -> Self {
+        Self {
+            producers: [None; 4],
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, frame: &mut FrameInventory) -> Result<(), InventoryError> {
+        frame.lf_source_frame = None;
+        if frame.uses_lf_frame() {
+            let source_level = frame
+                .lf_source_level()
+                .ok_or(InventoryError::SizeOverflow)?;
+            let source_slot =
+                usize::try_from(frame.lf_level).map_err(|_| InventoryError::SizeOverflow)?;
+            let producer = self.producers.get(source_slot).copied().flatten().ok_or(
+                InventoryError::MissingLowFrequencyFrame {
+                    frame_index: frame.frame_index,
+                    lf_level: source_level,
+                },
+            )?;
+            frame.lf_source_frame = Some(producer);
+        }
+
+        if frame.frame_type == FrameType::LowFrequency {
+            let destination_slot = frame
+                .lf_level
+                .checked_sub(1)
+                .and_then(|level| usize::try_from(level).ok())
+                .filter(|&slot| slot < self.producers.len())
+                .ok_or(InventoryError::InvalidFrame("invalid LF level"))?;
+            self.producers[destination_slot] = Some(frame.frame_index);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.producers = [None; 4];
+    }
+}
+
 pub(crate) fn parse_codestream_inventory(
     codestream: &[u8],
     limits: InventoryLimits,
@@ -655,6 +737,7 @@ pub(crate) fn parse_codestream_inventory(
     let mut is_preview = parsed_image.context.preview_size.is_some();
     let mut total_toc_entries = 0usize;
     let mut total_section_bytes = 0u64;
+    let mut lf_frames = LowFrequencyFrameTracker::default();
 
     loop {
         if frames.len() >= limits.max_frames {
@@ -665,7 +748,7 @@ pub(crate) fn parse_codestream_inventory(
 
         let frame_start_byte =
             usize::try_from(reader.bit_offset() / 8).map_err(|_| InventoryError::SizeOverflow)?;
-        let parsed_frame = parse_frame_prefix(
+        let mut parsed_frame = parse_frame_prefix(
             &codestream[frame_start_byte..],
             u64::try_from(frame_start_byte).map_err(|_| InventoryError::SizeOverflow)?,
             frame_index,
@@ -677,6 +760,7 @@ pub(crate) fn parse_codestream_inventory(
                 total_section_bytes,
             },
         )?;
+        lf_frames.resolve(&mut parsed_frame.frame)?;
         if parsed_frame.section_end_byte > codestream_bytes {
             return Err(InventoryError::UnexpectedEndOfBits {
                 bit_offset: parsed_frame
@@ -711,6 +795,7 @@ pub(crate) fn parse_codestream_inventory(
         if is_last {
             if is_preview {
                 is_preview = false;
+                lf_frames.clear();
             } else {
                 break;
             }
@@ -850,6 +935,8 @@ pub(crate) fn parse_frame_prefix(
         frame_type: header.frame_type,
         encoding: header.encoding,
         flags: header.flags,
+        lf_level: header.lf_level,
+        lf_source_frame: None,
         do_ycbcr: header.do_ycbcr,
         jpeg_upsampling: header.jpeg_upsampling,
         upsampling: header.upsampling,
@@ -2294,6 +2381,43 @@ mod tests {
         );
         assert_eq!(frame.sections[0].bytes.offset, 31);
         assert_eq!(frame.sections.last().unwrap().bytes.end(), Some(88_995));
+    }
+
+    #[test]
+    fn libjxl_progressive_dc_frames_resolve_the_exact_lf_chain() {
+        let Some(codestream) = crate::test_fixtures::cjxl_progressive_dc() else {
+            return;
+        };
+        let inventory = inventory(&codestream);
+        assert_eq!(inventory.frames.len(), 3);
+        assert_eq!(
+            inventory
+                .frames
+                .iter()
+                .map(|frame| (frame.frame_type, frame.lf_level, frame.lf_source_frame))
+                .collect::<Vec<_>>(),
+            vec![
+                (FrameType::LowFrequency, 2, None),
+                (FrameType::LowFrequency, 1, Some(0)),
+                (FrameType::Regular, 0, Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_progressive_dc_producer_is_a_typed_inventory_error() {
+        let mut frame = inventory(&crate::test_fixtures::basic()).frames.remove(0);
+        frame.flags |= FLAG_USE_LF_FRAME;
+        let error = LowFrequencyFrameTracker::default()
+            .resolve(&mut frame)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            InventoryError::MissingLowFrequencyFrame {
+                frame_index: 0,
+                lf_level: 1,
+            }
+        );
     }
 
     #[test]
