@@ -10,10 +10,10 @@ use jxl_gpu_protocol::{
 };
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
-    MemoryPermit, ResidentEpfInputs, ResidentF32Plane, ResidentGaborishInputs,
-    ResidentStorageBinding, ResidentVarDctInputs, ResidentVarDctRenderConfig,
-    ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
-    UnvalidatedGpuImageOutput, WgpuBackend,
+    MemoryPermit, ResidentChromaShift, ResidentChromaUpsampleInputs, ResidentEpfInputs,
+    ResidentF32Plane, ResidentGaborishInputs, ResidentStorageBinding, ResidentVarDctInputs,
+    ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
+    UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
@@ -532,6 +532,8 @@ struct VarDctGroupJobBuffers {
 
 struct RestorationJobBuffers {
     _planes: [wgpu::Buffer; 3],
+    _pre_restoration_planes: Option<[wgpu::Buffer; 3]>,
+    _pre_restoration_uniforms: Vec<wgpu::Buffer>,
     _gaborish_uniform: Option<wgpu::Buffer>,
     _epf_sigma: Option<wgpu::Buffer>,
     _epf_sigma_uniforms: Vec<wgpu::Buffer>,
@@ -2446,6 +2448,25 @@ fn submit_vardct(
             wgpu::BufferUsages::COPY_DST,
         )
     });
+    let pre_restoration_planes = (source.memory.pre_restoration_upsample_bytes != 0).then(|| {
+        let labels = [
+            "jxl-wgpu VarDCT pre-restoration X plane",
+            "jxl-wgpu VarDCT pre-restoration Y plane",
+            "jxl-wgpu VarDCT pre-restoration B plane",
+        ];
+        let full_plane_bytes = source.memory.restoration_scratch_bytes / 3;
+        std::array::from_fn(|channel| {
+            if source.packet.profile.channel_shifts[channel].is_subsampled() {
+                storage(
+                    labels[channel],
+                    full_plane_bytes,
+                    wgpu::BufferUsages::empty(),
+                )
+            } else {
+                resident_planes[channel].clone()
+            }
+        })
+    });
     let restoration_planes = (source.gaborish.is_some() || source.epf.is_some()).then(|| {
         let labels = [
             "jxl-wgpu VarDCT restoration scratch X plane",
@@ -2455,7 +2476,7 @@ fn submit_vardct(
         std::array::from_fn(|channel| {
             storage(
                 labels[channel],
-                source.memory.resident_plane_bytes[channel],
+                source.memory.restoration_scratch_bytes / 3,
                 wgpu::BufferUsages::empty(),
             )
         })
@@ -3094,9 +3115,46 @@ fn submit_vardct(
     }
     let image_width = source.packet.profile.width;
     let image_height = source.packet.profile.height;
+    let mut pre_restoration_uniforms = Vec::new();
+    if let Some(upsampled) = &pre_restoration_planes {
+        for channel in 0..3 {
+            let shift = source.packet.profile.channel_shifts[channel];
+            if !shift.is_subsampled() {
+                continue;
+            }
+            let [input_width, input_height] = shift
+                .shifted_extent(image_width, image_height)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "pre-restoration input extent",
+                })?;
+            pre_restoration_uniforms.push(pipelines.chroma_upsample.encode(
+                device,
+                &mut commands,
+                ResidentChromaUpsampleInputs {
+                    input: ResidentF32Plane {
+                        storage: resident_binding(&resident_planes[channel])?,
+                        width: input_width,
+                        height: input_height,
+                        stride: padded_width >> shift.horizontal,
+                    },
+                    output: ResidentF32Plane {
+                        storage: resident_binding(&upsampled[channel])?,
+                        width: image_width,
+                        height: image_height,
+                        stride: padded_width,
+                    },
+                    shift: ResidentChromaShift {
+                        horizontal: shift.horizontal != 0,
+                        vertical: shift.vertical != 0,
+                    },
+                },
+            )?);
+        }
+    }
+    let restoration_source = pre_restoration_planes.as_ref().unwrap_or(&resident_planes);
     let mut restoration = restoration_planes
         .as_ref()
-        .map(|scratch| RestorationCursor::new(&resident_planes, scratch));
+        .map(|scratch| RestorationCursor::new(restoration_source, scratch));
     let gaborish_uniform = match (source.gaborish, restoration.as_mut()) {
         (Some(weights), Some(restoration)) => {
             let (input_buffers, output_buffers) = restoration.advance();
@@ -3224,6 +3282,8 @@ fn submit_vardct(
     debug_assert_eq!(output_scratch.plan, source.output_plan);
     let restoration_buffers = restoration_planes.map(|planes| RestorationJobBuffers {
         _planes: planes,
+        _pre_restoration_planes: pre_restoration_planes,
+        _pre_restoration_uniforms: pre_restoration_uniforms,
         _gaborish_uniform: gaborish_uniform,
         _epf_sigma: epf_sigma,
         _epf_sigma_uniforms: epf_sigma_uniforms,

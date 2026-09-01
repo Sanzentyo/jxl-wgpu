@@ -85,6 +85,13 @@ source with libjpeg-turbo 3.2.0 `cjpeg -quality 90 -sample` values `1x1,1x1,1x1`
 `2x1,1x1,1x1`, and `1x2,1x1,1x1`, then losslessly transcoded by `cjxl` 0.12.0. Their containers
 retain `jbrd` reconstruction data, but this decoder assertion covers the `jxlc` pixels rather than
 claiming bit-identical JPEG reconstruction.
+The reusable pre-restoration component primitive has a separate actual-adapter differential. It
+executes horizontal, vertical, and fused two-axis interpolation into an odd 5x3 output and compares
+every F32 sample with a scalar quarter/three-quarter, replicated-edge oracle. Naga also validates
+both WGSL modules semantically, and compile-time plus unit checks fix the shared 32-byte,
+16-byte-aligned resident `Pod` uniform. This proves the primitive and its odd-edge geometry; the
+corpus still lacks a valid JPEG XL codestream that combines component subsampling with signaled
+Gaborish or EPF, so it is not yet end-to-end subsampled-restoration conformance evidence.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

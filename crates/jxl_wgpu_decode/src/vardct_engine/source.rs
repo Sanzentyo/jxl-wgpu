@@ -7,8 +7,8 @@ use jxl_gpu_bitstream::{
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
-    KernelVariant, ResidentEpfMemoryPlan, ResidentGaborishWeights, ResidentVarDctMemoryPlan,
-    WgpuBackend,
+    KernelVariant, ResidentChromaUpsampleMemoryPlan, ResidentEpfMemoryPlan,
+    ResidentGaborishWeights, ResidentVarDctMemoryPlan, WgpuBackend,
 };
 
 use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
@@ -181,11 +181,6 @@ pub(super) fn prepare_source(
     if has_subsampled_channels && packet.profile.adaptive_lf_smoothing {
         return Err(VarDctDecodeError::UnsupportedSubsampledStage {
             stage: "adaptive LF smoothing",
-        });
-    }
-    if has_subsampled_channels && (gaborish.is_some() || epf_header.is_some()) {
-        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-            stage: "restoration filter",
         });
     }
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
@@ -625,6 +620,15 @@ fn validate_device_limits(
             true,
         ),
         (
+            "one pre-restoration upsample plane",
+            if memory.pre_restoration_upsample_bytes == 0 {
+                0
+            } else {
+                memory.restoration_scratch_bytes / 3
+            },
+            true,
+        ),
+        (
             "one restoration scratch plane",
             memory.restoration_scratch_bytes / 3,
             true,
@@ -665,6 +669,14 @@ fn validate_device_limits(
             },
         ),
         ("Gaborish uniform", memory.gaborish_uniform_bytes),
+        (
+            "pre-restoration upsample uniform",
+            if memory.pre_restoration_upsample_uniform_bytes == 0 {
+                0
+            } else {
+                ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
+            },
+        ),
         ("EPF sigma uniform", epf_sigma_uniform_bytes),
         (
             "one EPF filter uniform",

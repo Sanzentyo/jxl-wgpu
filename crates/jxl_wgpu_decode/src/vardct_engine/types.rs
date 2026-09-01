@@ -3,9 +3,9 @@ use jxl_gpu_formats::{
     PixelFormat, RgbChannelOrder, TransferFunction, YcbcrEncoding,
 };
 use jxl_wgpu::{
-    MemoryBudgetError, ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError,
-    ResidentGaborishMemoryPlan, ResidentVarDctError, ResidentVarDctMemoryPlan,
-    SubmissionPollerError,
+    MemoryBudgetError, ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan,
+    ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
+    ResidentVarDctError, ResidentVarDctMemoryPlan, SubmissionPollerError,
 };
 use thiserror::Error;
 
@@ -79,6 +79,8 @@ pub enum VarDctDecodeError {
     Resource(#[from] VarDctResourceError),
     #[error(transparent)]
     Resident(#[from] ResidentVarDctError),
+    #[error(transparent)]
+    ChromaUpsample(#[from] ResidentChromaUpsampleError),
     #[error(transparent)]
     Gaborish(#[from] ResidentGaborishError),
     #[error(transparent)]
@@ -255,6 +257,11 @@ pub struct VarDctDecodeMemoryStats {
     /// physically smaller buffers rather than full-resolution padding.
     pub resident_plane_bytes: [u64; 3],
     pub resident_image_bytes: u64,
+    /// Full-resolution destinations allocated only for shifted components before restoration.
+    pub pre_restoration_upsample_bytes: u64,
+    /// One 32-byte interpolation uniform for each shifted component.
+    pub pre_restoration_upsample_uniform_bytes: u64,
+    /// Three full-resolution ping-pong destinations shared by Gaborish and EPF.
     pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
     pub epf_sigma_bytes: u64,
@@ -539,8 +546,47 @@ impl VarDctDecodeMemoryStats {
         let resident_plane_bytes = [resident_x?, resident_y?, resident_b?];
         let resident_image_bytes =
             checked_sum(resident_plane_bytes, "resident component image bytes")?;
+        let full_plane_bytes = u64::from(blocks_x)
+            .checked_mul(8)
+            .and_then(|width| {
+                u64::from(blocks_y)
+                    .checked_mul(8)
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "full-resolution restoration plane bytes",
+            })?;
+        let shifted_channel_count = packet
+            .profile
+            .channel_shifts
+            .into_iter()
+            .filter(|shift| shift.is_subsampled())
+            .count() as u64;
+        let pre_restoration_upsample_bytes = if restoration_scratch {
+            full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "pre-restoration upsample bytes",
+                },
+            )?
+        } else {
+            0
+        };
+        let pre_restoration_upsample_uniform_bytes = if restoration_scratch {
+            ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
+                .checked_mul(shifted_channel_count)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "pre-restoration upsample uniform bytes",
+                })?
+        } else {
+            0
+        };
         let restoration_scratch_bytes = if restoration_scratch {
-            resident_image_bytes
+            full_plane_bytes
+                .checked_mul(3)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "restoration scratch bytes",
+                })?
         } else {
             0
         };
@@ -599,6 +645,8 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             resident_image_bytes,
+            pre_restoration_upsample_bytes,
+            pre_restoration_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
@@ -655,6 +703,8 @@ impl VarDctDecodeMemoryStats {
             hf_sink_uniform_bytes,
             resident_plane_bytes,
             resident_image_bytes,
+            pre_restoration_upsample_bytes,
+            pre_restoration_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,

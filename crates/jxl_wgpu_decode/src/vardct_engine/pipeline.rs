@@ -3,8 +3,8 @@ use std::sync::{Arc, atomic::AtomicUsize};
 
 use jxl_gpu_bitstream::{CodestreamInventory, InventoryLimits, ParseLimits};
 use jxl_wgpu::{
-    KernelVariant, MemoryBudget, MemoryBudgetSnapshot, ResidentEpfPipeline,
-    ResidentGaborishPipeline, ResidentVarDctRenderer, WgpuBackend,
+    KernelVariant, MemoryBudget, MemoryBudgetSnapshot, ResidentChromaUpsamplePipeline,
+    ResidentEpfPipeline, ResidentGaborishPipeline, ResidentVarDctRenderer, WgpuBackend,
 };
 
 use crate::progressive_dc::ProgressiveDcPipeline;
@@ -32,6 +32,7 @@ pub(super) struct VarDctPipelines {
     pub(super) artifact: HfMetadataLoweringPipeline,
     pub(super) hf_coefficients: HfCoefficientPipeline,
     pub(super) renderer: ResidentVarDctRenderer,
+    pub(super) chroma_upsample: ResidentChromaUpsamplePipeline,
     pub(super) gaborish: ResidentGaborishPipeline,
     pub(super) epf_sigma: EpfSigmaPipeline,
     pub(super) epf: ResidentEpfPipeline,
@@ -49,6 +50,8 @@ impl VarDctPipelines {
             resolve_kernel_variant(backend, "vardct_output", KernelVariant::Lanes256)?;
         let gaborish_variant =
             resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
+        let chroma_upsample_variant =
+            resolve_kernel_variant(backend, "vardct_chroma_upsample", KernelVariant::Tile16x16)?;
         let epf_sigma_variant =
             resolve_kernel_variant(backend, "vardct_epf_sigma", KernelVariant::Lanes64)?;
         let epf_variant = resolve_kernel_variant(backend, "vardct_epf", KernelVariant::Tile16x16)?;
@@ -68,6 +71,10 @@ impl VarDctPipelines {
             artifact: HfMetadataLoweringPipeline::new(device),
             hf_coefficients: HfCoefficientPipeline::new(device),
             renderer: ResidentVarDctRenderer::new(device),
+            chroma_upsample: ResidentChromaUpsamplePipeline::with_variant(
+                device,
+                chroma_upsample_variant,
+            )?,
             gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,

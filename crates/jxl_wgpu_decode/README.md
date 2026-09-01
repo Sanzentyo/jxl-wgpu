@@ -185,9 +185,14 @@ through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, frame upsampling, spectral progressive pass, or other frame feature.
-Subsampled YCbCr currently requires adaptive LF smoothing and restoration to be disabled; those
-pre-upsampling stages return a typed error until their resident scheduler is connected. A separate
-stock path accepts recursive progressive-DC dependencies. It keeps three F32
+Subsampled YCbCr still rejects adaptive LF smoothing because that LF-domain step needs
+component-aware scheduling. Gaborish and EPF are connected: shifted components use a fused
+horizontal/vertical quarter/three-quarter resident upsample before the full-resolution restoration
+cursor, while unshifted component buffers are reused directly. All destination planes and 32-byte
+`Pod` uniforms are included in the shared byte budget. The interpolation primitive is actual-GPU
+tested on horizontal, vertical, two-axis, odd-edge cases; a valid subsampled-restoration codestream
+fixture is still needed for end-to-end libjxl conformance. A separate stock path accepts recursive
+progressive-DC dependencies. It keeps three F32
 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
 hidden and visible status, and publishes only the final frame. A single-entry intermediate frame
 first executes HF metadata on GPU, maps its bounded HF-global cursor, host-parses only scalar
@@ -361,8 +366,8 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
-progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF/restoration,
-uncommon asymmetric JPEG component layouts and other Modular side images,
+progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
+valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

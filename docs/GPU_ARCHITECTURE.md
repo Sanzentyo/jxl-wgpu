@@ -187,22 +187,28 @@ buffer. The inverse transform dispatches each independently bounded LF-group art
 padded resident planes. XYB groups use coalesced full-image LF storage and chroma-from-luma. The
 bounded JPEG-reconstruction path instead retains exact component-sized LF/AC grids in Cb/Y/Cr
 order; each task carries a channel mask, component destination, and LF offset so 4:2:2, 4:4:0, and
-4:2:0 chroma never expands before final output. Group-local LF and correlation data first scatter into their resident
+4:2:0 chroma does not expand during coefficient reconstruction. Group-local LF and correlation data first scatter into their resident
 atlases; adaptive LF smoothing runs once over an XYB atlas, or the standard skip flag writes LF
 directly to the transform input.
-An optional fused Gaborish dispatch reads only the actual image extent with mirrored image-edge
+For a subsampled frame that signals restoration, each shifted component is expanded into its own
+full-resolution resident plane immediately before filtering. One-axis sampling uses the reusable
+horizontal/vertical quarter/three-quarter kernel; 4:2:0 uses the fused two-axis kernel and avoids an
+intermediate plane. Unshifted components retain their compact buffer handle by reference. An
+optional fused Gaborish dispatch then reads only the actual image extent with mirrored image-edge
 sampling. When EPF is enabled, one linear dispatch per LF group lowers per-transform `hf_mul` and
 per-block sharpness into disjoint rectangles of the full-image inverse-sigma plane, then the
 signaled EPF0/EPF1/EPF2 sequence and Gaborish advance one shared restoration cursor between the
 resident image and one three-plane scratch set. The output packer consumes whichever set is current
 after the final pass. For JPEG reconstruction it performs separable quarter/three-quarter 2x
 upsampling with replicated edges and encoded BT.601 YCbCr conversion in the same packed-output
-dispatch. Subsampled adaptive LF and restoration reject with a typed error until those stages have
-component-aware scheduling. Global-tree frames copy every LF group's packet and artifact status
+dispatch when restoration is disabled, and consumes the already full-resolution planes when it is
+enabled. Subsampled adaptive LF still rejects with a typed error until LF-domain component-aware
+scheduling is implemented. Global-tree frames copy every LF group's packet and artifact status
 plus all pass-group records into one mapped staging buffer. Local-tree frames map that buffer once for LF
 cursors and once for final validation. No coefficient or pixel crosses the host. The
-three F32 scratch planes, inverse-sigma plane, and exact 80-byte restoration uniforms are included
-in the same backend byte admission as entropy, transform, output, and aggregate validation storage.
+three F32 scratch planes, full-resolution shifted-component destinations, inverse-sigma plane,
+32-byte interpolation uniforms, and exact 80-byte restoration uniforms are included in the same
+backend byte admission as entropy, transform, output, and aggregate validation storage.
 
 An unsupported profile rejects during capability negotiation or header validation. A CPU oracle
 may decode the result in tests, but oracle code cannot be reached from a production encode/decode

@@ -34,6 +34,7 @@ mod pipeline_cache;
 mod planner;
 mod poller;
 mod readback;
+mod resident_chroma_upsample;
 mod resident_epf;
 mod resident_gaborish;
 mod resident_vardct;
@@ -75,6 +76,10 @@ pub use readback::{
     ImageReadbackBatchResult, ImageReadbackBatchSubmission, ImageReadbackLimits,
     ImageReadbackMapping, ImageReadbackPipeline, ImageReadbackResult, ImageReadbackStats,
     ImageReadbackSubmission, UnvalidatedImageReadbackResult, UnvalidatedImageReadbackSubmission,
+};
+pub use resident_chroma_upsample::{
+    ResidentChromaShift, ResidentChromaUpsampleError, ResidentChromaUpsampleInputs,
+    ResidentChromaUpsampleMemoryPlan, ResidentChromaUpsamplePipeline,
 };
 pub use resident_epf::{
     ResidentEpfError, ResidentEpfInputs, ResidentEpfMemoryPlan, ResidentEpfParameters,
