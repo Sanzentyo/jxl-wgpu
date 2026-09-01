@@ -40,8 +40,10 @@ The incremental transport scanner accepts arbitrary shared chunks for raw, `jxlc
 out-of-order v1 `jxlp` delivery. Apart from the inline reconstructed two-byte codestream signature,
 ordered codestream and auxiliary-box payloads remain zero-copy `Arc` slices; only future fragments
 waiting on a v1 gap use payload-only storage bounded by explicitly reported logical bytes. Its
-terminal event validates transport end-of-input, but the stock decode engines still require
-contiguous inventory and frame-section integration, so this is not yet an incremental `GpuDecoder`
+terminal event validates transport end-of-input. A second bounded scanner incrementally parses the
+image header and each frame header/TOC, emits frame inventories before their physical sections, and
+routes ordered section ranges without retaining the whole codestream. The stock decode engines
+still require contiguous section integration, so this is not yet an incremental `GpuDecoder`
 claim.
 
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory

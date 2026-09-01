@@ -16,8 +16,18 @@ as soon as the gap closes. Auxiliary-box events preserve the exact 8/16-byte hea
 stream payload slices without assembling the box. Typed limits cover input chunks, total input,
 box count/size, codestream size, and buffered future fragments. The
 terminal `End` event is emitted only after end-of-input validates transport order and completeness;
-earlier events are deliberately non-authoritative. Incremental frame-header/TOC inventory and
-direct GPU-window consumption remain the next layer and do not call the contiguous `parse` path.
+earlier events are deliberately non-authoritative.
+
+`CodestreamStreamScanner` observes those transport events by reference, so auxiliary metadata
+remains available to the caller. It reconstructs only bounded image-header and current-frame
+header/TOC probes, then emits an `Arc`-owned image inventory, an `Arc`-owned frame inventory, and
+ordered `SectionChunk` ranges as soon as each TOC is known. Probe sizes grow geometrically rather
+than reparsing every byte; logical live/peak and cumulative copied-prefix bytes are observable.
+Section payload following the probe retains its `StreamSlice` backing, while a small probe
+overshoot remains backed by the bounded prefix allocation. Byte-drip animation, entropy-permuted
+TOC, version-1 fragment reorder, caller-`Arc` section identity, truncation, rollback, and poisoned
+state tests match the contiguous inventory. Direct GPU-window consumption remains the next layer;
+neither stock decode engine calls this streaming path yet.
 
 After transport validation, `ParsedJxl::codestream_inventory` extracts the standard image header,
 enumerated/ICC color and tone-mapping metadata, typed extra channels, animation timing, complete

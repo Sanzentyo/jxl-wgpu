@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod acceleration;
 mod inventory;
+mod inventory_stream;
 mod stream;
 
 #[cfg(test)]
@@ -85,6 +86,10 @@ pub use inventory::{
     OpsinInverseMatrixInventory, PrimariesInventory, RenderingIntentInventory,
     RestorationFilterInventory, SampleBitDepth, ToneMappingInventory, TransferFunctionInventory,
     UpsamplingWeightsInventory, WhitePointInventory,
+};
+pub use inventory_stream::{
+    CodestreamInventoryEvent, CodestreamStreamError, CodestreamStreamLimits, CodestreamStreamPhase,
+    CodestreamStreamScanner, CodestreamStreamStats,
 };
 pub use stream::{
     ContainerBoxSizeEncoding, ContainerStreamBoxHeader, ContainerStreamContext,

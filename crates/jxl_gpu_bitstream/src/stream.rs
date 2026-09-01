@@ -16,9 +16,9 @@ const MAX_HEADER_BYTES: usize = 20;
 /// Independent limits for incremental transport ingestion.
 ///
 /// `parse` limits the complete logical input. `max_chunk_bytes` bounds one caller-owned input
-/// allocation retained by emitted zero-copy slices. `max_buffered_fragment_bytes` bounds the only
-/// potentially large scanner-owned storage: future `jxlp` fragments received before a missing
-/// earlier fragment in file-type version 1 containers.
+/// allocation retained by emitted zero-copy slices. `max_buffered_fragment_bytes` bounds logical
+/// payload in the only potentially large scanner-owned storage: future `jxlp` fragments received
+/// before a missing earlier fragment in file-type version 1 containers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContainerStreamLimits {
     pub parse: ParseLimits,
@@ -58,6 +58,22 @@ pub struct StreamSlice {
 }
 
 impl StreamSlice {
+    /// Wraps a complete caller-owned allocation without copying its bytes.
+    #[must_use]
+    pub fn from_shared(storage: Arc<[u8]>) -> Self {
+        let length = storage.len();
+        Self::shared(storage, 0..length)
+    }
+
+    /// Wraps a checked range of a caller-owned allocation without copying its bytes.
+    #[must_use]
+    pub fn from_shared_range(storage: Arc<[u8]>, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > storage.len() {
+            return None;
+        }
+        Some(Self::shared(storage, range))
+    }
+
     fn shared(storage: Arc<[u8]>, range: Range<usize>) -> Self {
         debug_assert!(range.start <= range.end && range.end <= storage.len());
         Self {
@@ -73,7 +89,7 @@ impl StreamSlice {
         }
     }
 
-    fn owned(bytes: Vec<u8>) -> Self {
+    pub(crate) fn owned(bytes: Vec<u8>) -> Self {
         let length = bytes.len();
         Self {
             storage: StreamStorage::Buffered(Arc::new(bytes)),
@@ -117,6 +133,20 @@ impl StreamSlice {
     #[must_use]
     pub fn storage_range(&self) -> Range<usize> {
         self.range.clone()
+    }
+
+    /// Returns a relative subrange with the same backing storage.
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.len() {
+            return None;
+        }
+        let start = self.range.start.checked_add(range.start)?;
+        let end = self.range.start.checked_add(range.end)?;
+        Some(Self {
+            storage: self.storage.clone(),
+            range: start..end,
+        })
     }
 }
 
@@ -1161,6 +1191,26 @@ mod tests {
             &shared_tail.expect("raw payload tail is emitted")
         ));
         scanner.finish_input().unwrap();
+    }
+
+    #[test]
+    fn public_shared_slice_constructor_checks_ranges_without_copying() {
+        let storage: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
+        let slice = StreamSlice::from_shared_range(Arc::clone(&storage), 1..3).unwrap();
+        assert_eq!(slice.bytes(), [2, 3]);
+        assert!(Arc::ptr_eq(
+            &storage,
+            &slice
+                .shared_storage()
+                .expect("shared range retains its Arc")
+        ));
+        let reversed_start = 3;
+        let reversed_end = 2;
+        assert!(
+            StreamSlice::from_shared_range(Arc::clone(&storage), reversed_start..reversed_end)
+                .is_none()
+        );
+        assert!(StreamSlice::from_shared_range(storage, 0..5).is_none());
     }
 
     #[test]

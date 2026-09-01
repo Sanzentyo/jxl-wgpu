@@ -53,9 +53,17 @@ signature, raw, `jxlc`, and in-order `jxlp` payloads are emitted as ranges over 
 buffer per fragment under a separate logical-byte limit, then release it when its logical turn is
 emitted. Auxiliary box start/chunk/end events retain the original compact, extended, or to-end
 header bytes. No output is authoritative until the end-of-input event validates transport and
-fragment completeness. The current inventory and both decode engines still consume a contiguous
-codestream, so incremental header/TOC state and direct entropy-window ingestion remain an explicit
-frontend boundary rather than being hidden behind whole-input reassembly.
+fragment completeness.
+
+`CodestreamStreamScanner` observes that event stream without taking ownership of auxiliary boxes.
+It copies only a separately limited image or current-frame metadata probe, parses the image header
+and frame header/TOC at geometrically increasing probe sizes, emits `Arc<FrameInventory>` before
+section bytes, and splits subsequent `StreamSlice` ranges at exact physical TOC boundaries. A
+probe may contain a bounded section prefix; that tail keeps the probe allocation rather than being
+copied again, while later section ranges retain caller/transport backing. Complete image/frame/TOC
+state no longer requires a contiguous codestream. Both decode engines still own contiguous input,
+so adapting these section events to their existing bounded entropy upload windows remains the next
+frontend boundary rather than being hidden behind reassembly.
 
 `GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
 inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that

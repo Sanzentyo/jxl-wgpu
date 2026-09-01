@@ -40,8 +40,17 @@ future fragment under a four-byte limit must fail with typed
 `BufferedFragmentSizeLimit` before retained state survives the error. Typed count/size limits cover
 the mandatory file-type box, every prefix of a real fragmented animation is either rejected or
 matches the existing contiguous transport parser exactly, and a poisoned scanner rejects further
-input. These are transport tests only; incremental inventory and GPU decode evidence are still
-required before `FRONT-03` can be complete.
+input.
+
+`CodestreamStreamScanner` is then checked against the complete contiguous inventory at every
+two-chunk split of the basic fixture and under byte-at-a-time fragmented animation, entropy-coded
+TOC permutation, and out-of-order version-1 delivery. The event order is image header, frame/TOC,
+physical section ranges, frame end, and finally authoritative stream end. Every reconstructed
+section is compared byte-for-byte with its declared absolute range and logical TOC index. A large
+VarDCT fixture proves that payload after the bounded metadata probe still shares caller `Arc`
+storage and that peak prefix retention is sublinear in codestream size. Typed prefix/offset/trailing
+errors, same-call statistics rollback, poisoning, and every truncated basic prefix are covered.
+Direct GPU entropy-window ingestion is still required before `FRONT-03` can be complete.
 
 ## Procedural VarDCT encoder matrix
 

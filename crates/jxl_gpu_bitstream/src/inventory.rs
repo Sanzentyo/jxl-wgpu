@@ -593,14 +593,14 @@ pub enum InventoryError {
     SizeOverflow,
 }
 
-struct ParsedImageHeader {
-    inventory: ImageHeaderInventory,
-    frame_start_bits: u64,
-    context: ImageContext,
+pub(crate) struct ParsedImageHeader {
+    pub(crate) inventory: ImageHeaderInventory,
+    pub(crate) frame_start_bits: u64,
+    pub(crate) context: ImageContext,
 }
 
 #[derive(Clone, Copy)]
-struct ImageContext {
+pub(crate) struct ImageContext {
     width: u32,
     height: u32,
     preview_size: Option<(u32, u32)>,
@@ -608,6 +608,34 @@ struct ImageContext {
     num_extra_channels: u32,
     have_animation: bool,
     have_timecodes: bool,
+}
+
+impl ImageContext {
+    pub(crate) fn frame_context(self, is_preview: bool) -> Result<FrameContext, InventoryError> {
+        let mut context = FrameContext::from_image(self);
+        if is_preview {
+            let (width, height) = self
+                .preview_size
+                .ok_or(InventoryError::InvalidFrame("missing preview size"))?;
+            context.width = width;
+            context.height = height;
+        }
+        Ok(context)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InventoryProgress {
+    pub(crate) total_toc_entries: usize,
+    pub(crate) total_section_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedFramePrefix {
+    pub(crate) frame: FrameInventory,
+    pub(crate) section_start_byte: u64,
+    pub(crate) section_end_byte: u64,
+    pub(crate) progress: InventoryProgress,
 }
 
 pub(crate) fn parse_codestream_inventory(
@@ -633,144 +661,52 @@ pub(crate) fn parse_codestream_inventory(
             return Err(InventoryError::ResourceLimit("frame count"));
         }
         let frame_index = u32::try_from(frames.len()).map_err(|_| InventoryError::SizeOverflow)?;
-        let frame_context = if is_preview {
-            let (width, height) = parsed_image
-                .context
-                .preview_size
-                .ok_or(InventoryError::InvalidFrame("missing preview size"))?;
-            FrameContext {
-                width,
-                height,
-                ..FrameContext::from_image(parsed_image.context)
-            }
-        } else {
-            FrameContext::from_image(parsed_image.context)
-        };
+        let frame_context = parsed_image.context.frame_context(is_preview)?;
 
-        let header_start = reader.bit_offset();
-        let header = parse_frame_header(&mut reader, frame_context, is_preview, limits)?;
-        let header_end = reader.bit_offset();
-        if header_end
-            .checked_sub(header_start)
-            .ok_or(InventoryError::SizeOverflow)?
-            > limits.max_frame_header_bits
-        {
-            return Err(InventoryError::ResourceLimit("frame header bits"));
-        }
-
-        let counts = compute_frame_counts(&header)?;
-        if counts.toc_entries > MAX_TOC_ENTRIES {
-            return Err(InventoryError::InvalidFrame("too many TOC entries"));
-        }
-        let toc_entries = usize::try_from(counts.toc_entries)
-            .map_err(|_| InventoryError::ResourceLimit("TOC entries per frame"))?;
-        if toc_entries > limits.max_toc_entries_per_frame {
-            return Err(InventoryError::ResourceLimit("TOC entries per frame"));
-        }
-        total_toc_entries = total_toc_entries
-            .checked_add(toc_entries)
-            .ok_or(InventoryError::SizeOverflow)?;
-        if total_toc_entries > limits.max_total_toc_entries {
-            return Err(InventoryError::ResourceLimit("total TOC entries"));
-        }
-
-        let toc_start = reader.bit_offset();
-        let toc = parse_toc(&mut reader, toc_entries, codestream)?;
-        let toc_end = reader.bit_offset();
-        let section_start_byte = toc_end / 8;
-        let mut section_cursor = section_start_byte;
-        let mut sections = Vec::new();
-        sections
-            .try_reserve_exact(toc_entries)
-            .map_err(|_| InventoryError::AllocationFailed("frame sections"))?;
-
-        for (bitstream_index, (&toc_index, &length)) in toc
-            .logical_indices_in_bitstream_order
-            .iter()
-            .zip(&toc.entry_lengths_in_bitstream_order)
-            .enumerate()
-        {
-            let length = u64::from(length);
-            total_section_bytes = total_section_bytes
-                .checked_add(length)
-                .ok_or(InventoryError::SizeOverflow)?;
-            if total_section_bytes > limits.max_total_section_bytes {
-                return Err(InventoryError::ResourceLimit("total frame section bytes"));
-            }
-            let section_end = section_cursor
-                .checked_add(length)
-                .ok_or(InventoryError::SizeOverflow)?;
-            if section_end > codestream_bytes {
-                return Err(InventoryError::UnexpectedEndOfBits {
-                    bit_offset: reader.bit_offset(),
-                });
-            }
-            let bit_offset = section_cursor
-                .checked_mul(8)
-                .ok_or(InventoryError::SizeOverflow)?;
-            let bit_length = length.checked_mul(8).ok_or(InventoryError::SizeOverflow)?;
-            sections.push(FrameSection {
-                bitstream_index: u32::try_from(bitstream_index)
-                    .map_err(|_| InventoryError::SizeOverflow)?,
-                toc_index: u32::try_from(toc_index).map_err(|_| InventoryError::SizeOverflow)?,
-                kind: section_kind(toc_index as u64, counts, header.num_passes),
-                bytes: ByteRange {
-                    offset: section_cursor,
-                    length,
-                },
-                bits: BitRange {
-                    offset: bit_offset,
-                    length: bit_length,
-                },
+        let frame_start_byte =
+            usize::try_from(reader.bit_offset() / 8).map_err(|_| InventoryError::SizeOverflow)?;
+        let parsed_frame = parse_frame_prefix(
+            &codestream[frame_start_byte..],
+            u64::try_from(frame_start_byte).map_err(|_| InventoryError::SizeOverflow)?,
+            frame_index,
+            frame_context,
+            is_preview,
+            limits,
+            InventoryProgress {
+                total_toc_entries,
+                total_section_bytes,
+            },
+        )?;
+        if parsed_frame.section_end_byte > codestream_bytes {
+            return Err(InventoryError::UnexpectedEndOfBits {
+                bit_offset: parsed_frame
+                    .frame
+                    .toc_bits
+                    .end()
+                    .ok_or(InventoryError::SizeOverflow)?,
             });
-            section_cursor = section_end;
         }
-
-        let section_bits = section_cursor
-            .checked_sub(section_start_byte)
+        let prefix_bits = parsed_frame
+            .section_start_byte
+            .checked_mul(8)
+            .and_then(|offset| offset.checked_sub(reader.bit_offset()))
+            .ok_or(InventoryError::SizeOverflow)?;
+        reader
+            .skip_bits(prefix_bits)
+            .map_err(|error| map_reader_error(error, reader.bit_offset()))?;
+        let section_bits = parsed_frame
+            .section_end_byte
+            .checked_sub(parsed_frame.section_start_byte)
             .and_then(|bytes| bytes.checked_mul(8))
             .ok_or(InventoryError::SizeOverflow)?;
         reader
             .skip_bits(section_bits)
             .map_err(|error| map_reader_error(error, reader.bit_offset()))?;
 
-        let is_last = header.is_last;
-        frames.push(FrameInventory {
-            frame_index,
-            is_preview,
-            header_bits: BitRange::between(header_start, header_end)?,
-            toc_bits: BitRange::between(toc_start, toc_end)?,
-            toc_permuted: toc.permuted,
-            frame_type: header.frame_type,
-            encoding: header.encoding,
-            flags: header.flags,
-            do_ycbcr: header.do_ycbcr,
-            jpeg_upsampling: header.jpeg_upsampling,
-            upsampling: header.upsampling,
-            extra_channel_upsampling: header.extra_channel_upsampling,
-            group_size_shift: header.group_size_shift,
-            x_qm_scale: header.x_qm_scale,
-            b_qm_scale: header.b_qm_scale,
-            width: header.width,
-            height: header.height,
-            x0: header.x0,
-            y0: header.y0,
-            have_crop: header.have_crop,
-            color_blend: header.color_blend,
-            extra_channel_blends: header.extra_channel_blends,
-            num_passes: header.num_passes,
-            progressive_passes: header.progressive_passes,
-            duration_ticks: header.duration,
-            timecode: header.timecode,
-            is_last,
-            save_as_reference: header.save_as_reference,
-            save_before_color_transform: header.save_before_color_transform,
-            name_bytes: header.name_bytes,
-            restoration_filter: header.restoration_filter,
-            group_count: counts.groups,
-            low_frequency_group_count: counts.low_frequency_groups,
-            sections,
-        });
+        total_toc_entries = parsed_frame.progress.total_toc_entries;
+        total_section_bytes = parsed_frame.progress.total_section_bytes;
+        let is_last = parsed_frame.frame.is_last;
+        frames.push(parsed_frame.frame);
 
         if is_last {
             if is_preview {
@@ -793,7 +729,198 @@ pub(crate) fn parse_codestream_inventory(
     })
 }
 
-fn parse_image_header(
+pub(crate) fn parse_frame_prefix(
+    frame_bytes: &[u8],
+    base_byte_offset: u64,
+    frame_index: u32,
+    frame_context: FrameContext,
+    is_preview: bool,
+    limits: InventoryLimits,
+    progress: InventoryProgress,
+) -> Result<ParsedFramePrefix, InventoryError> {
+    let base_bit_offset = base_byte_offset
+        .checked_mul(8)
+        .ok_or(InventoryError::SizeOverflow)?;
+    let mut reader = BitReader::new(frame_bytes);
+
+    let header_start = reader.bit_offset();
+    let header = offset_inventory_result(
+        parse_frame_header(&mut reader, frame_context, is_preview, limits),
+        base_bit_offset,
+    )?;
+    let header_end = reader.bit_offset();
+    if header_end
+        .checked_sub(header_start)
+        .ok_or(InventoryError::SizeOverflow)?
+        > limits.max_frame_header_bits
+    {
+        return Err(InventoryError::ResourceLimit("frame header bits"));
+    }
+
+    let counts = compute_frame_counts(&header)?;
+    if counts.toc_entries > MAX_TOC_ENTRIES {
+        return Err(InventoryError::InvalidFrame("too many TOC entries"));
+    }
+    let toc_entries = usize::try_from(counts.toc_entries)
+        .map_err(|_| InventoryError::ResourceLimit("TOC entries per frame"))?;
+    if toc_entries > limits.max_toc_entries_per_frame {
+        return Err(InventoryError::ResourceLimit("TOC entries per frame"));
+    }
+    let total_toc_entries = progress
+        .total_toc_entries
+        .checked_add(toc_entries)
+        .ok_or(InventoryError::SizeOverflow)?;
+    if total_toc_entries > limits.max_total_toc_entries {
+        return Err(InventoryError::ResourceLimit("total TOC entries"));
+    }
+
+    let toc_start = reader.bit_offset();
+    let toc = offset_inventory_result(
+        parse_toc(&mut reader, toc_entries, frame_bytes),
+        base_bit_offset,
+    )?;
+    let toc_end = reader.bit_offset();
+    let section_start_byte = base_byte_offset
+        .checked_add(toc_end / 8)
+        .ok_or(InventoryError::SizeOverflow)?;
+    let mut section_cursor = section_start_byte;
+    let mut sections = Vec::new();
+    sections
+        .try_reserve_exact(toc_entries)
+        .map_err(|_| InventoryError::AllocationFailed("frame sections"))?;
+
+    let mut total_section_bytes = progress.total_section_bytes;
+    for (bitstream_index, (&toc_index, &length)) in toc
+        .logical_indices_in_bitstream_order
+        .iter()
+        .zip(&toc.entry_lengths_in_bitstream_order)
+        .enumerate()
+    {
+        let length = u64::from(length);
+        total_section_bytes = total_section_bytes
+            .checked_add(length)
+            .ok_or(InventoryError::SizeOverflow)?;
+        if total_section_bytes > limits.max_total_section_bytes {
+            return Err(InventoryError::ResourceLimit("total frame section bytes"));
+        }
+        let section_end = section_cursor
+            .checked_add(length)
+            .ok_or(InventoryError::SizeOverflow)?;
+        let bit_offset = section_cursor
+            .checked_mul(8)
+            .ok_or(InventoryError::SizeOverflow)?;
+        let bit_length = length.checked_mul(8).ok_or(InventoryError::SizeOverflow)?;
+        sections.push(FrameSection {
+            bitstream_index: u32::try_from(bitstream_index)
+                .map_err(|_| InventoryError::SizeOverflow)?,
+            toc_index: u32::try_from(toc_index).map_err(|_| InventoryError::SizeOverflow)?,
+            kind: section_kind(toc_index as u64, counts, header.num_passes),
+            bytes: ByteRange {
+                offset: section_cursor,
+                length,
+            },
+            bits: BitRange {
+                offset: bit_offset,
+                length: bit_length,
+            },
+        });
+        section_cursor = section_end;
+    }
+
+    let frame = FrameInventory {
+        frame_index,
+        is_preview,
+        header_bits: BitRange::between(
+            base_bit_offset
+                .checked_add(header_start)
+                .ok_or(InventoryError::SizeOverflow)?,
+            base_bit_offset
+                .checked_add(header_end)
+                .ok_or(InventoryError::SizeOverflow)?,
+        )?,
+        toc_bits: BitRange::between(
+            base_bit_offset
+                .checked_add(toc_start)
+                .ok_or(InventoryError::SizeOverflow)?,
+            base_bit_offset
+                .checked_add(toc_end)
+                .ok_or(InventoryError::SizeOverflow)?,
+        )?,
+        toc_permuted: toc.permuted,
+        frame_type: header.frame_type,
+        encoding: header.encoding,
+        flags: header.flags,
+        do_ycbcr: header.do_ycbcr,
+        jpeg_upsampling: header.jpeg_upsampling,
+        upsampling: header.upsampling,
+        extra_channel_upsampling: header.extra_channel_upsampling,
+        group_size_shift: header.group_size_shift,
+        x_qm_scale: header.x_qm_scale,
+        b_qm_scale: header.b_qm_scale,
+        width: header.width,
+        height: header.height,
+        x0: header.x0,
+        y0: header.y0,
+        have_crop: header.have_crop,
+        color_blend: header.color_blend,
+        extra_channel_blends: header.extra_channel_blends,
+        num_passes: header.num_passes,
+        progressive_passes: header.progressive_passes,
+        duration_ticks: header.duration,
+        timecode: header.timecode,
+        is_last: header.is_last,
+        save_as_reference: header.save_as_reference,
+        save_before_color_transform: header.save_before_color_transform,
+        name_bytes: header.name_bytes,
+        restoration_filter: header.restoration_filter,
+        group_count: counts.groups,
+        low_frequency_group_count: counts.low_frequency_groups,
+        sections,
+    };
+
+    Ok(ParsedFramePrefix {
+        frame,
+        section_start_byte,
+        section_end_byte: section_cursor,
+        progress: InventoryProgress {
+            total_toc_entries,
+            total_section_bytes,
+        },
+    })
+}
+
+fn offset_inventory_result<T>(
+    result: Result<T, InventoryError>,
+    base_bit_offset: u64,
+) -> Result<T, InventoryError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => Err(offset_inventory_error(error, base_bit_offset)?),
+    }
+}
+
+fn offset_inventory_error(
+    error: InventoryError,
+    base_bit_offset: u64,
+) -> Result<InventoryError, InventoryError> {
+    match error {
+        InventoryError::UnexpectedEndOfBits { bit_offset } => {
+            Ok(InventoryError::UnexpectedEndOfBits {
+                bit_offset: base_bit_offset
+                    .checked_add(bit_offset)
+                    .ok_or(InventoryError::SizeOverflow)?,
+            })
+        }
+        InventoryError::NonZeroPadding { bit_offset } => Ok(InventoryError::NonZeroPadding {
+            bit_offset: base_bit_offset
+                .checked_add(bit_offset)
+                .ok_or(InventoryError::SizeOverflow)?,
+        }),
+        error => Ok(error),
+    }
+}
+
+pub(crate) fn parse_image_header(
     codestream: &[u8],
     limits: InventoryLimits,
 ) -> Result<ParsedImageHeader, InventoryError> {
@@ -1156,7 +1283,7 @@ fn transformed_icc_output_size(encoded: &[u8]) -> Result<u64, InventoryError> {
 }
 
 #[derive(Clone, Copy)]
-struct FrameContext {
+pub(crate) struct FrameContext {
     width: u32,
     height: u32,
     xyb_encoded: bool,
@@ -1166,7 +1293,7 @@ struct FrameContext {
 }
 
 impl FrameContext {
-    fn from_image(image: ImageContext) -> Self {
+    pub(crate) fn from_image(image: ImageContext) -> Self {
         Self {
             width: image.width,
             height: image.height,
