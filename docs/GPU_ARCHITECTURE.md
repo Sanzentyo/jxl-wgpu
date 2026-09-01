@@ -154,8 +154,11 @@ resource plan reserves a worst-case power-of-two AC LZ ring, 464-byte resume sta
 status, parameters, and sink uniforms before the first submission. After the cursor map, exact
 entropy/order/window buffers are admitted against the same byte budget and retained through final
 validation. Parametric dequantization modes 0 through 6 are expanded from bounded scalar metadata
-and uploaded over the existing matrix region before AC/render commands; raw mode 7 remains a typed
-unsupported Modular side-image path.
+and uploaded over the existing matrix region before AC/render commands. Raw mode 7 is parsed as a
+resumable, three-channel Modular side-image plan containing its MA descriptor, transformed channel
+topology, inverse schedule, denominator, and exact stream index. Its resident entropy execution,
+inverse transforms, matrix overlay, and repeated cursor scheduling are the remaining integration
+work; the host never reconstructs its image samples.
 
 For VarDCT, the caller/device cap is first evaluated against exact packet, AC, render, validation,
 and output bytes. If that frame would exceed the shared budget's total capacity, the planner

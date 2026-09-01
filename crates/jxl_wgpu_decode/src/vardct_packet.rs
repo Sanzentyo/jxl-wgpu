@@ -22,6 +22,7 @@ use crate::vardct_frontend::{
     map_metadata_reader_error, metadata_bits, metadata_bool, metadata_f16,
     parse_hf_metadata_header_reader, parse_lf_group_header_reader, validate_packet_end_bits,
 };
+use crate::vardct_side_image::RawHfDequantSideImagePlan;
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
 const MODULAR_ENTROPY_ABI: &str = include_str!("modular_entropy_abi.wgsl");
@@ -151,6 +152,7 @@ pub struct BoundedVarDctPacketPlan {
     pub hf_coefficients: Option<HfCoefficientEntropyPlan>,
     hf_block_context: HfBlockContextIr,
     global_ma_config: Option<MaConfigIr>,
+    pending_hf_global: Option<PendingHfGlobalParse>,
 }
 
 /// One host-packed MA tree/histogram bundle and its exact GPU reconstruction requirements.
@@ -194,7 +196,7 @@ pub struct BoundedVarDctGroupPlan {
 }
 
 /// Host-packed entropy tables and untouched pass-group packets for one VarDCT AC pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HfCoefficientEntropyPlan {
     pub num_hf_presets: u32,
     pub num_block_clusters: u32,
@@ -218,6 +220,44 @@ pub struct HfCoefficientEntropyPlan {
     pub lz77_window_words: u32,
     /// Complete matrix resource region as F32 bit patterns when HF-global overrides defaults.
     pub dequant_matrix_words: Option<Vec<[u32; 4]>>,
+    /// Raw mode-7 matrices whose resident Modular arenas must overlay the scalar/default resource.
+    pub(crate) raw_dequant_matrices: Vec<RawHfDequantSideImagePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingHfGlobalParse {
+    packet: BitRange,
+    group_count: u32,
+    block_context: HfBlockContextIr,
+    pass_groups: Vec<BitRange>,
+    decoded_symbol_limit: u32,
+    trailing_pass_group: bool,
+    matrix_state: HfDequantMatrixParseState,
+    side_image: RawHfDequantSideImagePlan,
+}
+
+pub(crate) enum HfCoefficientParse {
+    Complete(Box<HfCoefficientEntropyPlan>),
+    SideImage(Box<PendingHfGlobalParse>),
+}
+
+#[derive(Clone, Copy)]
+struct HfCoefficientParseContext<'config> {
+    group_count: u32,
+    block_context: &'config HfBlockContextIr,
+    decoded_symbol_limit: u32,
+    bit_depth: u32,
+    low_frequency_group_count: u64,
+    global_ma_config: Option<&'config MaConfigIr>,
+}
+
+struct HfAfterDequantContext<'config> {
+    packet_end: u64,
+    parse: HfCoefficientParseContext<'config>,
+    pass_groups: Vec<BitRange>,
+    trailing_pass_group: bool,
+    dequant_matrix_words: Option<Vec<[u32; 4]>>,
+    raw_dequant_matrices: Vec<RawHfDequantSideImagePlan>,
 }
 
 fn parse_ma_config_at_reader(
@@ -671,17 +711,27 @@ impl BoundedVarDctPacketPlan {
                 HfCoefficientEntropyPlan::parse_inner(
                     source,
                     packet,
-                    u32::try_from(profile.group_count).map_err(|_| {
-                        BoundedVarDctPacketError::ArithmeticOverflow {
-                            field: "pass-group count",
-                        }
-                    })?,
-                    &lf_global.hf_block_context,
+                    HfCoefficientParseContext {
+                        group_count: u32::try_from(profile.group_count).map_err(|_| {
+                            BoundedVarDctPacketError::ArithmeticOverflow {
+                                field: "pass-group count",
+                            }
+                        })?,
+                        block_context: &lf_global.hf_block_context,
+                        decoded_symbol_limit,
+                        bit_depth: profile.bits_per_sample,
+                        low_frequency_group_count: profile.low_frequency_group_count,
+                        global_ma_config: global_ma_config.as_ref(),
+                    },
                     pass_groups,
-                    decoded_symbol_limit,
                 )
             })
             .transpose()?;
+        let (hf_coefficients, pending_hf_global) = match hf_coefficients {
+            Some(HfCoefficientParse::Complete(plan)) => (Some(*plan), None),
+            Some(HfCoefficientParse::SideImage(pending)) => (None, Some(*pending)),
+            None => (None, None),
+        };
         let needs_self_correcting = if profile.uses_lf_frame {
             groups
                 .iter()
@@ -707,6 +757,7 @@ impl BoundedVarDctPacketPlan {
             hf_coefficients,
             hf_block_context: lf_global.hf_block_context,
             global_ma_config,
+            pending_hf_global,
         })
     }
 
@@ -753,6 +804,7 @@ impl BoundedVarDctPacketPlan {
     #[must_use]
     pub const fn requires_hf_global_staging(&self) -> bool {
         matches!(&self.profile.sections, VarDctSectionLayout::Single { .. })
+            || self.pending_hf_global.is_some()
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
@@ -857,7 +909,7 @@ impl BoundedVarDctPacketPlan {
         &self,
         source: &GpuCodestream,
         hf_metadata_end: u32,
-    ) -> Result<HfCoefficientEntropyPlan, BoundedVarDctPacketError> {
+    ) -> Result<HfCoefficientParse, BoundedVarDctPacketError> {
         if self.groups.len() != 1 {
             return Err(BoundedVarDctPacketError::PackedMetadata);
         }
@@ -895,13 +947,18 @@ impl BoundedVarDctPacketPlan {
                 offset: u64::from(hf_metadata_end),
                 length: packet_end - u64::from(hf_metadata_end),
             },
-            u32::try_from(self.profile.group_count).map_err(|_| {
-                BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "single-entry pass-group count",
-                }
-            })?,
-            &self.hf_block_context,
-            decoded_symbol_limit,
+            HfCoefficientParseContext {
+                group_count: u32::try_from(self.profile.group_count).map_err(|_| {
+                    BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "single-entry pass-group count",
+                    }
+                })?,
+                block_context: &self.hf_block_context,
+                decoded_symbol_limit,
+                bit_depth: self.profile.bits_per_sample,
+                low_frequency_group_count: self.profile.low_frequency_group_count,
+                global_ma_config: self.global_ma_config.as_ref(),
+            },
         )
     }
 }
@@ -1132,7 +1189,7 @@ impl BoundedVarDctGroupPlan {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum HfDequantMatrixEncoding {
     Default,
     Hornuss([[f32; 3]; 3]),
@@ -1151,15 +1208,61 @@ enum HfDequantMatrixEncoding {
         dct4x4_params: [Vec<f32>; 3],
     },
     Dct([Vec<f32>; 3]),
+    Raw,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HfDequantMatrixParseState {
+    next_matrix: usize,
+    encodings: Vec<HfDequantMatrixEncoding>,
+    raw_side_images: Vec<RawHfDequantSideImagePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum HfDequantMatrixParse {
+    Complete {
+        words: Option<Vec<[u32; 4]>>,
+        raw_side_images: Vec<RawHfDequantSideImagePlan>,
+    },
+    SideImage {
+        plan: Box<RawHfDequantSideImagePlan>,
+        state: HfDequantMatrixParseState,
+    },
 }
 
 fn parse_hf_dequant_matrices(
     reader: &mut impl BitInput,
-) -> Result<Option<Vec<[u32; 4]>>, BoundedVarDctPacketError> {
+    bit_depth: u32,
+    low_frequency_group_count: u64,
+    global_ma_config: Option<&MaConfigIr>,
+) -> Result<HfDequantMatrixParse, BoundedVarDctPacketError> {
     if metadata_bool(reader, "HF dequantization matrix defaults")? {
-        return Ok(None);
+        return Ok(HfDequantMatrixParse::Complete {
+            words: None,
+            raw_side_images: Vec::new(),
+        });
     }
 
+    parse_hf_dequant_matrices_from(
+        reader,
+        HfDequantMatrixParseState {
+            next_matrix: 0,
+            encodings: Vec::with_capacity(17),
+            raw_side_images: Vec::new(),
+        },
+        bit_depth,
+        low_frequency_group_count,
+        global_ma_config,
+    )
+}
+
+fn parse_hf_dequant_matrices_from(
+    reader: &mut impl BitInput,
+    mut state: HfDequantMatrixParseState,
+    bit_depth: u32,
+    low_frequency_group_count: u64,
+    global_ma_config: Option<&MaConfigIr>,
+) -> Result<HfDequantMatrixParse, BoundedVarDctPacketError> {
     fn read_fixed<const N: usize>(
         reader: &mut impl BitInput,
         matrix: usize,
@@ -1205,8 +1308,7 @@ fn parse_hf_dequant_matrices(
         Ok(params)
     }
 
-    let mut encodings = Vec::with_capacity(17);
-    for matrix in 0..17 {
+    for matrix in state.next_matrix..17 {
         let encoding = u8::try_from(metadata_bits(
             reader,
             "HF dequantization matrix encoding",
@@ -1244,12 +1346,31 @@ fn parse_hf_dequant_matrices(
                 }
             }
             6 => HfDequantMatrixEncoding::Dct(read_dct_params(reader, matrix)?),
-            7 => return Err(BoundedVarDctPacketError::RawHfDequantMatrix { matrix }),
+            7 => {
+                let plan = RawHfDequantSideImagePlan::parse(
+                    reader,
+                    matrix,
+                    bit_depth,
+                    low_frequency_group_count,
+                    global_ma_config,
+                )?;
+                state.encodings.push(HfDequantMatrixEncoding::Raw);
+                state.raw_side_images.push(plan.clone());
+                state.next_matrix = matrix + 1;
+                return Ok(HfDequantMatrixParse::SideImage {
+                    plan: Box::new(plan),
+                    state,
+                });
+            }
             _ => unreachable!("three-bit encoding is in 0..=7"),
         };
-        encodings.push(encoding);
+        state.encodings.push(encoding);
     }
-    expand_hf_dequant_matrices(&encodings).map(Some)
+    let words = expand_hf_dequant_matrices(&state.encodings)?;
+    Ok(HfDequantMatrixParse::Complete {
+        words: Some(words),
+        raw_side_images: state.raw_side_images,
+    })
 }
 
 fn expand_hf_dequant_matrices(
@@ -1367,7 +1488,9 @@ fn expand_hf_dequant_matrices(
         matrix: usize,
     ) -> Result<[Vec<f32>; 3], BoundedVarDctPacketError> {
         let output = match encoding {
-            HfDequantMatrixEncoding::Default => unreachable!("defaults are expanded separately"),
+            HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
+                unreachable!("defaults and raw overlays are expanded separately")
+            }
             HfDequantMatrixEncoding::Dct(params) => {
                 let extent = transform.pixel_extent();
                 [
@@ -1539,7 +1662,7 @@ fn expand_hf_dequant_matrices(
         let index = matrix_param_index(transform);
         let extent = transform.pixel_extent();
         let channels = match &encodings[index] {
-            HfDequantMatrixEncoding::Default => {
+            HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
                 let transform_type = crate::vardct_resource::vardct_transform_type(transform);
                 std::array::from_fn(|channel| {
                     if transform.needs_transpose() {
@@ -1618,62 +1741,52 @@ impl HfCoefficientEntropyPlan {
         pass_groups: Vec<BitRange>,
         decoded_symbol_limit: u32,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(
+        match Self::parse_inner(
             PacketSource::Slice(codestream),
             packet,
-            group_count,
-            block_context,
+            HfCoefficientParseContext {
+                group_count,
+                block_context,
+                decoded_symbol_limit,
+                bit_depth: 8,
+                low_frequency_group_count: 1,
+                global_ma_config: None,
+            },
             pass_groups,
-            decoded_symbol_limit,
-        )
+        )? {
+            HfCoefficientParse::Complete(plan) => Ok(*plan),
+            HfCoefficientParse::SideImage(pending) => {
+                Err(BoundedVarDctPacketError::RawHfDequantMatrix {
+                    matrix: pending.side_image.matrix_index,
+                })
+            }
+        }
     }
 
     fn parse_inner(
         source: PacketSource<'_>,
         packet: BitRange,
-        group_count: u32,
-        block_context: &HfBlockContextIr,
+        context: HfCoefficientParseContext<'_>,
         pass_groups: Vec<BitRange>,
-        decoded_symbol_limit: u32,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner_with_tail(
-            source,
-            packet,
-            group_count,
-            block_context,
-            pass_groups,
-            decoded_symbol_limit,
-            false,
-        )
+    ) -> Result<HfCoefficientParse, BoundedVarDctPacketError> {
+        Self::parse_inner_with_tail(source, packet, context, pass_groups, false)
     }
 
     fn parse_single_tail_inner(
         source: PacketSource<'_>,
         packet: BitRange,
-        group_count: u32,
-        block_context: &HfBlockContextIr,
-        decoded_symbol_limit: u32,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner_with_tail(
-            source,
-            packet,
-            group_count,
-            block_context,
-            Vec::new(),
-            decoded_symbol_limit,
-            true,
-        )
+        context: HfCoefficientParseContext<'_>,
+    ) -> Result<HfCoefficientParse, BoundedVarDctPacketError> {
+        Self::parse_inner_with_tail(source, packet, context, Vec::new(), true)
     }
 
     fn parse_inner_with_tail(
         source: PacketSource<'_>,
         packet: BitRange,
-        group_count: u32,
-        block_context: &HfBlockContextIr,
-        mut pass_groups: Vec<BitRange>,
-        decoded_symbol_limit: u32,
+        context: HfCoefficientParseContext<'_>,
+        pass_groups: Vec<BitRange>,
         trailing_pass_group: bool,
-    ) -> Result<Self, BoundedVarDctPacketError> {
+    ) -> Result<HfCoefficientParse, BoundedVarDctPacketError> {
         let packet_end = packet
             .end()
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
@@ -1682,11 +1795,69 @@ impl HfCoefficientEntropyPlan {
         validate_source_packet_end(source, packet_end)?;
         let mut reader = source_reader_at(source, packet.offset)?;
         let mut reader = BoundedBitInput::new(&mut reader, packet_end);
-        let dequant_matrix_words = parse_hf_dequant_matrices(&mut reader)?;
-        let prefix =
-            HfGlobalPrefix::parse_after_dequant_reader(&mut reader, packet_end, group_count)?;
+        let (dequant_matrix_words, raw_dequant_matrices) = match parse_hf_dequant_matrices(
+            &mut reader,
+            context.bit_depth,
+            context.low_frequency_group_count,
+            context.global_ma_config,
+        )? {
+            HfDequantMatrixParse::Complete {
+                words,
+                raw_side_images,
+            } => (words, raw_side_images),
+            HfDequantMatrixParse::SideImage { plan, state } => {
+                return Ok(HfCoefficientParse::SideImage(Box::new(
+                    PendingHfGlobalParse {
+                        packet,
+                        group_count: context.group_count,
+                        block_context: context.block_context.clone(),
+                        pass_groups,
+                        decoded_symbol_limit: context.decoded_symbol_limit,
+                        trailing_pass_group,
+                        matrix_state: state,
+                        side_image: *plan,
+                    },
+                )));
+            }
+        };
+        Self::parse_after_dequant(
+            source,
+            &mut reader,
+            HfAfterDequantContext {
+                packet_end,
+                parse: context,
+                pass_groups,
+                trailing_pass_group,
+                dequant_matrix_words,
+                raw_dequant_matrices,
+            },
+        )
+        .map(Box::new)
+        .map(HfCoefficientParse::Complete)
+    }
+
+    fn parse_after_dequant(
+        source: PacketSource<'_>,
+        reader: &mut impl BitInput,
+        context: HfAfterDequantContext<'_>,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        let HfAfterDequantContext {
+            packet_end,
+            parse,
+            mut pass_groups,
+            trailing_pass_group,
+            dequant_matrix_words,
+            raw_dequant_matrices,
+        } = context;
+        let HfCoefficientParseContext {
+            group_count,
+            block_context,
+            decoded_symbol_limit,
+            ..
+        } = parse;
+        let prefix = HfGlobalPrefix::parse_after_dequant_reader(reader, packet_end, group_count)?;
         let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
-            parse_coefficient_orders_reader(&mut reader, prefix, packet_end)?;
+            parse_coefficient_orders_reader(reader, prefix, packet_end)?;
         let lf_context_count = block_context
             .lf_thresholds
             .iter()
@@ -1785,6 +1956,7 @@ impl HfCoefficientEntropyPlan {
             pass_groups,
             lz77_window_words,
             dequant_matrix_words,
+            raw_dequant_matrices,
         })
     }
 }
@@ -2697,9 +2869,14 @@ mod tests {
         let bytes = writer.into_bytes();
         let mut reader = jxl_gpu_bitstream::BitReader::new(&bytes);
 
-        let words = parse_hf_dequant_matrices(&mut reader)
-            .unwrap()
-            .expect("custom set produces an explicit resource payload");
+        let HfDequantMatrixParse::Complete {
+            words: Some(words),
+            raw_side_images,
+        } = parse_hf_dequant_matrices(&mut reader, 8, 1, None).unwrap()
+        else {
+            panic!("scalar custom set must produce an explicit resource payload")
+        };
+        assert!(raw_side_images.is_empty());
         let layout = crate::vardct_resource::VarDctResourceLayout::new(1, 1, 1).unwrap();
         layout.validate_dequant_matrix_words(&words).unwrap();
 
@@ -2745,17 +2922,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_and_transform_incompatible_hf_matrices_have_typed_errors() {
-        let mut raw = BitWriter::new();
-        raw.write_bits(0, 1).unwrap();
-        raw.write_bits(7, 3).unwrap();
-        let raw_bytes = raw.into_bytes();
-        let mut raw_reader = jxl_gpu_bitstream::BitReader::new(&raw_bytes);
-        assert!(matches!(
-            parse_hf_dequant_matrices(&mut raw_reader),
-            Err(BoundedVarDctPacketError::RawHfDequantMatrix { matrix: 0 })
-        ));
-
+    fn transform_incompatible_hf_matrix_has_a_typed_error() {
         let mut incompatible = BitWriter::new();
         incompatible.write_bits(0, 1).unwrap();
         for _ in 0..4 {
@@ -2765,12 +2932,83 @@ mod tests {
         let incompatible_bytes = incompatible.into_bytes();
         let mut incompatible_reader = jxl_gpu_bitstream::BitReader::new(&incompatible_bytes);
         assert!(matches!(
-            parse_hf_dequant_matrices(&mut incompatible_reader),
+            parse_hf_dequant_matrices(&mut incompatible_reader, 8, 1, None),
             Err(BoundedVarDctPacketError::HfDequantMatrixEncoding {
                 matrix: 4,
                 encoding: 1
             })
         ));
+    }
+
+    #[test]
+    fn libjxl_jpeg_transcode_exposes_a_general_modular_raw_matrix_plan() {
+        let container = decode_hex(include_str!(
+            "../test-data/jpeg_transcode_raw_matrix.jxl.hex"
+        ));
+        let parsed = jxl_gpu_bitstream::parse(&container, Default::default()).unwrap();
+        let codestream = parsed.codestream();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let frame = &inventory.frames[0];
+        let lf_global = frame
+            .sections
+            .iter()
+            .find(|section| {
+                matches!(
+                    section.kind,
+                    jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                )
+            })
+            .unwrap()
+            .bits;
+        let hf_global = frame
+            .sections
+            .iter()
+            .find(|section| {
+                matches!(
+                    section.kind,
+                    jxl_gpu_bitstream::FrameSectionKind::HighFrequencyGlobal
+                )
+            })
+            .unwrap()
+            .bits;
+
+        let mut lf_reader = BitReader::new(codestream);
+        lf_reader.skip_bits(lf_global.offset).unwrap();
+        let lf_prefix =
+            LfGlobalPrefix::parse_reader(&mut lf_reader, lf_global.end().unwrap()).unwrap();
+        let global_ma_config = lf_prefix.global_ma_tree_bit_offset.map(|offset| {
+            let mut reader = BitReader::new(codestream);
+            reader.skip_bits(offset).unwrap();
+            parse_ma_config_at_reader(&mut reader, lf_global.end().unwrap())
+                .unwrap()
+                .0
+        });
+
+        let mut hf_reader = BitReader::new(codestream);
+        hf_reader.skip_bits(hf_global.offset).unwrap();
+        assert!(!metadata_bool(&mut hf_reader, "custom HF matrix set").unwrap());
+        assert_eq!(
+            metadata_bits(&mut hf_reader, "raw HF matrix encoding", 3).unwrap(),
+            7
+        );
+        let plan = crate::vardct_side_image::RawHfDequantSideImagePlan::parse(
+            &mut hf_reader,
+            0,
+            8,
+            frame.low_frequency_group_count,
+            global_ma_config.as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.stream_index, 4);
+        assert_eq!(
+            plan.final_planes.map(|plane| [plane.width, plane.height]),
+            [[8, 8]; 3]
+        );
+        assert_eq!(plan.decoded_words, 8 * 8 * 3);
+        assert!((plan.denominator - 1.0 / 2040.0).abs() < 1e-7);
+        assert!(plan.token_bit_offset > hf_global.offset as u32);
+        assert!(u64::from(plan.token_bit_offset) < hf_global.end().unwrap());
     }
 
     #[test]

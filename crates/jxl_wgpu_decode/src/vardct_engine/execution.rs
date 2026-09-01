@@ -26,8 +26,8 @@ use crate::vardct_output::{
     VarDctOutputConfig, VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch,
 };
 use crate::vardct_packet::{
-    GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
-    VarDctPacketValidation,
+    GpuVarDctPacketStatus, HfCoefficientParse, VarDctModularParams, VarDctPacketBuffers,
+    VarDctPacketControl, VarDctPacketValidation,
 };
 use crate::vardct_pass_group::{
     GpuHfCoefficientStatus, HfCoefficientBuffers, HfCoefficientExecutionPlan,
@@ -1177,6 +1177,15 @@ impl VarDctPendingFrame {
             .packet
             .parse_single_hf_global_continuation_source(&source.codestream, cursor)
             .map_err(VarDctDecodeError::from)?;
+        let entropy = match entropy {
+            HfCoefficientParse::Complete(plan) => *plan,
+            HfCoefficientParse::SideImage(_) => {
+                return Err(VarDctDecodeError::EngineContract {
+                    detail: "raw HF dequantization side-image staging is not submitted",
+                }
+                .into());
+            }
+        };
         let artifacts = source
             .groups
             .iter()
