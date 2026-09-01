@@ -14,7 +14,7 @@ use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat,
 use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
-    ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
+    ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
 use jxl_wgpu_decode::vardct::packet::{
@@ -22,7 +22,7 @@ use jxl_wgpu_decode::vardct::packet::{
 };
 use jxl_wgpu_decode::{
     DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
-    VarDctDecodeError, WgpuDecodeEngine,
+    PrefetchBackpressure, VarDctDecodeError, VarDctSubmissionEngine, WgpuDecodeEngine,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
@@ -996,6 +996,135 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
         std::thread::yield_now();
     }
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+}
+
+#[test]
+fn vardct_stream_windows_adapt_to_the_shared_frame_budget() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let encoded = common::green_queen_vardct_nonzero_ac();
+    let reference = rust_jxl_rgb8(encoded, Extent2d::new(438, 589));
+    let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+    let memory_at_limit = |limit| {
+        let decoder = GpuDecoder::new(
+            VarDctSubmissionEngine::new(backend.clone())
+                .unwrap()
+                .with_stream_window_limit(NonZeroU64::new(limit).unwrap()),
+        );
+        let session = decoder.open(encoded, request.clone()).unwrap();
+        session.submission_session().memory_stats()
+    };
+    let minimum = memory_at_limit(40);
+    let configured = memory_at_limit(256);
+    assert!(minimum.total_frame_bytes < configured.total_frame_bytes);
+    let budget_limit =
+        minimum.total_frame_bytes + (configured.total_frame_bytes - minimum.total_frame_bytes) / 2;
+    assert!(budget_limit < configured.total_frame_bytes);
+
+    let budget = MemoryBudget::new(NonZeroU64::new(budget_limit).unwrap());
+    let engine = VarDctSubmissionEngine::with_memory_budget(backend.clone(), budget.clone())
+        .unwrap()
+        .with_stream_window_limit(NonZeroU64::new(256).unwrap());
+    assert_eq!(engine.stream_window_limit(), NonZeroU64::new(256));
+    let decoder = GpuDecoder::new(engine);
+    let mut session = decoder.open(encoded, request.clone()).unwrap();
+    let memory = session.submission_session().memory_stats();
+    assert!(memory.resolved_stream_window_limit_bytes >= 40);
+    assert!(memory.resolved_stream_window_limit_bytes < 256);
+    assert_eq!(memory.resolved_stream_window_limit_bytes % 4, 0);
+    assert!(memory.total_frame_bytes <= budget_limit);
+    assert!(memory.packet_stream_window_bytes <= memory.resolved_stream_window_limit_bytes,);
+    assert!(memory.hf_stream_window_bytes <= memory.resolved_stream_window_limit_bytes);
+
+    let frame = pollster::block_on(session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(maximum_error(&readback.frame.outputs[0].bytes, &reference,) <= 1);
+    drop(readback);
+    drop(frame);
+    drop(session);
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
+
+    let mut abandoned = decoder.open(encoded, request.clone()).unwrap();
+    let mut backpressured = decoder.open(encoded, request.clone()).unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(budget.snapshot().reserved_bytes > 0);
+    let progress = backpressured
+        .prefetch(NonZeroUsize::new(1).unwrap())
+        .unwrap();
+    assert_eq!(progress.submitted, 0);
+    assert_eq!(progress.queued, 0);
+    assert!(
+        matches!(
+            progress.backpressure,
+            Some(PrefetchBackpressure::Memory(
+                MemoryBudgetError::Exhausted { .. }
+            ))
+        ),
+        "unexpected concurrent VarDCT backpressure: {progress:?}",
+    );
+    drop(abandoned);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while budget.snapshot().reserved_bytes != 0 && std::time::Instant::now() < deadline {
+        backend.device().poll(wgpu::PollType::Poll).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
+
+    let retried_frame = backpressured.next_frame().unwrap().unwrap();
+    let retried_readback = ImageReadbackPipeline::new(&backend)
+        .submit(retried_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(maximum_error(&retried_readback.frame.outputs[0].bytes, &reference) <= 1);
+    drop(retried_readback);
+    drop(retried_frame);
+    drop(backpressured);
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
+
+    let insufficient_limit = minimum.total_frame_bytes - 1;
+    let insufficient_budget = MemoryBudget::new(NonZeroU64::new(insufficient_limit).unwrap());
+    let insufficient = GpuDecoder::new(
+        VarDctSubmissionEngine::with_memory_budget(backend, insufficient_budget)
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+    );
+    let error = match insufficient.open(encoded, request) {
+        Ok(_) => panic!("minimum-window VarDCT layout unexpectedly fit"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DecodeError::VarDct(VarDctDecodeError::MemoryBudgetTooSmall {
+            required_bytes,
+            limit_bytes,
+        }) if required_bytes == minimum.total_frame_bytes && limit_bytes == insufficient_limit
+    ));
 }
 
 #[test]

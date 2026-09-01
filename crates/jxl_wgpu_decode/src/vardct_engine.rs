@@ -131,6 +131,13 @@ pub enum VarDctDecodeError {
         limit_bytes: u64,
         minimum_bytes: u64,
     },
+    #[error(
+        "the minimum-window VarDCT frame needs {required_bytes} bytes, but the shared memory budget permits {limit_bytes} bytes"
+    )]
+    MemoryBudgetTooSmall {
+        required_bytes: u64,
+        limit_bytes: u64,
+    },
     #[error("VarDCT {resource} needs {required} bytes, device permits {available}")]
     DeviceLimit {
         resource: &'static str,
@@ -190,6 +197,8 @@ pub fn vardct_rgb8_format() -> PixelFormat {
 /// Exact GPU buffer accounting for one bounded VarDCT frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctDecodeMemoryStats {
+    /// Effective packet/AC entropy upload cap after caller, device, and frame-budget policy.
+    pub resolved_stream_window_limit_bytes: u64,
     pub codestream_bytes: u64,
     pub modular_metadata_bytes: u64,
     /// True when HF-local metadata size is discovered after the LF cursor map. The initial
@@ -247,6 +256,7 @@ pub struct VarDctDecodeMemoryStats {
 impl VarDctDecodeMemoryStats {
     fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
         let VarDctDecodeMemoryInputs {
+            stream_limit,
             codestream_len,
             packet,
             groups,
@@ -565,6 +575,7 @@ impl VarDctDecodeMemoryStats {
             },
         )?;
         Ok(Self {
+            resolved_stream_window_limit_bytes: stream_limit,
             codestream_bytes,
             modular_metadata_bytes,
             deferred_hf_modular_metadata: packet.requires_local_tree_staging(),
@@ -610,6 +621,7 @@ impl VarDctDecodeMemoryStats {
 }
 
 struct VarDctDecodeMemoryInputs<'a> {
+    stream_limit: u64,
     codestream_len: usize,
     packet: &'a BoundedVarDctPacketPlan,
     groups: &'a [VarDctGroupSource],
@@ -721,13 +733,17 @@ impl VarDctSubmissionEngine {
     /// Caps reusable VarDCT entropy uploads.
     ///
     /// Combined/global-tree packets, staged local-tree LF/HF packets, and AC pass groups enforce
-    /// this cap. Recursive entropy streams will adopt the same policy with their resume state.
+    /// this caller upper bound. Device limits and the shared per-frame byte budget may resolve a
+    /// smaller four-byte-aligned cap. Recursive entropy streams will adopt the same policy with
+    /// their resume state.
     #[must_use]
     pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
         self.stream_window_limit = Some(limit);
         self
     }
 
+    /// Returns the caller-supplied upper bound, not a session's budget-resolved cap. The latter is
+    /// reported by [`VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`].
     #[must_use]
     pub const fn stream_window_limit(&self) -> Option<NonZeroU64> {
         self.stream_window_limit
@@ -756,6 +772,7 @@ impl VarDctSubmissionEngine {
             inventory,
             self.pipelines.output_variant,
             self.stream_window_limit,
+            self.memory.snapshot().limit_bytes,
         )?;
         let extent = source.layout.extent;
         let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
@@ -808,6 +825,103 @@ struct VarDctSource {
     quant_biases: [f32; 4],
     frame_name: String,
     memory: VarDctDecodeMemoryStats,
+}
+
+struct VarDctEntropyPlanSelection {
+    stream_limit: u64,
+    lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
+    combined_packet_windows: Option<CombinedPacketWindowExecutionPlan>,
+    hf_coefficients: Option<HfCoefficientExecutionPlan>,
+    memory: VarDctDecodeMemoryStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdaptiveStreamMemory {
+    total_frame_bytes: u64,
+    packet_stream_window_bytes: u64,
+    hf_stream_window_bytes: u64,
+}
+
+impl From<VarDctDecodeMemoryStats> for AdaptiveStreamMemory {
+    fn from(memory: VarDctDecodeMemoryStats) -> Self {
+        Self {
+            total_frame_bytes: memory.total_frame_bytes,
+            packet_stream_window_bytes: memory.packet_stream_window_bytes,
+            hf_stream_window_bytes: memory.hf_stream_window_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdaptiveStreamLimitDecision {
+    Selected(u64),
+    BudgetTooSmall { required_bytes: u64 },
+}
+
+fn select_budget_adaptive_stream_limit(
+    configured_limit: u64,
+    memory_limit_bytes: u64,
+    mut memory_at_limit: impl FnMut(u64) -> Result<AdaptiveStreamMemory, VarDctDecodeError>,
+) -> Result<AdaptiveStreamLimitDecision, VarDctDecodeError> {
+    let configured_limit = configured_limit & !3;
+    let configured = memory_at_limit(configured_limit)?;
+    if configured.total_frame_bytes <= memory_limit_bytes {
+        return Ok(AdaptiveStreamLimitDecision::Selected(configured_limit));
+    }
+
+    let minimum = memory_at_limit(MIN_STREAM_WINDOW_BYTES)?;
+    if minimum.total_frame_bytes > memory_limit_bytes {
+        return Ok(AdaptiveStreamLimitDecision::BudgetTooSmall {
+            required_bytes: minimum.total_frame_bytes,
+        });
+    }
+
+    let active_stream_windows = u64::from(minimum.packet_stream_window_bytes != 0)
+        + u64::from(minimum.hf_stream_window_bytes != 0);
+    debug_assert!(active_stream_windows != 0);
+    let non_stream_bytes = minimum
+        .total_frame_bytes
+        .checked_sub(minimum.packet_stream_window_bytes)
+        .and_then(|bytes| bytes.checked_sub(minimum.hf_stream_window_bytes))
+        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+            field: "minimum-window VarDCT non-stream bytes",
+        })?;
+    let available_stream_bytes = memory_limit_bytes.saturating_sub(non_stream_bytes);
+    let suggested_limit = available_stream_bytes
+        .checked_div(active_stream_windows)
+        .unwrap_or(MIN_STREAM_WINDOW_BYTES)
+        .min(configured_limit)
+        .max(MIN_STREAM_WINDOW_BYTES)
+        & !3;
+
+    let mut best_limit = MIN_STREAM_WINDOW_BYTES;
+    let mut failing_limit = configured_limit;
+    if suggested_limit > best_limit && suggested_limit < failing_limit {
+        let suggested = memory_at_limit(suggested_limit)?;
+        if suggested.total_frame_bytes <= memory_limit_bytes {
+            best_limit = suggested_limit;
+        } else {
+            failing_limit = suggested_limit;
+        }
+    }
+    for _ in 0..32 {
+        let remaining_steps = failing_limit.saturating_sub(best_limit) / 4;
+        if remaining_steps <= 1 {
+            break;
+        }
+        let midpoint = best_limit.checked_add((remaining_steps / 2) * 4).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "adaptive VarDCT stream-window midpoint",
+            },
+        )?;
+        let candidate = memory_at_limit(midpoint)?;
+        if candidate.total_frame_bytes <= memory_limit_bytes {
+            best_limit = midpoint;
+        } else {
+            failing_limit = midpoint;
+        }
+    }
+    Ok(AdaptiveStreamLimitDecision::Selected(best_limit))
 }
 
 #[derive(Clone, Debug)]
@@ -1202,6 +1316,7 @@ fn prepare_source(
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     output_variant: KernelVariant,
     stream_window_limit: Option<NonZeroU64>,
+    memory_limit_bytes: u64,
 ) -> Result<VarDctSource, VarDctDecodeError> {
     if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
         return Err(VarDctDecodeError::UnsupportedOutput);
@@ -1236,24 +1351,16 @@ fn prepare_source(
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
     let staged_local_trees = packet.requires_local_tree_staging();
     let limits = backend.device().limits();
-    let stream_limit = stream_window_limit
+    let configured_stream_limit = stream_window_limit
         .map_or(u64::MAX, NonZeroU64::get)
         .min(limits.max_buffer_size)
         .min(limits.max_storage_buffer_binding_size);
-    if stream_limit < MIN_STREAM_WINDOW_BYTES {
+    if configured_stream_limit < MIN_STREAM_WINDOW_BYTES {
         return Err(VarDctDecodeError::EntropyStreamWindowTooSmall {
-            limit_bytes: stream_limit,
+            limit_bytes: configured_stream_limit,
             minimum_bytes: MIN_STREAM_WINDOW_BYTES,
         });
     }
-    let lf_packet_windows = staged_local_trees
-        .then(|| LfPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit))
-        .transpose()?
-        .flatten();
-    let combined_packet_windows = (!staged_local_trees)
-        .then(|| CombinedPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit))
-        .transpose()?
-        .flatten();
     let [blocks_x, blocks_y] = packet.block_extent();
     let resource_layout =
         VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;
@@ -1344,23 +1451,10 @@ fn prepare_source(
         .and_then(|plan| plan.sigma_groups.first())
         .map(|config| config.plan())
         .transpose()?;
-    let hf_coefficients = packet
-        .hf_coefficients
-        .as_ref()
-        .map(|entropy| {
-            let artifacts = groups
-                .iter()
-                .map(|group| group.artifact_layout)
-                .collect::<Vec<_>>();
-            HfCoefficientExecutionPlan::new(
-                &packet,
-                entropy,
-                &artifacts,
-                codestream.bytes(),
-                stream_limit,
-            )
-        })
-        .transpose()?;
+    let artifacts = groups
+        .iter()
+        .map(|group| group.artifact_layout)
+        .collect::<Vec<_>>();
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
         packet.profile.width,
         packet.profile.height,
@@ -1397,22 +1491,83 @@ fn prepare_source(
         .iter()
         .map(|group| ResidentVarDctMemoryPlan::new(group.coefficient_words()))
         .collect::<Result<Vec<_>, _>>()?;
-    let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
-        codestream_len: codestream.bytes().len(),
-        packet: &packet,
-        groups: &groups,
-        lf_packet_windows: lf_packet_windows.as_ref(),
-        combined_packet_windows: combined_packet_windows.as_ref(),
-        resource: resource_layout,
-        hf_coefficients: hf_coefficients.as_ref(),
-        adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
-        restoration_scratch: gaborish.is_some() || epf.is_some(),
-        gaborish: gaborish.is_some(),
-        epf_sigma: epf_sigma_memory,
-        epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
-        resident: &resident_memory,
-        output: output_plan,
-    })?;
+    let plan_at_limit =
+        |stream_limit: u64| -> Result<VarDctEntropyPlanSelection, VarDctDecodeError> {
+            let lf_packet_windows = staged_local_trees
+                .then(|| {
+                    LfPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit)
+                })
+                .transpose()?
+                .flatten();
+            let combined_packet_windows = (!staged_local_trees)
+                .then(|| {
+                    CombinedPacketWindowExecutionPlan::new(
+                        codestream.bytes(),
+                        &packet,
+                        stream_limit,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let hf_coefficients = packet
+                .hf_coefficients
+                .as_ref()
+                .map(|entropy| {
+                    HfCoefficientExecutionPlan::new(
+                        &packet,
+                        entropy,
+                        &artifacts,
+                        codestream.bytes(),
+                        stream_limit,
+                    )
+                })
+                .transpose()?;
+            let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
+                stream_limit,
+                codestream_len: codestream.bytes().len(),
+                packet: &packet,
+                groups: &groups,
+                lf_packet_windows: lf_packet_windows.as_ref(),
+                combined_packet_windows: combined_packet_windows.as_ref(),
+                resource: resource_layout,
+                hf_coefficients: hf_coefficients.as_ref(),
+                adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
+                restoration_scratch: gaborish.is_some() || epf.is_some(),
+                gaborish: gaborish.is_some(),
+                epf_sigma: epf_sigma_memory,
+                epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
+                resident: &resident_memory,
+                output: output_plan,
+            })?;
+            Ok(VarDctEntropyPlanSelection {
+                stream_limit,
+                lf_packet_windows,
+                combined_packet_windows,
+                hf_coefficients,
+                memory,
+            })
+        };
+    let selected_stream_limit = match select_budget_adaptive_stream_limit(
+        configured_stream_limit,
+        memory_limit_bytes,
+        |stream_limit| Ok(plan_at_limit(stream_limit)?.memory.into()),
+    )? {
+        AdaptiveStreamLimitDecision::Selected(stream_limit) => stream_limit,
+        AdaptiveStreamLimitDecision::BudgetTooSmall { required_bytes } => {
+            return Err(VarDctDecodeError::MemoryBudgetTooSmall {
+                required_bytes,
+                limit_bytes: memory_limit_bytes,
+            });
+        }
+    };
+    let entropy_plan = plan_at_limit(selected_stream_limit)?;
+    let VarDctEntropyPlanSelection {
+        stream_limit,
+        lf_packet_windows,
+        combined_packet_windows,
+        hf_coefficients,
+        memory,
+    } = entropy_plan;
     validate_device_limits(
         backend.device(),
         memory,
@@ -4093,6 +4248,59 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_stream_memory(
+        fixed_bytes: u64,
+        packet_window: bool,
+        hf_window: bool,
+        stream_limit: u64,
+    ) -> AdaptiveStreamMemory {
+        let packet_stream_window_bytes = if packet_window { stream_limit } else { 0 };
+        let hf_stream_window_bytes = if hf_window { stream_limit } else { 0 };
+        AdaptiveStreamMemory {
+            total_frame_bytes: fixed_bytes + packet_stream_window_bytes + hf_stream_window_bytes,
+            packet_stream_window_bytes,
+            hf_stream_window_bytes,
+        }
+    }
+
+    #[test]
+    fn adaptive_stream_limit_uses_the_largest_aligned_cap_that_fits() {
+        let decision = select_budget_adaptive_stream_limit(256, 1_120, |stream_limit| {
+            Ok(synthetic_stream_memory(1_000, true, true, stream_limit))
+        })
+        .unwrap();
+        assert_eq!(decision, AdaptiveStreamLimitDecision::Selected(60));
+
+        let unchanged = select_budget_adaptive_stream_limit(256, 1_512, |stream_limit| {
+            Ok(synthetic_stream_memory(1_000, true, true, stream_limit))
+        })
+        .unwrap();
+        assert_eq!(unchanged, AdaptiveStreamLimitDecision::Selected(256));
+    }
+
+    #[test]
+    fn adaptive_stream_limit_reports_the_exact_minimum_window_layout() {
+        let decision = select_budget_adaptive_stream_limit(256, 1_079, |stream_limit| {
+            Ok(synthetic_stream_memory(1_000, true, true, stream_limit))
+        })
+        .unwrap();
+        assert_eq!(
+            decision,
+            AdaptiveStreamLimitDecision::BudgetTooSmall {
+                required_bytes: 1_080,
+            }
+        );
+    }
+
+    #[test]
+    fn adaptive_stream_limit_normalizes_the_caller_cap_to_four_bytes() {
+        let decision = select_budget_adaptive_stream_limit(255, 2_000, |stream_limit| {
+            Ok(synthetic_stream_memory(1_000, true, false, stream_limit))
+        })
+        .unwrap();
+        assert_eq!(decision, AdaptiveStreamLimitDecision::Selected(252));
+    }
 
     #[test]
     fn quant_matrix_scales_cover_all_wire_values_and_reject_out_of_range() {

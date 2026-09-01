@@ -66,6 +66,17 @@ stream bytes may not exceed the cap, and the submission count must equal the ini
 planned AC batches, and resident pre/post stages without double-counting the co-submitted final
 packet command.
 
+`vardct_engine_gpu::vardct_stream_windows_adapt_to_the_shared_frame_budget` opens the same
+438×589 global-tree/nonzero-AC fixture at 40-byte and 256-byte caller caps, then chooses a shared
+budget strictly between those exact frame totals. Production planning must resolve a four-byte-
+aligned cap below 256, report packet/AC peaks at or below it, and keep the complete planned frame at
+or below the budget. Runtime-neutral async output remains within one RGB8 code of Rust `jxl`.
+A second simultaneous session must expose typed non-blocking `MemoryBudgetError::Exhausted`
+backpressure without consuming its source; abandoning the admitted session must drain the budget
+after the queue fence, after which retrying that same backpressured session must decode the reference
+pixels. A budget one byte below the exact 40-byte layout must fail at open with typed
+`MemoryBudgetTooSmall` and matching required/limit fields.
+
 `vardct_engine_gpu::combined_single_packet_resumes_across_bounded_gpu_windows` generates a patterned
 32×32 DCT32x32 stream through the GPU encoder and forces its single combined LF/HF packet through a
 40-byte cap. More than two windows share the same 64/128-byte state across the LF-to-HF transition;

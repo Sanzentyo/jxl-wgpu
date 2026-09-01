@@ -174,10 +174,18 @@ for local trees it covers LF. HF packet descriptors are host-discovered after th
 `hf_packet_stream_batch_count()` and `submissions_per_frame()` become exact when that dynamic plan is
 installed; performance harnesses sample them after frame completion. Applying
 `WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines and governs
-combined/global packets, local-tree LF/HF packets, and AC pass groups. Actual-adapter runs force a
-40-byte 32x32 combined packet and 256-byte shared-global/local-tree/nonzero-AC paths through
-blocking or runtime-neutral async decode, typed corruption, and cancellation-driven reservation
-release.
+combined/global packets, local-tree LF/HF packets, and AC pass groups. It is a caller upper bound:
+device limits and deterministic planning against the shared budget's total capacity may select a
+smaller four-byte-aligned value, exposed as
+`VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`. Planning does not sample live
+headroom, so concurrent opens are reproducible; live jobs still receive typed non-blocking memory
+backpressure at submission. If even the 40-byte overlap/sentinel layout exceeds the budget,
+`MemoryBudgetTooSmall` reports both exact planned bytes and the configured limit before GPU work.
+Cursor-dependent local-HF metadata remains the one dynamic addition and admits only its exact
+positive difference from the same budget. Actual-adapter runs force a 40-byte 32x32 combined packet,
+256-byte shared-global/local-tree/nonzero-AC paths, and an intermediate budget-resolved cap through
+blocking or runtime-neutral async decode, typed corruption/backpressure, and cancellation-driven
+reservation release.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27

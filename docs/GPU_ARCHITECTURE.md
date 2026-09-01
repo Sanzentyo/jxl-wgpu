@@ -107,6 +107,15 @@ LF local header. Five words in the same state retain LF/HF phase, both decoded c
 count, and extra precision across the three LF and four HF channels. Only the final segment validates
 the packet tail, and its command shares the first downstream queue submission.
 
+For VarDCT, the caller/device cap is first evaluated against exact packet, AC, render, validation,
+and output bytes. If that frame would exceed the shared budget's total capacity, the planner
+evaluates the 40-byte minimum and searches four-byte-aligned caps for the largest tested layout that
+fits. The resolved cap is recorded in `VarDctDecodeMemoryStats`; an impossible minimum layout is a
+typed pre-submission error. Planning deliberately does not use momentary live headroom: concurrent
+jobs race only at non-blocking `MemoryBudget` admission and report retryable backpressure. A staged
+local tree reuses its already planned packet upload for host-discovered HF entropy; only a larger
+HF metadata allocation requests its exact difference after the LF cursor map.
+
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local
 per-substream MA trees first submit one or more bounded LF entropy windows, map only aggregate end cursors, host-pack the
