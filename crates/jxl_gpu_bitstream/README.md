@@ -5,6 +5,20 @@ Bounded JPEG XL transport and codestream inventory for GPU codec front ends.
 `parse` validates transport framing for raw codestreams, `jxlc` containers, and ordered or indexed
 `jxlp` fragment sequences. Raw and single-`jxlc` codestreams remain borrowed; only fragmented
 streams are joined.
+
+`ContainerStreamScanner` is the non-accumulating transport path. It accepts owned `Arc<[u8]>`
+chunks at arbitrary byte boundaries and emits raw/`jxlc`/`jxlp` codestream slices in logical order.
+Except for the two-byte codestream signature reconstructed inline across arbitrary chunk
+boundaries, ordered payload slices share the caller allocation. A file-type version 1 fragment
+received ahead of a gap is the only copied payload; arbitrary input chunks are coalesced into one
+retained payload buffer per future fragment under an independent logical-byte limit, then released
+as soon as the gap closes. Auxiliary-box events preserve the exact 8/16-byte header encoding and
+stream payload slices without assembling the box. Typed limits cover input chunks, total input,
+box count/size, codestream size, and buffered future fragments. The
+terminal `End` event is emitted only after end-of-input validates transport order and completeness;
+earlier events are deliberately non-authoritative. Incremental frame-header/TOC inventory and
+direct GPU-window consumption remain the next layer and do not call the contiguous `parse` path.
+
 After transport validation, `ParsedJxl::codestream_inventory` extracts the standard image header,
 enumerated/ICC color and tone-mapping metadata, typed extra channels, animation timing, complete
 color and extra-channel blending contracts, per-channel upsampling, XYB quant-matrix scales,

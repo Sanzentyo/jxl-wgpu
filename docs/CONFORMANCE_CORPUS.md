@@ -23,6 +23,26 @@ The checked-in inventory includes 1x1, tiny (2x2), odd (17x13, 19x11), square (6
 1x16384), 255/256/257 group boundaries, HD 1280x720 (Gray8 and RGB8), FHD 1920x1080 (RGBA8), UHD 4K
 3840x2160 (RGB10), UHD 8K 7680x4320 (Gray8), and UHD 16K 15360x8640 (Gray8).
 
+## Incremental transport matrix
+
+`jxl_gpu_bitstream::stream` tests raw codestreams and compact `jxlc`/`jxlp` containers at every
+two-chunk split, plus byte-at-a-time signature, file-type, box-header, fragment-index, auxiliary
+payload, and codestream delivery. Extended 64-bit auxiliary sizes and a size-zero `jxlc` are split
+at every byte. Ordered events must reconstruct the exact codestream; auxiliary events must preserve
+their original header bytes and payload. Caller-allocation identity tests prove that raw, `jxlc`,
+ordered `jxlp`, and auxiliary payload tails share the supplied `Arc` rather than being copied; the
+signature reconstructed across arbitrary boundaries is held inline.
+
+The version-1 out-of-order fixture delivers the final fragment one byte at a time before fragment
+zero. It must coalesce those chunks into one four-byte retained payload buffer, report exactly that
+logical peak, release it when the gap closes, and emit the canonical codestream order. A five-byte
+future fragment under a four-byte limit must fail with typed
+`BufferedFragmentSizeLimit` before retained state survives the error. Typed count/size limits cover
+the mandatory file-type box, every prefix of a real fragmented animation is either rejected or
+matches the existing contiguous transport parser exactly, and a poisoned scanner rejects further
+input. These are transport tests only; incremental inventory and GPU decode evidence are still
+required before `FRONT-03` can be complete.
+
 ## Procedural VarDCT encoder matrix
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than

@@ -1,9 +1,9 @@
 //! Bounded JPEG XL container and bitstream orchestration.
 //!
 //! This crate deliberately does not decode or encode image samples. It validates the transport
-//! container, exposes the contiguous JPEG XL codestream to a GPU codec, inventories standard image
-//! and frame headers plus physical TOC section ranges, and provides deterministic bit/box writers
-//! for final packet assembly.
+//! container, either exposes a contiguous JPEG XL codestream or incrementally emits bounded shared
+//! ranges to a GPU codec, inventories standard image and frame headers plus physical TOC section
+//! ranges, and provides deterministic bit/box writers for final packet assembly.
 
 #![deny(unsafe_code)]
 
@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod acceleration;
 mod inventory;
+mod stream;
 
 #[cfg(test)]
 mod test_fixtures {
@@ -84,6 +85,11 @@ pub use inventory::{
     OpsinInverseMatrixInventory, PrimariesInventory, RenderingIntentInventory,
     RestorationFilterInventory, SampleBitDepth, ToneMappingInventory, TransferFunctionInventory,
     UpsamplingWeightsInventory, WhitePointInventory,
+};
+pub use stream::{
+    ContainerBoxSizeEncoding, ContainerStreamBoxHeader, ContainerStreamContext,
+    ContainerStreamEvent, ContainerStreamLimits, ContainerStreamScanner, ContainerStreamStats,
+    StreamSlice,
 };
 
 /// Raw JPEG XL codestream signature (`0xff 0x0a`).
@@ -366,7 +372,11 @@ fn join_fragments(
     last_fragment: Option<u32>,
     limits: ParseLimits,
 ) -> Result<Vec<u8>, Error> {
-    let last = last_fragment.ok_or(Error::MissingCodestream)?;
+    let last = match last_fragment {
+        Some(last) => last,
+        None if fragments.is_empty() => return Err(Error::MissingCodestream),
+        None => return Err(Error::MissingFinalFragment),
+    };
     let expected_count = last.checked_add(1).ok_or(Error::SizeOverflow)?;
     if usize::try_from(expected_count).map_err(|_| Error::SizeOverflow)? != fragments.len() {
         return Err(Error::MissingFragment);
@@ -745,6 +755,8 @@ pub enum Error {
     InvalidFileTypeBox,
     #[error("JPEG XL ftyp box may only occur as the second box")]
     MisplacedFileTypeBox,
+    #[error("JPEG XL signature box may only occur first")]
+    MisplacedSignatureBox,
     #[error("JPEG XL container file-type version {0} is not supported")]
     UnsupportedFileTypeVersion(u32),
     #[error("box type {0:?} is reserved for JPEG XL container transport")]
@@ -775,6 +787,22 @@ pub enum Error {
     FragmentAfterLast(u32),
     #[error("resource limit exceeded for {0}")]
     ResourceLimit(&'static str),
+    #[error("incremental input chunk has {bytes} bytes, limit is {limit}")]
+    InputChunkSizeLimit { bytes: u64, limit: u64 },
+    #[error("incremental input reached {bytes} bytes, limit is {limit}")]
+    InputSizeLimit { bytes: u64, limit: u64 },
+    #[error("container reached {boxes} boxes, limit is {limit}")]
+    BoxCountLimit { boxes: usize, limit: usize },
+    #[error("container box {box_type:?} reached {bytes} bytes, limit is {limit}")]
+    BoxSizeLimit {
+        box_type: [u8; 4],
+        bytes: u64,
+        limit: u64,
+    },
+    #[error("logical codestream reached {bytes} bytes, limit is {limit}")]
+    CodestreamSizeLimit { bytes: u64, limit: u64 },
+    #[error("out-of-order fragments require {bytes} buffered bytes, limit is {limit}")]
+    BufferedFragmentSizeLimit { bytes: u64, limit: u64 },
     #[error("allocation failed while building {0}")]
     AllocationFailed(&'static str),
     #[error("size arithmetic overflow")]
@@ -795,6 +823,14 @@ pub enum Error {
     TooManyFragments,
     #[error("fragmented container is missing its final fragment")]
     MissingFinalFragment,
+    #[error("incremental input ended while reading {context:?}")]
+    UnexpectedEndOfInput { context: ContainerStreamContext },
+    #[error("incremental input was already finished")]
+    StreamAlreadyFinished,
+    #[error("incremental input scanner is poisoned by an earlier error")]
+    StreamFailed,
+    #[error("incremental input scanner contract failed: {0}")]
+    StreamContract(&'static str),
 }
 
 #[cfg(test)]
@@ -879,6 +915,17 @@ mod tests {
         assert_eq!(
             parse(&input, ParseLimits::default()).unwrap_err(),
             Error::MissingFragment
+        );
+    }
+
+    #[test]
+    fn fragmented_container_distinguishes_an_absent_final_marker() {
+        let mut input = CONTAINER_SIGNATURE_BOX.to_vec();
+        input.extend_from_slice(&CONTAINER_FILE_TYPE_BOX_V0);
+        push_jxlp(&mut input, 0, &[0xff, 0x0a, 1]);
+        assert_eq!(
+            parse(&input, ParseLimits::default()).unwrap_err(),
+            Error::MissingFinalFragment
         );
     }
 

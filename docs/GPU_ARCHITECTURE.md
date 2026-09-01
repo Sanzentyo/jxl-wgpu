@@ -46,6 +46,17 @@ GPU image source -> GPU prediction/transform/quantization/tokenization
                  -> deterministic group packet assembly -> JPEG XL codestream/container
 ```
 
+Before codestream inventory, `jxl_gpu_bitstream::ContainerStreamScanner` can now consume arbitrary
+owned chunks without joining the complete transport. Apart from the inline reconstructed two-byte
+signature, raw, `jxlc`, and in-order `jxlp` payloads are emitted as ranges over the caller's
+`Arc<[u8]>`; version-1 fragments ahead of a gap coalesce input chunks into one retained payload
+buffer per fragment under a separate logical-byte limit, then release it when its logical turn is
+emitted. Auxiliary box start/chunk/end events retain the original compact, extended, or to-end
+header bytes. No output is authoritative until the end-of-input event validates transport and
+fragment completeness. The current inventory and both decode engines still consume a contiguous
+codestream, so incremental header/TOC state and direct entropy-window ingestion remain an explicit
+frontend boundary rather than being hidden behind whole-input reassembly.
+
 `GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
 inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that
 inventory into either the Modular or VarDCT submission session. The selector does not merge their

@@ -8,8 +8,8 @@ not production dependencies or fallback paths.
 
 ## Crates
 
-- `jxl_gpu_bitstream`: bounded raw/container parsing, bit IO, and deterministic `jxlc`/`jxlp`
-  assembly shared by encode and decode.
+- `jxl_gpu_bitstream`: bounded raw/container parsing, non-accumulating incremental transport
+  events, bit IO, and deterministic `jxlc`/`jxlp` assembly shared by encode and decode.
 - `jxl_gpu_protocol`: backend-neutral render plans, decoded-group packets, and the canonical
   `RenderBackend`/`FrameSession` contracts.
 - `jxl_gpu_formats`: checked pitch-linear image layouts and CPU reference conversion, including
@@ -35,6 +35,14 @@ assembles the final codestream. Pixel prediction, transform/quantization, coeffi
 processing, and supported entropy work belong to GPU jobs. The exact initially supported profile
 is capability-negotiated; broader JPEG XL features remain typed rejections until their kernels and
 conformance tests exist.
+
+The incremental transport scanner accepts arbitrary shared chunks for raw, `jxlc`, ordered v0 and
+out-of-order v1 `jxlp` delivery. Apart from the inline reconstructed two-byte codestream signature,
+ordered codestream and auxiliary-box payloads remain zero-copy `Arc` slices; only future fragments
+waiting on a v1 gap use payload-only storage bounded by explicitly reported logical bytes. Its
+terminal event validates transport end-of-input, but the stock decode engines still require
+contiguous inventory and frame-section integration, so this is not yet an incremental `GpuDecoder`
+claim.
 
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.

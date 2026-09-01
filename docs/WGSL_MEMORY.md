@@ -81,7 +81,13 @@ name shown in parentheses.
   serializers use explicit little-endian fields and packed offsets. In particular, a serialized
   prefix entry is three bytes (`u8` plus `u16`), while Rust's naturally aligned
   `PrefixCodeEntry` occupies four bytes. Deriving `Pod` would serialize host padding and produce a
-  different, invalid wire format.
+  different, invalid wire format. Incremental transport therefore uses `StreamSlice` ranges over
+  caller-owned `Arc<[u8]>`, not a fake fixed ABI. Apart from the two-byte codestream signature
+  reconstructed inline across arbitrary chunk boundaries, ordered raw/`jxlc`/`jxlp` and auxiliary
+  payloads share those allocations. Only out-of-order version-1 fragments are copied and arbitrary
+  input chunks are coalesced into one retained payload buffer per future fragment; logical retained
+  bytes and their peak are reported and hard-limited independently. Allocator capacity and
+  collection metadata are outside those logical counters.
 - Raw image planes and mapped packed-image byte ranges have runtime-selected formats, plane counts,
   row strides, and lengths. `ImageLayout` validates their byte ranges; there is no single fixed
   Rust record that could safely represent their contents.
