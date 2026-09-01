@@ -54,8 +54,10 @@ The Modular consumer separately parses the stock lossless profile through one ch
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and
 exercise unaligned zero-bit checks. Existing actual-GPU Modular tests then run through the same
-span-backed bounded uploader. Public event-to-engine ingestion and the VarDCT source conversion are
-still required before `FRONT-03` can be complete.
+span-backed bounded uploader. VarDCT separately verifies that one bounded upload segment crossing
+three physical spans is byte-exact and that an out-of-range segment returns its typed execution
+contract error. Public event-to-engine ingestion, remaining VarDCT metadata-parser conversion, and
+retained-span backpressure/cancellation are still required before `FRONT-03` can be complete.
 
 ## Procedural VarDCT encoder matrix
 

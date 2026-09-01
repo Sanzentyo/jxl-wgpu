@@ -72,6 +72,15 @@ impl CodestreamData {
         self.logical_bytes
     }
 
+    /// Returns the complete logical source only when it is physically backed by one span.
+    ///
+    /// This is a temporary bridge for metadata parsers that have not yet been generalized to
+    /// [`CodestreamBitReader`]. GPU uploads and range consumers must use [`Self::copy_range`].
+    pub(crate) fn contiguous_bytes(&self) -> Option<&[u8]> {
+        let span = self.spans.first()?;
+        (self.spans.len() == 1 && span.logical_offset == 0).then(|| span.bytes.bytes())
+    }
+
     pub(crate) fn logical_bits(&self) -> Result<u64> {
         self.logical_bytes
             .checked_mul(8)
@@ -82,27 +91,17 @@ impl CodestreamData {
         CodestreamBitReader::new(self)
     }
 
-    pub(crate) fn copy_range(&self, range: Range<u64>, destination: &mut [u8]) -> Result<()> {
+    pub(crate) fn for_each_range_chunk(
+        &self,
+        range: Range<u64>,
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         if range.start > range.end || range.end > self.logical_bytes {
             return Err(Error::EngineContract(
-                "codestream copy range is outside the logical source",
+                "codestream chunk range is outside the logical source",
             ));
         }
-        let range_bytes = range
-            .end
-            .checked_sub(range.start)
-            .ok_or_else(|| Error::backend("codestream copy range underflow"))?;
-        if u64::try_from(destination.len())
-            .map_err(|_| Error::backend("codestream copy destination exceeds u64"))?
-            != range_bytes
-        {
-            return Err(Error::EngineContract(
-                "codestream copy destination has the wrong length",
-            ));
-        }
-
         let mut logical_cursor = range.start;
-        let mut destination_cursor = 0usize;
         let first_span = self
             .spans
             .partition_point(|span| span.logical_offset <= range.start)
@@ -127,26 +126,50 @@ impl CodestreamData {
                 .map_err(|_| Error::backend("codestream source offset exceeds host space"))?;
             let source_end = usize::try_from(copy_end - span.logical_offset)
                 .map_err(|_| Error::backend("codestream source end exceeds host space"))?;
-            let copy_len = source_end
-                .checked_sub(source_start)
-                .ok_or_else(|| Error::backend("codestream source range underflow"))?;
+            visit(span.bytes.bytes().get(source_start..source_end).ok_or(
+                Error::EngineContract("codestream span storage is truncated"),
+            )?)?;
+            logical_cursor = copy_end;
+        }
+        if logical_cursor != range.end {
+            return Err(Error::EngineContract(
+                "codestream span table does not cover the requested range",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_range(&self, range: Range<u64>, destination: &mut [u8]) -> Result<()> {
+        let range_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(|| Error::backend("codestream copy range underflow"))?;
+        if u64::try_from(destination.len())
+            .map_err(|_| Error::backend("codestream copy destination exceeds u64"))?
+            != range_bytes
+        {
+            return Err(Error::EngineContract(
+                "codestream copy destination has the wrong length",
+            ));
+        }
+
+        let mut destination_cursor = 0usize;
+        self.for_each_range_chunk(range, |chunk| {
             let destination_end = destination_cursor
-                .checked_add(copy_len)
+                .checked_add(chunk.len())
                 .ok_or_else(|| Error::backend("codestream destination range overflow"))?;
             destination
                 .get_mut(destination_cursor..destination_end)
                 .ok_or(Error::EngineContract(
                     "codestream copy destination is truncated",
                 ))?
-                .copy_from_slice(span.bytes.bytes().get(source_start..source_end).ok_or(
-                    Error::EngineContract("codestream span storage is truncated"),
-                )?);
+                .copy_from_slice(chunk);
             destination_cursor = destination_end;
-            logical_cursor = copy_end;
-        }
-        if logical_cursor != range.end || destination_cursor != destination.len() {
+            Ok(())
+        })?;
+        if destination_cursor != destination.len() {
             return Err(Error::EngineContract(
-                "codestream span table does not cover the requested range",
+                "codestream copy destination is truncated",
             ));
         }
         Ok(())
@@ -329,6 +352,19 @@ mod tests {
             let mut copied = [0; 3];
             source.copy_range(1..4, &mut copied).unwrap();
             assert_eq!(copied, bytes[1..4]);
+
+            let mut visited = Vec::new();
+            source
+                .for_each_range_chunk(1..4, |chunk| {
+                    visited.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(visited, bytes[1..4]);
+            assert_eq!(
+                source.contiguous_bytes().is_some(),
+                split == 0 || split == 5
+            );
         }
         let storage: Arc<[u8]> = Arc::from(bytes);
         let byte_spans = (0..storage.len()).map(|offset| {

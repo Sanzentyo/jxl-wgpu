@@ -44,17 +44,6 @@ pub(crate) struct StreamBatch {
     pub group_count: usize,
 }
 
-pub(crate) fn build_stream_batches(
-    codestream: &[u8],
-    groups: &[GroupEntropyRange],
-    stream_limit: u64,
-    max_groups_per_batch: usize,
-) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
-    let codestream_bytes = u64::try_from(codestream.len())
-        .map_err(|_| Error::backend("codestream size exceeds u64"))?;
-    build_stream_batches_for_len(codestream_bytes, groups, stream_limit, max_groups_per_batch)
-}
-
 pub(crate) fn build_stream_batches_for_len(
     codestream_bytes: u64,
     groups: &[GroupEntropyRange],

@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::{
-    GroupEntropyRange, GroupStreamSegment, StreamBatch, build_stream_batches,
+    GroupEntropyRange, GroupStreamSegment, StreamBatch, build_stream_batches_for_len,
 };
 use crate::vardct_artifact::{
     HF_ORDER_CHANNELS, HF_ORDER_COUNT, HfCoefficientSinkParams, VarDctArtifactLayout,
@@ -151,7 +151,7 @@ impl HfCoefficientExecutionPlan {
         packet: &BoundedVarDctPacketPlan,
         entropy: &HfCoefficientEntropyPlan,
         artifacts: &[VarDctArtifactLayout],
-        codestream: &[u8],
+        codestream_bytes: u64,
         stream_limit: u64,
     ) -> Result<Self, HfCoefficientPlanError> {
         let metadata_words = u32::try_from(entropy.metadata.len()).map_err(|_| {
@@ -323,11 +323,15 @@ impl HfCoefficientExecutionPlan {
                         field: "HF execution-state offset",
                     })?;
             }
-            let (stream_segments, stream_batches, stream_bytes) =
-                build_stream_batches(codestream, &stream_ranges, stream_limit, params.len())
-                    .map_err(|error| HfCoefficientPlanError::EntropyWindow {
-                        message: error.to_string(),
-                    })?;
+            let (stream_segments, stream_batches, stream_bytes) = build_stream_batches_for_len(
+                codestream_bytes,
+                &stream_ranges,
+                stream_limit,
+                params.len(),
+            )
+            .map_err(|error| HfCoefficientPlanError::EntropyWindow {
+                message: error.to_string(),
+            })?;
             let segment_params = stream_segments
                 .iter()
                 .map(|segment| {

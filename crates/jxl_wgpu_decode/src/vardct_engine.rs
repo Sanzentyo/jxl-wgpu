@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -40,7 +39,7 @@ use wgpu::util::DeviceExt;
 
 use crate::entropy_window::{
     GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
-    build_stream_batches,
+    build_stream_batches_for_len,
 };
 use crate::vardct_artifact::{
     GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfMetadataArtifactConfig,
@@ -72,6 +71,7 @@ use crate::{
     AnimationMetadata, DecodeProfile, Error as DecodeError, FrameDuration, FrameMetadata,
     GpuCodestream, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, Result as DecodeResult, SubmittedGpuFrame,
+    codestream_data::CodestreamData,
 };
 
 const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
@@ -176,6 +176,16 @@ pub enum VarDctDecodeError {
     },
     #[error("VarDCT entropy-window execution contract failed: {detail}")]
     EntropyWindowContract { detail: &'static str },
+    #[error("VarDCT codestream source contract failed")]
+    CodestreamSource {
+        #[source]
+        source: Box<DecodeError>,
+    },
+    #[error("failed to access the mapped VarDCT codestream buffer: {source}")]
+    CodestreamMap {
+        #[source]
+        source: wgpu::MapRangeError,
+    },
 }
 
 /// Exact canonical output supported by [`VarDctSubmissionEngine`].
@@ -808,8 +818,7 @@ impl std::fmt::Debug for VarDctSubmissionEngine {
 }
 
 struct VarDctSource {
-    codestream_storage: Arc<[u8]>,
-    codestream_range: Range<usize>,
+    codestream: CodestreamData,
     packet: BoundedVarDctPacketPlan,
     groups: Vec<VarDctGroupSource>,
     lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
@@ -963,9 +972,49 @@ fn map_packet_window_plan_error(error: DecodeError) -> VarDctDecodeError {
     }
 }
 
+fn map_codestream_source_error(source: DecodeError) -> VarDctDecodeError {
+    VarDctDecodeError::CodestreamSource {
+        source: Box::new(source),
+    }
+}
+
+fn copy_stream_segment(
+    codestream: &CodestreamData,
+    segment: GroupStreamSegment,
+    upload: &mut [u8],
+    detail: &'static str,
+) -> Result<(), VarDctDecodeError> {
+    let input_len = segment
+        .input_end
+        .checked_sub(segment.input_start)
+        .ok_or(VarDctDecodeError::EntropyWindowContract { detail })?;
+    let output_end = segment.upload_offset.checked_add(input_len).ok_or(
+        VarDctDecodeError::ArithmeticOverflow {
+            field: "bounded stream upload end",
+        },
+    )?;
+    let output = upload
+        .get_mut(segment.upload_offset..output_end)
+        .ok_or(VarDctDecodeError::EntropyWindowContract { detail })?;
+    let input_start =
+        u64::try_from(segment.input_start).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "bounded stream input start",
+        })?;
+    let input_end =
+        u64::try_from(segment.input_end).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "bounded stream input end",
+        })?;
+    if input_end > codestream.logical_bytes() {
+        return Err(VarDctDecodeError::EntropyWindowContract { detail });
+    }
+    codestream
+        .copy_range(input_start..input_end, output)
+        .map_err(map_codestream_source_error)
+}
+
 impl LfPacketWindowExecutionPlan {
     fn new(
-        codestream: &[u8],
+        codestream_bytes: u64,
         packet: &BoundedVarDctPacketPlan,
         stream_limit: u64,
     ) -> Result<Option<Self>, VarDctDecodeError> {
@@ -986,8 +1035,9 @@ impl LfPacketWindowExecutionPlan {
                 })
             })
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
-        let (segments, batches, _) = build_stream_batches(codestream, &ranges, stream_limit, 1)
-            .map_err(map_packet_window_plan_error)?;
+        let (segments, batches, _) =
+            build_stream_batches_for_len(codestream_bytes, &ranges, stream_limit, 1)
+                .map_err(map_packet_window_plan_error)?;
         let uses_windows = segments.iter().any(|segment| {
             segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
         });
@@ -1027,7 +1077,7 @@ impl LfPacketWindowExecutionPlan {
 
 impl CombinedPacketWindowExecutionPlan {
     fn new(
-        codestream: &[u8],
+        codestream_bytes: u64,
         packet: &BoundedVarDctPacketPlan,
         stream_limit: u64,
     ) -> Result<Option<Self>, VarDctDecodeError> {
@@ -1046,8 +1096,8 @@ impl CombinedPacketWindowExecutionPlan {
                 })
             })
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
-        let (segments, batches, stream_bytes) = build_stream_batches(
-            codestream,
+        let (segments, batches, stream_bytes) = build_stream_batches_for_len(
+            codestream_bytes,
             &ranges,
             stream_limit,
             packet.groups.len().max(1),
@@ -1095,7 +1145,7 @@ impl CombinedPacketWindowExecutionPlan {
 
 impl HfPacketWindowExecutionPlan {
     fn new(
-        codestream: &[u8],
+        codestream_bytes: u64,
         packet: &BoundedVarDctPacketPlan,
         continuations: &[BoundedHfMetadataContinuation],
         stream_limit: u64,
@@ -1125,8 +1175,8 @@ impl HfPacketWindowExecutionPlan {
                 })
             })
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
-        let (segments, batches, stream_bytes) = build_stream_batches(
-            codestream,
+        let (segments, batches, stream_bytes) = build_stream_batches_for_len(
+            codestream_bytes,
             &ranges,
             stream_limit,
             packet.groups.len().max(1),
@@ -1349,6 +1399,11 @@ fn prepare_source(
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
     let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
+    let codestream_len = codestream.bytes().len();
+    let codestream_bytes =
+        u64::try_from(codestream_len).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "codestream source length",
+        })?;
     let staged_local_trees = packet.requires_local_tree_staging();
     let limits = backend.device().limits();
     let configured_stream_limit = stream_window_limit
@@ -1494,18 +1549,12 @@ fn prepare_source(
     let plan_at_limit =
         |stream_limit: u64| -> Result<VarDctEntropyPlanSelection, VarDctDecodeError> {
             let lf_packet_windows = staged_local_trees
-                .then(|| {
-                    LfPacketWindowExecutionPlan::new(codestream.bytes(), &packet, stream_limit)
-                })
+                .then(|| LfPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit))
                 .transpose()?
                 .flatten();
             let combined_packet_windows = (!staged_local_trees)
                 .then(|| {
-                    CombinedPacketWindowExecutionPlan::new(
-                        codestream.bytes(),
-                        &packet,
-                        stream_limit,
-                    )
+                    CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
                 })
                 .transpose()?
                 .flatten();
@@ -1517,14 +1566,14 @@ fn prepare_source(
                         &packet,
                         entropy,
                         &artifacts,
-                        codestream.bytes(),
+                        codestream_bytes,
                         stream_limit,
                     )
                 })
                 .transpose()?;
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
                 stream_limit,
-                codestream_len: codestream.bytes().len(),
+                codestream_len,
                 packet: &packet,
                 groups: &groups,
                 lf_packet_windows: lf_packet_windows.as_ref(),
@@ -1576,9 +1625,10 @@ fn prepare_source(
         hf_coefficients.as_ref(),
     )?;
     let frame_name = packet.profile.frame_name.clone();
+    let codestream =
+        CodestreamData::from_gpu_codestream(codestream).map_err(map_codestream_source_error)?;
     Ok(VarDctSource {
-        codestream_storage: codestream.shared_storage(),
-        codestream_range: codestream.storage_range(),
+        codestream,
         packet,
         groups,
         lf_packet_windows,
@@ -2439,12 +2489,11 @@ impl VarDctPendingFrame {
         lifetime.status_staging.unmap();
         lifetime.status_mapped.store(false, Ordering::Release);
 
-        let codestream = source
-            .codestream_storage
-            .get(source.codestream_range.clone())
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "staged codestream storage range",
-            })?;
+        let codestream = source.codestream.contiguous_bytes().ok_or(
+            VarDctDecodeError::EntropyWindowContract {
+                detail: "HF continuation metadata parser requires one physical codestream span",
+            },
+        )?;
         let continuations = source
             .packet
             .groups
@@ -2458,7 +2507,7 @@ impl VarDctPendingFrame {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let hf_packet_windows = HfPacketWindowExecutionPlan::new(
-            codestream,
+            source.codestream.logical_bytes(),
             &source.packet,
             &continuations,
             source.stream_limit,
@@ -2604,22 +2653,12 @@ impl VarDctPendingFrame {
                             detail: "HF packet segment has no parameter record",
                         },
                     )?;
-                    let input = codestream
-                        .get(segment.input_start..segment.input_end)
-                        .ok_or(VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment exceeds the retained codestream",
-                        })?;
-                    let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
-                        VarDctDecodeError::ArithmeticOverflow {
-                            field: "HF packet stream upload end",
-                        },
+                    copy_stream_segment(
+                        &source.codestream,
+                        segment,
+                        &mut stream_upload,
+                        "HF packet segment exceeds the source or reusable upload",
                     )?;
-                    stream_upload
-                        .get_mut(segment.upload_offset..output_end)
-                        .ok_or(VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment exceeds the reusable upload",
-                        })?
-                        .copy_from_slice(input);
                     self.pipelines.packet.encode_hf(
                         device,
                         &mut encoder,
@@ -2984,6 +3023,58 @@ fn resident_image_planes<'a>(
     ])
 }
 
+fn upload_codestream(
+    codestream: &CodestreamData,
+    buffer: &wgpu::Buffer,
+    padded_bytes: u64,
+) -> Result<(), VarDctDecodeError> {
+    if padded_bytes < codestream.logical_bytes() || !padded_bytes.is_multiple_of(4) {
+        return Err(VarDctDecodeError::EntropyWindowContract {
+            detail: "GPU codestream buffer does not cover an aligned logical source",
+        });
+    }
+    let logical_size = usize::try_from(codestream.logical_bytes()).map_err(|_| {
+        VarDctDecodeError::ArithmeticOverflow {
+            field: "codestream upload length",
+        }
+    })?;
+    let mut mapped = buffer
+        .get_mapped_range_mut(..)
+        .map_err(|source| VarDctDecodeError::CodestreamMap { source })?;
+    let upload_result = (|| {
+        let mut mapped_cursor = 0usize;
+        codestream
+            .for_each_range_chunk(0..codestream.logical_bytes(), |chunk| -> DecodeResult<()> {
+                let mapped_end = mapped_cursor
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| DecodeError::backend("codestream mapped offset overflow"))?;
+                if mapped_end > mapped.len() {
+                    return Err(DecodeError::EngineContract(
+                        "codestream span exceeds the mapped GPU buffer",
+                    ));
+                }
+                mapped
+                    .slice(mapped_cursor..mapped_end)
+                    .copy_from_slice(chunk);
+                mapped_cursor = mapped_end;
+                Ok(())
+            })
+            .map_err(map_codestream_source_error)?;
+        if mapped_cursor != logical_size {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "codestream spans did not fill the logical mapped range",
+            });
+        }
+        if logical_size < mapped.len() {
+            mapped.slice(logical_size..).fill(0);
+        }
+        Ok(())
+    })();
+    drop(mapped);
+    buffer.unmap();
+    upload_result
+}
+
 fn submit_vardct(
     backend: &WgpuBackend,
     pipelines: Arc<VarDctPipelines>,
@@ -2994,25 +3085,17 @@ fn submit_vardct(
     poll_permit: SubmissionPollPermit,
 ) -> Result<VarDctPendingFrame, VarDctDecodeError> {
     let device = backend.device();
-    let codestream = source
-        .codestream_storage
-        .get(source.codestream_range.clone())
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "codestream storage range",
-        })?;
-    let upload_bytes = usize::try_from(source.memory.codestream_bytes).map_err(|_| {
-        VarDctDecodeError::ArithmeticOverflow {
-            field: "codestream upload host length",
-        }
-    })?;
-    let mut upload = Vec::with_capacity(upload_bytes);
-    upload.extend_from_slice(codestream);
-    upload.resize(upload_bytes, 0);
-    let codestream_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let codestream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT codestream"),
-        contents: &upload,
+        size: source.memory.codestream_bytes,
         usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: true,
     });
+    upload_codestream(
+        &source.codestream,
+        &codestream_buffer,
+        source.memory.codestream_bytes,
+    )?;
     let staged_local_trees = source.packet.requires_local_tree_staging();
     let modular_metadata = if staged_local_trees {
         source
@@ -3393,22 +3476,12 @@ fn submit_vardct(
                 }
             }
             let mut stream_upload = vec![0_u8; upload_len];
-            let input = codestream
-                .get(segment.input_start..segment.input_end)
-                .ok_or(VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment exceeds the retained codestream",
-                })?;
-            let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "LF packet stream upload end",
-                },
+            copy_stream_segment(
+                &source.codestream,
+                segment,
+                &mut stream_upload,
+                "LF packet segment exceeds the source or reusable upload",
             )?;
-            stream_upload
-                .get_mut(segment.upload_offset..output_end)
-                .ok_or(VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment exceeds the reusable upload",
-                })?
-                .copy_from_slice(input);
             let params = *plan.segment_params.get(segment_index).ok_or(
                 VarDctDecodeError::EntropyWindowContract {
                     detail: "LF packet segment has no parameter record",
@@ -3488,22 +3561,12 @@ fn submit_vardct(
                         detail: "combined packet segment has no parameter record",
                     },
                 )?;
-                let input = codestream
-                    .get(segment.input_start..segment.input_end)
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "combined packet segment exceeds the retained codestream",
-                    })?;
-                let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
-                    VarDctDecodeError::ArithmeticOverflow {
-                        field: "combined packet stream upload end",
-                    },
+                copy_stream_segment(
+                    &source.codestream,
+                    segment,
+                    &mut stream_upload,
+                    "combined packet segment exceeds the source or reusable upload",
                 )?;
-                stream_upload
-                    .get_mut(segment.upload_offset..output_end)
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "combined packet segment exceeds the reusable upload",
-                    })?
-                    .copy_from_slice(input);
                 pipelines.packet.encode(
                     device,
                     &mut encoder,
@@ -3733,22 +3796,12 @@ fn submit_vardct(
                 for batch in &group_plan.stream_batches {
                     let mut stream_upload = vec![0_u8; upload_len];
                     for segment in &group_plan.stream_segments[batch.segments.clone()] {
-                        let input = codestream
-                            .get(segment.input_start..segment.input_end)
-                            .ok_or(VarDctDecodeError::EntropyWindowContract {
-                                detail: "HF stream segment exceeds the retained codestream",
-                            })?;
-                        let output_end = segment.upload_offset.checked_add(input.len()).ok_or(
-                            VarDctDecodeError::ArithmeticOverflow {
-                                field: "HF stream segment upload end",
-                            },
+                        copy_stream_segment(
+                            &source.codestream,
+                            *segment,
+                            &mut stream_upload,
+                            "HF stream segment exceeds the source or reusable upload",
                         )?;
-                        let output = stream_upload
-                            .get_mut(segment.upload_offset..output_end)
-                            .ok_or(VarDctDecodeError::EntropyWindowContract {
-                                detail: "HF stream segment exceeds the reusable upload",
-                            })?;
-                        output.copy_from_slice(input);
                     }
                     let params_upload =
                         bytemuck::cast_slice(&group_plan.segment_params[batch.segments.clone()])
@@ -4248,6 +4301,7 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jxl_gpu_bitstream::StreamSlice;
 
     fn synthetic_stream_memory(
         fixed_bytes: u64,
@@ -4300,6 +4354,53 @@ mod tests {
         })
         .unwrap();
         assert_eq!(decision, AdaptiveStreamLimitDecision::Selected(252));
+    }
+
+    #[test]
+    fn bounded_stream_upload_crosses_physical_codestream_spans() {
+        let bytes: Arc<[u8]> = Arc::from([10, 11, 12, 13, 14, 15, 16]);
+        let source = CodestreamData::from_spans([
+            (
+                0,
+                StreamSlice::from_shared_range(Arc::clone(&bytes), 0..3).unwrap(),
+            ),
+            (
+                3,
+                StreamSlice::from_shared_range(Arc::clone(&bytes), 3..5).unwrap(),
+            ),
+            (5, StreamSlice::from_shared_range(bytes, 5..7).unwrap()),
+        ])
+        .unwrap();
+        let segment = GroupStreamSegment {
+            group_index: 0,
+            input_start: 2,
+            input_end: 7,
+            upload_offset: 3,
+            window_logical_start: 0,
+            window_upload_start: 0,
+            available_token_end: 0,
+            stream_token_end: 0,
+            window_yield_end: 0,
+            flags: 0,
+        };
+        let mut upload = [0u8; 9];
+        copy_stream_segment(&source, segment, &mut upload, "test source range").unwrap();
+        assert_eq!(upload, [0, 0, 0, 12, 13, 14, 15, 16, 0]);
+
+        assert!(matches!(
+            copy_stream_segment(
+                &source,
+                GroupStreamSegment {
+                    input_end: 8,
+                    ..segment
+                },
+                &mut upload,
+                "test source range",
+            ),
+            Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "test source range"
+            })
+        ));
     }
 
     #[test]

@@ -117,6 +117,15 @@ typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes befor
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
 1-GiB parser ceiling.
 
+The retained VarDCT source is a checked logically contiguous table of shared spans. Entropy-window
+planning depends only on its logical length; LF, combined LF/HF, staged HF, and AC uploads copy
+their exact ranges across arbitrary physical span boundaries. Whole-range kernels still require a
+full GPU codestream buffer, but it is initialized while mapped directly from the span table and
+zero-padded to four bytes without constructing a second full-size host `Vec`. The initial VarDCT
+packet parser and cursor-dependent local-HF metadata parser still take one contiguous slice, so the
+public decoder remains single-span until those two metadata boundaries and section-event ingestion
+are generalized.
+
 The host inventories bounded scalar headers, packs the shared or local MA-tree and coefficient entropy descriptors,
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF
 image entropy symbol or coefficient value. One GPU submission decodes and validates LF/HF metadata,
