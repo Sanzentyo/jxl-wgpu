@@ -125,6 +125,14 @@ entropy stream, followed by the coalesced pass-group wave. Both are validated by
 status map, so this is production transformed multi-group evidence rather than a primitive-only
 kernel test.
 
+Two adjacent `cjxl` gates cover the cross-group path. The 515×259 Gray Palette fixture must decode
+nonzero DC-global samples, report one frame-resident arena and exactly one Palette dispatch, execute
+one 144-byte finalizer, and match both its source and the Rust `jxl` oracle byte-for-byte. The
+same-size `--responsive=1` Squeeze fixture exercises a DC-local MA configuration when no outer global
+tree exists, requires nonzero DC-global samples and inverse jobs with no Palette dispatch, and is
+also byte-exact. Together they prove global entropy, pass-group plane assembly, and one frame-wide
+inverse; they do not cover channels scheduled in LF groups or progressive frame dependencies.
+
 `wgpu_gray8::local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust` uses the public
 `LosslessModularTreeMode::LocalPerGroup` encoder policy to produce a 515×259, six-pass-group stream.
 The stock decoder must report six local groups, two resident configurations (global plus one

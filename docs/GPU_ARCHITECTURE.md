@@ -186,9 +186,9 @@ horizontal or vertical Squeeze parameter from pairwise non-overlapping average, 
 views of one read-write storage arena. One invocation owns a complete row or column because the
 previous reconstructed odd sample is a normative dependency; linear 1/32/64/128/256-lane variants
 parallelize independent lines. Portable two-word signed arithmetic preserves the scalar `i64`
-smooth-tendency calculation over the complete `i32` input domain. The stock executor still rejects
-non-direct topologies until generalized entropy output targets the inverse arena and Palette plus
-production inverse submission exist.
+smooth-tendency calculation over the complete `i32` input domain. The stock executor routes
+generalized entropy output directly into the inverse arena and schedules Squeeze, RCT, and Palette
+without a host pixel intermediate.
 A second standalone resident primitive applies all 42 inverse RCT types in place. Three equal-size
 planes are disjoint views of the same read-write arena; each invocation loads all inputs before any
 permuted store, so operation and permutation never require an intermediate allocation. Unsigned
@@ -212,13 +212,19 @@ arena word offset, row stride, width/height, cumulative decoded start/end, and a
 prior-channel indices. Host lowering groups previous channels by exact width, height, horizontal
 shift, and vertical shift, then emits at most the 60 newest matches addressable by MA properties
 16..255. The descriptor table and references are appended to the existing immutable metadata and a
-244-byte group parameter carries independent MA-metadata and channel-descriptor offsets. Multi-group lowering reapplies the
-shared DC-global RCT sequence to each concrete edge geometry, then appends that pass group's local
-RCT/Palette/Squeeze sequence. Identical concrete plans share immutable descriptor ranges. Each lane
-is aligned to the device's storage-offset requirement; after a group's final entropy segment, its
-inverse jobs and 144-byte region-aware finalizer run against that lane before the next batch can
-reuse it. The separately bounded DC-global zero-symbol Prefix/ANS range executes through the same
-kernel and exact termination logic. Its status record is mapped once with all pass-group records.
+244-byte group parameter carries independent MA-metadata and channel-descriptor offsets. RCT-only
+multi-group streams reapply the shared DC-global sequence to each concrete edge geometry, then append
+that pass group's local RCT/Palette/Squeeze sequence. Identical concrete plans share immutable
+descriptor ranges. Each lane is aligned to the device's storage-offset requirement; after a group's
+final entropy segment, its inverse jobs and 144-byte region-aware finalizer run against that lane
+before the next batch can reuse it. For DC-global Palette/Squeeze, global entropy instead writes its
+meta/small-channel prefix into a separate frame-resident arena. Pass groups reconstruct the remaining
+shift-below-three transformed rectangles in reusable lanes, run local inverse jobs, and copy their
+final rows into disjoint full-frame views. One shared inverse plan and one 144-byte finalizer then run
+after the last group. The frame arena, its entropy/predictor state, inverse uniforms, and finalizer
+uniform share the same byte admission and device binding checks. Zero- and nonzero-sample DC-global
+Prefix/ANS ranges use the same exact termination logic; one map validates their status with every
+pass group.
 Each pass-group header independently selects the global MA configuration or supplies a bounded
 local tree, entropy tables, hybrid configs, context map, LZ77 parameters, and weighted-predictor
 header. Host lowering packs the global descriptor first, appends and rebases distinct locals,

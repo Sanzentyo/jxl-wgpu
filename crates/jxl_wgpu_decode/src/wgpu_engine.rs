@@ -34,7 +34,7 @@ use crate::modular_finalize::{
     ModularFinalizeF64Path, ModularFinalizeOutput, ModularFinalizeParams, ModularFinalizePipeline,
     ModularFinalizeRegion,
 };
-use crate::modular_inverse::ModularInverseJob;
+use crate::modular_inverse::{ModularInverseJob, ModularInversePlan};
 use crate::modular_palette::{
     DEFAULT_MODULAR_PALETTE_VARIANT, MODULAR_PALETTE_KERNEL_KEY, ModularPalettePipeline,
     ModularPaletteWeightedParams,
@@ -46,7 +46,8 @@ use crate::modular_rct::{
 use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezeParams, ModularSqueezePipeline};
 use crate::modular_tree::{EntropyCoderIr, MaTreeNodeIr};
 use crate::profile::{
-    ModularGroup, ResidentModularGroupPlan, StandardModularProfile, parse_standard_modular_profile,
+    ModularGroup, ResidentModularFramePlan, ResidentModularGroupPlan, StandardModularProfile,
+    parse_standard_modular_profile,
 };
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
@@ -165,6 +166,10 @@ pub struct WgpuDecodeMemoryStats {
     pub max_physical_reconstruction_sample_words: u32,
     /// Resident transformed-sample arena contained in one generalized reconstruction lane.
     pub resident_modular_arena_bytes: u64,
+    /// Frame-resident transformed arena and entropy state retained across all pass-group batches.
+    pub frame_modular_arena_bytes: u64,
+    /// Samples reconstructed from the DC-global stream before pass-group assembly.
+    pub global_reconstruction_sample_words: u32,
     /// Number of ordered inverse RCT/Palette/Squeeze dispatches after entropy reconstruction.
     pub inverse_transform_count: usize,
     /// Palette dispatches included in `inverse_transform_count`, including bounded serial chunks.
@@ -704,34 +709,48 @@ impl WgpuSubmissionEngine {
                 "global Modular metadata did not start at word zero",
             ));
         }
-        let mut unique_local_metadata = Vec::<(usize, u32)>::new();
+        let mut unique_local_metadata = Vec::<(crate::modular_tree::MaConfigIr, u32)>::new();
         let ma_metadata_offsets: Arc<[u32]> = profile
             .resident_group_plans
             .iter()
-            .enumerate()
-            .map(|(group_index, plan)| match &plan.ma_config {
-                crate::profile::ModularMaConfig::Global => Ok(0),
+            .map(|plan| match &plan.ma_config {
+                crate::profile::ModularMaConfig::Global => Ok::<u32, Error>(0),
                 crate::profile::ModularMaConfig::Local(local) => {
-                    if let Some((_, offset)) =
-                        unique_local_metadata.iter().find(|(candidate_index, _)| {
-                            matches!(
-                                &profile.resident_group_plans[*candidate_index].ma_config,
-                                crate::profile::ModularMaConfig::Local(candidate)
-                                    if candidate == local
-                            )
-                        })
+                    if let Some((_, offset)) = unique_local_metadata
+                        .iter()
+                        .find(|(candidate, _)| candidate == local)
                     {
                         return Ok(*offset);
                     }
                     let offset = local
                         .pack_gpu_metadata()?
                         .append_to(&mut modular_metadata)?;
-                    unique_local_metadata.push((group_index, offset));
+                    unique_local_metadata.push((local.clone(), offset));
                     Ok(offset)
                 }
             })
             .collect::<Result<Vec<_>>>()?
             .into();
+        let global_ma_metadata_offset = profile
+            .resident_frame_plan
+            .as_ref()
+            .map(|plan| match &plan.ma_config {
+                crate::profile::ModularMaConfig::Global => Ok::<u32, Error>(0),
+                crate::profile::ModularMaConfig::Local(local) => {
+                    if let Some((_, offset)) = unique_local_metadata
+                        .iter()
+                        .find(|(candidate, _)| candidate == local)
+                    {
+                        return Ok(*offset);
+                    }
+                    let offset = local
+                        .pack_gpu_metadata()?
+                        .append_to(&mut modular_metadata)?;
+                    unique_local_metadata.push((local.clone(), offset));
+                    Ok(offset)
+                }
+            })
+            .transpose()?;
         let local_ma_group_count = ma_metadata_offsets
             .iter()
             .filter(|&&offset| offset != global_metadata_offset)
@@ -769,6 +788,17 @@ impl WgpuSubmissionEngine {
         } else {
             Arc::from([])
         };
+        let global_channel_layout_offset = profile
+            .resident_frame_plan
+            .as_ref()
+            .map(|plan| {
+                plan.channel_metadata.append_to(
+                    &mut modular_metadata,
+                    plan.inverse_plan.arena_words(),
+                    &[],
+                )
+            })
+            .transpose()?;
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
         let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(
@@ -806,16 +836,34 @@ impl WgpuSubmissionEngine {
                     .resident_group_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
+                    .chain(
+                        profile
+                            .resident_frame_plan
+                            .iter()
+                            .flat_map(|plan| plan.inverse_plan.jobs()),
+                    )
                     .any(|job| matches!(job, ModularInverseJob::Squeeze { .. }));
                 let needs_rct = profile
                     .resident_group_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
+                    .chain(
+                        profile
+                            .resident_frame_plan
+                            .iter()
+                            .flat_map(|plan| plan.inverse_plan.jobs()),
+                    )
                     .any(|job| matches!(job, ModularInverseJob::Rct { .. }));
                 let needs_palette = profile
                     .resident_group_plans
                     .iter()
                     .flat_map(|plan| plan.inverse_plan.jobs())
+                    .chain(
+                        profile
+                            .resident_frame_plan
+                            .iter()
+                            .flat_map(|plan| plan.inverse_plan.jobs()),
+                    )
                     .any(|job| matches!(job, ModularInverseJob::Palette { .. }));
                 self.inverse_pipelines.get(
                     &self.backend,
@@ -826,19 +874,25 @@ impl WgpuSubmissionEngine {
                 )
             })
             .transpose()?;
-        let finalize_params: Arc<[ModularFinalizeParams]> = if generalized_channels {
-            profile
-                .groups
-                .iter()
-                .enumerate()
-                .map(|(group_index, group)| {
-                    modular_finalize_params(&profile, &output, group_index, *group)
-                })
-                .collect::<Result<Vec<_>>>()?
+        let finalize_params: Arc<[ModularFinalizeParams]> =
+            if let Some(frame_plan) = &profile.resident_frame_plan {
+                vec![modular_frame_finalize_params(
+                    &profile, &output, frame_plan,
+                )?]
                 .into()
-        } else {
-            Arc::from([])
-        };
+            } else if generalized_channels {
+                profile
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(|(group_index, group)| {
+                        modular_finalize_params(&profile, &output, group_index, *group)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into()
+            } else {
+                Arc::from([])
+            };
         let pipeline = pipelines.get_or_init(
             &self.backend,
             pipeline_f64_path,
@@ -876,6 +930,12 @@ impl WgpuSubmissionEngine {
             .resident_group_plans
             .iter()
             .map(|plan| plan.ma_config.resolve(&profile.ma_config))
+            .chain(
+                profile
+                    .resident_frame_plan
+                    .iter()
+                    .map(|plan| plan.ma_config.resolve(&profile.ma_config)),
+            )
             .max_by_key(|config| {
                 (
                     config.nodes.len(),
@@ -932,7 +992,9 @@ impl WgpuSubmissionEngine {
                     dispatch_layout,
                     modular_metadata,
                     ma_metadata_offsets,
+                    global_ma_metadata_offset,
                     channel_layout_offsets,
+                    global_channel_layout_offset,
                     finalize_params,
                     output,
                 }),
@@ -1510,7 +1572,9 @@ struct DecodeSource {
     // one rebased word buffer without sharing mutable GPU transient allocations.
     modular_metadata: Arc<[u32]>,
     ma_metadata_offsets: Arc<[u32]>,
+    global_ma_metadata_offset: Option<u32>,
     channel_layout_offsets: Arc<[u32]>,
+    global_channel_layout_offset: Option<u32>,
     finalize_params: Arc<[ModularFinalizeParams]>,
     output: OutputPlan,
 }
@@ -1519,6 +1583,7 @@ struct DecodeJobLifetime {
     output: GpuBufferLease,
     _modular_metadata: DecodeBufferLease,
     _reconstructed: DecodeBufferLease,
+    _frame_arena: Option<DecodeBufferLease>,
     _native_f64_dummy_words: Option<DecodeBufferLease>,
     _status: DecodeBufferLease,
     status_staging: DecodeBufferLease,
@@ -1553,6 +1618,8 @@ struct GroupDispatchLayout {
     max_logical_reconstruction_sample_words: u32,
     max_physical_reconstruction_sample_words: u32,
     resident_modular_arena_bytes: u64,
+    frame_modular_arena_bytes: u64,
+    global_reconstruction_sample_words: u32,
     inverse_transform_count: usize,
     palette_dispatch_count: usize,
     inverse_transform_uniform_bytes: u64,
@@ -1611,13 +1678,31 @@ impl GroupDispatchLayout {
             plan.ma_config
                 .resolve(&profile.ma_config)
                 .needs_self_correcting()
-        });
+        }) || (profile.global_stream.is_some()
+            && profile.resident_frame_plan.as_ref().is_some_and(|plan| {
+                plan.ma_config
+                    .resolve(&profile.ma_config)
+                    .needs_self_correcting()
+            }));
         let execution_state_bytes_per_lane =
             modular_execution_state_bytes(reconstruction_specialization, needs_self_correcting);
         let mut saw_prefix = false;
         let mut saw_ans = false;
         for plan in &profile.resident_group_plans {
             match plan.ma_config.resolve(&profile.ma_config).entropy.coder {
+                EntropyCoderIr::Prefix(_) => saw_prefix = true,
+                EntropyCoderIr::Ans { .. } => saw_ans = true,
+            }
+        }
+        if let (Some(frame_plan), Some(_)) =
+            (profile.resident_frame_plan.as_ref(), profile.global_stream)
+        {
+            match frame_plan
+                .ma_config
+                .resolve(&profile.ma_config)
+                .entropy
+                .coder
+            {
                 EntropyCoderIr::Prefix(_) => saw_prefix = true,
                 EntropyCoderIr::Ans { .. } => saw_ans = true,
             }
@@ -1662,11 +1747,25 @@ impl GroupDispatchLayout {
         } else {
             0
         };
+        let frame_workspace = profile
+            .resident_frame_plan
+            .as_ref()
+            .map(|plan| frame_arena_workspace(profile, plan, execution_state_bytes_per_lane))
+            .transpose()?;
+        let frame_modular_arena_bytes = frame_workspace.map_or(0, |workspace| workspace.bytes);
+        let global_reconstruction_sample_words =
+            frame_workspace.map_or(0, |workspace| workspace.decoded_words);
         let inverse_transform_count = if generalized_channels {
             profile
                 .resident_group_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
+                .chain(
+                    profile
+                        .resident_frame_plan
+                        .iter()
+                        .flat_map(|plan| plan.inverse_plan.jobs()),
+                )
                 .try_fold(0usize, |total, job| {
                     let dispatches = match job {
                         ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
@@ -1683,6 +1782,12 @@ impl GroupDispatchLayout {
                 .resident_group_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
+                .chain(
+                    profile
+                        .resident_frame_plan
+                        .iter()
+                        .flat_map(|plan| plan.inverse_plan.jobs()),
+                )
                 .try_fold(0usize, |total, job| {
                     let dispatches = match job {
                         ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
@@ -1699,6 +1804,12 @@ impl GroupDispatchLayout {
                 .resident_group_plans
                 .iter()
                 .flat_map(|plan| plan.inverse_plan.jobs())
+                .chain(
+                    profile
+                        .resident_frame_plan
+                        .iter()
+                        .flat_map(|plan| plan.inverse_plan.jobs()),
+                )
                 .try_fold(0u64, |total, job| {
                     let bytes = match job {
                         ModularInverseJob::Squeeze { .. } => {
@@ -1717,9 +1828,16 @@ impl GroupDispatchLayout {
         };
         let final_output_uniform_bytes = if generalized_channels {
             (std::mem::size_of::<ModularFinalizeParams>() as u64)
-                .checked_mul(u64::try_from(profile.groups.len()).map_err(|_| {
-                    Error::backend("Modular group count exceeds uniform accounting")
-                })?)
+                .checked_mul(
+                    u64::try_from(if profile.resident_frame_plan.is_some() {
+                        1
+                    } else {
+                        profile.groups.len()
+                    })
+                    .map_err(|_| {
+                        Error::backend("Modular group count exceeds uniform accounting")
+                    })?,
+                )
                 .ok_or_else(|| Error::backend("Modular finalizer uniform size overflow"))?
         } else {
             0
@@ -1825,6 +1943,7 @@ impl GroupDispatchLayout {
             std::mem::size_of::<DispatchControl>() as u64,
             inverse_transform_uniform_bytes,
             final_output_uniform_bytes,
+            frame_modular_arena_bytes,
         ]
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1894,6 +2013,8 @@ impl GroupDispatchLayout {
             max_logical_reconstruction_sample_words,
             max_physical_reconstruction_sample_words,
             resident_modular_arena_bytes,
+            frame_modular_arena_bytes,
+            global_reconstruction_sample_words,
             inverse_transform_count,
             palette_dispatch_count,
             inverse_transform_uniform_bytes,
@@ -2026,6 +2147,74 @@ fn group_reconstructed_bytes(
     align16(working_bytes)?
         .checked_add(execution_state_bytes)
         .ok_or_else(|| Error::backend("group execution state size overflow"))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameArenaWorkspace {
+    bytes: u64,
+    entropy_state_offset_words: u32,
+    decoded_words: u32,
+    maximum_width: u32,
+    lz77_window_words: u32,
+}
+
+fn frame_arena_workspace(
+    profile: &StandardModularProfile,
+    plan: &ResidentModularFramePlan,
+    execution_state_bytes: u64,
+) -> Result<FrameArenaWorkspace> {
+    let arena_words = plan.inverse_plan.arena_words();
+    let decoded_words = plan
+        .channel_metadata
+        .channels
+        .last()
+        .map_or(0, |channel| channel.decoded_end);
+    let maximum_width = plan
+        .channel_metadata
+        .channels
+        .iter()
+        .map(|channel| channel.width)
+        .max()
+        .unwrap_or(0);
+    if profile.global_stream.is_none() {
+        return Ok(FrameArenaWorkspace {
+            bytes: u64::from(arena_words) * 4,
+            entropy_state_offset_words: arena_words,
+            decoded_words,
+            maximum_width,
+            lz77_window_words: 0,
+        });
+    }
+    let ma_config = plan.ma_config.resolve(&profile.ma_config);
+    let predictor_words = if ma_config.needs_self_correcting() {
+        u64::from(maximum_width)
+            .checked_mul(5)
+            .ok_or_else(|| Error::backend("DC-global weighted predictor workspace overflow"))?
+    } else {
+        0
+    };
+    let lz77_window_words = ma_config
+        .entropy
+        .lz77_window_words(maximum_width, decoded_words)?;
+    let entropy_words = u64::from(lz77_scratch_words(lz77_window_words));
+    let working_bytes = u64::from(arena_words)
+        .checked_add(predictor_words)
+        .and_then(|words| words.checked_add(entropy_words))
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| Error::backend("DC-global reconstruction workspace size overflow"))?;
+    let aligned_bytes = align16(working_bytes)?;
+    let bytes = aligned_bytes
+        .checked_add(execution_state_bytes)
+        .ok_or_else(|| Error::backend("DC-global execution state size overflow"))?;
+    let entropy_state_offset_words = u32::try_from(aligned_bytes / 4)
+        .map_err(|_| Error::backend("DC-global entropy state offset exceeds WGSL u32"))?;
+    Ok(FrameArenaWorkspace {
+        bytes,
+        entropy_state_offset_words,
+        decoded_words,
+        maximum_width,
+        lz77_window_words,
+    })
 }
 
 const fn modular_execution_state_bytes(
@@ -2203,6 +2392,53 @@ fn modular_finalize_params(
     group_index: usize,
     group: ModularGroup,
 ) -> Result<ModularFinalizeParams> {
+    let finalize_output = modular_finalize_output(output)?;
+    let resident = resident_group_plan(profile, group_index)?;
+    ModularFinalizeParams::new(
+        ModularFinalizeRegion {
+            source_extent: Extent2d::new(group.width, group.height),
+            canvas_extent: output.layout.extent,
+            origin_x: group.x,
+            origin_y: group.y,
+            status_index: u32::try_from(group_index)
+                .map_err(|_| Error::backend("Modular finalizer status index exceeds u32"))?,
+        },
+        profile.bits_per_sample,
+        &resident.inverse_plan.final_gpu_layouts(),
+        resident.inverse_plan.arena_words(),
+        finalize_output,
+    )
+    .map_err(Error::from)
+}
+
+fn modular_frame_finalize_params(
+    profile: &StandardModularProfile,
+    output: &OutputPlan,
+    frame_plan: &ResidentModularFramePlan,
+) -> Result<ModularFinalizeParams> {
+    let status_index = if profile.global_stream.is_some() {
+        u32::try_from(profile.groups.len())
+            .map_err(|_| Error::backend("DC-global finalizer status index exceeds u32"))?
+    } else {
+        0
+    };
+    ModularFinalizeParams::new(
+        ModularFinalizeRegion {
+            source_extent: Extent2d::new(profile.width, profile.height),
+            canvas_extent: output.layout.extent,
+            origin_x: 0,
+            origin_y: 0,
+            status_index,
+        },
+        profile.bits_per_sample,
+        &frame_plan.inverse_plan.final_gpu_layouts(),
+        frame_plan.inverse_plan.arena_words(),
+        modular_finalize_output(output)?,
+    )
+    .map_err(Error::from)
+}
+
+fn modular_finalize_output(output: &OutputPlan) -> Result<ModularFinalizeOutput> {
     let to_u32 = |value: u64, name: &'static str| {
         u32::try_from(value).map_err(|_| Error::backend(format!("{name} exceeds WGSL u32")))
     };
@@ -2220,35 +2456,20 @@ fn modular_finalize_params(
         .layout
         .plane(1)
         .map_or(Extent2d::new(0, 0), |plane| plane.sample_extent);
-    let resident = resident_group_plan(profile, group_index)?;
-    ModularFinalizeParams::new(
-        ModularFinalizeRegion {
-            source_extent: Extent2d::new(group.width, group.height),
-            canvas_extent: output.layout.extent,
-            origin_x: group.x,
-            origin_y: group.y,
-            status_index: u32::try_from(group_index)
-                .map_err(|_| Error::backend("Modular finalizer status index exceeds u32"))?,
-        },
-        profile.bits_per_sample,
-        &resident.inverse_plan.final_gpu_layouts(),
-        resident.inverse_plan.arena_words(),
-        ModularFinalizeOutput {
-            kind: output.kind as u32,
-            transfer: output.transfer,
-            limited_range: output.limited_range,
-            channels: output.channels,
-            order: output.order,
-            bits: output.bits,
-            storage_bits: output.storage_bits,
-            numeric_mapping: output.numeric_mapping,
-            plane_offsets,
-            plane_strides,
-            logical_size: to_u32(output.layout.logical_size, "final output size")?,
-            chroma_extent,
-        },
-    )
-    .map_err(Error::from)
+    Ok(ModularFinalizeOutput {
+        kind: output.kind as u32,
+        transfer: output.transfer,
+        limited_range: output.limited_range,
+        channels: output.channels,
+        order: output.order,
+        bits: output.bits,
+        storage_bits: output.storage_bits,
+        numeric_mapping: output.numeric_mapping,
+        plane_offsets,
+        plane_strides,
+        logical_size: to_u32(output.layout.logical_size, "final output size")?,
+        chroma_extent,
+    })
 }
 
 #[repr(u32)]
@@ -2713,6 +2934,10 @@ fn validate_device_limits(
             "parallel reconstructed samples",
             dispatch.reconstructed_bytes,
         ),
+        (
+            "frame-resident Modular arena",
+            dispatch.frame_modular_arena_bytes,
+        ),
         ("requested output", output_bytes),
         ("group statuses", dispatch.status_bytes),
         ("group parameters", dispatch.params_bytes),
@@ -2742,6 +2967,7 @@ fn validate_device_limits(
         stream_bytes,
         metadata_bytes,
         dispatch.reconstructed_bytes,
+        dispatch.frame_modular_arena_bytes,
         output_bytes,
         native_f64_dummy_bytes,
         dispatch.status_bytes,
@@ -2800,6 +3026,8 @@ fn validate_device_limits(
         max_logical_reconstruction_sample_words: dispatch.max_logical_reconstruction_sample_words,
         max_physical_reconstruction_sample_words: dispatch.max_physical_reconstruction_sample_words,
         resident_modular_arena_bytes: dispatch.resident_modular_arena_bytes,
+        frame_modular_arena_bytes: dispatch.frame_modular_arena_bytes,
+        global_reconstruction_sample_words: dispatch.global_reconstruction_sample_words,
         inverse_transform_count: dispatch.inverse_transform_count,
         palette_dispatch_count: dispatch.palette_dispatch_count,
         inverse_transform_uniform_bytes: dispatch.inverse_transform_uniform_bytes,
@@ -2863,13 +3091,24 @@ fn submit_decode(
         bytemuck::cast_slice(source.modular_metadata.as_ref()),
     );
 
-    let reconstructed_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let reconstructed_usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
     let reconstructed = buffers.checkout(
         "jxl-wgpu decoded Modular samples",
         source.dispatch_layout.reconstructed_bytes,
         reconstructed_usage,
         std::mem::align_of::<u32>() as u64,
     );
+    let frame_arena = (source.dispatch_layout.frame_modular_arena_bytes != 0).then(|| {
+        buffers.checkout(
+            "jxl-wgpu frame-resident Modular arena",
+            source.dispatch_layout.frame_modular_arena_bytes,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            std::mem::align_of::<u32>() as u64,
+        )
+    });
     let output_size = align4(source.output.layout.logical_size)?;
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
@@ -2944,7 +3183,7 @@ fn submit_decode(
         },
         wgpu::BindGroupEntry {
             binding: 3,
-            resource: word_output_binding,
+            resource: word_output_binding.clone(),
         },
         wgpu::BindGroupEntry {
             binding: 4,
@@ -2970,11 +3209,55 @@ fn submit_decode(
         layout: &bind_group_layout,
         entries: &entries,
     });
+    let global_binding = frame_arena.as_ref().map(|frame_arena| {
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: stream.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: metadata_buffer.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: frame_arena.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: word_output_binding.clone(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: status.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: params_buffer.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: dispatch_control.buffer().as_entire_binding(),
+            },
+        ];
+        if source.output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: output.as_entire_binding(),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("jxl-wgpu decode DC-global Modular bindings"),
+            layout: &bind_group_layout,
+            entries: &entries,
+        })
+    });
     let completion = Arc::new(MapCompletion::default());
     let lifetime = Arc::new(DecodeJobLifetime {
         output: GpuBufferLease::from_tracked(output.as_ref().clone(), memory_permits.output),
         _modular_metadata: metadata_buffer,
         _reconstructed: reconstructed,
+        _frame_arena: frame_arena,
         _native_f64_dummy_words: native_f64_dummy_words,
         _status: status,
         status_staging,
@@ -3018,7 +3301,7 @@ fn submit_decode(
                     "DC-global entropy stream segment is missing",
                 ))?;
             copy_stream_segment(source, segment, &mut stream_upload, "DC-global")?;
-            let params = build_empty_global_params(segment, global_record_index_u32);
+            let params = build_global_params(segment, global_record_index_u32, source)?;
             backend.queue().write_buffer(
                 lifetime._params.buffer(),
                 global_params_offset,
@@ -3045,6 +3328,9 @@ fn submit_decode(
             });
             if batch_index == 0 {
                 commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
+                if let Some(frame_arena) = &lifetime._frame_arena {
+                    commands.clear_buffer(frame_arena.buffer(), 0, None);
+                }
                 commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
                 if let Some(dummy) = &lifetime._native_f64_dummy_words {
                     commands.clear_buffer(dummy.buffer(), 0, None);
@@ -3053,11 +3339,11 @@ fn submit_decode(
             }
             {
                 let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("jxl-wgpu empty DC-global Modular entropy validation"),
+                    label: Some("jxl-wgpu DC-global Modular entropy reconstruction"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &binding, &[]);
+                pass.set_bind_group(0, global_binding.as_ref().unwrap_or(&binding), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
             backend.queue().submit([commands.finish()]);
@@ -3129,6 +3415,9 @@ fn submit_decode(
         if batch_index == 0 {
             commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
             if !has_global_stream {
+                if let Some(frame_arena) = &lifetime._frame_arena {
+                    commands.clear_buffer(frame_arena.buffer(), 0, None);
+                }
                 commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
                 if let Some(dummy) = &lifetime._native_f64_dummy_words {
                     commands.clear_buffer(dummy.buffer(), 0, None);
@@ -3183,18 +3472,67 @@ fn submit_decode(
                     segment.group_index,
                     lane_index,
                 )?);
-                inverse_uniforms.push(encode_modular_finalize(
+                if source.profile.resident_frame_plan.is_some() {
+                    encode_group_plane_copies(
+                        &mut commands,
+                        source,
+                        lifetime._reconstructed.buffer(),
+                        lifetime
+                            ._frame_arena
+                            .as_ref()
+                            .ok_or(Error::EngineContract(
+                                "pass-group assembly is missing its frame arena",
+                            ))?
+                            .buffer(),
+                        segment.group_index,
+                        lane_index,
+                    )?;
+                } else {
+                    inverse_uniforms.push(encode_modular_finalize(
+                        device,
+                        &mut commands,
+                        source,
+                        &lifetime,
+                        pipelines,
+                        segment.group_index,
+                        lane_index,
+                    )?);
+                }
+            }
+        }
+        if final_batch {
+            if let Some(frame_plan) = &source.profile.resident_frame_plan {
+                let pipelines = inverse_pipelines.ok_or(Error::EngineContract(
+                    "frame Modular reconstruction is missing resident inverse pipelines",
+                ))?;
+                let frame_arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
+                    "frame-wide Modular inverse is missing its resident arena",
+                ))?;
+                let arena_size = NonZeroU64::new(frame_plan.inverse_plan.arena_bytes()).ok_or(
+                    Error::EngineContract(
+                        "frame Modular reconstruction produced an empty inverse arena",
+                    ),
+                )?;
+                inverse_uniforms.extend(encode_modular_inverse_jobs(
+                    device,
+                    &mut commands,
+                    ResidentStorageBinding {
+                        buffer: frame_arena.buffer(),
+                        offset: 0,
+                        size: arena_size,
+                    },
+                    &frame_plan.inverse_plan,
+                    frame_plan.wp_header,
+                    pipelines,
+                )?);
+                inverse_uniforms.push(encode_frame_modular_finalize(
                     device,
                     &mut commands,
                     source,
                     &lifetime,
                     pipelines,
-                    segment.group_index,
-                    lane_index,
                 )?);
             }
-        }
-        if final_batch {
             commands.copy_buffer_to_buffer(
                 lifetime._status.buffer(),
                 0,
@@ -3257,7 +3595,14 @@ fn submit_decode(
                 })
                 .collect::<Result<Vec<_>>>()?;
             if source.profile.global_stream.is_some() {
-                expected.push(0);
+                expected.push(
+                    source
+                        .profile
+                        .resident_frame_plan
+                        .as_ref()
+                        .and_then(|plan| plan.channel_metadata.channels.last())
+                        .map_or(0, |channel| channel.decoded_end),
+                );
             }
             expected.into()
         },
@@ -3291,26 +3636,82 @@ fn copy_stream_segment(
     )
 }
 
-fn build_empty_global_params(
+fn build_global_params(
     stream_segment: GroupStreamSegment,
     status_index: u32,
-) -> ShaderParams {
+    source: &DecodeSource,
+) -> Result<ShaderParams> {
+    let Some(plan) = source.profile.resident_frame_plan.as_ref() else {
+        let mut params = <ShaderParams as bytemuck::Zeroable>::zeroed();
+        params.entropy = EntropyStreamParams {
+            token_start: 0,
+            token_end: stream_segment.available_token_end,
+            lz77_window_mask: 0,
+        };
+        params.window_logical_start = stream_segment.window_logical_start;
+        params.window_upload_start = stream_segment.window_upload_start;
+        params.stream_token_end = stream_segment.stream_token_end;
+        params.window_yield_end = stream_segment.window_yield_end;
+        params.window_flags = stream_segment.flags;
+        params.status_index = status_index;
+        params.fixed_output_mode = FixedGradientOutputMode::DirectNormalizedGray8 as u32;
+        return Ok(params);
+    };
+    let workspace = frame_arena_workspace(
+        &source.profile,
+        plan,
+        source.dispatch_layout.execution_state_bytes_per_lane,
+    )?;
     let mut params = <ShaderParams as bytemuck::Zeroable>::zeroed();
     params.entropy = EntropyStreamParams {
         token_start: 0,
         token_end: stream_segment.available_token_end,
-        lz77_window_mask: 0,
+        lz77_window_mask: workspace.lz77_window_words.saturating_sub(1),
     };
     params.window_logical_start = stream_segment.window_logical_start;
     params.window_upload_start = stream_segment.window_upload_start;
     params.stream_token_end = stream_segment.stream_token_end;
     params.window_yield_end = stream_segment.window_yield_end;
     params.window_flags = stream_segment.flags;
+    params.entropy_state_offset = workspace.entropy_state_offset_words;
+    params.width = workspace.maximum_width;
+    params.height = 1;
+    params.sample_count = workspace.decoded_words;
+    params.source_channels = source.profile.channels.count();
+    params.channel_layout_offset =
+        source
+            .global_channel_layout_offset
+            .ok_or(Error::EngineContract(
+                "DC-global channel metadata offset is missing",
+            ))?;
+    params.metadata_base = source
+        .global_ma_metadata_offset
+        .ok_or(Error::EngineContract(
+            "DC-global MA metadata offset is missing",
+        ))?;
+    params.source_bits = u32::from(source.profile.bits_per_sample);
+    params.source_mask = (1u32 << source.profile.bits_per_sample) - 1;
+    params.needs_self_correcting = u32::from(
+        plan.ma_config
+            .resolve(&source.profile.ma_config)
+            .needs_self_correcting(),
+    );
     params.status_index = status_index;
-    // Prevent the zero-channel validation job from entering the legacy output finalizer when the
-    // active reconstruction pipeline does not use descriptor-addressed channels.
+    params.stream_index = 0;
     params.fixed_output_mode = FixedGradientOutputMode::DirectNormalizedGray8 as u32;
-    params
+    let wp_header = plan.wp_header;
+    params.wp_p1 = wp_header.p1;
+    params.wp_p2 = wp_header.p2;
+    params.wp_p3a = wp_header.p3a;
+    params.wp_p3b = wp_header.p3b;
+    params.wp_p3c = wp_header.p3c;
+    params.wp_p3d = wp_header.p3d;
+    params.wp_p3e = wp_header.p3e;
+    params.wp_w0 = wp_header.w0;
+    params.wp_w1 = wp_header.w1;
+    params.wp_w2 = wp_header.w2;
+    params.wp_w3 = wp_header.w3;
+    Ok(params)
 }
 
 fn encode_modular_inverse(
@@ -3343,8 +3744,26 @@ fn encode_modular_inverse(
         offset: arena_offset,
         size: arena_size,
     };
+    encode_modular_inverse_jobs(
+        device,
+        encoder,
+        storage,
+        &plan.inverse_plan,
+        plan.wp_header,
+        pipelines,
+    )
+}
+
+fn encode_modular_inverse_jobs(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    storage: ResidentStorageBinding<'_>,
+    plan: &ModularInversePlan,
+    wp_header: crate::modular_tree::WpHeaderIr,
+    pipelines: &ModularInversePipelines,
+) -> Result<Vec<wgpu::Buffer>> {
     let mut uniforms = Vec::new();
-    for job in plan.inverse_plan.jobs() {
+    for job in plan.jobs() {
         match *job {
             ModularInverseJob::Squeeze { params } => {
                 let pipeline = pipelines.squeeze.as_ref().ok_or(Error::EngineContract(
@@ -3387,12 +3806,82 @@ fn encode_modular_inverse(
                     encoder,
                     storage,
                     job,
-                    ModularPaletteWeightedParams::from(plan.wp_header),
+                    ModularPaletteWeightedParams::from(wp_header),
                 )?);
             }
         }
     }
     Ok(uniforms)
+}
+
+fn encode_group_plane_copies(
+    encoder: &mut wgpu::CommandEncoder,
+    source: &DecodeSource,
+    group_arena: &wgpu::Buffer,
+    frame_arena: &wgpu::Buffer,
+    group_index: usize,
+    lane_index: usize,
+) -> Result<()> {
+    let frame_plan = source
+        .profile
+        .resident_frame_plan
+        .as_ref()
+        .ok_or(Error::EngineContract(
+            "pass-group plane assembly is missing its frame plan",
+        ))?;
+    let copies = frame_plan
+        .group_plane_copies
+        .get(group_index)
+        .ok_or(Error::EngineContract(
+            "pass-group plane assembly is missing its copy plan",
+        ))?;
+    let lane_offset = u64::try_from(lane_index)
+        .ok()
+        .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
+        .ok_or_else(|| Error::backend("pass-group copy lane offset overflow"))?;
+    for copy in copies {
+        if copy.source.width != copy.destination.width
+            || copy.source.height != copy.destination.height
+            || copy.source.bit_depth != copy.destination.bit_depth
+        {
+            return Err(Error::EngineContract(
+                "pass-group source and frame-arena destination geometries disagree",
+            ));
+        }
+        let row_bytes = u64::from(copy.source.width)
+            .checked_mul(4)
+            .ok_or_else(|| Error::backend("pass-group copy row size overflow"))?;
+        for row in 0..copy.source.height {
+            let source_offset = u64::from(copy.source.word_offset)
+                .checked_add(u64::from(row) * u64::from(copy.source.row_stride_words))
+                .and_then(|words| words.checked_mul(4))
+                .and_then(|bytes| lane_offset.checked_add(bytes))
+                .ok_or_else(|| Error::backend("pass-group copy source offset overflow"))?;
+            let destination_offset = u64::from(copy.destination.word_offset)
+                .checked_add(u64::from(row) * u64::from(copy.destination.row_stride_words))
+                .and_then(|words| words.checked_mul(4))
+                .ok_or_else(|| Error::backend("pass-group copy destination offset overflow"))?;
+            if source_offset
+                .checked_add(row_bytes)
+                .is_none_or(|end| end > group_arena.size())
+                || destination_offset
+                    .checked_add(row_bytes)
+                    .is_none_or(|end| end > frame_arena.size())
+            {
+                return Err(Error::EngineContract(
+                    "pass-group plane copy exceeds a resident GPU arena",
+                ));
+            }
+            encoder.copy_buffer_to_buffer(
+                group_arena,
+                source_offset,
+                frame_arena,
+                destination_offset,
+                row_bytes,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn encode_modular_finalize(
@@ -3453,6 +3942,85 @@ fn encode_modular_finalize(
                     size: NonZeroU64::new(lifetime._status.buffer().size()).ok_or(
                         Error::EngineContract(
                             "descriptor reconstruction produced an empty status allocation",
+                        ),
+                    )?,
+                },
+                output_f64: native_f64_dummy_words.map(|_| ResidentStorageBinding {
+                    buffer: output,
+                    offset: 0,
+                    size: output_size,
+                }),
+            },
+            params,
+        )
+        .map_err(Error::from)
+}
+
+fn encode_frame_modular_finalize(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    source: &DecodeSource,
+    lifetime: &DecodeJobLifetime,
+    pipelines: &ModularInversePipelines,
+) -> Result<wgpu::Buffer> {
+    let params = source
+        .finalize_params
+        .first()
+        .copied()
+        .ok_or(Error::EngineContract(
+            "frame Modular reconstruction is missing final-output parameters",
+        ))?;
+    let plan = source
+        .profile
+        .resident_frame_plan
+        .as_ref()
+        .ok_or(Error::EngineContract(
+            "frame Modular reconstruction is missing its inverse plan",
+        ))?;
+    let frame_arena = lifetime
+        ._frame_arena
+        .as_ref()
+        .ok_or(Error::EngineContract(
+            "frame Modular reconstruction is missing its resident arena",
+        ))?
+        .buffer();
+    let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
+        Error::EngineContract("frame Modular reconstruction produced an empty arena"),
+    )?;
+    let output = lifetime.output.as_wgpu_buffer();
+    let output_size = NonZeroU64::new(output.size()).ok_or(Error::EngineContract(
+        "frame Modular reconstruction produced an empty output allocation",
+    ))?;
+    let native_f64_dummy_words = lifetime
+        ._native_f64_dummy_words
+        .as_ref()
+        .map(DecodeBufferLease::buffer);
+    let output_words_buffer = native_f64_dummy_words.unwrap_or(output);
+    let output_words_size = NonZeroU64::new(output_words_buffer.size()).ok_or(
+        Error::EngineContract("frame Modular reconstruction produced an empty word output"),
+    )?;
+    pipelines
+        .finalize
+        .encode(
+            device,
+            encoder,
+            ModularFinalizeBindings {
+                arena: ResidentStorageBinding {
+                    buffer: frame_arena,
+                    offset: 0,
+                    size: arena_size,
+                },
+                output_words: ResidentStorageBinding {
+                    buffer: output_words_buffer,
+                    offset: 0,
+                    size: output_words_size,
+                },
+                status: ResidentStorageBinding {
+                    buffer: lifetime._status.buffer(),
+                    offset: 0,
+                    size: NonZeroU64::new(lifetime._status.buffer().size()).ok_or(
+                        Error::EngineContract(
+                            "frame Modular reconstruction produced an empty status allocation",
                         ),
                     )?,
                 },

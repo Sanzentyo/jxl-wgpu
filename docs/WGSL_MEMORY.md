@@ -24,8 +24,8 @@ other driver-private allocations cannot be measured portably and are not include
   `ModularChannelGeometry` carries width, height, signed horizontal/vertical shifts, bit depth, and
   three zero words while meta-applying the transform stack. `GpuModularChannelLayout` replaces the
   padding with packed word offset and row stride for storage-buffer execution. All offsets and the
-  final sample end are checked against WGSL `u32` before allocation. These records are not bound by
-  the current direct-topology kernel yet; documenting the ABI does not claim inverse execution.
+  final sample end are checked against WGSL `u32` before allocation. The descriptor-specialized
+  Modular kernel binds these layouts for both reusable pass-group lanes and a frame-resident arena.
   Reverse planning retains two such channel vectors at a time; it does not allocate a topology per
   transform. A separate cumulative topology-work limit rejects legal-looking metadata that would
   otherwise force quadratic host planning before GPU admission.
@@ -107,7 +107,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Params` / `Params` | `width, height, row_stride, byte_offset` | 16 | 4 | uniform |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8ArtifactHeader` / `output_words[0..53]` | `event_count, raw_counts[19], lz77_counts[33]` | 212 | 4 | storage/readback record |
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Event` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
-| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields | 240 | 4 | read-only storage element |
+| `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields | 244 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 
 ### Values that intentionally are not `Pod`
@@ -316,6 +316,14 @@ against device limits prior to pipeline compilation and dispatch recording.
 | Generic image readback | `ImageReadbackStats` reports frame/output counts, logical bytes, exact aggregate staging bytes, and padding bytes. One `submit_frames` call uses one staging allocation, command buffer, queue submission, map callback, and completion future/wait across all supplied frames; `ImageReadbackLimits::max_transient_bytes` and device `max_buffer_size` are enforced on that aggregate. | `max_in_flight_bytes` is a hard byte-weighted budget shared by pipeline clones (or backend clones when created from a backend). The complete staging allocation is admitted atomically. A permit and every source lease remain attached through mapping/consumption; an abandoned future leaves them owned by the callback until GPU completion, and exhaustion is a typed non-blocking error. | Codec dispatches are not coalesced by this transport API. Driver-private mapping/command metadata excluded. |
 | Display textures | Pitch-linear source buffers are fully range/usage bounded. RGB, numeric, and color-image dispatches use exact 32, 64, and 96-byte Pod uniforms respectively. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing, short-lived uniform allocation internals, command metadata, and display-pipeline objects are intentionally excluded. |
 | Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
+
+For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
+`frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,
+Weighted-predictor, and aligned execution-state tail. Pass-group lanes copy only validated row
+ranges into disjoint views, after which frame-wide inverse and finalizer uniform bytes remain covered
+by the same transient permit. `global_reconstruction_sample_words` exposes the DC-global decoded
+prefix separately. Horizontal or vertical channel shifts of three or more are rejected until the
+LF-group scheduler can provide those planes.
 
 ## Shader write bounds fixed by this audit
 

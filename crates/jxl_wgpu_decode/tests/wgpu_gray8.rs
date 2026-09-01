@@ -1164,6 +1164,194 @@ fn cjxl_palette_transform_is_exact_through_resident_inverse_and_finalize() {
 }
 
 #[test]
+fn cjxl_multigroup_global_palette_is_exact_through_frame_resident_inverse() {
+    if Command::new("cjxl").arg("--version").output().is_err() {
+        eprintln!("skipping cjxl global Palette conformance: cjxl is not installed");
+        return;
+    }
+    let Some(backend) = backend() else {
+        eprintln!("skipping cjxl global Palette conformance: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (515u32, 259u32);
+    let colors = [2u8, 29, 113, 241];
+    let expected = (0..u64::from(width) * u64::from(height))
+        .map(|index| {
+            let x = index % u64::from(width);
+            let y = index / u64::from(width);
+            colors[((x / 11 + y / 7 + (x * y) % 5) % colors.len() as u64) as usize]
+        })
+        .collect::<Vec<_>>();
+    let unique = format!(
+        "jxl-wgpu-global-palette-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir().join(unique);
+    std::fs::create_dir(&directory).expect("create cjxl global Palette fixture directory");
+    let input = directory.join("global-palette.pgm");
+    let encoded_path = directory.join("global-palette.jxl");
+    let mut pgm = format!("P5\n{width} {height}\n255\n").into_bytes();
+    pgm.extend_from_slice(&expected);
+    std::fs::write(&input, pgm).expect("write cjxl global Palette source");
+    let command = Command::new("cjxl")
+        .arg(&input)
+        .arg(&encoded_path)
+        .args([
+            "-d",
+            "0",
+            "-m",
+            "1",
+            "-e",
+            "9",
+            "-x",
+            "color_space=Gra_D65_Rel_SRG",
+        ])
+        .output()
+        .expect("run cjxl global Palette encoder");
+    assert!(
+        command.status.success(),
+        "cjxl global Palette encoding failed: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let encoded = std::fs::read(&encoded_path).expect("read cjxl global Palette codestream");
+    let (oracle_extent, oracle) =
+        rust_jxl_decode_gray8(&encoded).expect("Rust jxl decodes global Palette fixture");
+    assert_eq!(oracle_extent, (width as usize, height as usize));
+    assert_eq!(oracle, expected);
+
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let request = GpuOutputRequest::numeric(
+        LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+        NumericSampleMapping::NativeUnsigned,
+    )
+    .unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("GPU decoder accepts the cjxl global Palette transform");
+    assert!(matches!(
+        session.profile(),
+        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
+            ..
+        }
+    ));
+    let stats = session
+        .submission_session()
+        .modular()
+        .expect("global Palette selects the Modular engine")
+        .memory_stats();
+    assert!(stats.global_reconstruction_sample_words > 0);
+    assert!(stats.frame_modular_arena_bytes > 0);
+    assert_eq!(stats.palette_dispatch_count, 1);
+    assert_eq!(stats.final_output_uniform_bytes, 144);
+    let frame = session
+        .next_frame()
+        .expect("cjxl global Palette GPU decode succeeds")
+        .expect("cjxl global Palette returns one frame");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+
+    std::fs::remove_file(&input).expect("remove cjxl global Palette source");
+    std::fs::remove_file(&encoded_path).expect("remove cjxl global Palette codestream");
+    std::fs::remove_dir(&directory).expect("remove cjxl global Palette fixture directory");
+}
+
+#[test]
+fn cjxl_multigroup_global_squeeze_is_exact_through_frame_resident_inverse() {
+    if Command::new("cjxl").arg("--version").output().is_err() {
+        eprintln!("skipping cjxl global Squeeze conformance: cjxl is not installed");
+        return;
+    }
+    let Some(backend) = backend() else {
+        eprintln!("skipping cjxl global Squeeze conformance: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (515u32, 259u32);
+    let expected = (0..u64::from(width) * u64::from(height))
+        .map(|index| {
+            let x = index % u64::from(width);
+            let y = index / u64::from(width);
+            x.wrapping_mul(37)
+                .wrapping_add(y.wrapping_mul(73))
+                .wrapping_add((x * y) % 251) as u8
+        })
+        .collect::<Vec<_>>();
+    let unique = format!(
+        "jxl-wgpu-global-squeeze-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir().join(unique);
+    std::fs::create_dir(&directory).expect("create cjxl global Squeeze fixture directory");
+    let input = directory.join("global-squeeze.pgm");
+    let encoded_path = directory.join("global-squeeze.jxl");
+    let mut pgm = format!("P5\n{width} {height}\n255\n").into_bytes();
+    pgm.extend_from_slice(&expected);
+    std::fs::write(&input, pgm).expect("write cjxl global Squeeze source");
+    let command = Command::new("cjxl")
+        .arg(&input)
+        .arg(&encoded_path)
+        .args([
+            "-d",
+            "0",
+            "-m",
+            "1",
+            "-e",
+            "9",
+            "-R",
+            "1",
+            "-x",
+            "color_space=Gra_D65_Rel_SRG",
+        ])
+        .output()
+        .expect("run cjxl global Squeeze encoder");
+    assert!(
+        command.status.success(),
+        "cjxl global Squeeze encoding failed: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let encoded = std::fs::read(&encoded_path).expect("read cjxl global Squeeze codestream");
+    let (oracle_extent, oracle) =
+        rust_jxl_decode_gray8(&encoded).expect("Rust jxl decodes global Squeeze fixture");
+    assert_eq!(oracle_extent, (width as usize, height as usize));
+    assert_eq!(oracle, expected);
+
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let request = GpuOutputRequest::numeric(
+        LosslessModularFormat::Gray.pixel_format(8).unwrap(),
+        NumericSampleMapping::NativeUnsigned,
+    )
+    .unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("GPU decoder accepts the cjxl global Squeeze transform");
+    let stats = session
+        .submission_session()
+        .modular()
+        .expect("global Squeeze selects the Modular engine")
+        .memory_stats();
+    assert!(stats.global_reconstruction_sample_words > 0);
+    assert!(stats.frame_modular_arena_bytes > 0);
+    assert_eq!(stats.palette_dispatch_count, 0);
+    assert!(stats.inverse_transform_count > 0);
+    let frame = session
+        .next_frame()
+        .expect("cjxl global Squeeze GPU decode succeeds")
+        .expect("cjxl global Squeeze returns one frame");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+
+    std::fs::remove_file(&input).expect("remove cjxl global Squeeze source");
+    std::fs::remove_file(&encoded_path).expect("remove cjxl global Squeeze codestream");
+    std::fs::remove_dir(&directory).expect("remove cjxl global Squeeze fixture directory");
+}
+
+#[test]
 fn cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly() {
     if Command::new("cjxl").arg("--version").output().is_err() {
         eprintln!("skipping cjxl multi-group local-transform conformance: cjxl is not installed");
@@ -1251,6 +1439,7 @@ fn cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly() {
     assert!(stats.inverse_transform_count >= group_count);
     assert!(stats.palette_dispatch_count >= 1);
     assert_eq!(stats.final_output_uniform_bytes, group_count as u64 * 144);
+    assert_eq!(stats.frame_modular_arena_bytes, 0);
     assert_eq!(stats.stream_batch_count, 2);
     assert_eq!(stats.submissions_per_frame, 2);
     let frame = session
