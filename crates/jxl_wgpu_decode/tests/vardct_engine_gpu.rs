@@ -1,6 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
 use jxl::api::{
@@ -32,6 +33,8 @@ use jxl_wgpu_encode::{
 use wgpu::util::DeviceExt;
 
 mod common;
+
+static DJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn open_incremental(
     decoder: &GpuDecoder<WgpuDecodeEngine>,
@@ -219,12 +222,13 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
         return None;
     }
     let nonce = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        DJXL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     );
     let input = std::env::temp_dir().join(format!("jxl-wgpu-vardct-{nonce}.jxl"));
     let output = std::env::temp_dir().join(format!("jxl-wgpu-vardct-{nonce}.ppm"));
