@@ -63,12 +63,12 @@ probe may contain a bounded section prefix; that tail keeps the probe allocation
 copied again, while later section ranges retain caller/transport backing. Complete image/frame/TOC
 state no longer requires a contiguous codestream. Both decoders now retain a checked table of
 logically contiguous shared spans, and exact bounded GPU upload ranges may cross physical chunks.
-Modular metadata bit reads are span-native. VarDCT planning uses the logical length and initializes
-its still-required whole-codestream GPU buffer directly from the spans without a second host-sized
-`Vec`, but its initial and cursor-dependent metadata parsers still take one physical slice. The
-public selector also still creates a single-span table, so adapting section events and converting
-the remaining VarDCT metadata boundaries remain explicit frontend work rather than being hidden
-behind reassembly.
+Modular and VarDCT metadata bit reads are span-native. VarDCT uses the common generic entropy IR for
+block-context maps and custom coefficient-order permutations, plans from logical length, and
+initializes its still-required whole-codestream GPU buffer directly from spans without a second
+host-sized `Vec`. Both mode engines and the internal selector accept the same multi-span source.
+The public selector still creates a single-span table, so adapting section events and bounding
+retained-span lifetime remain explicit frontend work rather than being hidden behind reassembly.
 
 `GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
 inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that

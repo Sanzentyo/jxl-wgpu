@@ -5,16 +5,19 @@ use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
 use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
+use crate::codestream_data::{CodestreamBitReader, CodestreamData};
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::GroupStreamSegment;
 use crate::modular_tree::{
-    EntropyDecoderIr, MaConfigIr, MaTreeLimits, MaTreeNodeIr, PackedModularMetadata,
-    parse_ma_config,
+    BitInput, EntropyDecoderIr, MaConfigIr, MaTreeLimits, MaTreeNodeIr, MetadataEntropyCursor,
+    PackedModularMetadata, parse_ma_config,
 };
 use crate::vardct_frontend::{
-    HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation, LfChannelDequantization,
-    LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError, VarDctGroupRect, VarDctPacketError,
-    VarDctSectionLayout, parse_hf_metadata_header_prefix, parse_lf_group_header_prefix,
+    BoundedBitInput, HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation,
+    LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
+    VarDctGroupRect, VarDctMetadataReaderError, VarDctPacketError, VarDctSectionLayout,
+    map_metadata_reader_error, parse_hf_metadata_header_reader, parse_lf_group_header_reader,
+    validate_packet_end_bits,
 };
 
 const SHADER_TEMPLATE: &str = include_str!("vardct_packet.wgsl");
@@ -56,10 +59,14 @@ pub enum BoundedVarDctPacketError {
     Unsupported(#[from] UnsupportedVarDctPacketFeature),
     #[error("failed to read bounded VarDCT metadata: {0}")]
     Bitstream(#[from] jxl_gpu_bitstream::Error),
+    #[error("failed to read bounded VarDCT metadata from codestream spans: {0}")]
+    CodestreamReader(#[source] VarDctMetadataReaderError),
     #[error("failed to parse the bounded MA-tree descriptor: {0}")]
     ModularTree(String),
     #[error("failed to position the HF coefficient-order reader: {0}")]
     CoefficientOrderBitstream(#[source] jxl_bitstream::Error),
+    #[error("failed to parse the HF coefficient-order span reader: {0}")]
+    CoefficientOrderReader(#[source] VarDctMetadataReaderError),
     #[error("failed to decode the HF coefficient-order permutation: {0}")]
     CoefficientOrderCoding(#[source] jxl_coding::Error),
     #[error("the packed MA-tree metadata ABI is malformed")]
@@ -107,7 +114,7 @@ pub enum GpuVarDctPacketError {
 }
 
 /// Parsed host metadata and untouched image entropy for one strict packet.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BoundedVarDctPacketPlan {
     pub profile: StandardVarDctProfile,
     /// A transform enforced for the single-entry packet form. Sectioned packets carry a
@@ -137,7 +144,7 @@ pub struct BoundedVarDctPacketPlan {
 }
 
 /// One host-packed MA tree/histogram bundle and its exact GPU reconstruction requirements.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedModularEntropyPlan {
     pub metadata: Vec<u32>,
     pub needs_self_correcting: bool,
@@ -145,7 +152,7 @@ pub struct BoundedModularEntropyPlan {
 }
 
 /// Host metadata discovered after the first GPU stage returns the LF entropy cursor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedHfMetadataContinuation {
     pub token_bit_offset: u32,
     pub block_count: u32,
@@ -153,7 +160,7 @@ pub struct BoundedHfMetadataContinuation {
 }
 
 /// One LF group's packet geometry and persistent decode contract.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedVarDctGroupPlan {
     pub index: u32,
     pub rect: VarDctGroupRect,
@@ -175,7 +182,7 @@ pub struct BoundedVarDctGroupPlan {
 }
 
 /// Host-packed entropy tables and untouched pass-group packets for one VarDCT AC pass.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HfCoefficientEntropyPlan {
     pub num_hf_presets: u32,
     pub num_block_clusters: u32,
@@ -199,15 +206,13 @@ pub struct HfCoefficientEntropyPlan {
     pub lz77_window_words: u32,
 }
 
-fn parse_ma_config_at(
-    codestream: &[u8],
-    bit_offset: u64,
+fn parse_ma_config_at_reader(
+    reader: &mut impl BitInput,
     packet_end: u64,
 ) -> Result<(MaConfigIr, u64), BoundedVarDctPacketError> {
-    let mut reader = BitReader::new(codestream);
-    reader.skip_bits(bit_offset)?;
-    let config = parse_ma_config(&mut reader, MaTreeLimits::default())
-        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+    let mut reader = BoundedBitInput::new(reader, packet_end);
+    let config =
+        parse_ma_config(&mut reader, MaTreeLimits::default()).map_err(map_modular_reader_error)?;
     let descriptor_end = reader.bit_offset();
     if descriptor_end > packet_end {
         return Err(VarDctPacketError::PacketBoundary {
@@ -218,6 +223,95 @@ fn parse_ma_config_at(
     }
     validate_ma_config(&config)?;
     Ok((config, descriptor_end))
+}
+
+fn map_modular_reader_error(source: crate::Error) -> BoundedVarDctPacketError {
+    match source {
+        crate::Error::Bitstream(source) => BoundedVarDctPacketError::Bitstream(source),
+        crate::Error::ModularTree(source) => {
+            BoundedVarDctPacketError::ModularTree(source.to_string())
+        }
+        source => BoundedVarDctPacketError::CodestreamReader(map_metadata_reader_error(source)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PacketSource<'source> {
+    Slice(&'source [u8]),
+    Spans(&'source CodestreamData),
+}
+
+impl<'source> PacketSource<'source> {
+    fn logical_bits(self) -> Result<u64, BoundedVarDctPacketError> {
+        match self {
+            Self::Slice(bytes) => u64::try_from(bytes.len())
+                .ok()
+                .and_then(|length| length.checked_mul(8))
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "codestream bit length",
+                }),
+            Self::Spans(source) => source.logical_bits().map_err(map_modular_reader_error),
+        }
+    }
+
+    fn reader_at(
+        self,
+        bit_offset: u64,
+    ) -> Result<PacketBitReader<'source>, BoundedVarDctPacketError> {
+        let mut reader = match self {
+            Self::Slice(bytes) => PacketBitReader::Slice(BitReader::new(bytes)),
+            Self::Spans(source) => PacketBitReader::Spans(source.reader()),
+        };
+        reader
+            .skip_bits(bit_offset)
+            .map_err(map_modular_reader_error)?;
+        Ok(reader)
+    }
+}
+
+enum PacketBitReader<'source> {
+    Slice(BitReader<'source>),
+    Spans(CodestreamBitReader<'source>),
+}
+
+impl PacketBitReader<'_> {
+    fn skip_bits(&mut self, count: u64) -> crate::Result<()> {
+        match self {
+            Self::Slice(reader) => reader.skip_bits(count).map_err(Into::into),
+            Self::Spans(reader) => reader.skip_bits(count),
+        }
+    }
+}
+
+impl BitInput for PacketBitReader<'_> {
+    fn bit_offset(&self) -> u64 {
+        match self {
+            Self::Slice(reader) => reader.bit_offset(),
+            Self::Spans(reader) => reader.bit_offset(),
+        }
+    }
+
+    fn read_bits(&mut self, count: u8) -> crate::Result<u64> {
+        match self {
+            Self::Slice(reader) => reader.read_bits(count).map_err(Into::into),
+            Self::Spans(reader) => reader.read_bits(count),
+        }
+    }
+}
+
+fn source_reader_at<'source>(
+    source: PacketSource<'source>,
+    bit_offset: u64,
+) -> Result<PacketBitReader<'source>, BoundedVarDctPacketError> {
+    source.reader_at(bit_offset)
+}
+
+fn validate_source_packet_end(
+    source: PacketSource<'_>,
+    packet_end: u64,
+) -> Result<(), BoundedVarDctPacketError> {
+    let codestream_bits = source.logical_bits()?;
+    validate_packet_end_bits(codestream_bits, packet_end).map_err(Into::into)
 }
 
 fn validate_ma_config(config: &MaConfigIr) -> Result<(), BoundedVarDctPacketError> {
@@ -264,6 +358,21 @@ impl BoundedVarDctPacketPlan {
         codestream: &[u8],
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(PacketSource::Slice(codestream), inventory)
+    }
+
+    /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
+    pub(crate) fn parse_source(
+        source: &CodestreamData,
+        inventory: &CodestreamInventory,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(PacketSource::Spans(source), inventory)
+    }
+
+    fn parse_inner(
+        source: PacketSource<'_>,
+        inventory: &CodestreamInventory,
+    ) -> Result<Self, BoundedVarDctPacketError> {
         let profile = StandardVarDctProfile::negotiate(inventory)?;
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
@@ -300,18 +409,19 @@ impl BoundedVarDctPacketPlan {
                     pass_groups.clone(),
                 ),
             };
-        let lf_global = LfGlobalPrefix::parse(codestream, lf_global_packet)?;
+        let lf_global_end =
+            lf_global_packet
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-global end",
+                })?;
+        validate_source_packet_end(source, lf_global_end)?;
+        let mut lf_global_reader = source_reader_at(source, lf_global_packet.offset)?;
+        let lf_global = LfGlobalPrefix::parse_reader(&mut lf_global_reader, lf_global_end)?;
         let (global_ma_config, descriptor_end) =
             if let Some(tree_offset) = lf_global.global_ma_tree_bit_offset {
-                let (config, end) = parse_ma_config_at(
-                    codestream,
-                    tree_offset,
-                    lf_global_packet
-                        .end()
-                        .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                            field: "LF-global end",
-                        })?,
-                )?;
+                let mut tree_reader = source_reader_at(source, tree_offset)?;
+                let (config, end) = parse_ma_config_at_reader(&mut tree_reader, lf_global_end)?;
                 (Some(config), end)
             } else {
                 (None, lf_global.suffix_bit_offset)
@@ -395,17 +505,9 @@ impl BoundedVarDctPacketPlan {
                         .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                             field: "LF-group end",
                         })?;
-                let lf_header = parse_lf_group_header_prefix(
-                    codestream,
-                    BitRange {
-                        offset: lf_group_start,
-                        length: lf_group_end.checked_sub(lf_group_start).ok_or(
-                            BoundedVarDctPacketError::ArithmeticOverflow {
-                                field: "LF-group range",
-                            },
-                        )?,
-                    },
-                )?;
+                validate_source_packet_end(source, lf_group_end)?;
+                let mut lf_reader = source_reader_at(source, lf_group_start)?;
+                let lf_header = parse_lf_group_header_reader(&mut lf_reader, lf_group_end)?;
                 let (lf_config, lf_token_bit_offset) = if lf_header.modular.use_global_tree {
                     (
                         global_ma_config.clone().ok_or(
@@ -416,11 +518,9 @@ impl BoundedVarDctPacketPlan {
                         lf_header.modular.tree_or_token_bit_offset,
                     )
                 } else {
-                    parse_ma_config_at(
-                        codestream,
-                        lf_header.modular.tree_or_token_bit_offset,
-                        lf_group_end,
-                    )?
+                    let mut tree_reader =
+                        source_reader_at(source, lf_header.modular.tree_or_token_bit_offset)?;
+                    parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
                 };
                 let lf_decoded_symbol_limit = block_count.checked_mul(3).ok_or(
                     BoundedVarDctPacketError::ArithmeticOverflow {
@@ -478,8 +578,8 @@ impl BoundedVarDctPacketPlan {
                         field: "pass-group coefficient symbol limit",
                     },
                 )?;
-                HfCoefficientEntropyPlan::parse(
-                    codestream,
+                HfCoefficientEntropyPlan::parse_inner(
+                    source,
                     packet,
                     u32::try_from(profile.group_count).map_err(|_| {
                         BoundedVarDctPacketError::ArithmeticOverflow {
@@ -554,6 +654,25 @@ impl BoundedVarDctPacketPlan {
         group: &BoundedVarDctGroupPlan,
         lf_entropy_end: u32,
     ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
+        self.parse_hf_continuation_inner(PacketSource::Slice(codestream), group, lf_entropy_end)
+    }
+
+    /// Parses the resumed HF metadata prefix from a multi-span codestream.
+    pub(crate) fn parse_hf_continuation_source(
+        &self,
+        source: &CodestreamData,
+        group: &BoundedVarDctGroupPlan,
+        lf_entropy_end: u32,
+    ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
+        self.parse_hf_continuation_inner(PacketSource::Spans(source), group, lf_entropy_end)
+    }
+
+    fn parse_hf_continuation_inner(
+        &self,
+        source: PacketSource<'_>,
+        group: &BoundedVarDctGroupPlan,
+        lf_entropy_end: u32,
+    ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
         if lf_entropy_end < group.lf_entropy_bit_offset {
             return Err(BoundedVarDctPacketError::HfContinuationBeforeLf {
                 cursor: lf_entropy_end,
@@ -567,9 +686,10 @@ impl BoundedVarDctPacketPlan {
                 .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "LF-group end",
                 })?;
-        let prefix = parse_hf_metadata_header_prefix(
-            codestream,
-            u64::from(lf_entropy_end),
+        validate_source_packet_end(source, packet_end)?;
+        let mut prefix_reader = source_reader_at(source, u64::from(lf_entropy_end))?;
+        let prefix = parse_hf_metadata_header_reader(
+            &mut prefix_reader,
             packet_end,
             group.rect.width,
             group.rect.height,
@@ -584,11 +704,9 @@ impl BoundedVarDctPacketPlan {
                 prefix.modular.tree_or_token_bit_offset,
             )
         } else {
-            parse_ma_config_at(
-                codestream,
-                prefix.modular.tree_or_token_bit_offset,
-                packet_end,
-            )?
+            let mut tree_reader =
+                source_reader_at(source, prefix.modular.tree_or_token_bit_offset)?;
+            parse_ma_config_at_reader(&mut tree_reader, packet_end)?
         };
         let correlation_samples = group.correlation_samples()?;
         let block_count = prefix.block_width.checked_mul(prefix.block_height).ok_or(
@@ -854,6 +972,7 @@ impl BoundedVarDctGroupPlan {
 impl HfCoefficientEntropyPlan {
     /// Parses HF-global tables without consuming a coefficient symbol. Pass-group ranges remain
     /// exact views into the caller-owned codestream for the GPU executor.
+    #[cfg(test)]
     fn parse(
         codestream: &[u8],
         packet: BitRange,
@@ -862,9 +981,34 @@ impl HfCoefficientEntropyPlan {
         pass_groups: Vec<BitRange>,
         decoded_symbol_limit: u32,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        let prefix = HfGlobalPrefix::parse(codestream, packet, group_count)?;
+        Self::parse_inner(
+            PacketSource::Slice(codestream),
+            packet,
+            group_count,
+            block_context,
+            pass_groups,
+            decoded_symbol_limit,
+        )
+    }
+
+    fn parse_inner(
+        source: PacketSource<'_>,
+        packet: BitRange,
+        group_count: u32,
+        block_context: &HfBlockContextIr,
+        pass_groups: Vec<BitRange>,
+        decoded_symbol_limit: u32,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        let packet_end = packet
+            .end()
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "HF-global packet end",
+            })?;
+        validate_source_packet_end(source, packet_end)?;
+        let mut reader = source_reader_at(source, packet.offset)?;
+        let prefix = HfGlobalPrefix::parse_reader(&mut reader, packet_end, group_count)?;
         let (coefficient_entropy_bit_offset, order_words, order_coordinate_offset_words) =
-            parse_coefficient_orders(codestream, prefix)?;
+            parse_coefficient_orders_reader(&mut reader, prefix, packet_end)?;
         let lf_context_count = block_context
             .lf_thresholds
             .iter()
@@ -895,11 +1039,6 @@ impl HfCoefficientEntropyPlan {
                 field: "HF coefficient context count",
             }
         })?;
-        let packet_end = packet
-            .end()
-            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "HF-global packet end",
-            })?;
         if coefficient_entropy_bit_offset > packet_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: coefficient_entropy_bit_offset,
@@ -907,12 +1046,15 @@ impl HfCoefficientEntropyPlan {
             }
             .into());
         }
-        let mut reader = BitReader::new(codestream);
-        reader.skip_bits(coefficient_entropy_bit_offset)?;
-        let descriptor =
-            EntropyDecoderIr::parse(&mut reader, context_count, MaTreeLimits::default())
-                .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-        let descriptor_end = reader.bit_offset();
+        let mut descriptor_reader = source_reader_at(source, coefficient_entropy_bit_offset)?;
+        let mut descriptor_reader = BoundedBitInput::new(&mut descriptor_reader, packet_end);
+        let descriptor = EntropyDecoderIr::parse(
+            &mut descriptor_reader,
+            context_count,
+            MaTreeLimits::default(),
+        )
+        .map_err(map_modular_reader_error)?;
+        let descriptor_end = descriptor_reader.bit_offset();
         if descriptor_end > packet_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: descriptor_end,
@@ -921,7 +1063,12 @@ impl HfCoefficientEntropyPlan {
             .into());
         }
         let remaining = packet_end - descriptor_end;
-        if remaining > 7 || reader.read_bits(remaining as u8)? != 0 {
+        if remaining > 7
+            || descriptor_reader
+                .read_bits(remaining as u8)
+                .map_err(map_modular_reader_error)?
+                != 0
+        {
             return Err(BoundedVarDctPacketError::HfGlobalTrailingBits { bits: remaining });
         }
         let lz77_window_words = descriptor
@@ -958,9 +1105,10 @@ impl HfCoefficientEntropyPlan {
     }
 }
 
-fn parse_coefficient_orders(
-    codestream: &[u8],
+fn parse_coefficient_orders_reader(
+    reader: &mut impl BitInput,
     prefix: HfGlobalPrefix,
+    packet_end: u64,
 ) -> Result<(u64, Vec<u32>, u32), BoundedVarDctPacketError> {
     use crate::vardct_artifact::{
         GpuHfOrderDescriptor, HF_ORDER_CHANNELS, HF_ORDER_COUNT, HF_ORDER_EXTENTS,
@@ -968,20 +1116,21 @@ fn parse_coefficient_orders(
 
     const DESCRIPTOR_WORDS: u32 = (HF_ORDER_COUNT * HF_ORDER_CHANNELS * 4) as u32;
 
-    let mut bitstream = jxl_bitstream::Bitstream::new(codestream);
-    bitstream
-        .skip_bits(
-            usize::try_from(prefix.order_entropy_bit_offset).map_err(|_| {
-                BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "HF coefficient-order bit offset",
-                }
-            })?,
-        )
-        .map_err(BoundedVarDctPacketError::CoefficientOrderBitstream)?;
-    let mut decoder = (prefix.used_orders != 0)
-        .then(|| jxl_coding::Decoder::parse(&mut bitstream, 8))
-        .transpose()
-        .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+    let mut bitstream = BoundedBitInput::new(reader, packet_end);
+    let decoder = (prefix.used_orders != 0)
+        .then(|| {
+            EntropyDecoderIr::parse(&mut bitstream, 8, MaTreeLimits::default())
+                .map_err(coefficient_reader_error)
+        })
+        .transpose()?;
+    let mut decoder_cursor = decoder.as_ref().map(|decoder| {
+        MetadataEntropyCursor::new(decoder, MaTreeLimits::default().metadata_symbol_limit)
+    });
+    if let Some(cursor) = decoder_cursor.as_mut() {
+        cursor
+            .begin(&mut bitstream)
+            .map_err(coefficient_reader_error)?;
+    }
 
     let mut descriptors = [GpuHfOrderDescriptor::zeroed(); HF_ORDER_COUNT * HF_ORDER_CHANNELS];
     let mut coordinates = Vec::new();
@@ -1010,13 +1159,41 @@ fn parse_coefficient_orders(
             continue;
         }
 
-        let decoder = decoder
+        let cursor = decoder_cursor
             .as_mut()
             .ok_or(BoundedVarDctPacketError::PackedMetadata)?;
         let skip = len / 64;
         for channel in 0..HF_ORDER_CHANNELS {
-            let permutation = jxl_coding::read_permutation(&mut bitstream, decoder, len, skip)
-                .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+            let end = cursor
+                .read_varint(&mut bitstream, coefficient_order_context(len), 0)
+                .map_err(coefficient_reader_error)?;
+            let permutation = if end > len - skip {
+                return Err(BoundedVarDctPacketError::CoefficientOrderCoding(
+                    jxl_coding::Error::InvalidPermutation,
+                ));
+            } else {
+                let mut lehmer = Vec::with_capacity(end as usize);
+                let mut previous = 0u32;
+                for index in 0..end {
+                    let value = cursor
+                        .read_varint(&mut bitstream, coefficient_order_context(previous), 0)
+                        .map_err(coefficient_reader_error)?;
+                    if value >= len - skip - index {
+                        return Err(BoundedVarDctPacketError::CoefficientOrderCoding(
+                            jxl_coding::Error::InvalidPermutation,
+                        ));
+                    }
+                    previous = value;
+                    lehmer.push(value);
+                }
+                let mut temp = (skip as usize..len as usize).collect::<Vec<_>>();
+                let mut permutation = (0..skip as usize).collect::<Vec<_>>();
+                for index in lehmer {
+                    permutation.push(temp.remove(index as usize));
+                }
+                permutation.extend(temp);
+                permutation
+            };
             let offset = u32::try_from(coordinates.len()).map_err(|_| {
                 BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "HF order coordinate offset",
@@ -1031,17 +1208,10 @@ fn parse_coefficient_orders(
             };
         }
     }
-    if let Some(decoder) = &mut decoder {
-        decoder
-            .finalize()
-            .map_err(BoundedVarDctPacketError::CoefficientOrderCoding)?;
+    if let Some(cursor) = &decoder_cursor {
+        cursor.finalize().map_err(coefficient_reader_error)?;
     }
-    let coefficient_entropy_bit_offset =
-        u64::try_from(bitstream.num_read_bits()).map_err(|_| {
-            BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "HF coefficient entropy bit offset",
-            }
-        })?;
+    let coefficient_entropy_bit_offset = bitstream.bit_offset();
 
     let descriptor_words = bytemuck::cast_slice::<GpuHfOrderDescriptor, u32>(&descriptors);
     let mut order_words = Vec::with_capacity(descriptor_words.len() + coordinates.len());
@@ -1052,6 +1222,26 @@ fn parse_coefficient_orders(
         order_words,
         DESCRIPTOR_WORDS,
     ))
+}
+
+fn coefficient_order_context(value: u32) -> usize {
+    let bits = if value >= 0x8000_0000 {
+        32
+    } else {
+        (value + 1).next_power_of_two().trailing_zeros()
+    };
+    usize::try_from(bits.min(7)).unwrap_or(7)
+}
+
+fn coefficient_reader_error(source: crate::Error) -> BoundedVarDctPacketError {
+    match source {
+        crate::Error::Bitstream(source) => BoundedVarDctPacketError::CoefficientOrderBitstream(
+            crate::vardct_frontend::map_gpu_bitstream_error(source),
+        ),
+        source => {
+            BoundedVarDctPacketError::CoefficientOrderReader(map_metadata_reader_error(source))
+        }
+    }
 }
 
 fn natural_coefficient_order(
@@ -1604,6 +1794,10 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use jxl_gpu_bitstream::StreamSlice;
+
     use super::*;
 
     fn decode_hex(source: &str) -> Vec<u8> {
@@ -1619,6 +1813,86 @@ mod tests {
                 ((high << 4) | low) as u8
             })
             .collect()
+    }
+
+    fn legacy_coefficient_orders(
+        codestream: &[u8],
+        prefix: HfGlobalPrefix,
+    ) -> (u64, Vec<u32>, u32) {
+        use crate::vardct_artifact::{
+            GpuHfOrderDescriptor, HF_ORDER_CHANNELS, HF_ORDER_COUNT, HF_ORDER_EXTENTS,
+        };
+
+        const DESCRIPTOR_WORDS: u32 = (HF_ORDER_COUNT * HF_ORDER_CHANNELS * 4) as u32;
+
+        let mut bitstream = jxl_bitstream::Bitstream::new(codestream);
+        bitstream
+            .skip_bits(usize::try_from(prefix.order_entropy_bit_offset).unwrap())
+            .unwrap();
+        let mut decoder = (prefix.used_orders != 0)
+            .then(|| jxl_coding::Decoder::parse(&mut bitstream, 8))
+            .transpose()
+            .unwrap();
+        let mut descriptors = [GpuHfOrderDescriptor::zeroed(); HF_ORDER_COUNT * HF_ORDER_CHANNELS];
+        let mut coordinates = Vec::new();
+        for (order_id, [width, height]) in HF_ORDER_EXTENTS.into_iter().enumerate() {
+            let natural = natural_coefficient_order(width, height).unwrap();
+            let len = u32::try_from(natural.len()).unwrap();
+            if prefix.used_orders & (1 << order_id) == 0 {
+                let offset = u32::try_from(coordinates.len()).unwrap();
+                coordinates.extend_from_slice(&natural);
+                let descriptor = GpuHfOrderDescriptor {
+                    offset,
+                    len,
+                    width,
+                    height,
+                };
+                descriptors[order_id * HF_ORDER_CHANNELS..(order_id + 1) * HF_ORDER_CHANNELS]
+                    .fill(descriptor);
+                continue;
+            }
+            let decoder = decoder.as_mut().unwrap();
+            let skip = len / 64;
+            for channel in 0..HF_ORDER_CHANNELS {
+                let permutation =
+                    jxl_coding::read_permutation(&mut bitstream, decoder, len, skip).unwrap();
+                let offset = u32::try_from(coordinates.len()).unwrap();
+                coordinates.extend(permutation.into_iter().map(|index| natural[index]));
+                descriptors[order_id * HF_ORDER_CHANNELS + channel] = GpuHfOrderDescriptor {
+                    offset,
+                    len,
+                    width,
+                    height,
+                };
+            }
+        }
+        if let Some(decoder) = &mut decoder {
+            decoder.finalize().unwrap();
+        }
+        let coefficient_entropy_bit_offset = u64::try_from(bitstream.num_read_bits()).unwrap();
+        let descriptor_words = bytemuck::cast_slice::<GpuHfOrderDescriptor, u32>(&descriptors);
+        let mut order_words = Vec::with_capacity(descriptor_words.len() + coordinates.len());
+        order_words.extend_from_slice(descriptor_words);
+        order_words.extend_from_slice(&coordinates);
+        (
+            coefficient_entropy_bit_offset,
+            order_words,
+            DESCRIPTOR_WORDS,
+        )
+    }
+
+    fn split_source(storage: Arc<[u8]>, split: usize) -> CodestreamData {
+        CodestreamData::from_spans([
+            (
+                0,
+                StreamSlice::from_shared_range(Arc::clone(&storage), 0..split).unwrap(),
+            ),
+            (
+                split as u64,
+                StreamSlice::from_shared_range(Arc::clone(&storage), split..storage.len()).unwrap(),
+            ),
+        ])
+        .unwrap()
     }
 
     #[test]
@@ -1704,6 +1978,23 @@ mod tests {
             panic!("fixture has physical VarDCT sections")
         };
         let lf = LfGlobalPrefix::parse(&codestream, lf_global).unwrap();
+        let prefix = HfGlobalPrefix::parse(
+            &codestream,
+            hf_global,
+            u32::try_from(profile.group_count).unwrap(),
+        )
+        .unwrap();
+        let mut order_reader = jxl_gpu_bitstream::BitReader::new(&codestream);
+        order_reader
+            .skip_bits(prefix.order_entropy_bit_offset)
+            .unwrap();
+        let actual_orders =
+            parse_coefficient_orders_reader(&mut order_reader, prefix, hf_global.end().unwrap())
+                .unwrap();
+        assert_eq!(
+            actual_orders,
+            legacy_coefficient_orders(&codestream, prefix)
+        );
         let plan = HfCoefficientEntropyPlan::parse(
             &codestream,
             hf_global,
@@ -1733,6 +2024,54 @@ mod tests {
                     .sum::<usize>()
                 + 2 * 64
         );
+    }
+
+    #[test]
+    fn packet_plan_is_identical_across_every_fixture_chunk_split() {
+        let codestream = decode_hex(include_str!(
+            "../test-data/green_queen_crop_vardct_epf2.jxl.hex"
+        ));
+        let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+        let storage: Arc<[u8]> = codestream.into();
+
+        for split in 0..=storage.len() {
+            let source = split_source(Arc::clone(&storage), split);
+            assert_eq!(
+                BoundedVarDctPacketPlan::parse_source(&source, &inventory).unwrap(),
+                expected,
+                "chunk split {split} changed the VarDCT packet plan"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_order_packet_and_hf_continuation_cross_byte_sized_spans() {
+        let codestream = decode_hex(include_str!(
+            "../../jxl_gpu_bitstream/test-data/green_queen_vardct_e3.jxl.hex"
+        ));
+        let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+        let expected_continuation = expected
+            .parse_hf_continuation(&codestream, &expected.groups[0], 67_171)
+            .unwrap();
+        let storage: Arc<[u8]> = codestream.into();
+        let spans = (0..storage.len()).map(|offset| {
+            (
+                offset as u64,
+                StreamSlice::from_shared_range(Arc::clone(&storage), offset..offset + 1).unwrap(),
+            )
+        });
+        let source = CodestreamData::from_spans(spans).unwrap();
+        let actual = BoundedVarDctPacketPlan::parse_source(&source, &inventory).unwrap();
+        let actual_continuation = actual
+            .parse_hf_continuation_source(&source, &actual.groups[0], 67_171)
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual_continuation, expected_continuation);
     }
 
     #[test]

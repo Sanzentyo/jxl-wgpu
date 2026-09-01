@@ -121,10 +121,11 @@ The retained VarDCT source is a checked logically contiguous table of shared spa
 planning depends only on its logical length; LF, combined LF/HF, staged HF, and AC uploads copy
 their exact ranges across arbitrary physical span boundaries. Whole-range kernels still require a
 full GPU codestream buffer, but it is initialized while mapped directly from the span table and
-zero-padded to four bytes without constructing a second full-size host `Vec`. The initial VarDCT
-packet parser and cursor-dependent local-HF metadata parser still take one contiguous slice, so the
-public decoder remains single-span until those two metadata boundaries and section-event ingestion
-are generalized.
+zero-padded to four bytes without constructing a second full-size host `Vec`. Initial LF/HF packet
+metadata, MA descriptors, block-context maps, custom coefficient-order permutations, and
+cursor-dependent local-HF metadata all read the same span table without joining it. Slice-based
+low-level APIs remain zero-copy through the same reader contract. The public decoder remains
+single-span only because section-event ingestion is not yet connected to this internal boundary.
 
 The host inventories bounded scalar headers, packs the shared or local MA-tree and coefficient entropy descriptors,
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF

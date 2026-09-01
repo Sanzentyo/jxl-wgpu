@@ -775,6 +775,17 @@ impl VarDctSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        let codestream =
+            CodestreamData::from_gpu_codestream(codestream).map_err(map_codestream_source_error)?;
+        self.open_with_inventory_data(codestream, request, inventory)
+    }
+
+    pub(crate) fn open_with_inventory_data(
+        &self,
+        codestream: CodestreamData,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
         let source = prepare_source(
             &self.backend,
             codestream,
@@ -1361,7 +1372,7 @@ impl GpuSubmissionEngine for VarDctSubmissionEngine {
 
 fn prepare_source(
     backend: &WgpuBackend,
-    codestream: GpuCodestream,
+    codestream: CodestreamData,
     request: &GpuOutputRequest,
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     output_variant: KernelVariant,
@@ -1398,10 +1409,10 @@ fn prepare_source(
         1.0,
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
-    let packet = BoundedVarDctPacketPlan::parse(codestream.bytes(), inventory)?;
-    let codestream_len = codestream.bytes().len();
-    let codestream_bytes =
-        u64::try_from(codestream_len).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+    let packet = BoundedVarDctPacketPlan::parse_source(&codestream, inventory)?;
+    let codestream_bytes = codestream.logical_bytes();
+    let codestream_len =
+        usize::try_from(codestream_bytes).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
             field: "codestream source length",
         })?;
     let staged_local_trees = packet.requires_local_tree_staging();
@@ -1625,8 +1636,6 @@ fn prepare_source(
         hf_coefficients.as_ref(),
     )?;
     let frame_name = packet.profile.frame_name.clone();
-    let codestream =
-        CodestreamData::from_gpu_codestream(codestream).map_err(map_codestream_source_error)?;
     Ok(VarDctSource {
         codestream,
         packet,
@@ -2489,11 +2498,6 @@ impl VarDctPendingFrame {
         lifetime.status_staging.unmap();
         lifetime.status_mapped.store(false, Ordering::Release);
 
-        let codestream = source.codestream.contiguous_bytes().ok_or(
-            VarDctDecodeError::EntropyWindowContract {
-                detail: "HF continuation metadata parser requires one physical codestream span",
-            },
-        )?;
         let continuations = source
             .packet
             .groups
@@ -2502,7 +2506,7 @@ impl VarDctPendingFrame {
             .map(|(group, cursor)| {
                 source
                     .packet
-                    .parse_hf_continuation(codestream, group, cursor)
+                    .parse_hf_continuation_source(&source.codestream, group, cursor)
                     .map_err(VarDctDecodeError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;

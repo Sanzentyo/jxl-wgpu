@@ -72,15 +72,6 @@ impl CodestreamData {
         self.logical_bytes
     }
 
-    /// Returns the complete logical source only when it is physically backed by one span.
-    ///
-    /// This is a temporary bridge for metadata parsers that have not yet been generalized to
-    /// [`CodestreamBitReader`]. GPU uploads and range consumers must use [`Self::copy_range`].
-    pub(crate) fn contiguous_bytes(&self) -> Option<&[u8]> {
-        let span = self.spans.first()?;
-        (self.spans.len() == 1 && span.logical_offset == 0).then(|| span.bytes.bytes())
-    }
-
     pub(crate) fn logical_bits(&self) -> Result<u64> {
         self.logical_bytes
             .checked_mul(8)
@@ -361,10 +352,6 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(visited, bytes[1..4]);
-            assert_eq!(
-                source.contiguous_bytes().is_some(),
-                split == 0 || split == 5
-            );
         }
         let storage: Arc<[u8]> = Arc::from(bytes);
         let byte_spans = (0..storage.len()).map(|offset| {

@@ -6,6 +6,7 @@
 
 use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use jxl_gpu_bitstream::{FrameEncoding, InventoryLimits, ParseLimits};
@@ -17,7 +18,7 @@ use crate::{
     Error, GpuCodestream, GpuDecoder, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame, VarDctDecodeSession,
     VarDctPendingFrame, VarDctSubmissionEngine, WgpuDecodeSession, WgpuPendingFrame,
-    WgpuSubmissionEngine,
+    WgpuSubmissionEngine, codestream_data::CodestreamData,
 };
 
 /// Stock GPU decoder engine that selects Modular or VarDCT from the standard frame header.
@@ -76,6 +77,36 @@ impl WgpuDecodeEngine {
     pub const fn vardct_engine(&self) -> &VarDctSubmissionEngine {
         &self.vardct
     }
+
+    pub(crate) fn open_with_inventory_data(
+        &self,
+        codestream: Arc<CodestreamData>,
+        request: &GpuOutputRequest,
+        inventory: &jxl_gpu_bitstream::CodestreamInventory,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        let encoding = inventory
+            .frames
+            .first()
+            .ok_or(Error::MissingImageFrame)?
+            .encoding;
+        match encoding {
+            FrameEncoding::Modular => {
+                validate_codestream_limit(codestream.logical_bytes(), self.modular.parse_limits())?;
+                map_modular(
+                    self.modular
+                        .open_with_inventory_data(codestream, request, inventory)?,
+                )
+            }
+            FrameEncoding::VarDct => {
+                validate_codestream_limit(codestream.logical_bytes(), self.vardct.parse_limits())?;
+                map_vardct(self.vardct.open_with_inventory_data(
+                    (*codestream).clone(),
+                    request,
+                    inventory,
+                )?)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for WgpuDecodeEngine {
@@ -109,27 +140,8 @@ impl GpuSubmissionEngine for WgpuDecodeEngine {
                 ..InventoryLimits::default()
             })
             .map_err(Error::CodestreamInventory)?;
-        let encoding = inventory
-            .frames
-            .first()
-            .ok_or(Error::MissingImageFrame)?
-            .encoding;
-        match encoding {
-            FrameEncoding::Modular => {
-                validate_codestream_limit(codestream.bytes().len(), self.modular.parse_limits())?;
-                map_modular(
-                    self.modular
-                        .open_with_inventory(codestream, request, &inventory)?,
-                )
-            }
-            FrameEncoding::VarDct => {
-                validate_codestream_limit(codestream.bytes().len(), self.vardct.parse_limits())?;
-                map_vardct(
-                    self.vardct
-                        .open_with_inventory(codestream, request, &inventory)?,
-                )
-            }
-        }
+        let codestream = Arc::new(CodestreamData::from_gpu_codestream(codestream)?);
+        self.open_with_inventory_data(codestream, request, &inventory)
     }
 }
 
@@ -142,8 +154,7 @@ fn maximum_limits(left: ParseLimits, right: ParseLimits) -> ParseLimits {
     }
 }
 
-fn validate_codestream_limit(length: usize, limits: ParseLimits) -> Result<()> {
-    let length = u64::try_from(length).map_err(|_| jxl_gpu_bitstream::Error::SizeOverflow)?;
+fn validate_codestream_limit(length: u64, limits: ParseLimits) -> Result<()> {
     if length > limits.max_input_bytes || length > limits.max_codestream_bytes {
         return Err(jxl_gpu_bitstream::Error::ResourceLimit("codestream size").into());
     }

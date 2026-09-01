@@ -1442,7 +1442,7 @@ fn lower_tree(
     Ok((lowered, max_depth))
 }
 
-struct MetadataEntropyCursor<'a> {
+pub(crate) struct MetadataEntropyCursor<'a> {
     descriptor: &'a EntropyDecoderIr,
     ans_state: Option<u32>,
     lz77: MetadataLz77State,
@@ -1459,7 +1459,7 @@ struct MetadataLz77State {
 }
 
 impl<'a> MetadataEntropyCursor<'a> {
-    fn new(descriptor: &'a EntropyDecoderIr, symbol_limit: usize) -> Self {
+    pub(crate) fn new(descriptor: &'a EntropyDecoderIr, symbol_limit: usize) -> Self {
         Self {
             descriptor,
             ans_state: None,
@@ -1469,21 +1469,21 @@ impl<'a> MetadataEntropyCursor<'a> {
         }
     }
 
-    fn begin(&mut self, reader: &mut impl BitInput) -> Result<()> {
+    pub(crate) fn begin(&mut self, reader: &mut impl BitInput) -> Result<()> {
         if matches!(self.descriptor.coder, EntropyCoderIr::Ans { .. }) {
             self.ans_state = Some(read_bits_u32(reader, 32)?);
         }
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    pub(crate) fn finalize(&self) -> Result<()> {
         if self.ans_state.is_some_and(|state| state != ANS_SIGNATURE) {
             return invalid_entropy("MA tree ANS stream has an invalid final state");
         }
         Ok(())
     }
 
-    fn read_varint(
+    pub(crate) fn read_varint(
         &mut self,
         reader: &mut impl BitInput,
         context: usize,
@@ -1666,7 +1666,7 @@ impl<'a> MetadataEntropyCursor<'a> {
     }
 }
 
-fn read_clusters(
+pub(crate) fn read_clusters(
     reader: &mut impl BitInput,
     context_count: usize,
     limits: MaTreeLimits,

@@ -5,12 +5,13 @@
 //! that every accepted entropy stream can be handed to the GPU implementation without a hidden
 //! fallback.
 
-use jxl_bitstream::{Bitstream as MetadataBitstream, U};
 use jxl_gpu_bitstream::{
-    BitRange, CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory, FrameBlendMode,
-    FrameEncoding, FrameInventory, FrameSectionKind, FrameType, SampleBitDepth,
+    BitRange, BitReader, CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
+    FrameBlendMode, FrameEncoding, FrameInventory, FrameSectionKind, FrameType, SampleBitDepth,
 };
 use thiserror::Error;
+
+use crate::modular_tree::{BitInput, MaTreeLimits, read_clusters};
 
 const MAX_CODESTREAM_BYTES: u64 = 1 << 28;
 const MAX_DIMENSION: u32 = 1 << 18;
@@ -86,6 +87,12 @@ pub enum VarDctPacketError {
         #[source]
         source: jxl_bitstream::Error,
     },
+    #[error("failed to parse {stage} at the VarDCT span-reader boundary")]
+    MetadataReader {
+        stage: &'static str,
+        #[source]
+        source: VarDctMetadataReaderError,
+    },
     #[error("failed to parse the HF block-context map: {0}")]
     BlockContextMap(#[from] jxl_coding::Error),
     #[error("the initial GPU VarDCT profile requires default {field}")]
@@ -106,6 +113,17 @@ pub enum VarDctPacketError {
     GeometryOverflow,
     #[error("{field} value {value} exceeds the portable WGSL u32 address space")]
     GpuAddressSpace { field: &'static str, value: u64 },
+}
+
+/// Non-recursive errors that can cross the span-backed metadata reader boundary.
+#[derive(Debug, Error)]
+pub enum VarDctMetadataReaderError {
+    #[error("codestream bit reader failed: {0}")]
+    Bitstream(#[from] jxl_gpu_bitstream::Error),
+    #[error("Modular metadata parser failed: {0}")]
+    ModularTree(#[from] crate::ModularTreeError),
+    #[error("codestream metadata reader failed: {0}")]
+    Other(&'static str),
 }
 
 /// Entropy context metadata used by the HF coefficient GPU decoder.
@@ -234,12 +252,20 @@ impl HfGlobalPrefix {
     ) -> Result<Self, VarDctPacketError> {
         let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
         validate_packet_end(codestream, packet_end)?;
-        let packet_offset =
-            usize::try_from(packet.offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-        let mut reader = MetadataBitstream::new(codestream);
-        metadata_at(&mut reader, "HF-global packet offset", |reader| {
-            reader.skip_bits(packet_offset)
-        })?;
+        let mut reader = BitReader::new(codestream);
+        reader
+            .skip_bits(packet.offset)
+            .map_err(|error| metadata_error("HF-global packet offset", error.into()))?;
+        Self::parse_reader(&mut reader, packet_end, group_count)
+    }
+
+    /// Parses this prefix from a reader positioned at the packet's absolute bit offset.
+    pub(crate) fn parse_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+        group_count: u32,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
         metadata_require_default(&mut reader, "HF dequantization matrices")?;
 
         let preset_bits = if group_count <= 1 {
@@ -247,22 +273,31 @@ impl HfGlobalPrefix {
         } else {
             group_count.next_power_of_two().trailing_zeros() as usize
         };
-        let num_hf_presets = metadata_at(&mut reader, "HF preset count", |reader| {
-            reader.read_bits(preset_bits).map(|value| value + 1)
-        })?;
+        let preset_bits =
+            u8::try_from(preset_bits).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
+        let num_hf_presets =
+            u32::try_from(metadata_bits(&mut reader, "HF preset count", preset_bits)?)
+                .map_err(|_| VarDctPacketError::PacketRangeOverflow)?
+                + 1;
         if num_hf_presets > group_count {
             return Err(VarDctPacketError::HfPresetCount {
                 preset_count: num_hf_presets,
                 group_count,
             });
         }
-        let used_orders = metadata_at(&mut reader, "HF coefficient-order mask", |reader| {
-            reader.read_u32(0x5f, 0x13, 0, U(13))
-        })?;
+        let used_orders = metadata_u32(
+            &mut reader,
+            "HF coefficient-order mask",
+            [
+                MetadataU32Part::constant(0x5f),
+                MetadataU32Part::constant(0x13),
+                MetadataU32Part::constant(0),
+                MetadataU32Part::bits(0, 13),
+            ],
+        )?;
         let used_orders =
             u16::try_from(used_orders).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-        let cursor = u64::try_from(reader.num_read_bits())
-            .map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
+        let cursor = metadata_cursor(&reader)?;
         if cursor > packet_end {
             return Err(VarDctPacketError::PacketBoundary { cursor, packet_end });
         }
@@ -316,15 +351,23 @@ impl LfGroupPrefix {
     ) -> Result<Self, VarDctPacketError> {
         let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
         validate_packet_end(codestream, packet_end)?;
-        let packet_offset =
-            usize::try_from(packet.offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-        let mut reader = MetadataBitstream::new(codestream);
-        metadata_at(&mut reader, "LF-group packet offset", |reader| {
-            reader.skip_bits(packet_offset)
-        })?;
-        let extra_precision = metadata_at(&mut reader, "LF extra precision", |reader| {
-            reader.read_bits(2)
-        })?;
+        let mut reader = BitReader::new(codestream);
+        reader
+            .skip_bits(packet.offset)
+            .map_err(|error| metadata_error("LF-group packet offset", error.into()))?;
+        Self::parse_reader(&mut reader, packet_end, lf_width, lf_height, stream_index)
+    }
+
+    /// Parses this prefix from a reader positioned at the packet's absolute bit offset.
+    pub(crate) fn parse_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+        lf_width: u32,
+        lf_height: u32,
+        stream_index: u32,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
+        let extra_precision = metadata_bits(&mut reader, "LF extra precision", 2)?;
         let extra_precision =
             u8::try_from(extra_precision).map_err(|_| VarDctPacketError::GeometryOverflow)?;
         let modular = parse_modular_header(&mut reader, "LF quantization")?;
@@ -382,12 +425,22 @@ impl HfMetadataPrefix {
                 packet_end,
             });
         }
-        let offset = usize::try_from(token_bit_offset)
-            .map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-        let mut reader = MetadataBitstream::new(codestream);
-        metadata_at(&mut reader, "HF metadata packet offset", |reader| {
-            reader.skip_bits(offset)
-        })?;
+        let mut reader = BitReader::new(codestream);
+        reader
+            .skip_bits(token_bit_offset)
+            .map_err(|error| metadata_error("HF metadata packet offset", error.into()))?;
+        Self::parse_reader(&mut reader, packet_end, lf_width, lf_height, stream_index)
+    }
+
+    /// Parses this prefix from a reader positioned at the supplied token bit offset.
+    pub(crate) fn parse_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+        lf_width: u32,
+        lf_height: u32,
+        stream_index: u32,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
         let block_width = lf_width.div_ceil(8);
         let block_height = lf_height.div_ceil(8);
         let block_area = block_width
@@ -401,10 +454,11 @@ impl HfMetadataPrefix {
             .ok_or(VarDctPacketError::GeometryOverflow)?
             .trailing_zeros();
         let count_bits =
-            usize::try_from(count_bits).map_err(|_| VarDctPacketError::GeometryOverflow)?;
-        let block_count = metadata_at(&mut reader, "HF varblock count", |reader| {
-            reader.read_bits(count_bits).map(|value| value + 1)
-        })?;
+            u8::try_from(count_bits).map_err(|_| VarDctPacketError::GeometryOverflow)?;
+        let block_count =
+            u32::try_from(metadata_bits(&mut reader, "HF varblock count", count_bits)?)
+                .map_err(|_| VarDctPacketError::PacketRangeOverflow)?
+                + 1;
         if block_count > block_area {
             return Err(VarDctPacketError::GeometryOverflow);
         }
@@ -458,14 +512,21 @@ impl HfMetadataPrefix {
 }
 
 fn parse_modular_header(
-    reader: &mut MetadataBitstream<'_>,
+    reader: &mut impl BitInput,
     stage: &'static str,
 ) -> Result<ModularHeaderPrefix, VarDctPacketError> {
-    let use_global_tree = metadata_at(reader, stage, |reader| reader.read_bool())?;
+    let use_global_tree = metadata_bool(reader, stage)?;
     metadata_require_default(reader, "local Modular weighted predictor")?;
-    let transform_count = metadata_at(reader, stage, |reader| {
-        reader.read_u32(0, 1, 2 + U(4), 18 + U(8))
-    })?;
+    let transform_count = metadata_u32(
+        reader,
+        stage,
+        [
+            MetadataU32Part::constant(0),
+            MetadataU32Part::constant(1),
+            MetadataU32Part::bits(2, 4),
+            MetadataU32Part::bits(18, 8),
+        ],
+    )?;
     if transform_count != 0 {
         return Err(VarDctPacketError::NonDefaultMetadata {
             field: "local Modular transforms",
@@ -477,21 +538,12 @@ fn parse_modular_header(
     })
 }
 
-pub(crate) fn parse_lf_group_header_prefix(
-    codestream: &[u8],
-    packet: BitRange,
+pub(crate) fn parse_lf_group_header_reader(
+    reader: &mut impl BitInput,
+    packet_end: u64,
 ) -> Result<LfGroupHeaderPrefix, VarDctPacketError> {
-    let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
-    validate_packet_end(codestream, packet_end)?;
-    let packet_offset =
-        usize::try_from(packet.offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-    let mut reader = MetadataBitstream::new(codestream);
-    metadata_at(&mut reader, "LF-group packet offset", |reader| {
-        reader.skip_bits(packet_offset)
-    })?;
-    let extra_precision = metadata_at(&mut reader, "LF extra precision", |reader| {
-        reader.read_bits(2)
-    })?;
+    let mut reader = BoundedBitInput::new(reader, packet_end);
+    let extra_precision = metadata_bits(&mut reader, "LF extra precision", 2)?;
     let extra_precision =
         u8::try_from(extra_precision).map_err(|_| VarDctPacketError::GeometryOverflow)?;
     let modular = parse_modular_header(&mut reader, "LF quantization")?;
@@ -507,25 +559,13 @@ pub(crate) fn parse_lf_group_header_prefix(
     })
 }
 
-pub(crate) fn parse_hf_metadata_header_prefix(
-    codestream: &[u8],
-    bit_offset: u64,
+pub(crate) fn parse_hf_metadata_header_reader(
+    reader: &mut impl BitInput,
     packet_end: u64,
     lf_width: u32,
     lf_height: u32,
 ) -> Result<HfMetadataHeaderPrefix, VarDctPacketError> {
-    validate_packet_end(codestream, packet_end)?;
-    if bit_offset >= packet_end {
-        return Err(VarDctPacketError::PacketBoundary {
-            cursor: bit_offset,
-            packet_end,
-        });
-    }
-    let offset = usize::try_from(bit_offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-    let mut reader = MetadataBitstream::new(codestream);
-    metadata_at(&mut reader, "HF metadata packet offset", |reader| {
-        reader.skip_bits(offset)
-    })?;
+    let mut reader = BoundedBitInput::new(reader, packet_end);
     let block_width = lf_width.div_ceil(8);
     let block_height = lf_height.div_ceil(8);
     let block_area = block_width
@@ -538,11 +578,10 @@ pub(crate) fn parse_hf_metadata_header_prefix(
         .checked_next_power_of_two()
         .ok_or(VarDctPacketError::GeometryOverflow)?
         .trailing_zeros();
-    let count_bits =
-        usize::try_from(count_bits).map_err(|_| VarDctPacketError::GeometryOverflow)?;
-    let block_count = metadata_at(&mut reader, "HF varblock count", |reader| {
-        reader.read_bits(count_bits).map(|value| value + 1)
-    })?;
+    let count_bits = u8::try_from(count_bits).map_err(|_| VarDctPacketError::GeometryOverflow)?;
+    let block_count = u32::try_from(metadata_bits(&mut reader, "HF varblock count", count_bits)?)
+        .map_err(|_| VarDctPacketError::PacketRangeOverflow)?
+        + 1;
     if block_count > block_area {
         return Err(VarDctPacketError::GeometryOverflow);
     }
@@ -561,8 +600,8 @@ pub(crate) fn parse_hf_metadata_header_prefix(
     })
 }
 
-fn metadata_cursor(reader: &MetadataBitstream<'_>) -> Result<u64, VarDctPacketError> {
-    u64::try_from(reader.num_read_bits()).map_err(|_| VarDctPacketError::PacketRangeOverflow)
+fn metadata_cursor(reader: &impl BitInput) -> Result<u64, VarDctPacketError> {
+    Ok(reader.bit_offset())
 }
 
 fn validate_packet_end(codestream: &[u8], packet_end: u64) -> Result<(), VarDctPacketError> {
@@ -570,10 +609,17 @@ fn validate_packet_end(codestream: &[u8], packet_end: u64) -> Result<(), VarDctP
         .ok()
         .and_then(|bytes| bytes.checked_mul(8))
         .ok_or(VarDctPacketError::PacketRangeOverflow)?;
-    if packet_end > codestream_end {
+    validate_packet_end_bits(codestream_end, packet_end)
+}
+
+pub(crate) fn validate_packet_end_bits(
+    codestream_bits: u64,
+    packet_end: u64,
+) -> Result<(), VarDctPacketError> {
+    if packet_end > codestream_bits {
         return Err(VarDctPacketError::PacketBoundary {
             cursor: packet_end,
-            packet_end: codestream_end,
+            packet_end: codestream_bits,
         });
     }
     validate_gpu_u32("packet bit end", packet_end)
@@ -600,26 +646,44 @@ impl LfGlobalPrefix {
     pub fn parse(codestream: &[u8], packet: BitRange) -> Result<Self, VarDctPacketError> {
         let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
         validate_packet_end(codestream, packet_end)?;
-        let packet_offset =
-            usize::try_from(packet.offset).map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
-        let mut reader = MetadataBitstream::new(codestream);
-        metadata_at(&mut reader, "LF-global packet offset", |reader| {
-            reader.skip_bits(packet_offset)
-        })?;
+        let mut reader = BitReader::new(codestream);
+        reader
+            .skip_bits(packet.offset)
+            .map_err(|error| metadata_error("LF-global packet offset", error.into()))?;
+        Self::parse_reader(&mut reader, packet_end)
+    }
+
+    /// Parses this prefix from a reader positioned at the packet's absolute bit offset.
+    pub(crate) fn parse_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
         let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
-        let global_scale = metadata_at(&mut reader, "global quantizer scale", |reader| {
-            reader.read_u32(1 + U(11), 2049 + U(11), 4097 + U(12), 8193 + U(16))
-        })?;
-        let quant_lf = metadata_at(&mut reader, "LF quantizer", |reader| {
-            reader.read_u32(16, 1 + U(5), 1 + U(8), 1 + U(16))
-        })?;
+        let global_scale = metadata_u32(
+            &mut reader,
+            "global quantizer scale",
+            [
+                MetadataU32Part::bits(1, 11),
+                MetadataU32Part::bits(2049, 11),
+                MetadataU32Part::bits(4097, 12),
+                MetadataU32Part::bits(8193, 16),
+            ],
+        )?;
+        let quant_lf = metadata_u32(
+            &mut reader,
+            "LF quantizer",
+            [
+                MetadataU32Part::constant(16),
+                MetadataU32Part::bits(1, 5),
+                MetadataU32Part::bits(1, 8),
+                MetadataU32Part::bits(1, 16),
+            ],
+        )?;
         let hf_block_context = parse_hf_block_context(&mut reader)?;
         let lf_correlation = parse_lf_channel_correlation(&mut reader)?;
-        let has_global_ma_tree = metadata_at(&mut reader, "global MA-tree flag", |reader| {
-            reader.read_bool()
-        })?;
-        let cursor = u64::try_from(reader.num_read_bits())
-            .map_err(|_| VarDctPacketError::PacketRangeOverflow)?;
+        let has_global_ma_tree = metadata_bool(&mut reader, "global MA-tree flag")?;
+        let cursor = metadata_cursor(&reader)?;
         if cursor > packet_end {
             return Err(VarDctPacketError::PacketBoundary { cursor, packet_end });
         }
@@ -636,19 +700,15 @@ impl LfGlobalPrefix {
 }
 
 fn parse_lf_channel_dequantization(
-    reader: &mut MetadataBitstream<'_>,
+    reader: &mut impl BitInput,
 ) -> Result<LfChannelDequantization, VarDctPacketError> {
-    if metadata_at(reader, "LF channel dequantization default flag", |reader| {
-        reader.read_bool()
-    })? {
+    if metadata_bool(reader, "LF channel dequantization default flag")? {
         return Ok(LfChannelDequantization::default());
     }
 
     let mut multipliers = [0.0; 3];
     for (channel, multiplier) in ["X", "Y", "B"].into_iter().zip(&mut multipliers) {
-        *multiplier = metadata_at(reader, "LF channel dequantization multiplier", |reader| {
-            reader.read_f16_as_f32()
-        })?;
+        *multiplier = metadata_f16(reader, "LF channel dequantization multiplier")?;
         if *multiplier / 128.0 < 1.0e-8 {
             return Err(VarDctPacketError::LfDequantizationTooSmall {
                 channel,
@@ -660,22 +720,25 @@ fn parse_lf_channel_dequantization(
 }
 
 fn parse_lf_channel_correlation(
-    reader: &mut MetadataBitstream<'_>,
+    reader: &mut impl BitInput,
 ) -> Result<LfChannelCorrelation, VarDctPacketError> {
-    if metadata_at(reader, "LF channel correlation default flag", |reader| {
-        reader.read_bool()
-    })? {
+    if metadata_bool(reader, "LF channel correlation default flag")? {
         return Ok(LfChannelCorrelation::default());
     }
 
-    let colour_factor = metadata_at(reader, "channel correlation colour factor", |reader| {
-        reader.read_u32(84, 256, 2 + U(8), 258 + U(16))
-    })?;
+    let colour_factor = metadata_u32(
+        reader,
+        "channel correlation colour factor",
+        [
+            MetadataU32Part::constant(84),
+            MetadataU32Part::constant(256),
+            MetadataU32Part::bits(2, 8),
+            MetadataU32Part::bits(258, 16),
+        ],
+    )?;
     let mut base = [0.0; 2];
     for (channel, correlation) in ["X", "B"].into_iter().zip(&mut base) {
-        *correlation = metadata_at(reader, "base channel correlation", |reader| {
-            reader.read_f16_as_f32()
-        })?;
+        *correlation = metadata_f16(reader, "base channel correlation")?;
         if correlation.abs() > 4.0 {
             return Err(VarDctPacketError::BaseCorrelationOutOfRange {
                 channel,
@@ -685,10 +748,7 @@ fn parse_lf_channel_correlation(
     }
     let mut lf_factors = [0; 2];
     for factor in &mut lf_factors {
-        *factor = metadata_at(reader, "LF channel correlation factor", |reader| {
-            reader.read_bits(8)
-        })? as i32
-            - 128;
+        *factor = metadata_bits(reader, "LF channel correlation factor", 8)? as i32 - 128;
     }
     Ok(LfChannelCorrelation {
         colour_factor,
@@ -698,11 +758,9 @@ fn parse_lf_channel_correlation(
 }
 
 fn parse_hf_block_context(
-    reader: &mut MetadataBitstream<'_>,
+    reader: &mut impl BitInput,
 ) -> Result<HfBlockContextIr, VarDctPacketError> {
-    if metadata_at(reader, "HF block-context default flag", |reader| {
-        reader.read_bool()
-    })? {
+    if metadata_bool(reader, "HF block-context default flag")? {
         return Ok(HfBlockContextIr {
             qf_thresholds: Vec::new(),
             lf_thresholds: [Vec::new(), Vec::new(), Vec::new()],
@@ -717,9 +775,7 @@ fn parse_hf_block_context(
     let mut lf_thresholds = [Vec::new(), Vec::new(), Vec::new()];
     let mut block_context_count = 1u32;
     for thresholds in &mut lf_thresholds {
-        let count = metadata_at(reader, "LF block-context threshold count", |reader| {
-            reader.read_bits(4)
-        })?;
+        let count = metadata_bits(reader, "LF block-context threshold count", 4)? as u32;
         block_context_count = block_context_count.checked_mul(count + 1).ok_or(
             VarDctPacketError::BlockContextLimit {
                 field: "context count",
@@ -731,16 +787,21 @@ fn parse_hf_block_context(
             }
         })?;
         for _ in 0..count {
-            let packed = metadata_at(reader, "LF block-context threshold", |reader| {
-                reader.read_u32(U(4), 16 + U(8), 272 + U(16), 65_808 + U(32))
-            })?;
-            thresholds.push(jxl_bitstream::unpack_signed(packed));
+            let packed = metadata_u32(
+                reader,
+                "LF block-context threshold",
+                [
+                    MetadataU32Part::bits(0, 4),
+                    MetadataU32Part::bits(16, 8),
+                    MetadataU32Part::bits(272, 16),
+                    MetadataU32Part::bits(65_808, 32),
+                ],
+            )?;
+            thresholds.push(unpack_signed(packed));
         }
     }
 
-    let qf_count = metadata_at(reader, "quant-field threshold count", |reader| {
-        reader.read_bits(4)
-    })?;
+    let qf_count = metadata_bits(reader, "quant-field threshold count", 4)? as u32;
     block_context_count = block_context_count.checked_mul(qf_count + 1).ok_or(
         VarDctPacketError::BlockContextLimit {
             field: "context count",
@@ -760,9 +821,16 @@ fn parse_hf_block_context(
             field: "quant-field thresholds",
         })?;
     for _ in 0..qf_count {
-        let threshold = metadata_at(reader, "quant-field threshold", |reader| {
-            reader.read_u32(U(2), 4 + U(3), 12 + U(5), 44 + U(8))
-        })?;
+        let threshold = metadata_u32(
+            reader,
+            "quant-field threshold",
+            [
+                MetadataU32Part::bits(0, 2),
+                MetadataU32Part::bits(4, 3),
+                MetadataU32Part::bits(12, 5),
+                MetadataU32Part::bits(44, 8),
+            ],
+        )?;
         qf_thresholds.push(threshold + 1);
     }
 
@@ -772,8 +840,19 @@ fn parse_hf_block_context(
             .ok_or(VarDctPacketError::BlockContextLimit {
                 field: "distribution count",
             })?;
-    let (num_block_clusters, block_context_map) =
-        jxl_coding::read_clusters(reader, distribution_count)?;
+    let block_context_map = read_clusters(
+        reader,
+        usize::try_from(distribution_count).map_err(|_| VarDctPacketError::BlockContextLimit {
+            field: "distribution count",
+        })?,
+        MaTreeLimits::default(),
+    )
+    .map_err(|source| metadata_error("HF block-context map", source))?;
+    let num_block_clusters = block_context_map
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, |maximum| u32::from(maximum) + 1);
     if num_block_clusters > 16 {
         return Err(VarDctPacketError::BlockContextLimit {
             field: "more than 16 HF block clusters",
@@ -1230,22 +1309,167 @@ fn unsupported<T>(feature: UnsupportedVarDctFeature) -> Result<T, VarDctFrontend
 }
 
 fn metadata_require_default(
-    reader: &mut MetadataBitstream<'_>,
+    reader: &mut impl BitInput,
     field: &'static str,
 ) -> Result<(), VarDctPacketError> {
-    let is_default = metadata_at(reader, field, |reader| reader.read_bool())?;
+    let is_default = metadata_bool(reader, field)?;
     if !is_default {
         return Err(VarDctPacketError::NonDefaultMetadata { field });
     }
     Ok(())
 }
 
-fn metadata_at<T>(
-    reader: &mut MetadataBitstream<'_>,
+/// A view of a [`BitInput`] that refuses reads crossing a physical packet boundary.
+pub(crate) struct BoundedBitInput<'a> {
+    reader: &'a mut dyn BitInput,
+    packet_end: u64,
+}
+
+impl<'a> BoundedBitInput<'a> {
+    pub(crate) fn new<R: BitInput>(reader: &'a mut R, packet_end: u64) -> Self {
+        Self { reader, packet_end }
+    }
+}
+
+impl BitInput for BoundedBitInput<'_> {
+    fn bit_offset(&self) -> u64 {
+        self.reader.bit_offset()
+    }
+
+    fn read_bits(&mut self, count: u8) -> crate::Result<u64> {
+        let end = self
+            .bit_offset()
+            .checked_add(u64::from(count))
+            .ok_or_else(|| crate::Error::backend("metadata bit offset overflow"))?;
+        if end > self.packet_end {
+            return Err(jxl_gpu_bitstream::Error::UnexpectedEndOfBits.into());
+        }
+        self.reader.read_bits(count)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MetadataU32Part {
+    offset: u32,
+    bit_count: Option<u8>,
+}
+
+impl MetadataU32Part {
+    const fn constant(value: u32) -> Self {
+        Self {
+            offset: value,
+            bit_count: None,
+        }
+    }
+
+    const fn bits(offset: u32, bit_count: u8) -> Self {
+        Self {
+            offset,
+            bit_count: Some(bit_count),
+        }
+    }
+}
+
+fn metadata_bits(
+    reader: &mut impl BitInput,
     stage: &'static str,
-    operation: impl FnOnce(&mut MetadataBitstream<'_>) -> Result<T, jxl_bitstream::Error>,
-) -> Result<T, VarDctPacketError> {
-    operation(reader).map_err(|source| VarDctPacketError::MetadataBitstream { stage, source })
+    count: u8,
+) -> Result<u64, VarDctPacketError> {
+    reader
+        .read_bits(count)
+        .map_err(|source| metadata_error(stage, source))
+}
+
+fn metadata_bool(
+    reader: &mut impl BitInput,
+    stage: &'static str,
+) -> Result<bool, VarDctPacketError> {
+    Ok(metadata_bits(reader, stage, 1)? != 0)
+}
+
+fn metadata_u32(
+    reader: &mut impl BitInput,
+    stage: &'static str,
+    parts: [MetadataU32Part; 4],
+) -> Result<u32, VarDctPacketError> {
+    let selector = metadata_bits(reader, stage, 2)? as usize;
+    let part = parts[selector];
+    let value = part.bit_count.map_or(Ok(u64::from(part.offset)), |count| {
+        metadata_bits(reader, stage, count).map(|value| value.wrapping_add(u64::from(part.offset)))
+    })?;
+    u32::try_from(value).map_err(|_| VarDctPacketError::PacketRangeOverflow)
+}
+
+fn metadata_f16(reader: &mut impl BitInput, stage: &'static str) -> Result<f32, VarDctPacketError> {
+    let value = metadata_bits(reader, stage, 16)? as u32;
+    let neg_bit = (value & 0x8000) << 16;
+    if value & 0x7fff == 0 {
+        return Ok(f32::from_bits(neg_bit));
+    }
+    let mantissa = value & 0x3ff;
+    let exponent = (value >> 10) & 0x1f;
+    if exponent == 0x1f {
+        return Err(VarDctPacketError::MetadataBitstream {
+            stage,
+            source: jxl_bitstream::Error::InvalidFloat,
+        });
+    }
+    if exponent == 0 {
+        let value = (1.0 / 16384.0) * (mantissa as f32 / 1024.0);
+        Ok(if neg_bit != 0 { -value } else { value })
+    } else {
+        let mantissa = mantissa << 13;
+        let exponent = exponent + 112;
+        let bitpattern = mantissa | (exponent << 23) | neg_bit;
+        Ok(f32::from_bits(bitpattern))
+    }
+}
+
+fn metadata_error(stage: &'static str, source: crate::Error) -> VarDctPacketError {
+    match source {
+        crate::Error::Bitstream(source) => VarDctPacketError::MetadataBitstream {
+            stage,
+            source: map_gpu_bitstream_error(source),
+        },
+        source => VarDctPacketError::MetadataReader {
+            stage,
+            source: map_metadata_reader_error(source),
+        },
+    }
+}
+
+pub(crate) fn map_metadata_reader_error(source: crate::Error) -> VarDctMetadataReaderError {
+    match source {
+        crate::Error::Bitstream(source) => VarDctMetadataReaderError::Bitstream(source),
+        crate::Error::ModularTree(source) => VarDctMetadataReaderError::ModularTree(source),
+        _ => VarDctMetadataReaderError::Other("metadata reader failed"),
+    }
+}
+
+pub(crate) fn map_gpu_bitstream_error(source: jxl_gpu_bitstream::Error) -> jxl_bitstream::Error {
+    match source {
+        jxl_gpu_bitstream::Error::UnexpectedEndOfBits => {
+            jxl_bitstream::Error::Io(std::io::ErrorKind::UnexpectedEof.into())
+        }
+        jxl_gpu_bitstream::Error::NonZeroPadding => jxl_bitstream::Error::NonZeroPadding,
+        jxl_gpu_bitstream::Error::InvalidBitCount(_) => {
+            jxl_bitstream::Error::ValidationFailed("invalid bit count")
+        }
+        _ => jxl_bitstream::Error::ValidationFailed("codestream bit reader failed"),
+    }
+}
+
+fn unpack_signed(value: u32) -> i32 {
+    if value & 1 == 0 {
+        (value >> 1) as i32
+    } else {
+        let magnitude = (value >> 1) + 1;
+        if magnitude == 1u32 << 31 {
+            i32::MIN
+        } else {
+            -i32::try_from(magnitude).expect("signed mapping magnitude is below i32::MAX")
+        }
+    }
 }
 
 #[cfg(test)]

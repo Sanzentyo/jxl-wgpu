@@ -56,8 +56,11 @@ group-range results. Its range-copy tests cross every split, reject gaps/overlap
 exercise unaligned zero-bit checks. Existing actual-GPU Modular tests then run through the same
 span-backed bounded uploader. VarDCT separately verifies that one bounded upload segment crossing
 three physical spans is byte-exact and that an out-of-range segment returns its typed execution
-contract error. Public event-to-engine ingestion, remaining VarDCT metadata-parser conversion, and
-retained-span backpressure/cancellation are still required before `FRONT-03` can be complete.
+contract error. Its complete packet plan is identical at every byte split of the checked-in 257x17
+EPF2 fixture. A custom-order 438x589 stream is then parsed from one-byte physical spans, including a
+cursor-dependent HF continuation, and its coefficient-order words and final entropy cursor match
+the previous `jxl_coding` reader exactly. Public event-to-engine ingestion and retained-span
+backpressure/cancellation are still required before `FRONT-03` can be complete.
 
 ## Procedural VarDCT encoder matrix
 
