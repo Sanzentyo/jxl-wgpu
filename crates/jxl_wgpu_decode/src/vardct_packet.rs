@@ -3141,7 +3141,7 @@ mod tests {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("raw HF matrix test codestream"),
                     contents: &codestream,
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 });
         let resources = backend
             .device()

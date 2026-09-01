@@ -115,10 +115,11 @@ impl RawHfDequantSideImagePipeline {
             ));
         }
         let device = backend.device();
+        let stream = stream_window(codestream, plan.token_bit_offset, packet_end)?;
         let (metadata, channel_layout_offset) = packed_metadata(plan)?;
         let workspace = workspace(plan)?;
-        let memory_bytes = frame_bytes(plan, metadata.len(), workspace.bytes)?;
-        validate_limits(device, metadata.len(), workspace.bytes)?;
+        let memory_bytes = frame_bytes(plan, metadata.len(), workspace.bytes, stream.bytes)?;
+        validate_limits(device, metadata.len(), workspace.bytes, stream.bytes)?;
 
         let source_mask = if plan.bit_depth == 32 {
             u32::MAX
@@ -130,12 +131,12 @@ impl RawHfDequantSideImagePipeline {
         };
         let mut params = <ShaderParams as Zeroable>::zeroed();
         params.entropy = EntropyStreamParams {
-            token_start: plan.token_bit_offset,
-            token_end: packet_end,
+            token_start: stream.token_start,
+            token_end: stream.token_end,
             lz77_window_mask: plan.lz77_window_words.saturating_sub(1),
         };
-        params.stream_token_end = packet_end;
-        params.window_yield_end = packet_end;
+        params.stream_token_end = stream.token_end;
+        params.window_yield_end = stream.token_end;
         params.window_flags = WINDOW_FIRST | WINDOW_FINAL;
         params.entropy_state_offset = workspace.entropy_state_offset_words;
         params.width = plan.maximum_width;
@@ -172,6 +173,12 @@ impl RawHfDequantSideImagePipeline {
             label: Some("jxl-wgpu raw HF dequant Modular metadata"),
             contents: bytemuck::cast_slice(&metadata),
             usage: wgpu::BufferUsages::STORAGE,
+        });
+        let stream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jxl-wgpu raw HF dequant bounded stream"),
+            size: stream.bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu raw HF dequant resident arena"),
@@ -219,7 +226,7 @@ impl RawHfDequantSideImagePipeline {
             label: Some("jxl-wgpu raw HF dequant Modular bindings"),
             layout: &self.decode.get_bind_group_layout(0),
             entries: &[
-                entry(0, codestream),
+                entry(0, &stream_buffer),
                 entry(1, &metadata),
                 entry(2, &arena),
                 entry(3, &dummy_output),
@@ -263,6 +270,13 @@ impl RawHfDequantSideImagePipeline {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu raw HF dequant side-image stage"),
         });
+        encoder.copy_buffer_to_buffer(
+            codestream,
+            stream.source_offset,
+            &stream_buffer,
+            0,
+            stream.bytes,
+        );
         encoder.clear_buffer(&arena, 0, None);
         encoder.clear_buffer(&dummy_output, 0, None);
         encoder.clear_buffer(&status, 0, None);
@@ -315,6 +329,8 @@ impl RawHfDequantSideImagePipeline {
             status_staging,
             status_mapped: AtomicBool::new(false),
             memory_bytes,
+            cursor_base_bits: stream.cursor_base_bits,
+            _stream: stream_buffer,
             _metadata: metadata,
             _arena: arena,
             _dummy_output: dummy_output,
@@ -326,10 +342,15 @@ impl RawHfDequantSideImagePipeline {
         })
     }
 
-    pub(crate) fn memory_bytes(&self, plan: &RawHfDequantSideImagePlan) -> Result<u64> {
+    pub(crate) fn memory_bytes(
+        &self,
+        plan: &RawHfDequantSideImagePlan,
+        packet_end: u32,
+    ) -> Result<u64> {
         let (metadata, _) = packed_metadata(plan)?;
         let workspace = workspace(plan)?;
-        frame_bytes(plan, metadata.len(), workspace.bytes)
+        let stream = stream_window_geometry(plan.token_bit_offset, packet_end)?;
+        frame_bytes(plan, metadata.len(), workspace.bytes, stream.bytes)
     }
 }
 
@@ -338,6 +359,8 @@ pub(crate) struct RawHfDequantSideImageJob {
     status_staging: wgpu::Buffer,
     status_mapped: AtomicBool,
     memory_bytes: u64,
+    cursor_base_bits: u32,
+    _stream: wgpu::Buffer,
     _metadata: wgpu::Buffer,
     _arena: wgpu::Buffer,
     _dummy_output: wgpu::Buffer,
@@ -387,8 +410,16 @@ impl RawHfDequantSideImageJob {
         Ok(RawHfDequantSideImageStatus {
             code: status.code,
             decoded_samples: status.decoded_samples,
-            cursor: status.cursor,
-            expected_cursor: status.expected_cursor,
+            cursor: status
+                .cursor
+                .checked_add(self.cursor_base_bits)
+                .ok_or_else(|| Error::backend("raw HF dequant cursor rebasing overflow"))?,
+            expected_cursor: status
+                .expected_cursor
+                .checked_add(self.cursor_base_bits)
+                .ok_or_else(|| {
+                    Error::backend("raw HF dequant expected-cursor rebasing overflow")
+                })?,
         })
     }
 }
@@ -402,6 +433,62 @@ impl Drop for RawHfDequantSideImageJob {
             self.status_staging.unmap();
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct StreamWindow {
+    source_offset: u64,
+    bytes: u64,
+    cursor_base_bits: u32,
+    token_start: u32,
+    token_end: u32,
+}
+
+fn stream_window(
+    codestream: &wgpu::Buffer,
+    token_start: u32,
+    token_end: u32,
+) -> Result<StreamWindow> {
+    let window = stream_window_geometry(token_start, token_end)?;
+    let source_end = window
+        .source_offset
+        .checked_add(window.bytes)
+        .ok_or_else(|| Error::backend("raw HF dequant stream range overflow"))?;
+    if source_end > codestream.size() {
+        return Err(Error::backend(
+            "raw HF dequant stream range exceeds the retained codestream",
+        ));
+    }
+    Ok(window)
+}
+
+fn stream_window_geometry(token_start: u32, token_end: u32) -> Result<StreamWindow> {
+    if token_start >= token_end {
+        return Err(Error::EngineContract(
+            "raw HF dequant entropy range is empty or reversed",
+        ));
+    }
+    let first_word = token_start / 32;
+    let end_word = token_end.div_ceil(32);
+    let word_count = end_word
+        .checked_sub(first_word)
+        .ok_or_else(|| Error::backend("raw HF dequant stream word range underflow"))?;
+    let bytes = u64::from(word_count)
+        .checked_mul(4)
+        .ok_or_else(|| Error::backend("raw HF dequant stream byte size overflow"))?;
+    let source_offset = u64::from(first_word)
+        .checked_mul(4)
+        .ok_or_else(|| Error::backend("raw HF dequant stream byte offset overflow"))?;
+    let cursor_base_bits = first_word
+        .checked_mul(32)
+        .ok_or_else(|| Error::backend("raw HF dequant cursor base overflow"))?;
+    Ok(StreamWindow {
+        source_offset,
+        bytes,
+        cursor_base_bits,
+        token_start: token_start - cursor_base_bits,
+        token_end: token_end - cursor_base_bits,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -454,6 +541,7 @@ fn frame_bytes(
     plan: &RawHfDequantSideImagePlan,
     metadata_words: usize,
     workspace_bytes: u64,
+    stream_bytes: u64,
 ) -> Result<u64> {
     let metadata_bytes = u64::try_from(metadata_words)
         .ok()
@@ -478,6 +566,7 @@ fn frame_bytes(
                 .ok_or_else(|| Error::backend("raw HF dequant inverse uniform overflow"))
         })?;
     [
+        stream_bytes,
         metadata_bytes,
         workspace_bytes,
         4,
@@ -500,6 +589,7 @@ fn validate_limits(
     device: &wgpu::Device,
     metadata_words: usize,
     workspace_bytes: u64,
+    stream_bytes: u64,
 ) -> Result<()> {
     let limits = device.limits();
     let metadata_bytes = u64::try_from(metadata_words)
@@ -507,6 +597,7 @@ fn validate_limits(
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("raw HF dequant metadata binding size overflow"))?;
     for (name, bytes) in [
+        ("raw HF dequant bounded stream", stream_bytes),
         ("raw HF dequant Modular metadata", metadata_bytes),
         ("raw HF dequant resident arena", workspace_bytes),
     ] {
@@ -613,5 +704,17 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(offsets.len(), expected);
         }
+    }
+
+    #[test]
+    fn side_image_stream_window_is_word_aligned_and_cursor_rebased() {
+        let window = stream_window_geometry(35, 100).unwrap();
+        assert_eq!(window.source_offset, 4);
+        assert_eq!(window.bytes, 12);
+        assert_eq!(window.cursor_base_bits, 32);
+        assert_eq!(window.token_start, 3);
+        assert_eq!(window.token_end, 68);
+        assert!(stream_window_geometry(100, 100).is_err());
+        assert!(stream_window_geometry(101, 100).is_err());
     }
 }

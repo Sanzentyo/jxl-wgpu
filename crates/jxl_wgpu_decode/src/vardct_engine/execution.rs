@@ -450,6 +450,26 @@ fn submit_hf_packet_commands(
     submit_vardct_downstream(queue, vec![final_batch.commands], downstream, lifetime)
 }
 
+fn submit_hf_metadata_packet_commands(
+    queue: &wgpu::Queue,
+    batches: Vec<HfPacketBatchSubmission>,
+    lifetime: &VarDctJobLifetime,
+) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
+    let stream = lifetime._packet_stream_window.as_ref().ok_or(
+        VarDctDecodeError::EntropyWindowContract {
+            detail: "windowed HF-metadata commands have no retained stream upload",
+        },
+    )?;
+    let mut last_submission = None;
+    for batch in batches {
+        write_hf_packet_batch(queue, stream, &batch, lifetime)?;
+        last_submission = Some(queue.submit([batch.commands]));
+    }
+    last_submission.ok_or(VarDctDecodeError::EntropyWindowContract {
+        detail: "windowed HF-metadata execution has no batches",
+    })
+}
+
 fn submit_vardct_downstream(
     queue: &wgpu::Queue,
     mut prefix: Vec<wgpu::CommandBuffer>,
@@ -941,12 +961,6 @@ impl VarDctPendingFrame {
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
 
         let deferred_hf_global = matches!(&post_lf, PostLfCommands::DeferredHfGlobal(_));
-        if deferred_hf_global && hf_packet_windows.is_some() {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "deferred fused HF metadata does not yet support bounded stream windows",
-            }
-            .into());
-        }
 
         let windowed_batches = if let Some(plan) = &hf_packet_windows {
             let stream = lifetime._packet_stream_window.as_ref().ok_or(
@@ -1004,20 +1018,38 @@ impl VarDctPendingFrame {
                         &mut stream_upload,
                         "HF packet segment exceeds the source or reusable upload",
                     )?;
-                    self.pipelines.packet.encode_hf(
-                        device,
-                        &mut encoder,
-                        VarDctPacketBuffers {
-                            codestream: stream,
-                            modular_metadata: metadata,
-                            reconstructed_lf: &buffers.reconstructed,
-                            raw_hf_metadata: &buffers.raw_metadata,
-                            coefficients: &buffers.coefficients,
-                            status: &buffers.packet_status,
-                            control: &buffers.packet_control,
-                            modular_params: &buffers.modular_params,
-                        },
-                    );
+                    let packet_buffers = VarDctPacketBuffers {
+                        codestream: stream,
+                        modular_metadata: metadata,
+                        reconstructed_lf: &buffers.reconstructed,
+                        raw_hf_metadata: &buffers.raw_metadata,
+                        coefficients: &buffers.coefficients,
+                        status: &buffers.packet_status,
+                        control: &buffers.packet_control,
+                        modular_params: &buffers.modular_params,
+                    };
+                    if deferred_hf_global {
+                        self.pipelines.packet.encode_hf_metadata(
+                            device,
+                            &mut encoder,
+                            packet_buffers,
+                        );
+                        encoder.copy_buffer_to_buffer(
+                            &buffers.packet_status,
+                            0,
+                            &lifetime.status_staging,
+                            u64::try_from(segment.group_index).map_err(|_| {
+                                VarDctDecodeError::ArithmeticOverflow {
+                                    field: "windowed HF-metadata status index",
+                                }
+                            })? * PACKET_STATUS_BYTES,
+                            PACKET_STATUS_BYTES,
+                        );
+                    } else {
+                        self.pipelines
+                            .packet
+                            .encode_hf(device, &mut encoder, packet_buffers);
+                    }
                     group_uploads.push(HfPacketGroupUpload {
                         group_index: segment.group_index,
                         control,
@@ -1064,13 +1096,16 @@ impl VarDctPendingFrame {
             self.runtime_stats
                 .submissions_per_frame
                 .store(total_submissions, Ordering::Release);
-            let PostLfCommands::Direct(downstream) = post_lf else {
-                unreachable!("deferred HF-global windows were rejected above")
-            };
-            (
-                submit_hf_packet_commands(self.backend.queue(), batches, downstream, lifetime)?,
-                None,
-            )
+            match post_lf {
+                PostLfCommands::Direct(downstream) => (
+                    submit_hf_packet_commands(self.backend.queue(), batches, downstream, lifetime)?,
+                    None,
+                ),
+                PostLfCommands::DeferredHfGlobal(deferred) => (
+                    submit_hf_metadata_packet_commands(self.backend.queue(), batches, lifetime)?,
+                    Some(deferred),
+                ),
+            }
         } else {
             let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu bounded VarDCT HF-local stage"),
@@ -1198,7 +1233,7 @@ impl VarDctPendingFrame {
         let memory_bytes = self
             .pipelines
             .raw_hf_dequant
-            .memory_bytes(&plan)
+            .memory_bytes(&plan, packet_end)
             .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
                 matrix: plan.matrix_index,
                 source: Box::new(source),
@@ -1327,44 +1362,58 @@ impl VarDctPendingFrame {
             .lifetime
             .as_ref()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
-        if self.expected_groups.len() != 1 {
-            return Err(VarDctDecodeError::GroupPlanCount {
-                component: "single-entry progressive-DC packet",
-                expected: 1,
-                actual: self.expected_groups.len(),
-            }
-            .into());
-        }
         let mapped = lifetime
             .status_staging
             .slice(..)
             .get_mapped_range()
             .map_err(DecodeError::backend)?;
-        let status: GpuVarDctPacketStatus = mapped
-            .get(..PACKET_STATUS_BYTES as usize)
-            .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
-            .ok_or(VarDctDecodeError::StatusAbi {
-                status: "HF-global cursor",
-            })?;
-        let expected = &self.expected_groups[0];
-        let cursor = status.validate_hf_metadata_stage(VarDctPacketValidation {
-            expected_strategy: expected.uniform_transform,
-            expected_lf_samples: expected.expected_lf_samples,
-            block_count: expected.expected_blocks,
-            correlation_samples: expected.correlation_samples,
-            task_capacity: expected.task_capacity,
-            expected_global_scale: expected.expected_global_scale,
-            expected_quant_lf: expected.expected_quant_lf,
-            expected_extra_precision: expected.expected_extra_precision,
-        });
+        let mut cursors = Vec::with_capacity(self.expected_groups.len());
+        for (index, expected) in self.expected_groups.iter().enumerate() {
+            let offset = index.checked_mul(PACKET_STATUS_BYTES as usize).ok_or(
+                VarDctDecodeError::StatusAbi {
+                    status: "HF-metadata cursor offset",
+                },
+            )?;
+            let status: GpuVarDctPacketStatus = mapped
+                .get(offset..offset + PACKET_STATUS_BYTES as usize)
+                .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
+                .ok_or(VarDctDecodeError::StatusAbi {
+                    status: "HF-metadata cursor",
+                })?;
+            cursors.push(
+                status
+                    .validate_hf_metadata_stage(VarDctPacketValidation {
+                        expected_strategy: expected.uniform_transform,
+                        expected_lf_samples: expected.expected_lf_samples,
+                        block_count: expected.expected_blocks,
+                        correlation_samples: expected.correlation_samples,
+                        task_capacity: expected.task_capacity,
+                        expected_global_scale: expected.expected_global_scale,
+                        expected_quant_lf: expected.expected_quant_lf,
+                        expected_extra_precision: expected.expected_extra_precision,
+                    })
+                    .map_err(VarDctDecodeError::from)?,
+            );
+        }
         drop(mapped);
         lifetime.status_staging.unmap();
         lifetime.status_mapped.store(false, Ordering::Release);
-        let cursor = cursor.map_err(VarDctDecodeError::from)?;
 
+        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+            self.start_raw_hf_dequant_stage(source, commands, None)?;
+            return Ok(());
+        }
+        let [cursor] = cursors.as_slice() else {
+            return Err(VarDctDecodeError::GroupPlanCount {
+                component: "single-entry progressive-DC packet",
+                expected: 1,
+                actual: cursors.len(),
+            }
+            .into());
+        };
         source
             .packet
-            .parse_single_hf_global_continuation_source(&source.codestream, cursor)
+            .parse_single_hf_global_continuation_source(&source.codestream, *cursor)
             .map_err(VarDctDecodeError::from)?;
         if source.packet.pending_raw_hf_dequant_side_image().is_some() {
             self.start_raw_hf_dequant_stage(source, commands, None)?;
@@ -2147,7 +2196,7 @@ fn submit_vardct(
     let codestream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT codestream"),
         size: source.memory.codestream_bytes,
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
     upload_codestream(
@@ -3279,12 +3328,9 @@ fn submit_vardct(
         progressive_dc_extent,
         progressive_dc_stride: padded_width,
     };
-    if source.packet.pending_raw_hf_dequant_side_image().is_some() {
-        if packet_stage_commands.is_some() {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "raw HF dequant side images with staged local trees are not yet supported",
-            });
-        }
+    if source.packet.pending_raw_hf_dequant_side_image().is_some()
+        && packet_stage_commands.is_none()
+    {
         if combined_packet_batches.is_some() {
             return Err(VarDctDecodeError::EntropyWindowContract {
                 detail: "raw HF dequant side images cannot use combined packet stream windows",
@@ -3308,7 +3354,7 @@ fn submit_vardct(
         if let Some(packet_stage_commands) = packet_stage_commands {
             let submission =
                 submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
-            if staged_hf_global {
+            if staged_hf_global || source.packet.pending_raw_hf_dequant_side_image().is_some() {
                 if source.packet.profile.uses_lf_frame {
                     (submission, None, deferred_commands)
                 } else {

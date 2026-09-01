@@ -162,8 +162,11 @@ common descriptor-adaptive entropy kernel, reuses the resident Palette/RCT/Squee
 pipelines, and overlays the validated three-channel raster into the strategy aliases in the
 existing resource buffer. Its 16-byte status carries decoded count, continuation cursor, and
 packet end through one map; the host resumes the HF-global scalar parser and repeats the stage
-until AC metadata is complete. The host never reconstructs image samples. Local-tree ordering and
-bounded side-image uploads remain separate scheduling work.
+until AC metadata is complete. The entropy binding is a four-byte-aligned copy of only the current
+HF-global packet range; shader-relative cursors are checked and rebased before host continuation.
+Local-tree packets first map every LF cursor, parse their scalar HF descriptors, and execute all
+bounded HF-local metadata windows before entering the same raw stage. The host never reconstructs
+image samples; a local-tree raw fixture remains required for conformance coverage.
 
 For VarDCT, the caller/device cap is first evaluated against exact packet, AC, render, validation,
 and output bytes. If that frame would exceed the shared budget's total capacity, the planner

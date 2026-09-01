@@ -330,8 +330,10 @@ scratch, dummy output, decode status and its staging copy, the 244-byte entropy 
 16-byte dispatch control, 64-byte overlay uniform, and every Palette/RCT/Squeeze inverse uniform.
 It is acquired before allocation and remains attached to the pending stage until status validation
 and matrix overlay complete. The large frame-resident resource table is already covered by
-`VarDctDecodeMemoryStats` and is not charged again. Bounded side-image uploads are not implemented
-yet, so this stage currently binds the retained whole codestream.
+`VarDctDecodeMemoryStats` and is not charged again. The decode binding is a four-byte-aligned GPU
+copy of only the current HF-global packet
+range; its bytes are included in the same permit, and mapped cursors are rebased to absolute
+codestream bits before parsing resumes.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,
@@ -350,9 +352,10 @@ resident reconstruction before the next dependency. Its worst-case LZ ring, 464-
 per pass group, status, parameters, and sink uniforms are included in the initial reservation;
 late buffers use the same budget and all producer lifetimes remain retained. Parametric custom
 matrix modes overwrite the already-accounted resource-table matrix region and add no GPU
-allocation. Sectioned global-tree raw matrices add only their exact temporary reservation above;
-local-tree/windowed raw matrices, Global/LF/HF image streams, and intermediate presentation still
-require broader scheduling.
+allocation. Sectioned raw matrices add only their exact temporary reservation above; local-tree
+packets validate every LF and bounded HF-local metadata stage before entering it. Local-tree raw
+conformance, Global/LF/HF image streams, and intermediate presentation still require broader
+scheduling.
 
 ## Shader write bounds fixed by this audit
 
