@@ -269,6 +269,11 @@ requires a breaking change. Each split must independently pass formatting, warni
 - `vardct_encoder.rs`: types, entropy, bitstream, dispatch, tests.
 - `scheduler.rs`: validation, pipeline, color/filter/blend/I/O nodes, tests.
 
+The first refactoring wave is complete: `lossless_modular.rs`, `wgpu_engine.rs`, and `scheduler.rs`
+now use these responsibility modules with explicit production imports and parent-scoped internal
+visibility. `vardct_engine.rs` and `vardct_encoder.rs` remain the second-wave gate before feature
+work resumes.
+
 The coding-mode selector, shared typed entropy-stream ABI, bounded Modular/VarDCT-AC/staged-LF/HF
 stream resume, nonzero-AC mixed/multi-group decode,
 local per-substream MA-tree frame execution, non-default LF dequantization/correlation, bounded
