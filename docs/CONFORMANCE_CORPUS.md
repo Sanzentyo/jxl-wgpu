@@ -164,6 +164,22 @@ WGSL source strings. The encoder's streamed 16K×1 RGB8 case additionally runs `
 through multiple bounded artifact batches in blocking and runtime-neutral forms, with Rust `jxl`
 and optional `djxl` exact output.
 
+## GPU color-output matrix
+
+`jxl_wgpu::yuv_output` treats color conversion as an executed GPU contract, not descriptor-only
+coverage. An independent scalar oracle compares RGB8 codes after D65 BT.709, BT.2020, and
+Display-P3 primary conversion; PQ and HLG source/target transfer; and the exact BT.2020 OETF. PQ
+uses normalized absolute luminance (`1.0 = 10,000 nit`) while HLG uses scene-linear light. A
+separate planar I444 readback compares BT.2020 non-constant-luminance and constant-luminance YCbCr,
+including their sign-dependent chroma divisors. Every comparison executes an actual adapter and
+allows at most two eight-bit codes for shader/scalar floating-point differences. Mismatched source
+declarations, undefined primaries/specifications/transfers, sensor primaries, and source Gamma
+without an exponent must fail with typed errors before GPU submission.
+
+The Rust/WGSL ABI gate parses the shader with Naga and reflects the complete uniform field order.
+Compile-time assertions independently fix `ImageOutputUniform` at 176 bytes and its three padded
+matrix rows at offsets 128, 144, and 160. No test searches shader source text.
+
 ## Procedural VarDCT encoder matrix
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than

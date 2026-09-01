@@ -86,7 +86,7 @@ name shown in parentheses.
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
 | `jxl_wgpu/extend.wgsl` | `ExtendUniform` / `Params` | image/frame dimensions, 3 strides, signed origin, `has_reference`, 2 pads | 48 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
-| `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad | 128 | 4 | uniform |
+| `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad, three padded primary-matrix rows | 176 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
 | `jxl_wgpu/display_numeric.wgsl` | `DisplayNumericParams` / `NumericParams` | dimensions/type/depth/components, plane offset/stride, visualization/non-finite/transfer/clamp, reserved word, `scale, bias`, 2 pads | 64 | 4 | uniform |
 | `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer` | 96 | 4 | uniform |
@@ -383,8 +383,10 @@ strategy, the deterministic encoder fixture, and the bounded decoder. Dedicated 
 - explicit same-queue numeric display and texture readback for all 10 VPI numeric formats,
   including signed endpoints, two-component visualization, NaN/infinity policy, unit clamp,
   Linear/sRGB transfer, and reported native/portable F64 precision;
-- byte-checked BT.709-primary conversion between Linear, sRGB, and BT.709 source/target transfer
-  functions, plus pre-dispatch rejection of mismatched, undefined, wide-gamut, and HDR contracts;
+- scalar-oracle actual-GPU conversion across D65 BT.709/BT.2020/Display-P3 primaries,
+  Linear/sRGB/BT.709/PQ/HLG/BT.2020 transfer contracts, and both BT.2020 NCL and
+  constant-luminance YCbCr, plus pre-dispatch typed rejection of mismatched, undefined, or
+  numerically incomplete contracts;
 - typed rejection of missing/mismatched numeric mappings and native-required F64 on devices without
   enabled `SHADER_F64`, plus an explicitly skipped native-F64 GPU test on unsupported adapters;
 - the 1,536-byte DCT8 and 2,304-byte special-VarDCT workgroup-storage requirements, all 27 inverse

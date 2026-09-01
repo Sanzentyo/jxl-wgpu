@@ -34,7 +34,7 @@ pub enum ColorSpace {
     Bt601,
     Bt709,
     Bt2020,
-    DciP3,
+    DisplayP3,
     Undefined,
 }
 
@@ -55,6 +55,7 @@ pub enum TransferFunction {
     Srgb,
     Sycc,
     Pq,
+    Hlg,
     Bt709,
     Bt2020,
     Smpte240M,

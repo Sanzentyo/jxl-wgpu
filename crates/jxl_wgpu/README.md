@@ -101,10 +101,14 @@ tracking is required.
 
 `WgpuFrameSession::submit_gpu_image` converts the final F32 RGB planes directly into a checked
 `jxl_gpu_formats::PixelFormat`. The plan's `OutputDesc::color_encoding` and the request's
-`source_encoding` must agree. BT.709 primaries with Linear, sRGB, or BT.709 transfer functions are
-converted as source EOTF -> linear light -> target OETF; undefined metadata, wide-gamut primaries,
-and HDR transfer functions return `Error::Unsupported`. `submit_image` plus `wait_image` provides
-the corresponding mapped transport. Supported layout families include:
+`source_encoding` must agree. D65 BT.709, BT.2020, and Display-P3 primaries are converted as source
+EOTF -> linear-light primary matrix -> target OETF. Source Linear/sRGB/BT.709/PQ/HLG and target
+Linear/sRGB/BT.709/PQ/HLG/BT.2020 transfer contracts execute in WGSL; PQ uses the normalized
+`1.0 = 10,000 nit` domain and HLG uses scene-linear light. BT.2020 non-constant- and
+constant-luminance YCbCr matrices are supported alongside BT.601/709. Undefined primaries,
+transfer functions without enough numeric metadata (including source Gamma), and unsupported
+spaces return `Error::Unsupported`. `submit_image` plus `wait_image` provides the corresponding
+mapped transport. Supported layout families include:
 
 - unsigned luma at 8 or 16 storage bits;
 - planar and semiplanar YCbCr 4:4:4, 4:2:2, and 4:2:0 at 8/10/12/16 bits, including NV12, NV21,

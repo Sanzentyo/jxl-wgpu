@@ -244,14 +244,12 @@ pub enum TransferFunction {
 
 /// RGB primary chromaticities attached to an output signal.
 ///
-/// The portable backend currently converts only BT.709 primaries. The other variants make an
-/// unsupported wide-gamut or undefined source an explicit, rejectable contract instead of
-/// allowing the same samples to be relabelled silently.
+/// The portable backend converts BT.709, BT.2020, and D65 Display-P3 primaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RgbPrimaries {
     Bt709,
     Bt2020,
-    DciP3,
+    DisplayP3,
     Undefined,
 }
 

@@ -310,7 +310,7 @@ impl VpiColorSpec {
     pub const fn specification(self) -> ColorSpecification {
         use ChromaLocation::{Both, Center, Even};
         use ColorRange::{Full, Limited};
-        use ColorSpace::{Bt709, Bt2020, DciP3, Sensor};
+        use ColorSpace::{Bt709, Bt2020, DisplayP3, Sensor};
         use TransferFunction::{Bt709 as Bt709Xfer, Bt2020 as Bt2020Xfer};
         use TransferFunction::{Linear, Pq, Smpte240M as Smpte240MXfer, Srgb, Sycc};
         use YcbcrEncoding::{Bt601, Bt709 as Bt709Encoding, Smpte240M, Undefined as NoEncoding};
@@ -351,8 +351,8 @@ impl VpiColorSpec {
             Self::Srgb => (Bt709, NoEncoding, Srgb, Full, Both, Both),
             Self::Sycc => (Bt709, Bt601, Sycc, Full, Center, Center),
             Self::Smpte240M => (Bt709, Smpte240M, Smpte240MXfer, Limited, Even, Even),
-            Self::DisplayP3 => (DciP3, NoEncoding, Srgb, Full, Both, Both),
-            Self::DisplayP3Linear => (DciP3, NoEncoding, Linear, Full, Both, Both),
+            Self::DisplayP3 => (DisplayP3, NoEncoding, Srgb, Full, Both, Both),
+            Self::DisplayP3Linear => (DisplayP3, NoEncoding, Linear, Full, Both, Both),
             Self::Sensor => (Sensor, NoEncoding, Linear, Full, Both, Both),
         };
         ColorSpecification::Defined(ColorSpec {

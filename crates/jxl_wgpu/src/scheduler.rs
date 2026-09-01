@@ -2613,8 +2613,7 @@ fn encode_image_save(
             output.id, source_encoding, request.source_encoding
         )));
     }
-    let (source_transfer, target_transfer) =
-        image_transfer_params(source_encoding, &request.format)?;
+    let color_transform = image_color_transform(source_encoding, &request.format)?;
     let channels = save
         .channels
         .iter()
@@ -2683,9 +2682,12 @@ fn encode_image_save(
         logical_size: to_shader_u32(layout.logical_size)?,
         dispatch_width,
         orientation: orientation_code(save.orientation),
-        source_transfer,
-        target_transfer,
+        source_transfer: color_transform.source_transfer,
+        target_transfer: color_transform.target_transfer,
         _padding: 0,
+        primaries_r: color_transform.primaries[0],
+        primaries_g: color_transform.primaries[1],
+        primaries_b: color_transform.primaries[2],
     };
     let uniform = create_uniform(factory.device, "jxl-wgpu generic image params", &params);
     let pipeline = create_pipeline_with_variant(
@@ -2855,20 +2857,26 @@ fn numeric_image_output_error(numeric: NumericFormatClass) -> Error {
     }
 }
 
-fn image_transfer_params(source: RgbColorEncoding, target: &PixelFormat) -> Result<(u32, u32)> {
-    if source.primaries != RgbPrimaries::Bt709 {
-        return Err(Error::Unsupported(format!(
-            "generic GPU output supports only BT.709 source primaries, not {:?}",
-            source.primaries
-        )));
-    }
+#[derive(Clone, Copy, Debug)]
+struct ImageColorTransform {
+    source_transfer: u32,
+    target_transfer: u32,
+    primaries: [[f32; 4]; 3],
+}
+
+fn image_color_transform(
+    source: RgbColorEncoding,
+    target: &PixelFormat,
+) -> Result<ImageColorTransform> {
     let source_transfer = match source.transfer {
         SourceTransferFunction::Linear => 0,
         SourceTransferFunction::Srgb => 1,
         SourceTransferFunction::Bt709 => 2,
+        SourceTransferFunction::Pq => 3,
+        SourceTransferFunction::Hlg => 4,
         unsupported => {
             return Err(Error::Unsupported(format!(
-                "generic GPU output source transfer {unsupported:?} is unsupported"
+                "generic GPU output source transfer {unsupported:?} has no complete numeric contract"
             )));
         }
     };
@@ -2880,23 +2888,102 @@ fn image_transfer_params(source: RgbColorEncoding, target: &PixelFormat) -> Resu
             ));
         }
     };
-    if target_color.space != ColorSpace::Bt709 {
-        return Err(Error::Unsupported(format!(
-            "generic GPU output supports only BT.709 target primaries, not {:?}",
-            target_color.space
-        )));
-    }
     let target_transfer = match target_color.transfer {
         ImageTransferFunction::Linear => 0,
         ImageTransferFunction::Srgb | ImageTransferFunction::Sycc => 1,
         ImageTransferFunction::Bt709 => 2,
+        ImageTransferFunction::Pq => 3,
+        ImageTransferFunction::Hlg => 4,
+        ImageTransferFunction::Bt2020 => 5,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "generic GPU output target transfer {unsupported:?} is unsupported"
             )));
         }
     };
-    Ok((source_transfer, target_transfer))
+    let primaries = primaries_transform(source.primaries, target_color.space)?;
+    Ok(ImageColorTransform {
+        source_transfer,
+        target_transfer,
+        primaries,
+    })
+}
+
+type Matrix3 = [[f32; 3]; 3];
+
+const IDENTITY_3: Matrix3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+const BT709_TO_XYZ: Matrix3 = [
+    [0.412_456_4, 0.357_576_1, 0.180_437_5],
+    [0.212_672_9, 0.715_152_2, 0.072_175],
+    [0.019_333_9, 0.119_192, 0.950_304_1],
+];
+const BT2020_TO_XYZ: Matrix3 = [
+    [0.636_958, 0.144_616_9, 0.168_881],
+    [0.262_700_2, 0.677_998_1, 0.059_301_7],
+    [0.0, 0.028_072_7, 1.060_985_1],
+];
+const DISPLAY_P3_TO_XYZ: Matrix3 = [
+    [0.486_570_95, 0.265_667_7, 0.198_217_29],
+    [0.228_974_57, 0.691_738_55, 0.079_286_91],
+    [0.0, 0.045_113_38, 1.043_944_4],
+];
+const XYZ_TO_BT709: Matrix3 = [
+    [3.240_454_2, -1.537_138_5, -0.498_531_4],
+    [-0.969_266, 1.876_010_8, 0.041_556],
+    [0.055_643_4, -0.204_025_9, 1.057_225_2],
+];
+const XYZ_TO_BT2020: Matrix3 = [
+    [1.716_651_2, -0.355_670_8, -0.253_366_3],
+    [-0.666_684_4, 1.616_481_2, 0.015_768_5],
+    [0.017_639_9, -0.042_770_6, 0.942_103_1],
+];
+const XYZ_TO_DISPLAY_P3: Matrix3 = [
+    [2.493_497, -0.931_383_6, -0.402_710_8],
+    [-0.829_489, 1.762_664, 0.023_624_7],
+    [0.035_845_8, -0.076_172_4, 0.956_884_5],
+];
+
+fn primaries_transform(source: RgbPrimaries, target: ColorSpace) -> Result<[[f32; 4]; 3]> {
+    let source_index = match source {
+        RgbPrimaries::Bt709 => 0,
+        RgbPrimaries::Bt2020 => 1,
+        RgbPrimaries::DisplayP3 => 2,
+        RgbPrimaries::Undefined => {
+            return Err(Error::Unsupported(
+                "generic GPU output requires defined source RGB primaries".into(),
+            ));
+        }
+    };
+    let target_index = match target {
+        ColorSpace::Bt709 => 0,
+        ColorSpace::Bt2020 => 1,
+        ColorSpace::DisplayP3 => 2,
+        unsupported => {
+            return Err(Error::Unsupported(format!(
+                "generic GPU output target primaries {unsupported:?} are unsupported"
+            )));
+        }
+    };
+    let matrix = if source_index == target_index {
+        IDENTITY_3
+    } else {
+        let source_to_xyz = [BT709_TO_XYZ, BT2020_TO_XYZ, DISPLAY_P3_TO_XYZ][source_index];
+        let xyz_to_target = [XYZ_TO_BT709, XYZ_TO_BT2020, XYZ_TO_DISPLAY_P3][target_index];
+        multiply_matrix3(xyz_to_target, source_to_xyz)
+    };
+    Ok(matrix.map(|row| [row[0], row[1], row[2], 0.0]))
+}
+
+fn multiply_matrix3(lhs: Matrix3, rhs: Matrix3) -> Matrix3 {
+    let mut product = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            product[row][column] = lhs[row][0] * rhs[0][column]
+                + lhs[row][1] * rhs[1][column]
+                + lhs[row][2] * rhs[2][column];
+        }
+    }
+    product
 }
 
 fn image_color_params(layout: &ImageLayout) -> Result<(u32, u32, u8, u8)> {
@@ -2911,6 +2998,8 @@ fn image_color_params(layout: &ImageLayout) -> Result<(u32, u32, u8, u8)> {
     let matrix = match color.encoding {
         YcbcrEncoding::Bt601 => 0,
         YcbcrEncoding::Bt709 => 1,
+        YcbcrEncoding::Bt2020 => 2,
+        YcbcrEncoding::Bt2020ConstantLuminance => 3,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "YCbCr GPU output matrix {unsupported:?} is unsupported"
@@ -3493,6 +3582,9 @@ struct ImageOutputUniform {
     source_transfer: u32,
     target_transfer: u32,
     _padding: u32,
+    primaries_r: [f32; 4],
+    primaries_g: [f32; 4],
+    primaries_b: [f32; 4],
 }
 
 const _: () = {
@@ -3526,8 +3618,11 @@ const _: () = {
     assert!(std::mem::align_of::<ExtendUniform>() == 4);
     assert!(std::mem::size_of::<SaveUniform>() == 32);
     assert!(std::mem::align_of::<SaveUniform>() == 4);
-    assert!(std::mem::size_of::<ImageOutputUniform>() == 128);
+    assert!(std::mem::size_of::<ImageOutputUniform>() == 176);
     assert!(std::mem::align_of::<ImageOutputUniform>() == 4);
+    assert!(std::mem::offset_of!(ImageOutputUniform, primaries_r) == 128);
+    assert!(std::mem::offset_of!(ImageOutputUniform, primaries_g) == 144);
+    assert!(std::mem::offset_of!(ImageOutputUniform, primaries_b) == 160);
 };
 
 #[cfg(test)]
@@ -3621,7 +3716,7 @@ mod tests {
             ("TransferUniform", size_of::<TransferUniform>(), 64),
             ("PremultiplyUniform", size_of::<PremultiplyUniform>(), 32),
             ("SaveUniform", size_of::<SaveUniform>(), 32),
-            ("ImageOutputUniform", size_of::<ImageOutputUniform>(), 128),
+            ("ImageOutputUniform", size_of::<ImageOutputUniform>(), 176),
         ];
         for (name, actual, expected) in sizes {
             assert_eq!(actual, expected, "Rust/WGSL ABI size drift for {name}");
@@ -4169,6 +4264,24 @@ mod tests {
             source_transfer: 30,
             target_transfer: 31,
             _padding: 32,
+            primaries_r: [
+                f32::from_bits(33),
+                f32::from_bits(34),
+                f32::from_bits(35),
+                f32::from_bits(36),
+            ],
+            primaries_g: [
+                f32::from_bits(37),
+                f32::from_bits(38),
+                f32::from_bits(39),
+                f32::from_bits(40),
+            ],
+            primaries_b: [
+                f32::from_bits(41),
+                f32::from_bits(42),
+                f32::from_bits(43),
+                f32::from_bits(44),
+            ],
         });
         assert_wgsl_fields(
             include_str!("../shaders/rgb_to_image.wgsl"),
@@ -4206,6 +4319,9 @@ mod tests {
                 "source_transfer",
                 "target_transfer",
                 "_padding",
+                "primaries_r",
+                "primaries_g",
+                "primaries_b",
             ],
         );
     }

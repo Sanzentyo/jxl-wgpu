@@ -34,6 +34,9 @@ struct Params {
     source_transfer: u32,
     target_transfer: u32,
     _padding: u32,
+    primaries_r: vec4<f32>,
+    primaries_g: vec4<f32>,
+    primaries_b: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -67,36 +70,82 @@ fn source_rgb_at(x: u32, y: u32) -> vec3<f32> {
 }
 
 fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
+    let magnitude = abs(value);
+    var linear = magnitude;
     if transfer == 1u {
-        if value <= 0.04045 { return value / 12.92; }
-        return pow((value + 0.055) / 1.055, 2.4);
+        linear = select(pow((magnitude + 0.055) / 1.055, 2.4), magnitude / 12.92, magnitude <= 0.04045);
+    } else if transfer == 2u {
+        linear = select(pow((magnitude + 0.099) / 1.099, 1.0 / 0.45), magnitude / 4.5, magnitude < 0.081);
+    } else if transfer == 3u {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = (2523.0 / 4096.0) * 128.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = (2413.0 / 4096.0) * 32.0;
+        let c3 = (2392.0 / 4096.0) * 32.0;
+        let powered = pow(magnitude, 1.0 / m2);
+        let numerator = max(powered - c1, 0.0);
+        linear = pow(numerator / max(c2 - c3 * powered, 1e-10), 1.0 / m1);
+    } else if transfer == 4u {
+        let hlg_a = 0.17883277;
+        let hlg_b = 1.0 - 4.0 * hlg_a;
+        let hlg_c = 0.5599107295;
+        linear = select(
+            (exp((magnitude - hlg_c) / hlg_a) + hlg_b) / 12.0,
+            magnitude * magnitude / 3.0,
+            magnitude <= 0.5,
+        );
     }
-    if transfer == 2u {
-        if value < 0.081 { return value / 4.5; }
-        return pow((value + 0.099) / 1.099, 1.0 / 0.45);
-    }
-    return value;
+    return select(linear, -linear, value < 0.0);
 }
 
 fn transfer_from_linear(value: f32, transfer: u32) -> f32 {
+    let magnitude = abs(value);
+    var encoded = magnitude;
     if transfer == 1u {
-        if value <= 0.0031308 { return 12.92 * value; }
-        return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+        encoded = select(1.055 * pow(magnitude, 1.0 / 2.4) - 0.055, 12.92 * magnitude, magnitude <= 0.0031308);
+    } else if transfer == 2u {
+        encoded = select(1.099 * pow(magnitude, 0.45) - 0.099, 4.5 * magnitude, magnitude < 0.018);
+    } else if transfer == 3u {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = (2523.0 / 4096.0) * 128.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = (2413.0 / 4096.0) * 32.0;
+        let c3 = (2392.0 / 4096.0) * 32.0;
+        let powered = pow(magnitude, m1);
+        encoded = pow((c1 + c2 * powered) / (1.0 + c3 * powered), m2);
+    } else if transfer == 4u {
+        let hlg_a = 0.17883277;
+        let hlg_b = 1.0 - 4.0 * hlg_a;
+        let hlg_c = 0.5599107295;
+        encoded = select(
+            hlg_a * log(12.0 * magnitude - hlg_b) + hlg_c,
+            sqrt(3.0 * magnitude),
+            magnitude <= 1.0 / 12.0,
+        );
+    } else if transfer == 5u {
+        let alpha = 1.09929682680944;
+        let beta = 0.018053968510807;
+        encoded = select(alpha * pow(magnitude, 0.45) - (alpha - 1.0), 4.5 * magnitude, magnitude < beta);
     }
-    if transfer == 2u {
-        if value < 0.018 { return 4.5 * value; }
-        return 1.099 * pow(value, 0.45) - 0.099;
-    }
-    return value;
+    return select(encoded, -encoded, value < 0.0);
 }
 
-fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
     let source = source_rgb_at(x, y);
-    let linear = vec3<f32>(
+    let source_linear = vec3<f32>(
         transfer_to_linear(source.r, params.source_transfer),
         transfer_to_linear(source.g, params.source_transfer),
         transfer_to_linear(source.b, params.source_transfer),
     );
+    return vec3<f32>(
+        dot(params.primaries_r.xyz, source_linear),
+        dot(params.primaries_g.xyz, source_linear),
+        dot(params.primaries_b.xyz, source_linear),
+    );
+}
+
+fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+    let linear = target_linear_rgb_at(x, y);
     return vec3<f32>(
         transfer_from_linear(linear.r, params.target_transfer),
         transfer_from_linear(linear.g, params.target_transfer),
@@ -108,7 +157,7 @@ fn coefficients() -> vec2<f32> {
     switch params.matrix {
         case 0u: { return vec2<f32>(0.299, 0.114); }
         case 1u: { return vec2<f32>(0.2126, 0.0722); }
-        default: { return vec2<f32>(0.2126, 0.0722); }
+        default: { return vec2<f32>(0.2627, 0.0593); }
     }
 }
 
@@ -125,13 +174,40 @@ fn rgb_to_yuv(rgb: vec3<f32>) -> vec3<f32> {
     );
 }
 
+fn yuv_at(x: u32, y: u32) -> vec3<f32> {
+    if params.matrix != 3u {
+        return rgb_to_yuv(rgb_at(x, y));
+    }
+    let linear = target_linear_rgb_at(x, y);
+    let encoded = vec3<f32>(
+        transfer_from_linear(linear.r, params.target_transfer),
+        transfer_from_linear(linear.g, params.target_transfer),
+        transfer_from_linear(linear.b, params.target_transfer),
+    );
+    let coefficient = coefficients();
+    let kr = coefficient.x;
+    let kb = coefficient.y;
+    let kg = 1.0 - kr - kb;
+    let y_encoded = transfer_from_linear(
+        kr * linear.r + kg * linear.g + kb * linear.b,
+        params.target_transfer,
+    );
+    let cb_divisor = select(1.9404, 1.5816, encoded.b > y_encoded);
+    let cr_divisor = select(1.7184, 0.9936, encoded.r > y_encoded);
+    return vec3<f32>(
+        y_encoded,
+        (encoded.b - y_encoded) / cb_divisor + 0.5,
+        (encoded.r - y_encoded) / cr_divisor + 0.5,
+    );
+}
+
 fn chroma_at(cx: u32, cy: u32) -> vec2<f32> {
     let origin_x = cx * params.subsample_x;
     let origin_y = cy * params.subsample_y;
     let centered_x = params.siting_x == 0u && params.subsample_x > 1u;
     let centered_y = params.siting_y == 0u && params.subsample_y > 1u;
     if !centered_x && !centered_y {
-        return rgb_to_yuv(rgb_at(origin_x, origin_y)).yz;
+        return yuv_at(origin_x, origin_y).yz;
     }
     let count_x = select(1u, params.subsample_x, centered_x);
     let count_y = select(1u, params.subsample_y, centered_y);
@@ -142,7 +218,7 @@ fn chroma_at(cx: u32, cy: u32) -> vec2<f32> {
             let x = origin_x + dx;
             let y = origin_y + dy;
             if x < params.width && y < params.height {
-                sum += rgb_to_yuv(rgb_at(x, y)).yz;
+                sum += yuv_at(x, y).yz;
                 count += 1u;
             }
         }
@@ -247,7 +323,7 @@ fn byte_at(index: u32) -> u32 {
         let bytes_per_sample = select(1u, 2u, params.kind == 3u);
         if local.y < params.height && local.x < params.width * bytes_per_sample {
             let pixel = local.x / bytes_per_sample;
-            let y = rgb_to_yuv(rgb_at(pixel, local.y)).x;
+            let y = yuv_at(pixel, local.y).x;
             if params.kind == 2u { return quantize8(y, 0u); }
             let code = quantize16(y);
             return (code >> ((local.x & 1u) * 8u)) & 0xffu;
@@ -266,8 +342,8 @@ fn byte_at(index: u32) -> u32 {
                 // UYVY stored positions map to canonical Y0/U/Y1/V positions.
                 yuyv_component = select(select(1u, 0u, byte == 1u), select(3u, 2u, byte == 3u), byte >= 2u);
             }
-            if yuyv_component == 0u { return quantize8(rgb_to_yuv(rgb_at(pair * 2u, local.y)).x, 0u); }
-            if yuyv_component == 2u { return quantize8(rgb_to_yuv(rgb_at(pair * 2u + 1u, local.y)).x, 0u); }
+            if yuyv_component == 0u { return quantize8(yuv_at(pair * 2u, local.y).x, 0u); }
+            if yuyv_component == 2u { return quantize8(yuv_at(pair * 2u + 1u, local.y).x, 0u); }
             let chroma = chroma_at(pair, local.y);
             return quantize8(select(chroma.x, chroma.y, yuyv_component == 3u), select(1u, 2u, yuyv_component == 3u));
         }
@@ -281,7 +357,7 @@ fn byte_at(index: u32) -> u32 {
         if local.x < params.width * bytes_per_sample && local.y < params.height {
             let sample_x = local.x / bytes_per_sample;
             let byte = local.x % bytes_per_sample;
-            return stored_code_byte(quantize_code(rgb_to_yuv(rgb_at(sample_x, local.y)).x, 0u), byte);
+            return stored_code_byte(quantize_code(yuv_at(sample_x, local.y).x, 0u), byte);
         }
         return 0u;
     }
