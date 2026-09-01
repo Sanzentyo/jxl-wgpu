@@ -569,6 +569,22 @@ pub struct FrameInventory {
 }
 
 impl FrameInventory {
+    /// Encoded color-sample extent after frame upsampling and progressive-DC downsampling.
+    ///
+    /// A level-`n` LF frame represents one sample for each `8^n` samples of the declared frame
+    /// rectangle. `None` reports arithmetic-invalid public field combinations; inventories
+    /// produced by this crate have already validated the same bounds while parsing the TOC.
+    #[must_use]
+    pub fn color_sample_extent(&self) -> Option<(u32, u32)> {
+        let lf_shift = self.lf_level.checked_mul(3)?;
+        let lf_divisor = 1_u32.checked_shl(lf_shift)?;
+        let divisor = self
+            .upsampling
+            .checked_mul(lf_divisor)
+            .filter(|&value| value != 0)?;
+        Some((self.width.div_ceil(divisor), self.height.div_ceil(divisor)))
+    }
+
     /// Whether this frame reads the next coarser progressive-DC level from an earlier LF frame.
     #[must_use]
     pub const fn uses_lf_frame(&self) -> bool {
@@ -2390,6 +2406,14 @@ mod tests {
         };
         let inventory = inventory(&codestream);
         assert_eq!(inventory.frames.len(), 3);
+        assert_eq!(
+            inventory
+                .frames
+                .iter()
+                .map(FrameInventory::color_sample_extent)
+                .collect::<Vec<_>>(),
+            vec![Some((16, 2)), Some((128, 16)), Some((1_024, 128))]
+        );
         assert_eq!(
             inventory
                 .frames

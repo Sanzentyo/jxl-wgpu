@@ -41,6 +41,10 @@ use crate::entropy_window::{
     GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
     build_stream_batches_for_len,
 };
+use crate::progressive_dc::{
+    ProgressiveDcGpuError, ProgressiveDcPackInputs, ProgressiveDcPackParams, ProgressiveDcPipeline,
+    ProgressiveDcXybPlanes,
+};
 use crate::vardct_artifact::{
     GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfMetadataArtifactConfig,
     HfMetadataLoweringBuffers, HfMetadataLoweringParams, HfMetadataLoweringPipeline,
@@ -120,9 +124,21 @@ pub enum VarDctDecodeError {
     #[error(transparent)]
     Output(#[from] VarDctOutputError),
     #[error(transparent)]
+    ProgressiveDc(#[from] ProgressiveDcGpuError),
+    #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error("VarDCT GPU memory arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("a progressive-DC VarDCT frame was submitted without its resident LF source")]
+    MissingProgressiveDcSource,
+    #[error("a resident progressive-DC LF source was supplied to a frame that does not use one")]
+    UnexpectedProgressiveDcSource,
+    #[error("VarDCT engine contract failed: {detail}")]
+    EngineContract { detail: &'static str },
+    #[error(
+        "multi-level progressive-DC requires general HF-global/AC decoding in a single-entry intermediate LF frame"
+    )]
+    UnsupportedProgressiveDcIntermediatePacket,
     #[error(
         "the bounded VarDCT entropy window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
     )]
@@ -232,6 +248,7 @@ pub struct VarDctDecodeMemoryStats {
     pub lf_temporary_bytes: u64,
     pub resource_bytes: u64,
     pub resource_uniform_bytes: u64,
+    pub progressive_dc_pack_uniform_bytes: u64,
     pub adaptive_lf_uniform_bytes: u64,
     pub artifact_bytes: u64,
     pub occupancy_bytes: u64,
@@ -301,26 +318,27 @@ impl VarDctDecodeMemoryStats {
                 field: "codestream upload length",
             }
         })?)?;
-        let modular_metadata_words = if packet.requires_local_tree_staging() {
-            packet.groups.iter().try_fold(0_u64, |total, group| {
-                let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
+        let modular_metadata_words =
+            if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
+                packet.groups.iter().try_fold(0_u64, |total, group| {
+                    let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
+                        VarDctDecodeError::ArithmeticOverflow {
+                            field: "LF-local Modular metadata length",
+                        }
+                    })?;
+                    total
+                        .checked_add(words)
+                        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                            field: "LF-local Modular metadata words",
+                        })
+                })?
+            } else {
+                u64::try_from(packet.modular_metadata.len()).map_err(|_| {
                     VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF-local Modular metadata length",
+                        field: "Modular metadata length",
                     }
-                })?;
-                total
-                    .checked_add(words)
-                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF-local Modular metadata words",
-                    })
-            })?
-        } else {
-            u64::try_from(packet.modular_metadata.len()).map_err(|_| {
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "Modular metadata length",
-                }
-            })?
-        };
+                })?
+            };
         let modular_metadata_bytes =
             checked_words(modular_metadata_words, "Modular metadata bytes")?;
         let predictor_capacity =
@@ -458,12 +476,26 @@ impl VarDctDecodeMemoryStats {
                 field: "LF temporary bytes",
             },
         )?;
+        let lf_temporary_bytes = if packet.profile.uses_lf_frame {
+            0
+        } else {
+            lf_temporary_bytes
+        };
         let resource_bytes = resource.bytes();
-        let resource_uniform_bytes = group_count
-            .checked_mul(std::mem::size_of::<VarDctResourceParams>() as u64)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "resource uniform bytes",
-            })?;
+        let resource_uniform_bytes = if packet.profile.uses_lf_frame {
+            0
+        } else {
+            group_count
+                .checked_mul(std::mem::size_of::<VarDctResourceParams>() as u64)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "resource uniform bytes",
+                })?
+        };
+        let progressive_dc_pack_uniform_bytes = if packet.profile.uses_lf_frame {
+            std::mem::size_of::<ProgressiveDcPackParams>() as u64
+        } else {
+            0
+        };
         let adaptive_lf_uniform_bytes = if adaptive_lf_smoothing {
             std::mem::size_of::<AdaptiveLfParams>() as u64
         } else {
@@ -549,6 +581,7 @@ impl VarDctDecodeMemoryStats {
             lf_temporary_bytes,
             resource_bytes,
             resource_uniform_bytes,
+            progressive_dc_pack_uniform_bytes,
             adaptive_lf_uniform_bytes,
             artifact_bytes,
             occupancy_bytes,
@@ -601,6 +634,7 @@ impl VarDctDecodeMemoryStats {
             lf_temporary_bytes,
             resource_bytes,
             resource_uniform_bytes,
+            progressive_dc_pack_uniform_bytes,
             adaptive_lf_uniform_bytes,
             artifact_bytes,
             occupancy_bytes,
@@ -658,6 +692,7 @@ struct VarDctPipelines {
     epf_sigma: EpfSigmaPipeline,
     epf: ResidentEpfPipeline,
     output: VarDctOutputPacker,
+    progressive_dc: ProgressiveDcPipeline,
     output_variant: KernelVariant,
 }
 
@@ -684,6 +719,7 @@ impl VarDctPipelines {
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
+            progressive_dc: ProgressiveDcPipeline::with_policy(device, backend.kernel_policy())?,
             output_variant,
         })
     }
@@ -788,10 +824,42 @@ impl VarDctSubmissionEngine {
             codestream,
             request,
             inventory,
-            self.pipelines.output_variant,
-            self.stream_window_limit,
-            self.memory.snapshot().limit_bytes,
+            VarDctPrepareOptions {
+                output_variant: self.pipelines.output_variant,
+                stream_window_limit: self.stream_window_limit,
+                memory_limit_bytes: self.memory.snapshot().limit_bytes,
+                progressive_dc_final: None,
+            },
         )?;
+        self.open_source(source)
+    }
+
+    pub(crate) fn open_progressive_dc_with_inventory_data(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+        is_final: bool,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        let source = prepare_source(
+            &self.backend,
+            codestream,
+            request,
+            inventory,
+            VarDctPrepareOptions {
+                output_variant: self.pipelines.output_variant,
+                stream_window_limit: self.stream_window_limit,
+                memory_limit_bytes: self.memory.snapshot().limit_bytes,
+                progressive_dc_final: Some(is_final),
+            },
+        )?;
+        self.open_source(source)
+    }
+
+    fn open_source(
+        &self,
+        source: VarDctSource,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
         let extent = source.layout.extent;
         let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
         let submissions_per_frame = source.submissions_per_frame();
@@ -842,6 +910,7 @@ struct VarDctSource {
     quant_biases: [f32; 4],
     frame_name: String,
     memory: VarDctDecodeMemoryStats,
+    external_lf: Option<ProgressiveDcXybPlanes>,
 }
 
 struct VarDctEntropyPlanSelection {
@@ -1369,14 +1438,20 @@ impl GpuSubmissionEngine for VarDctSubmissionEngine {
     }
 }
 
+#[derive(Clone, Copy)]
+struct VarDctPrepareOptions {
+    output_variant: KernelVariant,
+    stream_window_limit: Option<NonZeroU64>,
+    memory_limit_bytes: u64,
+    progressive_dc_final: Option<bool>,
+}
+
 fn prepare_source(
     backend: &WgpuBackend,
     codestream: GpuCodestream,
     request: &GpuOutputRequest,
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
-    output_variant: KernelVariant,
-    stream_window_limit: Option<NonZeroU64>,
-    memory_limit_bytes: u64,
+    options: VarDctPrepareOptions,
 ) -> Result<VarDctSource, VarDctDecodeError> {
     if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
         return Err(VarDctDecodeError::UnsupportedOutput);
@@ -1408,7 +1483,20 @@ fn prepare_source(
         1.0,
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
-    let packet = BoundedVarDctPacketPlan::parse_source(&codestream, inventory)?;
+    let packet = options.progressive_dc_final.map_or_else(
+        || BoundedVarDctPacketPlan::parse_source(&codestream, inventory),
+        |is_final| {
+            BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
+        },
+    )?;
+    if options.progressive_dc_final == Some(false)
+        && matches!(
+            packet.profile.sections,
+            crate::vardct_frontend::VarDctSectionLayout::Single { .. }
+        )
+    {
+        return Err(VarDctDecodeError::UnsupportedProgressiveDcIntermediatePacket);
+    }
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
         usize::try_from(codestream_bytes).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
@@ -1416,7 +1504,8 @@ fn prepare_source(
         })?;
     let staged_local_trees = packet.requires_local_tree_staging();
     let limits = backend.device().limits();
-    let configured_stream_limit = stream_window_limit
+    let configured_stream_limit = options
+        .stream_window_limit
         .map_or(u64::MAX, NonZeroU64::get)
         .min(limits.max_buffer_size)
         .min(limits.max_storage_buffer_binding_size);
@@ -1438,7 +1527,9 @@ fn prepare_source(
     let mut quant_offset = resource_layout.quant_offset;
     let mut groups = Vec::with_capacity(packet.groups.len());
     for packet_group in &packet.groups {
-        let control = if staged_local_trees {
+        let control = if let Some(continuation) = &packet_group.external_lf_hf {
+            packet_group.hf_stage_control(&packet, continuation)?
+        } else if staged_local_trees {
             packet_group.lf_stage_control(&packet)?
         } else {
             packet_group.packet_control(&packet)?
@@ -1524,7 +1615,7 @@ fn prepare_source(
         packet.profile.width,
         packet.profile.height,
         &backend.device().limits(),
-        output_variant,
+        options.output_variant,
     )?;
     let layout = ImageLayout::packed(
         Extent2d::new(packet.profile.width, packet.profile.height),
@@ -1562,7 +1653,7 @@ fn prepare_source(
                 .then(|| LfPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit))
                 .transpose()?
                 .flatten();
-            let combined_packet_windows = (!staged_local_trees)
+            let combined_packet_windows = (!staged_local_trees && !packet.profile.uses_lf_frame)
                 .then(|| {
                     CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
                 })
@@ -1608,14 +1699,14 @@ fn prepare_source(
         };
     let selected_stream_limit = match select_budget_adaptive_stream_limit(
         configured_stream_limit,
-        memory_limit_bytes,
+        options.memory_limit_bytes,
         |stream_limit| Ok(plan_at_limit(stream_limit)?.memory.into()),
     )? {
         AdaptiveStreamLimitDecision::Selected(stream_limit) => stream_limit,
         AdaptiveStreamLimitDecision::BudgetTooSmall { required_bytes } => {
             return Err(VarDctDecodeError::MemoryBudgetTooSmall {
                 required_bytes,
-                limit_bytes: memory_limit_bytes,
+                limit_bytes: options.memory_limit_bytes,
             });
         }
     };
@@ -1652,6 +1743,7 @@ fn prepare_source(
         quant_biases,
         frame_name,
         memory,
+        external_lf: None,
     })
 }
 
@@ -1807,16 +1899,17 @@ fn validate_device_limits(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    let modular_metadata_binding_bytes = if packet.requires_local_tree_staging() {
-        packet
-            .groups
-            .iter()
-            .map(|group| group.lf_modular.metadata.len() as u64 * 4)
-            .max()
-            .unwrap_or(0)
-    } else {
-        memory.modular_metadata_bytes
-    };
+    let modular_metadata_binding_bytes =
+        if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
+            packet
+                .groups
+                .iter()
+                .map(|group| group.lf_modular.metadata.len() as u64 * 4)
+                .max()
+                .unwrap_or(0)
+        } else {
+            memory.modular_metadata_bytes
+        };
     for (resource, required, storage) in [
         ("codestream upload", memory.codestream_bytes, true),
         ("Modular metadata", modular_metadata_binding_bytes, true),
@@ -1985,6 +2078,34 @@ impl VarDctDecodeSession {
         self.runtime_stats
             .hf_packet_stream_batch_count
             .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_progressive_dc_source(
+        &mut self,
+        planes: ProgressiveDcXybPlanes,
+    ) -> Result<(), VarDctDecodeError> {
+        let source = self
+            .source
+            .as_mut()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        if !source.packet.profile.uses_lf_frame {
+            return Err(VarDctDecodeError::UnexpectedProgressiveDcSource);
+        }
+        let [expected_width, expected_height] = source.packet.block_extent();
+        for (plane, actual) in planes.planes.iter().enumerate() {
+            if actual.width != expected_width || actual.height != expected_height {
+                return Err(ProgressiveDcGpuError::PlaneExtent {
+                    plane,
+                    actual_width: actual.width,
+                    actual_height: actual.height,
+                    expected_width,
+                    expected_height,
+                }
+                .into());
+            }
+        }
+        source.external_lf = Some(planes);
+        Ok(())
     }
 }
 
@@ -2332,10 +2453,12 @@ struct VarDctJobLifetime {
     _packet_stream_window: Option<wgpu::Buffer>,
     _modular_metadata: Mutex<Vec<wgpu::Buffer>>,
     _groups: Vec<VarDctGroupJobBuffers>,
-    _lf_temporary: wgpu::Buffer,
+    _lf_temporary: Option<wgpu::Buffer>,
     _resources: wgpu::Buffer,
     _resource_uniforms: Vec<wgpu::Buffer>,
     _adaptive_lf_uniform: Option<wgpu::Buffer>,
+    _progressive_dc_uniform: Option<wgpu::Buffer>,
+    _external_lf: Option<ProgressiveDcXybPlanes>,
     _hf_coefficients: Option<HfCoefficientJobBuffers>,
     _xyb_planes: [wgpu::Buffer; 3],
     _restoration: Option<RestorationJobBuffers>,
@@ -2377,6 +2500,8 @@ pub struct VarDctPendingFrame {
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
     expected_hf_group_indices: Vec<u32>,
+    progressive_dc_extent: Extent2d,
+    progressive_dc_stride: u32,
 }
 
 enum VarDctPendingStage {
@@ -2409,6 +2534,25 @@ impl std::fmt::Debug for VarDctPendingFrame {
 }
 
 impl VarDctPendingFrame {
+    pub(crate) fn progressive_dc_planes(
+        &self,
+    ) -> Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
+        if matches!(self.stage, VarDctPendingStage::LocalLf { .. }) {
+            return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted);
+        }
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        ProgressiveDcXybPlanes::from_buffers(
+            lifetime._xyb_planes.clone(),
+            self.progressive_dc_extent.width,
+            self.progressive_dc_extent.height,
+            self.progressive_dc_stride,
+        )
+        .map_err(Into::into)
+    }
+
     /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
     pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
         if matches!(self.stage, VarDctPendingStage::LocalLf { .. }) {
@@ -3100,7 +3244,8 @@ fn submit_vardct(
         source.memory.codestream_bytes,
     )?;
     let staged_local_trees = source.packet.requires_local_tree_staging();
-    let modular_metadata = if staged_local_trees {
+    let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame;
+    let modular_metadata = if group_specific_metadata {
         source
             .packet
             .groups
@@ -3167,7 +3312,7 @@ fn submit_vardct(
     for (index, (packet_group, group)) in
         source.packet.groups.iter().zip(&source.groups).enumerate()
     {
-        let predictor_capacity = source.packet.needs_self_correcting || staged_local_trees;
+        let predictor_capacity = source.packet.needs_self_correcting || group_specific_metadata;
         let reconstructed_bytes = u64::from(packet_group.reconstructed_words(predictor_capacity)?)
             .checked_mul(4)
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -3215,12 +3360,12 @@ fn submit_vardct(
         });
         let modular = &packet_group.lf_modular;
         let params = VarDctModularParams::default()
-            .with_lz77_window(if staged_local_trees {
+            .with_lz77_window(if group_specific_metadata {
                 modular.lz77_window_words
             } else {
                 packet_group.lz77_window_words
             })
-            .with_self_correcting(if staged_local_trees {
+            .with_self_correcting(if group_specific_metadata {
                 modular.needs_self_correcting
             } else {
                 source.packet.needs_self_correcting
@@ -3259,11 +3404,13 @@ fn submit_vardct(
             artifact_uniform,
         });
     }
-    let lf_temporary = storage(
-        "jxl-wgpu VarDCT dequantized LF temporary",
-        source.memory.lf_temporary_bytes,
-        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-    );
+    let lf_temporary = (source.memory.lf_temporary_bytes != 0).then(|| {
+        storage(
+            "jxl-wgpu VarDCT dequantized LF temporary",
+            source.memory.lf_temporary_bytes,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        )
+    });
     let resource_values = source.resource_layout.initial_values()?;
     let resources = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu VarDCT resource vectors"),
@@ -3365,8 +3512,10 @@ fn submit_vardct(
     let mut packet_commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("jxl-wgpu bounded VarDCT packet stage"),
     });
+    if let Some(lf_temporary) = &lf_temporary {
+        packet_commands.clear_buffer(lf_temporary, 0, None);
+    }
     for buffer in [
-        &lf_temporary,
         &xyb_planes[0],
         &xyb_planes[1],
         &xyb_planes[2],
@@ -3614,7 +3763,7 @@ fn submit_vardct(
         )
     } else {
         for (index, buffers) in group_buffers.iter().enumerate() {
-            let metadata = if staged_local_trees {
+            let metadata = if group_specific_metadata {
                 modular_metadata
                     .get(index)
                     .ok_or(VarDctDecodeError::GroupPlanCount {
@@ -3641,7 +3790,11 @@ fn submit_vardct(
                 control: &buffers.packet_control,
                 modular_params: &buffers.modular_params,
             };
-            if staged_local_trees {
+            if source.packet.profile.uses_lf_frame {
+                pipelines
+                    .packet
+                    .encode_hf(device, &mut packet_commands, buffers);
+            } else if staged_local_trees {
                 pipelines
                     .packet
                     .encode_lf(device, &mut packet_commands, buffers);
@@ -3676,55 +3829,80 @@ fn submit_vardct(
             (None, None, packet_commands)
         }
     };
-    let mut resource_uniforms = Vec::with_capacity(source.groups.len());
-    for (group, buffers) in source.groups.iter().zip(&group_buffers) {
-        resource_uniforms.push(pipelines.resource.encode(
-            device,
-            &mut commands,
-            VarDctResourceBuffers {
-                quantized_lf: &buffers.reconstructed,
-                dequantized_lf: &lf_temporary,
-            },
-            group.resource_params,
-        ));
-    }
     let [blocks_x, blocks_y] = source.packet.block_extent();
-    let smoothing_thresholds = source
-        .groups
-        .first()
-        .ok_or(VarDctDecodeError::GroupPlanCount {
-            component: "packet source",
-            expected: 1,
-            actual: 0,
-        })?
-        .resource_params
-        .smoothing_thresholds();
-    let adaptive_lf_uniform = if source.packet.profile.adaptive_lf_smoothing {
-        Some(pipelines.adaptive_lf.encode(
-            device,
-            &mut commands,
-            AdaptiveLfBuffers {
-                input: &lf_temporary,
-                output: &resources,
-            },
-            AdaptiveLfParams::new(
-                blocks_x,
-                blocks_y,
-                0,
-                source.resource_layout.lf_offset,
-                smoothing_thresholds,
-            ),
-        ))
-    } else {
-        commands.copy_buffer_to_buffer(
-            &lf_temporary,
-            0,
-            &resources,
-            u64::from(source.resource_layout.lf_offset) * 16,
-            source.memory.lf_temporary_bytes,
-        );
-        None
-    };
+    let external_lf = source.external_lf.clone();
+    let (resource_uniforms, adaptive_lf_uniform, progressive_dc_uniform) =
+        if source.packet.profile.uses_lf_frame {
+            let planes = external_lf
+                .as_ref()
+                .ok_or(VarDctDecodeError::MissingProgressiveDcSource)?;
+            let uniform = pipelines.progressive_dc.encode_pack(
+                device,
+                &mut commands,
+                ProgressiveDcPackInputs {
+                    planes,
+                    resources: resident_binding(&resources)?,
+                    lf_offset: source.resource_layout.lf_offset,
+                    lf_stride: blocks_x,
+                },
+            )?;
+            (Vec::new(), None, Some(uniform))
+        } else {
+            let lf_temporary = lf_temporary
+                .as_ref()
+                .ok_or(VarDctDecodeError::EngineContract {
+                    detail: "a regular VarDCT frame has no LF temporary buffer",
+                })?;
+            let mut resource_uniforms = Vec::with_capacity(source.groups.len());
+            for (group, buffers) in source.groups.iter().zip(&group_buffers) {
+                resource_uniforms.push(pipelines.resource.encode(
+                    device,
+                    &mut commands,
+                    VarDctResourceBuffers {
+                        quantized_lf: &buffers.reconstructed,
+                        dequantized_lf: lf_temporary,
+                    },
+                    group.resource_params,
+                ));
+            }
+            let smoothing_thresholds = source
+                .groups
+                .first()
+                .ok_or(VarDctDecodeError::GroupPlanCount {
+                    component: "packet source",
+                    expected: 1,
+                    actual: 0,
+                })?
+                .resource_params
+                .smoothing_thresholds();
+            let adaptive_lf_uniform = if source.packet.profile.adaptive_lf_smoothing {
+                Some(pipelines.adaptive_lf.encode(
+                    device,
+                    &mut commands,
+                    AdaptiveLfBuffers {
+                        input: lf_temporary,
+                        output: &resources,
+                    },
+                    AdaptiveLfParams::new(
+                        blocks_x,
+                        blocks_y,
+                        0,
+                        source.resource_layout.lf_offset,
+                        smoothing_thresholds,
+                    ),
+                ))
+            } else {
+                commands.copy_buffer_to_buffer(
+                    lf_temporary,
+                    0,
+                    &resources,
+                    u64::from(source.resource_layout.lf_offset) * 16,
+                    source.memory.lf_temporary_bytes,
+                );
+                None
+            };
+            (resource_uniforms, adaptive_lf_uniform, None)
+        };
     for buffers in &group_buffers {
         pipelines.artifact.encode(
             device,
@@ -4106,6 +4284,8 @@ fn submit_vardct(
         _resources: resources,
         _resource_uniforms: resource_uniforms,
         _adaptive_lf_uniform: adaptive_lf_uniform,
+        _progressive_dc_uniform: progressive_dc_uniform,
+        _external_lf: external_lf,
         _hf_coefficients: hf_coefficient_buffers,
         _xyb_planes: xyb_planes,
         _restoration: restoration_buffers,
@@ -4167,11 +4347,15 @@ fn submit_vardct(
             })?;
         expected_groups.push(VarDctGroupValidation {
             uniform_transform: source.packet.uniform_transform,
-            expected_lf_samples: expected_blocks.checked_mul(3).ok_or(
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "LF-group validation sample count",
-                },
-            )?,
+            expected_lf_samples: if source.packet.profile.uses_lf_frame {
+                0
+            } else {
+                expected_blocks
+                    .checked_mul(3)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-group validation sample count",
+                    })?
+            },
             expected_coefficients: group.coefficient_words(),
             expected_blocks,
             correlation_samples,
@@ -4189,6 +4373,10 @@ fn submit_vardct(
         .collect();
     let layout = source.layout.clone();
     let frame_name = source.frame_name.clone();
+    let progressive_dc_extent = Extent2d {
+        width: source.packet.profile.width,
+        height: source.packet.profile.height,
+    };
     let stage = if let Some(downstream) = downstream {
         VarDctPendingStage::LocalLf {
             completion,
@@ -4210,6 +4398,8 @@ fn submit_vardct(
         frame_name,
         expected_groups,
         expected_hf_group_indices,
+        progressive_dc_extent,
+        progressive_dc_stride: padded_width,
     })
 }
 

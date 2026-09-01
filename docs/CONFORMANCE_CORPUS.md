@@ -54,6 +54,12 @@ A libjxl-generated `--progressive_dc=2` VarDCT oracle additionally produces LF l
 and the regular frame. Both contiguous inventory and one-byte event delivery must resolve its
 producer chain exactly as `[None, frame 0, frame 1]`; a synthetic missing level-1 producer must
 return `InventoryError::MissingLowFrequencyFrame` before any engine sees the codestream.
+A separate actual-adapter `--progressive_dc=1` fixture uses a 1024×128 patterned RGB source. It
+must select the logical progressive-DC session, issue exactly two physical submissions, expose only
+one visible frame through runtime-neutral async completion, and agree with Rust `jxl` within one
+RGB8 code after explicit readback. The deeper `--progressive_dc=2` fixture remains a parser and
+planning oracle until general HF-global/AC decoding is implemented for its single-entry
+intermediate LF frame; it is not recursive pixel-conformance evidence.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

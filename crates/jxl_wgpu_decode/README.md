@@ -182,7 +182,13 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
-reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
+reference, preview, animation, subsampling, upsampling, spectral progressive pass, or other frame
+feature. A separate stock path accepts one progressive-DC LF producer and its final VarDCT
+consumer. It keeps three F32 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack
+`Pod` uniforms, validates both hidden and visible statuses, and publishes only the final frame.
+`cjxl --progressive_dc=1` actual-GPU output is checked against Rust `jxl` within one RGB8 code. A
+recursive `--progressive_dc=2` inventory is planned correctly, but execution still rejects the
+general HF-global/AC syntax carried by its single-entry intermediate LF frame.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
@@ -332,10 +338,11 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Multiple spectral/refinement passes, custom
+This is not full VarDCT coverage. Multiple spectral/refinement passes, multi-level progressive-DC
+single-entry intermediate packets, custom
 strategy quantization matrices, Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
-extra channels, progressive passes, animation, and reference frames return typed unsupported
+extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 
 ### Measured lossless Modular checkpoint

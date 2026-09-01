@@ -41,6 +41,7 @@ pub mod modular_squeeze;
 mod modular_transform;
 mod modular_tree;
 mod profile;
+mod progressive_dc;
 mod session;
 mod vardct_artifact;
 mod vardct_engine;
@@ -59,12 +60,15 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BUFFERS, DEFAULT_DECODE_BUFFER_POOL_BUFFERS_PER_KEY,
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
-pub use codec_engine::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
+pub use codec_engine::{
+    ProgressiveDcPlan, ProgressiveDcStage, WgpuDecodeEngine, WgpuDecodePendingFrame,
+    WgpuDecodeSubmissionSession,
+};
 pub use codestream_data::GpuCodestream;
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularInversePlanError, ModularTransformError,
-    ModularTransformFeature, ModularTreeError, Result, UnsupportedCodestreamFeature,
-    UnsupportedProfile,
+    ModularTransformFeature, ModularTreeError, ProgressiveDcError, Result,
+    UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
@@ -80,6 +84,7 @@ pub use model::{
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;
+pub use progressive_dc::ProgressiveDcGpuError;
 pub use session::{
     GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,
     GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure,

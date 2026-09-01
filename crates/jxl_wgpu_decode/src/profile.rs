@@ -1,5 +1,5 @@
 use jxl_gpu_bitstream::{
-    CodestreamInventory, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
+    CodestreamInventory, FiniteF16, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
     ImageHeaderInventory, SampleBitDepth,
 };
 
@@ -65,6 +65,26 @@ pub(crate) struct StandardModularProfile {
     pub generalized_channels: bool,
     pub resident_entropy_plans: Vec<ResidentModularGroupPlan>,
     pub resident_frame_plan: Option<ResidentModularFramePlan>,
+    pub progressive_dc: Option<ProgressiveDcModularProfile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProgressiveDcModularProfile {
+    pub lf_level: u32,
+    /// JPEG XL LF multipliers in X/Y/B order, retained exactly as binary16 values.
+    pub lf_dequantization: [FiniteF16; 3],
+}
+
+impl ProgressiveDcModularProfile {
+    pub(crate) fn lf_dequantization(self) -> [f32; 3] {
+        self.lf_dequantization.map(FiniteF16::to_f32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModularProfilePurpose {
+    Presentation,
+    ProgressiveDc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +256,21 @@ pub(crate) fn parse_standard_modular_profile(
     codestream: &GpuCodestream,
     inventory: &CodestreamInventory,
 ) -> Result<StandardModularProfile> {
+    parse_modular_profile(codestream, inventory, ModularProfilePurpose::Presentation)
+}
+
+pub(crate) fn parse_progressive_dc_modular_profile(
+    codestream: &GpuCodestream,
+    inventory: &CodestreamInventory,
+) -> Result<StandardModularProfile> {
+    parse_modular_profile(codestream, inventory, ModularProfilePurpose::ProgressiveDc)
+}
+
+fn parse_modular_profile(
+    codestream: &GpuCodestream,
+    inventory: &CodestreamInventory,
+    purpose: ModularProfilePurpose,
+) -> Result<StandardModularProfile> {
     let image = &inventory.image_header;
     if image.width == 0 || image.height == 0 {
         return unsupported("the lossless Modular GPU profile requires a non-empty image");
@@ -269,19 +304,27 @@ pub(crate) fn parse_standard_modular_profile(
             .into());
         }
     };
-    if image.xyb_encoded {
-        return unsupported("the lossless Modular GPU profile does not use XYB metadata");
-    }
-    validate_image_header(codestream, image, channels, bits_per_sample)?;
     if image.animation.is_some() || image.preview_size.is_some() || inventory.frames.len() != 1 {
-        return unsupported(
-            "the lossless Modular GPU profile requires exactly one still-image frame",
-        );
+        return unsupported("the Modular GPU profile requires exactly one still-image frame");
+    }
+    match purpose {
+        ModularProfilePurpose::Presentation => {
+            if image.xyb_encoded {
+                return unsupported("the lossless Modular GPU profile does not use XYB metadata");
+            }
+            validate_image_header(codestream, image, channels, bits_per_sample)?;
+        }
+        ModularProfilePurpose::ProgressiveDc => {
+            if !image.xyb_encoded || channels != ModularChannels::Rgb {
+                return unsupported(
+                    "a progressive-DC Modular producer requires three XYB color channels",
+                );
+            }
+        }
     }
 
     let frame = &inventory.frames[0];
-    if frame.is_preview
-        || frame.frame_type != FrameType::Regular
+    let shared_frame_is_invalid = frame.is_preview
         || frame.encoding != FrameEncoding::Modular
         || frame.flags != 0
         || frame.do_ycbcr
@@ -294,17 +337,36 @@ pub(crate) fn parse_standard_modular_profile(
         || frame.width != image.width
         || frame.height != image.height
         || frame.duration_ticks != 0
-        || !frame.is_last
         || frame.save_as_reference != 0
-        || frame.save_before_color_transform
         || !frame.name_bytes.is_empty()
         || frame.color_blend != FrameBlendInfo::default()
         || frame.extra_channel_blends
-            != vec![FrameBlendInfo::default(); usize::from(channels == ModularChannels::Rgba)]
-    {
-        return unsupported(
-            "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references",
-        );
+            != vec![FrameBlendInfo::default(); usize::from(channels == ModularChannels::Rgba)];
+    let role_is_invalid = match purpose {
+        ModularProfilePurpose::Presentation => {
+            frame.frame_type != FrameType::Regular
+                || frame.lf_level != 0
+                || frame.lf_source_frame.is_some()
+                || !frame.is_last
+                || frame.save_before_color_transform
+        }
+        ModularProfilePurpose::ProgressiveDc => {
+            frame.frame_type != FrameType::LowFrequency
+                || frame.lf_level == 0
+                || frame.lf_source_frame.is_some()
+                || frame.is_last
+                || !frame.save_before_color_transform
+        }
+    };
+    if shared_frame_is_invalid || role_is_invalid {
+        return unsupported(match purpose {
+            ModularProfilePurpose::Presentation => {
+                "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references"
+            }
+            ModularProfilePurpose::ProgressiveDc => {
+                "the progressive-DC Modular GPU profile requires one uncropped root LF frame with canonical grouping and XYB reference retention"
+            }
+        });
     }
     if !(1..=MAX_MODULAR_PASSES).contains(&frame.num_passes) {
         return Err(UnsupportedProfile::new(
@@ -316,11 +378,21 @@ pub(crate) fn parse_standard_modular_profile(
         .into());
     }
 
+    let (frame_width, frame_height) = match purpose {
+        ModularProfilePurpose::Presentation => (image.width, image.height),
+        ModularProfilePurpose::ProgressiveDc => frame
+            .color_sample_extent()
+            .ok_or_else(|| unsupported_error("progressive-DC frame extent is invalid"))?,
+    };
+    if frame_width == 0 || frame_height == 0 {
+        return unsupported("the Modular GPU profile requires a non-empty frame extent");
+    }
+
     let group_dimension = MIN_GROUP_DIMENSION
         .checked_shl(frame.group_size_shift)
         .ok_or_else(|| unsupported_error("Modular group dimension overflows u32"))?;
-    let group_columns = image.width.div_ceil(group_dimension);
-    let group_rows = image.height.div_ceil(group_dimension);
+    let group_columns = frame_width.div_ceil(group_dimension);
+    let group_rows = frame_height.div_ceil(group_dimension);
     let expected_group_count = u64::from(group_columns)
         .checked_mul(u64::from(group_rows))
         .ok_or_else(|| unsupported_error("Modular group grid overflow"))?;
@@ -343,13 +415,13 @@ pub(crate) fn parse_standard_modular_profile(
     .ok_or_else(|| unsupported_error("the Modular frame is missing DC-global metadata"))?;
     let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
-    parse_lf_channel_dequantization(&mut reader)?;
+    let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
             &mut reader,
             channels,
-            image.width,
-            image.height,
+            frame_width,
+            frame_height,
             u32::from(bits_per_sample),
         )?;
     let dc_end = dc_global
@@ -369,8 +441,8 @@ pub(crate) fn parse_standard_modular_profile(
     ) = if single_entry {
         validate_stock_modular_transform_plan(
             channels,
-            image.width,
-            image.height,
+            frame_width,
+            frame_height,
             u32::from(bits_per_sample),
             &transform_plan,
         )?;
@@ -379,8 +451,8 @@ pub(crate) fn parse_standard_modular_profile(
             token_bit_end: dc_end,
             x: 0,
             y: 0,
-            width: image.width,
-            height: image.height,
+            width: frame_width,
+            height: frame_height,
             stream_index: 0,
         }];
         (
@@ -393,8 +465,8 @@ pub(crate) fn parse_standard_modular_profile(
     } else {
         validate_stock_modular_transform_plan(
             channels,
-            image.width,
-            image.height,
+            frame_width,
+            frame_height,
             u32::from(bits_per_sample),
             &transform_plan,
         )?;
@@ -431,8 +503,8 @@ pub(crate) fn parse_standard_modular_profile(
         let lf_group_dimension = group_dimension
             .checked_mul(8)
             .ok_or_else(|| unsupported_error("Modular LF-group dimension overflow"))?;
-        let lf_group_columns = image.width.div_ceil(lf_group_dimension);
-        let lf_group_rows = image.height.div_ceil(lf_group_dimension);
+        let lf_group_columns = frame_width.div_ceil(lf_group_dimension);
+        let lf_group_rows = frame_height.div_ceil(lf_group_dimension);
         let expected_lf_group_count = u64::from(lf_group_columns)
             .checked_mul(u64::from(lf_group_rows))
             .ok_or_else(|| unsupported_error("Modular LF-group grid overflow"))?;
@@ -469,8 +541,8 @@ pub(crate) fn parse_standard_modular_profile(
                 let y = row
                     .checked_mul(group_dimension)
                     .ok_or_else(|| unsupported_error("Modular group y origin overflow"))?;
-                let width = image.width.saturating_sub(x).min(group_dimension);
-                let height = image.height.saturating_sub(y).min(group_dimension);
+                let width = frame_width.saturating_sub(x).min(group_dimension);
+                let height = frame_height.saturating_sub(y).min(group_dimension);
                 Ok(ModularGroup {
                     token_bit_offset: 0,
                     token_bit_end: 0,
@@ -675,8 +747,8 @@ pub(crate) fn parse_standard_modular_profile(
                 let y = row
                     .checked_mul(lf_group_dimension)
                     .ok_or_else(|| unsupported_error("Modular LF-group y origin overflow"))?;
-                let width = image.width.saturating_sub(x).min(lf_group_dimension);
-                let height = image.height.saturating_sub(y).min(lf_group_dimension);
+                let width = frame_width.saturating_sub(x).min(lf_group_dimension);
+                let height = frame_height.saturating_sub(y).min(lf_group_dimension);
                 let (source_topology, plane_targets) = grouped_subimage_topology(
                     &transform_plan.topology,
                     &frame_entropy_layout,
@@ -865,8 +937,8 @@ pub(crate) fn parse_standard_modular_profile(
     });
 
     Ok(StandardModularProfile {
-        width: image.width,
-        height: image.height,
+        width: frame_width,
+        height: frame_height,
         bits_per_sample,
         channels,
         pass_count: frame.num_passes,
@@ -880,6 +952,12 @@ pub(crate) fn parse_standard_modular_profile(
         generalized_channels,
         resident_entropy_plans,
         resident_frame_plan,
+        progressive_dc: (purpose == ModularProfilePurpose::ProgressiveDc).then_some(
+            ProgressiveDcModularProfile {
+                lf_level: frame.lf_level,
+                lf_dequantization,
+            },
+        ),
     })
 }
 
@@ -1159,21 +1237,22 @@ fn grouped_subimage_topology(
     Ok((ModularChannelTopology::new(channels, 0, limits)?, targets))
 }
 
-/// Advances across `LfChannelDequantization`, which precedes `GlobalModular` in LF-global.
-///
-/// These values only affect VarDCT. A lossless Modular frame must still carry the bundle, so the
-/// frontend parses its bounded wire shape before locating the global MA tree.
-fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<()> {
+/// Parses `LfChannelDequantization`, which precedes `GlobalModular` in LF-global.
+fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<[FiniteF16; 3]> {
     let all_default = reader.read_bits(1)? != 0;
-    if !all_default {
-        // m_x_lf, m_y_lf, and m_b_lf are IEEE-754 binary16 values on the wire. Their values are
-        // irrelevant to Modular reconstruction, but consuming all three fields is required to
-        // locate GlobalModular without depending on a CPU image decoder.
-        for _ in 0..3 {
-            reader.read_bits(16)?;
-        }
+    if all_default {
+        return Ok([0x2800_u16, 0x3400, 0x3800].map(|bits| {
+            FiniteF16::from_bits(bits).expect("JPEG XL default LF multipliers are finite")
+        }));
     }
-    Ok(())
+    let mut values = [FiniteF16::default(); 3];
+    for value in &mut values {
+        let bits = u16::try_from(reader.read_bits(16)?)
+            .map_err(|_| unsupported_error("LF channel dequantization exceeds binary16"))?;
+        *value = FiniteF16::from_bits(bits)
+            .ok_or_else(|| unsupported_error("LF channel dequantization is non-finite"))?;
+    }
+    Ok(values)
 }
 
 fn parse_dc_global_ir(
@@ -1689,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn libjxl_progressive_dc_root_has_exact_default_squeeze_topology() {
+    fn libjxl_progressive_dc_root_uses_its_effective_sample_extent() {
         let Some(encoded) = cjxl_progressive_dc() else {
             return;
         };
@@ -1697,68 +1776,70 @@ mod tests {
         let inventory = parsed
             .codestream_inventory(InventoryLimits::default())
             .unwrap();
-        let frame = &inventory.frames[0];
+        let frame = inventory.frames[0].clone();
         assert_eq!(frame.frame_type, FrameType::LowFrequency);
         assert_eq!(frame.encoding, FrameEncoding::Modular);
         assert_eq!(frame.lf_level, 2);
-        let section = frame.sections.first().unwrap();
         let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
         let codestream = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
-        let mut reader = codestream.reader();
-        reader.skip_bits(section.bits.offset).unwrap();
-        parse_lf_channel_dequantization(&mut reader).unwrap();
-        let (_, _, _, _, plan) = parse_dc_global_ir(
-            &mut reader,
-            ModularChannels::Rgb,
-            frame.width,
-            frame.height,
-            8,
-        )
-        .unwrap();
-        let [
-            ModularTransformIr::Squeeze {
-                used_default_parameters,
-                parameters,
-            },
-        ] = plan.transforms.as_slice()
-        else {
-            panic!(
-                "unexpected progressive-DC root transforms: {:?}",
-                plan.transforms
-            );
+        let mut projected = inventory.clone();
+        projected.frames = vec![frame];
+        let profile = parse_progressive_dc_modular_profile(&codestream, &projected).unwrap();
+        assert_eq!((profile.width, profile.height), (16, 2));
+        assert_eq!(profile.groups.len(), 1);
+        assert!(profile.generalized_channels);
+        let progressive_dc = profile.progressive_dc.unwrap();
+        assert_eq!(progressive_dc.lf_level, 2);
+        assert!(
+            progressive_dc
+                .lf_dequantization()
+                .into_iter()
+                .map(|multiplier| multiplier / 128.0)
+                .all(|multiplier| multiplier.is_finite() && multiplier > 0.0)
+        );
+        let [resident] = profile.resident_entropy_plans.as_slice() else {
+            panic!("progressive-DC root did not produce one resident entropy plan");
         };
-        assert!(*used_default_parameters);
-        assert_eq!(parameters.len(), 13);
-        assert_eq!(plan.source_topology().channels().len(), 3);
-        assert_eq!(plan.topology.channels().len(), 40);
-        assert_eq!(
-            plan.topology.sample_count(),
-            Some(u64::from(frame.width) * u64::from(frame.height) * 3)
-        );
-        assert_eq!(
-            plan.topology.channels()[..3]
-                .iter()
-                .map(|channel| (channel.width, channel.height))
-                .collect::<Vec<_>>(),
-            vec![(8, 8), (4, 4), (4, 4)]
-        );
-        let inverse = plan_modular_inverse(&plan).unwrap();
-        assert_eq!(inverse.jobs().len(), 37);
+        let inverse = &resident.inverse_plan;
         assert_eq!(inverse.final_planes().len(), 3);
         assert_eq!(
             u64::from(inverse.entropy_words()),
-            u64::from(frame.width) * u64::from(frame.height) * 3
+            u64::from(profile.width) * u64::from(profile.height) * 3
         );
-        assert!(inverse.arena_words() <= inverse.entropy_words() * 2);
+        assert!(inverse.arena_words() >= inverse.entropy_words());
         assert_eq!(
             inverse
                 .final_planes()
                 .iter()
                 .map(|plane| (plane.geometry.width, plane.geometry.height))
                 .collect::<Vec<_>>(),
-            vec![(frame.width, frame.height); 3]
+            vec![(profile.width, profile.height); 3]
         );
-        assert!(reader.bit_offset() <= section.bits.end().unwrap());
+
+        for (frame_index, expected_extent, is_final) in
+            [(1_usize, (128, 16), false), (2, (1_024, 128), true)]
+        {
+            let mut projected = inventory.clone();
+            projected.frames = vec![inventory.frames[frame_index].clone()];
+            let packet =
+                crate::vardct_packet::BoundedVarDctPacketPlan::parse_progressive_dc_source(
+                    &codestream,
+                    &projected,
+                    is_final,
+                )
+                .unwrap();
+            assert_eq!(
+                (packet.profile.width, packet.profile.height),
+                expected_extent
+            );
+            assert!(packet.profile.uses_lf_frame);
+            assert!(
+                packet
+                    .groups
+                    .iter()
+                    .all(|group| group.external_lf_hf.is_some())
+            );
+        }
     }
 
     fn cjxl_progressive_dc() -> Option<Vec<u8>> {

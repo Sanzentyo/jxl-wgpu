@@ -100,6 +100,8 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `GenericPacketExecutionState` / reconstruction words | common entropy/LZ/consumer state, active LF/HF phase, decoded LF/HF counts, first-block count, extra precision, previous gradient, two pads | 64 | 16 | storage subrecord |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `WeightedPacketExecutionState` / reconstruction words | generic prefix plus four true errors, twelve subprediction-error accumulators, two pads | 128 | 16 | storage subrecord |
+| `jxl_wgpu_decode/progressive_dc.wgsl` | `ProgressiveDcConvertParams` / `ConvertParams` | extent/count, three source offset/stride/extents, three output strides, three LF multipliers and reserved lanes | 96 | 16 | uniform |
+| `jxl_wgpu_decode/progressive_dc.wgsl` | `ProgressiveDcPackParams` / `PackParams` | extent/count, three input strides, LF vec4 offset/stride and two reserved words | 48 | 16 | uniform |
 | `jxl_wgpu_encode/vardct_encoder.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, strategy/quantization, 19 two-word prefix entries, X/Y/B inverse LF-dequantization factors, X/B LF-correlation slopes, and 12 pads | 256 | 4 | read-only storage |
 | `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableVarDctKernelParams` / `Params` | source/block geometry, strategy/quantization, 19 two-word prefix entries, five artifact offsets/capacities, topology, LF-fragment descriptor offset/length and LF-grid dimensions, X/Y/B inverse LF-dequantization factors, and X/B LF-correlation slopes | 256 | 4 | read-only storage |
 | `jxl_wgpu_encode/vardct_large_encoder.wgsl` | `ScalableVarDctArtifactHeader` / header words | status/live counts, section offsets/lengths, total fragment bits, source/block geometry, topology, 19-bin histogram, LF-fragment descriptor offset/length/grid/count, 18 pads | 256 | 4 | storage/readback record |
@@ -191,6 +193,7 @@ The table below states the default workgroup configuration for each entry point:
 | `display_image` | source RO, destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; each pitch-linear plane and its final address is bounded |
 | `vardct_resource` (decoder) | LF-group table RO, full-image dequantized-LF atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | checked local block count, global atlas stride/origin, and output range; one 1D workgroup per LF-group block batch |
 | `vardct_packet` (decoder) | whole or reusable-window codestream/MA metadata RO, reconstruction/raw metadata/coefficients/status RW, control U, Modular params RW | 1x1 | Tier B (fixed) | combined/global-tree and split LF/HF local-tree entry points use logical channel widths with explicit physical strides; all packet forms resume across ordered windows using one 64/128-byte aligned state and reusable upload, while only local trees map an aggregate LF cursor set before the final authoritative map |
+| `progressive_dc::{convert_modular,pack_lf}` (decoder) | Modular arena or X/Y/B planes RO, resident X/Y/B planes or VarDCT resources RW, U | 64x1 | Tier A (`KernelVariant` linear) | checked common extents/strides, source arena ranges, destination resource vec4 range, storage limits and WGSL-u32 addresses; one dependency retains all three buffers until its consumer completes |
 | `vardct_artifact` (decoder) | LF-group raw metadata RO, artifact/occupancy plus full-image resources RW, U | 1x1 | Tier B (fixed) | validates non-overlapping mixed varblocks, global LF/correlation strides and aligned destination origin, compacts all 27 strategy buckets, and emits three bounded indirect records per strategy plus exact coefficient ranges |
 | resident `vardct_general` (decoder) | coefficients/artifact/resources RO, two global scratch buffers and X/Y/B output RW, U | 64x1 | Tier B (fixed) | one indirect dequantize/horizontal/vertical sequence per populated regular strategy bucket; task/artifact/resource/LF-stride/output ranges are host-validated |
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
@@ -327,9 +330,10 @@ either shift below three use pass-group streams, including asymmetric shifts. Th
 scheduled first and share the same scratch lanes, bounded uploads, metadata inventory, and aggregate
 status map with the pass streams. One through three declared passes assign channels through the
 header's shift brackets, schedule only nonempty subimages, and expose `progressive_pass_count`; empty
-physical sections are zero-validated without allocating a lane. Global/LF/HF image-frame streams
-remain unsupported because they require a recursive frame scheduler distinct from this subimage
-LF-group and intra-frame pass scheduler.
+physical sections are zero-validated without allocating a lane. The one-level progressive-DC
+image-frame path now has a recursive-plan representation and one logical pending state, but general
+single-entry intermediate HF-global/AC syntax remains unsupported. Global/LF/HF image streams and
+intermediate presentation still require broader frame scheduling.
 
 ## Shader write bounds fixed by this audit
 

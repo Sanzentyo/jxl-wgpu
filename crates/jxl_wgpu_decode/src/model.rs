@@ -2,8 +2,9 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use jxl_gpu_formats::{
-    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingFieldKind,
-    PixelFormat, PixelFormatClass, PlaneSampling, SampleKind, Swizzle, classify_pixel_format,
+    ByteOrder, Channel, ChromaSubsampling, ColorModel, ColorSpecification, PackingField,
+    PackingFieldKind, PackingWord, PixelFormat, PixelFormatClass, PlaneFormat, PlaneSampling,
+    SampleKind, Swizzle, classify_pixel_format,
 };
 use jxl_gpu_protocol::Extent2d;
 
@@ -369,6 +370,63 @@ pub(crate) struct NativeModularFormat {
     pub channels: ModularChannels,
     pub bits_per_sample: u8,
     pub storage_bits: u8,
+}
+
+pub(crate) fn native_modular_pixel_format(
+    channels: ModularChannels,
+    bits_per_sample: u8,
+) -> Result<PixelFormat> {
+    if !(1..=16).contains(&bits_per_sample) {
+        return Err(Error::UnsupportedOutputFormat(
+            "native lossless-Modular depth must be in 1..=16".into(),
+        ));
+    }
+    let storage_bits = if bits_per_sample <= 8 { 8 } else { 16 };
+    let (model, color_spec, swizzle, components): (_, _, _, &[Channel]) = match channels {
+        ModularChannels::Gray => (
+            ColorModel::NonColor,
+            ColorSpecification::Undefined,
+            Swizzle::X000,
+            &[Channel::X],
+        ),
+        ModularChannels::Rgb => (
+            ColorModel::Rgb,
+            ColorSpecification::Default,
+            Swizzle::XYZ1,
+            &[Channel::X, Channel::Y, Channel::Z],
+        ),
+        ModularChannels::Rgba => (
+            ColorModel::Rgb,
+            ColorSpecification::Default,
+            Swizzle::XYZW,
+            &[Channel::X, Channel::Y, Channel::Z, Channel::W],
+        ),
+    };
+    let words = components
+        .iter()
+        .copied()
+        .map(|channel| {
+            let mut fields = Vec::with_capacity(2);
+            if bits_per_sample < storage_bits {
+                fields.push(PackingField::padding(storage_bits - bits_per_sample));
+            }
+            fields.push(PackingField::channel(channel, bits_per_sample));
+            PackingWord { fields }
+        })
+        .collect();
+    Ok(PixelFormat {
+        model,
+        color_spec,
+        chroma_subsampling: ChromaSubsampling::None,
+        sample_kind: SampleKind::Unsigned,
+        byte_order: ByteOrder::Native,
+        swizzle,
+        planes: vec![PlaneFormat {
+            sampling: PlaneSampling::FULL,
+            pixels_per_element: 1,
+            words,
+        }],
+    })
 }
 
 /// Recognizes the exact pitch-linear descriptor shared with the GPU lossless Modular encoder.

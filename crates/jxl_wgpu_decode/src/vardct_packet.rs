@@ -180,6 +180,8 @@ pub struct BoundedVarDctGroupPlan {
     /// Physical power-of-two history ring reused by the group's two sequential Modular streams.
     pub lz77_window_words: u32,
     pub extra_precision: u8,
+    /// HF metadata parsed directly when a progressive-DC producer replaces this group's LF stream.
+    pub external_lf_hf: Option<BoundedHfMetadataContinuation>,
 }
 
 /// Host-packed entropy tables and untouched pass-group packets for one VarDCT AC pass.
@@ -359,7 +361,7 @@ impl BoundedVarDctPacketPlan {
         codestream: &[u8],
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Slice(codestream), inventory)
+        Self::parse_inner(PacketSource::Slice(codestream), inventory, None)
     }
 
     /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
@@ -367,14 +369,26 @@ impl BoundedVarDctPacketPlan {
         source: &GpuCodestream,
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory)
+        Self::parse_inner(PacketSource::Spans(source), inventory, None)
+    }
+
+    pub(crate) fn parse_progressive_dc_source(
+        source: &GpuCodestream,
+        inventory: &CodestreamInventory,
+        is_final: bool,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(PacketSource::Spans(source), inventory, Some(is_final))
     }
 
     fn parse_inner(
         source: PacketSource<'_>,
         inventory: &CodestreamInventory,
+        progressive_dc_final: Option<bool>,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        let profile = StandardVarDctProfile::negotiate(inventory)?;
+        let profile = progressive_dc_final.map_or_else(
+            || StandardVarDctProfile::negotiate(inventory),
+            |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
+        )?;
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
         }
@@ -387,10 +401,14 @@ impl BoundedVarDctPacketPlan {
                         );
                     }
                     (
-                        Some(
-                            transform_for_extent(profile.width, profile.height)
-                                .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
-                        ),
+                        if profile.uses_lf_frame {
+                            None
+                        } else {
+                            Some(
+                                transform_for_extent(profile.width, profile.height)
+                                    .ok_or(UnsupportedVarDctPacketFeature::TransformExtent)?,
+                            )
+                        },
                         *packet,
                         vec![*packet],
                         None,
@@ -507,45 +525,104 @@ impl BoundedVarDctPacketPlan {
                             field: "LF-group end",
                         })?;
                 validate_source_packet_end(source, lf_group_end)?;
-                let mut lf_reader = source_reader_at(source, lf_group_start)?;
-                let lf_header = parse_lf_group_header_reader(&mut lf_reader, lf_group_end)?;
-                let (lf_config, lf_token_bit_offset) = if lf_header.modular.use_global_tree {
-                    (
-                        global_ma_config.clone().ok_or(
-                            BoundedVarDctPacketError::MissingGlobalMaTree {
-                                stage: "LF quantization",
-                            },
-                        )?,
-                        lf_header.modular.tree_or_token_bit_offset,
-                    )
-                } else {
-                    let mut tree_reader =
-                        source_reader_at(source, lf_header.modular.tree_or_token_bit_offset)?;
-                    parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
-                };
                 let lf_decoded_symbol_limit = block_count.checked_mul(3).ok_or(
                     BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group LF decoded symbol limit",
                     },
                 )?;
-                let lf_modular =
-                    pack_modular_plan(&lf_config, blocks_x.max(1), lf_decoded_symbol_limit)?;
-                let hf_window_words = if let Some(config) = &global_ma_config {
-                    config
-                        .entropy
-                        .lz77_window_words(
-                            block_count.max(blocks_x).max(1),
-                            hf_decoded_symbol_limit,
+                let (
+                    lf_token_bit_offset,
+                    lf_modular,
+                    lz77_window_words,
+                    extra_precision,
+                    external_lf_hf,
+                ) = if profile.uses_lf_frame {
+                    let mut hf_reader = source_reader_at(source, lf_group_start)?;
+                    let hf_header = parse_hf_metadata_header_reader(
+                        &mut hf_reader,
+                        lf_group_end,
+                        rect.width,
+                        rect.height,
+                    )?;
+                    let (hf_config, hf_token_bit_offset) = if hf_header.modular.use_global_tree {
+                        (
+                            global_ma_config.clone().ok_or(
+                                BoundedVarDctPacketError::MissingGlobalMaTree {
+                                    stage: "HF metadata",
+                                },
+                            )?,
+                            hf_header.modular.tree_or_token_bit_offset,
                         )
-                        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?
+                    } else {
+                        let mut tree_reader =
+                            source_reader_at(source, hf_header.modular.tree_or_token_bit_offset)?;
+                        parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
+                    };
+                    let hf_modular = pack_modular_plan(
+                        &hf_config,
+                        block_count.max(blocks_x).max(1),
+                        hf_decoded_symbol_limit,
+                    )?;
+                    let continuation = BoundedHfMetadataContinuation {
+                        token_bit_offset: u32::try_from(hf_token_bit_offset).map_err(|_| {
+                            BoundedVarDctPacketError::ArithmeticOverflow {
+                                field: "HF metadata token bit offset",
+                            }
+                        })?,
+                        block_count: hf_header.block_count,
+                        modular: hf_modular.clone(),
+                    };
+                    (
+                        hf_token_bit_offset,
+                        hf_modular.clone(),
+                        hf_modular.lz77_window_words,
+                        0,
+                        Some(continuation),
+                    )
                 } else {
-                    hf_decoded_symbol_limit.checked_next_power_of_two().ok_or(
-                        BoundedVarDctPacketError::ArithmeticOverflow {
-                            field: "LF-group deferred HF LZ77 window",
-                        },
-                    )?
+                    let mut lf_reader = source_reader_at(source, lf_group_start)?;
+                    let lf_header = parse_lf_group_header_reader(&mut lf_reader, lf_group_end)?;
+                    let (lf_config, lf_token_bit_offset) = if lf_header.modular.use_global_tree {
+                        (
+                            global_ma_config.clone().ok_or(
+                                BoundedVarDctPacketError::MissingGlobalMaTree {
+                                    stage: "LF quantization",
+                                },
+                            )?,
+                            lf_header.modular.tree_or_token_bit_offset,
+                        )
+                    } else {
+                        let mut tree_reader =
+                            source_reader_at(source, lf_header.modular.tree_or_token_bit_offset)?;
+                        parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
+                    };
+                    let lf_modular =
+                        pack_modular_plan(&lf_config, blocks_x.max(1), lf_decoded_symbol_limit)?;
+                    let hf_window_words = if let Some(config) = &global_ma_config {
+                        config
+                            .entropy
+                            .lz77_window_words(
+                                block_count.max(blocks_x).max(1),
+                                hf_decoded_symbol_limit,
+                            )
+                            .map_err(|error| {
+                                BoundedVarDctPacketError::ModularTree(error.to_string())
+                            })?
+                    } else {
+                        hf_decoded_symbol_limit.checked_next_power_of_two().ok_or(
+                            BoundedVarDctPacketError::ArithmeticOverflow {
+                                field: "LF-group deferred HF LZ77 window",
+                            },
+                        )?
+                    };
+                    (
+                        lf_token_bit_offset,
+                        lf_modular.clone(),
+                        lf_modular.lz77_window_words.max(hf_window_words),
+                        lf_header.extra_precision,
+                        None,
+                    )
                 };
-                let lz77_window_words = lf_modular.lz77_window_words.max(hf_window_words);
                 Ok(BoundedVarDctGroupPlan {
                     index,
                     rect,
@@ -561,7 +638,8 @@ impl BoundedVarDctPacketPlan {
                     })?,
                     lf_modular,
                     lz77_window_words,
-                    extra_precision: lf_header.extra_precision,
+                    extra_precision,
+                    external_lf_hf,
                 })
             })
             .collect::<Result<Vec<_>, BoundedVarDctPacketError>>()?;
@@ -593,6 +671,15 @@ impl BoundedVarDctPacketPlan {
                 )
             })
             .transpose()?;
+        let needs_self_correcting = if profile.uses_lf_frame {
+            groups
+                .iter()
+                .any(|group| group.lf_modular.needs_self_correcting)
+        } else {
+            global_ma_config
+                .as_ref()
+                .is_some_and(MaConfigIr::needs_self_correcting)
+        };
         Ok(Self {
             profile,
             uniform_transform,
@@ -600,9 +687,7 @@ impl BoundedVarDctPacketPlan {
             hf_global,
             entropy_bit_offset,
             modular_metadata: words,
-            needs_self_correcting: global_ma_config
-                .as_ref()
-                .is_some_and(MaConfigIr::needs_self_correcting),
+            needs_self_correcting,
             lf_dequantization: lf_global.lf_dequantization,
             global_scale: lf_global.global_scale,
             quant_lf: lf_global.quant_lf,
@@ -644,7 +729,7 @@ impl BoundedVarDctPacketPlan {
     /// Whether the HF metadata boundary must be discovered by a first GPU LF-only submission.
     #[must_use]
     pub const fn requires_local_tree_staging(&self) -> bool {
-        self.global_ma_config.is_none()
+        !self.profile.uses_lf_frame && self.global_ma_config.is_none()
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the

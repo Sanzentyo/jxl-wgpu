@@ -125,6 +125,36 @@ pub enum ModularInversePlanError {
     Rct(#[from] crate::modular_rct::ModularRctError),
 }
 
+/// Invalid progressive-DC producer/consumer graph discovered before GPU submission.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ProgressiveDcError {
+    #[error("a progressive-DC still must end in exactly one final regular frame")]
+    MissingFinalFrame,
+    #[error(
+        "progressive-DC frame {frame_index} is not part of the final frame's LF dependency chain"
+    )]
+    UnusedFrame { frame_index: u32 },
+    #[error("progressive-DC dependency recursion contains a cycle at frame {frame_index}")]
+    DependencyCycle { frame_index: u32 },
+    #[error("progressive-DC frame {frame_index} references invalid producer frame {source_frame}")]
+    InvalidSource { frame_index: u32, source_frame: u32 },
+    #[error(
+        "progressive-DC producer frame {source_frame} has sample extent {source_width}x{source_height}, but consumer frame {frame_index} requires {required_width}x{required_height} LF samples"
+    )]
+    ExtentMismatch {
+        frame_index: u32,
+        source_frame: u32,
+        source_width: u32,
+        source_height: u32,
+        required_width: u32,
+        required_height: u32,
+    },
+    #[error("progressive-DC frame {frame_index} has an invalid encoded sample extent")]
+    InvalidExtent { frame_index: u32 },
+    #[error("progressive-DC frame {frame_index} has unsupported role or coding mode")]
+    UnsupportedFrame { frame_index: u32 },
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("unsupported GPU decode profile feature {feature:?}: {detail}")]
 pub struct UnsupportedProfile {
@@ -207,6 +237,10 @@ pub enum Error {
     ModularTransform(#[from] ModularTransformError),
     #[error(transparent)]
     ModularInversePlan(#[from] ModularInversePlanError),
+    #[error(transparent)]
+    ProgressiveDc(#[from] ProgressiveDcError),
+    #[error(transparent)]
+    ProgressiveDcGpu(#[from] crate::progressive_dc::ProgressiveDcGpuError),
     #[error(transparent)]
     ModularFinalize(#[from] crate::modular_finalize::ModularFinalizeError),
     #[error(transparent)]

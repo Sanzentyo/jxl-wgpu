@@ -109,9 +109,13 @@ A consumer-neutral entropy-window planner owns byte-range validation, four-byte 
 space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
 their own resume records and dispatch ordering. The Modular engine, VarDCT AC pass-group consumer,
 and combined/global-tree plus staged local-tree VarDCT packet consumers use it in production.
-The common inventory already resolves progressive-DC reads to exact earlier LF producer frames in
-the four normative slots for both contiguous and incremental input; rendering those producers into
-resident LF slots and consuming them without readback remains `ENT-D02` work. The planner resolves one upload cap from the
+The common inventory resolves progressive-DC reads to exact earlier LF producer frames in the four
+normative slots for both contiguous and incremental input. The stock scheduler now projects each
+physical frame without rewriting absolute ranges, converts a Modular LF producer's signed final
+planes to dequantized resident XYB, and packs those planes into the next VarDCT LF resource atlas on
+the same queue. Hidden physical outputs are validated but never published. This is complete for one
+producer plus the final sectioned VarDCT frame; general HF-global/AC in a single-entry intermediate
+LF frame remains `ENT-D01` work. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
@@ -205,7 +209,9 @@ three views without allocation; before each Squeeze channel dispatch a best-fit 
 non-overlapping restored range, then releases its average/residual ranges and coalesces adjacent
 holes. In-place and tail-appended residual orders use the same logical-plane table. A five-job
 RCT/Squeeze/RCT case executes in one encoder and maps all three noncontiguous final planes once; the
-13-parameter progressive-DC root remains 37 jobs. The planner returns a typed address-space,
+13-parameter progressive-DC root remains 37 jobs. Its final `[Y, X, B-Y]` i32 planes feed a
+resident-only conversion and later LF-pack pass, without a canonical Modular output write or
+readback between physical frames. The planner returns a typed address-space,
 topology-state, free-list, or unsupported-Palette error before backend allocation.
 The entropy boundary now also has an explicit per-channel ABI. Each 32-byte descriptor stores its
 arena word offset, row stride, width/height, cumulative decoded start/end, and a range into flattened

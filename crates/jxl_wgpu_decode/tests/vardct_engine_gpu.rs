@@ -1821,3 +1821,95 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
         }
     }
 }
+
+#[test]
+fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
+    let Some(encoded) = common::cjxl_progressive_dc_codestream(1) else {
+        return;
+    };
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        session.submission_session(),
+        WgpuDecodeSubmissionSession::ProgressiveDc(_)
+    ));
+    assert_eq!(session.submission_session().submissions_per_frame(), 2);
+
+    let frame = pollster::block_on(session.next_frame_async())
+        .unwrap()
+        .unwrap();
+    assert!(session.next_frame().unwrap().is_none());
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let expected = rust_jxl_rgb8(&encoded, Extent2d::new(1_024, 128));
+    assert_eq!(actual.len(), expected.len());
+    let error = maximum_error(actual, &expected);
+    assert!(
+        error <= 1,
+        "GPU-resident progressive-DC output diverges from Rust jxl by {error}",
+    );
+
+    let mut blocking_session = decoder
+        .open(
+            &encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let blocking_frame = blocking_session.next_frame().unwrap().unwrap();
+    assert!(blocking_session.next_frame().unwrap().is_none());
+    let blocking_readback = ImageReadbackPipeline::new(&backend)
+        .submit(blocking_frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        blocking_readback.frame.outputs[0].bytes.as_slice(),
+        actual.as_slice()
+    );
+}
+
+#[test]
+fn multi_level_progressive_dc_rejects_the_remaining_single_packet_gap_before_submit() {
+    let Some(encoded) = common::cjxl_progressive_dc_codestream(2) else {
+        return;
+    };
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let error = match decoder.open(
+        &encoded,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+    ) {
+        Ok(_) => panic!("multi-level progressive-DC unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DecodeError::VarDct(VarDctDecodeError::UnsupportedProgressiveDcIntermediatePacket)
+    ));
+}

@@ -28,7 +28,7 @@ use crate::entropy_window::{
 };
 #[cfg(test)]
 use crate::entropy_window::{STREAM_OVERLAP_BYTES, STREAM_SENTINEL_BYTES};
-use crate::model::native_modular_format;
+use crate::model::{native_modular_format, native_modular_pixel_format};
 use crate::modular_finalize::{
     DEFAULT_MODULAR_FINALIZE_VARIANT, MODULAR_FINALIZE_KERNEL_KEY, ModularFinalizeBindings,
     ModularFinalizeF64Path, ModularFinalizeOutput, ModularFinalizeParams, ModularFinalizePipeline,
@@ -47,7 +47,11 @@ use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezeParams, ModularS
 use crate::modular_tree::{EntropyCoderIr, MaTreeNodeIr};
 use crate::profile::{
     ModularGroup, ResidentModularFramePlan, ResidentModularGroupPlan, StandardModularProfile,
-    parse_standard_modular_profile,
+    parse_progressive_dc_modular_profile, parse_standard_modular_profile,
+};
+use crate::progressive_dc::{
+    ProgressiveDcConvertInputs, ProgressiveDcGpuError, ProgressiveDcPipeline,
+    ProgressiveDcXybPlanes,
 };
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
@@ -182,6 +186,10 @@ pub struct WgpuDecodeMemoryStats {
     pub inverse_transform_uniform_bytes: u64,
     /// Final source-plane packing uniform retained through the same submission.
     pub final_output_uniform_bytes: u64,
+    /// Three planar F32 XYB dependency buffers retained by a progressive-DC producer.
+    pub progressive_dc_plane_bytes: u64,
+    /// Modular-to-XYB conversion uniform retained through the producer submission.
+    pub progressive_dc_uniform_bytes: u64,
     /// Largest descriptor-derived LZ history ring used by one group lane.
     pub max_lz77_window_words: u32,
     /// Largest physical LZ history ring stored in one reconstruction lane.
@@ -426,6 +434,8 @@ pub struct WgpuSubmissionEngine {
     pipelines: Arc<DecodePipelineCache>,
     native_f64_pipelines: Option<Arc<DecodePipelineCache>>,
     inverse_pipelines: Arc<ModularInversePipelineCache>,
+    progressive_dc_pipeline:
+        Arc<OnceLock<std::result::Result<Arc<ProgressiveDcPipeline>, ProgressiveDcGpuError>>>,
     memory: MemoryBudget,
     buffers: Arc<DecodeBufferPool>,
     stream_window_limit: Option<NonZeroU64>,
@@ -609,6 +619,7 @@ impl WgpuSubmissionEngine {
             pipelines,
             native_f64_pipelines,
             inverse_pipelines: Arc::new(ModularInversePipelineCache::default()),
+            progressive_dc_pipeline: Arc::new(OnceLock::new()),
             memory: memory_budget,
             buffers,
             stream_window_limit: None,
@@ -698,6 +709,30 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
+        self.open_profile(codestream, request, profile)
+    }
+
+    pub(crate) fn open_progressive_dc_with_inventory_data(
+        &self,
+        codestream: Arc<GpuCodestream>,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        let profile = parse_progressive_dc_modular_profile(&codestream, inventory)?;
+        let internal_request = GpuOutputRequest::color(native_modular_pixel_format(
+            profile.channels,
+            profile.bits_per_sample,
+        )?)?
+        .with_max_frame_slots(request.max_frame_slots());
+        self.open_profile(codestream, &internal_request, profile)
+    }
+
+    fn open_profile(
+        &self,
+        codestream: Arc<GpuCodestream>,
+        request: &GpuOutputRequest,
+        profile: StandardModularProfile,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         if profile.resident_entropy_plans.len() != profile.entropy_groups.len() {
             return Err(Error::EngineContract(
                 "Modular entropy plans do not match the LF/pass stream inventory",
@@ -878,25 +913,26 @@ impl WgpuSubmissionEngine {
                 )
             })
             .transpose()?;
-        let finalize_params: Arc<[ModularFinalizeParams]> =
-            if let Some(frame_plan) = &profile.resident_frame_plan {
-                vec![modular_frame_finalize_params(
-                    &profile, &output, frame_plan,
-                )?]
+        let finalize_params: Arc<[ModularFinalizeParams]> = if profile.progressive_dc.is_some() {
+            Arc::from([])
+        } else if let Some(frame_plan) = &profile.resident_frame_plan {
+            vec![modular_frame_finalize_params(
+                &profile, &output, frame_plan,
+            )?]
+            .into()
+        } else if generalized_channels {
+            profile
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    modular_finalize_params(&profile, &output, group_index, *group)
+                })
+                .collect::<Result<Vec<_>>>()?
                 .into()
-            } else if generalized_channels {
-                profile
-                    .groups
-                    .iter()
-                    .enumerate()
-                    .map(|(group_index, group)| {
-                        modular_finalize_params(&profile, &output, group_index, *group)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into()
-            } else {
-                Arc::from([])
-            };
+        } else {
+            Arc::from([])
+        };
         let pipeline = pipelines.get_or_init(
             &self.backend,
             pipeline_f64_path,
@@ -925,9 +961,27 @@ impl WgpuSubmissionEngine {
             metadata_inventory,
             &dispatch_layout,
             &output,
-            request.max_frame_slots().get(),
-            memory_limit_bytes,
+            DeviceAdmissionOptions {
+                requested_frame_slots: request.max_frame_slots().get(),
+                memory_limit_bytes,
+                progressive_dc: profile.progressive_dc.is_some(),
+            },
         )?;
+        let progressive_dc_pipeline = profile
+            .progressive_dc
+            .map(|_| {
+                match self.progressive_dc_pipeline.get_or_init(|| {
+                    ProgressiveDcPipeline::with_policy(
+                        self.backend.device(),
+                        self.backend.kernel_policy(),
+                    )
+                    .map(Arc::new)
+                }) {
+                    Ok(pipeline) => Ok(Arc::clone(pipeline)),
+                    Err(error) => Err(error.clone()),
+                }
+            })
+            .transpose()?;
         let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
             .expect("device admission always resolves at least one frame slot");
         let reported_ma_config = profile
@@ -1008,6 +1062,7 @@ impl WgpuSubmissionEngine {
                 buffers: Arc::clone(&self.buffers),
                 f64_output_path,
                 inverse_pipelines,
+                progressive_dc_pipeline,
             },
         )
         .with_resolved_frame_slots(resolved_frame_slots))
@@ -1314,6 +1369,7 @@ pub struct WgpuDecodeSession {
     buffers: Arc<DecodeBufferPool>,
     f64_output_path: Option<F64OutputPath>,
     inverse_pipelines: Option<Arc<ModularInversePipelines>>,
+    progressive_dc_pipeline: Option<Arc<ProgressiveDcPipeline>>,
 }
 
 impl std::fmt::Debug for WgpuDecodeSession {
@@ -1349,8 +1405,11 @@ impl GpuSubmissionSession for WgpuDecodeSession {
             .try_reserve(self.memory_stats.transient_bytes)?;
         let pending = submit_decode(
             &self.backend,
-            &self.pipeline,
-            self.inverse_pipelines.as_deref(),
+            SubmitPipelines {
+                decode: &self.pipeline,
+                inverse: self.inverse_pipelines.as_deref(),
+                progressive_dc: self.progressive_dc_pipeline.as_deref(),
+            },
             source,
             &self.buffers,
             DecodeMemoryPermits {
@@ -1413,6 +1472,15 @@ impl std::fmt::Debug for WgpuPendingFrame {
 }
 
 impl WgpuPendingFrame {
+    pub(crate) fn progressive_dc_planes(&self) -> Result<ProgressiveDcXybPlanes> {
+        self.lifetime
+            .as_ref()
+            .and_then(|lifetime| lifetime.progressive_dc_planes.clone())
+            .ok_or(Error::EngineContract(
+                "Modular pending frame does not retain progressive-DC XYB planes",
+            ))
+    }
+
     /// Clones a budget-tracked lease to the queue-submitted output before validation completes.
     ///
     /// Submit consumers only to the same [`WgpuBackend`] device and queue that created this decode
@@ -1596,6 +1664,8 @@ struct DecodeJobLifetime {
     _params: DecodeBufferLease,
     _dispatch_control: DecodeBufferLease,
     _transient_permit: MemoryPermit,
+    progressive_dc_planes: Option<ProgressiveDcXybPlanes>,
+    _progressive_dc_uniform: Mutex<Option<wgpu::Buffer>>,
 }
 
 impl Drop for DecodeJobLifetime {
@@ -1663,6 +1733,7 @@ enum FixedGradientOutputMode {
     FinalizePass = 0,
     DirectNormalizedGray8 = 1,
     CompactNormalizedGray8 = 2,
+    ResidentOnly = 3,
 }
 
 impl GroupDispatchLayout {
@@ -1731,18 +1802,23 @@ impl GroupDispatchLayout {
         let mut max_physical_reconstruction_sample_words = 0u32;
         let mut max_lz77_window_words = 0u32;
         let mut max_lz77_scratch_words = 0u32;
-        let output_mode = fixed_gradient_output_mode(
-            profile.channels.count(),
-            profile.bits_per_sample,
-            output,
-            reconstruction_specialization,
-        );
+        let output_mode = if profile.progressive_dc.is_some() {
+            FixedGradientOutputMode::ResidentOnly
+        } else {
+            fixed_gradient_output_mode(
+                profile.channels.count(),
+                profile.bits_per_sample,
+                output,
+                reconstruction_specialization,
+            )
+        };
         let output_specialization = match output_mode {
             FixedGradientOutputMode::FinalizePass => ModularOutputSpecialization::FinalizePass,
             FixedGradientOutputMode::DirectNormalizedGray8
             | FixedGradientOutputMode::CompactNormalizedGray8 => {
                 ModularOutputSpecialization::DirectNormalizedGray8
             }
+            FixedGradientOutputMode::ResidentOnly => ModularOutputSpecialization::FinalizePass,
         };
         let resident_modular_arena_bytes = if generalized_channels {
             profile
@@ -1833,7 +1909,8 @@ impl GroupDispatchLayout {
         } else {
             0
         };
-        let final_output_uniform_bytes = if generalized_channels {
+        let final_output_uniform_bytes = if generalized_channels && profile.progressive_dc.is_none()
+        {
             (std::mem::size_of::<ModularFinalizeParams>() as u64)
                 .checked_mul(
                     u64::try_from(if profile.resident_frame_plan.is_some() {
@@ -2915,14 +2992,20 @@ struct ModularMetadataInventory {
     unique_ma_config_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeviceAdmissionOptions {
+    requested_frame_slots: usize,
+    memory_limit_bytes: u64,
+    progressive_dc: bool,
+}
+
 fn validate_device_limits(
     device: &wgpu::Device,
     modular_metadata: &[u32],
     metadata_inventory: ModularMetadataInventory,
     dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
-    requested_frame_slots: usize,
-    memory_limit_bytes: u64,
+    options: DeviceAdmissionOptions,
 ) -> Result<WgpuDecodeMemoryStats> {
     let storage_limit = device.limits().max_storage_buffer_binding_size;
     let buffer_limit = device.limits().max_buffer_size;
@@ -2933,6 +3016,20 @@ fn validate_device_limits(
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
         NATIVE_F64_DUMMY_WORD_BYTES
+    } else {
+        0
+    };
+    let progressive_dc_plane_bytes = if options.progressive_dc {
+        u64::from(output.layout.extent.width)
+            .checked_mul(u64::from(output.layout.extent.height))
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+            .and_then(|bytes| bytes.checked_mul(3))
+            .ok_or_else(|| Error::backend("progressive-DC plane byte count overflow"))?
+    } else {
+        0
+    };
+    let progressive_dc_uniform_bytes = if options.progressive_dc {
+        std::mem::size_of::<crate::progressive_dc::ProgressiveDcConvertParams>() as u64
     } else {
         0
     };
@@ -2985,18 +3082,22 @@ fn validate_device_limits(
         dispatch_control_bytes,
         dispatch.inverse_transform_uniform_bytes,
         dispatch.final_output_uniform_bytes,
+        progressive_dc_plane_bytes,
+        progressive_dc_uniform_bytes,
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
     .ok_or_else(|| Error::backend("Modular GPU memory budget overflow"))?;
-    let affordable_slots = memory_limit_bytes / per_frame;
+    let affordable_slots = options.memory_limit_bytes / per_frame;
     if affordable_slots == 0 {
         return Err(Error::backend(format!(
-            "one Modular GPU frame requires {per_frame} bytes, exceeding the shared {memory_limit_bytes}-byte budget"
+            "one Modular GPU frame requires {per_frame} bytes, exceeding the shared {}-byte budget",
+            options.memory_limit_bytes
         )));
     }
-    let max_frame_slots =
-        requested_frame_slots.min(usize::try_from(affordable_slots).unwrap_or(usize::MAX));
+    let max_frame_slots = options
+        .requested_frame_slots
+        .min(usize::try_from(affordable_slots).unwrap_or(usize::MAX));
     let max_frame_window_bytes = per_frame
         .checked_mul(
             u64::try_from(max_frame_slots)
@@ -3043,6 +3144,8 @@ fn validate_device_limits(
         palette_dispatch_count: dispatch.palette_dispatch_count,
         inverse_transform_uniform_bytes: dispatch.inverse_transform_uniform_bytes,
         final_output_uniform_bytes: dispatch.final_output_uniform_bytes,
+        progressive_dc_plane_bytes,
+        progressive_dc_uniform_bytes,
         max_lz77_window_words: dispatch.max_lz77_window_words,
         max_lz77_scratch_words: dispatch.max_lz77_scratch_words,
         stream_batch_count: dispatch
@@ -3064,10 +3167,16 @@ fn validate_device_limits(
     })
 }
 
+#[derive(Clone, Copy)]
+struct SubmitPipelines<'a> {
+    decode: &'a wgpu::ComputePipeline,
+    inverse: Option<&'a ModularInversePipelines>,
+    progressive_dc: Option<&'a ProgressiveDcPipeline>,
+}
+
 fn submit_decode(
     backend: &WgpuBackend,
-    pipeline: &wgpu::ComputePipeline,
-    inverse_pipelines: Option<&ModularInversePipelines>,
+    pipelines: SubmitPipelines<'_>,
     source: &DecodeSource,
     buffers: &Arc<DecodeBufferPool>,
     memory_permits: DecodeMemoryPermits,
@@ -3120,6 +3229,13 @@ fn submit_decode(
             std::mem::align_of::<u32>() as u64,
         )
     });
+    let progressive_dc_planes = source
+        .profile
+        .progressive_dc
+        .map(|_| {
+            ProgressiveDcXybPlanes::new(device, source.profile.width, source.profile.height, 0)
+        })
+        .transpose()?;
     let output_size = align4(source.output.layout.logical_size)?;
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
@@ -3178,7 +3294,7 @@ fn submit_decode(
         || output.as_entire_binding(),
         |buffer| buffer.buffer().as_entire_binding(),
     );
-    let bind_group_layout = pipeline.get_bind_group_layout(0);
+    let bind_group_layout = pipelines.decode.get_bind_group_layout(0);
     let mut entries = vec![
         wgpu::BindGroupEntry {
             binding: 0,
@@ -3276,6 +3392,8 @@ fn submit_decode(
         _params: params_buffer,
         _dispatch_control: dispatch_control,
         _transient_permit: memory_permits.transient,
+        progressive_dc_planes,
+        _progressive_dc_uniform: Mutex::new(None),
     });
     let upload_len = usize::try_from(source.dispatch_layout.stream_bytes)
         .map_err(|_| Error::backend("bounded stream upload exceeds host address space"))?;
@@ -3353,7 +3471,7 @@ fn submit_decode(
                     label: Some("jxl-wgpu DC-global Modular entropy reconstruction"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(pipeline);
+                pass.set_pipeline(pipelines.decode);
                 pass.set_bind_group(0, global_binding.as_ref().unwrap_or(&binding), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
@@ -3441,7 +3559,7 @@ fn submit_decode(
                 label: Some("jxl-wgpu generic Modular entropy and MA reconstruction"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(pipeline);
+            pass.set_pipeline(pipelines.decode);
             pass.set_bind_group(0, &binding, &[]);
             pass.dispatch_workgroups(
                 control
@@ -3454,7 +3572,7 @@ fn submit_decode(
         let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
         let mut inverse_uniforms = Vec::new();
         if !source.channel_layout_offsets.is_empty() {
-            let pipelines = inverse_pipelines.ok_or(Error::EngineContract(
+            let inverse = pipelines.inverse.ok_or(Error::EngineContract(
                 "descriptor reconstruction is missing resident inverse pipelines",
             ))?;
             for segment_index in batch.segments.clone() {
@@ -3479,7 +3597,7 @@ fn submit_decode(
                     &mut commands,
                     source,
                     lifetime._reconstructed.buffer(),
-                    pipelines,
+                    inverse,
                     segment.group_index,
                     lane_index,
                 )?);
@@ -3498,13 +3616,13 @@ fn submit_decode(
                         segment.group_index,
                         lane_index,
                     )?;
-                } else {
+                } else if source.profile.progressive_dc.is_none() {
                     inverse_uniforms.push(encode_modular_finalize(
                         device,
                         &mut commands,
                         source,
                         &lifetime,
-                        pipelines,
+                        inverse,
                         segment.group_index,
                         lane_index,
                     )?);
@@ -3513,7 +3631,7 @@ fn submit_decode(
         }
         if final_batch {
             if let Some(frame_plan) = &source.profile.resident_frame_plan {
-                let pipelines = inverse_pipelines.ok_or(Error::EngineContract(
+                let inverse = pipelines.inverse.ok_or(Error::EngineContract(
                     "frame Modular reconstruction is missing resident inverse pipelines",
                 ))?;
                 let frame_arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
@@ -3534,15 +3652,73 @@ fn submit_decode(
                     },
                     &frame_plan.inverse_plan,
                     frame_plan.wp_header,
-                    pipelines,
+                    inverse,
                 )?);
-                inverse_uniforms.push(encode_frame_modular_finalize(
+                if source.profile.progressive_dc.is_none() {
+                    inverse_uniforms.push(encode_frame_modular_finalize(
+                        device,
+                        &mut commands,
+                        source,
+                        &lifetime,
+                        inverse,
+                    )?);
+                }
+            }
+            if let Some(progressive) = source.profile.progressive_dc {
+                let pipeline = pipelines.progressive_dc.ok_or(Error::EngineContract(
+                    "progressive-DC Modular conversion pipeline is missing",
+                ))?;
+                let planes =
+                    lifetime
+                        .progressive_dc_planes
+                        .as_ref()
+                        .ok_or(Error::EngineContract(
+                            "progressive-DC Modular conversion planes are missing",
+                        ))?;
+                let (arena, final_planes) =
+                    if let Some(frame_plan) = &source.profile.resident_frame_plan {
+                        let arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
+                            "progressive-DC frame inverse arena is missing",
+                        ))?;
+                        (arena.buffer(), frame_plan.inverse_plan.final_gpu_layouts())
+                    } else {
+                        let [group_plan] = source.profile.resident_entropy_plans.as_slice() else {
+                            return Err(Error::EngineContract(
+                                "progressive-DC Modular root requires one resident frame topology",
+                            ));
+                        };
+                        (
+                            lifetime._reconstructed.buffer(),
+                            group_plan.inverse_plan.final_gpu_layouts(),
+                        )
+                    };
+                let source_planes = final_planes.try_into().map_err(|_| {
+                    Error::EngineContract(
+                        "progressive-DC Modular root must reconstruct exactly three XYB planes",
+                    )
+                })?;
+                let arena_size = NonZeroU64::new(arena.size()).ok_or(Error::EngineContract(
+                    "progressive-DC Modular arena is empty",
+                ))?;
+                let uniform = pipeline.encode_convert(
                     device,
                     &mut commands,
-                    source,
-                    &lifetime,
-                    pipelines,
-                )?);
+                    ProgressiveDcConvertInputs {
+                        arena: ResidentStorageBinding {
+                            buffer: arena,
+                            offset: 0,
+                            size: arena_size,
+                        },
+                        source_planes,
+                        outputs: planes,
+                        multipliers: progressive.lf_dequantization(),
+                    },
+                )?;
+                *lifetime
+                    ._progressive_dc_uniform
+                    .lock()
+                    .map_err(|_| Error::backend("progressive-DC uniform lock was poisoned"))? =
+                    Some(uniform);
             }
             commands.copy_buffer_to_buffer(
                 lifetime._status.buffer(),
@@ -4097,15 +4273,19 @@ fn build_params(
     let decoded_symbol_count = group_decoded_symbol_count(&source.profile, group_index, group)?;
     let lz77_window_words =
         group_lz77_window_words(&source.profile, group_index, group, decoded_symbol_count)?;
-    let fixed_output_mode = refine_fixed_gradient_output_mode(
-        fixed_gradient_output_mode(
-            source.profile.channels.count(),
-            source.profile.bits_per_sample,
-            &source.output,
-            reconstruction_specialization,
-        ),
-        lz77_window_words,
-    );
+    let fixed_output_mode = if source.profile.progressive_dc.is_some() {
+        FixedGradientOutputMode::ResidentOnly
+    } else {
+        refine_fixed_gradient_output_mode(
+            fixed_gradient_output_mode(
+                source.profile.channels.count(),
+                source.profile.bits_per_sample,
+                &source.output,
+                reconstruction_specialization,
+            ),
+            lz77_window_words,
+        )
+    };
     let physical_sample_words =
         if fixed_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
             compact_gray8_sample_words(group)?

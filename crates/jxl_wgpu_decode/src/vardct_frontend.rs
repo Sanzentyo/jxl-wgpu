@@ -896,6 +896,10 @@ pub struct StandardVarDctProfile {
     /// Whether section F.2's adaptive smoothing pass is required after LF dequantization and
     /// chroma-from-luma reconstruction.
     pub adaptive_lf_smoothing: bool,
+    /// Earlier progressive-DC frame supplies the LF image instead of this frame's LF entropy.
+    pub uses_lf_frame: bool,
+    /// Progressive-DC level represented by this frame; zero is the final image level.
+    pub lf_level: u32,
     /// Validated UTF-8 frame name preserved in authoritative [`crate::FrameMetadata`].
     pub frame_name: String,
     pub sections: VarDctSectionLayout,
@@ -913,8 +917,29 @@ pub struct VarDctGroupRect {
 impl StandardVarDctProfile {
     /// Negotiate the strict single-frame/single-pass XYB VarDCT transform profile.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, VarDctFrontendError> {
+        Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
+    }
+
+    pub(crate) fn negotiate_progressive_dc(
+        inventory: &CodestreamInventory,
+        is_final: bool,
+    ) -> Result<Self, VarDctFrontendError> {
+        Self::negotiate_for_role(
+            inventory,
+            if is_final {
+                VarDctFrameRole::ProgressiveDcFinal
+            } else {
+                VarDctFrameRole::ProgressiveDcRefinement
+            },
+        )
+    }
+
+    fn negotiate_for_role(
+        inventory: &CodestreamInventory,
+        role: VarDctFrameRole,
+    ) -> Result<Self, VarDctFrontendError> {
         validate_image(inventory)?;
-        let frame = validate_frame(inventory)?;
+        let frame = validate_frame(inventory, role)?;
         let sections = collect_sections(inventory, frame)?;
         let frame_name = String::from_utf8(frame.name_bytes.clone())
             .map_err(|_| VarDctFrontendError::InvalidFrameName)?;
@@ -924,15 +949,26 @@ impl StandardVarDctProfile {
                 return unsupported(UnsupportedVarDctFeature::FloatingPointSamples);
             }
         };
+        let (width, height) = if role == VarDctFrameRole::Presentation {
+            (frame.width, frame.height)
+        } else {
+            frame
+                .color_sample_extent()
+                .ok_or(VarDctFrontendError::Unsupported {
+                    feature: UnsupportedVarDctFeature::ImageDimensions,
+                })?
+        };
         Ok(Self {
             capability: VarDctFrontendCapability::SinglePassXybEntropyPackets,
-            width: frame.width,
-            height: frame.height,
+            width,
+            height,
             bits_per_sample,
             group_dimension: 128u32 << frame.group_size_shift,
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
             adaptive_lf_smoothing: frame.flags & 0x80 == 0,
+            uses_lf_frame: frame.uses_lf_frame(),
+            lf_level: frame.lf_level,
             frame_name,
             sections,
         })
@@ -1003,6 +1039,13 @@ impl StandardVarDctProfile {
         }
         Ok(lf_index)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VarDctFrameRole {
+    Presentation,
+    ProgressiveDcRefinement,
+    ProgressiveDcFinal,
 }
 
 fn group_rect(
@@ -1110,18 +1153,46 @@ fn validate_image(inventory: &CodestreamInventory) -> Result<(), VarDctFrontendE
     Ok(())
 }
 
-fn validate_frame(inventory: &CodestreamInventory) -> Result<&FrameInventory, VarDctFrontendError> {
+fn validate_frame(
+    inventory: &CodestreamInventory,
+    role: VarDctFrameRole,
+) -> Result<&FrameInventory, VarDctFrontendError> {
     let frame = &inventory.frames[0];
-    if frame.frame_type != FrameType::Regular || frame.is_preview || !frame.is_last {
+    let role_is_invalid = match role {
+        VarDctFrameRole::Presentation => {
+            frame.frame_type != FrameType::Regular
+                || !frame.is_last
+                || frame.uses_lf_frame()
+                || frame.lf_level != 0
+        }
+        VarDctFrameRole::ProgressiveDcRefinement => {
+            frame.frame_type != FrameType::LowFrequency
+                || frame.is_last
+                || !frame.uses_lf_frame()
+                || frame.lf_level == 0
+                || !frame.save_before_color_transform
+        }
+        VarDctFrameRole::ProgressiveDcFinal => {
+            frame.frame_type != FrameType::Regular
+                || !frame.is_last
+                || !frame.uses_lf_frame()
+                || frame.lf_level != 0
+        }
+    };
+    if role_is_invalid || frame.is_preview {
         return unsupported(UnsupportedVarDctFeature::NonRegularFrame);
     }
     if frame.encoding != FrameEncoding::VarDct {
         return unsupported(UnsupportedVarDctFeature::ModularFrame);
     }
-    // Noise, patches, splines, LF-frame reuse, and unknown frame extensions remain outside the
-    // initial transform capability. Skip-adaptive-LF-smoothing is a supported rendering choice.
-    const SUPPORTED_FLAGS: u64 = 0x80;
-    if frame.flags & !SUPPORTED_FLAGS != 0 {
+    // Noise, patches, splines, and unknown frame extensions remain outside the transform
+    // capability. LF-frame reuse is accepted only by the recursive progressive-DC entry point.
+    let supported_flags = if role == VarDctFrameRole::Presentation {
+        0x80
+    } else {
+        0x20 | 0x80
+    };
+    if frame.flags & !supported_flags != 0 {
         return unsupported(UnsupportedVarDctFeature::FrameFeatures);
     }
     if frame.do_ycbcr {
@@ -1154,7 +1225,9 @@ fn validate_frame(inventory: &CodestreamInventory) -> Result<&FrameInventory, Va
     {
         return unsupported(UnsupportedVarDctFeature::Blending);
     }
-    if frame.save_as_reference != 0 || frame.save_before_color_transform {
+    if frame.save_as_reference != 0
+        || (role != VarDctFrameRole::ProgressiveDcRefinement && frame.save_before_color_transform)
+    {
         return unsupported(UnsupportedVarDctFeature::FrameReferences);
     }
     if frame.num_passes != 1
