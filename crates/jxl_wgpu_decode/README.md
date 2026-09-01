@@ -36,7 +36,15 @@ read-write arena, which removes storage-binding alias ambiguity and permits late
 Its portable WGSL emulates the required signed 64-bit smooth-tendency intermediate with two `u32`
 words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
 even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
-does not yet schedule this pipeline from the transform plan.
+does not yet feed transformed entropy output into this arena.
+The reverse planner does schedule every Squeeze parameter and selected channel from the parsed
+topology. A best-fit interval allocator reserves each destination before its dispatch, retires that
+channel's average and residual immediately afterward, and merges adjacent free spans. Thus an
+arbitrary valid in-place/out-of-place stack keeps only live planes, not every transform generation.
+A nested horizontal/vertical actual-adapter test records three ordered dispatches in one encoder and
+maps only the final plane; the checked 45-word entropy topology uses a 90-word peak arena and reuses
+its first retired range for the restored output. The real progressive-DC LF2 fixture lowers 13
+parameters to 37 jobs and three final full-resolution planes within twice its entropy sample count.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
@@ -83,7 +91,8 @@ exact node/decision/leaf counts, maximum depth, and self-correcting usage; custo
 engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
-channel topology are parsed, but multiple passes, Palette, scheduled Squeeze, and non-YCoCg inverse execution,
+channel topology are parsed, but multiple passes, Palette, stock-engine Squeeze submission, and
+non-YCoCg inverse execution,
 non-alpha extra channels, patches, splines, noise, and reference-frame animation remain typed
 unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from

@@ -104,6 +104,21 @@ pub enum ModularTransformError {
     InverseTopologyMismatch,
 }
 
+/// Invalid or unsupported lowering from Modular transform topology to resident GPU jobs.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ModularInversePlanError {
+    #[error("resident Modular inverse planning does not yet implement {feature:?}")]
+    UnsupportedTransform { feature: ModularTransformFeature },
+    #[error("resident Modular inverse topology and live plane state disagree: {reason}")]
+    TopologyState { reason: &'static str },
+    #[error("resident Modular inverse arena exceeds portable WGSL u32 word addressing")]
+    ArenaAddressSpace,
+    #[error("resident Modular inverse free-list ranges overlap")]
+    FreeListOverlap,
+    #[error(transparent)]
+    Squeeze(#[from] crate::modular_squeeze::ModularSqueezeError),
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("unsupported GPU decode profile feature {feature:?}: {detail}")]
 pub struct UnsupportedProfile {
@@ -184,6 +199,8 @@ pub enum Error {
     ModularTree(#[from] ModularTreeError),
     #[error(transparent)]
     ModularTransform(#[from] ModularTransformError),
+    #[error(transparent)]
+    ModularInversePlan(#[from] ModularInversePlanError),
     #[error(transparent)]
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]

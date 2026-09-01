@@ -3,6 +3,7 @@ use jxl_gpu_bitstream::{
     ImageHeaderInventory, SampleBitDepth,
 };
 
+use crate::modular_inverse::plan_modular_inverse;
 use crate::modular_transform::{
     ModularChannelTopology, ModularRct, ModularTransformIr, ModularTransformLimits,
     ModularTransformPlan, parse_modular_transforms,
@@ -477,7 +478,19 @@ fn validate_stock_modular_transform_plan(
     // backend allocation. The generalized transformed-channel executor will retain this table.
     let _gpu_channel_layout = transform_plan.topology.gpu_layout()?;
     match (channels, transform_plan.transforms.as_slice()) {
-        (ModularChannels::Gray, []) if topology_is_direct => {}
+        (ModularChannels::Gray, []) if topology_is_direct => {
+            let inverse = plan_modular_inverse(transform_plan)?;
+            if u64::from(inverse.entropy_words()) != expected_sample_count
+                || inverse.arena_words() != inverse.entropy_words()
+                || !inverse.jobs().is_empty()
+                || inverse.final_planes().len() != channels.count() as usize
+            {
+                return Err(crate::ModularInversePlanError::TopologyState {
+                    reason: "direct topology produced a non-direct inverse schedule",
+                }
+                .into());
+            }
+        }
         (
             ModularChannels::Rgb | ModularChannels::Rgba,
             [
@@ -493,6 +506,31 @@ fn validate_stock_modular_transform_plan(
             );
         }
         (_, transforms) => {
+            if transforms
+                .iter()
+                .all(|transform| matches!(transform, ModularTransformIr::Squeeze { .. }))
+            {
+                let inverse = plan_modular_inverse(transform_plan)?;
+                let expected_jobs = transforms.iter().try_fold(0usize, |total, transform| {
+                    let ModularTransformIr::Squeeze { parameters, .. } = transform else {
+                        unreachable!("the Squeeze-only predicate was checked above");
+                    };
+                    parameters.iter().try_fold(total, |total, parameter| {
+                        total.checked_add(parameter.channel_count as usize)
+                    })
+                });
+                if inverse.arena_words() < inverse.entropy_words()
+                    || inverse.arena_bytes() != u64::from(inverse.arena_words()) * 4
+                    || Some(inverse.jobs().len()) != expected_jobs
+                    || inverse.final_planes().len()
+                        != transform_plan.source_topology().channels().len()
+                {
+                    return Err(crate::ModularInversePlanError::TopologyState {
+                        reason: "Squeeze-only transform produced inconsistent resident requirements",
+                    }
+                    .into());
+                }
+            }
             let feature = transforms
                 .iter()
                 .find_map(|transform| match transform {
@@ -677,6 +715,22 @@ mod tests {
                 .map(|channel| (channel.width, channel.height))
                 .collect::<Vec<_>>(),
             vec![(8, 8), (4, 4), (4, 4)]
+        );
+        let inverse = plan_modular_inverse(&plan).unwrap();
+        assert_eq!(inverse.jobs().len(), 37);
+        assert_eq!(inverse.final_planes().len(), 3);
+        assert_eq!(
+            u64::from(inverse.entropy_words()),
+            u64::from(frame.width) * u64::from(frame.height) * 3
+        );
+        assert!(inverse.arena_words() <= inverse.entropy_words() * 2);
+        assert_eq!(
+            inverse
+                .final_planes()
+                .iter()
+                .map(|plane| (plane.geometry.width, plane.geometry.height))
+                .collect::<Vec<_>>(),
+            vec![(frame.width, frame.height); 3]
         );
         assert!(reader.bit_offset() <= section.bits.end().unwrap());
     }

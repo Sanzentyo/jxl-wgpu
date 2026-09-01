@@ -92,6 +92,15 @@ monotone runs, and wrapping reconstruction. The ABI test fixes the 64-byte/16-by
 uniform, while malformed arena views must fail with typed geometry, reserved-word, or overlap errors.
 This establishes the primitive itself, not stock-decoder scheduling or complete `MOD-D03` pixel
 conformance.
+Scheduler conformance composes an in-place horizontal split with a vertical split over both derived
+channels. Reverse lowering produces vertical, vertical, then horizontal jobs, and an actual adapter
+executes all three in one encoder before the sole final map. The final 9×5 plane is word-exact against
+the scalar schedule even when entropy planes contain signed extremes. Separate tests cover
+tail-appended residual placement, a zero-width residual for a one-column image, best-fit reuse,
+two-sided free-span coalescing, and typed overlap rejection. When `cjxl` is installed, the LF2 root's
+13 default parameters must lower to 37 jobs and three full-resolution final plane views within a
+two-times arena bound. These tests still initialize decoded entropy samples directly; connection to
+the production entropy executor remains a distinct gate.
 
 ## Procedural VarDCT encoder matrix
 

@@ -187,12 +187,21 @@ views of one read-write storage arena. One invocation owns a complete row or col
 previous reconstructed odd sample is a normative dependency; linear 1/32/64/128/256-lane variants
 parallelize independent lines. Portable two-word signed arithmetic preserves the scalar `i64`
 smooth-tendency calculation over the complete `i32` input domain. The stock executor still rejects
-non-direct topologies until lifetime allocation schedules this primitive and the Palette/RCT passes.
+non-direct topologies until generalized entropy output targets the inverse arena and Palette/RCT
+passes exist.
 Inverse lowering does not retain one full channel table per transform. It starts from the final
 entropy topology, reverses each Squeeze parameter and transform, invokes the lowering callback with
 only the current/restored pair, and verifies that the source topology is recovered exactly. A
 cumulative topology-work budget bounds repeated vector insertion/removal independently of transform
 and final-channel count limits.
+For Squeeze-only stacks, lowering now continues into an executable lifetime schedule. Entropy-visible
+planes begin as tightly packed ranges in one storage arena. Before each channel dispatch a best-fit
+allocator reserves a non-overlapping restored range; after that ordered dispatch its average and
+residual ranges become reusable and adjacent holes are coalesced. In-place and tail-appended residual
+orders use the same logical-plane table. A composed two-parameter case is executed as three GPU jobs
+inside one command encoder with only the final readback, while the 13-parameter progressive-DC root
+is preflighted as 37 jobs. The planner returns a typed address-space, topology-state, free-list, or
+unsupported-transform error before backend allocation.
 
 ## Protocol execution
 

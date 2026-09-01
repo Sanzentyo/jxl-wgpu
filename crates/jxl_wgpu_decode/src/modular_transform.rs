@@ -237,6 +237,26 @@ impl ModularTransformPlan {
         &self.source_topology
     }
 
+    #[cfg(test)]
+    pub(crate) fn squeeze_only_for_test(
+        source_topology: ModularChannelTopology,
+        parameters: Vec<ModularSqueezeParameter>,
+        limits: ModularTransformLimits,
+    ) -> Result<Self> {
+        let mut topology = source_topology.clone();
+        for parameter in &parameters {
+            apply_squeeze(&mut topology, *parameter, limits)?;
+        }
+        Ok(Self {
+            source_topology,
+            transforms: vec![ModularTransformIr::Squeeze {
+                used_default_parameters: false,
+                parameters,
+            }],
+            topology,
+        })
+    }
+
     /// Visits inverse operations without retaining one full topology snapshot per transform.
     ///
     /// The callback sees the entropy-visible source and the immediately reconstructed destination
