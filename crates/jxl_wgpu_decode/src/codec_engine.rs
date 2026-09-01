@@ -18,7 +18,7 @@ use crate::{
     Error, GpuCodestream, GpuDecoder, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame, VarDctDecodeSession,
     VarDctPendingFrame, VarDctSubmissionEngine, WgpuDecodeSession, WgpuPendingFrame,
-    WgpuSubmissionEngine, codestream_data::CodestreamData,
+    WgpuSubmissionEngine,
 };
 
 /// Stock GPU decoder engine that selects Modular or VarDCT from the standard frame header.
@@ -80,7 +80,7 @@ impl WgpuDecodeEngine {
 
     pub(crate) fn open_with_inventory_data(
         &self,
-        codestream: Arc<CodestreamData>,
+        codestream: Arc<GpuCodestream>,
         request: &GpuOutputRequest,
         inventory: &jxl_gpu_bitstream::CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
@@ -126,21 +126,21 @@ impl GpuSubmissionEngine for WgpuDecodeEngine {
         maximum_limits(self.modular.parse_limits(), self.vardct.parse_limits())
     }
 
+    fn inventory_limits(&self) -> InventoryLimits {
+        InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: self.parse_limits().max_codestream_bytes,
+            ..InventoryLimits::default()
+        }
+    }
+
     fn open(
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
+        inventory: Arc<jxl_gpu_bitstream::CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        let parsed = jxl_gpu_bitstream::parse(codestream.bytes(), self.parse_limits())?;
-        let inventory = parsed
-            .codestream_inventory(InventoryLimits {
-                max_frames: 1,
-                max_total_section_bytes: u64::try_from(codestream.bytes().len())
-                    .map_err(|_| Error::backend("codestream size exceeds u64"))?,
-                ..InventoryLimits::default()
-            })
-            .map_err(Error::CodestreamInventory)?;
-        let codestream = Arc::new(CodestreamData::from_gpu_codestream(codestream)?);
+        let codestream = Arc::new(codestream);
         self.open_with_inventory_data(codestream, request, &inventory)
     }
 }

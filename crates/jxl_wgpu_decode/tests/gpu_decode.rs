@@ -1,19 +1,24 @@
 use std::collections::VecDeque;
 use std::future::Future;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
+use jxl_gpu_bitstream::{
+    CodestreamInventory, ContainerStreamEvent, ContainerStreamLimits, ContainerStreamScanner,
+    InventoryLimits, ParseLimits,
+};
 use jxl_gpu_formats::{ChromaLocation2d, ColorRange, ColorSpec, ColorSpecification, PixelFormat};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu_decode::{
     AnimationMetadata, DecodeProfile, Error, FrameDuration, FrameMetadata, FrameTimebase,
     FrontendIncomplete, FrontendStage, GpuCodestream, GpuDecoder, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, ModularChannels, ModularGrouping,
-    ModularPredictionProfile, ModularPredictor, PrefetchBackpressure, PreparedGpuSession, Result,
-    SubmittedGpuFrame, UnsupportedCodestreamFeature, UnsupportedProfile,
+    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, IncrementalInputBudget,
+    ModularChannels, ModularGrouping, ModularPredictionProfile, ModularPredictor,
+    PrefetchBackpressure, PreparedGpuSession, Result, SubmittedGpuFrame,
+    UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 
 mod common;
@@ -33,6 +38,12 @@ fn output_request(limit: usize) -> GpuOutputRequest {
     GpuOutputRequest::color(PixelFormat::nv12(color))
         .unwrap()
         .with_max_frame_slots(NonZeroUsize::new(limit).unwrap())
+}
+
+fn assert_jxl_signature(codestream: &GpuCodestream) {
+    let mut signature = [0; 2];
+    codestream.copy_range(0..2, &mut signature).unwrap();
+    assert_eq!(signature, [0xff, 0x0a]);
 }
 
 fn fixed_profile(bits_per_sample: u8, predictor: ModularPredictor) -> DecodeProfile {
@@ -110,8 +121,9 @@ impl GpuSubmissionEngine for ReadyEngine {
         &self,
         codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        assert!(codestream.bytes().starts_with(&[0xff, 0x0a]));
+        assert_jxl_signature(&codestream);
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
             AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
@@ -183,6 +195,7 @@ impl GpuSubmissionEngine for TimecodeEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -344,6 +357,7 @@ impl GpuSubmissionEngine for PendingEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(16, ModularPredictor::West),
@@ -473,6 +487,7 @@ impl GpuSubmissionEngine for PrefetchAnimationEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -677,6 +692,7 @@ impl GpuSubmissionEngine for ResolvedSlotEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -733,9 +749,10 @@ impl GpuSubmissionEngine for TypedRejectEngine {
         &self,
         codestream: GpuCodestream,
         _request: &GpuOutputRequest,
+        _inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert_eq!(codestream.is_container(), self.expected_container);
-        assert!(codestream.bytes().starts_with(&[0xff, 0x0a]));
+        assert_jxl_signature(&codestream);
         if self.unsupported {
             return Err(UnsupportedProfile::new(
                 UnsupportedCodestreamFeature::VarDct,
@@ -784,6 +801,179 @@ fn real_fragmented_container_is_joined_before_typed_frontend_reject() {
             ..
         }))
     ));
+}
+
+#[derive(Clone, Debug)]
+struct CapturingEngine {
+    opened: Arc<Mutex<Option<OpenedSource>>>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenedSource {
+    logical_bytes: u64,
+    spans: usize,
+    retained_input_bytes: u64,
+    is_container: bool,
+    is_contiguous: bool,
+    inventory: CodestreamInventory,
+}
+
+impl GpuSubmissionEngine for CapturingEngine {
+    type Session = ReadySession;
+
+    fn open(
+        &self,
+        codestream: GpuCodestream,
+        _request: &GpuOutputRequest,
+        inventory: Arc<CodestreamInventory>,
+    ) -> Result<PreparedGpuSession<Self::Session>> {
+        assert_jxl_signature(&codestream);
+        *self.opened.lock().unwrap() = Some(OpenedSource {
+            logical_bytes: codestream.logical_bytes(),
+            spans: codestream.span_count(),
+            retained_input_bytes: codestream.retained_input_bytes(),
+            is_container: codestream.is_container(),
+            is_contiguous: codestream.contiguous_bytes().is_some(),
+            inventory: (*inventory).clone(),
+        });
+        Ok(PreparedGpuSession::new(
+            fixed_profile(8, ModularPredictor::Zero),
+            AnimationMetadata::animation(Extent2d::new(8, 6), timebase(), 0, false, Some(2)),
+            ReadySession {
+                frames: VecDeque::from([frame(0, false), frame(1, true)]),
+            },
+        ))
+    }
+}
+
+fn push_transport_ranges(
+    stream: &mut jxl_wgpu_decode::GpuDecodeStream<CapturingEngine>,
+    limits: ContainerStreamLimits,
+    input: &[u8],
+    ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+) {
+    let mut transport = ContainerStreamScanner::new(limits);
+    for range in ranges {
+        for event in transport.push_chunk(Arc::from(&input[range])).unwrap() {
+            stream.push_transport_event(&event).unwrap();
+        }
+    }
+    for event in transport.finish_input().unwrap() {
+        stream.push_transport_event(&event).unwrap();
+    }
+}
+
+#[test]
+fn incremental_frontend_matches_contiguous_inventory_at_every_split() {
+    let input = raw_still();
+    let parsed = jxl_gpu_bitstream::parse(input, ParseLimits::default()).unwrap();
+    let expected = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let codestream_bytes = expected.codestream_bytes;
+
+    for split in 0..=input.len() {
+        let opened = Arc::new(Mutex::new(None));
+        let decoder = GpuDecoder::new(CapturingEngine {
+            opened: Arc::clone(&opened),
+        });
+        let mut stream = decoder.stream(output_request(2)).unwrap();
+        push_transport_ranges(
+            &mut stream,
+            decoder.container_stream_limits(),
+            input,
+            [0..split, split..input.len()],
+        );
+        let stats = stream.stats();
+        assert!(stream.is_ready());
+        assert_eq!(stats.retained_codestream_bytes, codestream_bytes);
+        assert_eq!(stats.input_budget.reserved_bytes, codestream_bytes);
+
+        let _session = stream.finish().unwrap();
+        let actual = opened.lock().unwrap().take().unwrap();
+        assert_eq!(actual.logical_bytes, codestream_bytes);
+        assert_eq!(actual.retained_input_bytes, codestream_bytes);
+        assert!(actual.spans >= 2);
+        assert!(!actual.is_container);
+        assert!(!actual.is_contiguous);
+        assert_eq!(actual.inventory, expected);
+        assert_eq!(
+            decoder.incremental_input_budget().snapshot().reserved_bytes,
+            0
+        );
+    }
+}
+
+#[test]
+fn byte_drip_fragmented_container_reaches_engine_as_shared_spans() {
+    let input = fragmented_animation();
+    let parsed = jxl_gpu_bitstream::parse(input, ParseLimits::default()).unwrap();
+    let expected = parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let opened = Arc::new(Mutex::new(None));
+    let decoder = GpuDecoder::new(CapturingEngine {
+        opened: Arc::clone(&opened),
+    });
+    let mut stream = decoder.stream(output_request(2)).unwrap();
+    push_transport_ranges(
+        &mut stream,
+        decoder.container_stream_limits(),
+        input,
+        (0..input.len()).map(|offset| offset..offset + 1),
+    );
+    let span_count = stream.stats().retained_spans;
+    assert!(span_count > 2);
+    let _session = stream.finish().unwrap();
+
+    let actual = opened.lock().unwrap().take().unwrap();
+    assert_eq!(actual.logical_bytes, expected.codestream_bytes);
+    assert_eq!(actual.retained_input_bytes, expected.codestream_bytes);
+    assert_eq!(actual.spans, span_count);
+    assert!(actual.is_container);
+    assert!(!actual.is_contiguous);
+    assert_eq!(actual.inventory, expected);
+}
+
+#[test]
+fn incremental_input_backpressure_is_retryable_and_cancel_releases_budget() {
+    let input = raw_still();
+    let codestream_bytes = jxl_gpu_bitstream::parse(input, ParseLimits::default())
+        .unwrap()
+        .codestream()
+        .len() as u64;
+    let budget = IncrementalInputBudget::new(NonZeroU64::new(codestream_bytes).unwrap());
+    let decoder = GpuDecoder::new(CapturingEngine {
+        opened: Arc::new(Mutex::new(None)),
+    })
+    .with_incremental_input_budget(budget.clone());
+    let mut transport = ContainerStreamScanner::new(decoder.container_stream_limits());
+    let events = transport.push_chunk(Arc::from(input)).unwrap();
+    let mut first = decoder.stream(output_request(2)).unwrap();
+    for event in &events {
+        first.push_transport_event(event).unwrap();
+    }
+    assert_eq!(budget.snapshot().reserved_bytes, codestream_bytes);
+
+    let first_chunk = events
+        .iter()
+        .find(|event| matches!(event, ContainerStreamEvent::CodestreamChunk { .. }))
+        .unwrap();
+    let mut second = decoder.stream(output_request(2)).unwrap();
+    assert!(matches!(
+        second.push_transport_event(first_chunk),
+        Err(Error::IncrementalInputBudget(_))
+    ));
+    assert_eq!(second.stats().codestream.codestream_bytes_received, 0);
+
+    drop(first);
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
+    second.push_transport_event(first_chunk).unwrap();
+    assert!(matches!(
+        second.finish(),
+        Err(Error::IncrementalInputIncomplete)
+    ));
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
 }
 
 #[test]

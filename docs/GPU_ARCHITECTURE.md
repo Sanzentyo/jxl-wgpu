@@ -66,13 +66,23 @@ logically contiguous shared spans, and exact bounded GPU upload ranges may cross
 Modular and VarDCT metadata bit reads are span-native. VarDCT uses the common generic entropy IR for
 block-context maps and custom coefficient-order permutations, plans from logical length, and
 initializes its still-required whole-codestream GPU buffer directly from spans without a second
-host-sized `Vec`. Both mode engines and the internal selector accept the same multi-span source.
-The public selector still creates a single-span table, so adapting section events and bounding
-retained-span lifetime remain explicit frontend work rather than being hidden behind reassembly.
+host-sized `Vec`. Both mode engines and the selector accept the same public multi-span source.
 
-`GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
-inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that
-inventory into either the Modular or VarDCT submission session. The selector does not merge their
+`GpuDecoder::stream` is the ownership adapter between the two scanners and that source boundary.
+It borrows `ContainerStreamEvent` values, retains only their codestream slices, collects emitted
+image/frame inventories, and opens a session only after authoritative `End`. One growable permit
+from a cloneable incremental-input budget accounts exact logical retained bytes across concurrent
+streams. Admission precedes scanner mutation, so exhaustion is retryable with the same event.
+Host-source admission is separate from GPU allocation admission because the source and its upload
+are physically live at the same time. The permit moves with the source: Modular releases it after
+queue submission, while a staged local-tree VarDCT path retains it across the LF status map until
+the cursor-dependent HF submission. Dropping the stream, prepared session, or pending local-HF work
+releases its ownership without waiting for unrelated GPU buffer callbacks.
+
+`GpuDecoder::wgpu` is the sole stock high-level decode constructor. Contiguous `open` and event-fed
+`stream` each inventory a codestream once before `WgpuDecodeEngine` reads `FrameEncoding` and moves
+the validated codestream plus that inventory into either the Modular or VarDCT submission session.
+The selector does not merge their
 incompatible storage-binding layouts: pipeline caches and mode-specific state remain independent,
 while device, queue, completion worker, and the aggregate byte budget are shared. The pending-frame
 enum performs only lifetime operations (`submit_next`, blocking wait, and runtime-neutral poll), so

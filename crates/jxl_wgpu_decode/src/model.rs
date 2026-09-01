@@ -1,6 +1,4 @@
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::ops::Range;
-use std::sync::Arc;
 use std::time::Duration;
 
 use jxl_gpu_formats::{
@@ -97,44 +95,6 @@ pub enum ModularGrouping {
         columns: u32,
         rows: u32,
     },
-}
-
-/// Validated contiguous codestream handed to a GPU-only frontend.
-#[derive(Clone, Debug)]
-pub struct GpuCodestream {
-    storage: Arc<[u8]>,
-    byte_range: Range<usize>,
-    container: bool,
-}
-
-impl GpuCodestream {
-    pub(crate) fn new(storage: Arc<[u8]>, byte_range: Range<usize>, container: bool) -> Self {
-        Self {
-            storage,
-            byte_range,
-            container,
-        }
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.storage[self.byte_range.clone()]
-    }
-
-    #[must_use]
-    pub fn shared_storage(&self) -> Arc<[u8]> {
-        Arc::clone(&self.storage)
-    }
-
-    #[must_use]
-    pub fn storage_range(&self) -> Range<usize> {
-        self.byte_range.clone()
-    }
-
-    #[must_use]
-    pub const fn is_container(&self) -> bool {
-        self.container
-    }
 }
 
 /// Exact JPEG XL animation clock information.

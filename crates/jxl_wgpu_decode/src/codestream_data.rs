@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use jxl_gpu_bitstream::StreamSlice;
 
-use crate::{Error, GpuCodestream, Result, modular_tree::BitInput};
+use crate::{Error, Result, input_budget::IncrementalInputPermit, modular_tree::BitInput};
 
 #[derive(Clone, Debug)]
 struct CodestreamSpan {
@@ -13,27 +13,48 @@ struct CodestreamSpan {
     bytes: StreamSlice,
 }
 
-/// A logically contiguous codestream whose physical bytes may live in multiple shared chunks.
+/// A validated, logically contiguous codestream whose physical bytes may live in shared chunks.
 ///
 /// The span table owns only shared ranges. It never assembles the complete codestream into a new
-/// allocation; callers copy just the bounded metadata or GPU-upload range they are consuming.
+/// allocation; engines copy just the bounded metadata or GPU-upload range they are consuming.
 #[derive(Clone, Debug)]
-pub(crate) struct CodestreamData {
+pub struct GpuCodestream {
     spans: Arc<[CodestreamSpan]>,
     logical_bytes: u64,
+    container: bool,
+    retained_input: Option<IncrementalInputPermit>,
 }
 
-impl CodestreamData {
-    pub(crate) fn from_gpu_codestream(codestream: GpuCodestream) -> Result<Self> {
-        let bytes =
-            StreamSlice::from_shared_range(codestream.shared_storage(), codestream.storage_range())
-                .ok_or(Error::EngineContract(
-                    "GPU codestream range is outside its shared storage",
-                ))?;
-        Self::from_spans([(0, bytes)])
+impl GpuCodestream {
+    pub(crate) fn from_shared(
+        storage: Arc<[u8]>,
+        byte_range: Range<usize>,
+        container: bool,
+    ) -> Result<Self> {
+        let bytes = StreamSlice::from_shared_range(storage, byte_range).ok_or(
+            Error::EngineContract("GPU codestream range is outside its shared storage"),
+        )?;
+        Self::from_spans_inner([(0, bytes)], container, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_spans(spans: impl IntoIterator<Item = (u64, StreamSlice)>) -> Result<Self> {
+        Self::from_spans_inner(spans, false, None)
+    }
+
+    pub(crate) fn from_stream_spans(
+        spans: impl IntoIterator<Item = (u64, StreamSlice)>,
+        container: bool,
+        retained_input: IncrementalInputPermit,
+    ) -> Result<Self> {
+        Self::from_spans_inner(spans, container, Some(retained_input))
+    }
+
+    fn from_spans_inner(
+        spans: impl IntoIterator<Item = (u64, StreamSlice)>,
+        container: bool,
+        retained_input: Option<IncrementalInputPermit>,
+    ) -> Result<Self> {
         let mut expected_offset = 0u64;
         let mut collected = Vec::new();
         for (logical_offset, bytes) in spans {
@@ -65,11 +86,39 @@ impl CodestreamData {
         Ok(Self {
             spans: collected.into(),
             logical_bytes: expected_offset,
+            container,
+            retained_input,
         })
     }
 
-    pub(crate) const fn logical_bytes(&self) -> u64 {
+    #[must_use]
+    pub const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
+    }
+
+    #[must_use]
+    pub fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    #[must_use]
+    pub const fn is_container(&self) -> bool {
+        self.container
+    }
+
+    /// Returns the complete logical codestream only when one physical span covers it.
+    #[must_use]
+    pub fn contiguous_bytes(&self) -> Option<&[u8]> {
+        let span = self.spans.first()?;
+        (self.spans.len() == 1 && span.logical_offset == 0).then(|| span.bytes.bytes())
+    }
+
+    /// Bytes admitted by the incremental-input budget and retained by this source.
+    #[must_use]
+    pub fn retained_input_bytes(&self) -> u64 {
+        self.retained_input
+            .as_ref()
+            .map_or(0, IncrementalInputPermit::bytes)
     }
 
     pub(crate) fn logical_bits(&self) -> Result<u64> {
@@ -82,7 +131,7 @@ impl CodestreamData {
         CodestreamBitReader::new(self)
     }
 
-    pub(crate) fn for_each_range_chunk(
+    pub fn for_each_range_chunk(
         &self,
         range: Range<u64>,
         mut visit: impl FnMut(&[u8]) -> Result<()>,
@@ -130,7 +179,7 @@ impl CodestreamData {
         Ok(())
     }
 
-    pub(crate) fn copy_range(&self, range: Range<u64>, destination: &mut [u8]) -> Result<()> {
+    pub fn copy_range(&self, range: Range<u64>, destination: &mut [u8]) -> Result<()> {
         let range_bytes = range
             .end
             .checked_sub(range.start)
@@ -211,16 +260,16 @@ impl CodestreamData {
     }
 }
 
-/// Little-endian bit reader over a [`CodestreamData`] span table.
+/// Little-endian bit reader over a [`GpuCodestream`] span table.
 #[derive(Clone, Debug)]
 pub(crate) struct CodestreamBitReader<'source> {
-    source: &'source CodestreamData,
+    source: &'source GpuCodestream,
     bit_offset: u64,
     span_hint: usize,
 }
 
 impl<'source> CodestreamBitReader<'source> {
-    const fn new(source: &'source CodestreamData) -> Self {
+    const fn new(source: &'source GpuCodestream) -> Self {
         Self {
             source,
             bit_offset: 0,
@@ -311,9 +360,9 @@ impl BitInput for CodestreamBitReader<'_> {
 mod tests {
     use super::*;
 
-    fn split_source(bytes: &[u8], split: usize) -> CodestreamData {
+    fn split_source(bytes: &[u8], split: usize) -> GpuCodestream {
         let storage: Arc<[u8]> = Arc::from(bytes);
-        CodestreamData::from_spans([
+        GpuCodestream::from_spans([
             (
                 0,
                 StreamSlice::from_shared_range(Arc::clone(&storage), 0..split).unwrap(),
@@ -360,7 +409,7 @@ mod tests {
                 StreamSlice::from_shared_range(Arc::clone(&storage), offset..offset + 1).unwrap(),
             )
         });
-        let source = CodestreamData::from_spans(byte_spans).unwrap();
+        let source = GpuCodestream::from_spans(byte_spans).unwrap();
         let mut copied = [0; 3];
         source.copy_range(2..5, &mut copied).unwrap();
         assert_eq!(copied, bytes[2..5]);
@@ -371,14 +420,11 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from([1, 2, 3, 4]);
         let first = StreamSlice::from_shared_range(Arc::clone(&bytes), 0..2).unwrap();
         let second = StreamSlice::from_shared_range(bytes, 2..4).unwrap();
-        assert!(CodestreamData::from_spans([(0, first.clone()), (3, second.clone())]).is_err());
-        assert!(CodestreamData::from_spans([(0, first), (1, second)]).is_err());
+        assert!(GpuCodestream::from_spans([(0, first.clone()), (3, second.clone())]).is_err());
+        assert!(GpuCodestream::from_spans([(0, first), (1, second)]).is_err());
         assert!(
-            CodestreamData::from_spans([(
-                1,
-                StreamSlice::from_shared(Arc::from(Vec::<u8>::new()))
-            )])
-            .is_err()
+            GpuCodestream::from_spans([(1, StreamSlice::from_shared(Arc::from(Vec::<u8>::new())))])
+                .is_err()
         );
 
         let source = split_source(&[1, 2, 3, 4], 2);

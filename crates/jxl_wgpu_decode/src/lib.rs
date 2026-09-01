@@ -30,6 +30,7 @@ mod entropy;
 mod entropy_window;
 mod error;
 mod inflight;
+mod input_budget;
 mod model;
 mod modular_tree;
 mod profile;
@@ -52,23 +53,27 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
 pub use codec_engine::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
+pub use codestream_data::GpuCodestream;
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularTransformFeature, ModularTreeError, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
+pub use input_budget::{
+    IncrementalInputBudget, IncrementalInputBudgetError, IncrementalInputBudgetSnapshot,
+};
 pub use jxl_gpu_bitstream::ParseLimits;
 pub use jxl_gpu_formats::{ImageLayout, PixelFormat};
 pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
     AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration, FrameMetadata, FrameTimebase,
-    GpuCodestream, GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping,
-    ModularPredictionProfile, ModularPredictor, NumericSampleMapping,
+    GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping, ModularPredictionProfile,
+    ModularPredictor, NumericSampleMapping,
 };
 pub use session::{
-    GpuDecodeSession, GpuDecoder, GpuFrameLease, GpuPendingFrame, GpuSubmissionEngine,
-    GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure, PrefetchGpuFrames, PrefetchProgress,
-    PreparedGpuSession, SubmittedGpuFrame,
+    GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,
+    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure,
+    PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession, SubmittedGpuFrame,
 };
 pub use vardct_engine::{
     VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctPendingFrame,

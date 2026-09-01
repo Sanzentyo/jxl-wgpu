@@ -7,8 +7,8 @@ use jxl::api::{
     JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
 use jxl_gpu_bitstream::{
-    EdgePreservingFilterInventory, GaborishInventory, InventoryLimits, ParseLimits,
-    RestorationFilterInventory,
+    ContainerStreamScanner, EdgePreservingFilterInventory, GaborishInventory, InventoryLimits,
+    ParseLimits, RestorationFilterInventory,
 };
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
 use jxl_gpu_protocol::{Extent2d, TransformKind};
@@ -21,8 +21,9 @@ use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
 use jxl_wgpu_decode::{
-    DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
-    PrefetchBackpressure, VarDctDecodeError, VarDctSubmissionEngine, WgpuDecodeEngine,
+    DecodeProfile, Error as DecodeError, GpuDecodeSession, GpuDecoder, GpuOutputRequest,
+    NumericSampleMapping, PrefetchBackpressure, VarDctDecodeError, VarDctSubmissionEngine,
+    WgpuDecodeEngine, WgpuDecodeSubmissionSession,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
@@ -31,6 +32,28 @@ use jxl_wgpu_encode::{
 use wgpu::util::DeviceExt;
 
 mod common;
+
+fn open_incremental(
+    decoder: &GpuDecoder<WgpuDecodeEngine>,
+    encoded: &[u8],
+    request: GpuOutputRequest,
+) -> GpuDecodeSession<WgpuDecodeSubmissionSession> {
+    let mut stream = decoder.stream(request).unwrap();
+    let mut transport = ContainerStreamScanner::new(decoder.container_stream_limits());
+    let first = encoded.len().min(1);
+    let second = encoded.len().min(17);
+    for range in [0..first, first..second, second..encoded.len()] {
+        for event in transport.push_chunk(Arc::from(&encoded[range])).unwrap() {
+            stream.push_transport_event(&event).unwrap();
+        }
+    }
+    for event in transport.finish_input().unwrap() {
+        stream.push_transport_event(&event).unwrap();
+    }
+    assert!(stream.is_ready());
+    assert!(stream.stats().retained_spans >= 2);
+    stream.finish().unwrap()
+}
 
 fn device() -> Option<(wgpu::AdapterInfo, wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -368,15 +391,26 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         NumericSampleMapping::NormalizedGray8,
     )
     .unwrap();
-    let mut modular_session = decoder
-        .open(common::gpu_gray8_lossless(), modular_request)
-        .unwrap();
+    let modular_input = common::gpu_gray8_lossless();
+    let mut modular_session = open_incremental(&decoder, modular_input, modular_request);
+    let modular_codestream_bytes = jxl_gpu_bitstream::parse(modular_input, ParseLimits::default())
+        .unwrap()
+        .codestream()
+        .len() as u64;
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        modular_codestream_bytes
+    );
     assert!(matches!(
         modular_session.profile(),
         DecodeProfile::ModularLossless { .. }
     ));
     assert!(modular_session.submission_session().modular().is_some());
     let modular_frame = modular_session.next_frame().unwrap().unwrap();
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        0
+    );
     let modular_readback = ImageReadbackPipeline::new(&backend)
         .submit(modular_frame.output())
         .unwrap()
@@ -413,12 +447,21 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
             dct8_packet = Some(encoded.clone());
         }
         let oracle = djxl_ppm(&encoded, extent);
-        let mut session = decoder
-            .open(
-                &encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-            )
-            .unwrap();
+        let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+        let mut session = if index == 0 {
+            let session = open_incremental(&decoder, &encoded, request);
+            let codestream_bytes = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+                .unwrap()
+                .codestream()
+                .len() as u64;
+            assert_eq!(
+                decoder.incremental_input_budget().snapshot().reserved_bytes,
+                codestream_bytes
+            );
+            session
+        } else {
+            decoder.open(&encoded, request).unwrap()
+        };
         let memory = session
             .submission_session()
             .vardct()
@@ -432,6 +475,10 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         } else {
             session.next_frame().unwrap().unwrap()
         };
+        assert_eq!(
+            decoder.incremental_input_budget().snapshot().reserved_bytes,
+            0
+        );
         assert_eq!(
             frame.output().outputs[0].layout.format,
             vardct_rgb8_format()
@@ -576,12 +623,19 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
             .unwrap()
             .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
     );
-    let mut session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .unwrap();
+    let codestream_bytes = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+        .unwrap()
+        .codestream()
+        .len() as u64;
+    let mut session = open_incremental(
+        &decoder,
+        &encoded,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+    );
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        codestream_bytes
+    );
     let vardct = session.submission_session().vardct().unwrap();
     let memory = vardct.memory_stats();
     assert!(!memory.deferred_hf_modular_metadata);
@@ -1417,12 +1471,19 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
             .unwrap()
             .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
     );
-    let mut session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .unwrap();
+    let codestream_bytes = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+        .unwrap()
+        .codestream()
+        .len() as u64;
+    let mut session = open_incremental(
+        &decoder,
+        &encoded,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+    );
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        codestream_bytes
+    );
     let vardct = session
         .submission_session()
         .vardct()
@@ -1442,6 +1503,11 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     assert_eq!(vardct.submissions_per_frame(), submissions_before_hf_plan);
 
     session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        codestream_bytes,
+        "staged local-HF parsing retains compressed spans after the LF submission"
+    );
     assert!(matches!(
         session
             .front_pending_frame()
@@ -1453,6 +1519,11 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     ));
 
     let frame = session.next_frame().unwrap().unwrap();
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        0,
+        "the final local-HF submission releases compressed spans"
+    );
     let vardct = session
         .submission_session()
         .vardct()
@@ -1507,15 +1578,23 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     drop(async_session);
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
-    let mut abandoned = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .unwrap();
+    let mut abandoned = open_incremental(
+        &decoder,
+        &encoded,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+    );
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        codestream_bytes
+    );
     assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
     drop(abandoned);
+    assert_eq!(
+        decoder.incremental_input_budget().snapshot().reserved_bytes,
+        0,
+        "cancelling a staged local-HF session releases its source spans immediately"
+    );
     let fence = backend.queue().submit(std::iter::empty());
     backend
         .device()

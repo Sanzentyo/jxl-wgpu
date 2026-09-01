@@ -2,16 +2,21 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{CODESTREAM_SIGNATURE, ParseLimits};
+use jxl_gpu_bitstream::{
+    CodestreamInventory, CodestreamInventoryEvent, CodestreamStreamLimits, CodestreamStreamScanner,
+    CodestreamStreamStats, ContainerStreamEvent, ContainerStreamLimits, FrameInventory,
+    ImageHeaderInventory, InventoryLimits, ParseLimits, StreamSlice,
+};
 
 use crate::{
     AnimationMetadata, DecodeProfile, Error, FrameMetadata, GpuCodestream, GpuOutputRequest,
-    InFlightLimiter, InFlightPermit, Result,
+    InFlightLimiter, InFlightPermit, IncrementalInputBudget, IncrementalInputBudgetSnapshot,
+    Result, input_budget::IncrementalInputPermit,
 };
 
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
@@ -152,10 +157,16 @@ pub trait GpuSubmissionEngine: Send + Sync + 'static {
         ParseLimits::default()
     }
 
+    /// Hard inventory limits for complete and incremental frontend paths.
+    fn inventory_limits(&self) -> InventoryLimits {
+        InventoryLimits::default()
+    }
+
     fn open(
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
+        inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>>;
 }
 
@@ -170,10 +181,15 @@ pub trait GpuSubmissionEngine: 'static {
         ParseLimits::default()
     }
 
+    fn inventory_limits(&self) -> InventoryLimits {
+        InventoryLimits::default()
+    }
+
     fn open(
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
+        inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>>;
 }
 
@@ -181,24 +197,31 @@ pub trait GpuSubmissionEngine: 'static {
 pub struct GpuDecoder<E: GpuSubmissionEngine> {
     engine: Arc<E>,
     parse_limits: ParseLimits,
+    incremental_input_budget: IncrementalInputBudget,
 }
 
 impl<E: GpuSubmissionEngine> GpuDecoder<E> {
     #[must_use]
     pub fn new(engine: E) -> Self {
         let parse_limits = engine.parse_limits();
+        let retained_limit = NonZeroU64::new(parse_limits.max_codestream_bytes.max(1))
+            .expect("the retained-input limit is forced nonzero");
         Self {
             engine: Arc::new(engine),
             parse_limits,
+            incremental_input_budget: IncrementalInputBudget::new(retained_limit),
         }
     }
 
     #[must_use]
     pub fn from_shared(engine: Arc<E>) -> Self {
         let parse_limits = engine.parse_limits();
+        let retained_limit = NonZeroU64::new(parse_limits.max_codestream_bytes.max(1))
+            .expect("the retained-input limit is forced nonzero");
         Self {
             engine,
             parse_limits,
+            incremental_input_budget: IncrementalInputBudget::new(retained_limit),
         }
     }
 
@@ -212,6 +235,29 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
     #[must_use]
     pub const fn parse_limits(&self) -> ParseLimits {
         self.parse_limits
+    }
+
+    /// Matching transport limits for the [`jxl_gpu_bitstream::ContainerStreamScanner`] that feeds
+    /// [`Self::stream`].
+    #[must_use]
+    pub const fn container_stream_limits(&self) -> ContainerStreamLimits {
+        ContainerStreamLimits {
+            parse: self.parse_limits,
+            max_chunk_bytes: self.parse_limits.max_input_bytes,
+            max_buffered_fragment_bytes: self.parse_limits.max_codestream_bytes,
+        }
+    }
+
+    /// Replaces the shared compressed-input budget used only by incremental decoder streams.
+    #[must_use]
+    pub fn with_incremental_input_budget(mut self, budget: IncrementalInputBudget) -> Self {
+        self.incremental_input_budget = budget;
+        self
+    }
+
+    #[must_use]
+    pub const fn incremental_input_budget(&self) -> &IncrementalInputBudget {
+        &self.incremental_input_budget
     }
 
     #[must_use]
@@ -236,9 +282,16 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
         request: GpuOutputRequest,
     ) -> Result<GpuDecodeSession<E::Session>> {
         request.format().validate()?;
-        let codestream = parse_shared(encoded, self.parse_limits)?;
-        let prepared = self.engine.open(codestream, &request)?;
+        let (codestream, inventory) =
+            parse_shared(encoded, self.parse_limits, self.engine.inventory_limits())?;
+        let prepared = self.engine.open(codestream, &request, inventory)?;
         GpuDecodeSession::new(prepared, request)
+    }
+
+    /// Starts a decoder that accepts transport events without joining the codestream spans.
+    pub fn stream(&self, request: GpuOutputRequest) -> Result<GpuDecodeStream<E>> {
+        request.format().validate()?;
+        Ok(GpuDecodeStream::new(self, request))
     }
 }
 
@@ -281,6 +334,7 @@ impl<E: GpuSubmissionEngine> Clone for GpuDecoder<E> {
         Self {
             engine: Arc::clone(&self.engine),
             parse_limits: self.parse_limits,
+            incremental_input_budget: self.incremental_input_budget.clone(),
         }
     }
 }
@@ -291,17 +345,22 @@ impl<E: GpuSubmissionEngine + fmt::Debug> fmt::Debug for GpuDecoder<E> {
             .debug_struct("GpuDecoder")
             .field("engine", &self.engine)
             .field("parse_limits", &self.parse_limits)
+            .field("incremental_input_budget", &self.incremental_input_budget)
             .finish()
     }
 }
 
-fn parse_shared(encoded: Arc<[u8]>, limits: ParseLimits) -> Result<GpuCodestream> {
-    if encoded.starts_with(&CODESTREAM_SIGNATURE) {
-        jxl_gpu_bitstream::parse(&encoded, limits)?;
-        let length = encoded.len();
-        return Ok(GpuCodestream::new(encoded, 0..length, false));
-    }
+fn parse_shared(
+    encoded: Arc<[u8]>,
+    limits: ParseLimits,
+    inventory_limits: InventoryLimits,
+) -> Result<(GpuCodestream, Arc<CodestreamInventory>)> {
     let parsed = jxl_gpu_bitstream::parse(&encoded, limits)?;
+    let inventory = Arc::new(
+        parsed
+            .codestream_inventory(inventory_limits)
+            .map_err(Error::CodestreamInventory)?,
+    );
     let is_container = parsed.is_container();
     let (storage, byte_range) = match parsed.into_codestream() {
         Cow::Borrowed(codestream) => {
@@ -326,7 +385,262 @@ fn parse_shared(encoded: Arc<[u8]>, limits: ParseLimits) -> Result<GpuCodestream
             (Arc::from(codestream), 0..length)
         }
     };
-    Ok(GpuCodestream::new(storage, byte_range, is_container))
+    Ok((
+        GpuCodestream::from_shared(storage, byte_range, is_container)?,
+        inventory,
+    ))
+}
+
+/// Observable state of one event-fed GPU decode frontend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuDecodeStreamStats {
+    pub codestream: CodestreamStreamStats,
+    pub retained_codestream_bytes: u64,
+    pub retained_spans: usize,
+    pub completed_frames: u32,
+    pub authoritative_end: bool,
+    pub input_budget: IncrementalInputBudgetSnapshot,
+}
+
+/// Incremental frontend that turns validated transport events into one multi-span GPU session.
+///
+/// Feed borrowed events from [`jxl_gpu_bitstream::ContainerStreamScanner`] in order. A
+/// `CodestreamChunk` is admitted against the decoder's shared [`IncrementalInputBudget`] before
+/// either scanner state or retained ownership changes, so budget exhaustion is retryable. The
+/// final source and its one growable permit move into the codec engine and are released when that
+/// engine no longer needs compressed bytes or when the stream/session is cancelled.
+pub struct GpuDecodeStream<E: GpuSubmissionEngine> {
+    engine: Arc<E>,
+    request: GpuOutputRequest,
+    scanner: CodestreamStreamScanner,
+    spans: Vec<(u64, StreamSlice)>,
+    image_header: Option<Arc<ImageHeaderInventory>>,
+    frames: Vec<Arc<FrameInventory>>,
+    completed_frames: u32,
+    transport_end: Option<(u64, bool)>,
+    retained_input: Option<IncrementalInputPermit>,
+    input_budget: IncrementalInputBudget,
+    failed: bool,
+}
+
+impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
+    fn new(decoder: &GpuDecoder<E>, request: GpuOutputRequest) -> Self {
+        let defaults = CodestreamStreamLimits::default();
+        let max_codestream_bytes = decoder
+            .parse_limits
+            .max_input_bytes
+            .min(decoder.parse_limits.max_codestream_bytes);
+        let scanner = CodestreamStreamScanner::new(CodestreamStreamLimits {
+            inventory: decoder.engine.inventory_limits(),
+            max_codestream_bytes,
+            max_image_prefix_bytes: defaults.max_image_prefix_bytes.min(max_codestream_bytes),
+            max_frame_prefix_bytes: defaults.max_frame_prefix_bytes.min(max_codestream_bytes),
+        });
+        Self {
+            engine: Arc::clone(&decoder.engine),
+            request,
+            scanner,
+            spans: Vec::new(),
+            image_header: None,
+            frames: Vec::new(),
+            completed_frames: 0,
+            transport_end: None,
+            retained_input: Some(decoder.incremental_input_budget.reserve_empty()),
+            input_budget: decoder.incremental_input_budget.clone(),
+            failed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> GpuDecodeStreamStats {
+        GpuDecodeStreamStats {
+            codestream: self.scanner.stats(),
+            retained_codestream_bytes: self
+                .retained_input
+                .as_ref()
+                .map_or(0, IncrementalInputPermit::bytes),
+            retained_spans: self.spans.len(),
+            completed_frames: self.completed_frames,
+            authoritative_end: self.transport_end.is_some(),
+            input_budget: self.input_budget.snapshot(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.transport_end.is_some() && !self.failed
+    }
+
+    /// Observes one transport event without taking ownership of auxiliary-box data.
+    ///
+    /// An input-budget error leaves the event unconsumed and may be retried after another stream
+    /// releases its retained source. Syntax, ordering, allocation, and inventory failures poison
+    /// this stream and release all its retained spans immediately.
+    pub fn push_transport_event(&mut self, event: &ContainerStreamEvent) -> Result<()> {
+        if self.failed {
+            return Err(Error::IncrementalInputPoisoned);
+        }
+        let chunk = match event {
+            ContainerStreamEvent::CodestreamChunk {
+                logical_offset,
+                bytes,
+            } if !bytes.is_empty() => Some((*logical_offset, bytes.clone())),
+            _ => None,
+        };
+        if chunk.is_some()
+            && let Err(error) = self.spans.try_reserve(1)
+        {
+            return self.fail(Error::backend(format_args!(
+                "incremental codestream span-table allocation failed: {error}"
+            )));
+        }
+        if let Some((_, bytes)) = &chunk {
+            let additional = u64::try_from(bytes.len())
+                .map_err(|_| Error::backend("incremental codestream span exceeds u64"))?;
+            self.retained_input
+                .as_ref()
+                .ok_or(Error::EngineContract(
+                    "incremental input permit is absent before stream finish",
+                ))?
+                .try_grow(additional)?;
+        }
+
+        let inventory_events = match self.scanner.push_transport_event(event) {
+            Ok(events) => events,
+            Err(error) => return self.fail(error.into()),
+        };
+        if let Some(span) = chunk {
+            self.spans.push(span);
+        }
+        if let Err(error) = self.handle_inventory_events(inventory_events, event) {
+            return self.fail(error);
+        }
+        Ok(())
+    }
+
+    /// Consumes the authoritative event stream and opens the same GPU session used by contiguous
+    /// input. No complete host codestream is assembled.
+    pub fn finish(mut self) -> Result<GpuDecodeSession<E::Session>> {
+        if self.failed {
+            return Err(Error::IncrementalInputPoisoned);
+        }
+        let (codestream_bytes, is_container) = self
+            .transport_end
+            .ok_or(Error::IncrementalInputIncomplete)?;
+        let image_header = self.image_header.take().ok_or(Error::EngineContract(
+            "incremental inventory omitted the image header",
+        ))?;
+        if usize::try_from(self.completed_frames).ok() != Some(self.frames.len()) {
+            return Err(Error::EngineContract(
+                "incremental inventory frame completion count is inconsistent",
+            ));
+        }
+        let inventory = Arc::new(CodestreamInventory {
+            codestream_bytes,
+            image_header: (*image_header).clone(),
+            frames: self
+                .frames
+                .drain(..)
+                .map(|frame| (*frame).clone())
+                .collect(),
+        });
+        let retained_input = self.retained_input.take().ok_or(Error::EngineContract(
+            "incremental input permit was consumed before stream finish",
+        ))?;
+        let codestream =
+            GpuCodestream::from_stream_spans(self.spans.drain(..), is_container, retained_input)?;
+        if codestream.logical_bytes() != codestream_bytes {
+            return Err(Error::EngineContract(
+                "incremental source length differs from authoritative transport end",
+            ));
+        }
+        let prepared = self.engine.open(codestream, &self.request, inventory)?;
+        GpuDecodeSession::new(prepared, self.request)
+    }
+
+    fn handle_inventory_events(
+        &mut self,
+        events: Vec<CodestreamInventoryEvent>,
+        transport_event: &ContainerStreamEvent,
+    ) -> Result<()> {
+        for event in events {
+            match event {
+                CodestreamInventoryEvent::ImageHeader(header) => {
+                    if self.image_header.replace(header).is_some() {
+                        return Err(Error::EngineContract(
+                            "incremental inventory emitted the image header twice",
+                        ));
+                    }
+                }
+                CodestreamInventoryEvent::FrameStart(frame) => {
+                    if usize::try_from(frame.frame_index).ok() != Some(self.frames.len()) {
+                        return Err(Error::EngineContract(
+                            "incremental inventory emitted a non-sequential frame index",
+                        ));
+                    }
+                    self.frames.push(frame);
+                }
+                CodestreamInventoryEvent::SectionChunk { .. } => {}
+                CodestreamInventoryEvent::FrameEnd { frame_index } => {
+                    if frame_index != self.completed_frames {
+                        return Err(Error::EngineContract(
+                            "incremental inventory completed frames out of order",
+                        ));
+                    }
+                    self.completed_frames =
+                        self.completed_frames
+                            .checked_add(1)
+                            .ok_or(Error::EngineContract(
+                                "incremental completed-frame count overflow",
+                            ))?;
+                }
+                CodestreamInventoryEvent::End {
+                    codestream_bytes,
+                    frame_count,
+                } => {
+                    let ContainerStreamEvent::End {
+                        codestream_bytes: transport_bytes,
+                        is_container,
+                    } = transport_event
+                    else {
+                        return Err(Error::EngineContract(
+                            "incremental inventory ended without the transport end",
+                        ));
+                    };
+                    if codestream_bytes != *transport_bytes
+                        || frame_count != self.completed_frames
+                        || self.transport_end.is_some()
+                    {
+                        return Err(Error::EngineContract(
+                            "incremental inventory end metadata is inconsistent",
+                        ));
+                    }
+                    self.transport_end = Some((codestream_bytes, *is_container));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, error: Error) -> Result<T> {
+        self.failed = true;
+        self.spans.clear();
+        self.frames.clear();
+        self.image_header = None;
+        self.retained_input = None;
+        Err(error)
+    }
+}
+
+impl<E: GpuSubmissionEngine + fmt::Debug> fmt::Debug for GpuDecodeStream<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuDecodeStream")
+            .field("engine", &self.engine)
+            .field("stats", &self.stats())
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Bounded ownership wrapper for one GPU-resident output.
@@ -912,13 +1226,17 @@ mod tests {
             fixture(include_str!("../test-data/gpu_gray8_lossless.jxl.hex")),
         ] {
             let storage: Arc<[u8]> = Arc::from(encoded);
-            let parsed = parse_shared(Arc::clone(&storage), ParseLimits::default()).unwrap();
-            assert!(Arc::ptr_eq(&storage, &parsed.shared_storage()));
-            assert!(parsed.bytes().starts_with(&CODESTREAM_SIGNATURE));
-            assert_eq!(
-                &parsed.shared_storage()[parsed.storage_range()],
-                parsed.bytes()
-            );
+            let (parsed, inventory) = parse_shared(
+                Arc::clone(&storage),
+                ParseLimits::default(),
+                InventoryLimits::default(),
+            )
+            .unwrap();
+            let bytes = parsed.contiguous_bytes().unwrap();
+            assert!(bytes.starts_with(&jxl_gpu_bitstream::CODESTREAM_SIGNATURE));
+            assert_eq!(bytes.len() as u64, inventory.codestream_bytes);
+            assert!(bytes.as_ptr() >= storage.as_ptr());
+            assert!(bytes.as_ptr() < storage[storage.len()..].as_ptr());
         }
     }
 

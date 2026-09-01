@@ -5,7 +5,8 @@ use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
 use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
-use crate::codestream_data::{CodestreamBitReader, CodestreamData};
+use crate::GpuCodestream;
+use crate::codestream_data::CodestreamBitReader;
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::GroupStreamSegment;
 use crate::modular_tree::{
@@ -238,7 +239,7 @@ fn map_modular_reader_error(source: crate::Error) -> BoundedVarDctPacketError {
 #[derive(Clone, Copy)]
 enum PacketSource<'source> {
     Slice(&'source [u8]),
-    Spans(&'source CodestreamData),
+    Spans(&'source GpuCodestream),
 }
 
 impl<'source> PacketSource<'source> {
@@ -363,7 +364,7 @@ impl BoundedVarDctPacketPlan {
 
     /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
     pub(crate) fn parse_source(
-        source: &CodestreamData,
+        source: &GpuCodestream,
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
         Self::parse_inner(PacketSource::Spans(source), inventory)
@@ -660,7 +661,7 @@ impl BoundedVarDctPacketPlan {
     /// Parses the resumed HF metadata prefix from a multi-span codestream.
     pub(crate) fn parse_hf_continuation_source(
         &self,
-        source: &CodestreamData,
+        source: &GpuCodestream,
         group: &BoundedVarDctGroupPlan,
         lf_entropy_end: u32,
     ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
@@ -1881,8 +1882,8 @@ mod tests {
         )
     }
 
-    fn split_source(storage: Arc<[u8]>, split: usize) -> CodestreamData {
-        CodestreamData::from_spans([
+    fn split_source(storage: Arc<[u8]>, split: usize) -> GpuCodestream {
+        GpuCodestream::from_spans([
             (
                 0,
                 StreamSlice::from_shared_range(Arc::clone(&storage), 0..split).unwrap(),
@@ -2064,7 +2065,7 @@ mod tests {
                 StreamSlice::from_shared_range(Arc::clone(&storage), offset..offset + 1).unwrap(),
             )
         });
-        let source = CodestreamData::from_spans(spans).unwrap();
+        let source = GpuCodestream::from_spans(spans).unwrap();
         let actual = BoundedVarDctPacketPlan::parse_source(&source, &inventory).unwrap();
         let actual_continuation = actual
             .parse_hf_continuation_source(&source, &actual.groups[0], 67_171)

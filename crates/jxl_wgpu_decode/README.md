@@ -26,8 +26,9 @@ decode a pass-group entropy token, residual, predictor, color transform, or pixe
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
 host slice. The same span table copies exact entropy ranges into the reusable GPU window, including
 ranges that cross a chunk or entropy-word boundary, without first joining the codestream. The
-current public `GpuDecoder::open` still creates a single-span source after contiguous transport
-validation; feeding incremental section events into this internal boundary is the next API step.
+contiguous `GpuDecoder::open` creates one span, while `GpuDecoder::stream` accepts borrowed
+`ContainerStreamEvent` values and supplies the same engine boundary with an arbitrary checked span
+table plus the incrementally produced inventory.
 
 The compute shader reads Prefix or ANS symbols and hybrid integers from bounded codestream windows,
 validates every bit and output bound, applies LZ77, walks the MA tree, reconstructs all predictors,
@@ -125,7 +126,11 @@ zero-padded to four bytes without constructing a second full-size host `Vec`. In
 metadata, MA descriptors, block-context maps, custom coefficient-order permutations, and
 cursor-dependent local-HF metadata all read the same span table without joining it. Slice-based
 low-level APIs remain zero-copy through the same reader contract. The public decoder remains
-single-span only because section-event ingestion is not yet connected to this internal boundary.
+runtime-neutral: `GpuDecodeStream` feeds the public transport events synchronously, then returns the
+ordinary sync/async `GpuDecodeSession` after authoritative end-of-input. A separate cloneable input
+budget covers the compressed spans retained by concurrent streams without conflating host storage
+with the GPU allocation budget. Its permit moves into the codec source and is released at the last
+submission that still needs those bytes, or immediately when the stream/session is cancelled.
 
 The host inventories bounded scalar headers, packs the shared or local MA-tree and coefficient entropy descriptors,
 and expands only the small HF coefficient-order metadata permutation. It does not decode an LF/HF

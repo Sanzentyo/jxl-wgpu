@@ -103,6 +103,10 @@ pub enum Error {
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error("JPEG XL standard codestream inventory failed: {0}")]
     CodestreamInventory(#[from] jxl_gpu_bitstream::InventoryError),
+    #[error("incremental JPEG XL codestream inventory failed: {0}")]
+    CodestreamStream(#[from] jxl_gpu_bitstream::CodestreamStreamError),
+    #[error(transparent)]
+    IncrementalInputBudget(#[from] crate::IncrementalInputBudgetError),
     #[error("invalid requested pixel format: {0}")]
     PixelFormat(#[from] jxl_gpu_formats::PixelFormatError),
     #[error("invalid requested image layout: {0}")]
@@ -189,6 +193,10 @@ pub enum Error {
     MissingFinalFrame,
     #[error("GPU decode session cannot continue after a previous engine failure")]
     SessionPoisoned,
+    #[error("incremental GPU decode input ended before an authoritative transport End event")]
+    IncrementalInputIncomplete,
+    #[error("incremental GPU decode input cannot continue after a previous failure")]
+    IncrementalInputPoisoned,
 }
 
 impl Error {

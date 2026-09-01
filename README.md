@@ -42,14 +42,20 @@ ordered codestream and auxiliary-box payloads remain zero-copy `Arc` slices; onl
 waiting on a v1 gap use payload-only storage bounded by explicitly reported logical bytes. Its
 terminal event validates transport end-of-input. A second bounded scanner incrementally parses the
 image header and each frame header/TOC, emits frame inventories before their physical sections, and
-routes ordered section ranges without retaining the whole codestream. The stock decode engines
-still lack public section-event integration. Both engines retain a checked table of shared logical
-spans and copy bounded GPU upload ranges across physical chunk boundaries; VarDCT also initializes
-its temporary whole-codestream GPU buffer directly from those spans without a second host-sized
-`Vec`. Modular and VarDCT scalar metadata bit parsing is span-native, including VarDCT block-context
-maps, custom coefficient-order permutations, MA descriptors, and cursor-dependent local-HF
-headers. `GpuDecoder::open` still enters through contiguous transport and constructs a single-span
-source, so this is not yet an incremental `GpuDecoder` claim.
+routes ordered section ranges without retaining the whole codestream. `GpuDecoder::stream` consumes
+those borrowed transport events, builds one checked logical span table without joining it, and
+hands the same inventory/source pair to the stock coding-mode selector used by `open`. Its shared,
+non-blocking incremental-input budget admits a `CodestreamChunk` before scanner state changes, so a
+rejected event is retryable across concurrent streams. `GpuDecoder::container_stream_limits`
+provides matching hard limits for the caller's transport scanner. The one growable ownership
+permit follows
+the source into the selected engine: Modular releases it after submission, staged local-tree
+VarDCT retains it through cursor-dependent HF submission, and cancellation releases it immediately.
+Both engines copy bounded GPU upload ranges across physical chunk boundaries; VarDCT also
+initializes its temporary whole-codestream GPU buffer directly from those spans without a second
+host-sized `Vec`. All Modular and VarDCT scalar metadata bit parsing is span-native, including
+VarDCT block-context maps, custom coefficient-order permutations, MA descriptors, and
+cursor-dependent local-HF headers.
 
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.

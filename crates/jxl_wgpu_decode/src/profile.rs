@@ -3,9 +3,10 @@ use jxl_gpu_bitstream::{
     ImageHeaderInventory, SampleBitDepth,
 };
 
-use crate::codestream_data::CodestreamData;
 use crate::modular_tree::BitInput;
-use crate::{ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile};
+use crate::{
+    GpuCodestream, ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile,
+};
 use crate::{
     ModularTransformFeature,
     modular_tree::{MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config},
@@ -46,7 +47,7 @@ pub(crate) struct StandardModularProfile {
 }
 
 fn validate_image_header(
-    codestream: &CodestreamData,
+    codestream: &GpuCodestream,
     image: &ImageHeaderInventory,
     channels: ModularChannels,
     bits_per_sample: u8,
@@ -172,7 +173,7 @@ fn read_size(reader: &mut impl BitInput, has_ratio: bool) -> Result<u32> {
 /// headers are inspected here. Entropy symbols, residuals, predictors, and pixels are deliberately
 /// left unread for the GPU kernel.
 pub(crate) fn parse_standard_modular_profile(
-    codestream: &CodestreamData,
+    codestream: &GpuCodestream,
     inventory: &CodestreamInventory,
 ) -> Result<StandardModularProfile> {
     let image = &inventory.image_header;
@@ -466,7 +467,7 @@ fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {
 }
 
 fn validate_empty_non_pass_sections(
-    codestream: &CodestreamData,
+    codestream: &GpuCodestream,
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<()> {
     for section in &frame.sections {
@@ -535,12 +536,11 @@ mod tests {
             .unwrap();
         let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
         let complete =
-            CodestreamData::from_spans([(0, StreamSlice::from_shared(Arc::clone(&bytes)))])
-                .unwrap();
+            GpuCodestream::from_spans([(0, StreamSlice::from_shared(Arc::clone(&bytes)))]).unwrap();
         let expected = parse_standard_modular_profile(&complete, &inventory).unwrap();
 
         for split_offset in 0..=bytes.len() {
-            let split_source = CodestreamData::from_spans([
+            let split_source = GpuCodestream::from_spans([
                 (
                     0,
                     StreamSlice::from_shared_range(Arc::clone(&bytes), 0..split_offset).unwrap(),

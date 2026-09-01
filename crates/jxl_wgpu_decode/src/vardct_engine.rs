@@ -71,7 +71,6 @@ use crate::{
     AnimationMetadata, DecodeProfile, Error as DecodeError, FrameDuration, FrameMetadata,
     GpuCodestream, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, Result as DecodeResult, SubmittedGpuFrame,
-    codestream_data::CodestreamData,
 };
 
 const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
@@ -775,14 +774,12 @@ impl VarDctSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        let codestream =
-            CodestreamData::from_gpu_codestream(codestream).map_err(map_codestream_source_error)?;
         self.open_with_inventory_data(codestream, request, inventory)
     }
 
     pub(crate) fn open_with_inventory_data(
         &self,
-        codestream: CodestreamData,
+        codestream: GpuCodestream,
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
@@ -829,7 +826,7 @@ impl std::fmt::Debug for VarDctSubmissionEngine {
 }
 
 struct VarDctSource {
-    codestream: CodestreamData,
+    codestream: GpuCodestream,
     packet: BoundedVarDctPacketPlan,
     groups: Vec<VarDctGroupSource>,
     lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
@@ -990,7 +987,7 @@ fn map_codestream_source_error(source: DecodeError) -> VarDctDecodeError {
 }
 
 fn copy_stream_segment(
-    codestream: &CodestreamData,
+    codestream: &GpuCodestream,
     segment: GroupStreamSegment,
     upload: &mut [u8],
     detail: &'static str,
@@ -1354,25 +1351,27 @@ impl GpuSubmissionEngine for VarDctSubmissionEngine {
         }
     }
 
+    fn inventory_limits(&self) -> InventoryLimits {
+        InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: self.parse_limits().max_codestream_bytes,
+            ..InventoryLimits::default()
+        }
+    }
+
     fn open(
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
+        inventory: Arc<CodestreamInventory>,
     ) -> DecodeResult<PreparedGpuSession<Self::Session>> {
-        let parsed = jxl_gpu_bitstream::parse(codestream.bytes(), self.parse_limits())?;
-        let inventory = parsed.codestream_inventory(InventoryLimits {
-            max_frames: 1,
-            max_total_section_bytes: u64::try_from(codestream.bytes().len())
-                .map_err(|_| DecodeError::backend("VarDCT codestream size exceeds u64"))?,
-            ..InventoryLimits::default()
-        })?;
         self.open_with_inventory(codestream, request, &inventory)
     }
 }
 
 fn prepare_source(
     backend: &WgpuBackend,
-    codestream: CodestreamData,
+    codestream: GpuCodestream,
     request: &GpuOutputRequest,
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     output_variant: KernelVariant,
@@ -3028,7 +3027,7 @@ fn resident_image_planes<'a>(
 }
 
 fn upload_codestream(
-    codestream: &CodestreamData,
+    codestream: &GpuCodestream,
     buffer: &wgpu::Buffer,
     padded_bytes: u64,
 ) -> Result<(), VarDctDecodeError> {
@@ -4363,7 +4362,7 @@ mod tests {
     #[test]
     fn bounded_stream_upload_crosses_physical_codestream_spans() {
         let bytes: Arc<[u8]> = Arc::from([10, 11, 12, 13, 14, 15, 16]);
-        let source = CodestreamData::from_spans([
+        let source = GpuCodestream::from_spans([
             (
                 0,
                 StreamSlice::from_shared_range(Arc::clone(&bytes), 0..3).unwrap(),

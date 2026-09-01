@@ -60,7 +60,14 @@ contract error. Its complete packet plan is identical at every byte split of the
 EPF2 fixture. A custom-order 438x589 stream is then parsed from one-byte physical spans, including a
 cursor-dependent HF continuation, and its coefficient-order words and final entropy cursor match
 the previous `jxl_coding` reader exactly. Public event-to-engine ingestion and retained-span
-backpressure/cancellation are still required before `FRONT-03` can be complete.
+backpressure/cancellation are covered separately by `gpu_decode`: every two-chunk split produces
+the contiguous inventory, one-byte fragmented-container delivery reaches a custom engine as a
+multi-span source, a second concurrent stream receives retryable admission without consuming its
+event, and cancellation releases the exact retained-byte reservation. The actual-adapter selector
+test feeds three transport chunks through the same public API for both Modular and VarDCT and checks
+the existing output oracles. When `cjxl` is available, the staged local-tree test additionally proves
+that source admission survives the LF map, releases after final HF submission, and releases
+immediately when its pending session is abandoned. These gates complete `FRONT-03`.
 
 ## Procedural VarDCT encoder matrix
 

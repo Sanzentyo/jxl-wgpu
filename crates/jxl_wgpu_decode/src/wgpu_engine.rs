@@ -21,7 +21,6 @@ use jxl_wgpu::{
 use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
-use crate::codestream_data::CodestreamData;
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::{
     GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
@@ -587,13 +586,13 @@ impl WgpuSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
-        let codestream = Arc::new(CodestreamData::from_gpu_codestream(codestream)?);
+        let codestream = Arc::new(codestream);
         self.open_with_inventory_data(codestream, request, inventory)
     }
 
     pub(crate) fn open_with_inventory_data(
         &self,
-        codestream: Arc<CodestreamData>,
+        codestream: Arc<GpuCodestream>,
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
@@ -872,20 +871,20 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         }
     }
 
+    fn inventory_limits(&self) -> InventoryLimits {
+        InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: self.parse_limits().max_codestream_bytes,
+            ..InventoryLimits::default()
+        }
+    }
+
     fn open(
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
+        inventory: Arc<CodestreamInventory>,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        let parsed = jxl_gpu_bitstream::parse(codestream.bytes(), self.parse_limits())?;
-        let inventory = parsed
-            .codestream_inventory(InventoryLimits {
-                max_frames: 1,
-                max_total_section_bytes: u64::try_from(codestream.bytes().len())
-                    .map_err(|_| Error::backend("codestream size exceeds u64"))?,
-                ..InventoryLimits::default()
-            })
-            .map_err(Error::CodestreamInventory)?;
         self.open_with_inventory(codestream, request, &inventory)
     }
 }
@@ -1154,7 +1153,7 @@ impl GpuPendingFrame for WgpuPendingFrame {
 }
 
 struct DecodeSource {
-    codestream: Arc<CodestreamData>,
+    codestream: Arc<GpuCodestream>,
     profile: StandardModularProfile,
     dispatch_layout: GroupDispatchLayout,
     // Immutable within the session. All independently decoded groups share the standard
