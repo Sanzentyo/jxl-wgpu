@@ -141,9 +141,11 @@ pub enum NumericDisplayError {
 
 /// Texture properties used by a display conversion.
 ///
-/// `Rgba8Unorm` is the portable storage-texture format used by this backend. The pipeline always
-/// adds `STORAGE_BINDING`, `TEXTURE_BINDING`, `RENDER_ATTACHMENT`, `COPY_SRC`, and `COPY_DST`; use
-/// `additional_usage` only for an application-specific usage bit.
+/// `Rgba8Unorm` is the default SDR storage-texture format. Color-image conversion also accepts
+/// `Rgba16Float`, which is required for wide-gamut or HDR input so that linear-light excursions are
+/// not silently clipped. The pipeline always adds `STORAGE_BINDING`, `TEXTURE_BINDING`,
+/// `RENDER_ATTACHMENT`, `COPY_SRC`, and `COPY_DST`; use `additional_usage` only for an
+/// application-specific usage bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayTextureDescriptor {
     pub format: wgpu::TextureFormat,
@@ -159,11 +161,33 @@ impl Default for DisplayTextureDescriptor {
     }
 }
 
+impl DisplayTextureDescriptor {
+    /// A float texture preserving linear BT.709 values outside the normalized SDR range.
+    #[must_use]
+    pub const fn linear_bt709_hdr() -> Self {
+        Self {
+            format: wgpu::TextureFormat::Rgba16Float,
+            additional_usage: wgpu::TextureUsages::empty(),
+        }
+    }
+}
+
 /// Color encoding of a texture returned by [`DisplayPipeline`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DisplayColorEncoding {
     /// Full-range linear-light RGB using BT.709/sRGB primaries.
     LinearBt709,
+}
+
+/// Luminance normalization of linear RGB values returned by [`DisplayPipeline`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisplayLuminanceEncoding {
+    /// Relative linear light used by Linear, sRGB, BT.709, and BT.2020 SDR inputs.
+    Relative,
+    /// Absolute PQ light normalized so that `1.0` represents 10,000 nit.
+    PqNormalized10000Nits,
+    /// Scene-linear HLG after inverse OETF, before any display-specific OOTF.
+    HlgScene,
 }
 
 /// A GPU-resident texture ready for sampling, rendering, or copying.
@@ -176,8 +200,10 @@ pub struct DisplayTexture {
     pub extent: Extent2d,
     pub format: wgpu::TextureFormat,
     pub usage: wgpu::TextureUsages,
-    /// The explicit interpretation of the normalized RGB texels.
+    /// The explicit primary/transfer interpretation of the RGB texels.
     pub color_encoding: DisplayColorEncoding,
+    /// The explicit luminance normalization of the linear RGB texels.
+    pub luminance_encoding: DisplayLuminanceEncoding,
     /// Arithmetic used for a numeric visualization, or `None` for color image/RGB conversion.
     pub numeric_precision: Option<NumericDisplayPrecision>,
     texture: Arc<wgpu::Texture>,
@@ -402,10 +428,11 @@ impl DisplayPipeline {
     /// Encodes a pitch-linear color buffer into a linear-light BT.709 RGBA display texture.
     ///
     /// Matrix, transfer, range, chroma siting, and pixel format are taken from
-    /// `source.layout.format`. The source must use BT.709/sRGB primaries and a supported transfer;
-    /// unsupported HDR/wide-gamut contracts reject instead of being silently mis-presented. Rows
-    /// may be tightly packed; unlike a buffer-to-texture copy, this compute path has no 256-byte
-    /// row-pitch rule.
+    /// `source.layout.format`. D65 BT.709, BT.2020, and Display-P3 primaries plus
+    /// Linear/sRGB/BT.709/BT.2020/PQ/HLG transfers are converted without a host wait. Wide-gamut or
+    /// HDR input requires [`DisplayTextureDescriptor::linear_bt709_hdr`] so that negative and
+    /// greater-than-one linear values remain representable. Rows may be tightly packed; unlike a
+    /// buffer-to-texture copy, this compute path has no 256-byte row-pitch rule.
     pub fn encode_image(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -456,7 +483,6 @@ impl DisplayPipeline {
         label: &str,
     ) -> Result<DisplayTexture> {
         require_submission_guard(submission_guard, buffer)?;
-        validate_display_descriptor(descriptor)?;
         validate_extent(self.device(), layout.extent)?;
         require_buffer_usage(
             buffer.as_wgpu_buffer(),
@@ -464,18 +490,20 @@ impl DisplayPipeline {
             "image display source",
         )?;
         let validated = validate_image(layout, buffer.size())?;
+        validate_image_display_descriptor(descriptor, validated.requires_float_output)?;
         validate_storage_binding(self.device(), validated.binding_size)?;
 
-        let texture = self.create_texture(layout.extent, descriptor, label);
+        let mut texture = self.create_texture(layout.extent, descriptor, label);
+        texture.luminance_encoding = validated.luminance_encoding;
         let variant = self.kernel_variant("display_image", KernelVariant::Tile16x16)?;
-        let pipeline = self.compute_pipeline(
+        let pipeline = self.image_compute_pipeline(
             DisplayPipelineKey::Image {
                 format: validated.format,
                 destination: descriptor.format,
                 variant,
             },
             label,
-            wgpu::include_wgsl!("../shaders/display_image.wgsl"),
+            descriptor.format,
             variant,
         )?;
         let params = validated.params;
@@ -766,6 +794,7 @@ impl DisplayPipeline {
             format: descriptor.format,
             usage,
             color_encoding: DisplayColorEncoding::LinearBt709,
+            luminance_encoding: DisplayLuminanceEncoding::Relative,
             numeric_precision: None,
             texture,
             view,
@@ -818,6 +847,46 @@ impl DisplayPipeline {
             return Ok(Arc::clone(pipeline));
         }
         let source = numeric_shader_source(native_f64);
+        let module = self
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
+        let pipeline = Arc::new(self.device().create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
+                cache: None,
+            },
+        ));
+        pipelines.insert(key, Arc::clone(&pipeline));
+        Ok(pipeline)
+    }
+
+    fn image_compute_pipeline(
+        &self,
+        key: DisplayPipelineKey,
+        label: &str,
+        destination: wgpu::TextureFormat,
+        variant: KernelVariant,
+    ) -> Result<Arc<wgpu::ComputePipeline>> {
+        let mut pipelines = self.pipelines();
+        if let Some(pipeline) = pipelines.get(&key) {
+            return Ok(Arc::clone(pipeline));
+        }
+        let source = image_shader_source(destination);
         let module = self
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1195,6 +1264,8 @@ struct ValidatedImage {
     format: DisplayImageFormat,
     params: DisplayImageParams,
     binding_size: u64,
+    requires_float_output: bool,
+    luminance_encoding: DisplayLuminanceEncoding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1212,6 +1283,7 @@ struct DisplayImageFormat {
     bits: u8,
     storage_bits: u8,
     transfer: u8,
+    primaries: u8,
 }
 
 fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedImage> {
@@ -1242,21 +1314,26 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             ));
         }
     };
-    if color.space != jxl_gpu_formats::ColorSpace::Bt709 {
-        return Err(Error::Unsupported(format!(
-            "display conversion to linear BT.709 does not implement {:?} primaries",
-            color.space
-        )));
-    }
     let transfer = match color.transfer {
         TransferFunction::Linear => 0,
         TransferFunction::Srgb | TransferFunction::Sycc => 1,
         TransferFunction::Bt709 => 2,
+        TransferFunction::Pq => 3,
+        TransferFunction::Hlg => 4,
+        TransferFunction::Bt2020 => 5,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "display transfer {unsupported:?} is unsupported"
             )));
         }
+    };
+    let (primaries, primary_matrix) = display_primary_matrix(color.space)?;
+    let requires_float_output =
+        primaries != 0 || matches!(color.transfer, TransferFunction::Pq | TransferFunction::Hlg);
+    let luminance_encoding = match color.transfer {
+        TransferFunction::Pq => DisplayLuminanceEncoding::PqNormalized10000Nits,
+        TransferFunction::Hlg => DisplayLuminanceEncoding::HlgScene,
+        _ => DisplayLuminanceEncoding::Relative,
     };
     let (subsample_x, subsample_y) = layout
         .format
@@ -1287,6 +1364,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                 YcbcrEncoding::Bt601 => 0,
                 YcbcrEncoding::Bt709 => 1,
                 YcbcrEncoding::Bt2020 => 2,
+                YcbcrEncoding::Bt2020ConstantLuminance => 3,
                 unsupported => {
                     return Err(Error::Unsupported(format!(
                         "display YCbCr matrix {unsupported:?} is unsupported"
@@ -1371,6 +1449,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         bits,
         storage_bits,
         transfer,
+        primaries,
     };
     for (index, plane) in layout.planes.iter().enumerate() {
         if plane.plane_index != index {
@@ -1425,9 +1504,44 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             chroma_width: chroma_extent.width,
             chroma_height: chroma_extent.height,
             transfer: u32::from(transfer),
+            primaries_r: primary_matrix[0],
+            primaries_g: primary_matrix[1],
+            primaries_b: primary_matrix[2],
         },
         binding_size,
+        requires_float_output,
+        luminance_encoding,
     })
+}
+
+fn display_primary_matrix(space: jxl_gpu_formats::ColorSpace) -> Result<(u8, [[f32; 4]; 3])> {
+    let (code, matrix) = match space {
+        jxl_gpu_formats::ColorSpace::Bt709 => {
+            (0, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        }
+        jxl_gpu_formats::ColorSpace::Bt2020 => (
+            1,
+            [
+                [1.660_491, -0.587_641_1, -0.072_849_9],
+                [-0.124_550_5, 1.132_899_9, -0.008_349_4],
+                [-0.018_150_8, -0.100_578_9, 1.118_729_7],
+            ],
+        ),
+        jxl_gpu_formats::ColorSpace::DisplayP3 => (
+            2,
+            [
+                [1.224_745_3, -0.224_904_4, -0.000_000_1],
+                [-0.042_058_1, 1.042_081, -0.000_000_1],
+                [-0.019_642_3, -0.078_654_9, 1.098_537_2],
+            ],
+        ),
+        unsupported => {
+            return Err(Error::Unsupported(format!(
+                "display conversion to linear BT.709 does not implement {unsupported:?} primaries"
+            )));
+        }
+    };
+    Ok((code, matrix.map(|row| [row[0], row[1], row[2], 0.0])))
 }
 
 fn classify_display_format(format: &PixelFormat) -> Result<ColorFormatClass> {
@@ -1532,6 +1646,21 @@ fn validate_display_descriptor(descriptor: DisplayTextureDescriptor) -> Result<(
         )));
     }
     Ok(())
+}
+
+fn validate_image_display_descriptor(
+    descriptor: DisplayTextureDescriptor,
+    requires_float_output: bool,
+) -> Result<()> {
+    match descriptor.format {
+        wgpu::TextureFormat::Rgba8Unorm if requires_float_output => Err(Error::Unsupported(
+            "wide-gamut or HDR display input requires an Rgba16Float linear BT.709 texture".into(),
+        )),
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba16Float => Ok(()),
+        unsupported => Err(Error::Unsupported(format!(
+            "image display texture format {unsupported:?}; portable conversion supports Rgba8Unorm and Rgba16Float"
+        ))),
+    }
 }
 
 fn validate_extent(device: &wgpu::Device, extent: Extent2d) -> Result<()> {
@@ -1653,6 +1782,18 @@ fn numeric_shader_source(native_f64: bool) -> String {
     include_str!("../shaders/display_numeric.wgsl").replace(NUMERIC_F64_MARKER, implementation)
 }
 
+fn image_shader_source(destination: wgpu::TextureFormat) -> String {
+    let storage_format = match destination {
+        wgpu::TextureFormat::Rgba8Unorm => "rgba8unorm",
+        wgpu::TextureFormat::Rgba16Float => "rgba16float",
+        unsupported => unreachable!("validated display texture format {unsupported:?}"),
+    };
+    include_str!("../shaders/display_image.wgsl").replace(
+        "texture_storage_2d<rgba8unorm, write>",
+        &format!("texture_storage_2d<{storage_format}, write>"),
+    )
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct DisplayRgbParams {
@@ -1712,6 +1853,9 @@ struct DisplayImageParams {
     chroma_width: u32,
     chroma_height: u32,
     transfer: u32,
+    primaries_r: [f32; 4],
+    primaries_g: [f32; 4],
+    primaries_b: [f32; 4],
 }
 
 const _: () = {
@@ -1719,8 +1863,11 @@ const _: () = {
     assert!(std::mem::align_of::<DisplayRgbParams>() == 4);
     assert!(std::mem::size_of::<DisplayNumericParams>() == 64);
     assert!(std::mem::align_of::<DisplayNumericParams>() == 4);
-    assert!(std::mem::size_of::<DisplayImageParams>() == 96);
+    assert!(std::mem::size_of::<DisplayImageParams>() == 144);
     assert!(std::mem::align_of::<DisplayImageParams>() == 4);
+    assert!(std::mem::offset_of!(DisplayImageParams, primaries_r) == 96);
+    assert!(std::mem::offset_of!(DisplayImageParams, primaries_g) == 112);
+    assert!(std::mem::offset_of!(DisplayImageParams, primaries_b) == 128);
 };
 
 #[cfg(test)]
@@ -1931,10 +2078,27 @@ mod tests {
     }
 
     #[test]
+    fn image_shader_texture_variants_validate_semantically() {
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ] {
+            let module = naga::front::wgsl::parse_str(&image_shader_source(format))
+                .unwrap_or_else(|error| panic!("image WGSL parse failed for {format:?}: {error}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("image WGSL validation failed for {format:?}: {error}"));
+        }
+    }
+
+    #[test]
     fn display_uniform_abi_sizes_are_explicit_and_aligned() {
         assert_eq!(size_of::<DisplayRgbParams>(), 32);
         assert_eq!(size_of::<DisplayNumericParams>(), 64);
-        assert_eq!(size_of::<DisplayImageParams>(), 96);
+        assert_eq!(size_of::<DisplayImageParams>(), 144);
         assert_eq!(std::mem::align_of::<DisplayRgbParams>(), 4);
         assert_eq!(std::mem::align_of::<DisplayNumericParams>(), 4);
         assert_eq!(std::mem::align_of::<DisplayImageParams>(), 4);
@@ -2036,8 +2200,26 @@ mod tests {
             chroma_width: 22,
             chroma_height: 23,
             transfer: 24,
+            primaries_r: [
+                f32::from_bits(25),
+                f32::from_bits(26),
+                f32::from_bits(27),
+                f32::from_bits(28),
+            ],
+            primaries_g: [
+                f32::from_bits(29),
+                f32::from_bits(30),
+                f32::from_bits(31),
+                f32::from_bits(32),
+            ],
+            primaries_b: [
+                f32::from_bits(33),
+                f32::from_bits(34),
+                f32::from_bits(35),
+                f32::from_bits(36),
+            ],
         };
-        let expected = (1..=24).collect::<Vec<_>>();
+        let expected = (1..=36).collect::<Vec<_>>();
         assert_eq!(abi_words(&image), expected);
         assert_wgsl_fields(
             include_str!("../shaders/display_image.wgsl"),
@@ -2067,6 +2249,9 @@ mod tests {
                 "chroma_width",
                 "chroma_height",
                 "transfer",
+                "primaries_r",
+                "primaries_g",
+                "primaries_b",
             ],
         );
     }
@@ -2087,6 +2272,7 @@ mod tests {
             bits: 8,
             storage_bits: 8,
             transfer: 2,
+            primaries: 0,
         };
         let base = DisplayPipelineKey::Image {
             format,
@@ -2119,10 +2305,25 @@ mod tests {
             destination: wgpu::TextureFormat::Rgba8Unorm,
             variant: KernelVariant::Tile16x16,
         };
+        let primaries = DisplayPipelineKey::Image {
+            format: DisplayImageFormat {
+                primaries: 1,
+                ..format
+            },
+            destination: wgpu::TextureFormat::Rgba8Unorm,
+            variant: KernelVariant::Tile16x16,
+        };
+        let destination = DisplayPipelineKey::Image {
+            format,
+            destination: wgpu::TextureFormat::Rgba16Float,
+            variant: KernelVariant::Tile16x16,
+        };
         assert_ne!(base, matrix);
         assert_ne!(base, range);
         assert_ne!(base, planar);
         assert_ne!(base, transfer);
+        assert_ne!(base, primaries);
+        assert_ne!(base, destination);
     }
 
     #[test]
@@ -2170,9 +2371,9 @@ mod tests {
     }
 
     #[test]
-    fn display_rejects_unimplemented_primaries_and_hdr_transfer() {
+    fn display_wide_gamut_and_hdr_require_a_float_texture() {
         let extent = Extent2d::new(2, 2);
-        let unsupported = [
+        let float_required = [
             ColorSpec {
                 space: jxl_gpu_formats::ColorSpace::Bt2020,
                 encoding: YcbcrEncoding::Bt709,
@@ -2188,7 +2389,7 @@ mod tests {
                 chroma_location: jxl_gpu_formats::ChromaLocation2d::CENTER,
             },
         ];
-        for color in unsupported {
+        for color in float_required {
             let format = PixelFormat::rgb8(
                 RgbChannelOrder::Rgba,
                 false,
@@ -2196,11 +2397,39 @@ mod tests {
             );
             let layout = ImageLayout::packed(extent, format).unwrap();
             let buffer_size = align_to_word(layout.logical_size).unwrap();
+            let validated = validate_image(&layout, buffer_size).unwrap();
+            assert!(validated.requires_float_output);
             assert!(matches!(
-                validate_image(&layout, buffer_size),
+                validate_image_display_descriptor(
+                    DisplayTextureDescriptor::default(),
+                    validated.requires_float_output
+                ),
                 Err(Error::Unsupported(_))
             ));
+            validate_image_display_descriptor(
+                DisplayTextureDescriptor::linear_bt709_hdr(),
+                validated.requires_float_output,
+            )
+            .unwrap();
         }
+
+        let undefined = ColorSpec {
+            space: jxl_gpu_formats::ColorSpace::Undefined,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Linear,
+            range: ColorRange::Full,
+            chroma_location: jxl_gpu_formats::ChromaLocation2d::BOTH,
+        };
+        let format = PixelFormat::rgb8(
+            RgbChannelOrder::Rgba,
+            false,
+            ColorSpecification::Defined(undefined),
+        );
+        let layout = ImageLayout::packed(extent, format).unwrap();
+        assert!(matches!(
+            validate_image(&layout, align_to_word(layout.logical_size).unwrap()),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]

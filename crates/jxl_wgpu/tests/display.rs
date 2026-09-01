@@ -10,8 +10,8 @@ use std::sync::{Arc, mpsc};
 use jxl_gpu_protocol::{Extent2d, OutputId, OutputLayout, SampleType};
 use jxl_wgpu::{
     ChromaLocation2d, ChromaOrder, ChromaSubsampling, ColorRange, ColorSpace, ColorSpec,
-    ColorSpecification, DirectReadbackPolicy, DisplayColorEncoding, DisplayPipeline,
-    DisplayTexture, DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer,
+    ColorSpecification, DirectReadbackPolicy, DisplayColorEncoding, DisplayLuminanceEncoding,
+    DisplayPipeline, DisplayTexture, DisplayTextureDescriptor, GpuImageOutput, GpuOutputBuffer,
     NumericDisplayChannels, NumericDisplayClamp, NumericDisplayContract, NumericDisplayPrecision,
     NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy, Packed422Order,
     PixelFormat, RgbChannelOrder, SampleKind, TransferFunction, WgpuBackend, WgpuBackendConfig,
@@ -35,7 +35,18 @@ fn test_backend() -> Option<WgpuBackend> {
 }
 
 fn read_texture(backend: &WgpuBackend, texture: &DisplayTexture) -> Vec<u8> {
-    let bytes_per_row = texture.extent.width.checked_mul(4).unwrap().div_ceil(256) * 256;
+    let bytes_per_pixel = match texture.format {
+        wgpu::TextureFormat::Rgba8Unorm => 4,
+        wgpu::TextureFormat::Rgba16Float => 8,
+        unsupported => panic!("unsupported display test texture {unsupported:?}"),
+    };
+    let bytes_per_row = texture
+        .extent
+        .width
+        .checked_mul(bytes_per_pixel)
+        .unwrap()
+        .div_ceil(256)
+        * 256;
     let size = u64::from(bytes_per_row) * u64::from(texture.extent.height);
     let staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu display test readback"),
@@ -93,9 +104,9 @@ fn read_texture(backend: &WgpuBackend, texture: &DisplayTexture) -> Vec<u8> {
         .get_mapped_range()
         .expect("mapped display range");
     let mut packed = Vec::with_capacity(
-        usize::try_from(texture.extent.width * texture.extent.height * 4).unwrap(),
+        usize::try_from(texture.extent.width * texture.extent.height * bytes_per_pixel).unwrap(),
     );
-    let row_bytes = usize::try_from(texture.extent.width * 4).unwrap();
+    let row_bytes = usize::try_from(texture.extent.width * bytes_per_pixel).unwrap();
     for y in 0..texture.extent.height {
         let offset = usize::try_from(y * bytes_per_row).unwrap();
         packed.extend_from_slice(&mapped[offset..offset + row_bytes]);
@@ -103,6 +114,140 @@ fn read_texture(backend: &WgpuBackend, texture: &DisplayTexture) -> Vec<u8> {
     drop(mapped);
     staging.unmap();
     packed
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = bits & 0x03ff;
+    match exponent {
+        0 => sign * f32::from(fraction) * 2.0f32.powi(-24),
+        0x1f if fraction == 0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * (1.0 + f32::from(fraction) / 1024.0) * 2.0f32.powi(i32::from(exponent) - 15),
+    }
+}
+
+fn rgba16f(bytes: &[u8]) -> [f32; 4] {
+    std::array::from_fn(|channel| {
+        let offset = channel * 2;
+        f16_to_f32(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+    })
+}
+
+fn gpu_image(
+    backend: &WgpuBackend,
+    layout: jxl_wgpu::ImageLayout,
+    mut bytes: Vec<u8>,
+) -> GpuImageOutput {
+    bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+    let buffer = backend
+        .device()
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu color display source"),
+            contents: &bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+    GpuImageOutput {
+        id: OutputId(99),
+        layout,
+        buffer: jxl_wgpu::GpuBufferLease::from_external(buffer),
+    }
+}
+
+fn signed_map(value: f32, map: impl FnOnce(f32) -> f32) -> f32 {
+    map(value.abs()).copysign(value)
+}
+
+fn display_to_linear(value: f32, transfer: TransferFunction) -> f32 {
+    signed_map(value, |value| match transfer {
+        TransferFunction::Linear => value,
+        TransferFunction::Srgb | TransferFunction::Sycc => {
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        TransferFunction::Bt709 => {
+            if value < 0.081 {
+                value / 4.5
+            } else {
+                ((value + 0.099) / 1.099).powf(1.0 / 0.45)
+            }
+        }
+        TransferFunction::Pq => {
+            let m1 = 2610.0 / 16384.0;
+            let m2 = (2523.0 / 4096.0) * 128.0;
+            let c1 = 3424.0 / 4096.0;
+            let c2 = (2413.0 / 4096.0) * 32.0;
+            let c3 = (2392.0 / 4096.0) * 32.0;
+            let powered = value.powf(1.0 / m2);
+            ((powered - c1).max(0.0) / (c2 - c3 * powered).max(1e-10)).powf(1.0 / m1)
+        }
+        TransferFunction::Hlg => {
+            let a = 0.178_832_77;
+            let b = 1.0 - 4.0 * a;
+            let c = 0.559_910_7;
+            if value <= 0.5 {
+                value * value / 3.0
+            } else {
+                (((value - c) / a).exp() + b) / 12.0
+            }
+        }
+        TransferFunction::Bt2020 => {
+            let alpha = 1.099_296_8;
+            let beta = 0.018_053_97;
+            if value < 4.5 * beta {
+                value / 4.5
+            } else {
+                ((value + alpha - 1.0) / alpha).powf(1.0 / 0.45)
+            }
+        }
+        TransferFunction::Undefined | TransferFunction::Smpte240M => {
+            panic!("unsupported display oracle transfer")
+        }
+    })
+}
+
+fn bt2020_from_linear(value: f32) -> f32 {
+    signed_map(value, |value| {
+        let alpha = 1.099_296_8;
+        let beta = 0.018_053_97;
+        if value < beta {
+            4.5 * value
+        } else {
+            alpha * value.powf(0.45) - (alpha - 1.0)
+        }
+    })
+}
+
+fn to_linear_bt709(space: ColorSpace, linear: [f32; 3]) -> [f32; 3] {
+    let source_to_xyz = match space {
+        ColorSpace::Bt709 => [
+            [0.412_456_4, 0.357_576_1, 0.180_437_5],
+            [0.212_672_9, 0.715_152_2, 0.072_175],
+            [0.019_333_9, 0.119_192, 0.950_304_1],
+        ],
+        ColorSpace::Bt2020 => [
+            [0.636_958, 0.144_616_9, 0.168_881],
+            [0.262_700_2, 0.677_998_1, 0.059_301_7],
+            [0.0, 0.028_072_7, 1.060_985_1],
+        ],
+        ColorSpace::DisplayP3 => [
+            [0.486_570_95, 0.265_667_7, 0.198_217_29],
+            [0.228_974_57, 0.691_738_55, 0.079_286_91],
+            [0.0, 0.045_113_38, 1.043_944_4],
+        ],
+        unsupported => panic!("unsupported display oracle primaries {unsupported:?}"),
+    };
+    let xyz = source_to_xyz.map(|row| row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2]);
+    [
+        [3.240_454_2, -1.537_138_5, -0.498_531_4],
+        [-0.969_266, 1.876_010_8, 0.041_556],
+        [0.055_643_4, -0.204_025_9, 1.057_225_2],
+    ]
+    .map(|row| row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2])
 }
 
 fn bt709_linear_code(encoded: f32) -> u8 {
@@ -149,6 +294,10 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
     assert_eq!(
         submitted.texture.color_encoding,
         DisplayColorEncoding::LinearBt709
+    );
+    assert_eq!(
+        submitted.texture.luminance_encoding,
+        DisplayLuminanceEncoding::Relative
     );
     drop(rgb_output);
     let rgba = read_texture(&backend, &submitted.texture);
@@ -208,6 +357,160 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
         assert_eq!(pixel[3], 255);
     }
     assert_eq!(display.cache_stats().pipelines, 2);
+}
+
+#[test]
+fn wide_gamut_and_hdr_images_become_linear_float_textures() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let display = DisplayPipeline::new(&backend);
+    let extent = Extent2d::new(1, 1);
+    let cases = [
+        (
+            "BT.2020 PQ",
+            ColorSpace::Bt2020,
+            TransferFunction::Pq,
+            DisplayLuminanceEncoding::PqNormalized10000Nits,
+            [128, 164, 201, 127],
+        ),
+        (
+            "Display-P3 HLG",
+            ColorSpace::DisplayP3,
+            TransferFunction::Hlg,
+            DisplayLuminanceEncoding::HlgScene,
+            [100, 151, 220, 255],
+        ),
+        (
+            "BT.2020 OETF",
+            ColorSpace::Bt2020,
+            TransferFunction::Bt2020,
+            DisplayLuminanceEncoding::Relative,
+            [51, 127, 230, 204],
+        ),
+    ];
+
+    for (name, space, transfer, luminance_encoding, stored) in cases {
+        let color = ColorSpecification::Defined(ColorSpec {
+            space,
+            encoding: YcbcrEncoding::Undefined,
+            transfer,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        });
+        let format = PixelFormat::rgb8(RgbChannelOrder::Rgba, false, color);
+        let layout = jxl_wgpu::ImageLayout::packed(extent, format).expect("valid RGB8 layout");
+        let source = gpu_image(&backend, layout, stored.to_vec());
+        assert!(matches!(
+            display.submit_image(&source, DisplayTextureDescriptor::default()),
+            Err(jxl_wgpu::Error::Unsupported(_))
+        ));
+        let submission = display
+            .submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(submission.texture.format, wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(
+            submission.texture.color_encoding,
+            DisplayColorEncoding::LinearBt709
+        );
+        assert_eq!(submission.texture.luminance_encoding, luminance_encoding);
+        let actual = rgba16f(&read_texture(&backend, &submission.texture));
+        let source_linear = std::array::from_fn(|channel| {
+            display_to_linear(f32::from(stored[channel]) / 255.0, transfer)
+        });
+        let expected_rgb = to_linear_bt709(space, source_linear);
+        for channel in 0..3 {
+            assert!(
+                (actual[channel] - expected_rgb[channel]).abs() <= 0.002,
+                "{name} channel {channel}: GPU {}, scalar {}",
+                actual[channel],
+                expected_rgb[channel]
+            );
+        }
+        assert!((actual[3] - f32::from(stored[3]) / 255.0).abs() <= 0.001);
+    }
+}
+
+#[test]
+fn bt2020_constant_luminance_displays_through_its_normative_inverse() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let display = DisplayPipeline::new(&backend);
+    let extent = Extent2d::new(1, 1);
+    let source_linear = [0.18, 0.43, 0.72];
+    let encoded = source_linear.map(bt2020_from_linear);
+    let kr = 0.2627;
+    let kb = 0.0593;
+    let kg = 1.0 - kr - kb;
+    let y =
+        bt2020_from_linear(kr * source_linear[0] + kg * source_linear[1] + kb * source_linear[2]);
+    let cb_divisor = if encoded[2] > y { 1.5816 } else { 1.9404 };
+    let cr_divisor = if encoded[0] > y { 0.9936 } else { 1.7184 };
+    let codes = [
+        unorm8(y),
+        unorm8((encoded[2] - y) / cb_divisor + 0.5),
+        unorm8((encoded[0] - y) / cr_divisor + 0.5),
+    ];
+    let color = ColorSpecification::Defined(ColorSpec {
+        space: ColorSpace::Bt2020,
+        encoding: YcbcrEncoding::Bt2020ConstantLuminance,
+        transfer: TransferFunction::Bt2020,
+        range: ColorRange::Full,
+        chroma_location: ChromaLocation2d::BOTH,
+    });
+    let format = PixelFormat::i444(8, 8, color).expect("valid BT.2020 CL I444");
+    let layout = jxl_wgpu::ImageLayout::packed(extent, format).expect("valid I444 layout");
+    let mut bytes = vec![0; usize::try_from(layout.logical_size).unwrap()];
+    for (plane, code) in codes.into_iter().enumerate() {
+        bytes[usize::try_from(layout.planes[plane].offset).unwrap()] = code;
+    }
+    let source = gpu_image(&backend, layout, bytes);
+    let submission = display
+        .submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr())
+        .expect("submit BT.2020 constant-luminance display");
+    let actual = rgba16f(&read_texture(&backend, &submission.texture));
+
+    let y_encoded = f32::from(codes[0]) / 255.0;
+    let cb = (f32::from(codes[1]) - 128.0) / 255.0;
+    let cr = (f32::from(codes[2]) - 128.0) / 255.0;
+    let b_encoded = y_encoded + cb * if cb > 0.0 { 1.5816 } else { 1.9404 };
+    let r_encoded = y_encoded + cr * if cr > 0.0 { 0.9936 } else { 1.7184 };
+    let y_linear = display_to_linear(y_encoded, TransferFunction::Bt2020);
+    let r = display_to_linear(r_encoded, TransferFunction::Bt2020);
+    let b = display_to_linear(b_encoded, TransferFunction::Bt2020);
+    let g = (y_linear - kr * r - kb * b) / kg;
+    let expected = to_linear_bt709(ColorSpace::Bt2020, [r, g, b]);
+    for channel in 0..3 {
+        assert!(
+            (actual[channel] - expected[channel]).abs() <= 0.003,
+            "channel {channel}: GPU {}, scalar {}",
+            actual[channel],
+            expected[channel]
+        );
+    }
+    assert_eq!(actual[3], 1.0);
+
+    // A luma-only layout has no chroma planes. Its matrix tag must not make the shader enter the
+    // constant-luminance chroma reconstruction path.
+    let luma_layout = jxl_wgpu::ImageLayout::packed(extent, PixelFormat::luma(8, color))
+        .expect("valid BT.2020 luma layout");
+    let luma_source = gpu_image(&backend, luma_layout, vec![codes[0]]);
+    let luma_submission = display
+        .submit_image(&luma_source, DisplayTextureDescriptor::linear_bt709_hdr())
+        .expect("submit BT.2020 luma display");
+    let luma_actual = rgba16f(&read_texture(&backend, &luma_submission.texture));
+    let luma_linear = display_to_linear(y_encoded, TransferFunction::Bt2020);
+    let luma_expected = to_linear_bt709(ColorSpace::Bt2020, [luma_linear; 3]);
+    for channel in 0..3 {
+        assert!(
+            (luma_actual[channel] - luma_expected[channel]).abs() <= 0.002,
+            "luma channel {channel}: GPU {}, scalar {}",
+            luma_actual[channel],
+            luma_expected[channel]
+        );
+    }
+    assert_eq!(luma_actual[3], 1.0);
 }
 
 #[test]

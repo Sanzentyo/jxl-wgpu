@@ -152,9 +152,13 @@ naturally eight-byte aligned.
 
 ## Same-queue display
 
-`DisplayPipeline` turns a `GpuOutputBuffer` or `GpuImageOutput` into an `Rgba8Unorm` storage texture
-with texture-binding, render-attachment, and copy usages. The convenience submission uses the
-backend's queue and returns without a host wait:
+`DisplayPipeline` turns a `GpuOutputBuffer` or `GpuImageOutput` into a linear BT.709 storage texture
+with texture-binding, render-attachment, and copy usages. SDR BT.709 input can use the default
+`Rgba8Unorm` descriptor. D65 BT.2020/Display-P3 or PQ/HLG input requires
+`DisplayTextureDescriptor::linear_bt709_hdr()`, producing `Rgba16Float` so gamut excursions are not
+implicitly clipped. The shader also implements BT.2020 non-constant- and constant-luminance YCbCr
+inverse conversion. The convenience submission uses the backend's queue and returns without a host
+wait:
 
 ```rust,ignore
 use jxl_wgpu::{DisplayPipeline, DisplayTextureDescriptor};
@@ -166,6 +170,12 @@ let submitted = display.submit_image(
 )?;
 renderer.sample(submitted.texture.view());
 ```
+
+For a wide-gamut or HDR source, replace the default descriptor with
+`DisplayTextureDescriptor::linear_bt709_hdr()`. The resulting texture remains linear BT.709;
+`DisplayTexture::luminance_encoding` distinguishes relative SDR, normalized absolute PQ
+(`1.0 = 10,000 nit`), and scene-linear HLG before a display OOTF. Applications choose any later
+tone map, gamut map, HLG OOTF, and surface encoding explicitly.
 
 The source buffer and returned texture are retained by their GPU handles while commands are in
 flight. The pipeline cache is keyed by the complete source-format and color-conversion contract.

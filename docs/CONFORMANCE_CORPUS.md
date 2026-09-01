@@ -180,6 +180,15 @@ The Rust/WGSL ABI gate parses the shader with Naga and reflects the complete uni
 Compile-time assertions independently fix `ImageOutputUniform` at 176 bytes and its three padded
 matrix rows at offsets 128, 144, and 160. No test searches shader source text.
 
+The same-queue display gate then consumes stored BT.2020 PQ, BT.2020 SDR-OETF, Display-P3 HLG, and
+BT.2020 constant-luminance I444 inputs without a host dependency. It requires a tagged
+`Rgba16Float` linear-BT.709 texture, reads its half-float texels back only for the test oracle, and
+compares transfer inversion, primary conversion, alpha, luminance-contract tagging, and
+constant-luminance reconstruction.
+Attempting the same wide/HDR inputs with the default `Rgba8Unorm` descriptor must return a typed
+error before submission. Naga semantically validates both generated storage-texture variants; the
+144-byte display uniform fixes matrix-row offsets 96, 112, and 128.
+
 ## Procedural VarDCT encoder matrix
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than

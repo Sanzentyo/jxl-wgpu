@@ -26,6 +26,9 @@ struct Params {
     chroma_width: u32,
     chroma_height: u32,
     transfer: u32,
+    primaries_r: vec4<f32>,
+    primaries_g: vec4<f32>,
+    primaries_b: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> source: array<u32>;
@@ -165,37 +168,82 @@ fn yuv_rgb(pixel: vec2<u32>) -> vec3<f32> {
 }
 
 fn to_linear(encoded: f32) -> f32 {
-    let value = clamp(encoded, 0.0, 1.0);
+    let value = abs(encoded);
+    var linear = value;
     if params.transfer == 0u {
-        return value;
+        linear = value;
+    } else if params.transfer == 1u {
+        linear = select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
+    } else if params.transfer == 2u {
+        linear = select(pow((value + 0.099) / 1.099, 1.0 / 0.45), value / 4.5, value < 0.081);
+    } else if params.transfer == 3u {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = (2523.0 / 4096.0) * 128.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = (2413.0 / 4096.0) * 32.0;
+        let c3 = (2392.0 / 4096.0) * 32.0;
+        let powered = pow(value, 1.0 / m2);
+        linear = pow(max(powered - c1, 0.0) / max(c2 - c3 * powered, 1e-10), 1.0 / m1);
+    } else if params.transfer == 4u {
+        let hlg_a = 0.17883277;
+        let hlg_b = 1.0 - 4.0 * hlg_a;
+        let hlg_c = 0.5599107295;
+        linear = select(
+            (exp((value - hlg_c) / hlg_a) + hlg_b) / 12.0,
+            value * value / 3.0,
+            value <= 0.5,
+        );
+    } else {
+        let alpha = 1.09929682680944;
+        let beta = 0.018053968510807;
+        linear = select(
+            pow((value + (alpha - 1.0)) / alpha, 1.0 / 0.45),
+            value / 4.5,
+            value < 4.5 * beta,
+        );
     }
-    if params.transfer == 1u {
-        if value <= 0.04045 {
-            return value / 12.92;
-        }
-        return pow((value + 0.055) / 1.055, 2.4);
-    }
-    if value < 0.081 {
-        return value / 4.5;
-    }
-    return pow((value + 0.099) / 1.099, 1.0 / 0.45);
+    return select(linear, -linear, encoded < 0.0);
+}
+
+fn constant_luminance_yuv_linear(pixel: vec2<u32>) -> vec3<f32> {
+    let y_encoded = normalized_y(luma_code(pixel));
+    let position = chroma_position(pixel);
+    let cb = normalized_chroma(bilinear_chroma(0u, position));
+    let cr = normalized_chroma(bilinear_chroma(1u, position));
+    let b_encoded = y_encoded + cb * select(1.9404, 1.5816, cb > 0.0);
+    let r_encoded = y_encoded + cr * select(1.7184, 0.9936, cr > 0.0);
+    let coefficient = matrix_coefficients();
+    let kr = coefficient.x;
+    let kb = coefficient.y;
+    let y_linear = to_linear(y_encoded);
+    let r = to_linear(r_encoded);
+    let b = to_linear(b_encoded);
+    let g = (y_linear - kr * r - kb * b) / (1.0 - kr - kb);
+    return vec3<f32>(r, g, b);
 }
 
 @compute @workgroup_size(wg_x, wg_y, 1)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     if invocation.x >= params.width || invocation.y >= params.height { return; }
     let pixel = invocation.xy;
-    var rgba: vec4<f32>;
+    var encoded: vec4<f32>;
     if params.kind == 0u || params.kind == 1u {
-        rgba = vec4<f32>(rgb_sample(pixel, 0u), rgb_sample(pixel, 1u), rgb_sample(pixel, 2u), rgb_sample(pixel, 3u));
+        encoded = vec4<f32>(rgb_sample(pixel, 0u), rgb_sample(pixel, 1u), rgb_sample(pixel, 2u), rgb_sample(pixel, 3u));
     } else {
-        rgba = vec4<f32>(yuv_rgb(pixel), 1.0);
+        encoded = vec4<f32>(yuv_rgb(pixel), 1.0);
     }
-    rgba = vec4<f32>(
-        to_linear(rgba.r),
-        to_linear(rgba.g),
-        to_linear(rgba.b),
-        rgba.a,
+    var source_linear = vec3<f32>(
+        to_linear(encoded.r),
+        to_linear(encoded.g),
+        to_linear(encoded.b),
     );
-    textureStore(destination, vec2<i32>(pixel), rgba);
+    if params.matrix == 3u && params.kind >= 4u {
+        source_linear = constant_luminance_yuv_linear(pixel);
+    }
+    let bt709_linear = vec3<f32>(
+        dot(params.primaries_r.xyz, source_linear),
+        dot(params.primaries_g.xyz, source_linear),
+        dot(params.primaries_b.xyz, source_linear),
+    );
+    textureStore(destination, vec2<i32>(pixel), vec4<f32>(bt709_linear, encoded.a));
 }

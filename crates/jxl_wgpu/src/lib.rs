@@ -51,10 +51,10 @@ pub use context::{
     DirectReadbackPolicy, ShaderF64Policy, WgpuBackend, WgpuBackendConfig, WgpuMemoryPolicy,
 };
 pub use display::{
-    DisplayColorEncoding, DisplayPipeline, DisplayPipelineCacheStats, DisplaySubmission,
-    DisplayTexture, DisplayTextureDescriptor, NumericDisplayChannels, NumericDisplayClamp,
-    NumericDisplayContract, NumericDisplayError, NumericDisplayPrecision, NumericDisplaySource,
-    NumericDisplayTransfer, NumericNonFinitePolicy,
+    DisplayColorEncoding, DisplayLuminanceEncoding, DisplayPipeline, DisplayPipelineCacheStats,
+    DisplaySubmission, DisplayTexture, DisplayTextureDescriptor, NumericDisplayChannels,
+    NumericDisplayClamp, NumericDisplayContract, NumericDisplayError, NumericDisplayPrecision,
+    NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy,
 };
 pub use error::{Error, Result};
 pub use jxl_gpu_formats::{
