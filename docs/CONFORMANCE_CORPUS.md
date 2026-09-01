@@ -50,7 +50,12 @@ section is compared byte-for-byte with its declared absolute range and logical T
 VarDCT fixture proves that payload after the bounded metadata probe still shares caller `Arc`
 storage and that peak prefix retention is sublinear in codestream size. Typed prefix/offset/trailing
 errors, same-call statistics rollback, poisoning, and every truncated basic prefix are covered.
-Direct GPU entropy-window ingestion is still required before `FRONT-03` can be complete.
+The Modular consumer separately parses the stock lossless profile through one checked logical span
+table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
+group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and
+exercise unaligned zero-bit checks. Existing actual-GPU Modular tests then run through the same
+span-backed bounded uploader. Public event-to-engine ingestion and the VarDCT source conversion are
+still required before `FRONT-03` can be complete.
 
 ## Procedural VarDCT encoder matrix
 

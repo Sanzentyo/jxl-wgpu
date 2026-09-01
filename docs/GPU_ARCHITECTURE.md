@@ -61,9 +61,12 @@ and frame header/TOC at geometrically increasing probe sizes, emits `Arc<FrameIn
 section bytes, and splits subsequent `StreamSlice` ranges at exact physical TOC boundaries. A
 probe may contain a bounded section prefix; that tail keeps the probe allocation rather than being
 copied again, while later section ranges retain caller/transport backing. Complete image/frame/TOC
-state no longer requires a contiguous codestream. Both decode engines still own contiguous input,
-so adapting these section events to their existing bounded entropy upload windows remains the next
-frontend boundary rather than being hidden behind reassembly.
+state no longer requires a contiguous codestream. The Modular metadata parser and bounded uploader
+now consume a checked table of logically contiguous shared spans: bit reads and exact GPU upload
+ranges may cross physical chunks without constructing a whole-source `Vec`. The public selector
+still creates that table from one contiguous codestream, and VarDCT still owns contiguous input, so
+adapting section events to the Modular boundary and converting VarDCT remain explicit frontend
+work rather than being hidden behind reassembly.
 
 `GpuDecoder::wgpu` is the sole stock high-level decode constructor. Its `WgpuDecodeEngine`
 inventories a codestream once, reads `FrameEncoding`, and moves the validated codestream plus that

@@ -50,6 +50,17 @@ pub(crate) fn build_stream_batches(
     stream_limit: u64,
     max_groups_per_batch: usize,
 ) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
+    let codestream_bytes = u64::try_from(codestream.len())
+        .map_err(|_| Error::backend("codestream size exceeds u64"))?;
+    build_stream_batches_for_len(codestream_bytes, groups, stream_limit, max_groups_per_batch)
+}
+
+pub(crate) fn build_stream_batches_for_len(
+    codestream_bytes: u64,
+    groups: &[GroupEntropyRange],
+    stream_limit: u64,
+    max_groups_per_batch: usize,
+) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
     if max_groups_per_batch == 0 {
         return Err(Error::backend(
             "bounded entropy stream batch has zero group lanes",
@@ -103,11 +114,17 @@ pub(crate) fn build_stream_batches(
                 / 8,
         )
         .map_err(|_| Error::backend("group stream end exceeds host address space"))?;
-        let input = codestream
-            .get(input_start..input_end)
-            .ok_or_else(|| Error::backend("group stream window exceeds the codestream"))?;
-        let packet_bytes = u64::try_from(input.len())
-            .map_err(|_| Error::backend("group stream size exceeds u64"))?;
+        let input_end_u64 =
+            u64::try_from(input_end).map_err(|_| Error::backend("group stream end exceeds u64"))?;
+        if input_end_u64 > codestream_bytes {
+            return Err(Error::backend("group stream window exceeds the codestream"));
+        }
+        let packet_bytes = u64::try_from(
+            input_end
+                .checked_sub(input_start)
+                .ok_or_else(|| Error::backend("group stream byte range underflow"))?,
+        )
+        .map_err(|_| Error::backend("group stream size exceeds u64"))?;
         let group_packet_bytes = align4(packet_bytes)?
             .checked_add(STREAM_SENTINEL_BYTES)
             .ok_or_else(|| Error::backend("group stream batch size overflow"))?;

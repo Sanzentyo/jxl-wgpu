@@ -25,6 +25,7 @@ compile_error!(
 
 mod buffer_pool;
 mod codec_engine;
+mod codestream_data;
 mod entropy;
 mod entropy_window;
 mod error;

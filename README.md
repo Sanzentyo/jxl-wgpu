@@ -43,8 +43,11 @@ waiting on a v1 gap use payload-only storage bounded by explicitly reported logi
 terminal event validates transport end-of-input. A second bounded scanner incrementally parses the
 image header and each frame header/TOC, emits frame inventories before their physical sections, and
 routes ordered section ranges without retaining the whole codestream. The stock decode engines
-still require contiguous section integration, so this is not yet an incremental `GpuDecoder`
-claim.
+still lack public section-event integration. The Modular engine's metadata reader and bounded GPU
+uploader now accept a checked table of shared logical spans, including bit and upload ranges split
+across chunk boundaries, but `GpuDecoder::open` still constructs that table from one contiguous
+codestream and VarDCT still has its contiguous source contract. This is therefore not yet an
+incremental `GpuDecoder` claim.
 
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.

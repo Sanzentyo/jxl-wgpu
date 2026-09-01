@@ -21,10 +21,11 @@ use jxl_wgpu::{
 use crate::buffer_pool::{
     DecodeBufferLease, DecodeBufferPool, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
+use crate::codestream_data::CodestreamData;
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::{
     GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
-    build_stream_batches as build_entropy_stream_batches,
+    build_stream_batches_for_len as build_entropy_stream_batches,
 };
 #[cfg(test)]
 use crate::entropy_window::{STREAM_OVERLAP_BYTES, STREAM_SENTINEL_BYTES};
@@ -586,7 +587,17 @@ impl WgpuSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
-        let profile = parse_standard_modular_profile(codestream.bytes(), inventory)?;
+        let codestream = Arc::new(CodestreamData::from_gpu_codestream(codestream)?);
+        self.open_with_inventory_data(codestream, request, inventory)
+    }
+
+    pub(crate) fn open_with_inventory_data(
+        &self,
+        codestream: Arc<CodestreamData>,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        let profile = parse_standard_modular_profile(&codestream, inventory)?;
         let modular_metadata: Arc<[u32]> = profile.ma_config.pack_gpu_metadata()?.words.into();
         let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(
@@ -625,7 +636,7 @@ impl WgpuSubmissionEngine {
         let memory_limit_bytes = self.memory.snapshot().limit_bytes;
         let dispatch_layout = GroupDispatchLayout::new(
             self.backend.device(),
-            codestream.bytes(),
+            codestream.logical_bytes(),
             &profile,
             &modular_metadata,
             &output,
@@ -688,8 +699,7 @@ impl WgpuSubmissionEngine {
                 backend: self.backend.clone(),
                 pipeline,
                 source: Some(DecodeSource {
-                    codestream_storage: codestream.shared_storage(),
-                    codestream_range: codestream.storage_range(),
+                    codestream,
                     profile,
                     dispatch_layout,
                     modular_metadata,
@@ -1144,8 +1154,7 @@ impl GpuPendingFrame for WgpuPendingFrame {
 }
 
 struct DecodeSource {
-    codestream_storage: Arc<[u8]>,
-    codestream_range: std::ops::Range<usize>,
+    codestream: Arc<CodestreamData>,
     profile: StandardModularProfile,
     dispatch_layout: GroupDispatchLayout,
     // Immutable within the session. All independently decoded groups share the standard
@@ -1226,7 +1235,7 @@ enum FixedGradientOutputMode {
 impl GroupDispatchLayout {
     fn new(
         device: &wgpu::Device,
-        codestream: &[u8],
+        codestream_bytes: u64,
         profile: &StandardModularProfile,
         modular_metadata: &[u32],
         output: &OutputPlan,
@@ -1354,7 +1363,7 @@ impl GroupDispatchLayout {
             .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
         let requested_target = options.memory_limit_bytes / requested_slots;
         let selected = match select_parallel_group_layout(
-            codestream,
+            codestream_bytes,
             &profile.groups,
             ParallelGroupLimits {
                 stream_limit,
@@ -1366,7 +1375,7 @@ impl GroupDispatchLayout {
         ) {
             Ok(Some(selected)) => Some(selected),
             Ok(None) => select_parallel_group_layout(
-                codestream,
+                codestream_bytes,
                 &profile.groups,
                 ParallelGroupLimits {
                     stream_limit,
@@ -1414,7 +1423,7 @@ impl GroupDispatchLayout {
 }
 
 fn build_stream_batches(
-    codestream: &[u8],
+    codestream_bytes: u64,
     groups: &[ModularGroup],
     stream_limit: u64,
     max_groups_per_batch: usize,
@@ -1426,7 +1435,12 @@ fn build_stream_batches(
             token_bit_end: group.token_bit_end,
         })
         .collect::<Vec<_>>();
-    build_entropy_stream_batches(codestream, &ranges, stream_limit, max_groups_per_batch)
+    build_entropy_stream_batches(
+        codestream_bytes,
+        &ranges,
+        stream_limit,
+        max_groups_per_batch,
+    )
 }
 
 type ParallelGroupLayout = (usize, Vec<GroupStreamSegment>, Vec<StreamBatch>, u64);
@@ -1441,7 +1455,7 @@ struct ParallelGroupLimits {
 }
 
 fn select_parallel_group_layout(
-    codestream: &[u8],
+    codestream_bytes: u64,
     groups: &[ModularGroup],
     limits: ParallelGroupLimits,
 ) -> Result<Option<ParallelGroupLayout>> {
@@ -1466,7 +1480,7 @@ fn select_parallel_group_layout(
             continue;
         }
         let (segments, batches, stream_bytes) =
-            build_stream_batches(codestream, groups, effective_stream_limit, lanes)?;
+            build_stream_batches(codestream_bytes, groups, effective_stream_limit, lanes)?;
         let required = limits
             .fixed_bytes
             .checked_add(stream_bytes)
@@ -2193,12 +2207,10 @@ fn submit_decode(
     poll_permit: SubmissionPollPermit,
 ) -> Result<WgpuPendingFrame> {
     let device = backend.device();
-    let codestream = source
-        .codestream_storage
-        .get(source.codestream_range.clone())
-        .ok_or_else(|| Error::backend("codestream storage range is invalid"))?;
     // Only a bounded batch of pass-group packets is storage-bound at once. The host keeps the
-    // validated codestream Arc, while queue ordering lets every batch reuse this one GPU window.
+    // validated shared span table, while queue ordering lets every batch reuse this one GPU
+    // window. Cross-chunk ranges are copied directly into that bounded upload, never into a
+    // whole-codestream allocation.
     let stream = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu decode bounded group stream window"),
         size: source.dispatch_layout.stream_bytes,
@@ -2356,17 +2368,25 @@ fn submit_decode(
                 .get(segment_index)
                 .copied()
                 .ok_or_else(|| Error::backend("group stream segment is missing"))?;
-            let input = codestream
-                .get(segment.input_start..segment.input_end)
-                .ok_or_else(|| Error::backend("group stream input range is truncated"))?;
             let end = segment
                 .upload_offset
-                .checked_add(input.len())
+                .checked_add(
+                    segment
+                        .input_end
+                        .checked_sub(segment.input_start)
+                        .ok_or_else(|| Error::backend("group stream input range underflow"))?,
+                )
                 .ok_or_else(|| Error::backend("group stream upload range overflow"))?;
-            stream_upload
+            let destination = stream_upload
                 .get_mut(segment.upload_offset..end)
-                .ok_or_else(|| Error::backend("group stream upload range is truncated"))?
-                .copy_from_slice(input);
+                .ok_or_else(|| Error::backend("group stream upload range is truncated"))?;
+            source.codestream.copy_range(
+                u64::try_from(segment.input_start)
+                    .map_err(|_| Error::backend("group stream start exceeds u64"))?
+                    ..u64::try_from(segment.input_end)
+                        .map_err(|_| Error::backend("group stream end exceeds u64"))?,
+                destination,
+            )?;
 
             let group = source
                 .profile
@@ -2753,7 +2773,7 @@ mod tests {
 
     #[test]
     fn stream_batches_rebase_unaligned_group_bits_and_respect_peak_window() {
-        let codestream = vec![0u8; 32];
+        let codestream = [0u8; 32];
         let group = |start, end| ModularGroup {
             token_bit_offset: start,
             token_bit_end: end,
@@ -2764,7 +2784,8 @@ mod tests {
             stream_index: 0,
         };
         let groups = [group(3, 67), group(75, 139), group(147, 211)];
-        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 40, 1).unwrap();
+        let (segments, batches, peak) =
+            build_stream_batches(codestream.len() as u64, &groups, 40, 1).unwrap();
         assert_eq!(
             batches
                 .iter()
@@ -2800,7 +2821,7 @@ mod tests {
 
     #[test]
     fn stream_batches_never_alias_more_groups_than_scratch_lanes() {
-        let codestream = vec![0u8; 32];
+        let codestream = [0u8; 32];
         let groups = (0..5)
             .map(|index| ModularGroup {
                 token_bit_offset: index * 16 + 3,
@@ -2812,7 +2833,8 @@ mod tests {
                 stream_index: index as u32,
             })
             .collect::<Vec<_>>();
-        let (segments, batches, _) = build_stream_batches(&codestream, &groups, 1024, 2).unwrap();
+        let (segments, batches, _) =
+            build_stream_batches(codestream.len() as u64, &groups, 1024, 2).unwrap();
         assert_eq!(
             batches
                 .iter()
@@ -2837,7 +2859,8 @@ mod tests {
             height: 1,
             stream_index: 0,
         }];
-        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 64, 8).unwrap();
+        let (segments, batches, peak) =
+            build_stream_batches(codestream.len() as u64, &groups, 64, 8).unwrap();
         assert!(segments.len() > 2);
         assert_eq!(segments.len(), batches.len());
         assert_eq!(peak, 64);
@@ -2880,12 +2903,13 @@ mod tests {
             height: 1,
             stream_index: 0,
         }];
-        let (segments, batches, peak) = build_stream_batches(&codestream, &groups, 64, 1).unwrap();
+        let (segments, batches, peak) =
+            build_stream_batches(codestream.len() as u64, &groups, 64, 1).unwrap();
         assert!(segments.len() > 1);
         assert_eq!(segments.len(), batches.len());
         assert_eq!(peak, 64);
         assert!(matches!(
-            build_stream_batches(&codestream, &groups, 39, 1),
+            build_stream_batches(codestream.len() as u64, &groups, 39, 1),
             Err(Error::StreamWindowTooSmall {
                 limit_bytes: 39,
                 minimum_bytes: 40,
@@ -2908,7 +2932,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (lanes, _, batches, peak) = select_parallel_group_layout(
-            &codestream,
+            codestream.len() as u64,
             &groups,
             ParallelGroupLimits {
                 stream_limit: 64 * 1024,
@@ -2927,7 +2951,7 @@ mod tests {
         assert_eq!(peak, 8 * 1024 + STREAM_SENTINEL_BYTES);
 
         let (lanes, _, batches, peak) = select_parallel_group_layout(
-            &codestream,
+            codestream.len() as u64,
             &groups,
             ParallelGroupLimits {
                 stream_limit: 64 * 1024,

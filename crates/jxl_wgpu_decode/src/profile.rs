@@ -1,8 +1,10 @@
 use jxl_gpu_bitstream::{
-    BitReader, CodestreamInventory, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
+    CodestreamInventory, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
     ImageHeaderInventory, SampleBitDepth,
 };
 
+use crate::codestream_data::CodestreamData;
+use crate::modular_tree::BitInput;
 use crate::{ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile};
 use crate::{
     ModularTransformFeature,
@@ -44,7 +46,7 @@ pub(crate) struct StandardModularProfile {
 }
 
 fn validate_image_header(
-    codestream: &[u8],
+    codestream: &CodestreamData,
     image: &ImageHeaderInventory,
     channels: ModularChannels,
     bits_per_sample: u8,
@@ -61,7 +63,7 @@ fn validate_image_header(
         );
     }
 
-    let mut reader = BitReader::new(codestream);
+    let mut reader = codestream.reader();
     expect(&mut reader, 16, 0x0aff, "JPEG XL codestream signature")?;
     expect(&mut reader, 1, 0, "non-small image header")?;
     let height = read_size(&mut reader, true)?;
@@ -130,7 +132,7 @@ fn validate_image_header(
     Ok(())
 }
 
-fn read_integer_bit_depth(reader: &mut BitReader<'_>, expected: u8, field: &str) -> Result<()> {
+fn read_integer_bit_depth(reader: &mut impl BitInput, expected: u8, field: &str) -> Result<()> {
     expect(reader, 1, 0, field)?;
     let actual = match reader.read_bits(2)? {
         0 => 8,
@@ -150,7 +152,7 @@ fn read_integer_bit_depth(reader: &mut BitReader<'_>, expected: u8, field: &str)
     Ok(())
 }
 
-fn read_size(reader: &mut BitReader<'_>, has_ratio: bool) -> Result<u32> {
+fn read_size(reader: &mut impl BitInput, has_ratio: bool) -> Result<u32> {
     let selector = usize::try_from(reader.read_bits(2)?)
         .map_err(|_| unsupported_error("image extent selector overflow"))?;
     let widths = [9, 13, 18, 30];
@@ -170,7 +172,7 @@ fn read_size(reader: &mut BitReader<'_>, has_ratio: bool) -> Result<u32> {
 /// headers are inspected here. Entropy symbols, residuals, predictors, and pixels are deliberately
 /// left unread for the GPU kernel.
 pub(crate) fn parse_standard_modular_profile(
-    codestream: &[u8],
+    codestream: &CodestreamData,
     inventory: &CodestreamInventory,
 ) -> Result<StandardModularProfile> {
     let image = &inventory.image_header;
@@ -266,7 +268,7 @@ pub(crate) fn parse_standard_modular_profile(
             .find(|section| section.kind == FrameSectionKind::LowFrequencyGlobal)
     }
     .ok_or_else(|| unsupported_error("the Modular frame is missing DC-global metadata"))?;
-    let mut reader = BitReader::new(codestream);
+    let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
     parse_lf_channel_dequantization(&mut reader)?;
     let (ma_config, wp_header) = parse_dc_global_ir(&mut reader, channels)?;
@@ -289,7 +291,7 @@ pub(crate) fn parse_standard_modular_profile(
             stream_index: 0,
         }]
     } else {
-        if !bits_are_zero(codestream, reader.bit_offset(), dc_end) {
+        if !codestream.bits_are_zero(reader.bit_offset(), dc_end)? {
             return unsupported("non-zero data follows the bounded DC-global prefix metadata");
         }
         validate_empty_non_pass_sections(codestream, frame)?;
@@ -312,7 +314,7 @@ pub(crate) fn parse_standard_modular_profile(
             if slot.is_some() {
                 return unsupported("the Modular frame contains a duplicate pass-group section");
             }
-            let mut group_reader = BitReader::new(codestream);
+            let mut group_reader = codestream.reader();
             group_reader.skip_bits(section.bits.offset)?;
             expect(&mut group_reader, 1, 1, "LF-global Modular tree")?;
             expect(&mut group_reader, 1, 1, "default weighted predictor")?;
@@ -364,10 +366,7 @@ pub(crate) fn parse_standard_modular_profile(
             .collect::<Result<Vec<_>>>()?
     };
 
-    let codestream_bits = u64::try_from(codestream.len())
-        .ok()
-        .and_then(|bytes| bytes.checked_mul(8))
-        .ok_or_else(|| unsupported_error("codestream bit length overflow"))?;
+    let codestream_bits = codestream.logical_bits()?;
     for group in &groups {
         if group.width == 0
             || group.height == 0
@@ -396,7 +395,7 @@ pub(crate) fn parse_standard_modular_profile(
 ///
 /// These values only affect VarDCT. A lossless Modular frame must still carry the bundle, so the
 /// frontend parses its bounded wire shape before locating the global MA tree.
-fn parse_lf_channel_dequantization(reader: &mut BitReader<'_>) -> Result<()> {
+fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<()> {
     let all_default = reader.read_bits(1)? != 0;
     if !all_default {
         // m_x_lf, m_y_lf, and m_b_lf are IEEE-754 binary16 values on the wire. Their values are
@@ -410,7 +409,7 @@ fn parse_lf_channel_dequantization(reader: &mut BitReader<'_>) -> Result<()> {
 }
 
 fn parse_dc_global_ir(
-    reader: &mut BitReader<'_>,
+    reader: &mut impl BitInput,
     channels: ModularChannels,
 ) -> Result<(MaConfigIr, WpHeaderIr)> {
     expect(reader, 1, 1, "global Modular MA tree")?;
@@ -448,7 +447,7 @@ fn parse_dc_global_ir(
     Ok((ma_config, wp_header))
 }
 
-fn read_u32_selector(reader: &mut BitReader<'_>, variants: [(u32, u8); 4]) -> Result<u32> {
+fn read_u32_selector(reader: &mut impl BitInput, variants: [(u32, u8); 4]) -> Result<u32> {
     let selector = usize::try_from(reader.read_bits(2)?)
         .map_err(|_| unsupported_error("U32 selector exceeds host address space"))?;
     let (base, bits) = variants[selector];
@@ -467,7 +466,7 @@ fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {
 }
 
 fn validate_empty_non_pass_sections(
-    codestream: &[u8],
+    codestream: &CodestreamData,
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<()> {
     for section in &frame.sections {
@@ -477,7 +476,7 @@ fn validate_empty_non_pass_sections(
                     .bits
                     .end()
                     .ok_or_else(|| unsupported_error("Modular section bit range overflow"))?;
-                if !bits_are_zero(codestream, section.bits.offset, end) {
+                if !codestream.bits_are_zero(section.bits.offset, end)? {
                     return unsupported(
                         "the lossless Modular profile requires empty LF-group and HF-global sections",
                     );
@@ -496,7 +495,7 @@ fn validate_empty_non_pass_sections(
     Ok(())
 }
 
-fn expect(reader: &mut BitReader<'_>, count: u8, expected: u64, field: &str) -> Result<()> {
+fn expect(reader: &mut impl BitInput, count: u8, expected: u64, field: &str) -> Result<()> {
     let actual = reader.read_bits(count)?;
     if actual != expected {
         return unsupported(format!(
@@ -504,19 +503,6 @@ fn expect(reader: &mut BitReader<'_>, count: u8, expected: u64, field: &str) -> 
         ));
     }
     Ok(())
-}
-
-fn bits_are_zero(bytes: &[u8], start: u64, end: u64) -> bool {
-    let available_bits = u64::try_from(bytes.len())
-        .ok()
-        .and_then(|length| length.checked_mul(8));
-    if start > end || available_bits.is_none_or(|available| end > available) {
-        return false;
-    }
-    (start..end).all(|cursor| {
-        let byte = usize::try_from(cursor / 8).expect("validated bit offset fits usize");
-        bytes[byte] & (1u8 << (cursor % 8)) == 0
-    })
 }
 
 fn unsupported<T>(detail: impl Into<String>) -> Result<T> {
@@ -532,16 +518,66 @@ fn unsupported_error(detail: impl Into<String>) -> UnsupportedProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::bits_are_zero;
+    use std::sync::Arc;
+
+    use jxl_gpu_bitstream::{InventoryLimits, ParseLimits, StreamSlice, parse};
+
+    use super::*;
 
     #[test]
-    fn checks_unaligned_padding_bits() {
-        assert!(bits_are_zero(&[0b0000_0101], 3, 8));
-        assert!(!bits_are_zero(&[0b0001_0101], 3, 8));
-        assert!(bits_are_zero(&[0xff, 0, 0, 0xff], 8, 24));
-        assert!(!bits_are_zero(&[0xff, 0, 1, 0xff], 8, 24));
-        assert!(bits_are_zero(&[0b0000_0111, 0, 0b1110_0000], 3, 21));
-        assert!(!bits_are_zero(&[0; 1], 0, 9));
-        assert!(!bits_are_zero(&[0; 1], 7, 6));
+    fn modular_profile_is_identical_across_every_shared_chunk_split() {
+        let encoded: Arc<[u8]> = Arc::from(fixture(include_str!(
+            "../test-data/gpu_gray8_lossless.jxl.hex"
+        )));
+        let parsed = parse(&encoded, ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
+        let complete =
+            CodestreamData::from_spans([(0, StreamSlice::from_shared(Arc::clone(&bytes)))])
+                .unwrap();
+        let expected = parse_standard_modular_profile(&complete, &inventory).unwrap();
+
+        for split_offset in 0..=bytes.len() {
+            let split_source = CodestreamData::from_spans([
+                (
+                    0,
+                    StreamSlice::from_shared_range(Arc::clone(&bytes), 0..split_offset).unwrap(),
+                ),
+                (
+                    split_offset as u64,
+                    StreamSlice::from_shared_range(Arc::clone(&bytes), split_offset..bytes.len())
+                        .unwrap(),
+                ),
+            ])
+            .unwrap();
+            assert_eq!(
+                parse_standard_modular_profile(&split_source, &inventory).unwrap(),
+                expected,
+                "chunk split {split_offset} changed the parsed profile"
+            );
+        }
+    }
+
+    fn fixture(input: &str) -> Vec<u8> {
+        fn nibble(byte: u8) -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => panic!("invalid checked-in fixture hex digit"),
+            }
+        }
+
+        let digits = input
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
+        digits
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
     }
 }

@@ -23,6 +23,11 @@ explicit limits. It parses only the bounded DC-global MA tree, histogram descrip
 integer configuration, context maps, and pass-group ranges needed to build typed GPU metadata.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
+The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
+host slice. The same span table copies exact entropy ranges into the reusable GPU window, including
+ranges that cross a chunk or entropy-word boundary, without first joining the codestream. The
+current public `GpuDecoder::open` still creates a single-span source after contiguous transport
+validation; feeding incremental section events into this internal boundary is the next API step.
 
 The compute shader reads Prefix or ANS symbols and hybrid integers from bounded codestream windows,
 validates every bit and output bound, applies LZ77, walks the MA tree, reconstructs all predictors,
@@ -426,9 +431,10 @@ Repeated small and sequential decodes reuse a decoder-local, bounded cache for e
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
-aligned spans directly from the shared input storage, while metadata and packed 236-byte
-`ShaderParams` records (including the 12-byte shared entropy prefix) use `Queue::write_buffer`; no
-second full-codestream host `Vec` is created.
+only each planned bounded range from a checked table of shared input spans, even when the range
+crosses physical chunks, while metadata and packed 236-byte `ShaderParams` records (including the
+12-byte shared entropy prefix) use `Queue::write_buffer`; no second full-codestream host `Vec` is
+created.
 
 Idle retention defaults to 32 MiB, 256 buffers total, and 32 buffers per exact key.
 `WgpuSubmissionEngine::{buffer_pool_limits,set_buffer_pool_limits,clear_buffer_pool,buffer_pool_stats}`

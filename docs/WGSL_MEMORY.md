@@ -99,8 +99,11 @@ name shown in parentheses.
 - Codestream storage and the decoder prefix lookup are variable arrays, not fixed records. The
   lookup is retained session-locally as `Arc<[u32]>` and uploaded with `cast_slice`; the raw
   codestream remains bytes so its bit/byte offsets and explicit four-byte sentinel are preserved.
-  Aligned codestream spans are uploaded directly from shared input storage, without constructing
-  a second full-size host `Vec`.
+  Modular metadata and upload planning use a checked `Arc`-backed logical span table. Its bit
+  reader and exact range copier cross physical chunk boundaries, and only the resolved reusable
+  GPU window is materialized; no second full-size host `Vec` is constructed. The current public
+  open path retains the source spans for the session, so incremental ingestion must still release
+  consumed spans under the shared backpressure contract.
 
 Manual endian-aware serialization is therefore retained only for bitstream/container/file
 formats. Fixed GPU records do not use hand-written byte flattening.

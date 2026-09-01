@@ -11,6 +11,21 @@ use jxl_gpu_bitstream::{BitReader, PrefixCodeEntry};
 
 use crate::{ModularTreeError, Result};
 
+pub(crate) trait BitInput {
+    fn bit_offset(&self) -> u64;
+    fn read_bits(&mut self, count: u8) -> Result<u64>;
+}
+
+impl<'input> BitInput for BitReader<'input> {
+    fn bit_offset(&self) -> u64 {
+        BitReader::bit_offset(self)
+    }
+
+    fn read_bits(&mut self, count: u8) -> Result<u64> {
+        Ok(BitReader::read_bits(self, count)?)
+    }
+}
+
 const MAX_PREFIX_BITS: u8 = 15;
 const MAX_PREFIX_ALPHABET_SIZE: usize = 1 << MAX_PREFIX_BITS;
 const ANS_SIGNATURE: u32 = 0x13_0000;
@@ -52,7 +67,7 @@ pub(crate) struct HybridIntegerConfigIr {
 }
 
 impl HybridIntegerConfigIr {
-    fn parse(reader: &mut BitReader<'_>, log_alphabet_size: u32) -> Result<Self> {
+    fn parse(reader: &mut impl BitInput, log_alphabet_size: u32) -> Result<Self> {
         let bit_offset = reader.bit_offset();
         let split_exponent_bits = add_log2_ceil(log_alphabet_size);
         let split_exponent = read_bits_u32(reader, split_exponent_bits)?;
@@ -141,7 +156,7 @@ impl PrefixHistogramIr {
         })
     }
 
-    fn parse(reader: &mut BitReader<'_>, alphabet_size: usize) -> Result<Self> {
+    fn parse(reader: &mut impl BitInput, alphabet_size: usize) -> Result<Self> {
         if alphabet_size == 0 || alphabet_size > MAX_PREFIX_ALPHABET_SIZE {
             return invalid_entropy("prefix alphabet size is outside 1 through 32768");
         }
@@ -156,7 +171,7 @@ impl PrefixHistogramIr {
         Self::parse_complex(reader, alphabet_size, hskip)
     }
 
-    fn parse_simple(reader: &mut BitReader<'_>, alphabet_size: usize) -> Result<Self> {
+    fn parse_simple(reader: &mut impl BitInput, alphabet_size: usize) -> Result<Self> {
         let alphabet_bits = alphabet_size.next_power_of_two().trailing_zeros();
         let symbol_count = read_bits_u32(reader, 2)? + 1;
         let mut lengths = vec![0u8; alphabet_size];
@@ -191,7 +206,7 @@ impl PrefixHistogramIr {
         })
     }
 
-    fn parse_complex(reader: &mut BitReader<'_>, alphabet_size: usize, hskip: u32) -> Result<Self> {
+    fn parse_complex(reader: &mut impl BitInput, alphabet_size: usize, hskip: u32) -> Result<Self> {
         const ORDER: [usize; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let skip = usize::try_from(hskip)
             .map_err(|_| invalid_entropy_error("prefix hskip exceeds host address space"))?;
@@ -385,7 +400,7 @@ pub(crate) struct AnsHistogramIr {
 }
 
 impl AnsHistogramIr {
-    fn parse(reader: &mut BitReader<'_>, log_alphabet_size: u32) -> Result<Self> {
+    fn parse(reader: &mut impl BitInput, log_alphabet_size: u32) -> Result<Self> {
         #[derive(Clone, Copy)]
         struct WorkingBucket {
             distribution: u16,
@@ -710,7 +725,7 @@ pub(crate) struct EntropyDecoderIr {
 
 impl EntropyDecoderIr {
     pub(crate) fn parse(
-        reader: &mut BitReader<'_>,
+        reader: &mut impl BitInput,
         context_count: usize,
         limits: MaTreeLimits,
     ) -> Result<Self> {
@@ -718,7 +733,7 @@ impl EntropyDecoderIr {
     }
 
     fn parse_assume_no_lz77(
-        reader: &mut BitReader<'_>,
+        reader: &mut impl BitInput,
         context_count: usize,
         limits: MaTreeLimits,
     ) -> Result<Self> {
@@ -726,7 +741,7 @@ impl EntropyDecoderIr {
     }
 
     fn parse_inner(
-        reader: &mut BitReader<'_>,
+        reader: &mut impl BitInput,
         context_count: usize,
         limits: MaTreeLimits,
         forbid_lz77: bool,
@@ -978,7 +993,7 @@ impl Default for WpHeaderIr {
 }
 
 impl WpHeaderIr {
-    pub(crate) fn parse(reader: &mut BitReader<'_>) -> Result<Self> {
+    pub(crate) fn parse(reader: &mut impl BitInput) -> Result<Self> {
         if reader.read_bits(1)? != 0 {
             return Ok(Self::default());
         }
@@ -1000,7 +1015,7 @@ impl WpHeaderIr {
 
 /// Parses one standard MA configuration while leaving its image entropy unread.
 pub(crate) fn parse_ma_config(
-    reader: &mut BitReader<'_>,
+    reader: &mut impl BitInput,
     limits: MaTreeLimits,
 ) -> Result<MaConfigIr> {
     let tree_entropy = EntropyDecoderIr::parse(reader, 6, limits)?;
@@ -1454,7 +1469,7 @@ impl<'a> MetadataEntropyCursor<'a> {
         }
     }
 
-    fn begin(&mut self, reader: &mut BitReader<'_>) -> Result<()> {
+    fn begin(&mut self, reader: &mut impl BitInput) -> Result<()> {
         if matches!(self.descriptor.coder, EntropyCoderIr::Ans { .. }) {
             self.ans_state = Some(read_bits_u32(reader, 32)?);
         }
@@ -1470,7 +1485,7 @@ impl<'a> MetadataEntropyCursor<'a> {
 
     fn read_varint(
         &mut self,
-        reader: &mut BitReader<'_>,
+        reader: &mut impl BitInput,
         context: usize,
         distance_multiplier: u32,
     ) -> Result<u32> {
@@ -1555,7 +1570,7 @@ impl<'a> MetadataEntropyCursor<'a> {
         Ok(value)
     }
 
-    fn read_clustered(&mut self, reader: &mut BitReader<'_>, cluster: u8) -> Result<u32> {
+    fn read_clustered(&mut self, reader: &mut impl BitInput, cluster: u8) -> Result<u32> {
         let token = self.read_symbol(reader, cluster)?;
         let config = *self
             .descriptor
@@ -1565,7 +1580,7 @@ impl<'a> MetadataEntropyCursor<'a> {
         self.read_hybrid(reader, config, token)
     }
 
-    fn read_symbol(&mut self, reader: &mut BitReader<'_>, cluster: u8) -> Result<u32> {
+    fn read_symbol(&mut self, reader: &mut impl BitInput, cluster: u8) -> Result<u32> {
         match &self.descriptor.coder {
             EntropyCoderIr::Prefix(histograms) => {
                 let histogram = histograms
@@ -1626,7 +1641,7 @@ impl<'a> MetadataEntropyCursor<'a> {
 
     fn read_hybrid(
         &mut self,
-        reader: &mut BitReader<'_>,
+        reader: &mut impl BitInput,
         config: HybridIntegerConfigIr,
         token: u32,
     ) -> Result<u32> {
@@ -1652,7 +1667,7 @@ impl<'a> MetadataEntropyCursor<'a> {
 }
 
 fn read_clusters(
-    reader: &mut BitReader<'_>,
+    reader: &mut impl BitInput,
     context_count: usize,
     limits: MaTreeLimits,
 ) -> Result<Vec<u8>> {
@@ -1718,7 +1733,7 @@ fn read_clusters(
     Ok(clusters)
 }
 
-fn read_code_length_code(reader: &mut BitReader<'_>) -> Result<u8> {
+fn read_code_length_code(reader: &mut impl BitInput) -> Result<u8> {
     Ok(match read_bits_u32(reader, 2)? {
         0 => 0,
         1 => 4,
@@ -1768,7 +1783,7 @@ fn canonical_entries(lengths: &[u8]) -> Result<Vec<PrefixCodeEntry>> {
     Ok(entries)
 }
 
-fn read_prefix_symbol(reader: &mut BitReader<'_>, entries: &[PrefixCodeEntry]) -> Result<u32> {
+fn read_prefix_symbol(reader: &mut impl BitInput, entries: &[PrefixCodeEntry]) -> Result<u32> {
     if entries.len() == 1 && entries[0].bit_len == 0 {
         return Ok(0);
     }
@@ -1788,7 +1803,7 @@ fn read_prefix_symbol(reader: &mut BitReader<'_>, entries: &[PrefixCodeEntry]) -
     invalid_entropy("invalid prefix symbol")
 }
 
-fn read_ans_u8(reader: &mut BitReader<'_>) -> Result<u8> {
+fn read_ans_u8(reader: &mut impl BitInput) -> Result<u8> {
     if reader.read_bits(1)? == 0 {
         return Ok(0);
     }
@@ -1797,7 +1812,7 @@ fn read_ans_u8(reader: &mut BitReader<'_>) -> Result<u8> {
         .map_err(|_| invalid_entropy_error("ANS u8 value overflow").into())
 }
 
-fn read_ans_prefix(reader: &mut BitReader<'_>) -> Result<u16> {
+fn read_ans_prefix(reader: &mut impl BitInput) -> Result<u16> {
     Ok(match read_bits_u32(reader, 3)? {
         0 => 10,
         1 => {
@@ -1969,7 +1984,7 @@ fn unpack_signed(value: u32) -> i32 {
     }
 }
 
-fn read_bits_u32(reader: &mut BitReader<'_>, count: u32) -> Result<u32> {
+fn read_bits_u32(reader: &mut impl BitInput, count: u32) -> Result<u32> {
     let count = u8::try_from(count)
         .map_err(|_| invalid_entropy_error("bit count exceeds the bounded reader"))?;
     u32::try_from(reader.read_bits(count)?)
