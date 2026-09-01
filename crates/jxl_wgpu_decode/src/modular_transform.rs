@@ -498,6 +498,27 @@ impl ModularTransformPlan {
         &self.source_topology
     }
 
+    /// Re-applies the already parsed transform sequence to another source geometry.
+    ///
+    /// Pass groups share the DC-global transform metadata but operate on their own edge-aware
+    /// channel rectangles. Re-applying the typed IR avoids re-parsing bits and keeps every
+    /// topology/resource limit authoritative for the concrete group.
+    pub(crate) fn reapply_to(
+        &self,
+        source_topology: ModularChannelTopology,
+        limits: ModularTransformLimits,
+    ) -> Result<Self> {
+        Self::from_transforms(source_topology, self.transforms.clone(), limits)
+    }
+
+    pub(crate) fn from_ir(
+        source_topology: ModularChannelTopology,
+        transforms: Vec<ModularTransformIr>,
+        limits: ModularTransformLimits,
+    ) -> Result<Self> {
+        Self::from_transforms(source_topology, transforms, limits)
+    }
+
     #[cfg(test)]
     pub(crate) fn squeeze_only_for_test(
         source_topology: ModularChannelTopology,
@@ -516,6 +537,14 @@ impl ModularTransformPlan {
 
     #[cfg(test)]
     pub(crate) fn from_transforms_for_test(
+        source_topology: ModularChannelTopology,
+        transforms: Vec<ModularTransformIr>,
+        limits: ModularTransformLimits,
+    ) -> Result<Self> {
+        Self::from_transforms(source_topology, transforms, limits)
+    }
+
+    fn from_transforms(
         source_topology: ModularChannelTopology,
         transforms: Vec<ModularTransformIr>,
         limits: ModularTransformLimits,

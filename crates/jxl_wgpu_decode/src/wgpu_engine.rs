@@ -32,6 +32,7 @@ use crate::model::native_modular_format;
 use crate::modular_finalize::{
     DEFAULT_MODULAR_FINALIZE_VARIANT, MODULAR_FINALIZE_KERNEL_KEY, ModularFinalizeBindings,
     ModularFinalizeF64Path, ModularFinalizeOutput, ModularFinalizeParams, ModularFinalizePipeline,
+    ModularFinalizeRegion,
 };
 use crate::modular_inverse::ModularInverseJob;
 use crate::modular_palette::{
@@ -43,9 +44,10 @@ use crate::modular_rct::{
     ModularRctPipeline,
 };
 use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezeParams, ModularSqueezePipeline};
-use crate::modular_transform::{ModularRct, ModularTransformIr};
 use crate::modular_tree::{EntropyCoderIr, MaTreeNodeIr};
-use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
+use crate::profile::{
+    ModularGroup, ResidentModularGroupPlan, StandardModularProfile, parse_standard_modular_profile,
+};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, F64OutputPolicy, FrameDuration, FrameMetadata,
     GpuCodestream, GpuOutputMapping, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
@@ -171,7 +173,8 @@ pub struct WgpuDecodeMemoryStats {
     ///
     /// A logical one-word ring uses invocation-private state and therefore reports zero here.
     pub max_lz77_scratch_words: u32,
-    /// Bounded stream uploads required for one frame. Each batch is one ordered queue submission.
+    /// Bounded stream uploads required for one frame, including a DC-global entropy job when
+    /// present. Each batch is one ordered queue submission.
     pub stream_batch_count: usize,
     /// Actual codec queue submissions per decoded frame.
     pub submissions_per_frame: usize,
@@ -463,20 +466,7 @@ fn reconstruction_specialization(
 }
 
 fn uses_generalized_channel_layout(profile: &StandardModularProfile) -> bool {
-    !matches!(
-        (
-            profile.channels,
-            profile.transform_plan.transforms.as_slice()
-        ),
-        (crate::ModularChannels::Gray, [])
-            | (
-                crate::ModularChannels::Rgb | crate::ModularChannels::Rgba,
-                [ModularTransformIr::Rct(ModularRct {
-                    begin_channel: 0,
-                    rct_type: 6,
-                })],
-            )
-    )
+    profile.generalized_channels
 }
 
 fn channel_fixed_gradient_specialization(
@@ -681,23 +671,30 @@ impl WgpuSubmissionEngine {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
         let mut modular_metadata = profile.ma_config.pack_gpu_metadata()?.words;
         let generalized_channels = uses_generalized_channel_layout(&profile);
-        if generalized_channels && profile.groups.len() != 1 {
-            return Err(Error::UnsupportedProfile(crate::UnsupportedProfile::new(
-                crate::UnsupportedCodestreamFeature::Other(
-                    "multi-group-generalized-modular-layout".into(),
-                ),
-                "generalized Modular channel layouts currently require one root group",
-            )));
-        }
-        let channel_layout_offset = if generalized_channels {
-            let final_planes = profile.inverse_plan.final_gpu_layouts();
-            profile.channel_metadata.append_to(
-                &mut modular_metadata,
-                profile.inverse_plan.arena_words(),
-                &final_planes,
-            )?
+        let channel_layout_offsets: Arc<[u32]> = if generalized_channels {
+            if profile.resident_group_plans.len() != profile.groups.len() {
+                return Err(Error::EngineContract(
+                    "generalized Modular group plans do not match the frame grid",
+                ));
+            }
+            let mut unique = Vec::<(ResidentModularGroupPlan, u32)>::new();
+            let mut offsets = Vec::with_capacity(profile.resident_group_plans.len());
+            for plan in &profile.resident_group_plans {
+                if let Some((_, offset)) = unique.iter().find(|(candidate, _)| candidate == plan) {
+                    offsets.push(*offset);
+                    continue;
+                }
+                let offset = plan.channel_metadata.append_to(
+                    &mut modular_metadata,
+                    plan.inverse_plan.arena_words(),
+                    &plan.inverse_plan.final_gpu_layouts(),
+                )?;
+                unique.push((plan.clone(), offset));
+                offsets.push(offset);
+            }
+            offsets.into()
         } else {
-            0
+            Arc::from([])
         };
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
         let extent = Extent2d::new(profile.width, profile.height);
@@ -733,19 +730,19 @@ impl WgpuSubmissionEngine {
         let inverse_pipelines = generalized_channels
             .then(|| {
                 let needs_squeeze = profile
-                    .inverse_plan
-                    .jobs()
+                    .resident_group_plans
                     .iter()
+                    .flat_map(|plan| plan.inverse_plan.jobs())
                     .any(|job| matches!(job, ModularInverseJob::Squeeze { .. }));
                 let needs_rct = profile
-                    .inverse_plan
-                    .jobs()
+                    .resident_group_plans
                     .iter()
+                    .flat_map(|plan| plan.inverse_plan.jobs())
                     .any(|job| matches!(job, ModularInverseJob::Rct { .. }));
                 let needs_palette = profile
-                    .inverse_plan
-                    .jobs()
+                    .resident_group_plans
                     .iter()
+                    .flat_map(|plan| plan.inverse_plan.jobs())
                     .any(|job| matches!(job, ModularInverseJob::Palette { .. }));
                 self.inverse_pipelines.get(
                     &self.backend,
@@ -756,9 +753,19 @@ impl WgpuSubmissionEngine {
                 )
             })
             .transpose()?;
-        let finalize_params = generalized_channels
-            .then(|| modular_finalize_params(&profile, &output))
-            .transpose()?;
+        let finalize_params: Arc<[ModularFinalizeParams]> = if generalized_channels {
+            profile
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    modular_finalize_params(&profile, &output, group_index, *group)
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into()
+        } else {
+            Arc::from([])
+        };
         let pipeline = pipelines.get_or_init(
             &self.backend,
             pipeline_f64_path,
@@ -837,7 +844,7 @@ impl WgpuSubmissionEngine {
                     profile,
                     dispatch_layout,
                     modular_metadata,
-                    channel_layout_offset,
+                    channel_layout_offsets,
                     finalize_params,
                     output,
                 }),
@@ -1235,7 +1242,7 @@ pub struct WgpuPendingFrame {
     token: SubmissionToken,
     layout: ImageLayout,
     completion: Arc<MapCompletion>,
-    group_sample_counts: Arc<[u32]>,
+    stream_sample_counts: Arc<[u32]>,
     status_stride: u64,
 }
 
@@ -1245,7 +1252,7 @@ impl std::fmt::Debug for WgpuPendingFrame {
             .debug_struct("WgpuPendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
-            .field("group_sample_counts", &self.group_sample_counts)
+            .field("stream_sample_counts", &self.stream_sample_counts)
             .finish_non_exhaustive()
     }
 }
@@ -1291,7 +1298,7 @@ impl WgpuPendingFrame {
             .get_mapped_range()
             .map_err(Error::backend)?;
         let statuses = self
-            .group_sample_counts
+            .stream_sample_counts
             .iter()
             .copied()
             .enumerate()
@@ -1414,8 +1421,8 @@ struct DecodeSource {
     // Immutable within the session. All independently decoded groups share the standard
     // DC-global MA/entropy descriptor without sharing mutable GPU transient allocations.
     modular_metadata: Arc<[u32]>,
-    channel_layout_offset: u32,
-    finalize_params: Option<ModularFinalizeParams>,
+    channel_layout_offsets: Arc<[u32]>,
+    finalize_params: Arc<[ModularFinalizeParams]>,
     output: OutputPlan,
 }
 
@@ -1465,6 +1472,8 @@ struct GroupDispatchLayout {
     max_lz77_scratch_words: u32,
     parallel_group_lanes: usize,
     reconstructed_bytes: u64,
+    global_stream_segments: Arc<[GroupStreamSegment]>,
+    global_stream_batches: Arc<[StreamBatch]>,
     stream_segments: Arc<[GroupStreamSegment]>,
     stream_batches: Arc<[StreamBatch]>,
     stream_bytes: u64,
@@ -1538,15 +1547,20 @@ impl GroupDispatchLayout {
             }
         };
         let resident_modular_arena_bytes = if generalized_channels {
-            profile.inverse_plan.arena_bytes()
+            profile
+                .resident_group_plans
+                .iter()
+                .map(|plan| plan.inverse_plan.arena_bytes())
+                .max()
+                .unwrap_or(0)
         } else {
             0
         };
         let inverse_transform_count = if generalized_channels {
             profile
-                .inverse_plan
-                .jobs()
+                .resident_group_plans
                 .iter()
+                .flat_map(|plan| plan.inverse_plan.jobs())
                 .try_fold(0usize, |total, job| {
                     let dispatches = match job {
                         ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
@@ -1560,9 +1574,9 @@ impl GroupDispatchLayout {
         };
         let palette_dispatch_count = if generalized_channels {
             profile
-                .inverse_plan
-                .jobs()
+                .resident_group_plans
                 .iter()
+                .flat_map(|plan| plan.inverse_plan.jobs())
                 .try_fold(0usize, |total, job| {
                     let dispatches = match job {
                         ModularInverseJob::Palette { job } => job.dispatch_count() as usize,
@@ -1576,9 +1590,9 @@ impl GroupDispatchLayout {
         };
         let inverse_transform_uniform_bytes = if generalized_channels {
             profile
-                .inverse_plan
-                .jobs()
+                .resident_group_plans
                 .iter()
+                .flat_map(|plan| plan.inverse_plan.jobs())
                 .try_fold(0u64, |total, job| {
                     let bytes = match job {
                         ModularInverseJob::Squeeze { .. } => {
@@ -1596,21 +1610,28 @@ impl GroupDispatchLayout {
             0
         };
         let final_output_uniform_bytes = if generalized_channels {
-            std::mem::size_of::<ModularFinalizeParams>() as u64
+            (std::mem::size_of::<ModularFinalizeParams>() as u64)
+                .checked_mul(u64::try_from(profile.groups.len()).map_err(|_| {
+                    Error::backend("Modular group count exceeds uniform accounting")
+                })?)
+                .ok_or_else(|| Error::backend("Modular finalizer uniform size overflow"))?
         } else {
             0
         };
-        for group in &profile.groups {
-            let decoded_symbol_count = group_decoded_symbol_count(profile, *group)?;
-            let lz77_window_words = group_lz77_window_words(profile, *group, decoded_symbol_count)?;
+        for (group_index, group) in profile.groups.iter().copied().enumerate() {
+            let decoded_symbol_count = group_decoded_symbol_count(profile, group_index, group)?;
+            let lz77_window_words =
+                group_lz77_window_words(profile, group_index, group, decoded_symbol_count)?;
             let physical_lz77_words = lz77_scratch_words(lz77_window_words);
             let group_output_mode =
                 refine_fixed_gradient_output_mode(output_mode, lz77_window_words);
             let physical_sample_words =
                 if group_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
-                    compact_gray8_sample_words(*group)?
+                    compact_gray8_sample_words(group)?
                 } else if uses_generalized_channel_layout(profile) {
-                    profile.inverse_plan.arena_words()
+                    resident_group_plan(profile, group_index)?
+                        .inverse_plan
+                        .arena_words()
                 } else {
                     decoded_symbol_count
                 };
@@ -1620,14 +1641,24 @@ impl GroupDispatchLayout {
                 max_physical_reconstruction_sample_words.max(physical_sample_words);
             max_lz77_window_words = max_lz77_window_words.max(lz77_window_words);
             max_lz77_scratch_words = max_lz77_scratch_words.max(physical_lz77_words);
-            reconstruction_lane_stride =
-                reconstruction_lane_stride.max(align4(group_reconstructed_bytes(
-                    profile,
-                    *group,
-                    decoded_symbol_count,
-                    physical_sample_words,
-                    execution_state_bytes_per_lane,
-                )?)?);
+            let group_bytes = group_reconstructed_bytes(
+                profile,
+                group_index,
+                group,
+                decoded_symbol_count,
+                physical_sample_words,
+                execution_state_bytes_per_lane,
+            )?;
+            let lane_alignment = if generalized_channels && profile.groups.len() > 1 {
+                u64::from(limits.min_storage_buffer_offset_alignment).max(4)
+            } else {
+                4
+            };
+            reconstruction_lane_stride = reconstruction_lane_stride.max(align_to(
+                group_bytes,
+                lane_alignment,
+                "reconstruction lane",
+            )?);
         }
         if reconstruction_lane_stride == 0 {
             return Err(Error::backend("Modular reconstruction lane is empty"));
@@ -1648,14 +1679,32 @@ impl GroupDispatchLayout {
         }
         let group_count = u64::try_from(profile.groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
+        let (global_stream_segments, global_stream_batches, global_stream_bytes) =
+            profile.global_stream.map_or_else(
+                || Ok((Vec::new(), Vec::new(), 0)),
+                |stream| {
+                    build_entropy_stream_batches(
+                        codestream_bytes,
+                        &[GroupEntropyRange {
+                            token_bit_offset: stream.token_bit_offset,
+                            token_bit_end: stream.token_bit_end,
+                        }],
+                        stream_limit,
+                        1,
+                    )
+                },
+            )?;
+        let status_record_count = group_count
+            .checked_add(u64::from(profile.global_stream.is_some()))
+            .ok_or_else(|| Error::backend("Modular status record count overflow"))?;
         let status_stride = STATUS_BYTES;
         let status_bytes = status_stride
-            .checked_mul(group_count)
-            .ok_or_else(|| Error::backend("group status buffer size overflow"))?;
+            .checked_mul(status_record_count)
+            .ok_or_else(|| Error::backend("Modular status buffer size overflow"))?;
         let params_stride = std::mem::size_of::<ShaderParams>() as u64;
         let params_bytes = params_stride
-            .checked_mul(group_count)
-            .ok_or_else(|| Error::backend("group parameter buffer size overflow"))?;
+            .checked_mul(status_record_count)
+            .ok_or_else(|| Error::backend("Modular parameter buffer size overflow"))?;
         let fixed_bytes = [
             modular_metadata_bytes(modular_metadata)?,
             align4(output.layout.logical_size)?,
@@ -1726,7 +1775,8 @@ impl GroupDispatchLayout {
                 options.memory_limit_bytes
             ))
         })?;
-        let (parallel_group_lanes, stream_segments, stream_batches, stream_bytes) = selected;
+        let (parallel_group_lanes, stream_segments, stream_batches, group_stream_bytes) = selected;
+        let stream_bytes = group_stream_bytes.max(global_stream_bytes);
         let reconstructed_bytes = reconstruction_lane_stride
             .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
@@ -1746,6 +1796,8 @@ impl GroupDispatchLayout {
             max_lz77_scratch_words,
             parallel_group_lanes,
             reconstructed_bytes,
+            global_stream_segments: global_stream_segments.into(),
+            global_stream_batches: global_stream_batches.into(),
             stream_segments: stream_segments.into(),
             stream_batches: stream_batches.into(),
             stream_bytes,
@@ -1841,13 +1893,14 @@ fn compact_gray8_sample_words(group: ModularGroup) -> Result<u32> {
 
 fn group_reconstructed_bytes(
     profile: &StandardModularProfile,
+    group_index: usize,
     group: ModularGroup,
     decoded_symbol_count: u32,
     physical_sample_words: u32,
     execution_state_bytes: u64,
 ) -> Result<u64> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
-        u64::from(group_maximum_channel_width(profile, group)?)
+        u64::from(group_maximum_channel_width(profile, group_index, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
     } else {
@@ -1855,6 +1908,7 @@ fn group_reconstructed_bytes(
     };
     let entropy_words = u64::from(lz77_scratch_words(group_lz77_window_words(
         profile,
+        group_index,
         group,
         decoded_symbol_count,
     )?));
@@ -1887,12 +1941,13 @@ const fn modular_execution_state_bytes(
 
 fn group_entropy_state_offset_words(
     profile: &StandardModularProfile,
+    group_index: usize,
     group: ModularGroup,
     decoded_symbol_count: u32,
     physical_sample_words: u32,
 ) -> Result<u32> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
-        u64::from(group_maximum_channel_width(profile, group)?)
+        u64::from(group_maximum_channel_width(profile, group_index, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
     } else {
@@ -1900,6 +1955,7 @@ fn group_entropy_state_offset_words(
     };
     let entropy_words = u64::from(lz77_scratch_words(group_lz77_window_words(
         profile,
+        group_index,
         group,
         decoded_symbol_count,
     )?));
@@ -1957,10 +2013,13 @@ fn refine_fixed_gradient_output_mode(
 
 fn group_decoded_symbol_count(
     profile: &StandardModularProfile,
+    group_index: usize,
     group: ModularGroup,
 ) -> Result<u32> {
     if uses_generalized_channel_layout(profile) {
-        return Ok(profile.inverse_plan.entropy_words());
+        return Ok(resident_group_plan(profile, group_index)?
+            .inverse_plan
+            .entropy_words());
     }
     group
         .sample_count()?
@@ -1970,12 +2029,13 @@ fn group_decoded_symbol_count(
 
 fn group_maximum_channel_width(
     profile: &StandardModularProfile,
+    group_index: usize,
     group: ModularGroup,
 ) -> Result<u32> {
     if !uses_generalized_channel_layout(profile) {
         return Ok(group.width);
     }
-    profile
+    resident_group_plan(profile, group_index)?
         .channel_metadata
         .channels
         .iter()
@@ -1987,13 +2047,26 @@ fn group_maximum_channel_width(
 
 fn group_lz77_window_words(
     profile: &StandardModularProfile,
+    group_index: usize,
     group: ModularGroup,
     decoded_symbol_count: u32,
 ) -> Result<u32> {
     profile.ma_config.entropy.lz77_window_words(
-        group_maximum_channel_width(profile, group)?,
+        group_maximum_channel_width(profile, group_index, group)?,
         decoded_symbol_count,
     )
+}
+
+fn resident_group_plan(
+    profile: &StandardModularProfile,
+    group_index: usize,
+) -> Result<&ResidentModularGroupPlan> {
+    profile
+        .resident_group_plans
+        .get(group_index)
+        .ok_or(Error::EngineContract(
+            "resident Modular group plan is missing",
+        ))
 }
 
 const fn lz77_scratch_words(window_words: u32) -> u32 {
@@ -2010,6 +2083,8 @@ fn modular_metadata_bytes(metadata: &[u32]) -> Result<u64> {
 fn modular_finalize_params(
     profile: &StandardModularProfile,
     output: &OutputPlan,
+    group_index: usize,
+    group: ModularGroup,
 ) -> Result<ModularFinalizeParams> {
     let to_u32 = |value: u64, name: &'static str| {
         u32::try_from(value).map_err(|_| Error::backend(format!("{name} exceeds WGSL u32")))
@@ -2028,11 +2103,19 @@ fn modular_finalize_params(
         .layout
         .plane(1)
         .map_or(Extent2d::new(0, 0), |plane| plane.sample_extent);
+    let resident = resident_group_plan(profile, group_index)?;
     ModularFinalizeParams::new(
-        output.layout.extent,
+        ModularFinalizeRegion {
+            source_extent: Extent2d::new(group.width, group.height),
+            canvas_extent: output.layout.extent,
+            origin_x: group.x,
+            origin_y: group.y,
+            status_index: u32::try_from(group_index)
+                .map_err(|_| Error::backend("Modular finalizer status index exceeds u32"))?,
+        },
         profile.bits_per_sample,
-        &profile.inverse_plan.final_gpu_layouts(),
-        profile.inverse_plan.arena_words(),
+        &resident.inverse_plan.final_gpu_layouts(),
+        resident.inverse_plan.arena_words(),
         ModularFinalizeOutput {
             kind: output.kind as u32,
             transfer: output.transfer,
@@ -2564,15 +2647,15 @@ fn validate_device_limits(
     let transient_bytes = per_frame
         .checked_sub(output_bytes)
         .ok_or_else(|| Error::backend("Modular transient memory accounting underflow"))?;
-    let max_dispatch_workgroups =
-        dispatch
-            .stream_batches
-            .iter()
-            .try_fold(0u32, |maximum, batch| {
-                u32::try_from(batch.group_count)
-                    .map(|groups| maximum.max(groups.div_ceil(dispatch.group_workgroup_size)))
-                    .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
-            })?;
+    let max_dispatch_workgroups = dispatch
+        .global_stream_batches
+        .iter()
+        .chain(dispatch.stream_batches.iter())
+        .try_fold(0u32, |maximum, batch| {
+            u32::try_from(batch.group_count)
+                .map(|groups| maximum.max(groups.div_ceil(dispatch.group_workgroup_size)))
+                .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
+        })?;
     if max_dispatch_workgroups == 0 {
         return Err(Error::backend("Modular stream batch layout is empty"));
     }
@@ -2596,8 +2679,16 @@ fn validate_device_limits(
         final_output_uniform_bytes: dispatch.final_output_uniform_bytes,
         max_lz77_window_words: dispatch.max_lz77_window_words,
         max_lz77_scratch_words: dispatch.max_lz77_scratch_words,
-        stream_batch_count: dispatch.stream_batches.len(),
-        submissions_per_frame: dispatch.stream_batches.len(),
+        stream_batch_count: dispatch
+            .global_stream_batches
+            .len()
+            .checked_add(dispatch.stream_batches.len())
+            .ok_or_else(|| Error::backend("Modular stream batch count overflow"))?,
+        submissions_per_frame: dispatch
+            .global_stream_batches
+            .len()
+            .checked_add(dispatch.stream_batches.len())
+            .ok_or_else(|| Error::backend("Modular submission count overflow"))?,
         parallel_group_lanes: dispatch.parallel_group_lanes,
         group_workgroup_size: dispatch.group_workgroup_size,
         max_dispatch_workgroups,
@@ -2769,6 +2860,82 @@ fn submit_decode(
         .map_err(|_| Error::backend("bounded stream upload exceeds host address space"))?;
     let mut stream_upload = vec![0u8; upload_len];
     let mut final_submission = None;
+    let has_global_stream = !source.dispatch_layout.global_stream_batches.is_empty();
+    if has_global_stream {
+        let global_record_index = source.profile.groups.len();
+        let global_record_index_u32 = u32::try_from(global_record_index)
+            .map_err(|_| Error::backend("DC-global status index exceeds WGSL u32"))?;
+        let global_params_offset = u64::try_from(global_record_index)
+            .ok()
+            .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
+            .ok_or_else(|| Error::backend("DC-global parameter offset overflow"))?;
+        for (batch_index, batch) in source
+            .dispatch_layout
+            .global_stream_batches
+            .iter()
+            .enumerate()
+        {
+            stream_upload.fill(0);
+            let segment_index = batch.segments.start;
+            if batch.segments.end != segment_index + 1 {
+                return Err(Error::EngineContract(
+                    "one DC-global entropy batch must contain exactly one segment",
+                ));
+            }
+            let segment = source
+                .dispatch_layout
+                .global_stream_segments
+                .get(segment_index)
+                .copied()
+                .ok_or(Error::EngineContract(
+                    "DC-global entropy stream segment is missing",
+                ))?;
+            copy_stream_segment(source, segment, &mut stream_upload, "DC-global")?;
+            let params = build_empty_global_params(segment, global_record_index_u32);
+            backend.queue().write_buffer(
+                lifetime._params.buffer(),
+                global_params_offset,
+                bytemuck::bytes_of(&params),
+            );
+            backend.queue().write_buffer(&stream, 0, &stream_upload);
+            let control = DispatchControl {
+                first_group: global_record_index_u32,
+                group_count: 1,
+                lane_stride_words: u32::try_from(
+                    source.dispatch_layout.reconstruction_lane_stride / 4,
+                )
+                .map_err(|_| Error::backend("reconstruction lane stride exceeds WGSL u32"))?,
+                _padding: 0,
+            };
+            backend.queue().write_buffer(
+                lifetime._dispatch_control.buffer(),
+                0,
+                bytemuck::bytes_of(&control),
+            );
+
+            let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu validate bounded DC-global Modular entropy"),
+            });
+            if batch_index == 0 {
+                commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
+                commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
+                if let Some(dummy) = &lifetime._native_f64_dummy_words {
+                    commands.clear_buffer(dummy.buffer(), 0, None);
+                }
+                commands.clear_buffer(lifetime._status.buffer(), 0, None);
+            }
+            {
+                let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("jxl-wgpu empty DC-global Modular entropy validation"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &binding, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            backend.queue().submit([commands.finish()]);
+        }
+    }
     for (batch_index, batch) in source.dispatch_layout.stream_batches.iter().enumerate() {
         stream_upload.fill(0);
         for segment_index in batch.segments.clone() {
@@ -2778,25 +2945,7 @@ fn submit_decode(
                 .get(segment_index)
                 .copied()
                 .ok_or_else(|| Error::backend("group stream segment is missing"))?;
-            let end = segment
-                .upload_offset
-                .checked_add(
-                    segment
-                        .input_end
-                        .checked_sub(segment.input_start)
-                        .ok_or_else(|| Error::backend("group stream input range underflow"))?,
-                )
-                .ok_or_else(|| Error::backend("group stream upload range overflow"))?;
-            let destination = stream_upload
-                .get_mut(segment.upload_offset..end)
-                .ok_or_else(|| Error::backend("group stream upload range is truncated"))?;
-            source.codestream.copy_range(
-                u64::try_from(segment.input_start)
-                    .map_err(|_| Error::backend("group stream start exceeds u64"))?
-                    ..u64::try_from(segment.input_end)
-                        .map_err(|_| Error::backend("group stream end exceeds u64"))?,
-                destination,
-            )?;
+            copy_stream_segment(source, segment, &mut stream_upload, "group")?;
 
             let group = source
                 .profile
@@ -2808,6 +2957,7 @@ fn submit_decode(
                 .map_err(|_| Error::backend("group status index exceeds WGSL u32"))?;
             let params = build_params(
                 group,
+                segment.group_index,
                 segment,
                 status_index,
                 source,
@@ -2851,11 +3001,13 @@ fn submit_decode(
         });
         if batch_index == 0 {
             commands.clear_buffer(lifetime._reconstructed.buffer(), 0, None);
-            commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
-            if let Some(dummy) = &lifetime._native_f64_dummy_words {
-                commands.clear_buffer(dummy.buffer(), 0, None);
+            if !has_global_stream {
+                commands.clear_buffer(lifetime.output.as_wgpu_buffer(), 0, None);
+                if let Some(dummy) = &lifetime._native_f64_dummy_words {
+                    commands.clear_buffer(dummy.buffer(), 0, None);
+                }
+                commands.clear_buffer(lifetime._status.buffer(), 0, None);
             }
-            commands.clear_buffer(lifetime._status.buffer(), 0, None);
         }
         {
             let mut pass = commands.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2874,26 +3026,48 @@ fn submit_decode(
         }
         let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
         let mut inverse_uniforms = Vec::new();
-        if final_batch {
-            if source.channel_layout_offset != 0 {
-                let pipelines = inverse_pipelines.ok_or(Error::EngineContract(
-                    "descriptor reconstruction is missing resident inverse pipelines",
-                ))?;
-                inverse_uniforms = encode_modular_inverse(
+        if !source.channel_layout_offsets.is_empty() {
+            let pipelines = inverse_pipelines.ok_or(Error::EngineContract(
+                "descriptor reconstruction is missing resident inverse pipelines",
+            ))?;
+            for segment_index in batch.segments.clone() {
+                let segment = source
+                    .dispatch_layout
+                    .stream_segments
+                    .get(segment_index)
+                    .copied()
+                    .ok_or_else(|| Error::backend("group stream segment is missing"))?;
+                if segment.flags & GroupStreamSegment::FINAL == 0 {
+                    continue;
+                }
+                let lane_index = segment
+                    .group_index
+                    .checked_sub(batch.first_group)
+                    .filter(|lane| *lane < batch.group_count)
+                    .ok_or_else(|| {
+                        Error::backend("final Modular group lane is outside its batch")
+                    })?;
+                inverse_uniforms.extend(encode_modular_inverse(
                     device,
                     &mut commands,
                     source,
                     lifetime._reconstructed.buffer(),
                     pipelines,
-                )?;
+                    segment.group_index,
+                    lane_index,
+                )?);
                 inverse_uniforms.push(encode_modular_finalize(
                     device,
                     &mut commands,
                     source,
                     &lifetime,
                     pipelines,
+                    segment.group_index,
+                    lane_index,
                 )?);
             }
+        }
+        if final_batch {
             commands.copy_buffer_to_buffer(
                 lifetime._status.buffer(),
                 0,
@@ -2944,16 +3118,72 @@ fn submit_decode(
         token: SubmissionToken(1),
         layout: source.output.layout.clone(),
         completion,
-        group_sample_counts: source
-            .profile
-            .groups
-            .iter()
-            .copied()
-            .map(|group| group_decoded_symbol_count(&source.profile, group))
-            .collect::<Result<Vec<_>>>()?
-            .into(),
+        stream_sample_counts: {
+            let mut expected = source
+                .profile
+                .groups
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    group_decoded_symbol_count(&source.profile, group_index, group)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if source.profile.global_stream.is_some() {
+                expected.push(0);
+            }
+            expected.into()
+        },
         status_stride: source.dispatch_layout.status_stride,
     })
+}
+
+fn copy_stream_segment(
+    source: &DecodeSource,
+    segment: GroupStreamSegment,
+    upload: &mut [u8],
+    stream_name: &'static str,
+) -> Result<()> {
+    let input_len = segment
+        .input_end
+        .checked_sub(segment.input_start)
+        .ok_or_else(|| Error::backend(format!("{stream_name} stream input range underflow")))?;
+    let end = segment
+        .upload_offset
+        .checked_add(input_len)
+        .ok_or_else(|| Error::backend(format!("{stream_name} stream upload range overflow")))?;
+    let destination = upload
+        .get_mut(segment.upload_offset..end)
+        .ok_or_else(|| Error::backend(format!("{stream_name} stream upload range is truncated")))?;
+    source.codestream.copy_range(
+        u64::try_from(segment.input_start)
+            .map_err(|_| Error::backend(format!("{stream_name} stream start exceeds u64")))?
+            ..u64::try_from(segment.input_end)
+                .map_err(|_| Error::backend(format!("{stream_name} stream end exceeds u64")))?,
+        destination,
+    )
+}
+
+fn build_empty_global_params(
+    stream_segment: GroupStreamSegment,
+    status_index: u32,
+) -> ShaderParams {
+    let mut params = <ShaderParams as bytemuck::Zeroable>::zeroed();
+    params.entropy = EntropyStreamParams {
+        token_start: 0,
+        token_end: stream_segment.available_token_end,
+        lz77_window_mask: 0,
+    };
+    params.window_logical_start = stream_segment.window_logical_start;
+    params.window_upload_start = stream_segment.window_upload_start;
+    params.stream_token_end = stream_segment.stream_token_end;
+    params.window_yield_end = stream_segment.window_yield_end;
+    params.window_flags = stream_segment.flags;
+    params.status_index = status_index;
+    // Prevent the zero-channel validation job from entering the legacy output finalizer when the
+    // active reconstruction pipeline does not use descriptor-addressed channels.
+    params.fixed_output_mode = FixedGradientOutputMode::DirectNormalizedGray8 as u32;
+    params
 }
 
 fn encode_modular_inverse(
@@ -2962,22 +3192,32 @@ fn encode_modular_inverse(
     source: &DecodeSource,
     reconstructed: &wgpu::Buffer,
     pipelines: &ModularInversePipelines,
+    group_index: usize,
+    lane_index: usize,
 ) -> Result<Vec<wgpu::Buffer>> {
-    let arena_size = NonZeroU64::new(source.profile.inverse_plan.arena_bytes()).ok_or(
+    let plan = resident_group_plan(&source.profile, group_index)?;
+    let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
         Error::EngineContract("descriptor reconstruction produced an empty resident arena"),
     )?;
-    if arena_size.get() > reconstructed.size() {
+    let arena_offset = u64::try_from(lane_index)
+        .ok()
+        .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
+        .ok_or_else(|| Error::backend("resident Modular lane offset overflow"))?;
+    if arena_offset
+        .checked_add(arena_size.get())
+        .is_none_or(|end| end > reconstructed.size())
+    {
         return Err(Error::EngineContract(
             "resident Modular inverse arena exceeds its reconstruction lane",
         ));
     }
     let storage = ResidentStorageBinding {
         buffer: reconstructed,
-        offset: 0,
+        offset: arena_offset,
         size: arena_size,
     };
     let mut uniforms = Vec::new();
-    for job in source.profile.inverse_plan.jobs() {
+    for job in plan.inverse_plan.jobs() {
         match *job {
             ModularInverseJob::Squeeze { params } => {
                 let pipeline = pipelines.squeeze.as_ref().ok_or(Error::EngineContract(
@@ -3020,7 +3260,7 @@ fn encode_modular_inverse(
                     encoder,
                     storage,
                     job,
-                    ModularPaletteWeightedParams::from(source.profile.wp_header),
+                    ModularPaletteWeightedParams::from(plan.wp_header),
                 )?);
             }
         }
@@ -3034,13 +3274,24 @@ fn encode_modular_finalize(
     source: &DecodeSource,
     lifetime: &DecodeJobLifetime,
     pipelines: &ModularInversePipelines,
+    group_index: usize,
+    lane_index: usize,
 ) -> Result<wgpu::Buffer> {
-    let params = source.finalize_params.ok_or(Error::EngineContract(
-        "descriptor reconstruction is missing final-output parameters",
-    ))?;
-    let arena_size = NonZeroU64::new(source.profile.inverse_plan.arena_bytes()).ok_or(
+    let params = source
+        .finalize_params
+        .get(group_index)
+        .copied()
+        .ok_or(Error::EngineContract(
+            "descriptor reconstruction is missing final-output parameters",
+        ))?;
+    let plan = resident_group_plan(&source.profile, group_index)?;
+    let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
         Error::EngineContract("descriptor reconstruction produced an empty resident arena"),
     )?;
+    let arena_offset = u64::try_from(lane_index)
+        .ok()
+        .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
+        .ok_or_else(|| Error::backend("resident Modular lane offset overflow"))?;
     let output = lifetime.output.as_wgpu_buffer();
     let output_size = NonZeroU64::new(output.size()).ok_or(Error::EngineContract(
         "descriptor reconstruction produced an empty output allocation",
@@ -3061,7 +3312,7 @@ fn encode_modular_finalize(
             ModularFinalizeBindings {
                 arena: ResidentStorageBinding {
                     buffer: lifetime._reconstructed.buffer(),
-                    offset: 0,
+                    offset: arena_offset,
                     size: arena_size,
                 },
                 output_words: ResidentStorageBinding {
@@ -3091,6 +3342,7 @@ fn encode_modular_finalize(
 
 fn build_params(
     group: ModularGroup,
+    group_index: usize,
     stream_segment: GroupStreamSegment,
     status_index: u32,
     source: &DecodeSource,
@@ -3134,8 +3386,9 @@ fn build_params(
             ModularReconstructionSpecialization::GenericMetaAdaptive => (0, 0, 0, [0; 4]),
             ModularReconstructionSpecialization::DescriptorMetaAdaptive => (0, 0, 0, [0; 4]),
         };
-    let decoded_symbol_count = group_decoded_symbol_count(&source.profile, group)?;
-    let lz77_window_words = group_lz77_window_words(&source.profile, group, decoded_symbol_count)?;
+    let decoded_symbol_count = group_decoded_symbol_count(&source.profile, group_index, group)?;
+    let lz77_window_words =
+        group_lz77_window_words(&source.profile, group_index, group, decoded_symbol_count)?;
     let fixed_output_mode = refine_fixed_gradient_output_mode(
         fixed_gradient_output_mode(
             source.profile.channels.count(),
@@ -3149,16 +3402,24 @@ fn build_params(
         if fixed_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
             compact_gray8_sample_words(group)?
         } else if uses_generalized_channel_layout(&source.profile) {
-            source.profile.inverse_plan.arena_words()
+            resident_group_plan(&source.profile, group_index)?
+                .inverse_plan
+                .arena_words()
         } else {
             decoded_symbol_count
         };
     let entropy_state_offset = group_entropy_state_offset_words(
         &source.profile,
+        group_index,
         group,
         decoded_symbol_count,
         physical_sample_words,
     )?;
+    let wp_header = if uses_generalized_channel_layout(&source.profile) {
+        resident_group_plan(&source.profile, group_index)?.wp_header
+    } else {
+        source.profile.wp_header
+    };
     Ok(ShaderParams {
         entropy: EntropyStreamParams {
             token_start: 0,
@@ -3178,7 +3439,11 @@ fn build_params(
         sample_count: group.sample_count()?,
         initialize_chroma: u32::from(initialize_chroma),
         source_channels: source.profile.channels.count(),
-        channel_layout_offset: source.channel_layout_offset,
+        channel_layout_offset: source
+            .channel_layout_offsets
+            .get(group_index)
+            .copied()
+            .unwrap_or(0),
         source_bits: u32::from(source.profile.bits_per_sample),
         source_mask: (1u32 << source.profile.bits_per_sample) - 1,
         needs_self_correcting: u32::from(source.profile.ma_config.needs_self_correcting()),
@@ -3211,17 +3476,17 @@ fn build_params(
         fixed_leaf_cluster2: fixed_leaf_clusters[2],
         fixed_leaf_cluster3: fixed_leaf_clusters[3],
         fixed_output_mode: fixed_output_mode as u32,
-        wp_p1: source.profile.wp_header.p1,
-        wp_p2: source.profile.wp_header.p2,
-        wp_p3a: source.profile.wp_header.p3a,
-        wp_p3b: source.profile.wp_header.p3b,
-        wp_p3c: source.profile.wp_header.p3c,
-        wp_p3d: source.profile.wp_header.p3d,
-        wp_p3e: source.profile.wp_header.p3e,
-        wp_w0: source.profile.wp_header.w0,
-        wp_w1: source.profile.wp_header.w1,
-        wp_w2: source.profile.wp_header.w2,
-        wp_w3: source.profile.wp_header.w3,
+        wp_p1: wp_header.p1,
+        wp_p2: wp_header.p2,
+        wp_p3a: wp_header.p3a,
+        wp_p3b: wp_header.p3b,
+        wp_p3c: wp_header.p3c,
+        wp_p3d: wp_header.p3d,
+        wp_p3e: wp_header.p3e,
+        wp_w0: wp_header.w0,
+        wp_w1: wp_header.w1,
+        wp_w2: wp_header.w2,
+        wp_w3: wp_header.w3,
     })
 }
 
@@ -3237,6 +3502,18 @@ fn align16(value: u64) -> Result<u64> {
         .checked_add(15)
         .map(|value| value & !15)
         .ok_or_else(|| Error::backend("GPU buffer size overflow"))
+}
+
+fn align_to(value: u64, alignment: u64, name: &'static str) -> Result<u64> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(Error::backend(format!(
+            "{name} alignment is not a non-zero power of two"
+        )));
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or_else(|| Error::backend(format!("{name} size overflow")))
 }
 
 #[derive(Default)]

@@ -11,12 +11,13 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
 - one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
-  bounded 256x256 pass-group grid and one pass;
+  bounded 128/256/512/1024-pixel pass-group grid and one pass;
 - a bounded standard MA tree with all JPEG XL Modular predictors, including weighted
   self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS entropy,
   hybrid integers, context maps, and the standard LZ77 distance alphabet;
-- the standard reversible YCoCg transform for RGB(A), plus one full-resolution unassociated alpha
-  channel for RGBA; no other transforms, restoration filters, extra channels, or references.
+- shared DC-global RCT and per-pass-group RCT, Palette, or Squeeze stacks, including group-edge
+  geometry and one full-resolution unassociated alpha channel for RGBA; no local MA trees,
+  restoration filters, other extra channels, or references.
 
 Before submission the decoder inventories the standard image header, frame header, and TOC with
 explicit limits. It parses only the bounded DC-global MA tree, histogram descriptors, hybrid
@@ -26,13 +27,14 @@ to an exact entropy-visible channel topology without decoding pixels. This accou
 residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
 prefix under bounded transform/channel/squeeze limits. A portable 32-byte `Pod` descriptor then
 proves every packed channel offset fits WGSL `u32` addressing before backend allocation.
-For single-group streams a second 32-byte `Pod` record is appended to the immutable entropy metadata
+For every generalized group, a second 32-byte `Pod` record is appended to the immutable entropy metadata
 for each transformed channel. It carries arena offset/stride, dimensions, cumulative decoded sample
 range, and an absolute range into a flattened reference-channel list. That list contains only prior
 channels whose dimensions and horizontal/vertical shifts match, newest first, as properties 16+
 require. A geometry-keyed map bounds construction by channel count times the at-most-60 references
-addressable by the 8-bit MA property space. The 240-byte per-group parameter record now exposes the
-descriptor-table offset; WGSL consumption and per-stream multi-group descriptors are the next step.
+addressable by the 8-bit MA property space. The 240-byte per-group parameter record exposes the
+descriptor-table offset. Identical group plans share one immutable descriptor table; edge groups
+retain distinct checked geometry. The resident arena stride is aligned for dynamic storage offsets.
 Inverse planning walks the stack and each Squeeze parameter in reverse while retaining only the
 current and immediately restored topology, rather than materializing a channel table for every
 transform. The parser also charges the cumulative topology work, so a bounded channel count cannot
@@ -43,7 +45,7 @@ read-write arena, which removes storage-binding alias ambiguity and permits late
 Its portable WGSL emulates the required signed 64-bit smooth-tendency intermediate with two `u32`
 words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
 even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
-does not yet feed transformed entropy output into this arena.
+feeds transformed entropy output directly into this arena.
 A standalone `ModularRctPipeline` applies every one of the 42 normative operation/permutation
 combinations in place to three equal-size, non-overlapping views of that same arena. Each invocation
 loads all three signed words before writing any permutation, while explicit unsigned add/sub helpers
@@ -61,8 +63,9 @@ maps only the final plane; the checked 45-word entropy topology uses a 90-word p
 its first retired range for the restored output. The real progressive-DC LF2 fixture lowers 13
 parameters to 37 jobs and three final full-resolution planes within twice its entropy sample count.
 An RCT/Squeeze/RCT test emits five ordered jobs and executes them in one command encoder, copying all
-three noncontiguous final planes into one staging map. Production entropy-to-arena submission and
-Palette scheduling remain incomplete.
+three noncontiguous final planes into one staging map. Production scheduling applies the concrete
+inverse plan and a 144-byte region-aware finalizer as soon as each group's final entropy segment
+finishes, before that scratch lane can be reused. Palette continuation state remains GPU-resident.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one
@@ -84,9 +87,10 @@ value, and first error remain in a 16-byte-aligned 32-byte record at the end of 
 lane. Generic MA adds the Property-8 gradient history for a 48-byte record; a
 Weighted/SelfCorrecting consumer also retains four true errors and twelve subprediction-error
 accumulators for a 112-byte record. A resume exactly at a channel boundary resets channel-local
-predictor state. One aggregate status staging buffer is mapped once after the last batch, and every
-four-word group status is checked before the frame is reported. No reconstructed sample is produced
-on the CPU.
+predictor state. Multi-group streams also execute the DC-global zero-symbol Prefix/ANS stream through
+the same kernel and exact termination contract. One aggregate status staging buffer is mapped once
+after the last batch, and its four-word record plus every pass-group record is checked before the
+frame is reported. No reconstructed sample is produced on the CPU.
 Output pipeline selection is also per frame. When every plane offset and row stride is four-byte
 aligned and every actual internal group edge ends on a distinct storage word, the shader uses
 ordinary word RMW/store. Layouts with an odd stride, offset, or group edge use the atomic byte-safe
@@ -109,10 +113,10 @@ exact node/decision/leaf counts, maximum depth, and self-correcting usage; custo
 engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
-channel topology are parsed, but multiple passes, Palette, stock-engine Squeeze submission, and
-non-YCoCg inverse execution,
-non-alpha extra channels, patches, splines, noise, and reference-frame animation remain typed
-unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+channel topology are parsed and resident RCT/Palette/Squeeze stacks execute for single- and
+multi-group streams. Local MA trees, DC-global Palette/Squeeze sample data, Global/LF/HF image
+streams, multiple passes, lossy/XYB Modular, non-alpha extra channels, patches, splines, noise, and
+reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.
@@ -421,7 +425,7 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 236-byte `repr(C)` POD. Its first 12 bytes are the
+The CPU/WGSL per-group parameter ABI is a checked 240-byte `repr(C)` POD. Its first 12 bytes are the
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
 same typed prefix starts the 240-byte, 16-byte-aligned VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state

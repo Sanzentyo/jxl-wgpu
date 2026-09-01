@@ -5,6 +5,8 @@ override wg_x: u32 = 64u;
 struct Params {
     // width, height, source channel count, source bit depth
     extent: vec4<u32>,
+    // output x/y origin, status record index, reserved
+    region: vec4<u32>,
     source_offsets: vec4<u32>,
     source_strides: vec4<u32>,
     // output kind, transfer, limited range, component count
@@ -29,8 +31,9 @@ const STATUS_OK: u32 = 1u;
 const ERROR_OUTPUT_MAPPING: u32 = 9u;
 
 fn reject_output_mapping() {
-    if atomicLoad(&status[0]) == STATUS_OK {
-        atomicStore(&status[0], ERROR_OUTPUT_MAPPING);
+    let status_word = params.region.z * 4u;
+    if atomicLoad(&status[status_word]) == STATUS_OK {
+        atomicStore(&status[status_word], ERROR_OUTPUT_MAPPING);
     }
 }
 
@@ -89,7 +92,7 @@ fn write_stored_code(offset: u32, value: u32) {
     }
 }
 
-fn write_native_pixel(x: u32, y: u32) {
+fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
     let bytes_per_component = params.format.z / 8u;
     let pixel_offset = params.plane01.x
         + y * params.plane01.y
@@ -97,7 +100,7 @@ fn write_native_pixel(x: u32, y: u32) {
     for (var channel = 0u; channel < params.extent.z; channel += 1u) {
         write_stored_code(
             pixel_offset + channel * bytes_per_component,
-            source_sample(channel, x, y),
+            source_sample(channel, source_x, source_y),
         );
     }
 }
@@ -289,13 +292,13 @@ fn write_chroma(x: u32, y: u32) {
     }
 }
 
-fn write_packed_422(x: u32, y: u32) {
+fn write_packed_422(source_x: u32, source_y: u32, x: u32, y: u32) {
     if (x & 1u) != 0u {
         return;
     }
-    let x1 = min(x + 1u, params.extent.x - 1u);
-    let y0 = color_code(source_sample(0u, x, y));
-    let y1 = color_code(source_sample(0u, x1, y));
+    let source_x1 = min(source_x + 1u, params.extent.x - 1u);
+    let y0 = color_code(source_sample(0u, source_x, source_y));
+    let y1 = color_code(source_sample(0u, source_x1, source_y));
     let neutral = neutral_chroma_code();
     var packed = y0 | (neutral << 8u) | (y1 << 16u) | (neutral << 24u);
     if params.format.x == 1u {
@@ -306,23 +309,25 @@ fn write_packed_422(x: u32, y: u32) {
 
 @compute @workgroup_size(wg_x, 1, 1)
 fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
-    if atomicLoad(&status[0]) != STATUS_OK {
+    if atomicLoad(&status[params.region.z * 4u]) != STATUS_OK {
         return;
     }
     if id.x >= params.extent.x || id.y >= params.extent.y {
         return;
     }
-    let x = id.x;
-    let y = id.y;
+    let source_x = id.x;
+    let source_y = id.y;
+    let x = params.region.x + source_x;
+    let y = params.region.y + source_y;
     if params.output.x == 9u {
-        write_native_pixel(x, y);
+        write_native_pixel(source_x, source_y, x, y);
         return;
     }
     if params.output.x == 4u {
-        write_packed_422(x, y);
+        write_packed_422(source_x, source_y, x, y);
         return;
     }
-    let sample = source_sample(0u, x, y);
+    let sample = source_sample(0u, source_x, source_y);
     write_gray_pixel(x, y, sample);
     write_chroma(x, y);
 }

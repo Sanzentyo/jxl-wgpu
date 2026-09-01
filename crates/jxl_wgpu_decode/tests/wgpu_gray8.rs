@@ -823,8 +823,8 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
                 stats.reconstruction_lane_stride_bytes * stats.parallel_group_lanes as u64
             );
             assert!(stats.stream_window_bytes < stats.transient_bytes);
-            assert_eq!(stats.stream_batch_count, 1);
-            assert_eq!(stats.submissions_per_frame, 1);
+            assert_eq!(stats.stream_batch_count, 2);
+            assert_eq!(stats.submissions_per_frame, 2);
             assert_eq!(stats.output_write_path, OutputWritePath::AtomicBytes);
         }
         if (width, height, container) == (516, 3, false) {
@@ -1125,7 +1125,7 @@ fn cjxl_palette_transform_is_exact_through_resident_inverse_and_finalize() {
     assert!(stats.inverse_transform_count >= 1);
     assert!(stats.palette_dispatch_count >= 1);
     assert!(stats.inverse_transform_uniform_bytes >= 128);
-    assert_eq!(stats.final_output_uniform_bytes, 128);
+    assert_eq!(stats.final_output_uniform_bytes, 144);
     assert_eq!(
         stats.reconstruction_specialization,
         ModularReconstructionSpecialization::DescriptorMetaAdaptive
@@ -1141,6 +1141,109 @@ fn cjxl_palette_transform_is_exact_through_resident_inverse_and_finalize() {
     std::fs::remove_file(&input).expect("remove cjxl Palette source");
     std::fs::remove_file(&encoded_path).expect("remove cjxl Palette codestream");
     std::fs::remove_dir(&directory).expect("remove cjxl Palette fixture directory");
+}
+
+#[test]
+fn cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly() {
+    if Command::new("cjxl").arg("--version").output().is_err() {
+        eprintln!("skipping cjxl multi-group local-transform conformance: cjxl is not installed");
+        return;
+    }
+    let Some(backend) = backend() else {
+        eprintln!("skipping cjxl multi-group local-transform conformance: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (515u32, 259u32);
+    let mut expected = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let mut hash = x
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y.wrapping_mul(0x85eb_ca6b))
+                .wrapping_add(x.wrapping_mul(y).rotate_left(13));
+            hash ^= hash >> 16;
+            hash = hash.wrapping_mul(0x7feb_352d);
+            hash ^= hash >> 15;
+            let base = hash as u8;
+            expected.push(base);
+            expected.push(base.wrapping_add(((x / 17 + y / 11) % 5) as u8));
+            expected.push((hash.rotate_left(11) ^ 0xa5a5_5a5a) as u8);
+        }
+    }
+    let unique = format!(
+        "jxl-wgpu-local-transform-groups-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir().join(unique);
+    std::fs::create_dir(&directory).expect("create cjxl local-transform fixture directory");
+    let input = directory.join("local-transform.ppm");
+    let encoded_path = directory.join("local-transform.jxl");
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.extend_from_slice(&expected);
+    std::fs::write(&input, ppm).expect("write cjxl local-transform source");
+    let command = Command::new("cjxl")
+        .arg(&input)
+        .arg(&encoded_path)
+        .args([
+            "-d",
+            "0",
+            "-m",
+            "1",
+            "-e",
+            "9",
+            "-x",
+            "color_space=RGB_D65_SRG_Rel_SRG",
+        ])
+        .output()
+        .expect("run cjxl multi-group local-transform encoder");
+    assert!(
+        command.status.success(),
+        "cjxl multi-group local-transform encoding failed: {}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let encoded = std::fs::read(&encoded_path).expect("read cjxl local-transform codestream");
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let request =
+        GpuOutputRequest::color(LosslessModularFormat::Rgb.pixel_format(8).unwrap()).unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("GPU decoder accepts cjxl multi-group local transforms");
+    let stats = session
+        .submission_session()
+        .modular()
+        .expect("cjxl local transforms select the Modular engine")
+        .memory_stats();
+    let group_count = match session.profile() {
+        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { columns, rows },
+            ..
+        } => usize::try_from(columns * rows).unwrap(),
+        profile => panic!("cjxl local-transform fixture is not multi-group: {profile:?}"),
+    };
+    assert_eq!(
+        stats.reconstruction_specialization,
+        ModularReconstructionSpecialization::DescriptorMetaAdaptive
+    );
+    assert!(stats.inverse_transform_count >= group_count);
+    assert!(stats.palette_dispatch_count >= 1);
+    assert_eq!(stats.final_output_uniform_bytes, group_count as u64 * 144);
+    assert_eq!(stats.stream_batch_count, 2);
+    assert_eq!(stats.submissions_per_frame, 2);
+    let frame = session
+        .next_frame()
+        .expect("cjxl multi-group local-transform GPU decode succeeds")
+        .expect("cjxl multi-group local-transform returns one frame");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
+    drop(frame);
+    drop(session);
+
+    std::fs::remove_file(&input).expect("remove cjxl local-transform source");
+    std::fs::remove_file(&encoded_path).expect("remove cjxl local-transform codestream");
+    std::fs::remove_dir(&directory).expect("remove cjxl local-transform fixture directory");
 }
 
 #[test]

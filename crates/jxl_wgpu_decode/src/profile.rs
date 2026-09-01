@@ -30,6 +30,14 @@ pub(crate) struct ModularGroup {
     pub stream_index: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlobalModularStream {
+    // The current multi-group profile has no DC-global sample channels. Production still executes
+    // this zero-symbol stream on GPU so ANS final state and trailing padding remain authoritative.
+    pub token_bit_offset: u64,
+    pub token_bit_end: u64,
+}
+
 impl ModularGroup {
     pub(crate) fn sample_count(self) -> Result<u32> {
         self.width
@@ -47,9 +55,17 @@ pub(crate) struct StandardModularProfile {
     pub group_columns: u32,
     pub group_rows: u32,
     pub groups: Vec<ModularGroup>,
+    pub global_stream: Option<GlobalModularStream>,
     pub ma_config: MaConfigIr,
     pub wp_header: WpHeaderIr,
     pub transform_plan: ModularTransformPlan,
+    pub generalized_channels: bool,
+    pub resident_group_plans: Vec<ResidentModularGroupPlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentModularGroupPlan {
+    pub wp_header: WpHeaderIr,
     pub channel_metadata: PackedModularChannelMetadata,
     pub inverse_plan: ModularInversePlan,
 }
@@ -290,17 +306,6 @@ pub(crate) fn parse_standard_modular_profile(
         image.height,
         u32::from(bits_per_sample),
     )?;
-    validate_stock_modular_transform_plan(
-        channels,
-        image.width,
-        image.height,
-        u32::from(bits_per_sample),
-        &transform_plan,
-    )?;
-    let inverse_plan = plan_modular_inverse(&transform_plan)?;
-    let channel_metadata = transform_plan
-        .topology
-        .gpu_entropy_channels(ma_config.maximum_tree_property())?;
     let dc_end = dc_global
         .bits
         .end()
@@ -309,24 +314,41 @@ pub(crate) fn parse_standard_modular_profile(
         return unsupported("Modular DC-global metadata exceeds its TOC section");
     }
 
-    let groups = if expected_group_count == 1 {
-        vec![ModularGroup {
-            token_bit_offset: reader.bit_offset(),
-            token_bit_end: dc_end,
-            x: 0,
-            y: 0,
-            width: image.width,
-            height: image.height,
-            stream_index: 0,
-        }]
+    let (groups, concrete_transform_plans) = if expected_group_count == 1 {
+        validate_stock_modular_transform_plan(
+            channels,
+            image.width,
+            image.height,
+            u32::from(bits_per_sample),
+            &transform_plan,
+        )?;
+        (
+            vec![ModularGroup {
+                token_bit_offset: reader.bit_offset(),
+                token_bit_end: dc_end,
+                x: 0,
+                y: 0,
+                width: image.width,
+                height: image.height,
+                stream_index: 0,
+            }],
+            vec![(transform_plan.clone(), wp_header)],
+        )
     } else {
-        if !codestream.bits_are_zero(reader.bit_offset(), dc_end)? {
-            return unsupported("non-zero data follows the bounded DC-global prefix metadata");
+        if !transform_plan
+            .transforms
+            .iter()
+            .all(|transform| matches!(transform, ModularTransformIr::Rct(_)))
+        {
+            return unsupported(
+                "multi-group Modular execution does not yet schedule DC-global Palette or Squeeze data",
+            );
         }
         validate_empty_non_pass_sections(codestream, frame)?;
         let group_count = usize::try_from(expected_group_count)
             .map_err(|_| unsupported_error("Modular group count exceeds host address space"))?;
         let mut groups = vec![None; group_count];
+        let mut concrete_transform_plans = vec![None; group_count];
         for section in &frame.sections {
             let FrameSectionKind::PassGroup {
                 pass_index: 0,
@@ -343,11 +365,6 @@ pub(crate) fn parse_standard_modular_profile(
             if slot.is_some() {
                 return unsupported("the Modular frame contains a duplicate pass-group section");
             }
-            let mut group_reader = codestream.reader();
-            group_reader.skip_bits(section.bits.offset)?;
-            expect(&mut group_reader, 1, 1, "LF-global Modular tree")?;
-            expect(&mut group_reader, 1, 1, "default weighted predictor")?;
-            expect(&mut group_reader, 2, 0, "no local Modular transforms")?;
             let column = u32::try_from(group_index % u64::from(group_columns))
                 .map_err(|_| unsupported_error("Modular group column overflow"))?;
             let row = u32::try_from(group_index / u64::from(group_columns))
@@ -358,6 +375,40 @@ pub(crate) fn parse_standard_modular_profile(
             let y = row
                 .checked_mul(group_dimension)
                 .ok_or_else(|| unsupported_error("Modular group y origin overflow"))?;
+            let group_width = image.width.saturating_sub(x).min(group_dimension);
+            let group_height = image.height.saturating_sub(y).min(group_dimension);
+            let source_topology = ModularChannelTopology::full_resolution(
+                group_width,
+                group_height,
+                u32::from(bits_per_sample),
+                channels.count(),
+                ModularTransformLimits::default(),
+            )?;
+            let global_group_transform = transform_plan
+                .reapply_to(source_topology.clone(), ModularTransformLimits::default())?;
+            let mut group_reader = codestream.reader();
+            group_reader.skip_bits(section.bits.offset)?;
+            expect(&mut group_reader, 1, 1, "LF-global Modular tree")?;
+            let local_wp_header = WpHeaderIr::parse(&mut group_reader)?;
+            let local_transform = parse_modular_transforms(
+                &mut group_reader,
+                global_group_transform.topology.clone(),
+                ModularTransformLimits::default(),
+            )?;
+            let mut combined_transforms = transform_plan.transforms.clone();
+            combined_transforms.extend(local_transform.transforms);
+            let concrete_transform = ModularTransformPlan::from_ir(
+                source_topology,
+                combined_transforms,
+                ModularTransformLimits::default(),
+            )?;
+            validate_stock_modular_transform_plan(
+                channels,
+                group_width,
+                group_height,
+                u32::from(bits_per_sample),
+                &concrete_transform,
+            )?;
             let token_bit_end = section
                 .bits
                 .end()
@@ -368,8 +419,8 @@ pub(crate) fn parse_standard_modular_profile(
                     token_bit_end,
                     x,
                     y,
-                    width: image.width.saturating_sub(x).min(group_dimension),
-                    height: image.height.saturating_sub(y).min(group_dimension),
+                    width: group_width,
+                    height: group_height,
                     stream_index: u32::try_from(
                         18u64
                             .checked_add(
@@ -382,8 +433,9 @@ pub(crate) fn parse_standard_modular_profile(
                     )
                     .map_err(|_| unsupported_error("Modular stream index exceeds u32"))?,
                 });
+            concrete_transform_plans[index] = Some((concrete_transform, local_wp_header));
         }
-        groups
+        let groups = groups
             .into_iter()
             .enumerate()
             .map(|(index, group)| {
@@ -392,7 +444,20 @@ pub(crate) fn parse_standard_modular_profile(
                         .into()
                 })
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        let concrete_transform_plans = concrete_transform_plans
+            .into_iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                plan.ok_or_else(|| {
+                    unsupported_error(format!(
+                        "the Modular frame is missing transform metadata for pass-group {index}"
+                    ))
+                    .into()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (groups, concrete_transform_plans)
     };
 
     let codestream_bits = codestream.logical_bits()?;
@@ -407,6 +472,28 @@ pub(crate) fn parse_standard_modular_profile(
         group.sample_count()?;
     }
 
+    let generalized_channels = concrete_transform_plans
+        .iter()
+        .any(|(plan, _)| uses_generalized_channel_layout(channels, plan));
+    let resident_group_plans = if !generalized_channels {
+        Vec::new()
+    } else {
+        concrete_transform_plans
+            .into_iter()
+            .map(|(group_transform, group_wp_header)| {
+                let channel_metadata = group_transform
+                    .topology
+                    .gpu_entropy_channels(ma_config.maximum_tree_property())?;
+                let inverse_plan = plan_modular_inverse(&group_transform)?;
+                Ok(ResidentModularGroupPlan {
+                    wp_header: group_wp_header,
+                    channel_metadata,
+                    inverse_plan,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
     Ok(StandardModularProfile {
         width: image.width,
         height: image.height,
@@ -415,12 +502,35 @@ pub(crate) fn parse_standard_modular_profile(
         group_columns,
         group_rows,
         groups,
+        global_stream: (expected_group_count != 1 && reader.bit_offset() < dc_end).then_some(
+            GlobalModularStream {
+                token_bit_offset: reader.bit_offset(),
+                token_bit_end: dc_end,
+            },
+        ),
         ma_config,
         wp_header,
         transform_plan,
-        channel_metadata,
-        inverse_plan,
+        generalized_channels,
+        resident_group_plans,
     })
+}
+
+pub(crate) fn uses_generalized_channel_layout(
+    channels: ModularChannels,
+    transform_plan: &ModularTransformPlan,
+) -> bool {
+    !matches!(
+        (channels, transform_plan.transforms.as_slice()),
+        (ModularChannels::Gray, [])
+            | (
+                ModularChannels::Rgb | ModularChannels::Rgba,
+                [ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 6,
+                })],
+            )
+    )
 }
 
 /// Advances across `LfChannelDequantization`, which precedes `GlobalModular` in LF-global.
@@ -489,7 +599,7 @@ fn validate_stock_modular_transform_plan(
     // backend allocation. The generalized transformed-channel executor will retain this table.
     let _gpu_channel_layout = transform_plan.topology.gpu_layout()?;
     match (channels, transform_plan.transforms.as_slice()) {
-        (ModularChannels::Gray, []) if topology_is_direct => {
+        (_, []) if topology_is_direct => {
             let inverse = plan_modular_inverse(transform_plan)?;
             if u64::from(inverse.entropy_words()) != expected_sample_count
                 || inverse.arena_words() != inverse.entropy_words()
@@ -511,11 +621,6 @@ fn validate_stock_modular_transform_plan(
                 }),
             ],
         ) if topology_is_direct => {}
-        (ModularChannels::Rgb | ModularChannels::Rgba, []) => {
-            return unsupported(
-                "the standard Modular color profile requires its reversible color transform",
-            );
-        }
         (_, transforms) => {
             let gpu_resident = transforms.iter().all(|transform| {
                 matches!(

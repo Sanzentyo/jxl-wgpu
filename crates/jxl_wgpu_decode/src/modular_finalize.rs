@@ -50,11 +50,39 @@ pub(crate) struct ModularFinalizeOutput {
     pub chroma_extent: Extent2d,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModularFinalizeRegion {
+    pub source_extent: Extent2d,
+    pub canvas_extent: Extent2d,
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub status_index: u32,
+}
+
+impl ModularFinalizeRegion {
+    pub(crate) const fn full(extent: Extent2d) -> Self {
+        Self {
+            source_extent: extent,
+            canvas_extent: extent,
+            origin_x: 0,
+            origin_y: 0,
+            status_index: 0,
+        }
+    }
+}
+
+impl From<Extent2d> for ModularFinalizeRegion {
+    fn from(extent: Extent2d) -> Self {
+        Self::full(extent)
+    }
+}
+
 /// Uniform shared with `modular_finalize.wgsl`.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub(crate) struct ModularFinalizeParams {
     extent: [u32; 4],
+    region: [u32; 4],
     source_offsets: [u32; 4],
     source_strides: [u32; 4],
     output: [u32; 4],
@@ -65,21 +93,45 @@ pub(crate) struct ModularFinalizeParams {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ModularFinalizeParams>() == 128);
+    assert!(std::mem::size_of::<ModularFinalizeParams>() == 144);
     assert!(std::mem::align_of::<ModularFinalizeParams>() == 16);
 };
 
 impl ModularFinalizeParams {
     pub(crate) fn new(
-        extent: Extent2d,
+        region: impl Into<ModularFinalizeRegion>,
         source_bits: u8,
         source_planes: &[GpuModularChannelLayout],
         arena_words: u32,
         output: ModularFinalizeOutput,
     ) -> Result<Self, ModularFinalizeError> {
+        let region = region.into();
+        let extent = region.source_extent;
         if extent.width == 0 || extent.height == 0 {
             return Err(ModularFinalizeError::InvalidParams {
                 reason: "source extent is empty",
+            });
+        }
+        let region_end_x = region.origin_x.checked_add(extent.width);
+        if region.canvas_extent.width == 0
+            || region.canvas_extent.height == 0
+            || region_end_x.is_none_or(|end| end > region.canvas_extent.width)
+            || region
+                .origin_y
+                .checked_add(extent.height)
+                .is_none_or(|end| end > region.canvas_extent.height)
+        {
+            return Err(ModularFinalizeError::InvalidParams {
+                reason: "source region exceeds the output canvas",
+            });
+        }
+        if output.kind == 4
+            && (!region.origin_x.is_multiple_of(2)
+                || region_end_x
+                    .is_some_and(|end| end != region.canvas_extent.width && !end.is_multiple_of(2)))
+        {
+            return Err(ModularFinalizeError::InvalidParams {
+                reason: "packed 4:2:2 regions must own complete output pairs",
             });
         }
         let source_channels = u32::try_from(source_planes.len()).map_err(|_| {
@@ -124,7 +176,7 @@ impl ModularFinalizeParams {
             source_offsets[index] = plane.word_offset;
             source_strides[index] = plane.row_stride_words;
         }
-        validate_output(extent, source_channels, source_bits, output)?;
+        validate_output(region.canvas_extent, source_channels, source_bits, output)?;
         extent
             .width
             .checked_mul(extent.height)
@@ -138,6 +190,7 @@ impl ModularFinalizeParams {
                 source_channels,
                 u32::from(source_bits),
             ],
+            region: [region.origin_x, region.origin_y, region.status_index, 0],
             source_offsets,
             source_strides,
             output: [
@@ -186,6 +239,12 @@ impl ModularFinalizeParams {
             required = required.max(end);
         }
         required
+    }
+
+    fn required_status_bytes(self) -> Option<u64> {
+        u64::from(self.region[2])
+            .checked_mul(16)
+            .and_then(|offset| offset.checked_add(4))
     }
 }
 
@@ -538,10 +597,16 @@ fn validate_for_device(
     validate_binding(bindings.arena, "arena", &limits)?;
     validate_binding(bindings.output_words, "word output", &limits)?;
     validate_binding(bindings.status, "status", &limits)?;
-    if bindings.status.size.get() < 4 {
+    let required_status_bytes =
+        params
+            .required_status_bytes()
+            .ok_or(ModularFinalizeError::InvalidParams {
+                reason: "status index overflows the status binding",
+            })?;
+    if bindings.status.size.get() < required_status_bytes {
         return Err(ModularFinalizeError::BindingSize {
             binding: "status",
-            required: 4,
+            required: required_status_bytes,
             available: bindings.status.size.get(),
         });
     }
@@ -708,7 +773,7 @@ mod tests {
 
     #[test]
     fn uniform_and_wgsl_abis_validate_semantically() {
-        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 128);
+        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 144);
         assert_eq!(std::mem::align_of::<ModularFinalizeParams>(), 16);
         fn assert_pod<T: Pod>() {}
         assert_pod::<ModularFinalizeParams>();
@@ -740,6 +805,52 @@ mod tests {
             gray_params(29),
             Err(ModularFinalizeError::InvalidParams {
                 reason: "source plane exceeds the resident arena"
+            })
+        ));
+    }
+
+    #[test]
+    fn packed_regions_must_own_complete_output_pairs() {
+        let output = ModularFinalizeOutput {
+            kind: 4,
+            transfer: 0,
+            limited_range: false,
+            channels: 1,
+            order: 0,
+            bits: 8,
+            storage_bits: 8,
+            numeric_mapping: 0,
+            plane_offsets: [0; 4],
+            plane_strides: [12, 0, 0, 0],
+            logical_size: 12,
+            chroma_extent: Extent2d::new(0, 0),
+        };
+        let plane = GpuModularChannelLayout {
+            word_offset: 0,
+            row_stride_words: 3,
+            width: 3,
+            height: 1,
+            hshift: 0,
+            vshift: 0,
+            bit_depth: 8,
+            reserved: 0,
+        };
+        assert!(matches!(
+            ModularFinalizeParams::new(
+                ModularFinalizeRegion {
+                    source_extent: Extent2d::new(3, 1),
+                    canvas_extent: Extent2d::new(5, 1),
+                    origin_x: 1,
+                    origin_y: 0,
+                    status_index: 0,
+                },
+                8,
+                &[plane],
+                3,
+                output,
+            ),
+            Err(ModularFinalizeError::InvalidParams {
+                reason: "packed 4:2:2 regions must own complete output pairs"
             })
         ));
     }

@@ -115,6 +115,16 @@ reference slots while property 15 emits none. Existing every-chunk-split profile
 the appended descriptor metadata, and the full `ShaderParams` word-order test fixes its new 240-byte
 storage stride and channel-layout offset without inspecting shader source text.
 
+`wgpu_gray8::cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly` creates a
+515×259 RGB fixture and asks installed `cjxl` 0.12 to choose its lossless local Modular transforms.
+The resulting six pass groups include local Palette work and three distinct edge geometries. The
+production decoder must select descriptor reconstruction, schedule at least one inverse job per
+group, retain exactly one 144-byte finalizer record per group, and return byte-exact RGB. The test
+also fixes two codec submissions: one GPU execution/strict termination of the DC-global zero-symbol
+entropy stream, followed by the coalesced pass-group wave. Both are validated by one aggregate
+status map, so this is production transformed multi-group evidence rather than a primitive-only
+kernel test.
+
 ## Procedural VarDCT encoder matrix
 
 The `jxl_wgpu_encode` actual-adapter suite generates its VarDCT inputs in memory rather than
@@ -361,7 +371,7 @@ verify physical/logical mapping, first/final flags, 16-byte overlap, monotonic y
 one-lane scratch isolation, and exact peak bytes. Budget tests show that lane count and stream peak
 trade against the same per-frame target. A cap below the 40-byte minimum is a typed error, while
 every oversized accepted Modular group is segmented. Rust/WGSL full-record word casts pin the
-236-byte parameter record and the 32/48/112-byte, 16-byte-aligned resume layouts. Every composed
+240-byte parameter record and the 32/48/112-byte, 16-byte-aligned resume layouts. Every composed
 shader variant is parsed and semantically validated with Naga; no shader-source substring
 assertion is used.
 
