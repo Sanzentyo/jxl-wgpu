@@ -16,6 +16,7 @@ pub(crate) struct ModularTransformLimits {
     pub transform_count: usize,
     pub channel_count: usize,
     pub squeeze_parameter_count: usize,
+    pub topology_work: usize,
 }
 
 impl Default for ModularTransformLimits {
@@ -24,6 +25,7 @@ impl Default for ModularTransformLimits {
             transform_count: 512,
             channel_count: 1 << 16,
             squeeze_parameter_count: 1 << 17,
+            topology_work: 1 << 22,
         }
     }
 }
@@ -217,8 +219,74 @@ pub(crate) enum ModularTransformIr {
 /// Complete transform sequence plus the entropy-visible topology it produces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModularTransformPlan {
+    source_topology: ModularChannelTopology,
     pub transforms: Vec<ModularTransformIr>,
     pub topology: ModularChannelTopology,
+}
+
+/// One elementary operation in the order required for inverse reconstruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModularInverseTransform {
+    Rct(ModularRct),
+    Palette(ModularPalette),
+    Squeeze(ModularSqueezeParameter),
+}
+
+impl ModularTransformPlan {
+    pub(crate) fn source_topology(&self) -> &ModularChannelTopology {
+        &self.source_topology
+    }
+
+    /// Visits inverse operations without retaining one full topology snapshot per transform.
+    ///
+    /// The callback sees the entropy-visible source and the immediately reconstructed destination
+    /// for one elementary operation. At most two channel vectors are live regardless of transform
+    /// count. Squeeze parameters are visited in reverse inside their enclosing transform.
+    pub(crate) fn visit_inverse(
+        &self,
+        mut visit: impl FnMut(
+            ModularInverseTransform,
+            &ModularChannelTopology,
+            &ModularChannelTopology,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        let mut source = self.topology.clone();
+        for transform in self.transforms.iter().rev() {
+            match transform {
+                ModularTransformIr::Rct(rct) => {
+                    let destination = source.clone();
+                    visit(ModularInverseTransform::Rct(*rct), &source, &destination)?;
+                    source = destination;
+                }
+                ModularTransformIr::Palette(palette) => {
+                    let mut destination = source.clone();
+                    undo_palette(&mut destination, *palette)?;
+                    visit(
+                        ModularInverseTransform::Palette(*palette),
+                        &source,
+                        &destination,
+                    )?;
+                    source = destination;
+                }
+                ModularTransformIr::Squeeze { parameters, .. } => {
+                    for parameter in parameters.iter().rev() {
+                        let mut destination = source.clone();
+                        undo_squeeze(&mut destination, *parameter)?;
+                        visit(
+                            ModularInverseTransform::Squeeze(*parameter),
+                            &source,
+                            &destination,
+                        )?;
+                        source = destination;
+                    }
+                }
+            }
+        }
+        if source != self.source_topology {
+            return Err(ModularTransformError::InverseTopologyMismatch.into());
+        }
+        Ok(())
+    }
 }
 
 /// Parses and meta-applies the transform list from one Modular group header.
@@ -237,6 +305,7 @@ fn parse_modular_transform_count(
     mut topology: ModularChannelTopology,
     limits: ModularTransformLimits,
 ) -> Result<ModularTransformPlan> {
+    let source_topology = topology.clone();
     let transform_count = usize::try_from(transform_count).map_err(|_| {
         ModularTransformError::TransformLimitExceeded {
             actual: usize::MAX,
@@ -253,6 +322,7 @@ fn parse_modular_transform_count(
 
     let mut transforms = Vec::with_capacity(transform_count);
     let mut total_squeeze_parameters = 0usize;
+    let mut topology_work = 0usize;
     for _ in 0..transform_count {
         let transform_id = read_u32_bits(reader, 2)?;
         let transform = match transform_id {
@@ -261,6 +331,7 @@ fn parse_modular_transform_count(
                     begin_channel: read_begin_channel(reader)?,
                     rct_type: read_u32(reader, [(6, 0), (0, 2), (2, 4), (10, 6)])?,
                 };
+                charge_topology_work(&mut topology_work, topology.channels.len(), limits)?;
                 apply_rct(&topology, rct)?;
                 ModularTransformIr::Rct(rct)
             }
@@ -272,6 +343,7 @@ fn parse_modular_transform_count(
                     delta_count: read_u32(reader, [(0, 0), (1, 8), (257, 10), (1281, 16)])?,
                     predictor: read_u32_bits(reader, 4)?,
                 };
+                charge_topology_work(&mut topology_work, topology.channels.len(), limits)?;
                 apply_palette(&mut topology, palette, limits)?;
                 ModularTransformIr::Palette(palette)
             }
@@ -323,6 +395,7 @@ fn parse_modular_transform_count(
                     }
                 }
                 for parameter in &parameters {
+                    charge_topology_work(&mut topology_work, topology.channels.len(), limits)?;
                     apply_squeeze(&mut topology, *parameter, limits)?;
                 }
                 ModularTransformIr::Squeeze {
@@ -336,6 +409,7 @@ fn parse_modular_transform_count(
     }
 
     Ok(ModularTransformPlan {
+        source_topology,
         transforms,
         topology,
     })
@@ -492,6 +566,220 @@ fn apply_squeeze(
     Ok(())
 }
 
+fn undo_squeeze(
+    topology: &mut ModularChannelTopology,
+    parameter: ModularSqueezeParameter,
+) -> Result<()> {
+    let averages = channel_range(
+        "inverse Squeeze averages",
+        parameter.begin_channel,
+        parameter.channel_count,
+        topology.channels.len(),
+    )?;
+    let residual_start = if parameter.in_place {
+        averages.end
+    } else {
+        topology.channels.len().checked_sub(averages.len()).ok_or(
+            ModularTransformError::InvalidInverseTopology {
+                transform: "Squeeze",
+                reason: "residual channel count exceeds the transformed topology",
+            },
+        )?
+    };
+    let residual_end = residual_start.checked_add(averages.len()).ok_or(
+        ModularTransformError::InvalidInverseTopology {
+            transform: "Squeeze",
+            reason: "residual channel range overflows",
+        },
+    )?;
+    if residual_start < averages.end || residual_end > topology.channels.len() {
+        return Err(ModularTransformError::InvalidInverseTopology {
+            transform: "Squeeze",
+            reason: "average and residual channel ranges overlap or exceed the topology",
+        }
+        .into());
+    }
+
+    let selected_meta = averages.start < topology.meta_channels;
+    if selected_meta {
+        if !parameter.in_place || topology.meta_channels < averages.len() {
+            return Err(ModularTransformError::InvalidInverseTopology {
+                transform: "Squeeze",
+                reason: "meta-channel residual placement is inconsistent",
+            }
+            .into());
+        }
+        topology.meta_channels -= averages.len();
+    }
+
+    for index in 0..averages.len() {
+        let average = topology.channels[averages.start + index];
+        let residual = topology.channels[residual_start + index];
+        if average.bit_depth != residual.bit_depth
+            || average.hshift != residual.hshift
+            || average.vshift != residual.vshift
+        {
+            return Err(ModularTransformError::InvalidInverseTopology {
+                transform: "Squeeze",
+                reason: "average and residual channel metadata differ",
+            }
+            .into());
+        }
+        let mut restored = average;
+        if parameter.horizontal {
+            if average.height != residual.height
+                || average.width < residual.width
+                || average.width - residual.width > 1
+            {
+                return Err(ModularTransformError::InvalidInverseTopology {
+                    transform: "Squeeze",
+                    reason: "horizontal average and residual dimensions do not merge",
+                }
+                .into());
+            }
+            restored.width = average.width.checked_add(residual.width).ok_or(
+                ModularTransformError::InvalidInverseTopology {
+                    transform: "Squeeze",
+                    reason: "restored horizontal extent overflows",
+                },
+            )?;
+            if restored.hshift >= 0 {
+                if restored.hshift == 0 {
+                    return Err(ModularTransformError::InvalidInverseTopology {
+                        transform: "Squeeze",
+                        reason: "horizontal shift cannot be decremented",
+                    }
+                    .into());
+                }
+                restored.hshift -= 1;
+            }
+        } else {
+            if average.width != residual.width
+                || average.height < residual.height
+                || average.height - residual.height > 1
+            {
+                return Err(ModularTransformError::InvalidInverseTopology {
+                    transform: "Squeeze",
+                    reason: "vertical average and residual dimensions do not merge",
+                }
+                .into());
+            }
+            restored.height = average.height.checked_add(residual.height).ok_or(
+                ModularTransformError::InvalidInverseTopology {
+                    transform: "Squeeze",
+                    reason: "restored vertical extent overflows",
+                },
+            )?;
+            if restored.vshift >= 0 {
+                if restored.vshift == 0 {
+                    return Err(ModularTransformError::InvalidInverseTopology {
+                        transform: "Squeeze",
+                        reason: "vertical shift cannot be decremented",
+                    }
+                    .into());
+                }
+                restored.vshift -= 1;
+            }
+        }
+        topology.channels[averages.start + index] = restored;
+    }
+    topology.channels.drain(residual_start..residual_end);
+    Ok(())
+}
+
+fn undo_palette(topology: &mut ModularChannelTopology, palette: ModularPalette) -> Result<()> {
+    let palette_channel = topology.channels.first().copied().ok_or(
+        ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "palette meta channel is absent",
+        },
+    )?;
+    let expected_width = palette
+        .color_count
+        .checked_add(palette.delta_count)
+        .ok_or(ModularTransformError::PaletteDimensionOverflow)?;
+    if palette_channel.hshift != -1
+        || palette_channel.vshift != -1
+        || palette_channel.width != expected_width
+        || palette_channel.height != palette.channel_count
+    {
+        return Err(ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "palette meta-channel geometry does not match its transform",
+        }
+        .into());
+    }
+    if topology.meta_channels == 0 {
+        return Err(ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "palette meta-channel is outside the meta prefix",
+        }
+        .into());
+    }
+    topology.channels.remove(0);
+
+    let begin = usize::try_from(palette.begin_channel).map_err(|_| {
+        ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "restored begin channel exceeds host space",
+        }
+    })?;
+    let collapsed = topology.channels.get(begin).copied().ok_or(
+        ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "collapsed index channel is absent",
+        },
+    )?;
+    if collapsed.bit_depth != palette_channel.bit_depth {
+        return Err(ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "palette and index channel bit depths differ",
+        }
+        .into());
+    }
+    let channel_count = usize::try_from(palette.channel_count).map_err(|_| {
+        ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "restored channel count exceeds host space",
+        }
+    })?;
+    let selected_meta = topology.meta_channels >= 2 && begin <= topology.meta_channels - 2;
+    topology.meta_channels = if selected_meta {
+        topology
+            .meta_channels
+            .checked_add(channel_count)
+            .and_then(|count| count.checked_sub(2))
+            .ok_or(ModularTransformError::InvalidInverseTopology {
+                transform: "Palette",
+                reason: "restored meta-channel count overflows",
+            })?
+    } else {
+        topology.meta_channels.checked_sub(1).ok_or(
+            ModularTransformError::InvalidInverseTopology {
+                transform: "Palette",
+                reason: "restored data-channel meta prefix underflows",
+            },
+        )?
+    };
+    if (selected_meta
+        && begin
+            .checked_add(channel_count)
+            .is_none_or(|end| end > topology.meta_channels))
+        || (!selected_meta && begin < topology.meta_channels)
+    {
+        return Err(ModularTransformError::InvalidInverseTopology {
+            transform: "Palette",
+            reason: "restored channels cross the meta boundary",
+        }
+        .into());
+    }
+    topology.channels.splice(
+        (begin + 1)..(begin + 1),
+        std::iter::repeat_n(collapsed, channel_count.saturating_sub(1)),
+    );
+    Ok(())
+}
+
 fn default_squeeze_parameters(
     topology: &ModularChannelTopology,
 ) -> Result<Vec<ModularSqueezeParameter>> {
@@ -628,6 +916,28 @@ fn check_channel_limit(count: usize, limits: ModularTransformLimits) -> Result<(
         return Err(ModularTransformError::ChannelLimitExceeded {
             actual: count,
             limit: limits.channel_count,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn charge_topology_work(
+    total: &mut usize,
+    channels: usize,
+    limits: ModularTransformLimits,
+) -> Result<()> {
+    *total =
+        total
+            .checked_add(channels)
+            .ok_or(ModularTransformError::TopologyWorkLimitExceeded {
+                actual: usize::MAX,
+                limit: limits.topology_work,
+            })?;
+    if *total > limits.topology_work {
+        return Err(ModularTransformError::TopologyWorkLimitExceeded {
+            actual: *total,
+            limit: limits.topology_work,
         }
         .into());
     }
@@ -831,6 +1141,28 @@ mod tests {
         assert_eq!(layouts[0].word_offset, 0);
         assert_eq!(layouts[1].word_offset, 25);
         assert_eq!(bytemuck::bytes_of(&layouts[0]).len(), 32);
+
+        let mut inverse_steps = Vec::new();
+        plan.visit_inverse(|operation, source, destination| {
+            inverse_steps.push((
+                operation,
+                source.channels().to_vec(),
+                destination.channels().to_vec(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(inverse_steps.len(), 1);
+        assert_eq!(
+            inverse_steps[0].0,
+            ModularInverseTransform::Squeeze(ModularSqueezeParameter {
+                horizontal: true,
+                in_place: true,
+                begin_channel: 0,
+                channel_count: 1,
+            })
+        );
+        assert_eq!(inverse_steps[0].2, plan.source_topology().channels());
     }
 
     #[test]
@@ -871,6 +1203,29 @@ mod tests {
             topology.gpu_layout(),
             Err(Error::ModularTransform(
                 ModularTransformError::GpuAddressSpaceOverflow
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_transform_topology_work_before_quadratic_growth() {
+        let mut writer = BitWriter::new();
+        write_transform_count(&mut writer, 2);
+        write_rct(&mut writer, 0, 6);
+        write_rct(&mut writer, 0, 6);
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let limits = ModularTransformLimits {
+            topology_work: 5,
+            ..ModularTransformLimits::default()
+        };
+        assert!(matches!(
+            parse_modular_transforms(&mut reader, topology(1, 1, 3), limits),
+            Err(Error::ModularTransform(
+                ModularTransformError::TopologyWorkLimitExceeded {
+                    actual: 6,
+                    limit: 5,
+                }
             ))
         ));
     }
@@ -964,5 +1319,65 @@ mod tests {
                 ModularChannelGeometry::new(4, 5, 1, 0, 12),
             ]
         );
+        let mut operations = Vec::new();
+        plan.visit_inverse(|operation, _, _| {
+            operations.push(operation);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            operations,
+            vec![
+                ModularInverseTransform::Squeeze(ModularSqueezeParameter {
+                    horizontal: true,
+                    in_place: true,
+                    begin_channel: 1,
+                    channel_count: 1,
+                }),
+                ModularInverseTransform::Palette(ModularPalette {
+                    begin_channel: 0,
+                    channel_count: 3,
+                    color_count: 257,
+                    delta_count: 9,
+                    predictor: 13,
+                }),
+                ModularInverseTransform::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 41,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn inverse_palette_restores_a_meta_channel_selection() {
+        let limits = ModularTransformLimits::default();
+        let initial = ModularChannelTopology::new(
+            vec![
+                ModularChannelGeometry::meta(7, 3, 10),
+                ModularChannelGeometry::meta(7, 3, 10),
+                ModularChannelGeometry::meta(7, 3, 10),
+                ModularChannelGeometry::new(11, 5, 0, 0, 10),
+            ],
+            3,
+            limits,
+        )
+        .unwrap();
+        let mut writer = BitWriter::new();
+        write_transform_count(&mut writer, 1);
+        writer.write_bits(1, 2).unwrap();
+        write_begin_channel(&mut writer, 0);
+        write_u32(&mut writer, 3, [(1, 0), (3, 0), (4, 0), (1, 13)]);
+        write_u32(&mut writer, 17, [(0, 8), (256, 10), (1280, 12), (5376, 16)]);
+        write_u32(&mut writer, 0, [(0, 0), (1, 8), (257, 10), (1281, 16)]);
+        writer.write_bits(0, 4).unwrap();
+        let plan = parse(writer, initial.clone());
+        assert_eq!(plan.topology.meta_channel_count(), 2);
+        plan.visit_inverse(|operation, _, destination| {
+            assert!(matches!(operation, ModularInverseTransform::Palette(_)));
+            assert_eq!(destination, &initial);
+            Ok(())
+        })
+        .unwrap();
     }
 }

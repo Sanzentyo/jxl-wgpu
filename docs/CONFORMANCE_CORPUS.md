@@ -79,6 +79,12 @@ default odd-size Squeeze expansion, meta/non-meta crossing, and portable-address
 composed RCT/Palette/Squeeze header is decoded by both the production parser and the Rust `jxl`
 metadata oracle, with every wire field compared. These are parser/topology gates only; they are not
 counted as GPU inverse-transform or pixel-conformance evidence for `MOD-D03`.
+When `cjxl` is installed, its real 1024×128 `--progressive_dc=2` output additionally fixes the
+Modular LF2 producer to one default-Squeeze transform: 13 resolved parameters, 40 entropy-visible
+channels, leading 8×8/4×4/4×4 planes, no RCT, and a sample count equal to the original three full
+planes. Reverse-topology tests recover data- and meta-Palette selections plus odd Squeeze sources;
+an explicit work-limit case prevents repeated transforms from turning bounded channel metadata into
+unbounded quadratic planning.
 
 ## Procedural VarDCT encoder matrix
 

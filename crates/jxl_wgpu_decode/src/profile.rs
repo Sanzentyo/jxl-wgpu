@@ -284,6 +284,13 @@ pub(crate) fn parse_standard_modular_profile(
         image.height,
         u32::from(bits_per_sample),
     )?;
+    validate_stock_modular_transform_plan(
+        channels,
+        image.width,
+        image.height,
+        u32::from(bits_per_sample),
+        &transform_plan,
+    )?;
     let dc_end = dc_global
         .bits
         .end()
@@ -441,11 +448,22 @@ fn parse_dc_global_ir(
         limits,
     )?;
     let transform_plan = parse_modular_transforms(reader, topology, limits)?;
+    Ok((ma_config, wp_header, transform_plan))
+}
+
+fn validate_stock_modular_transform_plan(
+    channels: ModularChannels,
+    width: u32,
+    height: u32,
+    bit_depth: u32,
+    transform_plan: &ModularTransformPlan,
+) -> Result<()> {
     let expected_sample_count = u64::from(width)
         .checked_mul(u64::from(height))
         .and_then(|samples| samples.checked_mul(u64::from(channels.count())))
         .ok_or_else(|| unsupported_error("Modular source sample count overflows"))?;
     let topology_is_direct = transform_plan.topology.meta_channel_count() == 0
+        && transform_plan.topology == *transform_plan.source_topology()
         && transform_plan.topology.sample_count() == Some(expected_sample_count)
         && transform_plan.topology.channels().len() == channels.count() as usize
         && transform_plan.topology.channels().iter().all(|channel| {
@@ -494,7 +512,12 @@ fn parse_dc_global_ir(
             return unsupported_transform(feature);
         }
     }
-    Ok((ma_config, wp_header, transform_plan))
+    transform_plan.visit_inverse(|_, source, destination| {
+        source.gpu_layout()?;
+        destination.gpu_layout()?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {
@@ -560,7 +583,9 @@ fn unsupported_error(detail: impl Into<String>) -> UnsupportedProfile {
 mod tests {
     use std::sync::Arc;
 
-    use jxl_gpu_bitstream::{InventoryLimits, ParseLimits, StreamSlice, parse};
+    use jxl_gpu_bitstream::{
+        FrameEncoding, FrameType, InventoryLimits, ParseLimits, StreamSlice, parse,
+    };
 
     use super::*;
 
@@ -597,6 +622,120 @@ mod tests {
                 "chunk split {split_offset} changed the parsed profile"
             );
         }
+    }
+
+    #[test]
+    fn libjxl_progressive_dc_root_has_exact_default_squeeze_topology() {
+        let Some(encoded) = cjxl_progressive_dc() else {
+            return;
+        };
+        let parsed = parse(&encoded, ParseLimits::default()).unwrap();
+        let inventory = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let frame = &inventory.frames[0];
+        assert_eq!(frame.frame_type, FrameType::LowFrequency);
+        assert_eq!(frame.encoding, FrameEncoding::Modular);
+        assert_eq!(frame.lf_level, 2);
+        let section = frame.sections.first().unwrap();
+        let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
+        let codestream = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
+        let mut reader = codestream.reader();
+        reader.skip_bits(section.bits.offset).unwrap();
+        parse_lf_channel_dequantization(&mut reader).unwrap();
+        let (_, _, plan) = parse_dc_global_ir(
+            &mut reader,
+            ModularChannels::Rgb,
+            frame.width,
+            frame.height,
+            8,
+        )
+        .unwrap();
+        let [
+            ModularTransformIr::Squeeze {
+                used_default_parameters,
+                parameters,
+            },
+        ] = plan.transforms.as_slice()
+        else {
+            panic!(
+                "unexpected progressive-DC root transforms: {:?}",
+                plan.transforms
+            );
+        };
+        assert!(*used_default_parameters);
+        assert_eq!(parameters.len(), 13);
+        assert_eq!(plan.source_topology().channels().len(), 3);
+        assert_eq!(plan.topology.channels().len(), 40);
+        assert_eq!(
+            plan.topology.sample_count(),
+            Some(u64::from(frame.width) * u64::from(frame.height) * 3)
+        );
+        assert_eq!(
+            plan.topology.channels()[..3]
+                .iter()
+                .map(|channel| (channel.width, channel.height))
+                .collect::<Vec<_>>(),
+            vec![(8, 8), (4, 4), (4, 4)]
+        );
+        assert!(reader.bit_offset() <= section.bits.end().unwrap());
+    }
+
+    fn cjxl_progressive_dc() -> Option<Vec<u8>> {
+        if std::process::Command::new("cjxl")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping progressive-DC transform oracle: cjxl is not installed");
+            return None;
+        }
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let ppm_path = std::env::temp_dir().join(format!("jxl-wgpu-transform-{nonce}.ppm"));
+        let jxl_path = std::env::temp_dir().join(format!("jxl-wgpu-transform-{nonce}.jxl"));
+        let (width, height) = (1_024_u32, 128_u32);
+        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+        ppm.reserve((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                ppm.extend_from_slice(&[
+                    (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8,
+                    (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+                    (x.wrapping_mul(5) + y.wrapping_mul(17) + (x ^ y)) as u8,
+                ]);
+            }
+        }
+        std::fs::write(&ppm_path, ppm).unwrap();
+        let output = std::process::Command::new("cjxl")
+            .args([
+                "-d",
+                "2",
+                "-e",
+                "7",
+                "-m",
+                "0",
+                "--progressive_dc=2",
+                "--container=0",
+            ])
+            .arg(&ppm_path)
+            .arg(&jxl_path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&ppm_path);
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&jxl_path);
+            panic!("cjxl failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let encoded = std::fs::read(&jxl_path).unwrap();
+        let _ = std::fs::remove_file(&jxl_path);
+        Some(encoded)
     }
 
     fn fixture(input: &str) -> Vec<u8> {

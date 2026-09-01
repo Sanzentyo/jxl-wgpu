@@ -26,6 +26,10 @@ to an exact entropy-visible channel topology without decoding pixels. This accou
 residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
 prefix under bounded transform/channel/squeeze limits. A portable 32-byte `Pod` descriptor then
 proves every packed channel offset fits WGSL `u32` addressing before backend allocation.
+Inverse planning walks the stack and each Squeeze parameter in reverse while retaining only the
+current and immediately restored topology, rather than materializing a channel table for every
+transform. The parser also charges the cumulative topology work, so a bounded channel count cannot
+be combined with an adversarially quadratic transform sequence.
 Every token range and canvas origin comes directly from standard frame sections. It does not
 decode a pass-group entropy token, residual, predictor, color transform, or pixel on the CPU.
 The Modular metadata reader operates on a checked shared-span bit input rather than indexing one

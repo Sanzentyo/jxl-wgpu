@@ -26,6 +26,9 @@ other driver-private allocations cannot be measured portably and are not include
   padding with packed word offset and row stride for storage-buffer execution. All offsets and the
   final sample end are checked against WGSL `u32` before allocation. These records are not bound by
   the current direct-topology kernel yet; documenting the ABI does not claim inverse execution.
+  Reverse planning retains two such channel vectors at a time; it does not allocate a topology per
+  transform. A separate cumulative topology-work limit rejects legal-looking metadata that would
+  otherwise force quadratic host planning before GPU admission.
 - All buffer offsets and sizes are computed with checked integer arithmetic. Host-side sizes use
   `u64`; values consumed as WGSL indices are rejected unless they fit `u32`.
 - Uniforms are bound at offset zero. Resident/storage suballocations use an explicit binding size

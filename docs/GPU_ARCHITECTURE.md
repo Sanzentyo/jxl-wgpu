@@ -183,6 +183,11 @@ shifts, Palette/delta storage at the meta prefix, and transforms that target exi
 The plan contains no host pixel data. A checked packed-channel layout proves its complete sample
 address space fits portable WGSL `u32`; the current executor still rejects non-direct topologies
 until their resident inverse passes and lifetime allocation are connected.
+Inverse lowering does not retain one full channel table per transform. It starts from the final
+entropy topology, reverses each Squeeze parameter and transform, invokes the lowering callback with
+only the current/restored pair, and verifies that the source topology is recovered exactly. A
+cumulative topology-work budget bounds repeated vector insertion/removal independently of transform
+and final-channel count limits.
 
 ## Protocol execution
 

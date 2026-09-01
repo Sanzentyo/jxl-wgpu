@@ -62,6 +62,8 @@ pub enum ModularTransformError {
     ChannelLimitExceeded { actual: usize, limit: usize },
     #[error("Modular squeeze parameter count {actual} exceeds the bounded limit {limit}")]
     SqueezeLimitExceeded { actual: usize, limit: usize },
+    #[error("Modular transform topology work {actual} exceeds the bounded limit {limit}")]
+    TopologyWorkLimitExceeded { actual: usize, limit: usize },
     #[error("invalid Modular transform id {id}")]
     InvalidTransformId { id: u32 },
     #[error("invalid Modular RCT type {rct_type}; valid types are 0 through 41")]
@@ -93,6 +95,13 @@ pub enum ModularTransformError {
     PaletteDimensionOverflow,
     #[error("Modular transformed sample storage exceeds the portable WGSL u32 address space")]
     GpuAddressSpaceOverflow,
+    #[error("cannot reverse {transform} topology: {reason}")]
+    InvalidInverseTopology {
+        transform: &'static str,
+        reason: &'static str,
+    },
+    #[error("reversing the Modular transform stack did not recover its source topology")]
+    InverseTopologyMismatch,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
