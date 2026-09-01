@@ -92,6 +92,12 @@ monotone runs, and wrapping reconstruction. The ABI test fixes the 64-byte/16-by
 uniform, while malformed arena views must fail with typed geometry, reserved-word, or overlap errors.
 This establishes the primitive itself, not stock-decoder scheduling or complete `MOD-D03` pixel
 conformance.
+The inverse-RCT primitive has a parallel gate. Naga performs semantic validation, compile-time and
+unit checks fix the 64-byte/16-byte-aligned `Pod` layout, and typed validation rejects unequal,
+overlapping, zero-size, out-of-range, and non-linear configurations. Concrete scalar vectors cover
+all seven operations and six permutations. One actual-adapter differential executes all 42 types
+over odd dimensions, padded strides, nonzero offsets, and `i32` extremes without shader-source text
+inspection. Scheduler composition and production entropy input remain separate gates.
 Scheduler conformance composes an in-place horizontal split with a vertical split over both derived
 channels. Reverse lowering produces vertical, vertical, then horizontal jobs, and an actual adapter
 executes all three in one encoder before the sole final map. The final 9×5 plane is word-exact against

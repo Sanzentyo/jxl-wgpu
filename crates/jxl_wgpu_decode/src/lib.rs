@@ -33,6 +33,7 @@ mod inflight;
 mod input_budget;
 mod model;
 mod modular_inverse;
+pub mod modular_rct;
 pub mod modular_squeeze;
 mod modular_transform;
 mod modular_tree;

@@ -187,8 +187,14 @@ views of one read-write storage arena. One invocation owns a complete row or col
 previous reconstructed odd sample is a normative dependency; linear 1/32/64/128/256-lane variants
 parallelize independent lines. Portable two-word signed arithmetic preserves the scalar `i64`
 smooth-tendency calculation over the complete `i32` input domain. The stock executor still rejects
-non-direct topologies until generalized entropy output targets the inverse arena and Palette/RCT
-passes exist.
+non-direct topologies until generalized entropy output targets the inverse arena and Palette plus
+mixed inverse scheduling exist.
+A second standalone resident primitive applies all 42 inverse RCT types in place. Three equal-size
+planes are disjoint views of the same read-write arena; each invocation loads all inputs before any
+permuted store, so operation and permutation never require an intermediate allocation. Unsigned
+bit-pattern add/sub and explicit arithmetic shift reproduce wrapping signed semantics. The pass has
+Scalar/32/64/128/256-lane policy variants and no workgroup storage. It is not yet an ordered job in
+the inverse lifetime plan, so its existence alone does not expand the accepted stock profile.
 Inverse lowering does not retain one full channel table per transform. It starts from the final
 entropy topology, reverses each Squeeze parameter and transform, invokes the lowering callback with
 only the current/restored pair, and verifies that the source topology is recovered exactly. A

@@ -44,6 +44,13 @@ Its portable WGSL emulates the required signed 64-bit smooth-tendency intermedia
 words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
 even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
 does not yet feed transformed entropy output into this arena.
+A standalone `ModularRctPipeline` applies every one of the 42 normative operation/permutation
+combinations in place to three equal-size, non-overlapping views of that same arena. Each invocation
+loads all three signed words before writing any permutation, while explicit unsigned add/sub helpers
+preserve wrapping `i32` behavior and an explicit bit-pattern shift fixes negative rounding. Its
+64-byte, 16-byte-aligned `Pod` uniform and linear Scalar/32/64/128/256 policy variants are validated
+before recording. An actual-adapter differential covers all types with odd dimensions, padded
+strides, nonzero offsets, and signed extremes. Mixed RCT/Squeeze scheduling remains to be connected.
 The reverse planner does schedule every Squeeze parameter and selected channel from the parsed
 topology. A best-fit interval allocator reserves each destination before its dispatch, retires that
 channel's average and residual immediately afterward, and merges adjacent free spans. Thus an
