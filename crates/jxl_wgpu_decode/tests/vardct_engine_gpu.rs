@@ -1083,7 +1083,7 @@ fn standard_multiple_lf_groups_share_one_resident_image_and_status_map() {
 }
 
 #[test]
-fn ordinary_cjxl_local_trees_complete_through_two_stage_frame_engine() {
+fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
     let Some(encoded) = common::cjxl_local_tree_codestream() else {
         return;
     };
@@ -1102,7 +1102,11 @@ fn ordinary_cjxl_local_trees_complete_through_two_stage_frame_engine() {
         },
     )
     .unwrap();
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let decoder = GpuDecoder::new(
+        WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+    );
     let mut session = decoder
         .open(
             &encoded,
@@ -1113,8 +1117,21 @@ fn ordinary_cjxl_local_trees_complete_through_two_stage_frame_engine() {
         .submission_session()
         .vardct()
         .expect("ordinary cjxl selects the VarDCT submission session");
-    assert_eq!(vardct.submissions_per_frame(), 2);
-    assert!(vardct.memory_stats().deferred_hf_modular_metadata);
+    let memory = vardct.memory_stats();
+    assert!(memory.deferred_hf_modular_metadata);
+    assert!(memory.lf_packet_stream_window_bytes > 0);
+    assert!(memory.lf_packet_stream_window_bytes <= 256);
+    assert!(memory.lf_packet_stream_batch_count > 2);
+    assert_eq!(memory.packet_execution_state_bytes, 2 * 128);
+    let downstream_submissions = if memory.hf_stream_window_bytes == 0 {
+        1
+    } else {
+        memory.hf_stream_batch_count + 2
+    };
+    assert_eq!(
+        vardct.submissions_per_frame(),
+        memory.lf_packet_stream_batch_count + downstream_submissions,
+    );
 
     session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert!(matches!(

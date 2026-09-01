@@ -91,11 +91,16 @@ per-frequency-cell HF chroma correlation, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
 packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,
 executes LF image entropy on GPU, maps the aggregate end cursors, then parses and packs the following
-HF-local trees without decoding host image symbols. Separate `decode_vardct_lf` and
-`decode_vardct_hf` entry points preserve the resident LF reconstruction across that boundary. The
-stock runtime-neutral pending-frame state machine owns both submissions, both aggregate status
-maps, and the initial plus dynamically admitted metadata reservations. It is actual-GPU tested
-with ordinary multi-LF-group `cjxl` output through blocking and async completion. The image header
+HF-local trees without decoding host image symbols. Oversized LF-local ranges use the shared
+16-byte-overlap planner, one reusable upload, and ordered queue submissions. The ABI defines
+16-byte-aligned 64-byte generic and 128-byte SelfCorrecting `Pod` records that preserve ANS/LZ,
+consumer, and predictor state. Current local-tree planning reserves the conservative 128-byte
+capacity per group because the following HF-local tree is discovered only after the LF map; only the final segment performs entropy termination and contributes to the
+single aggregate LF status map. Separate `decode_vardct_lf` and `decode_vardct_hf` entry points
+preserve resident LF reconstruction across that boundary. The stock runtime-neutral pending-frame
+state machine owns every LF submission, both aggregate status maps, and the initial plus dynamically
+admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-group `cjxl` output
+through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
 reference, preview, animation, subsampling, upsampling, progressive pass, or other frame feature.
@@ -131,9 +136,9 @@ fits the resolved entropy cap, global-tree frames retain the one-submission path
 range instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/parameter pair,
 and ordered queue submissions. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
 state, nested block/channel/order progress, coefficient-sink error, and the 96-word nonzero context
-grid; only the final window validates exact ANS/padding termination. Local-tree frames first map one aggregate LF cursor
-record, then submit HF entropy and the already-recorded downstream work with one final aggregate
-validation map. Every LF group's packet and artifact status plus one 32-byte record per pass group
+grid; only the final window validates exact ANS/padding termination. Local-tree frames first run one
+or more bounded LF submissions and map one aggregate LF cursor record, then submit whole-range HF
+entropy and the already-recorded downstream work with one final aggregate validation map. Every LF group's packet and artifact status plus one 32-byte record per pass group
 share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
@@ -335,15 +340,17 @@ same session synchronously or by a later future.
 
 The CPU/WGSL per-group parameter ABI is a checked 236-byte `repr(C)` POD. Its first 12 bytes are the
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
-same typed prefix starts the 208-byte VarDCT packet entropy record. Each consumer supplies its own
+same typed prefix starts the 240-byte, 16-byte-aligned VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
 remain consumer-specific. Consumers whose entropy owns the complete token range also call one
 shared terminator for the ANS final-state and at most seven zero-padding bits; VarDCT packet streams
 followed by fixed metadata finalize ANS first and validate the enclosing section after that tail.
 The VarDCT AC parameter record is a separate 144-byte aligned `Pod`. Its window suffix carries
 logical/upload starts, available/full ends, the yield boundary, first/final flags, a 464-byte
-execution-state offset, and the canonical status index. LF/HF packet records remain whole-range
-consumers.
+execution-state offset, and the canonical status index. The VarDCT packet record has its own seven
+window fields, including a bounded-mode bit independent of FIRST/FINAL and a stream-base bit offset.
+Staged local-tree LF packets use those fields with 64-byte generic or 128-byte SelfCorrecting state;
+HF and combined/global-tree packet records remain whole-range consumers.
 The Modular suffix begins with six window fields: logical segment start, physical upload start,
 full stream end, yield boundary, first/final flags, and the aligned entropy-state offset. It then
 carries four plane offset/stride pairs, exact output

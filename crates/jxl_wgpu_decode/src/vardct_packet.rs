@@ -6,6 +6,7 @@ use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
+use crate::entropy_window::GroupStreamSegment;
 use crate::modular_tree::{
     EntropyDecoderIr, MaConfigIr, MaTreeLimits, MaTreeNodeIr, PackedModularMetadata,
     parse_ma_config,
@@ -25,6 +26,9 @@ const ENTROPY_MARKER: &str = "/*__JXL_MODULAR_ENTROPY__*/";
 const RECONSTRUCT_MARKER: &str = "/*__JXL_MODULAR_RECONSTRUCT__*/";
 
 const ZERO_AC_HF_GLOBAL: u32 = 0x2495;
+const PACKET_WINDOW_ENABLED: u32 = 1 << 2;
+pub(crate) const GENERIC_PACKET_EXECUTION_STATE_BYTES: u64 = 64;
+pub(crate) const WEIGHTED_PACKET_EXECUTION_STATE_BYTES: u64 = 128;
 
 /// A standard feature excluded from the deliberately bounded VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -75,8 +79,17 @@ pub enum BoundedVarDctPacketError {
 /// GPU-reported validation failure. No output is authoritative after this error.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum GpuVarDctPacketError {
-    #[error("GPU VarDCT packet entropy failed with status {code} at bit {cursor}/{end}")]
-    Entropy { code: u32, cursor: u32, end: u32 },
+    #[error(
+        "GPU VarDCT packet entropy failed with status {code} at bit {cursor}/{end} after LF/HF {lf_decoded}/{hf_decoded} symbols (detail {detail})"
+    )]
+    Entropy {
+        code: u32,
+        cursor: u32,
+        end: u32,
+        lf_decoded: u32,
+        hf_decoded: u32,
+        detail: u32,
+    },
     #[error("GPU VarDCT packet has invalid LF local header")]
     LfHeader,
     #[error("GPU VarDCT packet does not declare the negotiated bounded first-block count")]
@@ -623,8 +636,27 @@ impl BoundedVarDctGroupPlan {
         [self.rect.width.div_ceil(8), self.rect.height.div_ceil(8)]
     }
 
-    /// U32 scratch words retaining LF samples, weighted-predictor rows, and the LZ history ring.
+    /// U32 words retaining LF samples, weighted-predictor rows, the LZ history ring, and one
+    /// aligned packet resume record. The resume record is shared by the sequential LF/HF packet
+    /// consumers because their executions never overlap.
     pub fn reconstructed_words(
+        &self,
+        needs_self_correcting: bool,
+    ) -> Result<u32, BoundedVarDctPacketError> {
+        let state_offset = self.packet_execution_state_offset_words(needs_self_correcting)?;
+        let state_words = u32::try_from(packet_execution_state_bytes(needs_self_correcting) / 4)
+            .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "VarDCT packet execution-state words",
+            })?;
+        state_offset
+            .checked_add(state_words)
+            .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "VarDCT reconstruction and packet execution state",
+            })
+    }
+
+    /// Word offset of the 16-byte-aligned packet resume record within `reconstructed`.
+    pub fn packet_execution_state_offset_words(
         &self,
         needs_self_correcting: bool,
     ) -> Result<u32, BoundedVarDctPacketError> {
@@ -661,12 +693,17 @@ impl BoundedVarDctGroupPlan {
         } else {
             0
         };
-        samples
+        let working_words = samples
             .checked_add(predictor_words)
             .and_then(|words| words.checked_add(self.lz77_window_words))
             .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "VarDCT reconstruction scratch",
-            })
+            })?;
+        working_words.checked_add(3).map(|words| words & !3).ok_or(
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "VarDCT packet execution-state alignment",
+            },
+        )
     }
 
     pub fn packet_control(
@@ -1073,11 +1110,61 @@ pub struct VarDctPacketControl {
 }
 
 /// Generic Modular parameter ABI retained by the composable entropy/reconstruction fragments.
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct VarDctModularParams {
     entropy: EntropyStreamParams,
+    window_logical_start: u32,
+    window_upload_start: u32,
+    stream_token_end: u32,
+    window_yield_end: u32,
+    window_flags: u32,
+    entropy_state_offset: u32,
+    stream_base_bit: u32,
     consumer_words: [u32; 49],
+    _reserved: u32,
+}
+
+/// Common 56-byte prefix of both packet resume records.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct PacketExecutionStatePrefix {
+    entropy: [u32; 8],
+    packet_phase: u32,
+    lf_decoded: u32,
+    hf_decoded: u32,
+    first_blocks: u32,
+    extra_precision: u32,
+    predictor_prev_grad: i32,
+}
+
+/// Exact 64-byte packet state for generic MA prediction without SelfCorrecting rows.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct GenericPacketExecutionState {
+    prefix: PacketExecutionStatePrefix,
+    _reserved: [u32; 2],
+}
+
+/// Exact 128-byte packet state including every SelfCorrecting predictor accumulator.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct WeightedPacketExecutionState {
+    prefix: PacketExecutionStatePrefix,
+    wp_true_errors: [i32; 4],
+    wp_subpred_nw_ww: [u32; 4],
+    wp_subpred_n_w: [u32; 4],
+    wp_subpred_ne: [u32; 4],
+    _reserved: [u32; 2],
+}
+
+#[must_use]
+pub(crate) const fn packet_execution_state_bytes(needs_self_correcting: bool) -> u64 {
+    if needs_self_correcting {
+        WEIGHTED_PACKET_EXECUTION_STATE_BYTES
+    } else {
+        GENERIC_PACKET_EXECUTION_STATE_BYTES
+    }
 }
 
 impl Default for VarDctModularParams {
@@ -1094,7 +1181,15 @@ impl Default for VarDctModularParams {
         consumer_words[48] = 12;
         Self {
             entropy: EntropyStreamParams::default(),
+            window_logical_start: 0,
+            window_upload_start: 0,
+            stream_token_end: 0,
+            window_yield_end: 0,
+            window_flags: 0,
+            entropy_state_offset: 0,
+            stream_base_bit: 0,
             consumer_words,
+            _reserved: 0,
         }
     }
 }
@@ -1110,6 +1205,39 @@ impl VarDctModularParams {
     pub fn with_self_correcting(mut self, enabled: bool) -> Self {
         self.consumer_words[9] = u32::from(enabled);
         self
+    }
+
+    /// Rebinds the packet entropy consumer to one relative, overlapping upload segment.
+    #[must_use]
+    pub(crate) fn with_stream_segment(
+        mut self,
+        segment: GroupStreamSegment,
+        stream_base_bit: u32,
+        entropy_state_offset: u32,
+    ) -> Self {
+        self.entropy.token_start = 0;
+        self.entropy.token_end = segment.available_token_end;
+        self.window_logical_start = segment.window_logical_start;
+        self.window_upload_start = segment.window_upload_start;
+        self.stream_token_end = segment.stream_token_end;
+        self.window_yield_end = segment.window_yield_end;
+        self.window_flags = segment.flags | PACKET_WINDOW_ENABLED;
+        self.entropy_state_offset = entropy_state_offset;
+        self.stream_base_bit = stream_base_bit;
+        self
+    }
+
+    #[cfg(test)]
+    fn window_contract(&self) -> [u32; 7] {
+        [
+            self.window_logical_start,
+            self.window_upload_start,
+            self.stream_token_end,
+            self.window_yield_end,
+            self.window_flags,
+            self.entropy_state_offset,
+            self.stream_base_bit,
+        ]
     }
 }
 
@@ -1174,11 +1302,17 @@ impl GpuVarDctPacketStatus {
                 code: self.code,
                 cursor: self.cursor,
                 end: self.expected_end,
+                lf_decoded: self.lf_decoded,
+                hf_decoded: self.hf_decoded,
+                detail: self.detail,
             }),
             2..=13 => Err(GpuVarDctPacketError::Entropy {
                 code: self.code,
                 cursor: self.cursor,
                 end: self.expected_end,
+                lf_decoded: self.lf_decoded,
+                hf_decoded: self.hf_decoded,
+                detail: self.detail,
             }),
             code => Err(GpuVarDctPacketError::Unknown { code }),
         }
@@ -1222,6 +1356,9 @@ impl GpuVarDctPacketStatus {
                 code: self.code,
                 cursor: self.cursor,
                 end: self.expected_end,
+                lf_decoded: self.lf_decoded,
+                hf_decoded: self.hf_decoded,
+                detail: self.detail,
             }),
             20 => Err(GpuVarDctPacketError::LfHeader),
             21 => Err(GpuVarDctPacketError::FirstBlock),
@@ -1236,6 +1373,9 @@ impl GpuVarDctPacketStatus {
                 code: self.code,
                 cursor: self.cursor,
                 end: self.expected_end,
+                lf_decoded: self.lf_decoded,
+                hf_decoded: self.hf_decoded,
+                detail: self.detail,
             }),
             code => Err(GpuVarDctPacketError::Unknown { code }),
         }
@@ -1443,8 +1583,16 @@ const fn transform_id(transform: TransformKind) -> u32 {
 const _: () = {
     assert!(std::mem::size_of::<VarDctPacketControl>() == 128);
     assert!(std::mem::align_of::<VarDctPacketControl>() == 16);
-    assert!(std::mem::size_of::<VarDctModularParams>() == 208);
-    assert!(std::mem::align_of::<VarDctModularParams>() == 4);
+    assert!(std::mem::size_of::<VarDctModularParams>() == 240);
+    assert!(std::mem::align_of::<VarDctModularParams>() == 16);
+    assert!(std::mem::size_of::<PacketExecutionStatePrefix>() == 56);
+    assert!(std::mem::align_of::<PacketExecutionStatePrefix>() == 4);
+    assert!(std::mem::size_of::<GenericPacketExecutionState>() == 64);
+    assert!(std::mem::align_of::<GenericPacketExecutionState>() == 16);
+    assert!(std::mem::size_of::<WeightedPacketExecutionState>() == 128);
+    assert!(std::mem::align_of::<WeightedPacketExecutionState>() == 16);
+    assert!(GENERIC_PACKET_EXECUTION_STATE_BYTES == 64);
+    assert!(WEIGHTED_PACKET_EXECUTION_STATE_BYTES == 128);
     assert!(std::mem::size_of::<GpuVarDctPacketStatus>() == 64);
 };
 
@@ -1482,16 +1630,55 @@ mod tests {
         let params = VarDctModularParams::default()
             .with_lz77_window(8)
             .with_self_correcting(true);
-        let words = bytemuck::cast::<VarDctModularParams, [u32; 52]>(params);
-        let mut expected = [0; 52];
+        let words = bytemuck::cast::<VarDctModularParams, [u32; 60]>(params);
+        let mut expected = [0; 60];
         expected[2] = 7;
-        expected[12] = 1;
-        expected[41] = 16;
-        expected[42] = 10;
-        expected[43..=45].fill(7);
-        expected[48] = 13;
-        expected[49..=51].fill(12);
+        expected[19] = 1;
+        expected[48] = 16;
+        expected[49] = 10;
+        expected[50..=52].fill(7);
+        expected[55] = 13;
+        expected[56..=58].fill(12);
         assert_eq!(words, expected);
+    }
+
+    #[test]
+    fn modular_parameter_record_rebases_one_packet_window() {
+        let segment = GroupStreamSegment {
+            group_index: 0,
+            input_start: 0,
+            input_end: 8,
+            upload_offset: 0,
+            window_logical_start: 16,
+            window_upload_start: 3,
+            available_token_end: 72,
+            stream_token_end: 96,
+            window_yield_end: 64,
+            flags: GroupStreamSegment::FINAL,
+        };
+        let params = VarDctModularParams::default().with_stream_segment(segment, 41, 128);
+        assert_eq!(params.entropy.token_start, 0);
+        assert_eq!(params.entropy.token_end, 72);
+        assert_eq!(params.window_contract(), [16, 3, 96, 64, 6, 128, 41]);
+    }
+
+    #[test]
+    fn intermediate_packet_window_keeps_bounded_mode_without_boundary_flags() {
+        let segment = GroupStreamSegment {
+            group_index: 0,
+            input_start: 8,
+            input_end: 16,
+            upload_offset: 0,
+            window_logical_start: 64,
+            window_upload_start: 0,
+            available_token_end: 128,
+            stream_token_end: 192,
+            window_yield_end: 112,
+            flags: 0,
+        };
+        let params = VarDctModularParams::default().with_stream_segment(segment, 41, 128);
+
+        assert_eq!(params.window_contract(), [64, 0, 192, 112, 4, 128, 41]);
     }
 
     #[test]
