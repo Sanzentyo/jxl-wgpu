@@ -636,7 +636,7 @@ impl WgpuSubmissionEngine {
 }
 
 impl ModularInversePipelineCache {
-    fn get(
+    pub(super) fn get(
         &self,
         backend: &WgpuBackend,
         f64_path: F64OutputPath,

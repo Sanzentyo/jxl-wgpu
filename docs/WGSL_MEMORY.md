@@ -112,6 +112,7 @@ name shown in parentheses.
 | `jxl_wgpu_encode/lossless_gray8.wgsl` | `Gray8Event` / four-word event | `kind, token, extra_bit_count, extra_bits` | 16 | 4 | storage/readback element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields | 244 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
+| `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
 
 ### Values that intentionally are not `Pod`
 
@@ -193,6 +194,7 @@ The table below states the default workgroup configuration for each entry point:
 | `display_numeric` | source words RO, destination T, U; native-F64 variant also binds the same source as F64 RO | 16x16 | Tier A (`KernelVariant` 2-D) | exact pitch-linear plane range/stride and WGSL `u32` addresses; explicit sample kind, affine mapping, non-finite handling, clamp, transfer, and channel visualization |
 | `display_image` | source RO, RGBA8 or RGBA16F destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; each pitch-linear plane and its final address is bounded; wide-gamut/HDR requires float output |
 | `vardct_resource` (decoder) | LF-group table RO, full-image dequantized-LF atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | checked local block count, global atlas stride/origin, and output range; one 1D workgroup per LF-group block batch |
+| `vardct_raw_matrix` (decoder) | inverse-transformed side-image arena RO, resident resource table and shared decode status RW, U | 64x1 default, autotuned linear lanes | Tier A (`KernelVariant` 1-D) | one invocation per canonical matrix sample; checked plane offsets/strides and one, two, or four aliased resource targets; non-positive or oversized weights set a typed sticky status before AC/render |
 | `vardct_packet` (decoder) | whole or reusable-window codestream/MA metadata RO, reconstruction/raw metadata/coefficients/status RW, control U, Modular params RW | 1x1 | Tier B (fixed) | combined/global-tree and split LF/HF local-tree entry points use logical channel widths with explicit physical strides; all packet forms resume across ordered windows using one 64/128-byte aligned state and reusable upload, while only local trees map an aggregate LF cursor set before the final authoritative map |
 | `progressive_dc::{convert_modular,pack_lf}` (decoder) | Modular arena or X/Y/B planes RO, resident X/Y/B planes or VarDCT resources RW, U | 64x1 | Tier A (`KernelVariant` linear) | checked common extents/strides, source arena ranges, destination resource vec4 range, storage limits and WGSL-u32 addresses; one dependency retains all three buffers until its consumer completes |
 | `vardct_artifact` (decoder) | LF-group raw metadata RO, artifact/occupancy plus full-image resources RW, U | 1x1 | Tier B (fixed) | validates non-overlapping mixed varblocks, global LF/correlation strides and aligned destination origin, compacts all 27 strategy buckets, and emits three bounded indirect records per strategy plus exact coefficient ranges |
@@ -321,6 +323,16 @@ against device limits prior to pipeline compilation and dispatch recording.
 | Display textures | Pitch-linear source buffers are fully range/usage bounded. RGB, numeric, and color-image dispatches use exact 32, 64, and 144-byte Pod uniforms respectively. Color images produce RGBA8 SDR or RGBA16F wide-gamut/HDR linear BT.709 textures. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing, short-lived uniform allocation internals, command metadata, and display-pipeline objects are intentionally excluded. |
 | Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
 
+Raw mode-7 VarDCT side images use a dynamic, exact shared-budget reservation because later matrices
+are discovered only after the preceding GPU entropy cursor is mapped. The reservation covers
+packed MA/channel metadata, the transformed/inverse arena plus entropy state and LZ/predictor
+scratch, dummy output, decode status and its staging copy, the 244-byte entropy parameters,
+16-byte dispatch control, 64-byte overlay uniform, and every Palette/RCT/Squeeze inverse uniform.
+It is acquired before allocation and remains attached to the pending stage until status validation
+and matrix overlay complete. The large frame-resident resource table is already covered by
+`VarDctDecodeMemoryStats` and is not charged again. Bounded side-image uploads are not implemented
+yet, so this stage currently binds the retained whole codestream.
+
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,
 Weighted-predictor, and aligned execution-state tail. Pass-group lanes copy only validated row
@@ -338,7 +350,8 @@ resident reconstruction before the next dependency. Its worst-case LZ ring, 464-
 per pass group, status, parameters, and sink uniforms are included in the initial reservation;
 late buffers use the same budget and all producer lifetimes remain retained. Parametric custom
 matrix modes overwrite the already-accounted resource-table matrix region and add no GPU
-allocation. Raw Modular matrices, Global/LF/HF image streams, and intermediate presentation still
+allocation. Sectioned global-tree raw matrices add only their exact temporary reservation above;
+local-tree/windowed raw matrices, Global/LF/HF image streams, and intermediate presentation still
 require broader scheduling.
 
 ## Shader write bounds fixed by this audit

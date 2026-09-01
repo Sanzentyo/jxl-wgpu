@@ -98,6 +98,7 @@ pub(super) enum FixedGradientOutputMode {
     DirectNormalizedGray8 = 1,
     CompactNormalizedGray8 = 2,
     ResidentOnly = 3,
+    CursorContinuation = 4,
 }
 
 impl GroupDispatchLayout {
@@ -183,6 +184,9 @@ impl GroupDispatchLayout {
                 ModularOutputSpecialization::DirectNormalizedGray8
             }
             FixedGradientOutputMode::ResidentOnly => ModularOutputSpecialization::FinalizePass,
+            FixedGradientOutputMode::CursorContinuation => {
+                ModularOutputSpecialization::FinalizePass
+            }
         };
         let resident_modular_arena_bytes = if generalized_channels {
             profile

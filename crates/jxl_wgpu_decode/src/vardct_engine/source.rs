@@ -67,6 +67,14 @@ impl VarDctSource {
 
     pub(super) fn submissions_per_frame(&self) -> usize {
         if self.deferred_hf.is_some() {
+            if self.packet.pending_raw_hf_dequant_side_image().is_some()
+                && !self.packet.requires_local_tree_staging()
+                && !self.packet.profile.uses_lf_frame
+            {
+                // The final AC/render submission is known up front. Each raw side image adds its
+                // own submission as the resumable HF-global parser discovers it.
+                return 1;
+            }
             if self.packet.profile.uses_lf_frame {
                 return 2;
             }
@@ -322,12 +330,14 @@ pub(super) fn prepare_source(
                 .then(|| LfPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit))
                 .transpose()?
                 .flatten();
-            let combined_packet_windows = (!staged_local_trees && !packet.profile.uses_lf_frame)
-                .then(|| {
-                    CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
-                })
-                .transpose()?
-                .flatten();
+            let combined_packet_windows = (!staged_local_trees
+                && !packet.profile.uses_lf_frame
+                && deferred_hf.is_none())
+            .then(|| {
+                CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
+            })
+            .transpose()?
+            .flatten();
             let hf_coefficients = packet
                 .hf_coefficients
                 .as_ref()

@@ -26,14 +26,18 @@ use crate::vardct_output::{
     VarDctOutputConfig, VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch,
 };
 use crate::vardct_packet::{
-    GpuVarDctPacketStatus, HfCoefficientParse, VarDctModularParams, VarDctPacketBuffers,
-    VarDctPacketControl, VarDctPacketValidation,
+    GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
+    VarDctPacketValidation,
 };
 use crate::vardct_pass_group::{
     GpuHfCoefficientStatus, HfCoefficientBuffers, HfCoefficientExecutionPlan,
     HfCoefficientGroupExecutionPlan,
 };
 use crate::vardct_resource::VarDctResourceBuffers;
+use crate::wgpu_engine::{
+    RawHfDequantSideImageJob, RawHfDequantSideImageStatus, raw_matrix_status_ok,
+    raw_matrix_value_error,
+};
 use crate::{
     Error as DecodeError, FrameDuration, FrameMetadata, GpuCodestream, GpuPendingFrame,
     GpuSubmissionSession, Result as DecodeResult, SubmittedGpuFrame,
@@ -300,7 +304,7 @@ enum VarDctDownstreamCommands {
 }
 
 struct DeferredHfGlobalCommands {
-    before_coefficients: wgpu::CommandBuffer,
+    before_coefficients: Option<wgpu::CommandBuffer>,
     after_coefficients: wgpu::CommandBuffer,
 }
 
@@ -317,6 +321,12 @@ enum VarDctPendingContinuation {
     HfGlobal {
         source: Box<VarDctSource>,
         commands: DeferredHfGlobalCommands,
+    },
+    RawHfDequant {
+        source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
+        job: Box<RawHfDequantSideImageJob>,
+        permit: MemoryPermit,
     },
 }
 
@@ -580,6 +590,13 @@ enum VarDctPendingStage {
         source: Box<VarDctSource>,
         commands: Option<DeferredHfGlobalCommands>,
     },
+    RawHfDequant {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+        commands: Option<DeferredHfGlobalCommands>,
+        job: Option<Box<RawHfDequantSideImageJob>>,
+        permit: Option<MemoryPermit>,
+    },
     Final {
         completion: Arc<MapCompletion>,
     },
@@ -597,6 +614,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
                 &match &self.stage {
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
                     VarDctPendingStage::HfGlobal { .. } => "hf-global",
+                    VarDctPendingStage::RawHfDequant { .. } => "raw-hf-dequant",
                     VarDctPendingStage::Final { .. } => "final",
                 },
             )
@@ -619,7 +637,9 @@ impl VarDctPendingFrame {
     ) -> Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
         if matches!(
             self.stage,
-            VarDctPendingStage::LocalLf { .. } | VarDctPendingStage::HfGlobal { .. }
+            VarDctPendingStage::LocalLf { .. }
+                | VarDctPendingStage::HfGlobal { .. }
+                | VarDctPendingStage::RawHfDequant { .. }
         ) {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted);
         }
@@ -640,7 +660,9 @@ impl VarDctPendingFrame {
     pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
         if matches!(
             self.stage,
-            VarDctPendingStage::LocalLf { .. } | VarDctPendingStage::HfGlobal { .. }
+            VarDctPendingStage::LocalLf { .. }
+                | VarDctPendingStage::HfGlobal { .. }
+                | VarDctPendingStage::RawHfDequant { .. }
         ) {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted.into());
         }
@@ -662,6 +684,7 @@ impl VarDctPendingFrame {
         match &self.stage {
             VarDctPendingStage::LocalLf { completion, .. }
             | VarDctPendingStage::HfGlobal { completion, .. }
+            | VarDctPendingStage::RawHfDequant { completion, .. }
             | VarDctPendingStage::Final { completion } => Arc::clone(completion),
         }
     }
@@ -686,6 +709,20 @@ impl VarDctPendingFrame {
             } => commands
                 .take()
                 .map(|commands| VarDctPendingContinuation::HfGlobal { source, commands }),
+            VarDctPendingStage::RawHfDequant {
+                source,
+                mut commands,
+                mut job,
+                mut permit,
+                ..
+            } => commands.take().zip(job.take()).zip(permit.take()).map(
+                |((commands, job), permit)| VarDctPendingContinuation::RawHfDequant {
+                    source,
+                    commands,
+                    job,
+                    permit,
+                },
+            ),
             final_stage @ VarDctPendingStage::Final { .. } => {
                 self.stage = final_stage;
                 None
@@ -701,6 +738,15 @@ impl VarDctPendingFrame {
             }
             Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
                 self.submit_hf_global_stage(mapping, source, commands)?;
+                Ok(true)
+            }
+            Some(VarDctPendingContinuation::RawHfDequant {
+                source,
+                commands,
+                job,
+                permit,
+            }) => {
+                self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -1127,10 +1173,153 @@ impl VarDctPendingFrame {
         Ok(())
     }
 
+    fn start_raw_hf_dequant_stage(
+        &mut self,
+        source: Box<VarDctSource>,
+        mut commands: DeferredHfGlobalCommands,
+        poll_permit: Option<SubmissionPollPermit>,
+    ) -> Result<(), VarDctDecodeError> {
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        let plan = source
+            .packet
+            .pending_raw_hf_dequant_side_image()
+            .cloned()
+            .ok_or(VarDctDecodeError::EngineContract {
+                detail: "raw HF dequant stage has no pending side image",
+            })?;
+        let packet_end = source.packet.pending_raw_hf_dequant_packet_end().ok_or(
+            VarDctDecodeError::EngineContract {
+                detail: "raw HF dequant stage has no bounded packet end",
+            },
+        )?;
+        let memory_bytes = self
+            .pipelines
+            .raw_hf_dequant
+            .memory_bytes(&plan)
+            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
+                matrix: plan.matrix_index,
+                source: Box::new(source),
+            })?;
+        let permit = self.memory.try_reserve(memory_bytes)?;
+        let mut job = self
+            .pipelines
+            .raw_hf_dequant
+            .prepare(
+                &self.backend,
+                &lifetime._codestream,
+                &lifetime._resources,
+                source.resource_layout,
+                &plan,
+                packet_end,
+            )
+            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
+                matrix: plan.matrix_index,
+                source: Box::new(source),
+            })?;
+        if job.memory_bytes() != memory_bytes {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "raw HF dequant allocation disagrees with its byte admission",
+            });
+        }
+        let poll_permit = match poll_permit {
+            Some(permit) => permit,
+            None => self
+                .backend
+                .submission_poller()
+                .try_reserve()
+                .map_err(VarDctDecodeError::PollBackpressure)?,
+        };
+        let mut submission_commands = Vec::with_capacity(2);
+        if let Some(before_coefficients) = commands.before_coefficients.take() {
+            submission_commands.push(before_coefficients);
+        }
+        submission_commands.push(job.take_commands().map_err(|source| {
+            VarDctDecodeError::RawHfDequantGpu {
+                matrix: plan.matrix_index,
+                source: Box::new(source),
+            }
+        })?);
+        let submission = self.backend.queue().submit(submission_commands);
+        let completion = Arc::new(MapCompletion::default());
+        arm_raw_hf_dequant_status_map(&job, &completion);
+        let poll_completion = Arc::clone(&completion);
+        if let Err(error) = poll_permit.register(submission, move |error| {
+            poll_completion.complete(Err(error));
+        }) {
+            completion.complete(Err(format!(
+                "raw HF dequant GPU poll registration failed: {error}"
+            )));
+        }
+        let submissions = self
+            .runtime_stats
+            .submissions_per_frame
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "raw HF dequant submission count",
+            })?;
+        self.runtime_stats
+            .submissions_per_frame
+            .store(submissions, Ordering::Release);
+        self.stage = VarDctPendingStage::RawHfDequant {
+            completion,
+            source,
+            commands: Some(commands),
+            job: Some(Box::new(job)),
+            permit: Some(permit),
+        };
+        Ok(())
+    }
+
+    fn finish_raw_hf_dequant_stage(
+        &mut self,
+        mapping: Result<(), String>,
+        mut source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
+        job: Box<RawHfDequantSideImageJob>,
+        permit: MemoryPermit,
+    ) -> DecodeResult<()> {
+        mapping.map_err(DecodeError::backend)?;
+        let plan = source
+            .packet
+            .pending_raw_hf_dequant_side_image()
+            .cloned()
+            .ok_or(VarDctDecodeError::EngineContract {
+                detail: "completed raw HF dequant stage has no parser continuation",
+            })?;
+        let packet_end = source.packet.pending_raw_hf_dequant_packet_end().ok_or(
+            VarDctDecodeError::EngineContract {
+                detail: "completed raw HF dequant stage has no bounded packet end",
+            },
+        )?;
+        let status = job
+            .finish_status()
+            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
+                matrix: plan.matrix_index,
+                source: Box::new(source),
+            })?;
+        validate_raw_hf_dequant_status(&plan, packet_end, status)?;
+        drop(job);
+        drop(permit);
+        source
+            .packet
+            .resume_hf_global_after_raw_side_image_source(&source.codestream, status.cursor)
+            .map_err(VarDctDecodeError::from)?;
+        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+            self.start_raw_hf_dequant_stage(source, commands, None)?;
+            Ok(())
+        } else {
+            self.submit_deferred_hf_coefficients(source, commands)
+        }
+    }
+
     fn submit_hf_global_stage(
         &mut self,
         mapping: Result<(), String>,
-        source: Box<VarDctSource>,
+        mut source: Box<VarDctSource>,
         commands: DeferredHfGlobalCommands,
     ) -> DecodeResult<()> {
         mapping.map_err(DecodeError::backend)?;
@@ -1173,19 +1362,34 @@ impl VarDctPendingFrame {
         lifetime.status_mapped.store(false, Ordering::Release);
         let cursor = cursor.map_err(VarDctDecodeError::from)?;
 
-        let entropy = source
+        source
             .packet
             .parse_single_hf_global_continuation_source(&source.codestream, cursor)
             .map_err(VarDctDecodeError::from)?;
-        let entropy = match entropy {
-            HfCoefficientParse::Complete(plan) => *plan,
-            HfCoefficientParse::SideImage(_) => {
-                return Err(VarDctDecodeError::EngineContract {
-                    detail: "raw HF dequantization side-image staging is not submitted",
-                }
-                .into());
-            }
-        };
+        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+            self.start_raw_hf_dequant_stage(source, commands, None)?;
+            return Ok(());
+        }
+        self.submit_deferred_hf_coefficients(source, commands)
+    }
+
+    fn submit_deferred_hf_coefficients(
+        &mut self,
+        source: Box<VarDctSource>,
+        mut commands: DeferredHfGlobalCommands,
+    ) -> DecodeResult<()> {
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        let entropy =
+            source
+                .packet
+                .hf_coefficients
+                .as_ref()
+                .ok_or(VarDctDecodeError::EngineContract {
+                    detail: "deferred HF-global parse did not produce coefficient metadata",
+                })?;
         let artifacts = source
             .groups
             .iter()
@@ -1193,7 +1397,7 @@ impl VarDctPendingFrame {
             .collect::<Vec<_>>();
         let plan = HfCoefficientExecutionPlan::new(
             &source.packet,
-            &entropy,
+            entropy,
             &artifacts,
             source.codestream.logical_bytes(),
             source.stream_limit,
@@ -1483,12 +1687,16 @@ impl VarDctPendingFrame {
 
         let submission =
             if let Some(whole_coefficients) = whole_coefficients {
-                self.backend.queue().submit([
-                    commands.before_coefficients,
+                let mut submissions = Vec::with_capacity(4);
+                if let Some(before_coefficients) = commands.before_coefficients.take() {
+                    submissions.push(before_coefficients);
+                }
+                submissions.extend([
                     whole_coefficients,
                     commands.after_coefficients,
                     status_commands.finish(),
-                ])
+                ]);
+                self.backend.queue().submit(submissions)
             } else {
                 let retained = lock_unpoisoned(&lifetime._hf_coefficients);
                 let buffers = retained.as_ref().ok_or(VarDctDecodeError::EngineContract {
@@ -1516,9 +1724,13 @@ impl VarDctPendingFrame {
                 self.backend
                     .queue()
                     .write_buffer(params, 0, &first.params_upload);
-                self.backend
-                    .queue()
-                    .submit([commands.before_coefficients, first.commands]);
+                if let Some(before_coefficients) = commands.before_coefficients.take() {
+                    self.backend
+                        .queue()
+                        .submit([before_coefficients, first.commands]);
+                } else {
+                    self.backend.queue().submit([first.commands]);
+                }
                 let mut batch_count = 1_usize;
                 for batch in batches {
                     self.backend
@@ -1739,6 +1951,14 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
                     self.submit_hf_global_stage(mapping, source, commands)?;
                 }
+                Some(VarDctPendingContinuation::RawHfDequant {
+                    source,
+                    commands,
+                    job,
+                    permit,
+                }) => {
+                    self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)?;
+                }
                 None => return self.finish(mapping),
             }
         }
@@ -1763,6 +1983,18 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 }
                 Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
                     if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Some(VarDctPendingContinuation::RawHfDequant {
+                    source,
+                    commands,
+                    job,
+                    permit,
+                }) => {
+                    if let Err(error) =
+                        self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)
+                    {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -1795,6 +2027,18 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 }
                 Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
                     if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Some(VarDctPendingContinuation::RawHfDequant {
+                    source,
+                    commands,
+                    job,
+                    permit,
+                }) => {
+                    if let Err(error) =
+                        self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)
+                    {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -2595,7 +2839,7 @@ fn submit_vardct(
         (None, None) => {}
         _ => unreachable!("EPF plan and sigma buffer are constructed together"),
     }
-    let deferred_before_coefficients = if staged_hf_global {
+    let deferred_before_coefficients = if source.deferred_hf.is_some() {
         let before = commands.finish();
         commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu deferred HF-global post-coefficient stage"),
@@ -2925,14 +3169,14 @@ fn submit_vardct(
     }
 
     let after_coefficients = commands.finish();
-    let (downstream_commands, deferred_commands) =
+    let (downstream_commands, mut deferred_commands) =
         if let Some(before_coefficients) = deferred_before_coefficients {
             debug_assert!(windowed_before_coefficients.is_none());
             debug_assert!(windowed_coefficient_batches.is_empty());
             (
                 None,
                 Some(DeferredHfGlobalCommands {
-                    before_coefficients,
+                    before_coefficients: Some(before_coefficients),
                     after_coefficients,
                 }),
             )
@@ -2969,6 +3213,96 @@ fn submit_vardct(
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
+    let mut expected_groups = Vec::with_capacity(source.packet.groups.len());
+    for group in &source.packet.groups {
+        let [group_blocks_x, group_blocks_y] = group.block_extent();
+        let expected_blocks = group_blocks_x.checked_mul(group_blocks_y).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group validation block count",
+            },
+        )?;
+        let correlation_samples = group
+            .rect
+            .width
+            .div_ceil(64)
+            .checked_mul(group.rect.height.div_ceil(64))
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "LF-group validation correlation samples",
+            })?;
+        expected_groups.push(VarDctGroupValidation {
+            uniform_transform: source.packet.uniform_transform,
+            expected_lf_samples: if source.packet.profile.uses_lf_frame {
+                0
+            } else {
+                expected_blocks
+                    .checked_mul(3)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-group validation sample count",
+                    })?
+            },
+            expected_coefficients: group.coefficient_words(),
+            expected_blocks,
+            correlation_samples,
+            task_capacity: group.task_capacity,
+            expected_global_scale: source.packet.global_scale,
+            expected_quant_lf: source.packet.quant_lf,
+            expected_extra_precision: group.extra_precision,
+        });
+    }
+    let expected_hf_group_indices = source
+        .hf_coefficients
+        .iter()
+        .flat_map(|plan| &plan.groups)
+        .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
+        .collect();
+    let layout = source.layout.clone();
+    let frame_name = source.frame_name.clone();
+    let progressive_dc_extent = Extent2d {
+        width: source.packet.profile.width,
+        height: source.packet.profile.height,
+    };
+    let mut pending = VarDctPendingFrame {
+        backend: backend.clone(),
+        pipelines,
+        memory,
+        runtime_stats,
+        lifetime: Some(Arc::clone(&lifetime)),
+        stage: VarDctPendingStage::Final {
+            completion: Arc::new(MapCompletion::default()),
+        },
+        token: SubmissionToken(1),
+        layout,
+        frame_name,
+        expected_groups,
+        expected_hf_group_indices,
+        deferred_hf_global: staged_hf_global,
+        progressive_dc_extent,
+        progressive_dc_stride: padded_width,
+    };
+    if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+        if packet_stage_commands.is_some() {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "raw HF dequant side images with staged local trees are not yet supported",
+            });
+        }
+        if combined_packet_batches.is_some() {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "raw HF dequant side images cannot use combined packet stream windows",
+            });
+        }
+        if downstream_commands.is_some() {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "raw HF dequant side image unexpectedly has eager downstream commands",
+            });
+        }
+        let commands = deferred_commands
+            .take()
+            .ok_or(VarDctDecodeError::EngineContract {
+                detail: "raw HF dequant side image has no deferred coefficient commands",
+            })?;
+        pending.start_raw_hf_dequant_stage(Box::new(source), commands, Some(poll_permit))?;
+        return Ok(pending);
+    }
     let completion = Arc::new(MapCompletion::default());
     let (submission, local_commands, deferred_commands) =
         if let Some(packet_stage_commands) = packet_stage_commands {
@@ -3030,55 +3364,7 @@ fn submit_vardct(
     }) {
         completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
     }
-    let mut expected_groups = Vec::with_capacity(source.packet.groups.len());
-    for group in &source.packet.groups {
-        let [group_blocks_x, group_blocks_y] = group.block_extent();
-        let expected_blocks = group_blocks_x.checked_mul(group_blocks_y).ok_or(
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "LF-group validation block count",
-            },
-        )?;
-        let correlation_samples = group
-            .rect
-            .width
-            .div_ceil(64)
-            .checked_mul(group.rect.height.div_ceil(64))
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "LF-group validation correlation samples",
-            })?;
-        expected_groups.push(VarDctGroupValidation {
-            uniform_transform: source.packet.uniform_transform,
-            expected_lf_samples: if source.packet.profile.uses_lf_frame {
-                0
-            } else {
-                expected_blocks
-                    .checked_mul(3)
-                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF-group validation sample count",
-                    })?
-            },
-            expected_coefficients: group.coefficient_words(),
-            expected_blocks,
-            correlation_samples,
-            task_capacity: group.task_capacity,
-            expected_global_scale: source.packet.global_scale,
-            expected_quant_lf: source.packet.quant_lf,
-            expected_extra_precision: group.extra_precision,
-        });
-    }
-    let expected_hf_group_indices = source
-        .hf_coefficients
-        .iter()
-        .flat_map(|plan| &plan.groups)
-        .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
-        .collect();
-    let layout = source.layout.clone();
-    let frame_name = source.frame_name.clone();
-    let progressive_dc_extent = Extent2d {
-        width: source.packet.profile.width,
-        height: source.packet.profile.height,
-    };
-    let stage = if let Some(commands) = local_commands {
+    pending.stage = if let Some(commands) = local_commands {
         VarDctPendingStage::LocalLf {
             completion,
             source: Box::new(source),
@@ -3093,22 +3379,7 @@ fn submit_vardct(
     } else {
         VarDctPendingStage::Final { completion }
     };
-    Ok(VarDctPendingFrame {
-        backend: backend.clone(),
-        pipelines,
-        memory,
-        runtime_stats,
-        lifetime: Some(lifetime),
-        stage,
-        token: SubmissionToken(1),
-        layout,
-        frame_name,
-        expected_groups,
-        expected_hf_group_indices,
-        deferred_hf_global: staged_hf_global,
-        progressive_dc_extent,
-        progressive_dc_stride: padded_width,
-    })
+    Ok(pending)
 }
 
 #[derive(Default)]
@@ -3168,6 +3439,45 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+fn validate_raw_hf_dequant_status(
+    plan: &crate::vardct_side_image::RawHfDequantSideImagePlan,
+    packet_end: u32,
+    status: RawHfDequantSideImageStatus,
+) -> Result<(), VarDctDecodeError> {
+    if raw_matrix_value_error(status.code) {
+        return Err(VarDctDecodeError::RawHfDequantValue {
+            matrix: plan.matrix_index,
+        });
+    }
+    if !raw_matrix_status_ok(status.code)
+        || status.decoded_samples != plan.decoded_words
+        || status.cursor < plan.token_bit_offset
+        || status.cursor > packet_end
+        || status.expected_cursor != packet_end
+    {
+        return Err(VarDctDecodeError::RawHfDequantStatus {
+            matrix: plan.matrix_index,
+            code: status.code,
+            decoded_samples: status.decoded_samples,
+            expected_samples: plan.decoded_words,
+            cursor: status.cursor,
+            expected_cursor: status.expected_cursor,
+        });
+    }
+    Ok(())
+}
+
+fn arm_raw_hf_dequant_status_map(job: &RawHfDequantSideImageJob, completion: &Arc<MapCompletion>) {
+    job.mark_status_mapped();
+    let callback_completion = Arc::clone(completion);
+    job.status_staging()
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            callback_completion.complete(result.map_err(|error| error.to_string()));
+        });
+}
+
 fn arm_status_map(
     lifetime: &Arc<VarDctJobLifetime>,
     completion: &Arc<MapCompletion>,

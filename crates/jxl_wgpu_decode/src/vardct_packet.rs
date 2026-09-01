@@ -804,7 +804,25 @@ impl BoundedVarDctPacketPlan {
     #[must_use]
     pub const fn requires_hf_global_staging(&self) -> bool {
         matches!(&self.profile.sections, VarDctSectionLayout::Single { .. })
-            || self.pending_hf_global.is_some()
+    }
+
+    /// Whether AC planning depends on a GPU-discovered HF-global entropy cursor.
+    #[must_use]
+    pub const fn requires_deferred_hf_coefficients(&self) -> bool {
+        self.requires_hf_global_staging() || self.pending_hf_global.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn pending_raw_hf_dequant_side_image(&self) -> Option<&RawHfDequantSideImagePlan> {
+        self.pending_hf_global
+            .as_ref()
+            .map(|pending| &pending.side_image)
+    }
+
+    pub(crate) fn pending_raw_hf_dequant_packet_end(&self) -> Option<u32> {
+        self.pending_hf_global
+            .as_ref()
+            .and_then(|pending| pending.packet.end().and_then(|end| u32::try_from(end).ok()))
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
@@ -906,10 +924,10 @@ impl BoundedVarDctPacketPlan {
     /// Parses the general HF-global descriptor and the sole pass-group tail of a single-entry
     /// packet after the GPU reports the HF-metadata entropy cursor.
     pub(crate) fn parse_single_hf_global_continuation_source(
-        &self,
+        &mut self,
         source: &GpuCodestream,
         hf_metadata_end: u32,
-    ) -> Result<HfCoefficientParse, BoundedVarDctPacketError> {
+    ) -> Result<(), BoundedVarDctPacketError> {
         if self.groups.len() != 1 {
             return Err(BoundedVarDctPacketError::PackedMetadata);
         }
@@ -941,7 +959,7 @@ impl BoundedVarDctPacketPlan {
                 field: "single-entry pass-group coefficient symbol limit",
             },
         )?;
-        HfCoefficientEntropyPlan::parse_single_tail_inner(
+        let parsed = HfCoefficientEntropyPlan::parse_single_tail_inner(
             PacketSource::Spans(source),
             BitRange {
                 offset: u64::from(hf_metadata_end),
@@ -959,7 +977,103 @@ impl BoundedVarDctPacketPlan {
                 low_frequency_group_count: self.profile.low_frequency_group_count,
                 global_ma_config: self.global_ma_config.as_ref(),
             },
-        )
+        )?;
+        self.install_hf_coefficient_parse(parsed);
+        Ok(())
+    }
+
+    /// Resumes HF-global metadata immediately after the current raw matrix entropy consumer.
+    pub(crate) fn resume_hf_global_after_raw_side_image_source(
+        &mut self,
+        source: &GpuCodestream,
+        entropy_end: u32,
+    ) -> Result<(), BoundedVarDctPacketError> {
+        let pending = self
+            .pending_hf_global
+            .take()
+            .ok_or(BoundedVarDctPacketError::PackedMetadata)?;
+        let packet_end =
+            pending
+                .packet
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "raw HF dequantization packet end",
+                })?;
+        if entropy_end < pending.side_image.token_bit_offset {
+            return Err(BoundedVarDctPacketError::HfContinuationBeforeLf {
+                cursor: entropy_end,
+                lf_start: pending.side_image.token_bit_offset,
+            });
+        }
+        if u64::from(entropy_end) > packet_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: u64::from(entropy_end),
+                packet_end,
+            }
+            .into());
+        }
+
+        let mut reader = source_reader_at(PacketSource::Spans(source), u64::from(entropy_end))?;
+        let mut reader = BoundedBitInput::new(&mut reader, packet_end);
+        let parsed = parse_hf_dequant_matrices_from(
+            &mut reader,
+            pending.matrix_state,
+            self.profile.bits_per_sample,
+            self.profile.low_frequency_group_count,
+            self.global_ma_config.as_ref(),
+        )?;
+        match parsed {
+            HfDequantMatrixParse::SideImage { plan, state } => {
+                self.pending_hf_global = Some(PendingHfGlobalParse {
+                    packet: pending.packet,
+                    group_count: pending.group_count,
+                    block_context: pending.block_context,
+                    pass_groups: pending.pass_groups,
+                    decoded_symbol_limit: pending.decoded_symbol_limit,
+                    trailing_pass_group: pending.trailing_pass_group,
+                    matrix_state: state,
+                    side_image: *plan,
+                });
+            }
+            HfDequantMatrixParse::Complete {
+                words,
+                raw_side_images,
+            } => {
+                self.hf_coefficients = Some(HfCoefficientEntropyPlan::parse_after_dequant(
+                    PacketSource::Spans(source),
+                    &mut reader,
+                    HfAfterDequantContext {
+                        packet_end,
+                        parse: HfCoefficientParseContext {
+                            group_count: pending.group_count,
+                            block_context: &pending.block_context,
+                            decoded_symbol_limit: pending.decoded_symbol_limit,
+                            bit_depth: self.profile.bits_per_sample,
+                            low_frequency_group_count: self.profile.low_frequency_group_count,
+                            global_ma_config: self.global_ma_config.as_ref(),
+                        },
+                        pass_groups: pending.pass_groups,
+                        trailing_pass_group: pending.trailing_pass_group,
+                        dequant_matrix_words: words,
+                        raw_dequant_matrices: raw_side_images,
+                    },
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    fn install_hf_coefficient_parse(&mut self, parsed: HfCoefficientParse) {
+        match parsed {
+            HfCoefficientParse::Complete(plan) => {
+                self.hf_coefficients = Some(*plan);
+                self.pending_hf_global = None;
+            }
+            HfCoefficientParse::SideImage(pending) => {
+                self.hf_coefficients = None;
+                self.pending_hf_global = Some(*pending);
+            }
+        }
     }
 }
 
@@ -1376,31 +1490,6 @@ fn parse_hf_dequant_matrices_from(
 fn expand_hf_dequant_matrices(
     encodings: &[HfDequantMatrixEncoding],
 ) -> Result<Vec<[u32; 4]>, BoundedVarDctPacketError> {
-    fn matrix_param_index(transform: TransformKind) -> usize {
-        match transform {
-            TransformKind::Dct8 => 0,
-            TransformKind::Hornuss => 1,
-            TransformKind::Dct2x2 => 2,
-            TransformKind::Dct4x4 => 3,
-            TransformKind::Dct16x16 => 4,
-            TransformKind::Dct32x32 => 5,
-            TransformKind::Dct16x8 | TransformKind::Dct8x16 => 6,
-            TransformKind::Dct32x8 | TransformKind::Dct8x32 => 7,
-            TransformKind::Dct32x16 | TransformKind::Dct16x32 => 8,
-            TransformKind::Dct4x8 | TransformKind::Dct8x4 => 9,
-            TransformKind::Afv0
-            | TransformKind::Afv1
-            | TransformKind::Afv2
-            | TransformKind::Afv3 => 10,
-            TransformKind::Dct64x64 => 11,
-            TransformKind::Dct64x32 | TransformKind::Dct32x64 => 12,
-            TransformKind::Dct128x128 => 13,
-            TransformKind::Dct128x64 | TransformKind::Dct64x128 => 14,
-            TransformKind::Dct256x256 => 15,
-            TransformKind::Dct256x128 | TransformKind::Dct128x256 => 16,
-        }
-    }
-
     fn representative(index: usize) -> TransformKind {
         [
             TransformKind::Dct8,
@@ -1659,7 +1748,7 @@ fn expand_hf_dequant_matrices(
     })?;
     let mut packed = Vec::new();
     for transform in TransformKind::ALL {
-        let index = matrix_param_index(transform);
+        let index = crate::vardct_resource::hf_matrix_param_index(transform);
         let extent = transform.pixel_extent();
         let channels = match &encodings[index] {
             HfDequantMatrixEncoding::Default | HfDequantMatrixEncoding::Raw => {
@@ -2737,6 +2826,71 @@ mod tests {
             .collect()
     }
 
+    fn jpeg_transcode_raw_matrix_fixture() -> (Vec<u8>, RawHfDequantSideImagePlan, u32) {
+        let container = decode_hex(include_str!(
+            "../test-data/jpeg_transcode_raw_matrix.jxl.hex"
+        ));
+        let parsed = jxl_gpu_bitstream::parse(&container, Default::default()).unwrap();
+        let codestream = parsed.codestream().to_vec();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let frame = &inventory.frames[0];
+        let lf_global = frame
+            .sections
+            .iter()
+            .find(|section| {
+                matches!(
+                    section.kind,
+                    jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                )
+            })
+            .unwrap()
+            .bits;
+        let hf_global = frame
+            .sections
+            .iter()
+            .find(|section| {
+                matches!(
+                    section.kind,
+                    jxl_gpu_bitstream::FrameSectionKind::HighFrequencyGlobal
+                )
+            })
+            .unwrap()
+            .bits;
+
+        let mut lf_reader = BitReader::new(&codestream);
+        lf_reader.skip_bits(lf_global.offset).unwrap();
+        let lf_prefix =
+            LfGlobalPrefix::parse_reader(&mut lf_reader, lf_global.end().unwrap()).unwrap();
+        let global_ma_config = lf_prefix.global_ma_tree_bit_offset.map(|offset| {
+            let mut reader = BitReader::new(&codestream);
+            reader.skip_bits(offset).unwrap();
+            parse_ma_config_at_reader(&mut reader, lf_global.end().unwrap())
+                .unwrap()
+                .0
+        });
+
+        let mut hf_reader = BitReader::new(&codestream);
+        hf_reader.skip_bits(hf_global.offset).unwrap();
+        assert!(!metadata_bool(&mut hf_reader, "custom HF matrix set").unwrap());
+        assert_eq!(
+            metadata_bits(&mut hf_reader, "raw HF matrix encoding", 3).unwrap(),
+            7
+        );
+        let plan = RawHfDequantSideImagePlan::parse(
+            &mut hf_reader,
+            0,
+            8,
+            frame.low_frequency_group_count,
+            global_ma_config.as_ref(),
+        )
+        .unwrap();
+        (
+            codestream,
+            plan,
+            u32::try_from(hf_global.end().unwrap()).unwrap(),
+        )
+    }
+
     fn legacy_coefficient_orders(
         codestream: &[u8],
         prefix: HfGlobalPrefix,
@@ -2942,63 +3096,7 @@ mod tests {
 
     #[test]
     fn libjxl_jpeg_transcode_exposes_a_general_modular_raw_matrix_plan() {
-        let container = decode_hex(include_str!(
-            "../test-data/jpeg_transcode_raw_matrix.jxl.hex"
-        ));
-        let parsed = jxl_gpu_bitstream::parse(&container, Default::default()).unwrap();
-        let codestream = parsed.codestream();
-        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-        let frame = &inventory.frames[0];
-        let lf_global = frame
-            .sections
-            .iter()
-            .find(|section| {
-                matches!(
-                    section.kind,
-                    jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
-                )
-            })
-            .unwrap()
-            .bits;
-        let hf_global = frame
-            .sections
-            .iter()
-            .find(|section| {
-                matches!(
-                    section.kind,
-                    jxl_gpu_bitstream::FrameSectionKind::HighFrequencyGlobal
-                )
-            })
-            .unwrap()
-            .bits;
-
-        let mut lf_reader = BitReader::new(codestream);
-        lf_reader.skip_bits(lf_global.offset).unwrap();
-        let lf_prefix =
-            LfGlobalPrefix::parse_reader(&mut lf_reader, lf_global.end().unwrap()).unwrap();
-        let global_ma_config = lf_prefix.global_ma_tree_bit_offset.map(|offset| {
-            let mut reader = BitReader::new(codestream);
-            reader.skip_bits(offset).unwrap();
-            parse_ma_config_at_reader(&mut reader, lf_global.end().unwrap())
-                .unwrap()
-                .0
-        });
-
-        let mut hf_reader = BitReader::new(codestream);
-        hf_reader.skip_bits(hf_global.offset).unwrap();
-        assert!(!metadata_bool(&mut hf_reader, "custom HF matrix set").unwrap());
-        assert_eq!(
-            metadata_bits(&mut hf_reader, "raw HF matrix encoding", 3).unwrap(),
-            7
-        );
-        let plan = crate::vardct_side_image::RawHfDequantSideImagePlan::parse(
-            &mut hf_reader,
-            0,
-            8,
-            frame.low_frequency_group_count,
-            global_ma_config.as_ref(),
-        )
-        .unwrap();
+        let (_, plan, packet_end) = jpeg_transcode_raw_matrix_fixture();
 
         assert_eq!(plan.stream_index, 4);
         assert_eq!(
@@ -3007,8 +3105,145 @@ mod tests {
         );
         assert_eq!(plan.decoded_words, 8 * 8 * 3);
         assert!((plan.denominator - 1.0 / 2040.0).abs() < 1e-7);
-        assert!(plan.token_bit_offset > hf_global.offset as u32);
-        assert!(u64::from(plan.token_bit_offset) < hf_global.end().unwrap());
+        assert!(plan.token_bit_offset < packet_end);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn libjxl_raw_matrix_decodes_and_overlays_on_an_actual_adapter() {
+        use std::sync::mpsc;
+
+        use jxl_wgpu::{
+            DirectReadbackPolicy, KernelVariant, ShaderF64Policy, WgpuBackend, WgpuBackendConfig,
+        };
+        use wgpu::util::DeviceExt;
+
+        use crate::vardct_resource::{VarDctResourceLayout, hf_matrix_param_index};
+        use crate::wgpu_engine::{RawHfDequantSideImagePipeline, raw_matrix_status_ok};
+
+        let config = WgpuBackendConfig {
+            label: "jxl-wgpu raw HF matrix actual-adapter test".into(),
+            direct_readback_policy: DirectReadbackPolicy::Disabled,
+            shader_f64_policy: ShaderF64Policy::Disabled,
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        };
+        let Ok(backend) = pollster::block_on(WgpuBackend::request_default(config)) else {
+            eprintln!("skipping raw HF matrix GPU test: no compatible adapter");
+            return;
+        };
+        let (codestream, plan, packet_end) = jpeg_transcode_raw_matrix_fixture();
+        let layout = VarDctResourceLayout::new(1, 1, 1).unwrap();
+        let initial_resources = layout.initial_values().unwrap();
+        let codestream_buffer =
+            backend
+                .device()
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("raw HF matrix test codestream"),
+                    contents: &codestream,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+        let resources = backend
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("raw HF matrix test resources"),
+                contents: bytemuck::cast_slice(&initial_resources),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+        let resource_staging = backend.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raw HF matrix test resource readback"),
+            size: layout.bytes(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let pipeline = RawHfDequantSideImagePipeline::new(&backend, KernelVariant::Lanes64);
+        let mut job = pipeline
+            .prepare(
+                &backend,
+                &codestream_buffer,
+                &resources,
+                layout,
+                &plan,
+                packet_end,
+            )
+            .unwrap();
+        let mut copy = backend
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("raw HF matrix test resource copy"),
+            });
+        copy.copy_buffer_to_buffer(&resources, 0, &resource_staging, 0, layout.bytes());
+
+        let submission = backend
+            .queue()
+            .submit([job.take_commands().unwrap(), copy.finish()]);
+        let (status_tx, status_rx) = mpsc::channel();
+        job.mark_status_mapped();
+        job.status_staging()
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = status_tx.send(result);
+            });
+        let (resource_tx, resource_rx) = mpsc::channel();
+        resource_staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = resource_tx.send(result);
+            });
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        status_rx.recv().unwrap().unwrap();
+        resource_rx.recv().unwrap().unwrap();
+
+        let status = job.finish_status().unwrap();
+        assert!(raw_matrix_status_ok(status.code));
+        assert_eq!(status.decoded_samples, plan.decoded_words);
+        assert_eq!(status.expected_cursor, packet_end);
+        assert!((plan.token_bit_offset..=packet_end).contains(&status.cursor));
+
+        let mapped = resource_staging.slice(..).get_mapped_range().unwrap();
+        let actual = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped);
+        let transform_index = TransformKind::ALL
+            .into_iter()
+            .position(|transform| hf_matrix_param_index(transform) == plan.matrix_index)
+            .unwrap();
+        let matrix_offset = layout.matrix_offsets[transform_index] as usize;
+        let sample_count =
+            usize::try_from(plan.final_planes[0].width * plan.final_planes[0].height).unwrap();
+        let actual_matrix = &actual[matrix_offset..matrix_offset + sample_count];
+        let initial_matrix = &initial_resources[matrix_offset..matrix_offset + sample_count];
+        const CHROMA: [u32; 64] = [
+            5, 5, 7, 14, 30, 30, 30, 30, 5, 6, 8, 20, 30, 30, 30, 30, 7, 8, 17, 30, 30, 30, 30, 30,
+            14, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+            30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+        ];
+        const LUMA: [u32; 64] = [
+            5, 4, 4, 4, 5, 7, 15, 22, 3, 4, 4, 5, 7, 11, 19, 28, 3, 4, 5, 7, 11, 17, 23, 29, 5, 6,
+            7, 9, 17, 19, 26, 29, 7, 8, 12, 15, 20, 24, 31, 34, 12, 17, 17, 26, 33, 31, 36, 30, 15,
+            18, 21, 24, 31, 34, 36, 31, 18, 17, 17, 19, 23, 28, 30, 30,
+        ];
+        for (index, value) in actual_matrix.iter().enumerate() {
+            let expected = [CHROMA[index], LUMA[index], CHROMA[index]]
+                .map(|sample| sample as f32 * plan.denominator);
+            assert_eq!(value[0].to_bits(), expected[0].to_bits());
+            assert_eq!(value[1].to_bits(), expected[1].to_bits());
+            assert_eq!(value[2].to_bits(), expected[2].to_bits());
+            assert_eq!(value[3], 0.0);
+        }
+        assert!(actual_matrix.iter().all(|value| {
+            value[..3]
+                .iter()
+                .all(|&channel| channel > 0.0 && channel < 1.0e8)
+                && value[3] == 0.0
+        }));
+        assert_ne!(actual_matrix, initial_matrix);
+        drop(mapped);
+        resource_staging.unmap();
     }
 
     #[test]

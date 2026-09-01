@@ -156,9 +156,14 @@ entropy/order/window buffers are admitted against the same byte budget and retai
 validation. Parametric dequantization modes 0 through 6 are expanded from bounded scalar metadata
 and uploaded over the existing matrix region before AC/render commands. Raw mode 7 is parsed as a
 resumable, three-channel Modular side-image plan containing its MA descriptor, transformed channel
-topology, inverse schedule, denominator, and exact stream index. Its resident entropy execution,
-inverse transforms, matrix overlay, and repeated cursor scheduling are the remaining integration
-work; the host never reconstructs its image samples.
+topology, inverse schedule, denominator, and exact stream index. The sectioned global-tree path
+allocates a temporary arena and descriptor buffers under an exact shared-budget permit, runs the
+common descriptor-adaptive entropy kernel, reuses the resident Palette/RCT/Squeeze inverse
+pipelines, and overlays the validated three-channel raster into the strategy aliases in the
+existing resource buffer. Its 16-byte status carries decoded count, continuation cursor, and
+packet end through one map; the host resumes the HF-global scalar parser and repeats the stage
+until AC metadata is complete. The host never reconstructs image samples. Local-tree ordering and
+bounded side-image uploads remain separate scheduling work.
 
 For VarDCT, the caller/device cap is first evaluated against exact packet, AC, render, validation,
 and output bytes. If that frame would exceed the shared budget's total capacity, the planner

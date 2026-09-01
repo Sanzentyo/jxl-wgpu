@@ -15,6 +15,7 @@ use crate::vardct_output::VarDctOutputPacker;
 use crate::vardct_packet::VarDctPacketPipeline;
 use crate::vardct_pass_group::HfCoefficientPipeline;
 use crate::vardct_resource::VarDctResourcePipeline;
+use crate::wgpu_engine::RawHfDequantSideImagePipeline;
 use crate::{
     AnimationMetadata, DecodeProfile, GpuCodestream, GpuOutputRequest, GpuSubmissionEngine,
     PreparedGpuSession, Result as DecodeResult,
@@ -36,6 +37,7 @@ pub(super) struct VarDctPipelines {
     pub(super) epf: ResidentEpfPipeline,
     pub(super) output: VarDctOutputPacker,
     pub(super) progressive_dc: ProgressiveDcPipeline,
+    pub(super) raw_hf_dequant: RawHfDequantSideImagePipeline,
     pub(super) output_variant: KernelVariant,
 }
 
@@ -50,6 +52,14 @@ impl VarDctPipelines {
         let epf_sigma_variant =
             resolve_kernel_variant(backend, "vardct_epf_sigma", KernelVariant::Lanes64)?;
         let epf_variant = resolve_kernel_variant(backend, "vardct_epf", KernelVariant::Tile16x16)?;
+        let raw_hf_dequant_variant =
+            resolve_kernel_variant(backend, "vardct_raw_matrix", KernelVariant::Lanes64)?;
+        if raw_hf_dequant_variant.workgroup_size().1 != 1 {
+            return Err(VarDctDecodeError::KernelPolicy {
+                kernel: "vardct_raw_matrix",
+                message: "raw matrix decode requires a linear workgroup".to_owned(),
+            });
+        }
         let device = backend.device();
         Ok(Self {
             packet: VarDctPacketPipeline::new(device),
@@ -63,6 +73,7 @@ impl VarDctPipelines {
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
             progressive_dc: ProgressiveDcPipeline::with_policy(device, backend.kernel_policy())?,
+            raw_hf_dequant: RawHfDequantSideImagePipeline::new(backend, raw_hf_dequant_variant),
             output_variant,
         })
     }

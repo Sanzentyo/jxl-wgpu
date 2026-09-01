@@ -3,8 +3,9 @@ use jxl_gpu_formats::{
     PixelFormat, RgbChannelOrder, TransferFunction, YcbcrEncoding,
 };
 use jxl_wgpu::{
-    ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
-    ResidentVarDctError, ResidentVarDctMemoryPlan,
+    MemoryBudgetError, ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError,
+    ResidentGaborishMemoryPlan, ResidentVarDctError, ResidentVarDctMemoryPlan,
+    SubmissionPollerError,
 };
 use thiserror::Error;
 
@@ -88,6 +89,10 @@ pub enum VarDctDecodeError {
     ProgressiveDc(#[from] ProgressiveDcGpuError),
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    #[error("VarDCT GPU memory backpressure: {0}")]
+    MemoryBackpressure(#[from] MemoryBudgetError),
+    #[error("VarDCT GPU submission-poll backpressure: {0}")]
+    PollBackpressure(#[from] SubmissionPollerError),
     #[error("VarDCT GPU memory arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
     #[error("a progressive-DC VarDCT frame was submitted without its resident LF source")]
@@ -124,6 +129,25 @@ pub enum VarDctDecodeError {
     },
     #[error("mapped VarDCT validation status has an invalid {status} ABI")]
     StatusAbi { status: &'static str },
+    #[error("raw HF dequantization matrix {matrix} GPU setup or execution failed")]
+    RawHfDequantGpu {
+        matrix: usize,
+        #[source]
+        source: Box<DecodeError>,
+    },
+    #[error(
+        "raw HF dequantization matrix {matrix} failed with status {code} after {decoded_samples}/{expected_samples} samples at bit {cursor}/{expected_cursor}"
+    )]
+    RawHfDequantStatus {
+        matrix: usize,
+        code: u32,
+        decoded_samples: u32,
+        expected_samples: u32,
+        cursor: u32,
+        expected_cursor: u32,
+    },
+    #[error("raw HF dequantization matrix {matrix} produced a non-positive or oversized weight")]
+    RawHfDequantValue { matrix: usize },
     #[error("VarDCT {component} has {actual} LF-group plans; expected {expected}")]
     GroupPlanCount {
         component: &'static str,
@@ -677,7 +701,7 @@ impl DeferredHfCoefficientLayout {
     pub(super) fn plan(
         packet: &BoundedVarDctPacketPlan,
     ) -> Result<Option<Self>, VarDctDecodeError> {
-        if !packet.requires_hf_global_staging() {
+        if !packet.requires_deferred_hf_coefficients() {
             return Ok(None);
         }
         let pass_group_count = usize::try_from(packet.profile.group_count).map_err(|_| {

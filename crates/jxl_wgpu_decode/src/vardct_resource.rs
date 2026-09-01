@@ -312,6 +312,29 @@ impl DefaultDequantMatrices {
     }
 }
 
+#[must_use]
+pub(crate) const fn hf_matrix_param_index(transform: TransformKind) -> usize {
+    match transform {
+        TransformKind::Dct8 => 0,
+        TransformKind::Hornuss => 1,
+        TransformKind::Dct2x2 => 2,
+        TransformKind::Dct4x4 => 3,
+        TransformKind::Dct16x16 => 4,
+        TransformKind::Dct32x32 => 5,
+        TransformKind::Dct16x8 | TransformKind::Dct8x16 => 6,
+        TransformKind::Dct32x8 | TransformKind::Dct8x32 => 7,
+        TransformKind::Dct32x16 | TransformKind::Dct16x32 => 8,
+        TransformKind::Dct4x8 | TransformKind::Dct8x4 => 9,
+        TransformKind::Afv0 | TransformKind::Afv1 | TransformKind::Afv2 | TransformKind::Afv3 => 10,
+        TransformKind::Dct64x64 => 11,
+        TransformKind::Dct64x32 | TransformKind::Dct32x64 => 12,
+        TransformKind::Dct128x128 => 13,
+        TransformKind::Dct128x64 | TransformKind::Dct64x128 => 14,
+        TransformKind::Dct256x256 => 15,
+        TransformKind::Dct256x128 | TransformKind::Dct128x256 => 16,
+    }
+}
+
 fn backend_matrix_index(transform: TransformKind, frequency_x: u32, frequency_y: u32) -> usize {
     let extent = transform.pixel_extent();
     let index = if transform.is_special() || extent.height < extent.width {

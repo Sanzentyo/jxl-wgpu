@@ -108,6 +108,7 @@ const WINDOW_FINAL: u32 = 2u;
 
 const FIXED_OUTPUT_DIRECT_NORMALIZED_GRAY8: u32 = 1u;
 const FIXED_OUTPUT_COMPACT_NORMALIZED_GRAY8: u32 = 2u;
+const FIXED_OUTPUT_CURSOR_CONTINUATION: u32 = 4u;
 
 fn reconstruction_load(index: u32) -> u32 {
     return reconstructed[reconstruction_base + index];
@@ -650,7 +651,11 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         save_entropy_execution_state(0u);
         status_code = STATUS_IN_PROGRESS;
     } else {
-        entropy_finish_exact();
+        if params.fixed_output_mode == FIXED_OUTPUT_CURSOR_CONTINUATION {
+            entropy_finalize();
+        } else {
+            entropy_finish_exact();
+        }
         status_code = decode_error;
         if decode_error == 0u
             && params.fixed_output_mode == 0u

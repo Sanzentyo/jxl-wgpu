@@ -68,8 +68,12 @@ the cursor-discovered entropy/order/window reservation to fail as typed `MemoryB
 verifies that cancellation releases every retained reservation.
 A bit-level unit oracle exercises every parametric mode 0 through 6 across all 27 backend strategy
 regions and compares every expanded channel value bit-for-bit with `jxl-vardct`; separate cases
-require typed rejection of raw mode 7 and a transform-incompatible encoding. Shader coverage
-remains Naga semantic validation and actual GPU execution; it does not inspect WGSL source strings.
+require typed rejection of a transform-incompatible encoding. A 188-byte cjpeg-to-cjxl
+JPEG-transcode fixture fixes raw mode 7's general Modular header and entropy cursor. An
+actual-adapter test decodes its 192 DCT8 samples, runs the resident inverse schedule, checks the
+16-byte status and exact packet end, then reads back the resource table to require positive bounded
+weights and a real replacement of the normative default matrix. Shader coverage remains Naga
+semantic validation and actual GPU execution; it does not inspect WGSL source strings.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and

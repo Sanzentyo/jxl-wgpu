@@ -192,8 +192,13 @@ scratch/status capacity is admitted before submission; descriptor/order/window b
 the cursor are admitted through the same shared budget. `cjxl --progressive_dc=1` and
 `--progressive_dc=2` actual-GPU outputs are checked through blocking and runtime-neutral async
 completion against Rust `jxl` within one RGB8 code. Parametric matrix modes 0 through 6 populate the
-resident resource table; raw mode 7 still returns a typed error because its Modular image stream is
-not lowered yet.
+resident resource table. For raw mode 7, the sectioned global-tree path now decodes the complete
+three-channel Modular side image with the common GPU entropy executor, runs its resident
+Palette/RCT/Squeeze inverse schedule, validates one 16-byte mapped status, and overlays positive
+finite weights into each aliased strategy-matrix target before AC/render. A real cjpeg-to-cjxl
+JPEG-transcode stream covers that primitive on an actual adapter. Local-tree raw matrices, bounded
+side-image stream windows, and the fixture's non-XYB JPEG-reconstruction presentation path remain
+typed gaps.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
@@ -344,7 +349,7 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
-progressive intermediates, raw Modular strategy quantization matrices and other Modular side images,
+progressive intermediates, local-tree/windowed raw strategy matrices and other Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

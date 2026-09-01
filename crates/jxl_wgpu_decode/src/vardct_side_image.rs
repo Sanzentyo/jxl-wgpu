@@ -22,6 +22,7 @@ const RAW_MATRIX_COUNT: usize = 17;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawHfDequantSideImagePlan {
     pub matrix_index: usize,
+    pub bit_depth: u32,
     pub denominator: f32,
     pub stream_index: u32,
     pub token_bit_offset: u32,
@@ -134,6 +135,7 @@ impl RawHfDequantSideImagePlan {
 
         Ok(Self {
             matrix_index,
+            bit_depth,
             denominator,
             stream_index,
             token_bit_offset,
