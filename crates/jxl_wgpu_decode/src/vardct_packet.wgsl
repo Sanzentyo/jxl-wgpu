@@ -397,6 +397,28 @@ fn initialize_packet(start: u32, end: u32, stream_index: u32) {
     params.stream_index = stream_index;
 }
 
+fn lf_channel_extent(channel: u32) -> vec2<u32> {
+    let packed = control.scratch[channel + 1u];
+    return vec2<u32>(packed & 0xffffu, packed >> 16u);
+}
+
+fn lf_channel_samples(channel: u32) -> u32 {
+    let extent = lf_channel_extent(channel);
+    return extent.x * extent.y;
+}
+
+fn lf_channel_start(channel: u32) -> u32 {
+    var start = 0u;
+    for (var index = 0u; index < channel; index += 1u) {
+        start += lf_channel_samples(index);
+    }
+    return start;
+}
+
+fn lf_expected_samples() -> u32 {
+    return lf_channel_samples(0u) + lf_channel_samples(1u) + lf_channel_samples(2u);
+}
+
 fn decode_lf_channels() -> u32 {
     let block_count = control.geometry.z * control.geometry.w;
     params.sample_count = block_count;
@@ -404,10 +426,11 @@ fn decode_lf_channels() -> u32 {
     var decoded = 0u;
     entropy_begin();
     for (current_channel = 0u; current_channel < 3u && decode_error == 0u; current_channel += 1u) {
+        let extent = lf_channel_extent(current_channel);
         decoded += decode_channel(
-            control.geometry.z,
-            control.geometry.w,
-            control.geometry.z,
+            extent.x,
+            extent.y,
+            extent.x,
             current_channel * block_count,
             0u,
             0u,
@@ -421,21 +444,27 @@ fn configure_lf_channels() {
     let block_count = control.geometry.z * control.geometry.w;
     params.sample_count = block_count;
     params.source_channels = 3u;
-    params.width = control.geometry.z;
-    params.height = control.geometry.w;
+    let extent = lf_channel_extent(0u);
+    params.width = extent.x;
+    params.height = extent.y;
 }
 
 fn continue_lf_channels_bounded() -> u32 {
     let block_count = control.geometry.z * control.geometry.w;
     configure_lf_channels();
-    current_channel = consumer_decoded / block_count;
+    current_channel = 0u;
+    while current_channel < 3u
+        && consumer_decoded >= lf_channel_start(current_channel) + lf_channel_samples(current_channel) {
+        current_channel += 1u;
+    }
     while current_channel < 3u && decode_error == 0u && !window_should_pause() {
-        let channel_start = current_channel * block_count;
+        let extent = lf_channel_extent(current_channel);
+        let channel_start = lf_channel_start(current_channel);
         let channel_decoded = consumer_decoded - channel_start;
         let decoded = decode_channel(
-            control.geometry.z,
-            control.geometry.w,
-            control.geometry.z,
+            extent.x,
+            extent.y,
+            extent.x,
             current_channel * block_count,
             0u,
             channel_decoded,
@@ -444,7 +473,7 @@ fn continue_lf_channels_bounded() -> u32 {
         if decode_error != 0u || window_should_pause() {
             break;
         }
-        if decoded != block_count {
+        if decoded != extent.x * extent.y {
             decode_error = ERROR_RAW_TOKEN;
             break;
         }
@@ -467,7 +496,7 @@ fn decode_lf_channels_bounded() -> u32 {
 }
 
 fn finish_bounded_lf(lf_decoded: u32) -> u32 {
-    let expected_samples = 3u * control.geometry.z * control.geometry.w;
+    let expected_samples = lf_expected_samples();
     var status_code = decode_error;
     if decode_error != 0u {
         if !window_is_final() {
@@ -801,7 +830,7 @@ fn pause_bounded_packet() -> u32 {
 
 fn decode_combined_packet_bounded() -> u32 {
     let block_count = control.geometry.z * control.geometry.w;
-    let expected_lf_samples = 3u * block_count;
+    let expected_lf_samples = lf_expected_samples();
     if window_is_first() {
         bit_cursor = params.entropy.token_start;
         decode_error = 0u;

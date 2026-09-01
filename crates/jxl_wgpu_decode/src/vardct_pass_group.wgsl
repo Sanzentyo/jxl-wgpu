@@ -24,7 +24,7 @@ struct Params {
     coeff_shift: u32,
     global_group_index: u32,
     block_context: HfBlockContextTables,
-    _reserved: u32,
+    channel_shifts: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -164,6 +164,24 @@ fn channel_index(order_channel: u32) -> u32 {
     if order_channel == 0u { return 1u; }
     if order_channel == 1u { return 0u; }
     return 2u;
+}
+
+fn channel_shift(channel: u32) -> vec2<u32> {
+    let offset = channel * 2u;
+    return vec2<u32>(
+        (params.channel_shifts >> offset) & 1u,
+        (params.channel_shifts >> (offset + 1u)) & 1u,
+    );
+}
+
+fn lf_sample(channel: u32, x: u32, y: u32) -> i32 {
+    let shift = channel_shift(channel);
+    let width = params.blocks_per_row >> shift.x;
+    let index = (y >> shift.y) * width + (x >> shift.x);
+    var source_channel = channel;
+    if (channel == 0u) { source_channel = 1u; }
+    if (channel == 1u) { source_channel = 0u; }
+    return bitcast<i32>(reconstruction[source_channel * params.lf_plane_stride_words + index]);
 }
 
 fn window_is_first() -> bool {
@@ -343,12 +361,24 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
         let num_blocks = task_block_width * task_block_height;
         let num_blocks_log = countTrailingZeros(num_blocks);
         let channel = channel_index(order_channel);
+        let task_flags = hf_artifact[task_metadata + 11u];
+        let channel_mask = task_flags >> 8u;
+        if (((channel_mask >> channel) & 1u) == 0u) {
+            if (phase != PHASE_NONZERO_COUNT) {
+                fail(ERROR_TASK_SHAPE);
+                continue;
+            }
+            advance_channel(&position);
+            continue;
+        }
         let qf = hf_artifact[task_metadata + 6u];
         let order_id = hf_artifact[task_metadata + 10u];
+        let lf_x = params.block_origin_x + x;
+        let lf_y = params.block_origin_y + y;
         let lf = vec3<i32>(
-            bitcast<i32>(reconstruction[params.lf_plane_stride_words + raster]),
-            bitcast<i32>(reconstruction[raster]),
-            bitcast<i32>(reconstruction[2u * params.lf_plane_stride_words + raster]),
+            lf_sample(0u, lf_x, lf_y),
+            lf_sample(1u, lf_x, lf_y),
+            lf_sample(2u, lf_x, lf_y),
         );
         let block_context = hf_block_context(
             params.block_context,
@@ -363,11 +393,14 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
         }
 
         if phase == PHASE_NONZERO_COUNT {
-            let grid_index = channel * 32u + x;
+            let shift = channel_shift(channel);
+            let shifted_x = x >> shift.x;
+            let shifted_y = y >> shift.y;
+            let grid_index = channel * 32u + shifted_x;
             var predicted = 32u;
-            if y == 0u {
-                if x != 0u { predicted = nonzero_grid[grid_index - 1u]; }
-            } else if x == 0u {
+            if shifted_y == 0u {
+                if shifted_x != 0u { predicted = nonzero_grid[grid_index - 1u]; }
+            } else if shifted_x == 0u {
                 predicted = nonzero_grid[grid_index];
             } else {
                 predicted = (nonzero_grid[grid_index] + nonzero_grid[grid_index - 1u] + 1u) >> 1u;
@@ -382,7 +415,8 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
                 continue;
             }
             let normalized_nonzero = (remaining_nonzero + num_blocks - 1u) >> num_blocks_log;
-            for (var dx = 0u; dx < task_block_width; dx += 1u) {
+            let shifted_task_width = max(1u, task_block_width >> shift.x);
+            for (var dx = 0u; dx < shifted_task_width; dx += 1u) {
                 nonzero_grid[grid_index + dx] = normalized_nonzero;
             }
             if remaining_nonzero == 0u {

@@ -157,7 +157,9 @@ per-group scratch. The explicit section topology removes the ambiguity with a on
 single-transform packet. The sectioned form supports odd and asymmetric pixel extents across LF
 group boundaries while keeping edge padding internal to GPU storage; 2056x256 is the checked
 two-LF-group boundary case.
-Both forms accept exactly one final 8-bit XYB still frame and one pass. The packet contract
+Both forms accept exactly one final 8-bit still frame and one pass. The main profile is XYB; a
+non-XYB JPEG-reconstruction profile accepts encoded YCbCr and the codestream's component sampling
+selectors. The packet contract
 accepts either adaptive LF smoothing or its standard skip flag, every 3-bit X/B frame
 quant-matrix scale, every normative default or parametric custom dequantization matrix encoding,
 disabled/default/custom Gaborish, disabled/default/custom
@@ -182,8 +184,10 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
-reference, preview, animation, subsampling, upsampling, spectral progressive pass, or other frame
-feature. A separate stock path accepts recursive progressive-DC dependencies. It keeps three F32
+reference, preview, animation, frame upsampling, spectral progressive pass, or other frame feature.
+Subsampled YCbCr currently requires adaptive LF smoothing and restoration to be disabled; those
+pre-upsampling stages return a typed error until their resident scheduler is connected. A separate
+stock path accepts recursive progressive-DC dependencies. It keeps three F32
 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
 hidden and visible status, and publishes only the final frame. A single-entry intermediate frame
 first executes HF metadata on GPU, maps its bounded HF-global cursor, host-parses only scalar
@@ -199,8 +203,12 @@ finite weights into each aliased strategy-matrix target before AC/render. A real
 JPEG-transcode stream covers that primitive on an actual adapter. Local-tree packets now complete
 their LF cursor and every HF-local metadata window before entering the same repeated raw-matrix
 state; each raw stage copies only its four-byte-aligned HF-global packet range into a dedicated
-storage binding and rebases the mapped cursor. A local-tree raw conformance fixture and the
-fixture's non-XYB JPEG-reconstruction presentation path remain gaps.
+storage binding and rebases the mapped cursor. The same 264x64 4:2:0 fixture now runs through the
+public decoder: LF/AC entropy uses exact per-component dimensions, tasks carry three LF offsets and
+component destinations, and the packed output kernel applies separable quarter/three-quarter JPEG
+upsampling with replicated edges followed by encoded BT.601 YCbCr-to-RGB conversion. Actual-GPU
+RGB8 differs from Rust `jxl` and optional `djxl` by at most one code. A local-tree raw conformance
+fixture and subsampled restoration remain gaps.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
@@ -241,8 +249,9 @@ records. The submission executes every populated bucket through the resident reg
 VarDCT renderer using the normative default matrix for that strategy and an explicit regular/wide/
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
-contract through a shared resident ping-pong plane set, applies inverse opsin plus sRGB transfer,
-and writes tightly packed RGB8 without an intermediate image readback. Combined/global packet and
+contract through a shared resident ping-pong plane set, then either applies inverse opsin plus sRGB
+transfer or fuses JPEG component upsampling and encoded YCbCr conversion. It writes tightly packed
+RGB8 without an intermediate image readback. Combined/global packet and
 AC pass-group ranges that fit the resolved entropy cap retain the one-submission path. Either
 oversized consumer instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/
 parameter pair, and ordered queue submissions. The final combined/global packet command shares the
@@ -351,7 +360,8 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
-progressive intermediates, local-tree raw-matrix conformance and other Modular side images,
+progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF/restoration,
+broader JPEG component layouts and other Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.

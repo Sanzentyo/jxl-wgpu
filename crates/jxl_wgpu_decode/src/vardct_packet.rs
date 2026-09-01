@@ -176,6 +176,9 @@ pub struct BoundedHfMetadataContinuation {
 pub struct BoundedVarDctGroupPlan {
     pub index: u32,
     pub rect: VarDctGroupRect,
+    /// Padded luma-grid extent in 8x8 blocks. JPEG component sampling can require an additional
+    /// even block at the right or bottom edge.
+    pub padded_block_extent: [u32; 2],
     /// Maximum number of non-overlapping first blocks reconstructed from this group's HF
     /// metadata. The actual count is decoded and reported by the GPU packet frontend.
     pub task_capacity: u32,
@@ -530,8 +533,7 @@ impl BoundedVarDctPacketPlan {
                     }
                 })?;
                 let rect = profile.low_frequency_group_rect(u64::from(index))?;
-                let blocks_x = rect.width.div_ceil(8);
-                let blocks_y = rect.height.div_ceil(8);
+                let [blocks_x, blocks_y] = profile.padded_group_block_extent(rect)?;
                 let block_count = blocks_x.checked_mul(blocks_y).ok_or(
                     BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group block count",
@@ -576,11 +578,17 @@ impl BoundedVarDctPacketPlan {
                             field: "LF-group end",
                         })?;
                 validate_source_packet_end(source, lf_group_end)?;
-                let lf_decoded_symbol_limit = block_count.checked_mul(3).ok_or(
-                    BoundedVarDctPacketError::ArithmeticOverflow {
+                let lf_decoded_symbol_limit = profile
+                    .lf_entropy_channel_block_extents(rect)?
+                    .into_iter()
+                    .try_fold(0u32, |total, [width, height]| {
+                        width
+                            .checked_mul(height)
+                            .and_then(|samples| total.checked_add(samples))
+                    })
+                    .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group LF decoded symbol limit",
-                    },
-                )?;
+                    })?;
                 let (
                     lf_token_bit_offset,
                     lf_modular,
@@ -677,6 +685,7 @@ impl BoundedVarDctPacketPlan {
                 Ok(BoundedVarDctGroupPlan {
                     index,
                     rect,
+                    padded_block_extent: [blocks_x, blocks_y],
                     task_capacity: block_count,
                     coefficient_words,
                     lf_group,
@@ -763,9 +772,16 @@ impl BoundedVarDctPacketPlan {
 
     #[must_use]
     pub fn block_extent(&self) -> [u32; 2] {
+        let [horizontal_shift, vertical_shift] = self.profile.jpeg_block_alignment;
+        let horizontal_alignment = 1u32 << horizontal_shift;
+        let vertical_alignment = 1u32 << vertical_shift;
         [
-            self.profile.width.div_ceil(8),
-            self.profile.height.div_ceil(8),
+            self.profile
+                .width
+                .div_ceil(8)
+                .div_ceil(horizontal_alignment)
+                * horizontal_alignment,
+            self.profile.height.div_ceil(8).div_ceil(vertical_alignment) * vertical_alignment,
         ]
     }
 
@@ -1085,7 +1101,7 @@ impl BoundedVarDctGroupPlan {
 
     #[must_use]
     pub fn block_extent(&self) -> [u32; 2] {
-        [self.rect.width.div_ceil(8), self.rect.height.div_ceil(8)]
+        self.padded_block_extent
     }
 
     /// U32 words retaining LF samples, weighted-predictor rows, the LZ history ring, and one
@@ -1260,7 +1276,15 @@ impl BoundedVarDctGroupPlan {
                     }
                 })?,
             ],
-            scratch: [self.predictor_width_capacity()?, 0, 0, 0],
+            scratch: {
+                let extents = packet.profile.lf_entropy_channel_block_extents(self.rect)?;
+                [
+                    self.predictor_width_capacity()?,
+                    pack_channel_extent(extents[0])?,
+                    pack_channel_extent(extents[1])?,
+                    pack_channel_extent(extents[2])?,
+                ]
+            },
         })
     }
 
@@ -1301,6 +1325,15 @@ impl BoundedVarDctGroupPlan {
                 field: "correlation sample count",
             })
     }
+}
+
+fn pack_channel_extent([width, height]: [u32; 2]) -> Result<u32, BoundedVarDctPacketError> {
+    if width > u32::from(u16::MAX) || height > u32::from(u16::MAX) {
+        return Err(BoundedVarDctPacketError::ArithmeticOverflow {
+            field: "packed LF channel extent",
+        });
+    }
+    Ok(width | (height << 16))
 }
 
 #[derive(Clone, Debug, PartialEq)]

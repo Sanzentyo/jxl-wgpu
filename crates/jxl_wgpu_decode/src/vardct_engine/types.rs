@@ -59,6 +59,8 @@ pub enum VarDctDecodeError {
     InvalidQuantMatrixScale { channel: &'static str, scale: u32 },
     #[error("the XYB image header does not contain an inverse opsin matrix")]
     MissingInverseOpsin,
+    #[error("subsampled VarDCT cannot yet execute the {stage} stage before JPEG upsampling")]
+    UnsupportedSubsampledStage { stage: &'static str },
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
     #[error(transparent)]
@@ -249,7 +251,10 @@ pub struct VarDctDecodeMemoryStats {
     pub hf_status_bytes: u64,
     pub hf_order_table_bytes: u64,
     pub hf_sink_uniform_bytes: u64,
-    pub xyb_plane_bytes: u64,
+    /// Exact Cb/X, Y, and Cr/B resident plane allocations. Subsampled JPEG components use
+    /// physically smaller buffers rather than full-resolution padding.
+    pub resident_plane_bytes: [u64; 3],
+    pub resident_image_bytes: u64,
     pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
     pub epf_sigma_bytes: u64,
@@ -474,7 +479,7 @@ impl VarDctDecodeMemoryStats {
                 field: "LF temporary bytes",
             },
         )?;
-        let lf_temporary_bytes = if packet.profile.uses_lf_frame {
+        let lf_temporary_bytes = if packet.profile.uses_lf_frame || !adaptive_lf_smoothing {
             0
         } else {
             lf_temporary_bytes
@@ -517,24 +522,25 @@ impl VarDctDecodeMemoryStats {
                 field: "artifact uniform bytes",
             })?;
         let [blocks_x, blocks_y] = packet.block_extent();
-        let pixels = u64::from(blocks_x)
-            .checked_mul(8)
-            .and_then(|width| {
-                u64::from(blocks_y)
-                    .checked_mul(8)
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "XYB pixel count",
-            })?;
-        let xyb_plane_bytes =
-            pixels
-                .checked_mul(12)
+        let resident_plane_bytes = packet.profile.channel_shifts.map(|shift| {
+            u64::from(blocks_x >> shift.horizontal)
+                .checked_mul(8)
+                .and_then(|width| {
+                    u64::from(blocks_y >> shift.vertical)
+                        .checked_mul(8)
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<f32>() as u64))
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "XYB plane bytes",
-                })?;
+                    field: "resident component plane bytes",
+                })
+        });
+        let [resident_x, resident_y, resident_b] = resident_plane_bytes;
+        let resident_plane_bytes = [resident_x?, resident_y?, resident_b?];
+        let resident_image_bytes =
+            checked_sum(resident_plane_bytes, "resident component image bytes")?;
         let restoration_scratch_bytes = if restoration_scratch {
-            xyb_plane_bytes
+            resident_image_bytes
         } else {
             0
         };
@@ -592,7 +598,7 @@ impl VarDctDecodeMemoryStats {
             hf_status_bytes,
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
-            xyb_plane_bytes,
+            resident_image_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
@@ -647,7 +653,8 @@ impl VarDctDecodeMemoryStats {
             hf_status_bytes,
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
-            xyb_plane_bytes,
+            resident_plane_bytes,
+            resident_image_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,

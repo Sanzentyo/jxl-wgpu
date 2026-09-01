@@ -73,7 +73,11 @@ JPEG-transcode fixture fixes raw mode 7's general Modular header and entropy cur
 actual-adapter test decodes its 192 DCT8 samples, runs the resident inverse schedule, checks the
 16-byte status and exact packet end, then reads back the resource table to require bit-exact
 `[chroma, luma, chroma] / 2040` values for all 64 raster positions and a real replacement of the
-normative default matrix. Shader coverage remains Naga
+normative default matrix. A second public-decoder actual-adapter test consumes the complete 264x64
+4:2:0 frame, including exact 17x4/34x8/17x4 LF component grids, channel-masked AC traversal,
+component-specific resident destinations, quarter/three-quarter edge-replicating upsampling, and
+encoded BT.601 YCbCr conversion. Its packed RGB8 result must remain within one code of Rust `jxl`
+and optional `djxl`; there is no intermediate pixel readback. Shader coverage remains Naga
 semantic validation and actual GPU execution; it does not inspect WGSL source strings.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and

@@ -5,6 +5,7 @@ struct Params {
     artifact_offsets: vec4<u32>,
     metadata_offsets: vec4<u32>,
     source_offsets: vec4<u32>,
+    channel_geometry: array<vec4<u32>, 3>,
     matrix_offsets: array<vec4<u32>, 7>,
     dequant_scales: vec4<f32>,
     correlation_params: vec4<f32>,
@@ -185,6 +186,37 @@ fn write_bucket(strategy: u32, task_offset: u32, task_count: u32) {
     artifact[indirect + 8u] = select(1u, 0u, special);
 }
 
+fn channel_is_active(channel: u32, x: u32, y: u32) -> bool {
+    let geometry = params.channel_geometry[channel];
+    let shifted_x = x >> geometry.x;
+    let shifted_y = y >> geometry.y;
+    if ((shifted_x << geometry.x) != x || (shifted_y << geometry.y) != y) {
+        return false;
+    }
+    if (geometry.x == 0u && geometry.y == 0u) {
+        return true;
+    }
+    let shifted_raster = shifted_y * params.dimensions.x + shifted_x;
+    let current_raster = y * params.dimensions.x + x;
+    return shifted_raster == current_raster
+        || artifact[params.metadata_offsets.y + shifted_raster] != 0u;
+}
+
+fn shifted_destination(channel: u32, x: u32, y: u32) -> vec2<u32> {
+    let geometry = params.channel_geometry[channel];
+    return vec2<u32>(
+        (params.image.y >> geometry.x) + (x >> geometry.x) * 8u,
+        (params.image.z >> geometry.y) + (y >> geometry.y) * 8u,
+    );
+}
+
+fn shifted_lf_offset(channel: u32, x: u32, y: u32) -> u32 {
+    let geometry = params.channel_geometry[channel];
+    let block_x = params.image.y / 8u + x;
+    let block_y = params.image.z / 8u + y;
+    return (block_y >> geometry.y) * geometry.w + (block_x >> geometry.x);
+}
+
 fn write_task(
     task_index: u32,
     strategy: u32,
@@ -197,25 +229,29 @@ fn write_task(
 ) {
     let area = extent.x * extent.y * 64u;
     let task = params.artifact_offsets.z + task_index * 16u;
-    let destination_x = params.image.y + x * 8u;
-    let destination_y = params.image.z + y * 8u;
+    let destination_x = shifted_destination(0u, x, y);
+    let destination_y = shifted_destination(1u, x, y);
+    let destination_b = shifted_destination(2u, x, y);
+    var channel_mask = 0u;
+    for (var channel = 0u; channel < 3u; channel += 1u) {
+        channel_mask |= select(0u, 1u << channel, channel_is_active(channel, x, y));
+    }
     artifact[task] = coefficient_offset;
     artifact[task + 1u] = select(coefficient_offset, params.image.w, strategy >= 14u && strategy <= 17u);
     artifact[task + 2u] = matrix_offset(strategy);
     artifact[task + 3u] = task_index;
-    artifact[task + 4u] = destination_x;
-    artifact[task + 5u] = (params.image.z / 8u + y) * params.image.x
-        + params.image.y / 8u + x;
-    artifact[task + 6u] = 7u;
-    artifact[task + 7u] = destination_y;
-    artifact[task + 8u] = destination_x;
-    artifact[task + 9u] = destination_y;
-    artifact[task + 10u] = destination_x;
-    artifact[task + 11u] = destination_y;
-    artifact[task + 12u] = destination_x;
-    artifact[task + 13u] = destination_y;
-    artifact[task + 14u] = 0u;
-    artifact[task + 15u] = 0u;
+    artifact[task + 4u] = params.image.y + x * 8u;
+    artifact[task + 5u] = shifted_lf_offset(0u, x, y);
+    artifact[task + 6u] = channel_mask;
+    artifact[task + 7u] = params.image.z + y * 8u;
+    artifact[task + 8u] = destination_x.x;
+    artifact[task + 9u] = destination_x.y;
+    artifact[task + 10u] = destination_y.x;
+    artifact[task + 11u] = destination_y.y;
+    artifact[task + 12u] = destination_b.x;
+    artifact[task + 13u] = destination_b.y;
+    artifact[task + 14u] = shifted_lf_offset(1u, x, y);
+    artifact[task + 15u] = shifted_lf_offset(2u, x, y);
 
     let task_metadata = params.metadata_offsets.x + task_index * 12u;
     artifact[task_metadata] = strategy;
@@ -231,7 +267,7 @@ fn write_task(
     artifact[task_metadata + 9u] = 3u * area;
     artifact[task_metadata + 10u] = order_id(strategy);
     artifact[task_metadata + 11u] = select(0u, 1u, needs_transpose(strategy))
-        | select(0u, 2u, is_special(strategy));
+        | select(0u, 2u, is_special(strategy)) | (channel_mask << 8u);
     artifact[params.metadata_offsets.y + raster_index] = task_index + 1u;
     let quant_scale = 65536.0 / (f32(params.source_offsets.z) * f32(hf_mul));
     resources[params.metadata_offsets.z + task_index] = vec4<f32>(

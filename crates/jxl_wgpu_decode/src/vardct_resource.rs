@@ -8,6 +8,8 @@ use jxl_wgpu::{KernelVariant, VAR_DCT_AFV_BASIS};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
+use crate::vardct_frontend::VarDctChannelShift;
+
 const RESOURCE_SHADER: &str = include_str!("vardct_resource.wgsl");
 
 /// Vec4-indexed resource table consumed by the resident VarDCT renderer.
@@ -16,7 +18,9 @@ pub struct VarDctResourceLayout {
     pub quant_offset: u32,
     pub quant_count: u32,
     pub correlation_offset: u32,
-    pub lf_offset: u32,
+    pub lf_offsets: [u32; 3],
+    pub lf_strides: [u32; 3],
+    pub lf_extents: [[u32; 2]; 3],
     pub matrix_offsets: [u32; TransformKind::ALL.len()],
     pub afv_basis_offset: u32,
     pub vector_count: u32,
@@ -30,6 +34,21 @@ impl VarDctResourceLayout {
         blocks_y: u32,
         quant_count: u32,
     ) -> Result<Self, VarDctResourceError> {
+        Self::with_channel_shifts(
+            blocks_x,
+            blocks_y,
+            quant_count,
+            [VarDctChannelShift::default(); 3],
+        )
+    }
+
+    pub fn with_channel_shifts(
+        blocks_x: u32,
+        blocks_y: u32,
+        quant_count: u32,
+        channel_shifts: [VarDctChannelShift; 3],
+    ) -> Result<Self, VarDctResourceError> {
+        validate_channel_shifts(channel_shifts)?;
         let block_count =
             blocks_x
                 .checked_mul(blocks_y)
@@ -47,17 +66,49 @@ impl VarDctResourceLayout {
             return Err(VarDctResourceError::ZeroQuantizationEntries);
         }
         let correlation_offset = quant_count;
-        let lf_offset = correlation_offset.checked_add(correlation_count).ok_or(
+        let lf_start = correlation_offset.checked_add(correlation_count).ok_or(
             VarDctResourceError::ArithmeticOverflow {
                 field: "LF resource offset",
             },
         )?;
-        let mut cursor =
-            lf_offset
-                .checked_add(block_count)
-                .ok_or(VarDctResourceError::ArithmeticOverflow {
-                    field: "matrix offset",
-                })?;
+        let lf_extents = channel_shifts.map(|shift| {
+            shift.shifted_extent(blocks_x, blocks_y).ok_or(
+                VarDctResourceError::ArithmeticOverflow {
+                    field: "shifted LF resource extent",
+                },
+            )
+        });
+        let lf_extents = [lf_extents[0]?, lf_extents[1]?, lf_extents[2]?];
+        let lf_strides = lf_extents.map(|extent| extent[0]);
+        let same_geometry = lf_extents
+            .into_iter()
+            .all(|extent| extent == [blocks_x, blocks_y]);
+        let (lf_offsets, mut cursor) = if same_geometry {
+            (
+                [lf_start; 3],
+                lf_start.checked_add(block_count).ok_or(
+                    VarDctResourceError::ArithmeticOverflow {
+                        field: "matrix offset",
+                    },
+                )?,
+            )
+        } else {
+            let mut offsets = [0; 3];
+            let mut cursor = lf_start;
+            for (offset, [width, height]) in offsets.iter_mut().zip(lf_extents) {
+                *offset = cursor;
+                cursor = cursor
+                    .checked_add(width.checked_mul(height).ok_or(
+                        VarDctResourceError::ArithmeticOverflow {
+                            field: "shifted LF resource channel size",
+                        },
+                    )?)
+                    .ok_or(VarDctResourceError::ArithmeticOverflow {
+                        field: "shifted LF resource channel end",
+                    })?;
+            }
+            (offsets, cursor)
+        };
         let mut matrix_offsets = [0; TransformKind::ALL.len()];
         for (index, transform) in TransformKind::ALL.into_iter().enumerate() {
             matrix_offsets[index] = cursor;
@@ -93,7 +144,9 @@ impl VarDctResourceLayout {
             quant_offset,
             quant_count,
             correlation_offset,
-            lf_offset,
+            lf_offsets,
+            lf_strides,
+            lf_extents,
             matrix_offsets,
             afv_basis_offset,
             vector_count,
@@ -185,6 +238,14 @@ pub enum VarDctResourceError {
     ArithmeticOverflow { field: &'static str },
     #[error("LF output stride {actual} is smaller than required extent {required}")]
     InvalidOutputStride { required: u32, actual: u32 },
+    #[error(
+        "VarDCT JPEG channel {channel} has invalid shift {horizontal}x{vertical}; each axis is at most one bit"
+    )]
+    InvalidChannelShift {
+        channel: usize,
+        horizontal: u32,
+        vertical: u32,
+    },
     #[error("VarDCT resource preparation requires at least one quantization entry")]
     ZeroQuantizationEntries,
     #[error("failed to construct the normative default VarDCT dequantization matrices")]
@@ -199,12 +260,13 @@ pub enum VarDctResourceError {
     WorkgroupVariant { variant: KernelVariant },
 }
 
-/// Exact 64-byte LF preparation uniform.
+/// Exact 144-byte LF preparation uniform.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct VarDctResourceParams {
     pub geometry: [u32; 4],
-    pub offsets: [u32; 4],
+    pub source_geometry: [[u32; 4]; 3],
+    pub destination_geometry: [[u32; 4]; 3],
     pub scales: [f32; 4],
     pub correlation: [f32; 4],
 }
@@ -212,8 +274,11 @@ pub struct VarDctResourceParams {
 #[derive(Clone, Copy, Debug)]
 pub struct VarDctResourceConfig {
     pub block_extent: [u32; 2],
-    pub output_stride: u32,
     pub output_origin: [u32; 2],
+    pub channel_shifts: [VarDctChannelShift; 3],
+    pub lf_offsets: [u32; 3],
+    pub lf_strides: [u32; 3],
+    pub apply_chroma_from_luma: bool,
     pub global_scale: u32,
     pub quant_lf: u32,
     pub lf_dequantization: [f32; 3],
@@ -225,42 +290,84 @@ impl VarDctResourceParams {
     pub fn new(config: VarDctResourceConfig) -> Result<Self, VarDctResourceError> {
         let VarDctResourceConfig {
             block_extent: [blocks_x, blocks_y],
-            output_stride,
             output_origin,
+            channel_shifts,
+            lf_offsets,
+            lf_strides,
+            apply_chroma_from_luma,
             global_scale,
             quant_lf,
             lf_dequantization,
             lf_correlation,
             extra_precision,
         } = config;
+        validate_channel_shifts(channel_shifts)?;
         let blocks =
             blocks_x
                 .checked_mul(blocks_y)
                 .ok_or(VarDctResourceError::ArithmeticOverflow {
                     field: "LF preparation block count",
                 })?;
-        let output_right = output_origin[0].checked_add(blocks_x).ok_or(
-            VarDctResourceError::ArithmeticOverflow {
-                field: "LF output horizontal extent",
-            },
-        )?;
-        if output_stride < output_right {
-            return Err(VarDctResourceError::InvalidOutputStride {
-                required: output_right,
-                actual: output_stride,
-            });
+        let output_extents = channel_shifts.map(|shift| {
+            shift.shifted_extent(blocks_x, blocks_y).ok_or(
+                VarDctResourceError::ArithmeticOverflow {
+                    field: "shifted LF group extent",
+                },
+            )
+        });
+        let output_extents = [output_extents[0]?, output_extents[1]?, output_extents[2]?];
+        let mut destination_geometry = [[0; 4]; 3];
+        for (channel, destination) in destination_geometry.iter_mut().enumerate() {
+            let shift = channel_shifts[channel];
+            let origin = [
+                output_origin[0] >> shift.horizontal,
+                output_origin[1] >> shift.vertical,
+            ];
+            let required = origin[0].checked_add(output_extents[channel][0]).ok_or(
+                VarDctResourceError::ArithmeticOverflow {
+                    field: "LF output horizontal extent",
+                },
+            )?;
+            let stride = lf_strides[channel];
+            if stride < required {
+                return Err(VarDctResourceError::InvalidOutputStride {
+                    required,
+                    actual: stride,
+                });
+            }
+            *destination = [stride, origin[0], origin[1], lf_offsets[channel]];
         }
-        let output_offset = output_origin[1]
-            .checked_mul(output_stride)
-            .and_then(|offset| offset.checked_add(output_origin[0]))
-            .ok_or(VarDctResourceError::ArithmeticOverflow {
-                field: "LF output origin",
-            })?;
+        let source_order = [1usize, 0, 2];
+        let mut source_geometry = [[0; 4]; 3];
+        for (channel, source) in source_geometry.iter_mut().enumerate() {
+            let source_channel = source_order[channel];
+            let [width, height] = output_extents[channel];
+            *source = [
+                width,
+                height,
+                u32::try_from(source_channel)
+                    .ok()
+                    .and_then(|channel| channel.checked_mul(blocks))
+                    .ok_or(VarDctResourceError::ArithmeticOverflow {
+                        field: "LF source channel offset",
+                    })?,
+                source_channel as u32,
+            ];
+        }
         let denominator = global_scale as f32 * quant_lf as f32;
         let precision_divisor = (1u32 << extra_precision) as f32;
+        let coalesced_lf = lf_offsets.into_iter().all(|offset| offset == lf_offsets[0]);
+        let reconstruction_mode = if apply_chroma_from_luma {
+            1
+        } else if coalesced_lf {
+            2
+        } else {
+            0
+        };
         Ok(Self {
-            geometry: [blocks_x, blocks_y, blocks, output_stride],
-            offsets: [0, blocks, 2 * blocks, output_offset],
+            geometry: [blocks_x, blocks_y, blocks, reconstruction_mode],
+            source_geometry,
+            destination_geometry,
             scales: [
                 512.0 * lf_dequantization[0] / denominator / precision_divisor,
                 512.0 * lf_dequantization[1] / denominator / precision_divisor,
@@ -284,6 +391,21 @@ impl VarDctResourceParams {
             self.scales[2] * self.scales[3],
         ]
     }
+}
+
+fn validate_channel_shifts(
+    channel_shifts: [VarDctChannelShift; 3],
+) -> Result<(), VarDctResourceError> {
+    for (channel, shift) in channel_shifts.into_iter().enumerate() {
+        if shift.horizontal > 1 || shift.vertical > 1 {
+            return Err(VarDctResourceError::InvalidChannelShift {
+                channel,
+                horizontal: shift.horizontal,
+                vertical: shift.vertical,
+            });
+        }
+    }
+    Ok(())
 }
 
 struct DefaultDequantMatrices(DequantMatrixSet);
@@ -483,7 +605,7 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<VarDctResourceParams>() == 64);
+    assert!(std::mem::size_of::<VarDctResourceParams>() == 144);
     assert!(std::mem::align_of::<VarDctResourceParams>() == 16);
 };
 
@@ -495,7 +617,7 @@ mod tests {
     fn layout_and_shader_are_bounded() {
         let layout = VarDctResourceLayout::new(4, 2, 1).unwrap();
         assert_eq!(layout.correlation_count, 1);
-        assert_eq!(layout.lf_offset, 2);
+        assert_eq!(layout.lf_offsets, [2; 3]);
         assert_eq!(layout.matrix_offsets[0], 10);
         for index in 1..TransformKind::ALL.len() {
             let previous_area = TransformKind::ALL[index - 1].pixel_extent().area().unwrap() as u32;
@@ -518,11 +640,31 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_component_shifts_are_bounded_before_layout_arithmetic() {
+        let shifts = [
+            VarDctChannelShift {
+                horizontal: 2,
+                vertical: 0,
+            },
+            VarDctChannelShift::default(),
+            VarDctChannelShift::default(),
+        ];
+        assert_eq!(
+            VarDctResourceLayout::with_channel_shifts(4, 2, 1, shifts).unwrap_err(),
+            VarDctResourceError::InvalidChannelShift {
+                channel: 0,
+                horizontal: 2,
+                vertical: 0,
+            }
+        );
+    }
+
+    #[test]
     fn correlation_grid_scales_past_one_frequency_cell() {
         let layout = VarDctResourceLayout::new(17, 9, 1).unwrap();
         assert_eq!(layout.correlation_count, 6);
         assert_eq!(layout.correlation_offset, 1);
-        assert_eq!(layout.lf_offset, 7);
+        assert_eq!(layout.lf_offsets, [7; 3]);
         let values = layout.initial_values().unwrap();
         assert_eq!(&values[1..7], &[[0.0, 1.0, 0.0, 0.0]; 6]);
     }
@@ -534,7 +676,7 @@ mod tests {
         assert_eq!(layout.quant_count, 5);
         assert_eq!(layout.correlation_offset, 5);
         assert_eq!(layout.correlation_count, 6);
-        assert_eq!(layout.lf_offset, 11);
+        assert_eq!(layout.lf_offsets, [11; 3]);
         assert_eq!(layout.matrix_offsets[0], 164);
 
         let values = layout.initial_values().unwrap();

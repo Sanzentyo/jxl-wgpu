@@ -17,7 +17,8 @@ use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_output::{VarDctInverseOpsin, VarDctOutputPlan};
+use crate::vardct_frontend::VarDctColorTransform;
+use crate::vardct_output::{VarDctInverseOpsin, VarDctOutputPlan, VarDctOutputTransform};
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
@@ -47,7 +48,7 @@ pub(super) struct VarDctSource {
     pub(super) epf: Option<VarDctEpfPlan>,
     pub(super) output_plan: VarDctOutputPlan,
     pub(super) layout: ImageLayout,
-    pub(super) inverse_opsin: VarDctInverseOpsin,
+    pub(super) output_transform: VarDctOutputTransform,
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
@@ -172,6 +173,21 @@ pub(super) fn prepare_source(
             BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
         },
     )?;
+    let has_subsampled_channels = packet
+        .profile
+        .channel_shifts
+        .into_iter()
+        .any(|shift| shift.is_subsampled());
+    if has_subsampled_channels && packet.profile.adaptive_lf_smoothing {
+        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
+            stage: "adaptive LF smoothing",
+        });
+    }
+    if has_subsampled_channels && (gaborish.is_some() || epf_header.is_some()) {
+        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
+            stage: "restoration filter",
+        });
+    }
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -192,8 +208,12 @@ pub(super) fn prepare_source(
         });
     }
     let [blocks_x, blocks_y] = packet.block_extent();
-    let resource_layout =
-        VarDctResourceLayout::new(blocks_x, blocks_y, packet.total_task_capacity()?)?;
+    let resource_layout = VarDctResourceLayout::with_channel_shifts(
+        blocks_x,
+        blocks_y,
+        packet.total_task_capacity()?,
+        packet.profile.channel_shifts,
+    )?;
     let correlation_width = packet.profile.width.div_ceil(64);
     let pass_group_dim_blocks = packet.profile.group_dimension.checked_div(8).ok_or(
         VarDctDecodeError::ArithmeticOverflow {
@@ -212,10 +232,18 @@ pub(super) fn prepare_source(
         };
         let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
         let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
+        let lf_offsets = if packet.profile.adaptive_lf_smoothing {
+            [0; 3]
+        } else {
+            resource_layout.lf_offsets
+        };
         let resource_params = VarDctResourceParams::new(VarDctResourceConfig {
             block_extent: [group_blocks_x, group_blocks_y],
-            output_stride: blocks_x,
             output_origin: block_origin,
+            channel_shifts: packet.profile.channel_shifts,
+            lf_offsets,
+            lf_strides: resource_layout.lf_strides,
+            apply_chroma_from_luma: packet.profile.uses_chroma_from_luma(),
             global_scale: packet.global_scale,
             quant_lf: packet.quant_lf,
             lf_dequantization: packet.lf_dequantization.multipliers,
@@ -249,6 +277,9 @@ pub(super) fn prepare_source(
             quant_offset,
             correlation_offset,
             global_scale: packet.global_scale,
+            channel_shifts: packet.profile.channel_shifts,
+            lf_offsets: resource_layout.lf_offsets,
+            lf_strides: resource_layout.lf_strides,
             matrix_offsets: resource_layout.matrix_offsets,
         };
         let artifact_layout = VarDctArtifactLayout::plan(
@@ -297,27 +328,47 @@ pub(super) fn prepare_source(
         Extent2d::new(packet.profile.width, packet.profile.height),
         vardct_rgb8_format(),
     )?;
-    let opsin = inventory
-        .image_header
-        .opsin_inverse_matrix
-        .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
-    let inverse_opsin = VarDctInverseOpsin {
-        opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
-        inverse_opsin_matrix: opsin
-            .inverse_matrix
-            .map(|row| row.map(|value| value.to_f32())),
-        intensity_target: inventory
-            .image_header
-            .tone_mapping
-            .intensity_target
-            .to_f32(),
+    let (output_transform, quant_biases) = match packet.profile.color_transform {
+        VarDctColorTransform::Xyb => {
+            let opsin = inventory
+                .image_header
+                .opsin_inverse_matrix
+                .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
+            (
+                VarDctOutputTransform::Xyb(VarDctInverseOpsin {
+                    opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
+                    inverse_opsin_matrix: opsin
+                        .inverse_matrix
+                        .map(|row| row.map(|value| value.to_f32())),
+                    intensity_target: inventory
+                        .image_header
+                        .tone_mapping
+                        .intensity_target
+                        .to_f32(),
+                }),
+                [
+                    opsin.quant_bias[0].to_f32(),
+                    opsin.quant_bias[1].to_f32(),
+                    opsin.quant_bias[2].to_f32(),
+                    opsin.quant_bias_numerator.to_f32(),
+                ],
+            )
+        }
+        VarDctColorTransform::Ycbcr => (
+            VarDctOutputTransform::Ycbcr {
+                channel_shifts: packet.profile.channel_shifts,
+            },
+            // Non-XYB image metadata omits the optional opsin object that otherwise carries these
+            // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32
+            // roundings.
+            [
+                1.0 - 0.054_650_072,
+                1.0 - 0.070_054_5,
+                1.0 - 0.049_935_102,
+                0.145,
+            ],
+        ),
     };
-    let quant_biases = [
-        opsin.quant_bias[0].to_f32(),
-        opsin.quant_bias[1].to_f32(),
-        opsin.quant_bias[2].to_f32(),
-        opsin.quant_bias_numerator.to_f32(),
-    ];
     let resident_memory = packet
         .groups
         .iter()
@@ -437,7 +488,7 @@ pub(super) fn prepare_source(
         epf,
         output_plan,
         layout,
-        inverse_opsin,
+        output_transform,
         quant_biases,
         frame_name,
         memory,
@@ -568,7 +619,11 @@ fn validate_device_limits(
             memory.hf_order_table_bytes,
             true,
         ),
-        ("one XYB plane", memory.xyb_plane_bytes / 3, true),
+        (
+            "one resident component plane",
+            memory.resident_plane_bytes.into_iter().max().unwrap_or(0),
+            true,
+        ),
         (
             "one restoration scratch plane",
             memory.restoration_scratch_bytes / 3,

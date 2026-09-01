@@ -1,4 +1,4 @@
-//! Fused GPU-resident XYB inverse, sRGB transfer, and packed RGB8 output.
+//! Fused GPU-resident XYB/YCbCr reconstruction and packed RGB8 output.
 //!
 //! The kernel assigns one invocation to each output `u32`. That ownership rule
 //! removes byte-level read/modify/write races while retaining the externally
@@ -10,6 +10,8 @@ use jxl_gpu_protocol::XybParams;
 use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
 
+use crate::vardct_frontend::VarDctChannelShift;
+
 const OUTPUT_WORD_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 #[cfg(test)]
 const WORKGROUP_SIZE: u32 = 256;
@@ -18,19 +20,38 @@ const DEFAULT_VARIANT: KernelVariant = KernelVariant::Lanes256;
 /// WGSL source for the fused VarDCT output kernel.
 pub const VAR_DCT_OUTPUT_SHADER: &str = include_str!("vardct_output.wgsl");
 
-/// One GPU-resident F32 XYB plane.
+/// One GPU-resident F32 XYB or JPEG component plane.
 #[derive(Clone, Copy, Debug)]
 pub struct VarDctOutputPlane<'a> {
     /// Checked storage-buffer subrange containing row-major F32 samples.
     pub storage: ResidentStorageBinding<'a>,
+    /// Available logical samples in each row.
+    pub width: u32,
+    /// Available logical rows.
+    pub height: u32,
     /// Row stride in F32 scalars. Zero selects the configured image width.
     pub stride: u32,
 }
 
 impl VarDctOutputPlane<'_> {
-    const fn effective_stride(self, width: u32) -> u32 {
-        if self.stride == 0 { width } else { self.stride }
+    const fn effective_stride(self) -> u32 {
+        if self.stride == 0 {
+            self.width
+        } else {
+            self.stride
+        }
     }
+}
+
+/// Color transform fused into the final packed RGB8 kernel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VarDctOutputTransform {
+    /// JPEG XL XYB inverse followed by the sRGB transfer function.
+    Xyb(VarDctInverseOpsin),
+    /// JPEG reconstruction's encoded YCbCr, including component upsampling.
+    Ycbcr {
+        channel_shifts: [VarDctChannelShift; 3],
+    },
 }
 
 /// JPEG XL inverse-opsin fields used by the fused output kernel.
@@ -61,9 +82,7 @@ pub struct VarDctOutputConfig {
     pub width: u32,
     /// Logical pixel height.
     pub height: u32,
-    /// Inverse-opsin parameters with the same semantics as
-    /// [`jxl_gpu_protocol::XybParams`].
-    pub inverse_opsin: VarDctInverseOpsin,
+    pub transform: VarDctOutputTransform,
 }
 
 /// GPU bindings consumed by [`VarDctOutputPacker::encode`].
@@ -233,7 +252,7 @@ fn validate_workgroup_variant(
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct VarDctOutputScratch {
-    /// The fixed 128-byte parameter buffer.
+    /// The fixed 176-byte parameter buffer.
     pub uniform: wgpu::Buffer,
     /// Exact output/transient accounting and dispatch geometry.
     pub plan: VarDctOutputPlan,
@@ -263,6 +282,24 @@ pub enum VarDctOutputError {
         plane: usize,
         stride: u32,
         width: u32,
+    },
+    /// One input plane does not cover the component extent required by the color transform.
+    #[error(
+        "VarDCT RGB8 input plane {plane} extent {width}x{height} is smaller than required {required_width}x{required_height}"
+    )]
+    InputExtent {
+        plane: usize,
+        width: u32,
+        height: u32,
+        required_width: u32,
+        required_height: u32,
+    },
+    /// JPEG component shifts are limited to the one-bit factors defined by the codestream.
+    #[error("VarDCT RGB8 JPEG channel {channel} has invalid shift {horizontal}x{vertical}")]
+    InvalidJpegShift {
+        channel: usize,
+        horizontal: u32,
+        vertical: u32,
     },
     /// An inverse-opsin field is non-finite.
     #[error("VarDCT RGB8 inverse-opsin field {field} must be finite")]
@@ -312,7 +349,7 @@ pub enum VarDctOutputError {
         required: u64,
         available: u64,
     },
-    /// The 128-byte uniform exceeds an unusual device limit.
+    /// The 176-byte uniform exceeds an unusual device limit.
     #[error("VarDCT RGB8 uniform needs {required} bytes, uniform binding limit is {available}")]
     UniformBindingLimit { required: u64, available: u64 },
     /// Output packing requires a one-dimensional workgroup.
@@ -332,7 +369,7 @@ pub enum VarDctOutputError {
     DispatchLimit { required_y: u32, available: u32 },
 }
 
-/// Reusable fused XYB-to-packed-sRGB8 compute pipeline.
+/// Reusable fused XYB/YCbCr-to-packed-RGB8 compute pipeline.
 pub struct VarDctOutputPacker {
     pipeline: wgpu::ComputePipeline,
     variant: KernelVariant,
@@ -424,14 +461,9 @@ impl VarDctOutputPacker {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct VarDctOutputParams {
-    width: u32,
-    height: u32,
-    input_stride_x: u32,
-    input_stride_y: u32,
-    input_stride_b: u32,
-    pixel_count: u32,
-    output_word_count: u32,
-    dispatch_width: u32,
+    image: [u32; 4],
+    dispatch: [u32; 4],
+    plane_geometry: [[u32; 4]; 3],
     matrix_r: [f32; 4],
     matrix_g: [f32; 4],
     matrix_b: [f32; 4],
@@ -446,7 +478,9 @@ fn validate_inputs(
     inputs: VarDctOutputInputs<'_>,
     variant: KernelVariant,
 ) -> Result<(VarDctOutputParams, VarDctOutputPlan), VarDctOutputError> {
-    validate_inverse_opsin(inputs.config.inverse_opsin)?;
+    if let VarDctOutputTransform::Xyb(inverse) = inputs.config.transform {
+        validate_inverse_opsin(inverse)?;
+    }
     let plan = VarDctOutputPlan::for_limits_with_variant(
         inputs.config.width,
         inputs.config.height,
@@ -465,19 +499,49 @@ fn validate_inputs(
             available: u64::from(u32::MAX),
         })?;
 
-    let mut strides = [0; 3];
+    let required_extents = match inputs.config.transform {
+        VarDctOutputTransform::Xyb(_) => [[inputs.config.width, inputs.config.height]; 3],
+        VarDctOutputTransform::Ycbcr { channel_shifts } => {
+            let mut extents = [[0; 2]; 3];
+            for (channel, shift) in channel_shifts.into_iter().enumerate() {
+                if shift.horizontal > 1 || shift.vertical > 1 {
+                    return Err(VarDctOutputError::InvalidJpegShift {
+                        channel,
+                        horizontal: shift.horizontal,
+                        vertical: shift.vertical,
+                    });
+                }
+                extents[channel] = [
+                    inputs.config.width.div_ceil(1 << shift.horizontal),
+                    inputs.config.height.div_ceil(1 << shift.vertical),
+                ];
+            }
+            extents
+        }
+    };
+    let mut plane_geometry = [[0; 4]; 3];
     for (plane, input) in inputs.planes.into_iter().enumerate() {
-        let stride = input.effective_stride(inputs.config.width);
-        if stride < inputs.config.width {
+        let [required_width, required_height] = required_extents[plane];
+        if input.width < required_width || input.height < required_height {
+            return Err(VarDctOutputError::InputExtent {
+                plane,
+                width: input.width,
+                height: input.height,
+                required_width,
+                required_height,
+            });
+        }
+        let stride = input.effective_stride();
+        if stride < input.width {
             return Err(VarDctOutputError::InputStride {
                 plane,
                 stride,
-                width: inputs.config.width,
+                width: input.width,
             });
         }
-        let required_scalars = u64::from(inputs.config.height - 1)
+        let required_scalars = u64::from(required_height - 1)
             .checked_mul(u64::from(stride))
-            .and_then(|value| value.checked_add(u64::from(inputs.config.width)))
+            .and_then(|value| value.checked_add(u64::from(required_width)))
             .ok_or(VarDctOutputError::ArithmeticOverflow {
                 field: "VarDCT input plane scalars",
             })?;
@@ -500,7 +564,16 @@ fn validate_inputs(
             _ => "B input",
         };
         validate_binding(device, role, input.storage, required_bytes)?;
-        strides[plane] = stride;
+        let shift = match inputs.config.transform {
+            VarDctOutputTransform::Xyb(_) => VarDctChannelShift::default(),
+            VarDctOutputTransform::Ycbcr { channel_shifts } => channel_shifts[plane],
+        };
+        plane_geometry[plane] = [
+            stride,
+            required_width,
+            required_height,
+            shift.horizontal | (shift.vertical << 1),
+        ];
     }
     validate_binding(
         device,
@@ -509,23 +582,32 @@ fn validate_inputs(
         plan.memory.output_storage_bytes,
     )?;
 
-    let inverse = inputs.config.inverse_opsin;
-    let intensity_scale = 255.0 / inverse.intensity_target;
-    let bias_cbrt = inverse.opsin_bias.map(f32::cbrt);
-    let scaled_bias = inverse.opsin_bias.map(|value| value * intensity_scale);
+    let (mode, matrix, bias_cbrt, scaled_bias, intensity_scale) = match inputs.config.transform {
+        VarDctOutputTransform::Xyb(inverse) => {
+            let intensity_scale = 255.0 / inverse.intensity_target;
+            (
+                0,
+                inverse.inverse_opsin_matrix,
+                inverse.opsin_bias.map(f32::cbrt),
+                inverse.opsin_bias.map(|value| value * intensity_scale),
+                intensity_scale,
+            )
+        }
+        VarDctOutputTransform::Ycbcr { .. } => (1, [[0.0; 3]; 3], [0.0; 3], [0.0; 3], 0.0),
+    };
     Ok((
         VarDctOutputParams {
-            width: inputs.config.width,
-            height: inputs.config.height,
-            input_stride_x: strides[0],
-            input_stride_y: strides[1],
-            input_stride_b: strides[2],
-            pixel_count,
-            output_word_count: plan.output_words,
-            dispatch_width: plan.dispatch_width,
-            matrix_r: matrix_row(inverse.inverse_opsin_matrix[0]),
-            matrix_g: matrix_row(inverse.inverse_opsin_matrix[1]),
-            matrix_b: matrix_row(inverse.inverse_opsin_matrix[2]),
+            image: [
+                inputs.config.width,
+                inputs.config.height,
+                pixel_count,
+                plan.output_words,
+            ],
+            dispatch: [plan.dispatch_width, mode, 0, 0],
+            plane_geometry,
+            matrix_r: matrix_row(matrix[0]),
+            matrix_g: matrix_row(matrix[1]),
+            matrix_b: matrix_row(matrix[2]),
             bias_cbrt: [bias_cbrt[0], bias_cbrt[1], bias_cbrt[2], 0.0],
             scaled_bias: [scaled_bias[0], scaled_bias[1], scaled_bias[2], 0.0],
             intensity_scale,
@@ -689,7 +771,7 @@ const fn matrix_row(row: [f32; 3]) -> [f32; 4] {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<VarDctOutputParams>() == 128);
+    assert!(std::mem::size_of::<VarDctOutputParams>() == 176);
     assert!(std::mem::align_of::<VarDctOutputParams>() == 16);
 };
 
@@ -725,7 +807,7 @@ mod tests {
     fn wgsl_and_uniform_abi_validate() {
         fn assert_pod<T: Pod>() {}
         assert_pod::<VarDctOutputParams>();
-        assert_eq!(std::mem::size_of::<VarDctOutputParams>(), 128);
+        assert_eq!(std::mem::size_of::<VarDctOutputParams>(), 176);
         assert_eq!(std::mem::align_of::<VarDctOutputParams>(), 16);
 
         let module =
@@ -743,9 +825,9 @@ mod tests {
         let memory = VarDctOutputMemoryPlan::new(5, 3).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 128);
-        assert_eq!(memory.transient_bytes, 128);
-        assert_eq!(memory.total_bytes, 176);
+        assert_eq!(memory.uniform_bytes, 176);
+        assert_eq!(memory.transient_bytes, 176);
+        assert_eq!(memory.total_bytes, 224);
 
         let plan = VarDctOutputPlan::for_limits(5, 3, &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -896,14 +978,20 @@ mod tests {
                     planes: [
                         VarDctOutputPlane {
                             storage: binding(&x),
+                            width: 3,
+                            height: 1,
                             stride: 3,
                         },
                         VarDctOutputPlane {
                             storage: binding(&y),
+                            width: 3,
+                            height: 1,
                             stride: 3,
                         },
                         VarDctOutputPlane {
                             storage: binding(&b),
+                            width: 3,
+                            height: 1,
                             stride: 3,
                         },
                     ],
@@ -911,14 +999,14 @@ mod tests {
                     config: VarDctOutputConfig {
                         width: 3,
                         height: 1,
-                        inverse_opsin: inverse_opsin(),
+                        transform: VarDctOutputTransform::Xyb(inverse_opsin()),
                     },
                 },
             )
             .expect("record fused VarDCT RGB8 output");
         assert_eq!(scratch.plan.memory.logical_output_bytes, 9);
         assert_eq!(scratch.plan.memory.output_storage_bytes, 12);
-        assert_eq!(scratch.uniform.size(), 128);
+        assert_eq!(scratch.uniform.size(), 176);
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 12);
         let submission = queue.submit([encoder.finish()]);
         let (sender, receiver) = mpsc::sync_channel(1);

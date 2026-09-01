@@ -2,14 +2,9 @@ override wg_x: u32 = 256u;
 override wg_y: u32 = 1u;
 
 struct Params {
-    width: u32,
-    height: u32,
-    input_stride_x: u32,
-    input_stride_y: u32,
-    input_stride_b: u32,
-    pixel_count: u32,
-    output_word_count: u32,
-    dispatch_width: u32,
+    image: vec4<u32>,
+    dispatch: vec4<u32>,
+    plane_geometry: array<vec4<u32>, 3>,
     matrix_r: vec4<f32>,
     matrix_g: vec4<f32>,
     matrix_b: vec4<f32>,
@@ -45,16 +40,76 @@ fn quantize_srgb8(value: f32) -> u32 {
     return u32(clamp(floor(linear_to_srgb(value) * 255.0 + 0.5), 0.0, 255.0));
 }
 
+fn quantize_encoded8(value: f32) -> u32 {
+    return u32(clamp(floor(value * 255.0 + 0.5), 0.0, 255.0));
+}
+
+fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
+    let index = y * params.plane_geometry[channel].x + x;
+    if (channel == 0u) { return x_plane[index]; }
+    if (channel == 1u) { return y_plane[index]; }
+    return b_plane[index];
+}
+
+fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
+    let geometry = params.plane_geometry[channel];
+    let horizontal_shift = geometry.w & 1u;
+    let vertical_shift = (geometry.w >> 1u) & 1u;
+    var x0 = x;
+    var x1 = x;
+    var x_weight = 0.0;
+    if (horizontal_shift != 0u) {
+        let center = x >> 1u;
+        if ((x & 1u) == 0u) {
+            x0 = select(0u, center - 1u, center != 0u);
+            x1 = center;
+            x_weight = 0.75;
+        } else {
+            x0 = center;
+            x1 = min(center + 1u, geometry.y - 1u);
+            x_weight = 0.25;
+        }
+    }
+    var y0 = y;
+    var y1 = y;
+    var y_weight = 0.0;
+    if (vertical_shift != 0u) {
+        let center = y >> 1u;
+        if ((y & 1u) == 0u) {
+            y0 = select(0u, center - 1u, center != 0u);
+            y1 = center;
+            y_weight = 0.75;
+        } else {
+            y0 = center;
+            y1 = min(center + 1u, geometry.z - 1u);
+            y_weight = 0.25;
+        }
+    }
+    let top = mix(plane_value(channel, x0, y0), plane_value(channel, x1, y0), x_weight);
+    let bottom = mix(plane_value(channel, x0, y1), plane_value(channel, x1, y1), x_weight);
+    return mix(top, bottom, y_weight);
+}
+
 fn rgb8_at(pixel: u32) -> vec3<u32> {
-    if (pixel >= params.pixel_count) {
+    if (pixel >= params.image.z) {
         return vec3<u32>(0u);
     }
 
-    let row = pixel / params.width;
-    let column = pixel - row * params.width;
-    let x = x_plane[row * params.input_stride_x + column];
-    let y = y_plane[row * params.input_stride_y + column];
-    let b = b_plane[row * params.input_stride_b + column];
+    let row = pixel / params.image.x;
+    let column = pixel - row * params.image.x;
+    if (params.dispatch.y == 1u) {
+        let cb = jpeg_sample(0u, column, row);
+        let y = jpeg_sample(1u, column, row) + 128.0 / 255.0;
+        let cr = jpeg_sample(2u, column, row);
+        return vec3<u32>(
+            quantize_encoded8(y + 1.402 * cr),
+            quantize_encoded8(y - (0.114 * 1.772 / 0.587) * cb - (0.299 * 1.402 / 0.587) * cr),
+            quantize_encoded8(y + 1.772 * cb),
+        );
+    }
+    let x = plane_value(0u, column, row);
+    let y = plane_value(1u, column, row);
+    let b = plane_value(2u, column, row);
 
     // This is deliberately identical to jxl_wgpu's XYB inverse contract:
     // reconstruct biased LMS, apply the sign-preserving cube, then the
@@ -105,8 +160,8 @@ fn pack_rgb8_word(word_index: u32) -> u32 {
 
 @compute @workgroup_size(wg_x, wg_y, 1)
 fn pack_rgb8(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let word_index = gid.y * params.dispatch_width + gid.x;
-    if (word_index >= params.output_word_count) {
+    let word_index = gid.y * params.dispatch.x + gid.x;
+    if (word_index >= params.image.w) {
         return;
     }
     output_words[word_index] = pack_rgb8_word(word_index);

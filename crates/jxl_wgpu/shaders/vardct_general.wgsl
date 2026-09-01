@@ -4,7 +4,7 @@ struct Task {
     matrix_offset: u32,
     quant_index: u32,
     coefficient_origin_x: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     channel_mask: u32,
     coefficient_origin_y: u32,
     destination_x_x: u32,
@@ -13,8 +13,8 @@ struct Task {
     destination_y_y: u32,
     destination_x_b: u32,
     destination_y_b: u32,
-    _pad1: u32,
-    _pad2: u32,
+    lf_offset_y: u32,
+    lf_offset_b: u32,
 };
 
 struct Params {
@@ -27,7 +27,7 @@ struct Params {
     lf_height: u32,
     quant_offset: u32,
     correlation_offset: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     output_width_x: u32,
     output_height_x: u32,
     output_stride_x: u32,
@@ -42,11 +42,12 @@ struct Params {
     correlation_height: u32,
     task_word_offset: u32,
     bucket_word_offset: u32,
-    lf_stride: u32,
+    lf_stride_x: u32,
     _padding0: u32,
     _padding1: u32,
     _padding2: u32,
     quant_biases: vec4<f32>,
+    lf_channel_layout: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> coefficients: array<i32>;
@@ -100,14 +101,25 @@ fn hf_correlation(task: Task, frequency_x: u32, frequency_y: u32) -> vec2<f32> {
 
 fn lf_coefficient(task: Task, frequency_x: u32, frequency_y: u32) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
-    let lf_stride = select(params.lf_width, params.lf_stride, params.lf_stride != 0u);
+    let lf_strides = vec3<u32>(
+        select(params.lf_width, params.lf_stride_x, params.lf_stride_x != 0u),
+        select(params.lf_width, params.lf_channel_layout.z, params.lf_channel_layout.z != 0u),
+        select(params.lf_width, params.lf_channel_layout.w, params.lf_channel_layout.w != 0u),
+    );
+    let lf_bases = vec3<u32>(
+        params.lf_offset_x + task.lf_offset_x,
+        params.lf_channel_layout.x + task.lf_offset_y,
+        params.lf_channel_layout.y + task.lf_offset_b,
+    );
     for (var spatial_y = 0u; spatial_y < params.lf_height; spatial_y = spatial_y + 1u) {
         let basis_y = idct_basis(spatial_y, frequency_y, params.lf_height);
         for (var spatial_x = 0u; spatial_x < params.lf_width; spatial_x = spatial_x + 1u) {
             let basis_x = idct_basis(spatial_x, frequency_x, params.lf_width);
-            let lf = resources[
-                params.lf_offset + task.lf_offset + spatial_y * lf_stride + spatial_x
-            ].xyz;
+            let lf = vec3<f32>(
+                resources[lf_bases.x + spatial_y * lf_strides.x + spatial_x].x,
+                resources[lf_bases.y + spatial_y * lf_strides.y + spatial_x].y,
+                resources[lf_bases.z + spatial_y * lf_strides.z + spatial_x].z,
+            );
             sum = fma(lf, vec3<f32>(basis_x * basis_y), sum);
         }
     }

@@ -70,7 +70,7 @@ pub struct HfCoefficientPassParams {
     coeff_shift: u32,
     global_group_index: u32,
     block_context: HfBlockContextTables,
-    _reserved: u32,
+    channel_shifts: u32,
 }
 
 /// Exact 464-byte resume record for one serial HF coefficient consumer.
@@ -287,7 +287,14 @@ impl HfCoefficientExecutionPlan {
                     coeff_shift: 0,
                     global_group_index,
                     block_context,
-                    _reserved: 0,
+                    channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
+                        0u32,
+                        |packed, (channel, shift)| {
+                            packed
+                                | shift.horizontal << (channel as u32 * 2)
+                                | shift.vertical << (channel as u32 * 2 + 1)
+                        },
+                    ),
                 });
                 stream_ranges.push(GroupEntropyRange {
                     token_bit_offset: range.offset,

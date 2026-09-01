@@ -86,9 +86,9 @@ pub struct ResidentVarDctRenderConfig {
     pub bucket_word_offset: u32,
     pub quant_offset: u32,
     pub correlation_offset: u32,
-    pub lf_offset: u32,
-    /// Row stride of the image-wide LF tuple grid.
-    pub lf_stride: u32,
+    pub lf_offsets: [u32; 3],
+    /// Row strides of the image-wide LF channel grids.
+    pub lf_strides: [u32; 3],
     pub correlation_width: u32,
     pub correlation_height: u32,
     pub quant_biases: [f32; 4],
@@ -437,7 +437,7 @@ struct ResidentVarDctParams {
     lf_height: u32,
     quant_offset: u32,
     correlation_offset: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     output_width_x: u32,
     output_height_x: u32,
     output_stride_x: u32,
@@ -452,11 +452,12 @@ struct ResidentVarDctParams {
     correlation_height: u32,
     task_word_offset: u32,
     bucket_word_offset: u32,
-    lf_stride: u32,
+    lf_stride_x: u32,
     _padding0: u32,
     _padding1: u32,
     _padding2: u32,
     quant_biases: [f32; 4],
+    lf_channel_layout: [u32; 4],
 }
 
 fn validate_inputs(
@@ -589,7 +590,7 @@ fn resident_params(
         lf_height: lf_extent.height,
         quant_offset: inputs.config.quant_offset,
         correlation_offset: inputs.config.correlation_offset,
-        lf_offset: inputs.config.lf_offset,
+        lf_offset_x: inputs.config.lf_offsets[0],
         output_width_x: inputs.outputs[0].width,
         output_height_x: inputs.outputs[0].height,
         output_stride_x: inputs.outputs[0].effective_stride(),
@@ -604,11 +605,17 @@ fn resident_params(
         correlation_height: inputs.config.correlation_height,
         task_word_offset: inputs.config.task_word_offset,
         bucket_word_offset: inputs.config.bucket_word_offset,
-        lf_stride: inputs.config.lf_stride,
+        lf_stride_x: inputs.config.lf_strides[0],
         _padding0: 0,
         _padding1: 0,
         _padding2: 0,
         quant_biases: inputs.config.quant_biases,
+        lf_channel_layout: [
+            inputs.config.lf_offsets[1],
+            inputs.config.lf_offsets[2],
+            inputs.config.lf_strides[1],
+            inputs.config.lf_strides[2],
+        ],
     })
 }
 
@@ -671,7 +678,7 @@ fn entire_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ResidentVarDctParams>() == 128);
+    assert!(std::mem::size_of::<ResidentVarDctParams>() == 144);
     assert!(std::mem::align_of::<ResidentVarDctParams>() == 16);
 };
 
@@ -683,7 +690,7 @@ mod tests {
     fn uniform_and_task_contract_match_the_shared_shader() {
         fn assert_pod<T: Pod>() {}
         assert_pod::<ResidentVarDctParams>();
-        assert_eq!(std::mem::size_of::<ResidentVarDctParams>(), 128);
+        assert_eq!(std::mem::size_of::<ResidentVarDctParams>(), 144);
         assert_eq!(GENERAL_TASK_BYTES, 64);
         for shader in [
             include_str!("../shaders/vardct_general.wgsl"),
@@ -703,8 +710,8 @@ mod tests {
     fn memory_plan_counts_both_scratch_allocations_and_uniform() {
         let plan = ResidentVarDctMemoryPlan::new(3 * 32 * 32).unwrap();
         assert_eq!(plan.scratch_buffer_bytes, 12_288);
-        assert_eq!(plan.uniform_bytes, 3_456);
-        assert_eq!(plan.total_bytes, 28_032);
+        assert_eq!(plan.uniform_bytes, 3_888);
+        assert_eq!(plan.total_bytes, 28_464);
     }
 
     #[test]

@@ -554,7 +554,7 @@ struct VarDctJobLifetime {
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
-    _xyb_planes: [wgpu::Buffer; 3],
+    _resident_planes: [wgpu::Buffer; 3],
     _restoration: Option<RestorationJobBuffers>,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: VarDctOutputScratch,
@@ -668,7 +668,7 @@ impl VarDctPendingFrame {
             .as_ref()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
         ProgressiveDcXybPlanes::from_buffers(
-            lifetime._xyb_planes.clone(),
+            lifetime._resident_planes.clone(),
             self.progressive_dc_extent.width,
             self.progressive_dc_extent.height,
             self.progressive_dc_stride,
@@ -2131,6 +2131,30 @@ fn resident_image_planes<'a>(
     ])
 }
 
+fn resident_shifted_image_planes<'a>(
+    buffers: &'a [wgpu::Buffer; 3],
+    width: u32,
+    height: u32,
+    shifts: [crate::vardct_frontend::VarDctChannelShift; 3],
+) -> Result<[ResidentF32Plane<'a>; 3], VarDctDecodeError> {
+    let plane = |channel: usize| -> Result<ResidentF32Plane<'a>, VarDctDecodeError> {
+        let shift = shifts[channel];
+        let [plane_width, plane_height] =
+            shift
+                .shifted_extent(width, height)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "resident shifted channel extent",
+                })?;
+        Ok(ResidentF32Plane {
+            storage: resident_binding(&buffers[channel])?,
+            width: plane_width,
+            height: plane_height,
+            stride: plane_width,
+        })
+    };
+    Ok([plane(0)?, plane(1)?, plane(2)?])
+}
+
 fn upload_codestream(
     codestream: &GpuCodestream,
     buffer: &wgpu::Buffer,
@@ -2410,20 +2434,31 @@ fn submit_vardct(
         .hf_coefficients
         .as_ref()
         .map(|plan| create_hf_coefficient_job_buffers(device, plan));
-    let plane_bytes = source.memory.xyb_plane_bytes / 3;
-    let xyb_planes = [
+    let image_labels = [
         "jxl-wgpu VarDCT X plane",
         "jxl-wgpu VarDCT Y plane",
         "jxl-wgpu VarDCT B plane",
-    ]
-    .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::COPY_DST));
+    ];
+    let resident_planes = std::array::from_fn(|channel| {
+        storage(
+            image_labels[channel],
+            source.memory.resident_plane_bytes[channel],
+            wgpu::BufferUsages::COPY_DST,
+        )
+    });
     let restoration_planes = (source.gaborish.is_some() || source.epf.is_some()).then(|| {
-        [
+        let labels = [
             "jxl-wgpu VarDCT restoration scratch X plane",
             "jxl-wgpu VarDCT restoration scratch Y plane",
             "jxl-wgpu VarDCT restoration scratch B plane",
-        ]
-        .map(|label| storage(label, plane_bytes, wgpu::BufferUsages::empty()))
+        ];
+        std::array::from_fn(|channel| {
+            storage(
+                labels[channel],
+                source.memory.resident_plane_bytes[channel],
+                wgpu::BufferUsages::empty(),
+            )
+        })
     });
     let epf_sigma = source.epf.as_ref().map(|_| {
         storage(
@@ -2457,9 +2492,9 @@ fn submit_vardct(
         packet_commands.clear_buffer(lf_temporary, 0, None);
     }
     for buffer in [
-        &xyb_planes[0],
-        &xyb_planes[1],
-        &xyb_planes[2],
+        &resident_planes[0],
+        &resident_planes[1],
+        &resident_planes[2],
         output.as_ref(),
     ] {
         packet_commands.clear_buffer(buffer, 0, None);
@@ -2789,17 +2824,21 @@ fn submit_vardct(
                 ProgressiveDcPackInputs {
                     planes,
                     resources: resident_binding(&resources)?,
-                    lf_offset: source.resource_layout.lf_offset,
+                    lf_offset: source.resource_layout.lf_offsets[0],
                     lf_stride: blocks_x,
                 },
             )?;
             (Vec::new(), None, Some(uniform))
         } else {
-            let lf_temporary = lf_temporary
-                .as_ref()
-                .ok_or(VarDctDecodeError::EngineContract {
-                    detail: "a regular VarDCT frame has no LF temporary buffer",
-                })?;
+            let lf_destination = if source.packet.profile.adaptive_lf_smoothing {
+                lf_temporary
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EngineContract {
+                        detail: "adaptive LF smoothing has no temporary buffer",
+                    })?
+            } else {
+                &resources
+            };
             let mut resource_uniforms = Vec::with_capacity(source.groups.len());
             for (group, buffers) in source.groups.iter().zip(&group_buffers) {
                 resource_uniforms.push(pipelines.resource.encode(
@@ -2807,7 +2846,7 @@ fn submit_vardct(
                     &mut commands,
                     VarDctResourceBuffers {
                         quantized_lf: &buffers.reconstructed,
-                        dequantized_lf: lf_temporary,
+                        dequantized_lf: lf_destination,
                     },
                     group.resource_params,
                 ));
@@ -2827,25 +2866,18 @@ fn submit_vardct(
                     device,
                     &mut commands,
                     AdaptiveLfBuffers {
-                        input: lf_temporary,
+                        input: lf_destination,
                         output: &resources,
                     },
                     AdaptiveLfParams::new(
                         blocks_x,
                         blocks_y,
                         0,
-                        source.resource_layout.lf_offset,
+                        source.resource_layout.lf_offsets[0],
                         smoothing_thresholds,
                     ),
                 ))
             } else {
-                commands.copy_buffer_to_buffer(
-                    lf_temporary,
-                    0,
-                    &resources,
-                    u64::from(source.resource_layout.lf_offset) * 16,
-                    source.memory.lf_temporary_bytes,
-                );
                 None
             };
             (resource_uniforms, adaptive_lf_uniform, None)
@@ -3036,11 +3068,11 @@ fn submit_vardct(
                 coefficients: resident_binding(&buffers.coefficients)?,
                 artifact: resident_binding(&buffers.artifact)?,
                 resources: resident_binding(&resources)?,
-                outputs: resident_image_planes(
-                    &xyb_planes,
+                outputs: resident_shifted_image_planes(
+                    &resident_planes,
                     padded_width,
                     padded_height,
-                    padded_width,
+                    source.packet.profile.channel_shifts,
                 )?,
                 indirect: &buffers.artifact,
                 indirect_base_offset: u64::from(group.artifact_layout.indirect_offset_words) * 4,
@@ -3051,8 +3083,8 @@ fn submit_vardct(
                     bucket_word_offset: group.artifact_layout.buckets_offset_words,
                     quant_offset: group.quant_offset,
                     correlation_offset: source.resource_layout.correlation_offset,
-                    lf_offset: source.resource_layout.lf_offset,
-                    lf_stride: blocks_x,
+                    lf_offsets: source.resource_layout.lf_offsets,
+                    lf_strides: source.resource_layout.lf_strides,
                     correlation_width,
                     correlation_height,
                     quant_biases: source.quant_biases,
@@ -3064,7 +3096,7 @@ fn submit_vardct(
     let image_height = source.packet.profile.height;
     let mut restoration = restoration_planes
         .as_ref()
-        .map(|scratch| RestorationCursor::new(&xyb_planes, scratch));
+        .map(|scratch| RestorationCursor::new(&resident_planes, scratch));
     let gaborish_uniform = match (source.gaborish, restoration.as_mut()) {
         (Some(weights), Some(restoration)) => {
             let (input_buffers, output_buffers) = restoration.advance();
@@ -3133,7 +3165,30 @@ fn submit_vardct(
     }
     let presentation_planes = restoration
         .as_ref()
-        .map_or(&xyb_planes, RestorationCursor::current);
+        .map_or(&resident_planes, RestorationCursor::current);
+    let presentation_shifts = if restoration.is_some() {
+        [crate::vardct_frontend::VarDctChannelShift::default(); 3]
+    } else {
+        source.packet.profile.channel_shifts
+    };
+    let presentation_geometry = presentation_shifts.map(|shift| {
+        shift.shifted_extent(image_width, image_height).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "presentation channel extent",
+            },
+        )
+    });
+    let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
+    let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
+    let presentation_strides = presentation_shifts.map(|shift| {
+        padded_width
+            .checked_shr(shift.horizontal)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                field: "presentation channel stride",
+            })
+    });
+    let [stride_x, stride_y, stride_b] = presentation_strides;
+    let presentation_strides = [stride_x?, stride_y?, stride_b?];
     let output_scratch = pipelines.output.encode(
         device,
         &mut commands,
@@ -3141,22 +3196,28 @@ fn submit_vardct(
             planes: [
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[0])?,
-                    stride: padded_width,
+                    width: presentation_geometry[0][0],
+                    height: presentation_geometry[0][1],
+                    stride: presentation_strides[0],
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[1])?,
-                    stride: padded_width,
+                    width: presentation_geometry[1][0],
+                    height: presentation_geometry[1][1],
+                    stride: presentation_strides[1],
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[2])?,
-                    stride: padded_width,
+                    width: presentation_geometry[2][0],
+                    height: presentation_geometry[2][1],
+                    stride: presentation_strides[2],
                 },
             ],
             output: resident_binding(&output)?,
             config: VarDctOutputConfig {
                 width: source.packet.profile.width,
                 height: source.packet.profile.height,
-                inverse_opsin: source.inverse_opsin,
+                transform: source.output_transform,
             },
         },
     )?;
@@ -3257,13 +3318,13 @@ fn submit_vardct(
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
-        _xyb_planes: xyb_planes,
+        _resident_planes: resident_planes,
         _restoration: restoration_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
     let mut expected_groups = Vec::with_capacity(source.packet.groups.len());
-    for group in &source.packet.groups {
+    for (group, group_source) in source.packet.groups.iter().zip(&source.groups) {
         let [group_blocks_x, group_blocks_y] = group.block_extent();
         let expected_blocks = group_blocks_x.checked_mul(group_blocks_y).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
@@ -3283,8 +3344,15 @@ fn submit_vardct(
             expected_lf_samples: if source.packet.profile.uses_lf_frame {
                 0
             } else {
-                expected_blocks
-                    .checked_mul(3)
+                group_source
+                    .resource_params
+                    .source_geometry
+                    .into_iter()
+                    .try_fold(0u32, |total, [width, height, _, _]| {
+                        width
+                            .checked_mul(height)
+                            .and_then(|samples| total.checked_add(samples))
+                    })
                     .ok_or(VarDctDecodeError::ArithmeticOverflow {
                         field: "LF-group validation sample count",
                     })?

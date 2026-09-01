@@ -15,7 +15,8 @@ use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat,
 use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
-    ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, WgpuBackend, WgpuBackendConfig,
+    ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
+    WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
 use jxl_wgpu_decode::vardct::packet::{
@@ -189,6 +190,60 @@ fn maximum_error(left: &[u8], right: &[u8]) -> u8 {
         .map(|(&left, &right)| left.abs_diff(right))
         .max()
         .unwrap_or(0)
+}
+
+#[test]
+fn jpeg_transcode_ycbcr_420_raw_matrix_matches_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let encoded = common::jpeg_transcode_raw_matrix();
+    let extent = Extent2d::new(264, 64);
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let mut session = decoder
+        .open(
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let memory = session
+        .submission_session()
+        .vardct()
+        .expect("JPEG reconstruction selects the VarDCT submission session")
+        .memory_stats();
+    assert_eq!(memory.resident_plane_bytes, [17_408, 69_632, 17_408]);
+    assert_eq!(memory.resident_image_bytes, 104_448);
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(encoded, extent);
+    assert_eq!(actual.len(), rust.len());
+    let rust_error = maximum_error(actual, &rust);
+    assert!(
+        rust_error <= 1,
+        "JPEG-transcode GPU output diverges from Rust jxl by {rust_error}",
+    );
+    if let Some(djxl) = djxl_ppm(encoded, extent) {
+        let djxl_error = maximum_error(actual, &djxl);
+        assert!(
+            djxl_error <= 1,
+            "JPEG-transcode GPU output diverges from djxl by {djxl_error}",
+        );
+    }
 }
 
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
@@ -807,13 +862,11 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .expect("VarDCT input selects the VarDCT submission session")
             .memory_stats();
         assert_eq!(
-            memory.xyb_plane_bytes,
+            memory.resident_image_bytes,
             u64::from(extent.width.div_ceil(8) * 8) * u64::from(extent.height.div_ceil(8) * 8) * 12,
         );
-        assert_eq!(
-            memory.resident_transient_bytes,
-            2 * u64::from(blocks * 8 * 8 * 3) * std::mem::size_of::<f32>() as u64 + 27 * 128,
-        );
+        let resident_plan = ResidentVarDctMemoryPlan::new(blocks * 8 * 8 * 3).unwrap();
+        assert_eq!(memory.resident_transient_bytes, resident_plan.total_bytes);
         let frame = if extent.width == 257 {
             pollster::block_on(session.next_frame_async())
                 .unwrap()
@@ -1711,7 +1764,10 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
         .vardct()
         .expect("VarDCT input selects the VarDCT submission session")
         .memory_stats();
-    assert_eq!(memory.restoration_scratch_bytes, memory.xyb_plane_bytes);
+    assert_eq!(
+        memory.restoration_scratch_bytes,
+        memory.resident_image_bytes
+    );
     assert_eq!(memory.gaborish_uniform_bytes, 80);
     assert_eq!(
         memory.transient_bytes + memory.output_lease_bytes,
@@ -1787,7 +1843,10 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
             .vardct()
             .expect("EPF fixture selects the VarDCT submission session")
             .memory_stats();
-        assert_eq!(memory.restoration_scratch_bytes, memory.xyb_plane_bytes);
+        assert_eq!(
+            memory.restoration_scratch_bytes,
+            memory.resident_image_bytes
+        );
         assert_eq!(memory.gaborish_uniform_bytes, 80);
         assert_eq!(memory.epf_sigma_bytes, 33 * 3 * 4);
         assert_eq!(memory.epf_sigma_uniform_bytes, 80);

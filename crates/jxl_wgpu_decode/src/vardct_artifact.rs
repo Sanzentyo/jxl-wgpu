@@ -13,6 +13,8 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
+use crate::vardct_frontend::VarDctChannelShift;
+
 pub const VAR_DCT_STRATEGY_COUNT: usize = 27;
 pub const HF_ORDER_COUNT: usize = 13;
 pub const HF_ORDER_CHANNELS: usize = 3;
@@ -114,6 +116,11 @@ pub struct HfMetadataArtifactConfig {
     pub correlation_offset: u32,
     /// LF-global quantization scale denominator component.
     pub global_scale: u32,
+    /// Effective resident channel shifts in Cb/X, Y, Cr/B order.
+    pub channel_shifts: [VarDctChannelShift; 3],
+    /// Base vector and row stride of each channel's LF resource plane.
+    pub lf_offsets: [u32; 3],
+    pub lf_strides: [u32; 3],
     /// Resource-vector offsets for the dequant matrix selected by each wire strategy.
     pub matrix_offsets: [u32; VAR_DCT_STRATEGY_COUNT],
 }
@@ -157,6 +164,32 @@ impl VarDctArtifactLayout {
             return Err(VarDctArtifactError::InvalidGeometry {
                 field: "LF stride is smaller than the block width",
             });
+        }
+        for (channel, shift) in config.channel_shifts.into_iter().enumerate() {
+            if shift.horizontal > 1 || shift.vertical > 1 {
+                return Err(VarDctArtifactError::InvalidGeometry {
+                    field: "JPEG component shift exceeds one bit",
+                });
+            }
+            let factor = 1u32 << shift.horizontal;
+            let origin = config.destination_origin[0]
+                .checked_div(8)
+                .map(|value| value >> shift.horizontal)
+                .ok_or(VarDctArtifactError::ArithmeticOverflow {
+                    field: "component LF horizontal origin",
+                })?;
+            let width = config.blocks_width.div_ceil(factor);
+            let right =
+                origin
+                    .checked_add(width)
+                    .ok_or(VarDctArtifactError::ArithmeticOverflow {
+                        field: "component LF horizontal extent",
+                    })?;
+            if right > config.lf_strides[channel] {
+                return Err(VarDctArtifactError::InvalidGeometry {
+                    field: "component LF horizontal extent exceeds its stride",
+                });
+            }
         }
         if config.correlation_stride < config.correlation_width {
             return Err(VarDctArtifactError::InvalidGeometry {
@@ -622,7 +655,7 @@ pub struct GpuGeneralVarDctTask {
     pub matrix_offset: u32,
     pub quant_index: u32,
     pub coefficient_origin_x: u32,
-    pub lf_offset: u32,
+    pub lf_offset_x: u32,
     pub channel_mask: u32,
     pub coefficient_origin_y: u32,
     pub destination_x_x: u32,
@@ -631,8 +664,8 @@ pub struct GpuGeneralVarDctTask {
     pub destination_y_y: u32,
     pub destination_x_b: u32,
     pub destination_y_b: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub lf_offset_y: u32,
+    pub lf_offset_b: u32,
 }
 
 /// Entropy-side metadata parallel to the compact general-transform task array.
@@ -673,6 +706,7 @@ pub struct HfMetadataLoweringParams {
     pub artifact_offsets: [u32; 4],
     pub metadata_offsets: [u32; 4],
     pub source_offsets: [u32; 4],
+    pub channel_geometry: [[u32; 4]; 3],
     pub matrix_offsets: [[u32; 4]; 7],
     pub dequant_scales: [f32; 4],
     pub correlation_params: [f32; 4],
@@ -727,6 +761,15 @@ impl HfMetadataLoweringParams {
                 config.global_scale,
                 config.correlation_stride,
             ],
+            channel_geometry: std::array::from_fn(|channel| {
+                let shift = config.channel_shifts[channel];
+                [
+                    shift.horizontal,
+                    shift.vertical,
+                    config.lf_offsets[channel],
+                    config.lf_strides[channel],
+                ]
+            }),
             matrix_offsets,
             dequant_scales: [dequant_scales[0], dequant_scales[1], dequant_scales[2], 0.0],
             correlation_params: [
@@ -961,7 +1004,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuDispatchIndirectArgs>() == 12);
     assert!(std::mem::size_of::<GpuHfOrderDescriptor>() == 16);
     assert!(std::mem::size_of::<HfCoefficientSinkParams>() == 32);
-    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 240);
+    assert!(std::mem::size_of::<HfMetadataLoweringParams>() == 288);
     assert!(std::mem::align_of::<HfMetadataLoweringParams>() == 16);
 };
 

@@ -25,7 +25,35 @@ const MAX_GROUPS: u64 = 1 << 16;
 /// conversion, restoration, and output packing have separate capability checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VarDctFrontendCapability {
-    SinglePassXybEntropyPackets,
+    SinglePassEntropyPackets,
+}
+
+/// Effective horizontal and vertical JPEG component subsampling relative to the largest
+/// component grid. JPEG XL permits only zero or one bit of shift on each axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VarDctChannelShift {
+    pub horizontal: u32,
+    pub vertical: u32,
+}
+
+impl VarDctChannelShift {
+    #[must_use]
+    pub const fn is_subsampled(self) -> bool {
+        self.horizontal != 0 || self.vertical != 0
+    }
+
+    pub(crate) fn shifted_extent(self, width: u32, height: u32) -> Option<[u32; 2]> {
+        let horizontal = 1u32.checked_shl(self.horizontal)?;
+        let vertical = 1u32.checked_shl(self.vertical)?;
+        Some([width.div_ceil(horizontal), height.div_ceil(vertical)])
+    }
+}
+
+/// Color-domain contract carried by resident VarDCT planes before output conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VarDctColorTransform {
+    Xyb,
+    Ycbcr,
 }
 
 /// Feature that prevents a codestream from entering the initial GPU VarDCT path.
@@ -900,6 +928,13 @@ pub struct StandardVarDctProfile {
     pub width: u32,
     pub height: u32,
     pub bits_per_sample: u32,
+    pub color_transform: VarDctColorTransform,
+    /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
+    pub channel_shifts: [VarDctChannelShift; 3],
+    /// Raw JPEG component sampling selectors in Cb/X, Y, Cr/B order.
+    pub jpeg_upsampling: [u32; 3],
+    /// Axis padding required by the JPEG component sampling factors before channel shifts.
+    pub jpeg_block_alignment: [u32; 2],
     pub group_dimension: u32,
     pub group_count: u64,
     pub low_frequency_group_count: u64,
@@ -925,7 +960,7 @@ pub struct VarDctGroupRect {
 }
 
 impl StandardVarDctProfile {
-    /// Negotiate the strict single-frame/single-pass XYB VarDCT transform profile.
+    /// Negotiate the strict single-frame/single-pass XYB or JPEG-reconstruction VarDCT profile.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, VarDctFrontendError> {
         Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
     }
@@ -969,10 +1004,18 @@ impl StandardVarDctProfile {
                 })?
         };
         Ok(Self {
-            capability: VarDctFrontendCapability::SinglePassXybEntropyPackets,
+            capability: VarDctFrontendCapability::SinglePassEntropyPackets,
             width,
             height,
             bits_per_sample,
+            color_transform: if frame.do_ycbcr {
+                VarDctColorTransform::Ycbcr
+            } else {
+                VarDctColorTransform::Xyb
+            },
+            channel_shifts: jpeg_channel_shifts(frame.jpeg_upsampling),
+            jpeg_upsampling: frame.jpeg_upsampling,
+            jpeg_block_alignment: jpeg_block_alignment(frame.jpeg_upsampling),
             group_dimension: 128u32 << frame.group_size_shift,
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
@@ -1049,6 +1092,83 @@ impl StandardVarDctProfile {
         }
         Ok(lf_index)
     }
+
+    pub(crate) fn padded_group_block_extent(
+        &self,
+        rect: VarDctGroupRect,
+    ) -> Result<[u32; 2], VarDctFrontendError> {
+        let width = align_up_power_of_two(rect.width.div_ceil(8), self.jpeg_block_alignment[0])?;
+        let height = align_up_power_of_two(rect.height.div_ceil(8), self.jpeg_block_alignment[1])?;
+        Ok([width, height])
+    }
+
+    pub(crate) fn channel_block_extent(
+        &self,
+        rect: VarDctGroupRect,
+        channel: usize,
+    ) -> Result<[u32; 2], VarDctFrontendError> {
+        let [width, height] = self.padded_group_block_extent(rect)?;
+        self.channel_shifts
+            .get(channel)
+            .and_then(|shift| shift.shifted_extent(width, height))
+            .ok_or(VarDctFrontendError::Unsupported {
+                feature: UnsupportedVarDctFeature::ImageDimensions,
+            })
+    }
+
+    pub(crate) fn lf_entropy_channel_block_extents(
+        &self,
+        rect: VarDctGroupRect,
+    ) -> Result<[[u32; 2]; 3], VarDctFrontendError> {
+        Ok([
+            self.channel_block_extent(rect, 1)?,
+            self.channel_block_extent(rect, 0)?,
+            self.channel_block_extent(rect, 2)?,
+        ])
+    }
+
+    pub(crate) fn uses_chroma_from_luma(&self) -> bool {
+        self.jpeg_upsampling == [0; 3]
+    }
+}
+
+fn align_up_power_of_two(value: u32, shift: u32) -> Result<u32, VarDctFrontendError> {
+    let alignment = 1u32
+        .checked_shl(shift)
+        .ok_or(VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::ImageDimensions,
+        })?;
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+        .ok_or(VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::ImageDimensions,
+        })
+}
+
+fn jpeg_block_alignment(jpeg_upsampling: [u32; 3]) -> [u32; 2] {
+    const HORIZONTAL: [u32; 4] = [0, 1, 1, 0];
+    const VERTICAL: [u32; 4] = [0, 1, 0, 1];
+    jpeg_upsampling.into_iter().fold([0, 0], |maximum, value| {
+        let index = value as usize;
+        [
+            maximum[0].max(HORIZONTAL[index]),
+            maximum[1].max(VERTICAL[index]),
+        ]
+    })
+}
+
+fn jpeg_channel_shifts(jpeg_upsampling: [u32; 3]) -> [VarDctChannelShift; 3] {
+    const HORIZONTAL: [u32; 4] = [0, 1, 1, 0];
+    const VERTICAL: [u32; 4] = [0, 1, 0, 1];
+    let maximum = jpeg_block_alignment(jpeg_upsampling);
+    jpeg_upsampling.map(|value| {
+        let index = value as usize;
+        VarDctChannelShift {
+            horizontal: maximum[0] - HORIZONTAL[index],
+            vertical: maximum[1] - VERTICAL[index],
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1130,9 +1250,6 @@ fn validate_image(inventory: &CodestreamInventory) -> Result<(), VarDctFrontendE
     {
         return unsupported(UnsupportedVarDctFeature::ImageDimensions);
     }
-    if !image.xyb_encoded {
-        return unsupported(UnsupportedVarDctFeature::NonXybImage);
-    }
     if image.grayscale {
         return unsupported(UnsupportedVarDctFeature::GrayscaleImage);
     }
@@ -1205,10 +1322,16 @@ fn validate_frame(
     if frame.flags & !supported_flags != 0 {
         return unsupported(UnsupportedVarDctFeature::FrameFeatures);
     }
-    if frame.do_ycbcr {
+    if !inventory.image_header.xyb_encoded && !frame.do_ycbcr {
+        return unsupported(UnsupportedVarDctFeature::NonXybImage);
+    }
+    if inventory.image_header.xyb_encoded && frame.do_ycbcr {
         return unsupported(UnsupportedVarDctFeature::Ycbcr);
     }
-    if frame.jpeg_upsampling != [0; 3] {
+    if frame.jpeg_upsampling.into_iter().any(|value| value > 3) {
+        return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
+    }
+    if !frame.do_ycbcr && frame.jpeg_upsampling != [0; 3] {
         return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
     }
     if frame.upsampling != 1

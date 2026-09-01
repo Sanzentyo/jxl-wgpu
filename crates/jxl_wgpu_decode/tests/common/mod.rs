@@ -1,6 +1,21 @@
 #![allow(dead_code)]
 
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn temp_file_nonce() -> String {
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    )
+}
 
 pub fn cjxl_local_tree_codestream() -> Option<Vec<u8>> {
     if std::process::Command::new("cjxl")
@@ -11,14 +26,7 @@ pub fn cjxl_local_tree_codestream() -> Option<Vec<u8>> {
         eprintln!("skipping local-tree VarDCT oracle: cjxl is not installed");
         return None;
     }
-    let nonce = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let nonce = temp_file_nonce();
     let ppm_path = std::env::temp_dir().join(format!("jxl-wgpu-local-tree-{nonce}.ppm"));
     let jxl_path = std::env::temp_dir().join(format!("jxl-wgpu-local-tree-{nonce}.jxl"));
     let width = 2056_u32;
@@ -61,14 +69,7 @@ pub fn cjxl_progressive_dc_codestream(level: u8) -> Option<Vec<u8>> {
         eprintln!("skipping progressive-DC oracle: cjxl is not installed");
         return None;
     }
-    let nonce = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let nonce = temp_file_nonce();
     let ppm_path = std::env::temp_dir().join(format!("jxl-wgpu-progressive-dc-{nonce}.ppm"));
     let jxl_path = std::env::temp_dir().join(format!("jxl-wgpu-progressive-dc-{nonce}.jxl"));
     let (width, height) = (1_024_u32, 128_u32);
@@ -217,6 +218,15 @@ pub fn testsrc_vardct_multi_lf_skip_smoothing() -> &'static [u8] {
     static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
         decode_hex(include_str!(
             "../../test-data/testsrc_vardct_multi_lf_skip_smoothing.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn jpeg_transcode_raw_matrix() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_raw_matrix.jxl.hex"
         ))
     });
     BYTES.as_slice()

@@ -4,7 +4,7 @@ struct Task {
     matrix_offset: u32,
     quant_index: u32,
     coefficient_origin_x: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     channel_mask: u32,
     coefficient_origin_y: u32,
     destination_x_x: u32,
@@ -13,8 +13,8 @@ struct Task {
     destination_y_y: u32,
     destination_x_b: u32,
     destination_y_b: u32,
-    _pad1: u32,
-    _pad2: u32,
+    lf_offset_y: u32,
+    lf_offset_b: u32,
 };
 
 struct Params {
@@ -27,7 +27,7 @@ struct Params {
     lf_height: u32,
     quant_offset: u32,
     correlation_offset: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     output_width_x: u32,
     output_height_x: u32,
     output_stride_x: u32,
@@ -42,11 +42,12 @@ struct Params {
     correlation_height: u32,
     task_word_offset: u32,
     bucket_word_offset: u32,
-    lf_stride: u32,
+    lf_stride_x: u32,
     _padding0: u32,
     _padding1: u32,
     _padding2: u32,
     quant_biases: vec4<f32>,
+    lf_channel_layout: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> coefficients: array<i32>;
@@ -405,10 +406,9 @@ fn main(
             + correlation_cell_x
     ].xy;
     if (lane == 0u) {
-        let lf = resources[params.lf_offset + task.lf_offset].xyz;
-        block[0u] = lf.x;
-        block[64u] = lf.y;
-        block[128u] = lf.z;
+        block[0u] = resources[params.lf_offset_x + task.lf_offset_x].x;
+        block[64u] = resources[params.lf_channel_layout.x + task.lf_offset_y].y;
+        block[128u] = resources[params.lf_channel_layout.y + task.lf_offset_b].z;
     } else {
         block[lane] = fma(correlation.x, y_value, x_value);
         block[64u + lane] = y_value;

@@ -291,7 +291,7 @@ struct GpuTask {
     matrix_offset: u32,
     quant_index: u32,
     coefficient_origin_x: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     channel_mask: u32,
     coefficient_origin_y: u32,
     destination_x_x: u32,
@@ -300,8 +300,8 @@ struct GpuTask {
     destination_y_y: u32,
     destination_x_b: u32,
     destination_y_b: u32,
-    _pad1: u32,
-    _pad2: u32,
+    lf_offset_y: u32,
+    lf_offset_b: u32,
 }
 
 #[repr(C, align(16))]
@@ -320,7 +320,7 @@ struct GeneralUniform {
     lf_height: u32,
     quant_offset: u32,
     correlation_offset: u32,
-    lf_offset: u32,
+    lf_offset_x: u32,
     output_width_x: u32,
     output_height_x: u32,
     output_stride_x: u32,
@@ -335,11 +335,12 @@ struct GeneralUniform {
     correlation_height: u32,
     task_word_offset: u32,
     bucket_word_offset: u32,
-    lf_stride: u32,
+    lf_stride_x: u32,
     _padding0: u32,
     _padding1: u32,
     _padding2: u32,
     quant_biases: [f32; 4],
+    lf_channel_layout: [u32; 4],
 }
 
 const _: () = {
@@ -347,7 +348,7 @@ const _: () = {
     assert!(std::mem::align_of::<GpuTask>() == 4);
     assert!(std::mem::size_of::<GpuResourceVector>() == 16);
     assert!(std::mem::align_of::<GpuResourceVector>() == 16);
-    assert!(std::mem::size_of::<GeneralUniform>() == 128);
+    assert!(std::mem::size_of::<GeneralUniform>() == 144);
     assert!(std::mem::align_of::<GeneralUniform>() == 16);
 };
 
@@ -678,7 +679,7 @@ fn prepare(
                     matrix_offset,
                     quant_index: u32::from(task.quant_index),
                     coefficient_origin_x: task.coefficient_origin.0,
-                    lf_offset: task.lf_offset,
+                    lf_offset_x: task.lf_offset,
                     channel_mask,
                     coefficient_origin_y: task.coefficient_origin.1,
                     destination_x_x: destinations[0].0,
@@ -687,8 +688,8 @@ fn prepare(
                     destination_y_y: destinations[1].1,
                     destination_x_b: destinations[2].0,
                     destination_y_b: destinations[2].1,
-                    _pad1: 0,
-                    _pad2: 0,
+                    lf_offset_y: task.lf_offset,
+                    lf_offset_b: task.lf_offset,
                 });
             }
         }
@@ -932,7 +933,7 @@ fn encode_prepared(
                 lf_height: lf_extent.height,
                 quant_offset: prepared.quant_offset,
                 correlation_offset: prepared.correlation_offset,
-                lf_offset: prepared.lf_offset,
+                lf_offset_x: prepared.lf_offset,
                 output_width_x: outputs[0].desc.extent.width,
                 output_height_x: outputs[0].desc.extent.height,
                 output_stride_x: stride(&outputs[0].desc),
@@ -947,11 +948,12 @@ fn encode_prepared(
                 correlation_height: prepared.correlation_height,
                 task_word_offset: 0,
                 bucket_word_offset: u32::MAX,
-                lf_stride: 0,
+                lf_stride_x: 0,
                 _padding0: 0,
                 _padding1: 0,
                 _padding2: 0,
                 quant_biases: prepared.quant_biases,
+                lf_channel_layout: [prepared.lf_offset, prepared.lf_offset, 0, 0],
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("jxl-wgpu general VarDCT params"),
@@ -1286,7 +1288,7 @@ mod tests {
             matrix_offset: 3,
             quant_index: 4,
             coefficient_origin_x: 5,
-            lf_offset: 6,
+            lf_offset_x: 6,
             channel_mask: 7,
             coefficient_origin_y: 8,
             destination_x_x: 9,
@@ -1295,8 +1297,8 @@ mod tests {
             destination_y_y: 12,
             destination_x_b: 13,
             destination_y_b: 14,
-            _pad1: 15,
-            _pad2: 16,
+            lf_offset_y: 15,
+            lf_offset_b: 16,
         };
         assert_eq!(abi_words(&task), &(1..=16).collect::<Vec<_>>());
 
@@ -1310,7 +1312,7 @@ mod tests {
             lf_height: 7,
             quant_offset: 8,
             correlation_offset: 9,
-            lf_offset: 10,
+            lf_offset_x: 10,
             output_width_x: 11,
             output_height_x: 12,
             output_stride_x: 13,
@@ -1325,7 +1327,7 @@ mod tests {
             correlation_height: 22,
             task_word_offset: 23,
             bucket_word_offset: 24,
-            lf_stride: 25,
+            lf_stride_x: 25,
             _padding0: 26,
             _padding1: 27,
             _padding2: 28,
@@ -1335,8 +1337,9 @@ mod tests {
                 f32::from_bits(31),
                 f32::from_bits(32),
             ],
+            lf_channel_layout: [33, 34, 35, 36],
         };
-        assert_eq!(abi_words(&params), &(1..=32).collect::<Vec<_>>());
+        assert_eq!(abi_words(&params), &(1..=36).collect::<Vec<_>>());
 
         let task_fields = [
             "coefficient_offset",
@@ -1344,7 +1347,7 @@ mod tests {
             "matrix_offset",
             "quant_index",
             "coefficient_origin_x",
-            "lf_offset",
+            "lf_offset_x",
             "channel_mask",
             "coefficient_origin_y",
             "destination_x_x",
@@ -1353,8 +1356,8 @@ mod tests {
             "destination_y_y",
             "destination_x_b",
             "destination_y_b",
-            "_pad1",
-            "_pad2",
+            "lf_offset_y",
+            "lf_offset_b",
         ];
         let param_fields = [
             "task_base",
@@ -1366,7 +1369,7 @@ mod tests {
             "lf_height",
             "quant_offset",
             "correlation_offset",
-            "lf_offset",
+            "lf_offset_x",
             "output_width_x",
             "output_height_x",
             "output_stride_x",
@@ -1381,11 +1384,12 @@ mod tests {
             "correlation_height",
             "task_word_offset",
             "bucket_word_offset",
-            "lf_stride",
+            "lf_stride_x",
             "_padding0",
             "_padding1",
             "_padding2",
             "quant_biases",
+            "lf_channel_layout",
         ];
         for shader in [
             include_str!("../shaders/vardct_general.wgsl"),

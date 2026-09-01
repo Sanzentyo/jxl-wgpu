@@ -2,6 +2,7 @@
 
 use std::sync::mpsc;
 
+use jxl_wgpu_decode::vardct::frontend::VarDctChannelShift;
 use jxl_wgpu_decode::vardct::resource::{
     VarDctResourceBuffers, VarDctResourceConfig, VarDctResourceParams, VarDctResourcePipeline,
 };
@@ -35,8 +36,11 @@ fn custom_lf_dequantization_and_correlation_execute_on_gpu() {
     };
     let params = VarDctResourceParams::new(VarDctResourceConfig {
         block_extent: [2, 1],
-        output_stride: 2,
         output_origin: [0, 0],
+        channel_shifts: [VarDctChannelShift::default(); 3],
+        lf_offsets: [0; 3],
+        lf_strides: [2; 3],
+        apply_chroma_from_luma: true,
         global_scale: 4,
         quant_lf: 2,
         lf_dequantization: [0.0625, 0.125, 0.25],
