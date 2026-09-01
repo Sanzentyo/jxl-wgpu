@@ -132,6 +132,12 @@ const WATCHDOG_PARALLEL_GROUP_LANE_CAP: usize = 512;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WgpuDecodeMemoryStats {
     pub per_frame_bytes: u64,
+    /// Packed global and deduplicated local MA/entropy descriptors retained on the GPU.
+    pub modular_metadata_bytes: u64,
+    /// Pass groups that select a local rather than the DC-global MA configuration.
+    pub local_ma_group_count: usize,
+    /// Distinct MA configurations resident in `modular_metadata_bytes`, including the global one.
+    pub unique_ma_config_count: usize,
     /// Bytes that remain reserved with the caller-owned output buffer.
     pub output_lease_bytes: u64,
     /// Per-frame bytes released when status readback completes.
@@ -199,6 +205,8 @@ pub enum ModularEntropyCoding {
     Prefix,
     /// JPEG XL's 12-bit asymmetric numeral system.
     Ans,
+    /// Independently coded groups use both Prefix and ANS descriptors.
+    Mixed,
 }
 
 /// GPU output update strategy selected for a validated frame layout.
@@ -275,6 +283,7 @@ struct ShaderParams {
     initialize_chroma: u32,
     source_channels: u32,
     channel_layout_offset: u32,
+    metadata_base: u32,
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
@@ -382,7 +391,7 @@ struct DecodeStatus {
 const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 240);
+    assert!(std::mem::size_of::<ShaderParams>() == 244);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<EntropyExecutionState>() == 32);
     assert!(std::mem::align_of::<EntropyExecutionState>() == 16);
@@ -458,11 +467,22 @@ fn reconstruction_specialization(
     if uses_generalized_channel_layout(profile) {
         return ModularReconstructionSpecialization::DescriptorMetaAdaptive;
     }
-    channel_fixed_gradient_specialization(
-        &profile.ma_config.nodes,
-        profile.channels.count(),
-        profile.ma_config.needs_self_correcting(),
-    )
+    let mut candidates = profile.resident_group_plans.iter().map(|plan| {
+        let ma_config = plan.ma_config.resolve(&profile.ma_config);
+        channel_fixed_gradient_specialization(
+            &ma_config.nodes,
+            profile.channels.count(),
+            ma_config.needs_self_correcting(),
+        )
+    });
+    let Some(first) = candidates.next() else {
+        return ModularReconstructionSpecialization::GenericMetaAdaptive;
+    };
+    if candidates.all(|candidate| candidate == first) {
+        first
+    } else {
+        ModularReconstructionSpecialization::GenericMetaAdaptive
+    }
 }
 
 fn uses_generalized_channel_layout(profile: &StandardModularProfile) -> bool {
@@ -669,18 +689,71 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
-        let mut modular_metadata = profile.ma_config.pack_gpu_metadata()?.words;
+        if profile.resident_group_plans.len() != profile.groups.len() {
+            return Err(Error::EngineContract(
+                "Modular group plans do not match the frame grid",
+            ));
+        }
+        let mut modular_metadata = Vec::new();
+        let global_metadata_offset = profile
+            .ma_config
+            .pack_gpu_metadata()?
+            .append_to(&mut modular_metadata)?;
+        if global_metadata_offset != 0 {
+            return Err(Error::EngineContract(
+                "global Modular metadata did not start at word zero",
+            ));
+        }
+        let mut unique_local_metadata = Vec::<(usize, u32)>::new();
+        let ma_metadata_offsets: Arc<[u32]> = profile
+            .resident_group_plans
+            .iter()
+            .enumerate()
+            .map(|(group_index, plan)| match &plan.ma_config {
+                crate::profile::ModularMaConfig::Global => Ok(0),
+                crate::profile::ModularMaConfig::Local(local) => {
+                    if let Some((_, offset)) =
+                        unique_local_metadata.iter().find(|(candidate_index, _)| {
+                            matches!(
+                                &profile.resident_group_plans[*candidate_index].ma_config,
+                                crate::profile::ModularMaConfig::Local(candidate)
+                                    if candidate == local
+                            )
+                        })
+                    {
+                        return Ok(*offset);
+                    }
+                    let offset = local
+                        .pack_gpu_metadata()?
+                        .append_to(&mut modular_metadata)?;
+                    unique_local_metadata.push((group_index, offset));
+                    Ok(offset)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into();
+        let local_ma_group_count = ma_metadata_offsets
+            .iter()
+            .filter(|&&offset| offset != global_metadata_offset)
+            .count();
+        let unique_ma_config_count = unique_local_metadata
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Error::backend("Modular MA configuration count overflow"))?;
+        let metadata_inventory = ModularMetadataInventory {
+            local_ma_group_count,
+            unique_ma_config_count,
+        };
         let generalized_channels = uses_generalized_channel_layout(&profile);
         let channel_layout_offsets: Arc<[u32]> = if generalized_channels {
-            if profile.resident_group_plans.len() != profile.groups.len() {
-                return Err(Error::EngineContract(
-                    "generalized Modular group plans do not match the frame grid",
-                ));
-            }
-            let mut unique = Vec::<(ResidentModularGroupPlan, u32)>::new();
+            let mut unique = Vec::<(usize, u32)>::new();
             let mut offsets = Vec::with_capacity(profile.resident_group_plans.len());
-            for plan in &profile.resident_group_plans {
-                if let Some((_, offset)) = unique.iter().find(|(candidate, _)| candidate == plan) {
+            for (group_index, plan) in profile.resident_group_plans.iter().enumerate() {
+                if let Some((_, offset)) = unique.iter().find(|(candidate_index, _)| {
+                    let candidate = &profile.resident_group_plans[*candidate_index];
+                    candidate.channel_metadata == plan.channel_metadata
+                        && candidate.inverse_plan == plan.inverse_plan
+                }) {
                     offsets.push(*offset);
                     continue;
                 }
@@ -689,7 +762,7 @@ impl WgpuSubmissionEngine {
                     plan.inverse_plan.arena_words(),
                     &plan.inverse_plan.final_gpu_layouts(),
                 )?;
-                unique.push((plan.clone(), offset));
+                unique.push((group_index, offset));
                 offsets.push(offset);
             }
             offsets.into()
@@ -791,6 +864,7 @@ impl WgpuSubmissionEngine {
         let memory_stats = validate_device_limits(
             self.backend.device(),
             &modular_metadata,
+            metadata_inventory,
             &dispatch_layout,
             &output,
             request.max_frame_slots().get(),
@@ -798,11 +872,24 @@ impl WgpuSubmissionEngine {
         )?;
         let resolved_frame_slots = NonZeroUsize::new(memory_stats.max_frame_slots)
             .expect("device admission always resolves at least one frame slot");
-        let node_count = u32::try_from(profile.ma_config.nodes.len())
+        let reported_ma_config = profile
+            .resident_group_plans
+            .iter()
+            .map(|plan| plan.ma_config.resolve(&profile.ma_config))
+            .max_by_key(|config| {
+                (
+                    config.nodes.len(),
+                    config.max_depth,
+                    config.needs_self_correcting(),
+                )
+            })
+            .ok_or(Error::EngineContract(
+                "Modular frame has no group MA configuration",
+            ))?;
+        let node_count = u32::try_from(reported_ma_config.nodes.len())
             .map_err(|_| Error::backend("MA tree node count exceeds public profile bounds"))?;
         let decision_node_count = u32::try_from(
-            profile
-                .ma_config
+            reported_ma_config
                 .nodes
                 .iter()
                 .filter(|node| matches!(node, MaTreeNodeIr::Decision { .. }))
@@ -812,14 +899,14 @@ impl WgpuSubmissionEngine {
         let leaf_context_count = node_count
             .checked_sub(decision_node_count)
             .ok_or_else(|| Error::backend("MA leaf context count underflow"))?;
-        let max_depth = u32::try_from(profile.ma_config.max_depth)
+        let max_depth = u32::try_from(reported_ma_config.max_depth)
             .map_err(|_| Error::backend("MA tree depth exceeds public profile bounds"))?;
         let prediction = ModularPredictionProfile::MetaAdaptive {
             node_count,
             decision_node_count,
             leaf_context_count,
             max_depth,
-            uses_self_correcting: profile.ma_config.needs_self_correcting(),
+            uses_self_correcting: reported_ma_config.needs_self_correcting(),
         };
         Ok(PreparedGpuSession::new(
             DecodeProfile::ModularLossless {
@@ -844,6 +931,7 @@ impl WgpuSubmissionEngine {
                     profile,
                     dispatch_layout,
                     modular_metadata,
+                    ma_metadata_offsets,
                     channel_layout_offsets,
                     finalize_params,
                     output,
@@ -1418,9 +1506,10 @@ struct DecodeSource {
     codestream: Arc<GpuCodestream>,
     profile: StandardModularProfile,
     dispatch_layout: GroupDispatchLayout,
-    // Immutable within the session. All independently decoded groups share the standard
-    // DC-global MA/entropy descriptor without sharing mutable GPU transient allocations.
+    // Immutable within the session. Global and deduplicated local MA/entropy descriptors share
+    // one rebased word buffer without sharing mutable GPU transient allocations.
     modular_metadata: Arc<[u32]>,
+    ma_metadata_offsets: Arc<[u32]>,
     channel_layout_offsets: Arc<[u32]>,
     finalize_params: Arc<[ModularFinalizeParams]>,
     output: OutputPlan,
@@ -1518,13 +1607,30 @@ impl GroupDispatchLayout {
             output.write_path_for_groups(&profile.groups)?
         };
         let reconstruction_specialization = reconstruction_specialization(profile);
-        let execution_state_bytes_per_lane = modular_execution_state_bytes(
-            reconstruction_specialization,
-            profile.ma_config.needs_self_correcting(),
-        );
-        let entropy_coding = match profile.ma_config.entropy.coder {
-            EntropyCoderIr::Prefix(_) => ModularEntropyCoding::Prefix,
-            EntropyCoderIr::Ans { .. } => ModularEntropyCoding::Ans,
+        let needs_self_correcting = profile.resident_group_plans.iter().any(|plan| {
+            plan.ma_config
+                .resolve(&profile.ma_config)
+                .needs_self_correcting()
+        });
+        let execution_state_bytes_per_lane =
+            modular_execution_state_bytes(reconstruction_specialization, needs_self_correcting);
+        let mut saw_prefix = false;
+        let mut saw_ans = false;
+        for plan in &profile.resident_group_plans {
+            match plan.ma_config.resolve(&profile.ma_config).entropy.coder {
+                EntropyCoderIr::Prefix(_) => saw_prefix = true,
+                EntropyCoderIr::Ans { .. } => saw_ans = true,
+            }
+        }
+        let entropy_coding = match (saw_prefix, saw_ans) {
+            (true, false) => ModularEntropyCoding::Prefix,
+            (false, true) => ModularEntropyCoding::Ans,
+            (true, true) => ModularEntropyCoding::Mixed,
+            (false, false) => {
+                return Err(Error::EngineContract(
+                    "Modular frame has no group entropy descriptors",
+                ));
+            }
         };
         let limits = device.limits();
         let group_workgroup_size = options.kernel_variant.workgroup_size().0;
@@ -1899,7 +2005,7 @@ fn group_reconstructed_bytes(
     physical_sample_words: u32,
     execution_state_bytes: u64,
 ) -> Result<u64> {
-    let predictor_words = if profile.ma_config.needs_self_correcting() {
+    let predictor_words = if group_ma_config(profile, group_index)?.needs_self_correcting() {
         u64::from(group_maximum_channel_width(profile, group_index, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
@@ -1946,7 +2052,7 @@ fn group_entropy_state_offset_words(
     decoded_symbol_count: u32,
     physical_sample_words: u32,
 ) -> Result<u32> {
-    let predictor_words = if profile.ma_config.needs_self_correcting() {
+    let predictor_words = if group_ma_config(profile, group_index)?.needs_self_correcting() {
         u64::from(group_maximum_channel_width(profile, group_index, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
@@ -2051,10 +2157,21 @@ fn group_lz77_window_words(
     group: ModularGroup,
     decoded_symbol_count: u32,
 ) -> Result<u32> {
-    profile.ma_config.entropy.lz77_window_words(
-        group_maximum_channel_width(profile, group_index, group)?,
-        decoded_symbol_count,
-    )
+    group_ma_config(profile, group_index)?
+        .entropy
+        .lz77_window_words(
+            group_maximum_channel_width(profile, group_index, group)?,
+            decoded_symbol_count,
+        )
+}
+
+fn group_ma_config(
+    profile: &StandardModularProfile,
+    group_index: usize,
+) -> Result<&crate::modular_tree::MaConfigIr> {
+    Ok(resident_group_plan(profile, group_index)?
+        .ma_config
+        .resolve(&profile.ma_config))
 }
 
 fn resident_group_plan(
@@ -2562,9 +2679,16 @@ fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
     Ok((transfer, spec.range == ColorRange::Limited))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModularMetadataInventory {
+    local_ma_group_count: usize,
+    unique_ma_config_count: usize,
+}
+
 fn validate_device_limits(
     device: &wgpu::Device,
     modular_metadata: &[u32],
+    metadata_inventory: ModularMetadataInventory,
     dispatch: &GroupDispatchLayout,
     output: &OutputPlan,
     requested_frame_slots: usize,
@@ -2661,6 +2785,9 @@ fn validate_device_limits(
     }
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
+        modular_metadata_bytes: metadata_bytes,
+        local_ma_group_count: metadata_inventory.local_ma_group_count,
+        unique_ma_config_count: metadata_inventory.unique_ma_config_count,
         output_lease_bytes: output_bytes,
         transient_bytes,
         max_frame_slots,
@@ -3415,11 +3542,9 @@ fn build_params(
         decoded_symbol_count,
         physical_sample_words,
     )?;
-    let wp_header = if uses_generalized_channel_layout(&source.profile) {
-        resident_group_plan(&source.profile, group_index)?.wp_header
-    } else {
-        source.profile.wp_header
-    };
+    let group_plan = resident_group_plan(&source.profile, group_index)?;
+    let wp_header = group_plan.wp_header;
+    let ma_config = group_plan.ma_config.resolve(&source.profile.ma_config);
     Ok(ShaderParams {
         entropy: EntropyStreamParams {
             token_start: 0,
@@ -3444,9 +3569,12 @@ fn build_params(
             .get(group_index)
             .copied()
             .unwrap_or(0),
+        metadata_base: source.ma_metadata_offsets.get(group_index).copied().ok_or(
+            Error::EngineContract("Modular group MA metadata offset is missing"),
+        )?,
         source_bits: u32::from(source.profile.bits_per_sample),
         source_mask: (1u32 << source.profile.bits_per_sample) - 1,
-        needs_self_correcting: u32::from(source.profile.ma_config.needs_self_correcting()),
+        needs_self_correcting: u32::from(ma_config.needs_self_correcting()),
         output_kind: source.output.kind as u32,
         transfer: source.output.transfer,
         limited_range: u32::from(source.output.limited_range),
@@ -4381,7 +4509,7 @@ mod tests {
         assert_eq!(MIN_STREAM_WINDOW_BYTES, 40);
         assert_eq!(align16(1).unwrap(), 16);
         assert_eq!(align16(16).unwrap(), 16);
-        assert_eq!(std::mem::size_of::<ShaderParams>(), 240);
+        assert_eq!(std::mem::size_of::<ShaderParams>(), 244);
         assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
         let params = ShaderParams {
             entropy: EntropyStreamParams {
@@ -4403,56 +4531,57 @@ mod tests {
             initialize_chroma: 15,
             source_channels: 16,
             channel_layout_offset: 17,
-            source_bits: 18,
-            source_mask: 19,
-            needs_self_correcting: 20,
-            output_kind: 21,
-            transfer: 22,
-            limited_range: 23,
-            channels: 24,
-            order: 25,
-            bits: 26,
-            storage_bits: 27,
-            plane0_offset: 28,
-            plane0_stride: 29,
-            plane1_offset: 30,
-            plane1_stride: 31,
-            plane2_offset: 32,
-            plane2_stride: 33,
-            plane3_offset: 34,
-            plane3_stride: 35,
-            chroma_width: 36,
-            chroma_height: 37,
-            logical_size: 38,
-            numeric_mapping: 39,
-            status_index: 40,
-            stream_index: 41,
-            fixed_leaf_predictor: 42,
-            fixed_leaf_offset: 43,
-            fixed_leaf_multiplier: 44,
-            fixed_leaf_cluster0: 45,
-            fixed_leaf_cluster1: 46,
-            fixed_leaf_cluster2: 47,
-            fixed_leaf_cluster3: 48,
-            fixed_output_mode: 49,
-            wp_p1: 50,
-            wp_p2: 51,
-            wp_p3a: 52,
-            wp_p3b: 53,
-            wp_p3c: 54,
-            wp_p3d: 55,
-            wp_p3e: 56,
-            wp_w0: 57,
-            wp_w1: 58,
-            wp_w2: 59,
-            wp_w3: 60,
+            metadata_base: 18,
+            source_bits: 19,
+            source_mask: 20,
+            needs_self_correcting: 21,
+            output_kind: 22,
+            transfer: 23,
+            limited_range: 24,
+            channels: 25,
+            order: 26,
+            bits: 27,
+            storage_bits: 28,
+            plane0_offset: 29,
+            plane0_stride: 30,
+            plane1_offset: 31,
+            plane1_stride: 32,
+            plane2_offset: 33,
+            plane2_stride: 34,
+            plane3_offset: 35,
+            plane3_stride: 36,
+            chroma_width: 37,
+            chroma_height: 38,
+            logical_size: 39,
+            numeric_mapping: 40,
+            status_index: 41,
+            stream_index: 42,
+            fixed_leaf_predictor: 43,
+            fixed_leaf_offset: 44,
+            fixed_leaf_multiplier: 45,
+            fixed_leaf_cluster0: 46,
+            fixed_leaf_cluster1: 47,
+            fixed_leaf_cluster2: 48,
+            fixed_leaf_cluster3: 49,
+            fixed_output_mode: 50,
+            wp_p1: 51,
+            wp_p2: 52,
+            wp_p3a: 53,
+            wp_p3b: 54,
+            wp_p3c: 55,
+            wp_p3d: 56,
+            wp_p3e: 57,
+            wp_w0: 58,
+            wp_w1: 59,
+            wp_w2: 60,
+            wp_w3: 61,
         };
         assert_eq!(
-            bytemuck::cast::<ShaderParams, [u32; 60]>(params),
+            bytemuck::cast::<ShaderParams, [u32; 61]>(params),
             [
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-                45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+                45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
             ]
         );
         assert_eq!(std::mem::size_of::<EntropyExecutionState>(), 32);

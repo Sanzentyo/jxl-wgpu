@@ -26,7 +26,8 @@ use jxl_wgpu_decode::{
     PrefetchBackpressure, WgpuSubmissionEngine,
 };
 use jxl_wgpu_encode::{
-    BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
+    BufferImageSource, LosslessModularEncoder, LosslessModularFormat, LosslessModularTreeMode,
+    WgpuContext,
 };
 use wgpu::util::DeviceExt;
 
@@ -230,6 +231,24 @@ fn encode_standard_gray8(
     pixels: &[u8],
     container: bool,
 ) -> Vec<u8> {
+    encode_standard_gray8_with_tree_mode(
+        backend,
+        width,
+        height,
+        pixels,
+        container,
+        LosslessModularTreeMode::SharedGlobal,
+    )
+}
+
+fn encode_standard_gray8_with_tree_mode(
+    backend: &WgpuBackend,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    container: bool,
+    tree_mode: LosslessModularTreeMode,
+) -> Vec<u8> {
     let layout = ImageLayout::packed(
         Extent2d::new(width, height),
         PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
@@ -245,7 +264,8 @@ fn encode_standard_gray8(
             }),
     );
     let source = BufferImageSource::new(buffer, layout).unwrap();
-    let encoder = LosslessModularEncoder::new(WgpuContext::from_backend(backend));
+    let encoder =
+        LosslessModularEncoder::with_tree_mode(WgpuContext::from_backend(backend), tree_mode);
     if container {
         encoder.encode_container(source).unwrap()
     } else {
@@ -1417,41 +1437,48 @@ fn standard_multigroup_codestream_is_exact_in_djxl_when_available() {
     };
     let (width, height) = (513, 257);
     let expected = patterned_pixels(width, height);
-    let encoded = encode_standard_gray8(&backend, width, height, &expected, true);
-    let unique = format!(
-        "jxl-wgpu-decode-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after the Unix epoch")
-            .as_nanos()
-    );
-    let input = std::env::temp_dir().join(format!("{unique}.jxl"));
-    let output = std::env::temp_dir().join(format!("{unique}.pgm"));
-    std::fs::write(&input, encoded).expect("write temporary djxl input");
-    let command = Command::new("djxl")
-        .arg(&input)
-        .arg(&output)
-        .arg("--quiet")
-        .output()
-        .expect("run djxl oracle");
-    let decoded = std::fs::read(&output).unwrap_or_else(|error| {
-        panic!(
-            "djxl failed: status={} stderr={} read={error}",
-            command.status,
+    for tree_mode in [
+        LosslessModularTreeMode::SharedGlobal,
+        LosslessModularTreeMode::LocalPerGroup,
+    ] {
+        let encoded = encode_standard_gray8_with_tree_mode(
+            &backend, width, height, &expected, true, tree_mode,
+        );
+        let unique = format!(
+            "jxl-wgpu-decode-{tree_mode:?}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the Unix epoch")
+                .as_nanos()
+        );
+        let input = std::env::temp_dir().join(format!("{unique}.jxl"));
+        let output = std::env::temp_dir().join(format!("{unique}.pgm"));
+        std::fs::write(&input, encoded).expect("write temporary djxl input");
+        let command = Command::new("djxl")
+            .arg(&input)
+            .arg(&output)
+            .arg("--quiet")
+            .output()
+            .expect("run djxl oracle");
+        let decoded = std::fs::read(&output).unwrap_or_else(|error| {
+            panic!(
+                "djxl failed for {tree_mode:?}: status={} stderr={} read={error}",
+                command.status,
+                String::from_utf8_lossy(&command.stderr)
+            )
+        });
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+        assert!(
+            command.status.success(),
+            "djxl failed for {tree_mode:?}: {}",
             String::from_utf8_lossy(&command.stderr)
-        )
-    });
-    let _ = std::fs::remove_file(&input);
-    let _ = std::fs::remove_file(&output);
-    assert!(
-        command.status.success(),
-        "djxl failed: {}",
-        String::from_utf8_lossy(&command.stderr)
-    );
-    let (extent, pixels) = parse_binary_pgm(&decoded).expect("parse djxl PGM output");
-    assert_eq!(extent, (width as usize, height as usize));
-    assert_eq!(pixels, expected);
+        );
+        let (extent, pixels) = parse_binary_pgm(&decoded).expect("parse djxl PGM output");
+        assert_eq!(extent, (width as usize, height as usize));
+        assert_eq!(pixels, expected, "{tree_mode:?}");
+    }
 }
 
 #[test]
@@ -1508,6 +1535,65 @@ fn every_multigroup_gpu_status_is_validated_from_one_map() {
         ),
         "unexpected aggregate status error: {error}"
     );
+}
+
+#[test]
+fn local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust() {
+    let Some(backend) = backend() else {
+        eprintln!("skipping local-MA multi-group test: no wgpu adapter");
+        return;
+    };
+    let (width, height) = (515, 259);
+    let expected = run_and_noise_pixels(width, height);
+    let encoded = encode_standard_gray8_with_tree_mode(
+        &backend,
+        width,
+        height,
+        &expected,
+        false,
+        LosslessModularTreeMode::LocalPerGroup,
+    );
+    let (oracle_extent, oracle) = rust_jxl_decode_gray8(&encoded)
+        .unwrap_or_else(|error| panic!("Rust jxl rejected local-MA codestream: {error}"));
+    assert_eq!(oracle_extent, (width as usize, height as usize));
+    assert_eq!(oracle, expected);
+
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let request = GpuOutputRequest::numeric(
+        PixelFormat::non_color(SampleKind::Unsigned, 8, &[Channel::X]),
+        NumericSampleMapping::NormalizedGray8,
+    )
+    .unwrap();
+    let mut session = decoder
+        .open(&encoded, request)
+        .expect("GPU decoder accepts local per-group MA configurations");
+    assert!(matches!(
+        session.profile(),
+        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups {
+                columns: 3,
+                rows: 2,
+            },
+            ..
+        }
+    ));
+    let stats = session
+        .submission_session()
+        .modular()
+        .expect("local-MA input selects the Modular engine")
+        .memory_stats();
+    assert_eq!(stats.local_ma_group_count, 6);
+    assert_eq!(stats.unique_ma_config_count, 2);
+    assert!(stats.modular_metadata_bytes > 0);
+    assert_eq!(
+        stats.entropy_coding,
+        jxl_wgpu_decode::ModularEntropyCoding::Prefix
+    );
+    let frame = session
+        .next_frame()
+        .expect("local-MA GPU reconstruction succeeds")
+        .expect("local-MA codestream contains one frame");
+    assert_eq!(read_output(&backend, &frame.output().outputs[0]), expected);
 }
 
 #[test]

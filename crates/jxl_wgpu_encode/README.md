@@ -39,8 +39,13 @@ currently executable profiles.
 - Every group/channel produces independent Gradient-predictor residuals, LZ77/raw token events, and
   histograms. The host validates every artifact, combines histograms per channel, creates the four
   JPEG XL context prefix codes, and serializes channels inside standard row-major TOC groups.
-- LF global carries the shared Modular tree and entropy code; LF groups and HF global are empty;
-  each PassGroup carries its own group header and token stream.
+- LF global always carries a valid shared Modular tree and entropy code; LF groups and HF global
+  are empty. `LosslessModularTreeMode::SharedGlobal` makes each PassGroup select that descriptor.
+  `LocalPerGroup` instead writes a complete standards-compliant MA/entropy configuration after
+  every pass-group header. The current local mode repeats the frame-trained codes, providing a
+  deterministic interoperable policy and decoder/conformance input without pretending to perform
+  independent per-group tree learning. A streamed 16K×1 RGB8 test exercises this mode across
+  multiple bounded artifact batches through blocking and runtime-neutral completion.
 
 `LosslessModularEncoder::memory_plan` reports the detected valid bits, component storage bytes,
 full and peak source binding ranges, peak parameter/artifact/readback bytes, diagnostic total
@@ -59,13 +64,17 @@ exact dispatch rectangles and normative PassGroup order before completion.
 
 ```rust,no_run
 # use jxl_wgpu_encode::{
-#     BufferImageSource, LosslessModularEncoder, LosslessModularFormat, WgpuContext,
+#     BufferImageSource, LosslessModularEncoder, LosslessModularFormat,
+#     LosslessModularTreeMode, WgpuContext,
 # };
 # fn submit(
 #     context: WgpuContext,
 #     source: BufferImageSource,
 # ) -> Result<(), jxl_wgpu_encode::EncodeError> {
-let encoder = LosslessModularEncoder::new(context);
+let encoder = LosslessModularEncoder::with_tree_mode(
+    context,
+    LosslessModularTreeMode::LocalPerGroup,
+);
 let plan = encoder.memory_plan(&source)?;
 assert_eq!(plan.group_grid.groups, plan.group_grid.columns * plan.group_grid.rows);
 assert!((1..=16).contains(&plan.bits_per_sample));

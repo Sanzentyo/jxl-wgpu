@@ -345,12 +345,12 @@ fn ma_leaf(
     var node_index = 0u;
     var depth = 0u;
     loop {
-        if node_index >= modular_metadata[META_NODE_COUNT]
-            || depth > modular_metadata[META_MAX_DEPTH] {
+        if node_index >= entropy_metadata(META_NODE_COUNT)
+            || depth > entropy_metadata(META_MAX_DEPTH) {
             decode_error = ERROR_MA_TREE;
-            return modular_metadata[META_TREE_OFFSET];
+            return entropy_metadata(META_TREE_OFFSET);
         }
-        let node = modular_metadata[META_TREE_OFFSET] + node_index * 8u;
+        let node = entropy_metadata(META_TREE_OFFSET) + node_index * 8u;
         let kind = modular_metadata[node];
         if kind == 1u {
             return node;
@@ -370,7 +370,7 @@ fn ma_leaf(
         }
         depth += 1u;
     }
-    return modular_metadata[META_TREE_OFFSET];
+    return entropy_metadata(META_TREE_OFFSET);
 }
 
 fn predictor_value(

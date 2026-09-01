@@ -38,6 +38,30 @@ pub(crate) struct PackedModularMetadata {
     pub words: Vec<u32>,
 }
 
+impl PackedModularMetadata {
+    /// Appends one self-contained MA/entropy descriptor and rebases its internal table offsets.
+    pub(crate) fn append_to(mut self, metadata: &mut Vec<u32>) -> Result<u32> {
+        const OFFSET_WORDS: [usize; 3] = [4, 5, 6];
+        if self.words.len() < GPU_METADATA_HEADER_WORDS {
+            return invalid_entropy("packed GPU metadata header is truncated");
+        }
+        let base = u32::try_from(metadata.len())
+            .map_err(|_| invalid_entropy_error("GPU metadata base exceeds u32"))?;
+        for index in OFFSET_WORDS {
+            self.words[index] = self.words[index]
+                .checked_add(base)
+                .ok_or_else(|| invalid_entropy_error("GPU metadata offset exceeds u32"))?;
+        }
+        metadata
+            .len()
+            .checked_add(self.words.len())
+            .and_then(|words| u32::try_from(words).ok())
+            .ok_or_else(|| invalid_entropy_error("GPU metadata length exceeds u32"))?;
+        metadata.extend(self.words);
+        Ok(base)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MaTreeLimits {
     pub node_limit: usize,
@@ -2037,9 +2061,39 @@ fn invalid_tree_error(reason: &'static str) -> ModularTreeError {
 mod tests {
     use super::{
         AnsBucketIr, EntropyCoderIr, EntropyDecoderIr, HybridIntegerConfigIr,
-        MetadataEntropyCursor, PrefixHistogramIr, add_log2_ceil, unpack_signed,
-        validate_tree_property,
+        MetadataEntropyCursor, PackedModularMetadata, PrefixHistogramIr, add_log2_ceil,
+        unpack_signed, validate_tree_property,
     };
+
+    #[test]
+    fn packed_metadata_append_rebases_only_internal_offsets() {
+        let mut first_words = vec![0u32; 32];
+        first_words[4] = 24;
+        first_words[5] = 28;
+        first_words[6] = 31;
+        first_words[7] = 0x1234_5678;
+        let mut metadata = Vec::new();
+        let first_base = PackedModularMetadata { words: first_words }
+            .append_to(&mut metadata)
+            .unwrap();
+        assert_eq!(first_base, 0);
+
+        let mut second_words = vec![0u32; 30];
+        second_words[4] = 24;
+        second_words[5] = 26;
+        second_words[6] = 29;
+        second_words[7] = 0x9abc_def0;
+        let second_base = PackedModularMetadata {
+            words: second_words,
+        }
+        .append_to(&mut metadata)
+        .unwrap();
+
+        assert_eq!(second_base, 32);
+        assert_eq!(&metadata[4..8], &[24, 28, 31, 0x1234_5678]);
+        assert_eq!(&metadata[36..40], &[56, 58, 61, 0x9abc_def0]);
+        assert_eq!(metadata.len(), 62);
+    }
 
     #[test]
     fn packed_ans_bucket_round_trips_fields() {

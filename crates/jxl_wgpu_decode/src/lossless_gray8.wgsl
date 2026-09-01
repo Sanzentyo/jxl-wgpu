@@ -19,6 +19,7 @@ struct Params {
     initialize_chroma: u32,
     source_channels: u32,
     channel_layout_offset: u32,
+    metadata_base: u32,
     source_bits: u32,
     source_mask: u32,
     needs_self_correcting: u32,
@@ -167,6 +168,10 @@ fn read_bits(count: u32) -> u32 {
     let value = peek_bits(count);
     bit_cursor = bit_cursor + count;
     return value;
+}
+
+fn modular_metadata_base() -> u32 {
+    return params.metadata_base;
 }
 
 /*__JXL_MODULAR_ENTROPY__*/

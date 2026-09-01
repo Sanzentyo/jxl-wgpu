@@ -90,7 +90,7 @@ bounded VarDCT profile limitations do not become a common entropy or frame abstr
 
 The entropy executor has a narrower shared boundary than either submission pipeline. Rust and WGSL
 both define a 12-byte, four-byte-aligned `EntropyStreamParams` prefix for token start/end bounds and
-the LZ77 ring mask. It is the first field of the 240-byte Modular parameter record and the 208-byte
+the LZ77 ring mask. It is the first field of the 244-byte Modular parameter record and the 240-byte
 VarDCT packet record. The shared entropy fragment consumes that prefix plus consumer-provided
 storage access and LZ scratch-base functions. Geometry, prediction/output, and VarDCT
 metadata/coefficient state retain separate suffixes and bindings. This preserves one checked
@@ -115,7 +115,7 @@ resident LF slots and consuming them without readback remains `ENT-D02` work. Th
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
-partial Prefix/ANS/hybrid/LZ token becomes host-visible state. The 240-byte record maps the one
+partial Prefix/ANS/hybrid/LZ token becomes host-visible state. The 244-byte record maps the one
 group-relative cursor into the current physical upload and identifies first/final segments. A
 16-byte-aligned tail in each reconstruction lane retains the bit cursor, ANS state, LZ77 copy and
 last-value state, consumer progress, and a sticky error while the descriptor-sized history ring
@@ -212,13 +212,22 @@ arena word offset, row stride, width/height, cumulative decoded start/end, and a
 prior-channel indices. Host lowering groups previous channels by exact width, height, horizontal
 shift, and vertical shift, then emits at most the 60 newest matches addressable by MA properties
 16..255. The descriptor table and references are appended to the existing immutable metadata and a
-240-byte group parameter carries the selected table offset. Multi-group lowering reapplies the
+244-byte group parameter carries independent MA-metadata and channel-descriptor offsets. Multi-group lowering reapplies the
 shared DC-global RCT sequence to each concrete edge geometry, then appends that pass group's local
 RCT/Palette/Squeeze sequence. Identical concrete plans share immutable descriptor ranges. Each lane
 is aligned to the device's storage-offset requirement; after a group's final entropy segment, its
 inverse jobs and 144-byte region-aware finalizer run against that lane before the next batch can
 reuse it. The separately bounded DC-global zero-symbol Prefix/ANS range executes through the same
 kernel and exact termination logic. Its status record is mapped once with all pass-group records.
+Each pass-group header independently selects the global MA configuration or supplies a bounded
+local tree, entropy tables, hybrid configs, context map, LZ77 parameters, and weighted-predictor
+header. Host lowering packs the global descriptor first, appends and rebases distinct locals,
+deduplicates equal locals, and stores the selected word base in the group's 244-byte `Pod` record.
+The scheduler sizes lane state and LZ history for the maximum resolved group contract and only
+keeps a fixed reconstruction specialization when every group proves the same leaf mapping; mixed
+Prefix/ANS groups use the common generic allocation and are exposed as `ModularEntropyCoding::Mixed`.
+`WgpuDecodeMemoryStats` reports exact descriptor bytes, local-group count, and unique resident
+configuration count.
 
 ## Protocol execution
 

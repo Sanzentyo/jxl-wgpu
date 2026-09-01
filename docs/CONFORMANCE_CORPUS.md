@@ -112,8 +112,8 @@ The generalized entropy descriptor matrix fixes the 32-byte `Pod` layout, cumula
 and absolute metadata rebasing. A four-channel topology with one shift-mismatched plane proves that
 MA references skip incompatible predecessors and retain newest-first order; property 23 emits two
 reference slots while property 15 emits none. Existing every-chunk-split profile tests also compare
-the appended descriptor metadata, and the full `ShaderParams` word-order test fixes its new 240-byte
-storage stride and channel-layout offset without inspecting shader source text.
+the appended descriptor metadata, and the full `ShaderParams` word-order test fixes its 244-byte
+storage stride, MA-metadata base, and channel-layout offset without inspecting shader source text.
 
 `wgpu_gray8::cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly` creates a
 515×259 RGB fixture and asks installed `cjxl` 0.12 to choose its lossless local Modular transforms.
@@ -124,6 +124,18 @@ also fixes two codec submissions: one GPU execution/strict termination of the DC
 entropy stream, followed by the coalesced pass-group wave. Both are validated by one aggregate
 status map, so this is production transformed multi-group evidence rather than a primitive-only
 kernel test.
+
+`wgpu_gray8::local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust` uses the public
+`LosslessModularTreeMode::LocalPerGroup` encoder policy to produce a 515×259, six-pass-group stream.
+The stock decoder must report six local groups, two resident configurations (global plus one
+deduplicated local), nonzero metadata bytes, and Prefix coding, then return byte-exact GPU output.
+The same codestream is decoded byte-exactly by the Rust `jxl` oracle. The adjacent optional `djxl`
+gate runs both `SharedGlobal` and `LocalPerGroup` containers. A packed-metadata unit test appends two
+different descriptor records and checks their three internal offsets are rebased while unrelated
+header words remain unchanged. These tests execute the selected metadata base; they do not inspect
+WGSL source strings. The encoder's streamed 16K×1 RGB8 case additionally runs `LocalPerGroup`
+through multiple bounded artifact batches in blocking and runtime-neutral forms, with Rust `jxl`
+and optional `djxl` exact output.
 
 ## Procedural VarDCT encoder matrix
 
@@ -371,7 +383,7 @@ verify physical/logical mapping, first/final flags, 16-byte overlap, monotonic y
 one-lane scratch isolation, and exact peak bytes. Budget tests show that lane count and stream peak
 trade against the same per-frame target. A cap below the 40-byte minimum is a typed error, while
 every oversized accepted Modular group is segmented. Rust/WGSL full-record word casts pin the
-240-byte parameter record and the 32/48/112-byte, 16-byte-aligned resume layouts. Every composed
+244-byte parameter record and the 32/48/112-byte, 16-byte-aligned resume layouts. Every composed
 shader variant is parsed and semantically validated with Naga; no shader-source substring
 assertion is used.
 

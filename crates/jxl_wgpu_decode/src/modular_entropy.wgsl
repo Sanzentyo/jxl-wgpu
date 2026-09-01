@@ -24,6 +24,10 @@ const META_LZ_LENGTH_MSB: u32 = 13u;
 const META_LZ_LENGTH_LSB: u32 = 14u;
 const META_DISTANCE_CLUSTER: u32 = 15u;
 
+fn entropy_metadata(index: u32) -> u32 {
+    return modular_metadata[modular_metadata_base() + index];
+}
+
 var<private> entropy_ans_state: u32;
 var<private> entropy_copy_remaining: u32;
 var<private> entropy_copy_position: u32;
@@ -199,7 +203,7 @@ fn modular_descriptor_sample_store(channel: u32, x: u32, y: u32, value: u32) {
 }
 
 fn entropy_config_offset(cluster: u32) -> u32 {
-    return modular_metadata[META_CONFIG_OFFSET] + cluster * 4u;
+    return entropy_metadata(META_CONFIG_OFFSET) + cluster * 4u;
 }
 
 fn entropy_begin() {
@@ -208,13 +212,13 @@ fn entropy_begin() {
     entropy_copy_position = 0u;
     entropy_decoded = 0u;
     entropy_last_value = 0u;
-    if modular_metadata[META_CODER] == 1u {
+    if entropy_metadata(META_CODER) == 1u {
         entropy_ans_state = read_bits(32u);
     }
 }
 
 fn entropy_finalize() {
-    if decode_error == 0u && modular_metadata[META_CODER] == 1u
+    if decode_error == 0u && entropy_metadata(META_CODER) == 1u
         && entropy_ans_state != 0x00130000u {
         decode_error = ERROR_ANS_STATE;
     }
@@ -247,8 +251,8 @@ fn entropy_read_prefix_symbol(cluster: u32) -> u32 {
     }
     let available = min(15u, params.entropy.token_end - bit_cursor);
     let lookup_index = peek_bits(available);
-    let table_offset = modular_metadata[META_TABLE_OFFSET]
-        + cluster * modular_metadata[META_TABLE_STRIDE];
+    let table_offset = entropy_metadata(META_TABLE_OFFSET)
+        + cluster * entropy_metadata(META_TABLE_STRIDE);
     let entry = modular_metadata[table_offset + lookup_index];
     let bit_length = entry & 0xffu;
     if bit_length == 0u || bit_length > available {
@@ -260,12 +264,12 @@ fn entropy_read_prefix_symbol(cluster: u32) -> u32 {
 }
 
 fn entropy_read_ans_symbol(cluster: u32) -> u32 {
-    let log_bucket_size = modular_metadata[META_ANS_LOG_BUCKET];
+    let log_bucket_size = entropy_metadata(META_ANS_LOG_BUCKET);
     let index = entropy_ans_state & 0xfffu;
     let bucket_index = index >> log_bucket_size;
     let position = index & ((1u << log_bucket_size) - 1u);
-    let table_offset = modular_metadata[META_TABLE_OFFSET]
-        + cluster * modular_metadata[META_TABLE_STRIDE]
+    let table_offset = entropy_metadata(META_TABLE_OFFSET)
+        + cluster * entropy_metadata(META_TABLE_STRIDE)
         + bucket_index * 2u;
     let first = modular_metadata[table_offset];
     let second = modular_metadata[table_offset + 1u];
@@ -294,14 +298,14 @@ fn entropy_read_ans_symbol(cluster: u32) -> u32 {
 }
 
 fn entropy_read_symbol(cluster: u32) -> u32 {
-    if cluster >= modular_metadata[META_CLUSTER_COUNT] {
+    if cluster >= entropy_metadata(META_CLUSTER_COUNT) {
         decode_error = ERROR_ENTROPY_CLUSTER;
         return 0xffffffffu;
     }
-    if modular_metadata[META_CODER] == 0u {
+    if entropy_metadata(META_CODER) == 0u {
         return entropy_read_prefix_symbol(cluster);
     }
-    if modular_metadata[META_CODER] == 1u {
+    if entropy_metadata(META_CODER) == 1u {
         return entropy_read_ans_symbol(cluster);
     }
     decode_error = ERROR_ENTROPY_CLUSTER;
@@ -399,7 +403,7 @@ fn entropy_read_varint(cluster: u32, distance_multiplier: u32) -> u32 {
     if modular_descriptor_mode() {
         effective_distance_multiplier = modular_layout_max_width;
     }
-    if modular_metadata[META_LZ_ENABLED] == 0u {
+    if entropy_metadata(META_LZ_ENABLED) == 0u {
         return entropy_read_clustered(cluster);
     }
     if entropy_copy_remaining != 0u {
@@ -408,7 +412,7 @@ fn entropy_read_varint(cluster: u32, distance_multiplier: u32) -> u32 {
         return value;
     }
     let token = entropy_read_symbol(cluster);
-    let minimum_symbol = modular_metadata[META_LZ_MIN_SYMBOL];
+    let minimum_symbol = entropy_metadata(META_LZ_MIN_SYMBOL);
     if token < minimum_symbol {
         let config = entropy_config_offset(cluster);
         value = entropy_read_hybrid(
@@ -426,12 +430,12 @@ fn entropy_read_varint(cluster: u32, distance_multiplier: u32) -> u32 {
     }
     let run_value = entropy_read_hybrid(
         token - minimum_symbol,
-        modular_metadata[META_LZ_LENGTH_SPLIT],
-        modular_metadata[META_LZ_LENGTH_MSB],
-        modular_metadata[META_LZ_LENGTH_LSB],
+        entropy_metadata(META_LZ_LENGTH_SPLIT),
+        entropy_metadata(META_LZ_LENGTH_MSB),
+        entropy_metadata(META_LZ_LENGTH_LSB),
     );
-    entropy_copy_remaining = run_value + modular_metadata[META_LZ_MIN_LENGTH];
-    let distance_cluster = modular_metadata[META_DISTANCE_CLUSTER];
+    entropy_copy_remaining = run_value + entropy_metadata(META_LZ_MIN_LENGTH);
+    let distance_cluster = entropy_metadata(META_DISTANCE_CLUSTER);
     let distance_token = entropy_read_symbol(distance_cluster);
     let distance_config = entropy_config_offset(distance_cluster);
     var distance = entropy_read_hybrid(

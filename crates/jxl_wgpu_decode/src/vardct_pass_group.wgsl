@@ -113,6 +113,10 @@ fn read_bits(count: u32) -> u32 {
     return value;
 }
 
+fn modular_metadata_base() -> u32 {
+    return 0u;
+}
+
 /*__JXL_MODULAR_ENTROPY__*/
 
 /*__JXL_HF_COEFFICIENT_SINK__*/

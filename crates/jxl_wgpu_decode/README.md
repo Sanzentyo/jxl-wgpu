@@ -12,17 +12,18 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
   metadata requirement;
 - one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
   bounded 128/256/512/1024-pixel pass-group grid and one pass;
-- a bounded standard MA tree with all JPEG XL Modular predictors, including weighted
-  self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS entropy,
-  hybrid integers, context maps, and the standard LZ77 distance alphabet;
+- bounded DC-global or pass-group-local MA trees with all JPEG XL Modular predictors, including
+  weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
+  entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
 - shared DC-global RCT and per-pass-group RCT, Palette, or Squeeze stacks, including group-edge
-  geometry and one full-resolution unassociated alpha channel for RGBA; no local MA trees,
-  restoration filters, other extra channels, or references.
+  geometry and one full-resolution unassociated alpha channel for RGBA; no restoration filters,
+  other extra channels, or references.
 
 Before submission the decoder inventories the standard image header, frame header, and TOC with
-explicit limits. It parses only the bounded DC-global MA tree, histogram descriptors, hybrid
-integer configuration, context maps, ordered Modular transform metadata, and pass-group ranges
-needed to build typed GPU metadata. RCT, Palette, and explicit or default Squeeze are meta-applied
+explicit limits. It parses only the bounded DC-global and selected pass-group-local MA trees,
+histogram descriptors, hybrid integer configuration, context maps, ordered Modular transform
+metadata, and pass-group ranges needed to build typed GPU metadata. RCT, Palette, and explicit or
+default Squeeze are meta-applied
 to an exact entropy-visible channel topology without decoding pixels. This accounts odd average/
 residual dimensions, channel insertion order, shifts, delta-palette storage, and the meta-channel
 prefix under bounded transform/channel/squeeze limits. A portable 32-byte `Pod` descriptor then
@@ -32,9 +33,12 @@ for each transformed channel. It carries arena offset/stride, dimensions, cumula
 range, and an absolute range into a flattened reference-channel list. That list contains only prior
 channels whose dimensions and horizontal/vertical shifts match, newest first, as properties 16+
 require. A geometry-keyed map bounds construction by channel count times the at-most-60 references
-addressable by the 8-bit MA property space. The 240-byte per-group parameter record exposes the
-descriptor-table offset. Identical group plans share one immutable descriptor table; edge groups
-retain distinct checked geometry. The resident arena stride is aligned for dynamic storage offsets.
+addressable by the 8-bit MA property space. Each self-contained MA/entropy descriptor has its
+internal config/tree/table offsets rebased into one immutable GPU word buffer; equal local
+descriptors are deduplicated. The 244-byte per-group parameter record exposes independent MA and
+channel-descriptor bases. Identical transform plans share one descriptor table even when their MA
+or weighted-predictor configuration differs; edge groups retain distinct checked geometry. The
+resident arena stride is aligned for dynamic storage offsets.
 Inverse planning walks the stack and each Squeeze parameter in reverse while retaining only the
 current and immediately restored topology, rather than materializing a channel table for every
 transform. The parser also charges the cumulative topology work, so a bounded channel count cannot
@@ -87,7 +91,9 @@ value, and first error remain in a 16-byte-aligned 32-byte record at the end of 
 lane. Generic MA adds the Property-8 gradient history for a 48-byte record; a
 Weighted/SelfCorrecting consumer also retains four true errors and twelve subprediction-error
 accumulators for a 112-byte record. A resume exactly at a channel boundary resets channel-local
-predictor state. Multi-group streams also execute the DC-global zero-symbol Prefix/ANS stream through
+predictor state. State and LZ allocation use the maximum requirement across all selected group
+descriptors, and mixed Prefix/ANS frames are reported explicitly. Multi-group streams also execute
+the DC-global zero-symbol Prefix/ANS stream through
 the same kernel and exact termination contract. One aggregate status staging buffer is mapped once
 after the last batch, and its four-word record plus every pass-group record is checked before the
 frame is reported. No reconstructed sample is produced on the CPU.
@@ -96,7 +102,8 @@ aligned and every actual internal group edge ends on a distinct storage word, th
 ordinary word RMW/store. Layouts with an odd stride, offset, or group edge use the atomic byte-safe
 pipeline. The proof is performed on the host from the validated output layout and typed group
 rectangles; there is no caller hint that can force the non-atomic path.
-The validated MA-tree IR receives a second independent specialization proof. If every decision is
+The validated MA-tree IR receives a second independent specialization proof. If every group's
+resolved local/global tree has the same fixed specialization, and every decision is
 channel-only and channels 0 through 3 all terminate at Gradient leaves with zero offset and unit
 multiplier, the shader lowers the four cluster ids into the parameter record and runs a nested-row
 Gradient loop without per-sample MA traversal, coordinate division, unused-neighbor loads, or
@@ -113,9 +120,10 @@ exact node/decision/leaf counts, maximum depth, and self-correcting usage; custo
 engines use the distinct `Fixed` variant.
 
 For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
-channel topology are parsed and resident RCT/Palette/Squeeze stacks execute for single- and
-multi-group streams. Local MA trees, DC-global Palette/Squeeze sample data, Global/LF/HF image
-streams, multiple passes, lossy/XYB Modular, non-alpha extra channels, patches, splines, noise, and
+channel topology are parsed, local MA trees select per-group metadata bases, and resident
+RCT/Palette/Squeeze stacks execute for single- and multi-group streams. DC-global Palette/Squeeze
+sample data, Global/LF/HF image streams, multiple passes, lossy/XYB Modular, non-alpha extra
+channels, patches, splines, noise, and
 reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard frame once, and selects this engine or the bounded VarDCT engine from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -425,7 +433,7 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group parameter ABI is a checked 240-byte `repr(C)` POD. Its first 12 bytes are the
+The CPU/WGSL per-group Modular parameter ABI is a checked 244-byte `repr(C)` POD. Its first 12 bytes are the
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
 same typed prefix starts the 240-byte, 16-byte-aligned VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
@@ -495,7 +503,7 @@ reconstruction, status, status-staging, and POD parameter buffers (plus the nati
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
 only each planned bounded range from a checked table of shared input spans, even when the range
-crosses physical chunks, while metadata and packed 240-byte `ShaderParams` records (including the
+crosses physical chunks, while metadata and packed 244-byte `ShaderParams` records (including the
 12-byte shared entropy prefix) use `Queue::write_buffer`; no second full-codestream host `Vec` is
 created.
 

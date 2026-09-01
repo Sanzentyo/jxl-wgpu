@@ -57,17 +57,31 @@ pub(crate) struct StandardModularProfile {
     pub groups: Vec<ModularGroup>,
     pub global_stream: Option<GlobalModularStream>,
     pub ma_config: MaConfigIr,
-    pub wp_header: WpHeaderIr,
-    pub transform_plan: ModularTransformPlan,
     pub generalized_channels: bool,
     pub resident_group_plans: Vec<ResidentModularGroupPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResidentModularGroupPlan {
+    pub ma_config: ModularMaConfig,
     pub wp_header: WpHeaderIr,
     pub channel_metadata: PackedModularChannelMetadata,
     pub inverse_plan: ModularInversePlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModularMaConfig {
+    Global,
+    Local(MaConfigIr),
+}
+
+impl ModularMaConfig {
+    pub(crate) fn resolve<'a>(&'a self, global: &'a MaConfigIr) -> &'a MaConfigIr {
+        match self {
+            Self::Global => global,
+            Self::Local(local) => local,
+        }
+    }
 }
 
 fn validate_image_header(
@@ -332,7 +346,7 @@ pub(crate) fn parse_standard_modular_profile(
                 height: image.height,
                 stream_index: 0,
             }],
-            vec![(transform_plan.clone(), wp_header)],
+            vec![(transform_plan.clone(), wp_header, ModularMaConfig::Global)],
         )
     } else {
         if !transform_plan
@@ -388,7 +402,7 @@ pub(crate) fn parse_standard_modular_profile(
                 .reapply_to(source_topology.clone(), ModularTransformLimits::default())?;
             let mut group_reader = codestream.reader();
             group_reader.skip_bits(section.bits.offset)?;
-            expect(&mut group_reader, 1, 1, "LF-global Modular tree")?;
+            let use_global_tree = group_reader.read_bits(1)? != 0;
             let local_wp_header = WpHeaderIr::parse(&mut group_reader)?;
             let local_transform = parse_modular_transforms(
                 &mut group_reader,
@@ -409,6 +423,11 @@ pub(crate) fn parse_standard_modular_profile(
                 u32::from(bits_per_sample),
                 &concrete_transform,
             )?;
+            let group_ma_config = if use_global_tree {
+                ModularMaConfig::Global
+            } else {
+                ModularMaConfig::Local(parse_ma_config(&mut group_reader, MaTreeLimits::default())?)
+            };
             let token_bit_end = section
                 .bits
                 .end()
@@ -433,7 +452,8 @@ pub(crate) fn parse_standard_modular_profile(
                     )
                     .map_err(|_| unsupported_error("Modular stream index exceeds u32"))?,
                 });
-            concrete_transform_plans[index] = Some((concrete_transform, local_wp_header));
+            concrete_transform_plans[index] =
+                Some((concrete_transform, local_wp_header, group_ma_config));
         }
         let groups = groups
             .into_iter()
@@ -474,25 +494,23 @@ pub(crate) fn parse_standard_modular_profile(
 
     let generalized_channels = concrete_transform_plans
         .iter()
-        .any(|(plan, _)| uses_generalized_channel_layout(channels, plan));
-    let resident_group_plans = if !generalized_channels {
-        Vec::new()
-    } else {
-        concrete_transform_plans
-            .into_iter()
-            .map(|(group_transform, group_wp_header)| {
-                let channel_metadata = group_transform
-                    .topology
-                    .gpu_entropy_channels(ma_config.maximum_tree_property())?;
-                let inverse_plan = plan_modular_inverse(&group_transform)?;
-                Ok(ResidentModularGroupPlan {
-                    wp_header: group_wp_header,
-                    channel_metadata,
-                    inverse_plan,
-                })
+        .any(|(plan, _, _)| uses_generalized_channel_layout(channels, plan));
+    let resident_group_plans = concrete_transform_plans
+        .into_iter()
+        .map(|(group_transform, group_wp_header, group_ma_config)| {
+            let concrete_ma_config = group_ma_config.resolve(&ma_config);
+            let channel_metadata = group_transform
+                .topology
+                .gpu_entropy_channels(concrete_ma_config.maximum_tree_property())?;
+            let inverse_plan = plan_modular_inverse(&group_transform)?;
+            Ok(ResidentModularGroupPlan {
+                ma_config: group_ma_config,
+                wp_header: group_wp_header,
+                channel_metadata,
+                inverse_plan,
             })
-            .collect::<Result<Vec<_>>>()?
-    };
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(StandardModularProfile {
         width: image.width,
@@ -509,8 +527,6 @@ pub(crate) fn parse_standard_modular_profile(
             },
         ),
         ma_config,
-        wp_header,
-        transform_plan,
         generalized_channels,
         resident_group_plans,
     })

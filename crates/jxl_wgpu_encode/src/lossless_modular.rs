@@ -97,6 +97,20 @@ pub enum LosslessModularFormat {
     Rgba,
 }
 
+/// Selects where a multi-group lossless Modular frame stores its MA tree and entropy tables.
+///
+/// Both modes keep residual generation on the GPU and only change deterministic bitstream
+/// assembly. A single-group frame has no separate pass-group section and therefore uses its
+/// DC-global tree in either mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LosslessModularTreeMode {
+    /// Every pass group refers to the one DC-global MA configuration.
+    #[default]
+    SharedGlobal,
+    /// Every pass group carries a complete local MA configuration.
+    LocalPerGroup,
+}
+
 impl LosslessModularFormat {
     #[must_use]
     pub const fn channel_count(self) -> u32 {
@@ -454,6 +468,7 @@ struct ModularDispatchPlan {
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    tree_mode: LosslessModularTreeMode,
     parameters: Vec<ModularParams>,
     groups: Vec<ModularGroupPlan>,
     batches: Vec<ModularDispatchBatch>,
@@ -476,11 +491,18 @@ pub struct LosslessModularBackend {
     storage_offset_alignment: u64,
     max_compute_workgroups_per_dimension: u32,
     direct_mapping: bool,
+    tree_mode: LosslessModularTreeMode,
 }
 
 impl LosslessModularBackend {
     #[must_use]
     pub fn new(context: &WgpuContext) -> Self {
+        Self::with_tree_mode(context, LosslessModularTreeMode::SharedGlobal)
+    }
+
+    /// Creates a backend with an explicit multi-group MA-tree placement policy.
+    #[must_use]
+    pub fn with_tree_mode(context: &WgpuContext, tree_mode: LosslessModularTreeMode) -> Self {
         let module = context
             .device()
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -522,6 +544,7 @@ impl LosslessModularBackend {
             storage_offset_alignment: u64::from(limits.min_storage_buffer_offset_alignment),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             direct_mapping: context.direct_mapping_enabled(),
+            tree_mode,
         }
     }
 
@@ -911,6 +934,7 @@ impl LosslessModularBackend {
             group_grid,
             format,
             bits_per_sample: source_spec.bits_per_sample,
+            tree_mode: self.tree_mode,
             parameters,
             groups,
             batches,
@@ -1172,12 +1196,15 @@ impl StreamingModularWorker {
             is_last: self.request.is_last,
         };
         let mut assembler = ModularPacketAssembler::new(
-            self.plan.width,
-            self.plan.height,
-            self.plan.group_grid,
-            self.plan.format,
-            self.plan.bits_per_sample,
-            frame,
+            ModularPacketConfig {
+                width: self.plan.width,
+                height: self.plan.height,
+                group_grid: self.plan.group_grid,
+                format: self.plan.format,
+                bits_per_sample: self.plan.bits_per_sample,
+                tree_mode: self.plan.tree_mode,
+                frame,
+            },
             codes,
         )?;
         for batch in &self.plan.batches {
@@ -1815,6 +1842,7 @@ impl GpuEncodeBackend for LosslessModularBackend {
                 groups: plan.groups,
                 format: plan.format,
                 bits_per_sample: plan.bits_per_sample,
+                tree_mode: plan.tree_mode,
                 width: plan.width,
                 height: plan.height,
                 frame_index: request.frame_index,
@@ -2041,6 +2069,7 @@ struct ResidentLosslessModularJob {
     groups: Vec<ModularGroupPlan>,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    tree_mode: LosslessModularTreeMode,
     width: u32,
     height: u32,
     frame_index: FrameIndex,
@@ -2155,17 +2184,20 @@ impl BrowserStreamingLosslessModularJob {
             &self.aggregate_lz77,
         )?;
         self.assembler = Some(ModularPacketAssembler::new(
-            self.plan.width,
-            self.plan.height,
-            self.plan.group_grid,
-            self.plan.format,
-            self.plan.bits_per_sample,
-            ModularFrameHeader {
-                animation: self.request.animation,
-                canvas_width: self.request.canvas_width,
-                canvas_height: self.request.canvas_height,
-                options: self.request.options.clone(),
-                is_last: self.request.is_last,
+            ModularPacketConfig {
+                width: self.plan.width,
+                height: self.plan.height,
+                group_grid: self.plan.group_grid,
+                format: self.plan.format,
+                bits_per_sample: self.plan.bits_per_sample,
+                tree_mode: self.plan.tree_mode,
+                frame: ModularFrameHeader {
+                    animation: self.request.animation,
+                    canvas_width: self.request.canvas_width,
+                    canvas_height: self.request.canvas_height,
+                    options: self.request.options.clone(),
+                    is_last: self.request.is_last,
+                },
             },
             codes,
         )?);
@@ -2286,6 +2318,7 @@ impl ResidentLosslessModularJob {
             group_grid: self.group_grid,
             format: self.format,
             bits_per_sample: self.bits_per_sample,
+            tree_mode: self.tree_mode,
             frame: &self.header,
             group_plans: &self.groups,
             bytes,
@@ -2354,6 +2387,15 @@ impl LosslessModularEncoder {
     #[must_use]
     pub fn new(context: WgpuContext) -> Self {
         let backend = LosslessModularBackend::new(&context);
+        Self {
+            encoder: GpuEncoder::new(context, backend),
+        }
+    }
+
+    /// Creates an encoder with an explicit multi-group MA-tree placement policy.
+    #[must_use]
+    pub fn with_tree_mode(context: WgpuContext, tree_mode: LosslessModularTreeMode) -> Self {
+        let backend = LosslessModularBackend::with_tree_mode(&context, tree_mode);
         Self {
             encoder: GpuEncoder::new(context, backend),
         }
@@ -2793,6 +2835,7 @@ struct PacketBuildInput<'a> {
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    tree_mode: LosslessModularTreeMode,
     frame: &'a ModularFrameHeader,
     group_plans: &'a [ModularGroupPlan],
     bytes: &'a [u8],
@@ -2865,6 +2908,7 @@ struct ModularPacketAssembler {
     group_grid: LosslessModularGroupGrid,
     format: LosslessModularFormat,
     bits_per_sample: u8,
+    tree_mode: LosslessModularTreeMode,
     frame: ModularFrameHeader,
     codes: [PrefixCode; 4],
     packets: Vec<GroupPacket>,
@@ -2873,16 +2917,27 @@ struct ModularPacketAssembler {
     next_group: u32,
 }
 
+struct ModularPacketConfig {
+    width: u32,
+    height: u32,
+    group_grid: LosslessModularGroupGrid,
+    format: LosslessModularFormat,
+    bits_per_sample: u8,
+    tree_mode: LosslessModularTreeMode,
+    frame: ModularFrameHeader,
+}
+
 impl ModularPacketAssembler {
-    fn new(
-        width: u32,
-        height: u32,
-        group_grid: LosslessModularGroupGrid,
-        format: LosslessModularFormat,
-        bits_per_sample: u8,
-        frame: ModularFrameHeader,
-        codes: [PrefixCode; 4],
-    ) -> Result<Self, EncodeError> {
+    fn new(config: ModularPacketConfig, codes: [PrefixCode; 4]) -> Result<Self, EncodeError> {
+        let ModularPacketConfig {
+            width,
+            height,
+            group_grid,
+            format,
+            bits_per_sample,
+            tree_mode,
+            frame,
+        } = config;
         let (packets, single_group, token_bit_offset_in_group) = if group_grid.groups == 1 {
             let mut group = BitWriter::new();
             write_dc_global(&mut group, &codes, format)?;
@@ -2915,6 +2970,7 @@ impl ModularPacketAssembler {
             group_grid,
             format,
             bits_per_sample,
+            tree_mode,
             frame,
             codes,
             packets,
@@ -2947,10 +3003,14 @@ impl ModularPacketAssembler {
             }
         } else {
             let mut pass_group = BitWriter::new();
-            // GroupHeader: use the LF-global tree, default weighted predictor, no transforms.
-            pass_group.write_bits(1, 1)?;
+            let use_global_tree = self.tree_mode == LosslessModularTreeMode::SharedGlobal;
+            // GroupHeader: selected tree, default weighted predictor, no local transforms.
+            pass_group.write_bits(u64::from(use_global_tree), 1)?;
             pass_group.write_bits(1, 1)?;
             pass_group.write_bits(0, 2)?;
+            if !use_global_tree {
+                write_ma_config(&mut pass_group, &self.codes)?;
+            }
             for (channel, artifact) in artifacts.iter().enumerate() {
                 write_events(&mut pass_group, &self.codes[channel], artifact.events)?;
             }
@@ -3024,6 +3084,7 @@ fn build_packets(
         group_grid,
         format,
         bits_per_sample,
+        tree_mode,
         frame,
         group_plans,
         bytes,
@@ -3072,12 +3133,15 @@ fn build_packets(
 
     let codes = build_prefix_codes(format, bits_per_sample, &aggregate_raw, &aggregate_lz77)?;
     let mut assembler = ModularPacketAssembler::new(
-        width,
-        height,
-        group_grid,
-        format,
-        bits_per_sample,
-        frame.clone(),
+        ModularPacketConfig {
+            width,
+            height,
+            group_grid,
+            format,
+            bits_per_sample,
+            tree_mode,
+            frame: frame.clone(),
+        },
         codes,
     )?;
     for group in 0..group_grid.groups {
@@ -3275,8 +3339,23 @@ fn write_dc_global(
 ) -> Result<(), EncodeError> {
     // Handcrafted Modular metadata adapted from zune-jpegxl 0.5.2. See this crate's
     // `THIRD_PARTY.md` and `LICENSES/zune-jpegxl-MIT.txt`.
+    output.write_bits(1, 1)?; // default LF-channel dequantization
+    output.write_bits(1, 1)?; // GlobalModular is present
+    write_ma_config(output, codes)?;
     output.write_bits(1, 1)?;
     output.write_bits(1, 1)?;
+    if format.channel_count() > 2 {
+        output.write_bits(1, 2)?; // one transform
+        output.write_bits(0, 2)?; // reversible color transform
+        output.write_bits(0, 5)?; // begin channel 0
+        output.write_bits(0, 2)?; // YCoCg transform type 0
+    } else {
+        output.write_bits(0, 2)?; // no transforms
+    }
+    Ok(())
+}
+
+fn write_ma_config(output: &mut BitWriter, codes: &[PrefixCode; 4]) -> Result<(), EncodeError> {
     output.write_bits(0, 1)?;
     output.write_bits(1, 1)?;
     output.write_bits(0, 2)?;
@@ -3327,16 +3406,6 @@ fn write_dc_global(
     output.write_bits(1, 1)?;
     for code in codes {
         code.write_tree(output)?;
-    }
-    output.write_bits(1, 1)?;
-    output.write_bits(1, 1)?;
-    if format.channel_count() > 2 {
-        output.write_bits(1, 2)?; // one transform
-        output.write_bits(0, 2)?; // reversible color transform
-        output.write_bits(0, 5)?; // begin channel 0
-        output.write_bits(0, 2)?; // YCoCg transform type 0
-    } else {
-        output.write_bits(0, 2)?; // no transforms
     }
     Ok(())
 }
@@ -5464,7 +5533,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_rgb8_16k_panorama_is_exact_and_runtime_neutral() {
+    fn streamed_local_ma_rgb8_16k_panorama_is_exact_and_runtime_neutral() {
         let Some(context) = test_context() else {
             eprintln!("skipping streamed 16K GPU encode test: no wgpu adapter");
             return;
@@ -5473,7 +5542,8 @@ mod tests {
         let height = 1;
         let format = LosslessModularFormat::Rgb;
         let (source, expected) = packed_color_test_source(&context, width, height, format);
-        let encoder = LosslessModularEncoder::new(context);
+        let encoder =
+            LosslessModularEncoder::with_tree_mode(context, LosslessModularTreeMode::LocalPerGroup);
         let memory = encoder.memory_plan(&source).unwrap();
         assert!(memory.streaming);
         assert!(memory.batch_count > 1);

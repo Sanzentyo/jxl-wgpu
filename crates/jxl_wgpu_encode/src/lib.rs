@@ -62,7 +62,7 @@ pub use lossless_modular::{
     LosslessModularAnimationSession, LosslessModularBackend, LosslessModularEncoder,
     LosslessModularFormat, LosslessModularGroup, LosslessModularGroupGrid,
     LosslessModularInFlightMemory, LosslessModularJob, LosslessModularMemoryLimits,
-    LosslessModularMemoryPlan, LosslessModularSubmission,
+    LosslessModularMemoryPlan, LosslessModularSubmission, LosslessModularTreeMode,
 };
 pub use packet::{
     BitFragment, EncodedFrame, FrameGroupLayout, FramePacketSet, GroupPacket, GroupPacketKind,
