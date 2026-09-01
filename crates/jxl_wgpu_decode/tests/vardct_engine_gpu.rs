@@ -17,7 +17,9 @@ use jxl_wgpu::{
     ImageReadbackPipeline, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
-use jxl_wgpu_decode::vardct::packet::{BoundedVarDctPacketError, BoundedVarDctPacketPlan};
+use jxl_wgpu_decode::vardct::packet::{
+    BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
+};
 use jxl_wgpu_decode::{
     DecodeProfile, Error as DecodeError, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
     VarDctDecodeError, WgpuDecodeEngine,
@@ -1083,7 +1085,7 @@ fn standard_multiple_lf_groups_share_one_resident_image_and_status_map() {
 }
 
 #[test]
-fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
+fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let Some(encoded) = common::cjxl_local_tree_codestream() else {
         return;
     };
@@ -1119,8 +1121,8 @@ fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
         .expect("ordinary cjxl selects the VarDCT submission session");
     let memory = vardct.memory_stats();
     assert!(memory.deferred_hf_modular_metadata);
-    assert!(memory.lf_packet_stream_window_bytes > 0);
-    assert!(memory.lf_packet_stream_window_bytes <= 256);
+    assert!(memory.packet_stream_window_bytes > 0);
+    assert!(memory.packet_stream_window_bytes <= 256);
     assert!(memory.lf_packet_stream_batch_count > 2);
     assert_eq!(memory.packet_execution_state_bytes, 2 * 128);
     let downstream_submissions = if memory.hf_stream_window_bytes == 0 {
@@ -1128,10 +1130,8 @@ fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
     } else {
         memory.hf_stream_batch_count + 2
     };
-    assert_eq!(
-        vardct.submissions_per_frame(),
-        memory.lf_packet_stream_batch_count + downstream_submissions,
-    );
+    let submissions_before_hf_plan = memory.lf_packet_stream_batch_count + downstream_submissions;
+    assert_eq!(vardct.submissions_per_frame(), submissions_before_hf_plan);
 
     session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert!(matches!(
@@ -1145,6 +1145,16 @@ fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
     ));
 
     let frame = session.next_frame().unwrap().unwrap();
+    let vardct = session
+        .submission_session()
+        .vardct()
+        .expect("ordinary cjxl retains the VarDCT submission session");
+    let hf_packet_batches = vardct.hf_packet_stream_batch_count();
+    assert!(hf_packet_batches > 2);
+    assert_eq!(
+        vardct.submissions_per_frame(),
+        submissions_before_hf_plan + hf_packet_batches - 1,
+    );
     let readback = ImageReadbackPipeline::new(&backend)
         .submit(frame.output())
         .unwrap()
@@ -1213,6 +1223,50 @@ fn ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows() {
         backend.device().poll(wgpu::PollType::Poll).unwrap();
         std::thread::yield_now();
     }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let parsed = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default()).unwrap();
+    let inventory = parsed
+        .codestream_inventory(InventoryLimits {
+            max_frames: 1,
+            max_total_section_bytes: encoded.len() as u64,
+            ..InventoryLimits::default()
+        })
+        .unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+    let group = packet.groups.first().unwrap();
+    let group_end = group.lf_group.end().unwrap();
+    let damage_bit = group.lf_group.offset + (group_end - group.lf_group.offset) * 9 / 10;
+    let damage_start = usize::try_from(damage_bit / 8).unwrap();
+    let mut damaged = encoded.clone();
+    for byte in damaged
+        .get_mut(damage_start..damage_start + 32)
+        .expect("the late HF packet damage range is inside the first LF group")
+    {
+        *byte ^= 0xa5;
+    }
+    let mut damaged_session = decoder
+        .open(
+            &damaged,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let error = damaged_session.next_frame().unwrap_err();
+    assert!(matches!(
+        error,
+        DecodeError::VarDct(VarDctDecodeError::PacketGpu(
+            GpuVarDctPacketError::Entropy { .. }
+        ))
+    ));
+    drop(damaged_session);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 

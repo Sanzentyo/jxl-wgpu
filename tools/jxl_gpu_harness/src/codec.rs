@@ -839,21 +839,20 @@ fn decode_once_inner(
             "the animation workload requires an animated JPEG XL codestream",
         ));
     }
-    let submissions_per_frame = u64::try_from(session.submission_session().submissions_per_frame())
-        .map_err(|_| {
-            CodecIssue::new(
-                CodecIssueKind::Backend,
-                "gpu_decode",
-                "submission_count_overflow",
-                "the decoder GPU submission count does not fit report storage",
-            )
-        })?;
-
     let mut observation = DecodeObservation::default();
     let mut retained_frames = Vec::new();
     let mut readback_hash = blake3::Hasher::new();
     let mut readback_outputs = 0_u32;
     while let Some(frame) = session.next_frame().map_err(decode_issue)? {
+        let submissions_per_frame =
+            u64::try_from(session.submission_session().submissions_per_frame()).map_err(|_| {
+                CodecIssue::new(
+                    CodecIssueKind::Backend,
+                    "gpu_decode",
+                    "submission_count_overflow",
+                    "the decoder GPU submission count does not fit report storage",
+                )
+            })?;
         observation.frame_count = observation.frame_count.saturating_add(1);
         observation.codec_submissions = observation
             .codec_submissions

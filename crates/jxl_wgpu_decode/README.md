@@ -137,8 +137,10 @@ range instead uses the consumer-neutral 16-byte overlap plan, one reusable strea
 and ordered queue submissions. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
 state, nested block/channel/order progress, coefficient-sink error, and the 96-word nonzero context
 grid; only the final window validates exact ANS/padding termination. Local-tree frames first run one
-or more bounded LF submissions and map one aggregate LF cursor record, then submit whole-range HF
-entropy and the already-recorded downstream work with one final aggregate validation map. Every LF group's packet and artifact status plus one 32-byte record per pass group
+or more bounded LF submissions and map one aggregate LF cursor record, host-pack the HF descriptors,
+then run one or more bounded HF submissions through the same upload before the already-recorded
+downstream work and one final aggregate validation map. The final HF window shares the first
+downstream queue submission instead of adding an avoidable boundary. Every LF group's packet and artifact status plus one 32-byte record per pass group
 share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
@@ -161,12 +163,15 @@ carries authoritative metadata and changed regions. Native blocking and runtime-
 poll/future completion use the common decoder session API, and the engine compiles for browser
 WebGPU without a Tokio or async-std dependency.
 
-`VarDctDecodeMemoryStats` separately reports the reusable AC stream peak, ordered batch count,
-reusable parameter bytes, LZ scratch, and execution-state total. Applying
-`WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines; at this checkpoint
-the VarDCT cap governs AC pass groups while LF/HF packet windowing remains unfinished. A forced
-256-byte actual-adapter run covers blocking and runtime-neutral async decode, late-window typed
-corruption, and cancellation-driven reservation release against the libjxl nonzero-AC fixture.
+`VarDctDecodeMemoryStats` separately reports the shared local-tree packet stream peak, LF packet
+batch count, reusable AC stream peak and batch count, reusable parameter bytes, LZ scratch, and
+execution-state total. HF packet descriptors are host-discovered after the LF map, so
+`hf_packet_stream_batch_count()` and `submissions_per_frame()` become exact when that dynamic plan is
+installed; performance harnesses sample them after frame completion. Applying
+`WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines and governs
+local-tree LF/HF packets plus AC pass groups. Forced 256-byte actual-adapter runs cover blocking and
+runtime-neutral async decode, late-window typed corruption, and cancellation-driven reservation
+release for packet and nonzero-AC fixtures.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27
@@ -349,8 +354,9 @@ The VarDCT AC parameter record is a separate 144-byte aligned `Pod`. Its window 
 logical/upload starts, available/full ends, the yield boundary, first/final flags, a 464-byte
 execution-state offset, and the canonical status index. The VarDCT packet record has its own seven
 window fields, including a bounded-mode bit independent of FIRST/FINAL and a stream-base bit offset.
-Staged local-tree LF packets use those fields with 64-byte generic or 128-byte SelfCorrecting state;
-HF and combined/global-tree packet records remain whole-range consumers.
+Staged local-tree LF and HF packets use those fields with 64-byte generic or 128-byte
+SelfCorrecting state; the two sequential stages reuse one state allocation. Combined/global-tree
+packet records remain whole-range consumers.
 The Modular suffix begins with six window fields: logical segment start, physical upload start,
 full stream end, yield boundary, first/final flags, and the aligned entropy-state offset. It then
 carries four plane offset/stride pairs, exact output

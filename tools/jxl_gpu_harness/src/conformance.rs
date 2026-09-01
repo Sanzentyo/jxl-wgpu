@@ -1210,6 +1210,13 @@ fn execute_stock_gpu_round_trip(
             stage: "session creation",
             source,
         })?;
+    let frame = session
+        .next_frame()
+        .map_err(|source| StockGpuRoundTripError::Decode {
+            stage: "frame completion",
+            source,
+        })?
+        .ok_or(StockGpuRoundTripError::NoFrame)?;
     let decode_submissions = u64::try_from(session.submission_session().submissions_per_frame())
         .map_err(|_| StockGpuRoundTripError::SizeOverflow {
             what: "decode GPU submission count",
@@ -1219,13 +1226,6 @@ fn execute_stock_gpu_round_trip(
             what: "round-trip GPU submission count",
         },
     )?;
-    let frame = session
-        .next_frame()
-        .map_err(|source| StockGpuRoundTripError::Decode {
-            stage: "frame completion",
-            source,
-        })?
-        .ok_or(StockGpuRoundTripError::NoFrame)?;
     let readback = ImageReadbackPipeline::new(backend);
     let submission =
         readback

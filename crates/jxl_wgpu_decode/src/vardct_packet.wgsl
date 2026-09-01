@@ -201,9 +201,6 @@ fn load_packet_execution_state() {
     if params.needs_self_correcting == 0u {
         return;
     }
-    let channel_decoded = consumer_decoded % params.sample_count;
-    wp_x = channel_decoded % params.width;
-    wp_y = channel_decoded / params.width;
     wp_true_err_w = bitcast<i32>(reconstruction_load(base + 14u));
     wp_true_err_nw = bitcast<i32>(reconstruction_load(base + 15u));
     wp_true_err_n = bitcast<i32>(reconstruction_load(base + 16u));
@@ -284,6 +281,9 @@ fn decode_channel(
         if params.needs_self_correcting != 0u {
             wp_reset();
         }
+    } else if params.needs_self_correcting != 0u {
+        wp_x = start_decoded % width;
+        wp_y = start_decoded / width;
     }
     var decoded = start_decoded;
     let channel_samples = width * height;
@@ -526,6 +526,74 @@ fn decode_hf_channels(first_blocks: u32) -> u32 {
     return decoded;
 }
 
+fn decode_hf_channels_bounded(first_blocks: u32) -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    let correlation_width = (control.geometry.x + 63u) / 64u;
+    let correlation_height = (control.geometry.y + 63u) / 64u;
+    let correlation_samples = correlation_width * correlation_height;
+    let hf_samples = 2u * correlation_samples + 2u * first_blocks + block_count;
+    params.sample_count = max(3u * block_count, hf_samples);
+    params.source_channels = 1u;
+    params.width = correlation_width;
+    params.height = correlation_height;
+    if window_is_first() {
+        bit_cursor = params.entropy.token_start;
+        consumer_decoded = 0u;
+        decode_error = 0u;
+        entropy_begin();
+    } else {
+        load_packet_execution_state();
+    }
+    if first_blocks == 0u || first_blocks > control.capacities.w {
+        reject(ERROR_FIRST_BLOCK, first_blocks);
+        return consumer_decoded;
+    }
+    if consumer_decoded < correlation_samples {
+        current_channel = 0u;
+    } else if consumer_decoded < 2u * correlation_samples {
+        current_channel = 1u;
+    } else if consumer_decoded < 2u * correlation_samples + 2u * first_blocks {
+        current_channel = 2u;
+    } else {
+        current_channel = 3u;
+    }
+    while current_channel < 4u && decode_error == 0u && !window_should_pause() {
+        var channel_start = 0u;
+        var width = correlation_width;
+        var height = correlation_height;
+        var stride = correlation_width;
+        var offset = control.offsets.x;
+        if current_channel == 1u {
+            channel_start = correlation_samples;
+            offset = control.offsets.y;
+        } else if current_channel == 2u {
+            channel_start = 2u * correlation_samples;
+            width = first_blocks;
+            height = 2u;
+            stride = control.capacities.w;
+            offset = control.offsets.z;
+        } else if current_channel == 3u {
+            channel_start = 2u * correlation_samples + 2u * first_blocks;
+            width = control.geometry.z;
+            height = control.geometry.w;
+            stride = control.geometry.z;
+            offset = control.expected.w;
+        }
+        let channel_decoded = consumer_decoded - channel_start;
+        let decoded = decode_channel(width, height, stride, offset, 1u, channel_decoded);
+        consumer_decoded += decoded - channel_decoded;
+        if decode_error != 0u || window_should_pause() {
+            break;
+        }
+        if decoded != width * height {
+            decode_error = ERROR_RAW_TOKEN;
+            break;
+        }
+        current_channel += 1u;
+    }
+    return consumer_decoded;
+}
+
 fn validate_hf_values(first_blocks: u32) {
     let block_count = control.geometry.z * control.geometry.w;
     if control.expected.y != 0u {
@@ -560,6 +628,78 @@ fn finish_hf_packet() {
         }
         finish_section(params.entropy.token_end);
     }
+}
+
+fn finish_bounded_hf_packet() {
+    if control.streams.z != 0u {
+        finish_section(params.stream_token_end);
+        return;
+    }
+    let preset_bits = select(
+        0u,
+        32u - countLeadingZeros(control.streams.w - 1u),
+        control.streams.w > 1u,
+    );
+    let default_matrix = read_bits(1u);
+    let preset = read_bits(preset_bits);
+    let fixed_hf_tail = read_bits(17u);
+    if default_matrix != (control.expected.z & 1u)
+        || preset != 0u
+        || fixed_hf_tail != (control.expected.z >> 1u) {
+        reject(ERROR_HF_GLOBAL, bit_cursor);
+    }
+    finish_section(params.stream_token_end);
+}
+
+fn finish_bounded_hf(hf_decoded: u32, first_blocks: u32) -> u32 {
+    let block_count = control.geometry.z * control.geometry.w;
+    let correlation_samples = ((control.geometry.x + 63u) / 64u)
+        * ((control.geometry.y + 63u) / 64u);
+    let expected_samples = 2u * correlation_samples + 2u * first_blocks + block_count;
+    var status_code = decode_error;
+    if decode_error != 0u {
+        if !window_is_final() {
+            save_packet_execution_state(decode_error);
+        }
+    } else if hf_decoded != expected_samples {
+        if window_is_final() {
+            status_code = ERROR_TRUNCATED_BITS;
+        } else {
+            save_packet_execution_state(0u);
+            status_code = STATUS_IN_PROGRESS;
+        }
+    } else if !window_is_final() {
+        save_packet_execution_state(0u);
+        status_code = STATUS_IN_PROGRESS;
+    } else {
+        entropy_finalize();
+        validate_hf_values(first_blocks);
+        finish_bounded_hf_packet();
+        clear_coefficients();
+        status_code = decode_error;
+        if decode_error == 0u {
+            status_code = STATUS_OK;
+        }
+    }
+    return status_code;
+}
+
+fn write_bounded_hf_status(status_code: u32, hf_decoded: u32, first_blocks: u32) {
+    status[0] = status_code;
+    status[1] = params.stream_base_bit + bit_cursor;
+    status[2] = params.stream_base_bit + params.stream_token_end;
+    if control.streams.z != 0u && status_code == STATUS_OK {
+        status[1] = control.section_bits.w;
+        status[2] = control.section_bits.w;
+    }
+    status[4] = hf_decoded;
+    status[5] = raw_metadata[control.offsets.z];
+    status[6] = raw_metadata[control.offsets.w] + 1u;
+    status[7] = control.capacities.x;
+    status[8] = select(status[8], 0u, status_code == STATUS_OK);
+    status[9] = control.quantization.x;
+    status[10] = control.quantization.y;
+    status[11] = first_blocks;
 }
 
 fn clear_coefficients() {
@@ -597,6 +737,20 @@ fn decode_vardct_lf() {
 
 @compute @workgroup_size(1, 1, 1)
 fn decode_vardct_hf() {
+    params = params_input[0];
+    reconstruction_base = 0u;
+    if bounded_window_enabled() {
+        params.source_mask = 0x7fffffffu;
+        params.stream_index = control.streams.y;
+        let first_blocks = control.quantization.w;
+        let hf_decoded = decode_hf_channels_bounded(first_blocks);
+        write_bounded_hf_status(
+            finish_bounded_hf(hf_decoded, first_blocks),
+            hf_decoded,
+            first_blocks,
+        );
+        return;
+    }
     initialize_packet(control.section_bits.z, control.section_bits.y, control.streams.y);
     let first_blocks = control.quantization.w;
     if first_blocks == 0u || first_blocks > control.capacities.w {

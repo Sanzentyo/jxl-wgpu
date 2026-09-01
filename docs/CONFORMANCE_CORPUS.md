@@ -177,15 +177,19 @@ distance 2/effort 7/raw-codestream output, and requires more than one LF group w
 tree. On an actual adapter it dispatches every LF-local stream, maps the aggregate 64-byte status
 records, validates and uses only their entropy-end cursors, packs the following HF-local metadata,
 and dispatches every HF stream. The companion
-`vardct_engine_gpu::ordinary_cjxl_local_trees_resume_lf_across_bounded_packet_windows` runs the
+`vardct_engine_gpu::ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows` runs the
 same generated codestream through the stock frame engine with a forced 256-byte stream cap. Both LF
-groups must use the 128-byte SelfCorrecting packet state and more than two ordered LF submissions,
-while the reusable LF stream allocation remains at or below the cap. Only the final LF command
-copies the aggregate cursor records, after which whole-range HF and resident rendering continue.
+groups must use the 128-byte SelfCorrecting packet state and more than two ordered LF and HF
+submissions, while their shared reusable packet stream allocation remains at or below the cap. Only
+the final LF command copies the aggregate cursor records; after host descriptor packing, HF resumes
+across its correlation, strategy/quantizer, and sharpness channels. The final HF command shares the
+first downstream submission.
 The test requires the typed pre-HF `UnvalidatedOutputNotSubmitted` handoff error, blocking and
 runtime-neutral async RGB8 results within one code of Rust `jxl` and optional `djxl`, exact reported
 submission accounting, and complete shared-budget release after normal consumption or cancellation
-at the LF stage. The effort-7 stream also exercises X=5/B=5
+at the LF stage. A deterministic mutation at 90% of the first LF-group range damages a later HF
+window without touching its host-parsed descriptor and must return typed
+`PacketGpu(Entropy { .. })` from the final aggregate map before releasing the reservation. The effort-7 stream also exercises X=5/B=5
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
@@ -241,9 +245,9 @@ every oversized accepted Modular group is segmented. Rust/WGSL full-record word 
 shader variant is parsed and semantically validated with Naga; no shader-source substring
 assertion is used.
 
-Together these are Prefix+RLE/LZ77, production ANS+Weighted, staged local-tree VarDCT LF packet, and
-nonzero/custom-order VarDCT AC cross-window evidence. VarDCT HF packet, combined/global-tree packet,
-and recursive entropy consumers still need the same bounded resume contract, and broader
+Together these are Prefix+RLE/LZ77, production ANS+Weighted, staged local-tree VarDCT LF/HF packets,
+and nonzero/custom-order VarDCT AC cross-window evidence. Combined/global-tree VarDCT packets and
+recursive entropy consumers still need the same bounded resume contract, and broader
 corruption/truncation fuzzing is still required before `ENT-D02` can be marked done.
 
 ## Common entropy differential matrix

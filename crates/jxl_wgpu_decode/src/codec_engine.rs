@@ -203,9 +203,11 @@ impl WgpuDecodeSubmissionSession {
         }
     }
 
-    /// Number of queue submissions issued for one visible frame in the selected mode.
+    /// Number of queue submissions issued for one visible frame in the selected mode. A staged
+    /// VarDCT local-tree session updates this count after its LF cursor map determines the exact HF
+    /// packet window plan.
     #[must_use]
-    pub const fn submissions_per_frame(&self) -> usize {
+    pub fn submissions_per_frame(&self) -> usize {
         match self {
             Self::Modular(session) => session.memory_stats().submissions_per_frame,
             Self::VarDct(session) => session.submissions_per_frame(),

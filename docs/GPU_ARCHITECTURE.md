@@ -74,8 +74,8 @@ Every accepted stock Modular reconstruction specialization supports intra-group 
 A consumer-neutral entropy-window planner owns byte-range validation, four-byte packing, sentinel
 space, group batching, logical-to-upload rebasing, and the first/final flags; codec consumers retain
 their own resume records and dispatch ordering. The Modular engine, VarDCT AC pass-group consumer,
-and staged local-tree VarDCT LF packet consumer use it in production; VarDCT HF packets,
-combined/global-tree packets, and recursive streams remain `ENT-D02` work. The planner resolves one upload cap from the
+and staged local-tree VarDCT LF/HF packet consumers use it in production; combined/global-tree
+packets and recursive streams remain `ENT-D02` work. The planner resolves one upload cap from the
 caller policy, storage binding limit, and shared per-frame byte budget. A group that exceeds it is
 divided into ordered core ranges with 16-byte
 backward/forward overlap; a dispatch finishes the current output token before yielding, so no
@@ -97,12 +97,18 @@ its LF reconstruction allocation. Current local-tree planning reserves 128 bytes
 tree is not known until after the LF status map. The record retains the common entropy/LZ state, decoded-sample
 progress, sticky failure, previous-gradient state, and every weighted-predictor accumulator. Only
 the final LF segment checks exact termination and one aggregate map exposes the LF end cursors.
-VarDCT HF packet and combined/global-tree packet consumers still require one complete entropy range.
+After the aggregate LF cursor map, the host packs each HF descriptor and builds exact HF ranges
+against the same retained codestream and shared packet upload. HF reuses the packet state
+sequentially, persists progress across its two correlation maps, strategy/quantizer plane, and
+sharpness plane, and performs fixed-tail validation only on its final segment. The last HF command
+shares the first downstream queue submission. Combined/global-tree packet consumers still require
+one complete entropy range.
 
 For the bounded stock VarDCT profile, restoration remains resident in the downstream command
 buffer. Global-tree streams execute that buffer in the packet submission. Streams with local
 per-substream MA trees first submit one or more bounded LF entropy windows, map only aggregate end cursors, host-pack the
-cursor-dependent HF descriptors, and then submit HF entropy plus the downstream buffer. The inverse
+cursor-dependent HF descriptors, and then submit one or more bounded HF windows plus the downstream
+buffer. The inverse
 transform dispatches each independently bounded LF-group artifact into shared padded resident XYB
 planes. Group-local LF and correlation data first scatter into full-image atlases; adaptive LF
 smoothing runs once over that atlas, or the standard skip flag copies it resident-to-resident.
