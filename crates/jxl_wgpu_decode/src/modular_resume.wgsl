@@ -4,7 +4,16 @@
 //! `modular_reconstruct.wgsl` remains usable by whole-range VarDCT packet consumers.
 
 fn load_modular_execution_state() {
-    let channel_decoded = consumer_decoded % params.sample_count;
+    current_channel = modular_channel_for_decoded(consumer_decoded);
+    if current_channel >= modular_entropy_channel_count() {
+        predictor_prev_grad = 0i;
+        if params.needs_self_correcting != 0u {
+            wp_reset();
+        }
+        return;
+    }
+    modular_select_channel(current_channel);
+    let channel_decoded = consumer_decoded - modular_current_channel_decoded_start();
     if channel_decoded == 0u {
         predictor_prev_grad = 0i;
         if params.needs_self_correcting != 0u {
@@ -18,8 +27,9 @@ fn load_modular_execution_state() {
     if params.needs_self_correcting == 0u {
         return;
     }
-    wp_x = channel_decoded % params.width;
-    wp_y = channel_decoded / params.width;
+    let width = modular_current_channel_width(params.width);
+    wp_x = channel_decoded % width;
+    wp_y = channel_decoded / width;
     wp_true_err_w = bitcast<i32>(reconstruction_load(base + 9u));
     wp_true_err_nw = bitcast<i32>(reconstruction_load(base + 10u));
     wp_true_err_n = bitcast<i32>(reconstruction_load(base + 11u));

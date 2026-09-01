@@ -40,12 +40,23 @@ fn gradient_i32(north: i32, west: i32, north_west: i32) -> i32 {
     return clamp(gradient, min(north, west), max(north, west));
 }
 
-fn sample_at(channel: u32, index: u32) -> i32 {
+fn sample_at(channel: u32, index: u32, x: u32, y: u32) -> i32 {
+    if modular_descriptor_mode() {
+        return bitcast<i32>(modular_descriptor_sample_load(channel, x, y));
+    }
     return bitcast<i32>(reconstruction_load(channel * params.sample_count + index));
 }
 
 fn wp_row_base() -> u32 {
-    return params.sample_count * params.source_channels;
+    return modular_arena_words(params.sample_count * params.source_channels);
+}
+
+fn wp_scratch_width() -> u32 {
+    return modular_entropy_max_width(params.width);
+}
+
+fn wp_current_width() -> u32 {
+    return modular_current_channel_width(params.width);
 }
 
 fn wp_true_error(index: u32) -> i32 {
@@ -53,14 +64,14 @@ fn wp_true_error(index: u32) -> i32 {
 }
 
 fn wp_subpred_error(index: u32, component: u32) -> u32 {
-    return reconstruction_load(wp_row_base() + params.width + index * 4u + component);
+    return reconstruction_load(wp_row_base() + wp_scratch_width() + index * 4u + component);
 }
 
 fn wp_store_row(index: u32, true_error: i32, errors: array<u32, 4>) {
     reconstruction_store(wp_row_base() + index, bitcast<u32>(true_error));
     for (var component = 0u; component < 4u; component += 1u) {
         reconstruction_store(
-            wp_row_base() + params.width + index * 4u + component,
+            wp_row_base() + wp_scratch_width() + index * 4u + component,
             errors[component],
         );
     }
@@ -193,6 +204,7 @@ fn weighted_predict(n: i32, nw: i32, ne: i32, w: i32, nn: i32) -> WeightedPredic
 }
 
 fn weighted_record(prediction: WeightedPrediction, sample: i32) {
+    let width = wp_current_width();
     let sample3 = sample << 3u;
     let true_error = prediction.prediction - sample3;
     var errors: array<u32, 4>;
@@ -201,7 +213,7 @@ fn weighted_record(prediction: WeightedPrediction, sample: i32) {
     }
     wp_store_row(wp_x, true_error, errors);
     wp_x += 1u;
-    if wp_x >= params.width {
+    if wp_x >= width {
         wp_y += 1u;
         wp_x = 0u;
         wp_true_err_w = 0i;
@@ -211,7 +223,7 @@ fn weighted_record(prediction: WeightedPrediction, sample: i32) {
             wp_subpred_n_w[component] = wp_subpred_error(0u, component);
             wp_subpred_nw_ww[component] = wp_subpred_n_w[component];
         }
-        if params.width <= 1u {
+        if width <= 1u {
             wp_true_err_ne = wp_true_err_n;
             for (var component = 0u; component < 4u; component += 1u) {
                 wp_subpred_ne[component] = wp_subpred_n_w[component];
@@ -231,7 +243,7 @@ fn weighted_record(prediction: WeightedPrediction, sample: i32) {
         wp_subpred_nw_ww[component] = wp_subpred_n_w[component];
         wp_subpred_n_w[component] = wp_subpred_ne[component] + errors[component];
     }
-    if wp_x + 1u >= params.width {
+    if wp_x + 1u >= width {
         wp_true_err_ne = wp_true_err_n;
         for (var component = 0u; component < 4u; component += 1u) {
             wp_subpred_ne[component] = wp_subpred_n_w[component];
@@ -277,11 +289,21 @@ fn ma_property(
         default: {}
     }
     let previous_index = (property - 16u) / 4u;
-    if previous_index >= current_channel {
-        return 0i;
+    var previous_channel = 0u;
+    if modular_descriptor_mode() {
+        if previous_index >= modular_channel_reference_count(current_channel) {
+            return 0i;
+        }
+        previous_channel = modular_metadata[
+            modular_channel_reference_offset(current_channel) + previous_index
+        ];
+    } else {
+        if previous_index >= current_channel {
+            return 0i;
+        }
+        previous_channel = current_channel - previous_index - 1u;
     }
-    let previous_channel = current_channel - previous_index - 1u;
-    let center = sample_at(previous_channel, index);
+    let center = sample_at(previous_channel, index, x, y);
     let kind = (property - 16u) & 3u;
     if kind == 0u {
         return unsigned_abs_i32(center);
@@ -290,15 +312,16 @@ fn ma_property(
         return center;
     }
     var previous_gradient = 0i;
+    let width = modular_current_channel_width(params.width);
     if x == 0u && y != 0u {
-        previous_gradient = sample_at(previous_channel, index - params.width);
+        previous_gradient = sample_at(previous_channel, index - width, x, y - 1u);
     } else if y == 0u && x != 0u {
-        previous_gradient = sample_at(previous_channel, index - 1u);
+        previous_gradient = sample_at(previous_channel, index - 1u, x - 1u, y);
     } else if x != 0u && y != 0u {
         previous_gradient = gradient_i32(
-            sample_at(previous_channel, index - params.width),
-            sample_at(previous_channel, index - 1u),
-            sample_at(previous_channel, index - params.width - 1u),
+            sample_at(previous_channel, index - width, x, y - 1u),
+            sample_at(previous_channel, index - 1u, x - 1u, y),
+            sample_at(previous_channel, index - width - 1u, x - 1u, y - 1u),
         );
     }
     if kind == 2u {
@@ -389,6 +412,10 @@ fn predictor_value(
 }
 
 fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u32 {
+    modular_select_channel(current_channel);
+    let width = modular_current_channel_width(params.width);
+    let height = modular_current_channel_height(params.height);
+    let channel_samples = width * height;
     if start == 0u {
         predictor_prev_grad = 0i;
         if params.needs_self_correcting != 0u {
@@ -396,40 +423,40 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
         }
     }
     var decoded = start;
-    while decoded < params.sample_count && decode_error == 0u
+    while decoded < channel_samples && decode_error == 0u
         && (!may_pause || bit_cursor < pause_cursor) {
-        let x = decoded % params.width;
-        let y = decoded / params.width;
+        let x = decoded % width;
+        let y = decoded / width;
         var w = 0i;
         if x != 0u {
-            w = sample_at(current_channel, decoded - 1u);
+            w = sample_at(current_channel, decoded - 1u, x - 1u, y);
         } else if y != 0u {
-            w = sample_at(current_channel, decoded - params.width);
+            w = sample_at(current_channel, decoded - width, x, y - 1u);
         }
         var n = w;
         var nw = w;
         if y != 0u {
-            n = sample_at(current_channel, decoded - params.width);
+            n = sample_at(current_channel, decoded - width, x, y - 1u);
             nw = n;
             if x != 0u {
-                nw = sample_at(current_channel, decoded - params.width - 1u);
+                nw = sample_at(current_channel, decoded - width - 1u, x - 1u, y - 1u);
             }
         }
         var ne = n;
-        if y != 0u && x + 1u < params.width {
-            ne = sample_at(current_channel, decoded - params.width + 1u);
+        if y != 0u && x + 1u < width {
+            ne = sample_at(current_channel, decoded - width + 1u, x + 1u, y - 1u);
         }
         var nee = ne;
-        if y != 0u && x + 2u < params.width {
-            nee = sample_at(current_channel, decoded - params.width + 2u);
+        if y != 0u && x + 2u < width {
+            nee = sample_at(current_channel, decoded - width + 2u, x + 2u, y - 1u);
         }
         var nn = n;
         if y >= 2u {
-            nn = sample_at(current_channel, decoded - 2u * params.width);
+            nn = sample_at(current_channel, decoded - 2u * width, x, y - 2u);
         }
         var ww = w;
         if x >= 2u {
-            ww = sample_at(current_channel, decoded - 2u);
+            ww = sample_at(current_channel, decoded - 2u, x - 2u, y);
         }
         var weighted = WeightedPrediction(0i, 0i, array<i32, 4>(0i, 0i, 0i, 0i));
         if params.needs_self_correcting != 0u {
@@ -443,29 +470,33 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
         let leaf_offset = modular_metadata[leaf + 2u];
         let cluster = modular_metadata[leaf + 3u];
         let multiplier = modular_metadata[leaf + 4u];
-        let packed = entropy_read_varint(cluster, params.width);
+        let packed = entropy_read_varint(cluster, width);
         let difference = unpack_signed(packed);
         let residual = bitcast<i32>(
             bitcast<u32>(difference) * multiplier + leaf_offset
         );
         let prediction = predictor_value(predictor, weighted, n, w, nw, ne, nn, ww, nee);
         let sample = bitcast<i32>(bitcast<u32>(residual) + bitcast<u32>(prediction));
-        let maximum = i32(params.source_mask);
-        let signed_transform_channel = params.source_channels >= 3u
-            && (current_channel == 1u || current_channel == 2u);
-        if (!signed_transform_channel && (sample < 0i || sample > maximum))
-            || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
-            decode_error = ERROR_RAW_TOKEN;
-            break;
+        if !modular_descriptor_mode() {
+            let maximum = i32(params.source_mask);
+            let signed_transform_channel = params.source_channels >= 3u
+                && (current_channel == 1u || current_channel == 2u);
+            if (!signed_transform_channel && (sample < 0i || sample > maximum))
+                || (signed_transform_channel && (sample < -maximum || sample > maximum)) {
+                decode_error = ERROR_RAW_TOKEN;
+                break;
+            }
+            reconstruction_store(
+                current_channel * params.sample_count + decoded,
+                bitcast<u32>(sample),
+            );
+        } else {
+            modular_descriptor_sample_store(current_channel, x, y, bitcast<u32>(sample));
         }
-        reconstruction_store(
-            current_channel * params.sample_count + decoded,
-            bitcast<u32>(sample),
-        );
         if params.needs_self_correcting != 0u {
             weighted_record(weighted, sample);
         }
-        if x + 1u == params.width {
+        if x + 1u == width {
             predictor_prev_grad = 0i;
         } else {
             predictor_prev_grad = w - nw + n;

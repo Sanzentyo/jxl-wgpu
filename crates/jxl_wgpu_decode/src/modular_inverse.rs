@@ -7,8 +7,8 @@ use crate::{
     modular_rct::{ModularRctParams, ModularRctPlane},
     modular_squeeze::{ModularSqueezeDirection, ModularSqueezeParams, ModularSqueezePlane},
     modular_transform::{
-        ModularChannelGeometry, ModularChannelTopology, ModularInverseTransform, ModularRct,
-        ModularSqueezeParameter, ModularTransformPlan,
+        GpuModularChannelLayout, ModularChannelGeometry, ModularChannelTopology,
+        ModularInverseTransform, ModularRct, ModularSqueezeParameter, ModularTransformPlan,
     },
 };
 
@@ -58,6 +58,19 @@ impl ModularArenaPlane {
             offset_words: self.offset_words,
         }
     }
+
+    const fn gpu_layout(self) -> GpuModularChannelLayout {
+        GpuModularChannelLayout {
+            word_offset: self.offset_words,
+            row_stride_words: self.geometry.width,
+            width: self.geometry.width,
+            height: self.geometry.height,
+            hshift: self.geometry.hshift,
+            vshift: self.geometry.vshift,
+            bit_depth: self.geometry.bit_depth,
+            reserved: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +107,14 @@ impl ModularInversePlan {
 
     pub(crate) fn final_planes(&self) -> &[ModularArenaPlane] {
         &self.final_planes
+    }
+
+    pub(crate) fn final_gpu_layouts(&self) -> Vec<GpuModularChannelLayout> {
+        self.final_planes
+            .iter()
+            .copied()
+            .map(ModularArenaPlane::gpu_layout)
+            .collect()
     }
 }
 

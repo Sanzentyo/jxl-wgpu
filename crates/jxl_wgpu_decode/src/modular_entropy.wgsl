@@ -30,6 +30,174 @@ var<private> entropy_copy_position: u32;
 var<private> entropy_decoded: u32;
 var<private> entropy_last_value: u32;
 
+// Pipeline specialization keeps descriptor branches out of the existing direct-channel kernels.
+override descriptor_channels: u32 = 0u;
+
+// The lossless consumer configures this private view from its transformed-channel header.  The
+// shared entropy fragment is also composed into VarDCT and entropy-probe shaders, so the state is
+// deliberately populated through an explicit call rather than by reading consumer-specific
+// Params fields here.
+var<private> modular_layout_channel_count: u32;
+var<private> modular_layout_sample_count: u32;
+var<private> modular_layout_max_width: u32;
+var<private> modular_layout_arena_words: u32;
+var<private> modular_layout_descriptor_offset: u32;
+var<private> modular_layout_legacy_sample_count: u32;
+var<private> modular_layout_legacy_width: u32;
+var<private> modular_layout_legacy_height: u32;
+var<private> modular_current_width: u32;
+var<private> modular_current_height: u32;
+var<private> modular_current_decoded_start: u32;
+var<private> modular_current_decoded_end: u32;
+
+fn modular_layout_configure(
+    layout_offset: u32,
+    legacy_channel_count: u32,
+    legacy_sample_count: u32,
+    legacy_width: u32,
+    legacy_height: u32,
+) {
+    modular_layout_legacy_sample_count = legacy_sample_count;
+    modular_layout_legacy_width = legacy_width;
+    modular_layout_legacy_height = legacy_height;
+    if layout_offset == 0u {
+        modular_layout_channel_count = legacy_channel_count;
+        modular_layout_sample_count = legacy_sample_count * legacy_channel_count;
+        modular_layout_max_width = legacy_width;
+        modular_layout_arena_words = modular_layout_sample_count;
+        modular_layout_descriptor_offset = 0u;
+    } else {
+        modular_layout_channel_count = modular_metadata[layout_offset];
+        modular_layout_sample_count = modular_metadata[layout_offset + 1u];
+        modular_layout_max_width = modular_metadata[layout_offset + 2u];
+        modular_layout_arena_words = modular_metadata[layout_offset + 3u];
+        modular_layout_descriptor_offset = modular_metadata[layout_offset + 4u];
+    }
+    modular_current_width = legacy_width;
+    modular_current_height = legacy_height;
+    modular_current_decoded_start = 0u;
+    modular_current_decoded_end = legacy_sample_count;
+}
+
+fn modular_descriptor_mode() -> bool {
+    return descriptor_channels != 0u;
+}
+
+fn modular_entropy_channel_count() -> u32 {
+    return modular_layout_channel_count;
+}
+
+fn modular_entropy_sample_count() -> u32 {
+    return modular_layout_sample_count;
+}
+
+fn modular_entropy_max_width(fallback: u32) -> u32 {
+    if modular_descriptor_mode() {
+        return modular_layout_max_width;
+    }
+    return fallback;
+}
+
+fn modular_arena_words(fallback: u32) -> u32 {
+    if modular_descriptor_mode() {
+        return modular_layout_arena_words;
+    }
+    return fallback;
+}
+
+fn modular_channel_descriptor(channel: u32) -> u32 {
+    return modular_layout_descriptor_offset + channel * 8u;
+}
+
+fn modular_channel_decoded_start(channel: u32) -> u32 {
+    if !modular_descriptor_mode() {
+        return channel * modular_layout_legacy_sample_count;
+    }
+    return modular_metadata[modular_channel_descriptor(channel) + 4u];
+}
+
+fn modular_channel_decoded_end(channel: u32) -> u32 {
+    if !modular_descriptor_mode() {
+        return (channel + 1u) * modular_layout_legacy_sample_count;
+    }
+    return modular_metadata[modular_channel_descriptor(channel) + 5u];
+}
+
+fn modular_channel_for_decoded(decoded: u32) -> u32 {
+    var channel = 0u;
+    while channel < modular_layout_channel_count {
+        if decoded < modular_channel_decoded_end(channel) {
+            return channel;
+        }
+        channel += 1u;
+    }
+    return modular_layout_channel_count;
+}
+
+fn modular_select_channel(channel: u32) {
+    if modular_descriptor_mode() {
+        let descriptor = modular_channel_descriptor(channel);
+        modular_current_width = modular_metadata[descriptor + 2u];
+        modular_current_height = modular_metadata[descriptor + 3u];
+        modular_current_decoded_start = modular_metadata[descriptor + 4u];
+        modular_current_decoded_end = modular_metadata[descriptor + 5u];
+    } else {
+        modular_current_width = modular_layout_legacy_width;
+        modular_current_height = modular_layout_legacy_height;
+        modular_current_decoded_start = channel * modular_layout_legacy_sample_count;
+        modular_current_decoded_end = (channel + 1u) * modular_layout_legacy_sample_count;
+    }
+}
+
+fn modular_current_channel_width(fallback: u32) -> u32 {
+    if modular_descriptor_mode() {
+        return modular_current_width;
+    }
+    return fallback;
+}
+
+fn modular_current_channel_height(fallback: u32) -> u32 {
+    if modular_descriptor_mode() {
+        return modular_current_height;
+    }
+    return fallback;
+}
+
+fn modular_current_channel_decoded_start() -> u32 {
+    return modular_current_decoded_start;
+}
+
+fn modular_current_channel_decoded_end() -> u32 {
+    return modular_current_decoded_end;
+}
+
+fn modular_channel_reference_offset(channel: u32) -> u32 {
+    return modular_metadata[modular_channel_descriptor(channel) + 6u];
+}
+
+fn modular_channel_reference_count(channel: u32) -> u32 {
+    return modular_metadata[modular_channel_descriptor(channel) + 7u];
+}
+
+fn modular_descriptor_sample_load(channel: u32, x: u32, y: u32) -> u32 {
+    let descriptor = modular_channel_descriptor(channel);
+    return reconstruction_load(
+        modular_metadata[descriptor]
+            + y * modular_metadata[descriptor + 1u]
+            + x,
+    );
+}
+
+fn modular_descriptor_sample_store(channel: u32, x: u32, y: u32, value: u32) {
+    let descriptor = modular_channel_descriptor(channel);
+    reconstruction_store(
+        modular_metadata[descriptor]
+            + y * modular_metadata[descriptor + 1u]
+            + x,
+        value,
+    );
+}
+
 fn entropy_config_offset(cluster: u32) -> u32 {
     return modular_metadata[META_CONFIG_OFFSET] + cluster * 4u;
 }
@@ -227,6 +395,10 @@ fn entropy_record_value(value: u32) {
 
 fn entropy_read_varint(cluster: u32, distance_multiplier: u32) -> u32 {
     var value = 0u;
+    var effective_distance_multiplier = distance_multiplier;
+    if modular_descriptor_mode() {
+        effective_distance_multiplier = modular_layout_max_width;
+    }
     if modular_metadata[META_LZ_ENABLED] == 0u {
         return entropy_read_clustered(cluster);
     }
@@ -268,10 +440,13 @@ fn entropy_read_varint(cluster: u32, distance_multiplier: u32) -> u32 {
         modular_metadata[distance_config + 1u],
         modular_metadata[distance_config + 2u],
     );
-    if distance_multiplier != 0u {
+    if effective_distance_multiplier != 0u {
         if distance < 120u {
             let special = entropy_special_distance(distance);
-            distance = u32(max(special.x + i32(distance_multiplier) * special.y - 1i, 0i));
+            distance = u32(max(
+                special.x + i32(effective_distance_multiplier) * special.y - 1i,
+                0i,
+            ));
         } else {
             distance -= 120u;
         }

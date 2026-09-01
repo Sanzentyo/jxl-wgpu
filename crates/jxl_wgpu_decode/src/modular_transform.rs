@@ -94,6 +94,23 @@ pub(crate) struct GpuModularChannelLayout {
 const _: [(); 32] = [(); std::mem::size_of::<GpuModularChannelLayout>()];
 const _: [(); 4] = [(); std::mem::align_of::<GpuModularChannelLayout>()];
 
+/// Header for generalized entropy channels and their resident inverse result.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub(crate) struct GpuModularChannelHeader {
+    pub channel_count: u32,
+    pub entropy_sample_count: u32,
+    pub maximum_width: u32,
+    pub arena_words: u32,
+    pub descriptor_offset: u32,
+    pub final_plane_offset: u32,
+    pub final_plane_count: u32,
+    pub reserved: u32,
+}
+
+const _: [(); 32] = [(); std::mem::size_of::<GpuModularChannelHeader>()];
+const _: [(); 4] = [(); std::mem::align_of::<GpuModularChannelHeader>()];
+
 /// Entropy-consumer descriptor for one packed transformed channel.
 ///
 /// Reference indices point only to earlier channels with identical geometry and shifts, in reverse
@@ -121,8 +138,40 @@ pub(crate) struct PackedModularChannelMetadata {
 }
 
 impl PackedModularChannelMetadata {
-    pub(crate) fn append_to(&self, metadata: &mut Vec<u32>) -> Result<u32> {
+    pub(crate) fn append_to(
+        &self,
+        metadata: &mut Vec<u32>,
+        arena_words: u32,
+        final_planes: &[GpuModularChannelLayout],
+    ) -> Result<u32> {
+        let mut entropy_sample_count = 0u32;
+        let mut maximum_width = 0u32;
         for (channel_index, channel) in self.channels.iter().enumerate() {
+            if channel.decoded_start != entropy_sample_count
+                || channel.row_stride_words < channel.width
+                || channel
+                    .width
+                    .checked_mul(channel.height)
+                    .and_then(|samples| channel.decoded_start.checked_add(samples))
+                    != Some(channel.decoded_end)
+            {
+                return Err(ModularTransformError::InvalidEntropyChannelMetadata {
+                    reason: "channel geometry and cumulative decoded range disagree",
+                }
+                .into());
+            }
+            let required_words = layout_required_words(
+                channel.word_offset,
+                channel.row_stride_words,
+                channel.width,
+                channel.height,
+            )?;
+            if required_words > arena_words {
+                return Err(ModularTransformError::InvalidEntropyChannelMetadata {
+                    reason: "entropy channel exceeds the resident arena",
+                }
+                .into());
+            }
             let reference_end = channel
                 .reference_offset
                 .checked_add(channel.reference_count)
@@ -145,20 +194,71 @@ impl PackedModularChannelMetadata {
                 }
                 .into());
             }
+            entropy_sample_count = channel.decoded_end;
+            maximum_width = maximum_width.max(channel.width);
         }
-        let channel_offset = u32::try_from(metadata.len())
+        for plane in final_planes {
+            if plane.reserved != 0 || plane.row_stride_words < plane.width {
+                return Err(ModularTransformError::InvalidEntropyChannelMetadata {
+                    reason: "final plane layout is malformed",
+                }
+                .into());
+            }
+            if layout_required_words(
+                plane.word_offset,
+                plane.row_stride_words,
+                plane.width,
+                plane.height,
+            )? > arena_words
+            {
+                return Err(ModularTransformError::InvalidEntropyChannelMetadata {
+                    reason: "final plane exceeds the resident arena",
+                }
+                .into());
+            }
+        }
+        let header_offset = u32::try_from(metadata.len())
             .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?;
+        let header_words = std::mem::size_of::<GpuModularChannelHeader>() / 4;
         let descriptor_words = self
             .channels
             .len()
             .checked_mul(std::mem::size_of::<GpuModularEntropyChannel>() / 4)
             .ok_or(ModularTransformError::GpuAddressSpaceOverflow)?;
-        let reference_base = metadata
+        let descriptor_base = metadata
             .len()
+            .checked_add(header_words)
+            .ok_or(ModularTransformError::GpuAddressSpaceOverflow)?;
+        let reference_base = descriptor_base
             .checked_add(descriptor_words)
             .ok_or(ModularTransformError::GpuAddressSpaceOverflow)?;
+        let descriptor_base = u32::try_from(descriptor_base)
+            .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?;
         let reference_base = u32::try_from(reference_base)
             .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?;
+        let final_plane_base = usize::try_from(reference_base)
+            .ok()
+            .and_then(|base| base.checked_add(self.references.len()))
+            .ok_or(ModularTransformError::GpuAddressSpaceOverflow)?;
+        let final_plane_offset = if final_planes.is_empty() {
+            0
+        } else {
+            u32::try_from(final_plane_base)
+                .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?
+        };
+        let header = GpuModularChannelHeader {
+            channel_count: u32::try_from(self.channels.len())
+                .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?,
+            entropy_sample_count,
+            maximum_width,
+            arena_words,
+            descriptor_offset: descriptor_base,
+            final_plane_offset,
+            final_plane_count: u32::try_from(final_planes.len())
+                .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?,
+            reserved: 0,
+        };
+        metadata.extend_from_slice(bytemuck::cast_slice(std::slice::from_ref(&header)));
         for channel in &self.channels {
             let mut rebased = *channel;
             rebased.reference_offset = reference_base
@@ -167,10 +267,23 @@ impl PackedModularChannelMetadata {
             metadata.extend_from_slice(bytemuck::cast_slice(std::slice::from_ref(&rebased)));
         }
         metadata.extend_from_slice(&self.references);
+        metadata.extend_from_slice(bytemuck::cast_slice(final_planes));
         u32::try_from(metadata.len())
             .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?;
-        Ok(channel_offset)
+        Ok(header_offset)
     }
+}
+
+fn layout_required_words(offset: u32, stride: u32, width: u32, height: u32) -> Result<u32> {
+    if width == 0 || height == 0 {
+        return Ok(offset);
+    }
+    height
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride))
+        .and_then(|words| words.checked_add(offset))
+        .and_then(|words| words.checked_add(width))
+        .ok_or_else(|| ModularTransformError::GpuAddressSpaceOverflow.into())
 }
 
 /// Channel order and meta-channel prefix after applying an ordered transform prefix.
@@ -1587,8 +1700,10 @@ mod tests {
         )
         .unwrap();
         let packed = topology.gpu_entropy_channels(Some(23)).unwrap();
+        assert_eq!(std::mem::size_of::<GpuModularChannelHeader>(), 32);
         assert_eq!(std::mem::size_of::<GpuModularEntropyChannel>(), 32);
         fn assert_pod<T: Pod>() {}
+        assert_pod::<GpuModularChannelHeader>();
         assert_pod::<GpuModularEntropyChannel>();
         assert_eq!(packed.references, vec![0, 2, 0]);
         assert_eq!(
@@ -1612,13 +1727,33 @@ mod tests {
         );
 
         let mut metadata = vec![0xfeed_beef; 5];
-        assert_eq!(packed.append_to(&mut metadata).unwrap(), 5);
-        assert_eq!(metadata.len(), 5 + 4 * 8 + 3);
-        assert_eq!(metadata[5 + 6], 37);
-        assert_eq!(metadata[5 + 8 + 6], 37);
-        assert_eq!(metadata[5 + 16 + 6], 37);
-        assert_eq!(metadata[5 + 24 + 6], 38);
-        assert_eq!(&metadata[37..], &[0, 2, 0]);
+        let final_plane = GpuModularChannelLayout {
+            word_offset: 0,
+            row_stride_words: 8,
+            width: 8,
+            height: 4,
+            hshift: 0,
+            vshift: 0,
+            bit_depth: 10,
+            reserved: 0,
+        };
+        assert_eq!(
+            packed
+                .append_to(&mut metadata, 128, &[final_plane])
+                .unwrap(),
+            5
+        );
+        assert_eq!(metadata.len(), 5 + 8 + 4 * 8 + 3 + 8);
+        assert_eq!(&metadata[5..13], &[4, 128, 8, 128, 13, 48, 1, 0]);
+        assert_eq!(metadata[13 + 6], 45);
+        assert_eq!(metadata[13 + 8 + 6], 45);
+        assert_eq!(metadata[13 + 16 + 6], 45);
+        assert_eq!(metadata[13 + 24 + 6], 46);
+        assert_eq!(&metadata[45..48], &[0, 2, 0]);
+        assert_eq!(
+            &metadata[48..56],
+            bytemuck::cast_slice::<GpuModularChannelLayout, u32>(&[final_plane])
+        );
 
         let without_references = topology.gpu_entropy_channels(Some(15)).unwrap();
         assert!(without_references.references.is_empty());
@@ -1642,10 +1777,22 @@ mod tests {
         malformed.channels[1].reference_count = 1;
         malformed.references[0] = 1;
         assert!(matches!(
-            malformed.append_to(&mut Vec::new()).unwrap_err(),
+            malformed.append_to(&mut Vec::new(), 128, &[]).unwrap_err(),
             crate::Error::ModularTransform(
                 crate::ModularTransformError::InvalidEntropyChannelMetadata {
                     reason: "a channel reference does not precede its consumer"
+                }
+            )
+        ));
+        assert!(matches!(
+            topology
+                .gpu_entropy_channels(Some(23))
+                .unwrap()
+                .append_to(&mut Vec::new(), 127, &[])
+                .unwrap_err(),
+            crate::Error::ModularTransform(
+                crate::ModularTransformError::InvalidEntropyChannelMetadata {
+                    reason: "entropy channel exceeds the resident arena"
                 }
             )
         ));

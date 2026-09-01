@@ -29,6 +29,7 @@ use crate::entropy_window::{
 #[cfg(test)]
 use crate::entropy_window::{STREAM_OVERLAP_BYTES, STREAM_SENTINEL_BYTES};
 use crate::model::native_modular_format;
+use crate::modular_transform::{ModularRct, ModularTransformIr};
 use crate::modular_tree::{EntropyCoderIr, MaTreeNodeIr};
 use crate::profile::{ModularGroup, StandardModularProfile, parse_standard_modular_profile};
 use crate::{
@@ -199,6 +200,8 @@ pub enum ModularOutputSpecialization {
 pub enum ModularReconstructionSpecialization {
     /// The complete MA tree and predictor family are evaluated per sample.
     GenericMetaAdaptive,
+    /// The complete MA tree is evaluated against descriptor-addressed transformed channels.
+    DescriptorMetaAdaptive,
     /// Every channel resolves through channel-only decisions to one fixed leaf.
     ChannelFixed {
         predictor: ModularPredictor,
@@ -385,6 +388,8 @@ pub struct WgpuSubmissionEngine {
 struct DecodePipelineCache {
     generic_atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
     generic_word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
+    descriptor_atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
+    descriptor_word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
     fixed_gradient_atomic: OnceLock<Arc<wgpu::ComputePipeline>>,
     fixed_gradient_word_aligned: OnceLock<Arc<wgpu::ComputePipeline>>,
 }
@@ -392,10 +397,30 @@ struct DecodePipelineCache {
 fn reconstruction_specialization(
     profile: &StandardModularProfile,
 ) -> ModularReconstructionSpecialization {
+    if uses_generalized_channel_layout(profile) {
+        return ModularReconstructionSpecialization::DescriptorMetaAdaptive;
+    }
     channel_fixed_gradient_specialization(
         &profile.ma_config.nodes,
         profile.channels.count(),
         profile.ma_config.needs_self_correcting(),
+    )
+}
+
+fn uses_generalized_channel_layout(profile: &StandardModularProfile) -> bool {
+    !matches!(
+        (
+            profile.channels,
+            profile.transform_plan.transforms.as_slice()
+        ),
+        (crate::ModularChannels::Gray, [])
+            | (
+                crate::ModularChannels::Rgb | crate::ModularChannels::Rgba,
+                [ModularTransformIr::Rct(ModularRct {
+                    begin_channel: 0,
+                    rct_type: 6,
+                })],
+            )
     )
 }
 
@@ -599,8 +624,22 @@ impl WgpuSubmissionEngine {
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
         let mut modular_metadata = profile.ma_config.pack_gpu_metadata()?.words;
-        let channel_layout_offset = if profile.groups.len() == 1 {
-            profile.channel_metadata.append_to(&mut modular_metadata)?
+        let generalized_channels = uses_generalized_channel_layout(&profile);
+        if generalized_channels && profile.groups.len() != 1 {
+            return Err(Error::UnsupportedProfile(crate::UnsupportedProfile::new(
+                crate::UnsupportedCodestreamFeature::Other(
+                    "multi-group-generalized-modular-layout".into(),
+                ),
+                "generalized Modular channel layouts currently require one root group",
+            )));
+        }
+        let channel_layout_offset = if generalized_channels {
+            let final_planes = profile.inverse_plan.final_gpu_layouts();
+            profile.channel_metadata.append_to(
+                &mut modular_metadata,
+                profile.inverse_plan.arena_words(),
+                &final_planes,
+            )?
         } else {
             0
         };
@@ -738,37 +777,59 @@ impl DecodePipelineCache {
                 ..
             }
         );
-        let pipeline = match (fixed_gradient, output_write_path) {
-            (false, OutputWritePath::AtomicBytes) => &self.generic_atomic,
-            (false, OutputWritePath::WordAligned) => &self.generic_word_aligned,
-            (true, OutputWritePath::AtomicBytes) => &self.fixed_gradient_atomic,
-            (true, OutputWritePath::WordAligned) => &self.fixed_gradient_word_aligned,
+        let descriptor = matches!(
+            reconstruction,
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive
+        );
+        let pipeline = match (fixed_gradient, descriptor, output_write_path) {
+            (false, false, OutputWritePath::AtomicBytes) => &self.generic_atomic,
+            (false, false, OutputWritePath::WordAligned) => &self.generic_word_aligned,
+            (false, true, OutputWritePath::AtomicBytes) => &self.descriptor_atomic,
+            (false, true, OutputWritePath::WordAligned) => &self.descriptor_word_aligned,
+            (true, false, OutputWritePath::AtomicBytes) => &self.fixed_gradient_atomic,
+            (true, false, OutputWritePath::WordAligned) => &self.fixed_gradient_word_aligned,
+            (true, true, _) => unreachable!("descriptor reconstruction is never channel-fixed"),
         };
         Arc::clone(pipeline.get_or_init(|| {
-            let label = match (f64_path, output_write_path, fixed_gradient) {
-                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, false) => {
+            let label = match (f64_path, output_write_path, fixed_gradient, descriptor) {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, false, false) => {
                     "jxl-wgpu decode generic Modular atomic output"
                 }
-                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, false) => {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, false, false) => {
                     "jxl-wgpu decode generic Modular word-aligned output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, false) => {
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, false, false) => {
                     "jxl-wgpu decode generic Modular native-f64 atomic output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, false) => {
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, false, false) => {
                     "jxl-wgpu decode generic Modular native-f64 word-aligned output"
                 }
-                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, true) => {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, false, true) => {
+                    "jxl-wgpu decode descriptor Modular atomic arena"
+                }
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, false, true) => {
+                    "jxl-wgpu decode descriptor Modular word-aligned arena"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, false, true) => {
+                    "jxl-wgpu decode descriptor Modular native-f64 atomic arena"
+                }
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, false, true) => {
+                    "jxl-wgpu decode descriptor Modular native-f64 word-aligned arena"
+                }
+                (F64OutputPath::ExactF32Widening, OutputWritePath::AtomicBytes, true, false) => {
                     "jxl-wgpu decode fixed-Gradient Modular atomic output"
                 }
-                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, true) => {
+                (F64OutputPath::ExactF32Widening, OutputWritePath::WordAligned, true, false) => {
                     "jxl-wgpu decode fixed-Gradient Modular word-aligned output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, true) => {
+                (F64OutputPath::NativeArithmetic, OutputWritePath::AtomicBytes, true, false) => {
                     "jxl-wgpu decode fixed-Gradient Modular native-f64 atomic output"
                 }
-                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, true) => {
+                (F64OutputPath::NativeArithmetic, OutputWritePath::WordAligned, true, false) => {
                     "jxl-wgpu decode fixed-Gradient Modular native-f64 word-aligned output"
+                }
+                (_, _, true, true) => {
+                    unreachable!("descriptor reconstruction is never channel-fixed")
                 }
             };
             Arc::new(create_decode_pipeline(
@@ -776,6 +837,7 @@ impl DecodePipelineCache {
                 label,
                 &shader_source(f64_path, output_write_path, reconstruction),
                 variant,
+                descriptor,
             ))
         }))
     }
@@ -803,7 +865,8 @@ fn shader_source(
         ),
     };
     let reconstruction_shader = match reconstruction {
-        ModularReconstructionSpecialization::GenericMetaAdaptive => MODULAR_RECONSTRUCT_SHADER,
+        ModularReconstructionSpecialization::GenericMetaAdaptive
+        | ModularReconstructionSpecialization::DescriptorMetaAdaptive => MODULAR_RECONSTRUCT_SHADER,
         ModularReconstructionSpecialization::ChannelFixed {
             predictor: ModularPredictor::Gradient,
             ..
@@ -811,7 +874,8 @@ fn shader_source(
         ModularReconstructionSpecialization::ChannelFixed { .. } => MODULAR_RECONSTRUCT_SHADER,
     };
     let resume_shader = match reconstruction {
-        ModularReconstructionSpecialization::GenericMetaAdaptive => MODULAR_RESUME_SHADER,
+        ModularReconstructionSpecialization::GenericMetaAdaptive
+        | ModularReconstructionSpecialization::DescriptorMetaAdaptive => MODULAR_RESUME_SHADER,
         ModularReconstructionSpecialization::ChannelFixed { .. } => "",
     };
     SHADER_TEMPLATE
@@ -831,6 +895,7 @@ fn create_decode_pipeline(
     label: &str,
     shader: &str,
     variant: KernelVariant,
+    descriptor_channels: bool,
 ) -> wgpu::ComputePipeline {
     let module = backend
         .device()
@@ -842,6 +907,7 @@ fn create_decode_pipeline(
     let constants = [
         ("wg_x", f64::from(workgroup_x)),
         ("wg_y", f64::from(workgroup_y)),
+        ("descriptor_channels", f64::from(descriptor_channels)),
     ];
     backend
         .device()
@@ -1288,6 +1354,8 @@ impl GroupDispatchLayout {
             let physical_sample_words =
                 if group_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
                     compact_gray8_sample_words(*group)?
+                } else if uses_generalized_channel_layout(profile) {
+                    profile.inverse_plan.arena_words()
                 } else {
                     decoded_symbol_count
                 };
@@ -1517,7 +1585,7 @@ fn group_reconstructed_bytes(
     execution_state_bytes: u64,
 ) -> Result<u64> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
-        u64::from(group.width)
+        u64::from(group_maximum_channel_width(profile, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
     } else {
@@ -1562,7 +1630,7 @@ fn group_entropy_state_offset_words(
     physical_sample_words: u32,
 ) -> Result<u32> {
     let predictor_words = if profile.ma_config.needs_self_correcting() {
-        u64::from(group.width)
+        u64::from(group_maximum_channel_width(profile, group)?)
             .checked_mul(5)
             .ok_or_else(|| Error::backend("weighted predictor workspace overflow"))?
     } else {
@@ -1629,10 +1697,30 @@ fn group_decoded_symbol_count(
     profile: &StandardModularProfile,
     group: ModularGroup,
 ) -> Result<u32> {
+    if uses_generalized_channel_layout(profile) {
+        return Ok(profile.inverse_plan.entropy_words());
+    }
     group
         .sample_count()?
         .checked_mul(profile.channels.count())
         .ok_or_else(|| Error::backend("group reconstruction sample count overflow"))
+}
+
+fn group_maximum_channel_width(
+    profile: &StandardModularProfile,
+    group: ModularGroup,
+) -> Result<u32> {
+    if !uses_generalized_channel_layout(profile) {
+        return Ok(group.width);
+    }
+    profile
+        .channel_metadata
+        .channels
+        .iter()
+        .map(|channel| channel.width)
+        .max()
+        .filter(|width| *width != 0)
+        .ok_or_else(|| Error::backend("generalized Modular channel layout is empty"))
 }
 
 fn group_lz77_window_words(
@@ -1640,10 +1728,10 @@ fn group_lz77_window_words(
     group: ModularGroup,
     decoded_symbol_count: u32,
 ) -> Result<u32> {
-    profile
-        .ma_config
-        .entropy
-        .lz77_window_words(group.width, decoded_symbol_count)
+    profile.ma_config.entropy.lz77_window_words(
+        group_maximum_channel_width(profile, group)?,
+        decoded_symbol_count,
+    )
 }
 
 const fn lz77_scratch_words(window_words: u32) -> u32 {
@@ -2583,6 +2671,7 @@ fn build_params(
                 clusters.map(u32::from),
             ),
             ModularReconstructionSpecialization::GenericMetaAdaptive => (0, 0, 0, [0; 4]),
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive => (0, 0, 0, [0; 4]),
         };
     let decoded_symbol_count = group_decoded_symbol_count(&source.profile, group)?;
     let lz77_window_words = group_lz77_window_words(&source.profile, group, decoded_symbol_count)?;
@@ -2598,6 +2687,8 @@ fn build_params(
     let physical_sample_words =
         if fixed_output_mode == FixedGradientOutputMode::CompactNormalizedGray8 {
             compact_gray8_sample_words(group)?
+        } else if uses_generalized_channel_layout(&source.profile) {
+            source.profile.inverse_plan.arena_words()
         } else {
             decoded_symbol_count
         };
@@ -3734,6 +3825,26 @@ mod tests {
             OutputWritePath::WordAligned,
             GENERIC_RECONSTRUCTION,
         );
+        let descriptor_atomic = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::AtomicBytes,
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive,
+        );
+        let descriptor_aligned = shader_source(
+            F64OutputPath::ExactF32Widening,
+            OutputWritePath::WordAligned,
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive,
+        );
+        let native_descriptor_atomic = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::AtomicBytes,
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive,
+        );
+        let native_descriptor_aligned = shader_source(
+            F64OutputPath::NativeArithmetic,
+            OutputWritePath::WordAligned,
+            ModularReconstructionSpecialization::DescriptorMetaAdaptive,
+        );
         let fixed_gradient_atomic = shader_source(
             F64OutputPath::ExactF32Widening,
             OutputWritePath::AtomicBytes,
@@ -3783,6 +3894,26 @@ mod tests {
             (
                 "native-f64-aligned",
                 native_aligned,
+                naga::valid::Capabilities::FLOAT64,
+            ),
+            (
+                "portable-descriptor-atomic",
+                descriptor_atomic,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "portable-descriptor-aligned",
+                descriptor_aligned,
+                naga::valid::Capabilities::empty(),
+            ),
+            (
+                "native-f64-descriptor-atomic",
+                native_descriptor_atomic,
+                naga::valid::Capabilities::FLOAT64,
+            ),
+            (
+                "native-f64-descriptor-aligned",
+                native_descriptor_aligned,
                 naga::valid::Capabilities::FLOAT64,
             ),
             (

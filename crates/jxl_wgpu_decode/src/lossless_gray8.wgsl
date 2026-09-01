@@ -117,8 +117,8 @@ fn reconstruction_store(index: u32, value: u32) {
 }
 
 fn entropy_window_base() -> u32 {
-    return params.sample_count * params.source_channels
-        + params.needs_self_correcting * 5u * params.width;
+    return modular_arena_words(params.sample_count * params.source_channels)
+        + params.needs_self_correcting * 5u * modular_entropy_max_width(params.width);
 }
 
 fn bit_mask(count: u32) -> u32 {
@@ -589,6 +589,13 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     params = params_table[group_index];
     reconstruction_base = lane_index * dispatch_control.lane_stride_words;
     decode_error = 0u;
+    modular_layout_configure(
+        params.channel_layout_offset,
+        params.source_channels,
+        params.sample_count,
+        params.width,
+        params.height,
+    );
     if window_is_first() {
         bit_cursor = params.entropy.token_start;
         consumer_decoded = 0u;
@@ -596,11 +603,16 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     } else {
         load_entropy_execution_state();
     }
-    current_channel = consumer_decoded / params.sample_count;
+    current_channel = modular_channel_for_decoded(consumer_decoded);
 
-    while current_channel < params.source_channels && decode_error == 0u
+    while current_channel < modular_entropy_channel_count() && decode_error == 0u
         && !window_should_pause() {
-        let channel_start = current_channel * params.sample_count;
+        let channel_start = modular_channel_decoded_start(current_channel);
+        let channel_end = modular_channel_decoded_end(current_channel);
+        if channel_start == channel_end {
+            current_channel += 1u;
+            continue;
+        }
         let decoded = decode_adaptive_channel(
             consumer_decoded - channel_start,
             !window_is_final(),
@@ -610,13 +622,13 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         if decode_error != 0u || window_should_pause() {
             break;
         }
-        if consumer_decoded != (current_channel + 1u) * params.sample_count {
+        if consumer_decoded != channel_end {
             decode_error = ERROR_RAW_TOKEN;
             break;
         }
         current_channel += 1u;
     }
-    let expected_samples = params.sample_count * params.source_channels;
+    let expected_samples = modular_entropy_sample_count();
     var status_code = decode_error;
     if decode_error != 0u {
         if !window_is_final() {
@@ -635,7 +647,10 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     } else {
         entropy_finish_exact();
         status_code = decode_error;
-        if decode_error == 0u && params.fixed_output_mode == 0u {
+        if decode_error == 0u
+            && params.fixed_output_mode == 0u
+            && !modular_descriptor_mode()
+        {
             finalize_output();
             status_code = decode_error;
         }
