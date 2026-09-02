@@ -53,6 +53,7 @@ pub(super) struct VarDctSource {
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
+    pub(super) adaptive_lf_smoothing: bool,
     pub(super) external_lf: Option<ProgressiveDcXybPlanes>,
 }
 
@@ -179,11 +180,7 @@ pub(super) fn prepare_source(
         .channel_shifts
         .into_iter()
         .any(|shift| shift.is_subsampled());
-    if has_subsampled_channels && packet.profile.adaptive_lf_smoothing {
-        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-            stage: "adaptive LF smoothing",
-        });
-    }
+    let adaptive_lf_smoothing = packet.profile.adaptive_lf_smoothing && !has_subsampled_channels;
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -228,7 +225,7 @@ pub(super) fn prepare_source(
         };
         let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
         let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
-        let lf_offsets = if packet.profile.adaptive_lf_smoothing {
+        let lf_offsets = if adaptive_lf_smoothing {
             [0; 3]
         } else {
             resource_layout.lf_offsets
@@ -449,7 +446,7 @@ pub(super) fn prepare_source(
                 resource: resource_layout,
                 hf_coefficients: hf_coefficients.as_ref(),
                 deferred_hf: deferred_hf_plan,
-                adaptive_lf_smoothing: packet.profile.adaptive_lf_smoothing,
+                adaptive_lf_smoothing,
                 restoration_scratch: gaborish.is_some() || epf.is_some(),
                 gaborish: gaborish.is_some(),
                 epf_sigma: epf_sigma_memory,
@@ -527,6 +524,7 @@ pub(super) fn prepare_source(
         quant_biases,
         frame_name,
         memory,
+        adaptive_lf_smoothing,
         external_lf: None,
     })
 }

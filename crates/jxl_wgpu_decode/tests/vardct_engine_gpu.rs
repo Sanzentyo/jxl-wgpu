@@ -340,6 +340,45 @@ fn frame_upsampling_factors_match_reference_on_gpu() {
     }
 }
 
+#[test]
+fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let extent = Extent2d::new(264, 64);
+    let original = common::jpeg_transcode_422();
+
+    // Decode original
+    let mut session = decoder
+        .open(
+            original,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        )
+        .unwrap();
+    let frame = session.next_frame().unwrap().unwrap();
+    let readback = ImageReadbackPipeline::new(&backend)
+        .submit(frame.output())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let actual = &readback.frame.outputs[0].bytes;
+    let rust = rust_jxl_rgb8(original, extent);
+    assert_eq!(actual.len(), rust.len());
+    let rust_error = maximum_error(actual, &rust);
+    assert!(rust_error <= 1);
+}
+
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
     fn next_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> &'a [u8] {
         loop {

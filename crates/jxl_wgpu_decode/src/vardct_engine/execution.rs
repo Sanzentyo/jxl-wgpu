@@ -2879,7 +2879,7 @@ fn submit_vardct(
             )?;
             (Vec::new(), None, Some(uniform))
         } else {
-            let lf_destination = if source.packet.profile.adaptive_lf_smoothing {
+            let lf_destination = if source.adaptive_lf_smoothing {
                 lf_temporary
                     .as_ref()
                     .ok_or(VarDctDecodeError::EngineContract {
@@ -2910,7 +2910,7 @@ fn submit_vardct(
                 })?
                 .resource_params
                 .smoothing_thresholds();
-            let adaptive_lf_uniform = if source.packet.profile.adaptive_lf_smoothing {
+            let adaptive_lf_uniform = if source.adaptive_lf_smoothing {
                 Some(pipelines.adaptive_lf.encode(
                     device,
                     &mut commands,
