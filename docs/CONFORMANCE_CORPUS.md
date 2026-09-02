@@ -416,6 +416,14 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Frame upsampling conformance
+
+`vardct_engine_gpu::frame_upsampling_factors_match_reference_on_gpu` exercises 2×, 4×, and 8× frame
+upsampling on an actual GPU adapter using `cjxl`-generated test codestreams. The test verifies that
+`memory.frame_upsample_image_bytes` and `memory.frame_upsample_weight_bytes` are accounted for in the
+shared frame memory budget, and that decoded RGB8 outputs match Rust `jxl` and `djxl` reference
+decoders within two RGB8 codes across all three resampling factors.
+
 ## Bounded Modular stream-window matrix
 
 `wgpu_gray8::fixed_gradient_group_resumes_across_bounded_gpu_stream_windows` creates a standard

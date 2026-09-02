@@ -273,6 +273,73 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
     }
 }
 
+#[test]
+fn frame_upsampling_factors_match_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let factors = [2_u32, 4, 8];
+    for factor in factors {
+        let width = 257 * factor;
+        let height = 257 * factor;
+        let Some(encoded) = common::cjxl_upsampled_vardct_codestream(width, height, factor) else {
+            continue;
+        };
+        let extent = Extent2d::new(width, height);
+        let mut session = decoder
+            .open(
+                &encoded,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let memory = session
+            .submission_session()
+            .vardct()
+            .expect("upsampled VarDCT selects the VarDCT submission session")
+            .memory_stats();
+        assert_ne!(
+            memory.frame_upsample_image_bytes, 0,
+            "{factor}x upsampling must allocate frame upsample image bytes"
+        );
+        assert_ne!(
+            memory.frame_upsample_weight_bytes, 0,
+            "{factor}x upsampling must allocate frame upsample weights"
+        );
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let actual = &readback.frame.outputs[0].bytes;
+        let rust = rust_jxl_rgb8(&encoded, extent);
+        assert_eq!(actual.len(), rust.len(), "{factor}x output size");
+        let rust_error = maximum_error(actual, &rust);
+        assert!(
+            rust_error <= 2,
+            "{factor}x upsampled GPU output diverges from Rust jxl by {rust_error}",
+        );
+        if let Some(djxl) = djxl_ppm(&encoded, extent) {
+            let djxl_error = maximum_error(actual, &djxl);
+            assert!(
+                djxl_error <= 2,
+                "{factor}x upsampled GPU output diverges from djxl by {djxl_error}",
+            );
+        }
+    }
+}
+
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
     fn next_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> &'a [u8] {
         loop {

@@ -11,7 +11,8 @@ use jxl_gpu_protocol::{
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
     MemoryPermit, ResidentChromaShift, ResidentChromaUpsampleInputs, ResidentEpfInputs,
-    ResidentF32Plane, ResidentGaborishInputs, ResidentStorageBinding, ResidentVarDctInputs,
+    ResidentF32Plane, ResidentGaborishInputs, ResidentImageUpsampleInputs,
+    ResidentImageUpsampleResources, ResidentStorageBinding, ResidentVarDctInputs,
     ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
     UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
 };
@@ -532,8 +533,6 @@ struct VarDctGroupJobBuffers {
 
 struct RestorationJobBuffers {
     _planes: [wgpu::Buffer; 3],
-    _pre_restoration_planes: Option<[wgpu::Buffer; 3]>,
-    _pre_restoration_uniforms: Vec<wgpu::Buffer>,
     _gaborish_uniform: Option<wgpu::Buffer>,
     _epf_sigma: Option<wgpu::Buffer>,
     _epf_sigma_uniforms: Vec<wgpu::Buffer>,
@@ -557,7 +556,11 @@ struct VarDctJobLifetime {
     _external_lf: Option<ProgressiveDcXybPlanes>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: [wgpu::Buffer; 3],
+    _component_upsample_planes: Option<[wgpu::Buffer; 3]>,
+    _component_upsample_uniforms: Vec<wgpu::Buffer>,
     _restoration: Option<RestorationJobBuffers>,
+    _frame_upsample_planes: Option<[wgpu::Buffer; 3]>,
+    _frame_upsample_resources: Option<ResidentImageUpsampleResources>,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: VarDctOutputScratch,
 }
@@ -2448,13 +2451,24 @@ fn submit_vardct(
             wgpu::BufferUsages::COPY_DST,
         )
     });
-    let pre_restoration_planes = (source.memory.pre_restoration_upsample_bytes != 0).then(|| {
+    let component_upsample_planes = (source.memory.component_upsample_bytes != 0).then(|| {
         let labels = [
-            "jxl-wgpu VarDCT pre-restoration X plane",
-            "jxl-wgpu VarDCT pre-restoration Y plane",
-            "jxl-wgpu VarDCT pre-restoration B plane",
+            "jxl-wgpu VarDCT component upsample X plane",
+            "jxl-wgpu VarDCT component upsample Y plane",
+            "jxl-wgpu VarDCT component upsample B plane",
         ];
-        let full_plane_bytes = source.memory.restoration_scratch_bytes / 3;
+        let shifted = source
+            .packet
+            .profile
+            .channel_shifts
+            .into_iter()
+            .filter(|shift| shift.is_subsampled())
+            .count() as u64;
+        let full_plane_bytes = source
+            .memory
+            .component_upsample_bytes
+            .checked_div(shifted)
+            .unwrap_or(0);
         std::array::from_fn(|channel| {
             if source.packet.profile.channel_shifts[channel].is_subsampled() {
                 storage(
@@ -2477,6 +2491,20 @@ fn submit_vardct(
             storage(
                 labels[channel],
                 source.memory.restoration_scratch_bytes / 3,
+                wgpu::BufferUsages::empty(),
+            )
+        })
+    });
+    let frame_upsample_planes = (source.memory.frame_upsample_image_bytes != 0).then(|| {
+        let labels = [
+            "jxl-wgpu VarDCT frame upsample X plane",
+            "jxl-wgpu VarDCT frame upsample Y plane",
+            "jxl-wgpu VarDCT frame upsample B plane",
+        ];
+        std::array::from_fn(|channel| {
+            storage(
+                labels[channel],
+                source.memory.frame_upsample_image_bytes / 3,
                 wgpu::BufferUsages::empty(),
             )
         })
@@ -3115,8 +3143,8 @@ fn submit_vardct(
     }
     let image_width = source.packet.profile.width;
     let image_height = source.packet.profile.height;
-    let mut pre_restoration_uniforms = Vec::new();
-    if let Some(upsampled) = &pre_restoration_planes {
+    let mut component_upsample_uniforms = Vec::new();
+    if let Some(upsampled) = &component_upsample_planes {
         for channel in 0..3 {
             let shift = source.packet.profile.channel_shifts[channel];
             if !shift.is_subsampled() {
@@ -3125,9 +3153,9 @@ fn submit_vardct(
             let [input_width, input_height] = shift
                 .shifted_extent(image_width, image_height)
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "pre-restoration input extent",
+                    field: "component upsample input extent",
                 })?;
-            pre_restoration_uniforms.push(pipelines.chroma_upsample.encode(
+            component_upsample_uniforms.push(pipelines.chroma_upsample.encode(
                 device,
                 &mut commands,
                 ResidentChromaUpsampleInputs {
@@ -3151,7 +3179,9 @@ fn submit_vardct(
             )?);
         }
     }
-    let restoration_source = pre_restoration_planes.as_ref().unwrap_or(&resident_planes);
+    let restoration_source = component_upsample_planes
+        .as_ref()
+        .unwrap_or(&resident_planes);
     let mut restoration = restoration_planes
         .as_ref()
         .map(|scratch| RestorationCursor::new(restoration_source, scratch));
@@ -3221,32 +3251,86 @@ fn submit_vardct(
             )?);
         }
     }
-    let presentation_planes = restoration
+    let restored_planes = restoration
         .as_ref()
-        .map_or(&resident_planes, RestorationCursor::current);
-    let presentation_shifts = if restoration.is_some() {
-        [crate::vardct_frontend::VarDctChannelShift::default(); 3]
-    } else {
-        source.packet.profile.channel_shifts
-    };
-    let presentation_geometry = presentation_shifts.map(|shift| {
-        shift.shifted_extent(image_width, image_height).ok_or(
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "presentation channel extent",
-            },
+        .map_or(restoration_source, RestorationCursor::current);
+    let (presentation_planes, frame_upsample_resources) =
+        if let (Some(weights), Some(output_buffers)) = (
+            source.frame_upsampling.as_ref(),
+            frame_upsample_planes.as_ref(),
+        ) {
+            let presentation_width = source.packet.profile.presentation_width;
+            let presentation_height = source.packet.profile.presentation_height;
+            let inputs =
+                resident_image_planes(restored_planes, image_width, image_height, padded_width)?;
+            let outputs = [
+                ResidentF32Plane {
+                    storage: resident_binding(&output_buffers[0])?,
+                    width: presentation_width,
+                    height: presentation_height,
+                    stride: presentation_width,
+                },
+                ResidentF32Plane {
+                    storage: resident_binding(&output_buffers[1])?,
+                    width: presentation_width,
+                    height: presentation_height,
+                    stride: presentation_width,
+                },
+                ResidentF32Plane {
+                    storage: resident_binding(&output_buffers[2])?,
+                    width: presentation_width,
+                    height: presentation_height,
+                    stride: presentation_width,
+                },
+            ];
+            let resources = pipelines.image_upsample.encode(
+                device,
+                &mut commands,
+                ResidentImageUpsampleInputs {
+                    inputs,
+                    outputs,
+                    weights,
+                },
+            )?;
+            (output_buffers, Some(resources))
+        } else {
+            (restored_planes, None)
+        };
+    let (output_geometry, output_strides) = if source.frame_upsampling.is_some() {
+        (
+            [[
+                source.packet.profile.presentation_width,
+                source.packet.profile.presentation_height,
+            ]; 3],
+            [source.packet.profile.presentation_width; 3],
         )
-    });
-    let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
-    let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
-    let presentation_strides = presentation_shifts.map(|shift| {
-        padded_width
-            .checked_shr(shift.horizontal)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "presentation channel stride",
-            })
-    });
-    let [stride_x, stride_y, stride_b] = presentation_strides;
-    let presentation_strides = [stride_x?, stride_y?, stride_b?];
+    } else {
+        let has_full_components = restoration.is_some() || component_upsample_planes.is_some();
+        let presentation_shifts = if has_full_components {
+            [crate::vardct_frontend::VarDctChannelShift::default(); 3]
+        } else {
+            source.packet.profile.channel_shifts
+        };
+        let presentation_geometry = presentation_shifts.map(|shift| {
+            shift.shifted_extent(image_width, image_height).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "presentation channel extent",
+                },
+            )
+        });
+        let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
+        let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
+        let presentation_strides = presentation_shifts.map(|shift| {
+            padded_width.checked_shr(shift.horizontal).ok_or(
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "presentation channel stride",
+                },
+            )
+        });
+        let [stride_x, stride_y, stride_b] = presentation_strides;
+        let presentation_strides = [stride_x?, stride_y?, stride_b?];
+        (presentation_geometry, presentation_strides)
+    };
     let output_scratch = pipelines.output.encode(
         device,
         &mut commands,
@@ -3254,27 +3338,27 @@ fn submit_vardct(
             planes: [
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[0])?,
-                    width: presentation_geometry[0][0],
-                    height: presentation_geometry[0][1],
-                    stride: presentation_strides[0],
+                    width: output_geometry[0][0],
+                    height: output_geometry[0][1],
+                    stride: output_strides[0],
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[1])?,
-                    width: presentation_geometry[1][0],
-                    height: presentation_geometry[1][1],
-                    stride: presentation_strides[1],
+                    width: output_geometry[1][0],
+                    height: output_geometry[1][1],
+                    stride: output_strides[1],
                 },
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[2])?,
-                    width: presentation_geometry[2][0],
-                    height: presentation_geometry[2][1],
-                    stride: presentation_strides[2],
+                    width: output_geometry[2][0],
+                    height: output_geometry[2][1],
+                    stride: output_strides[2],
                 },
             ],
             output: resident_binding(&output)?,
             config: VarDctOutputConfig {
-                width: source.packet.profile.width,
-                height: source.packet.profile.height,
+                width: source.packet.profile.presentation_width,
+                height: source.packet.profile.presentation_height,
                 transform: source.output_transform,
             },
         },
@@ -3282,8 +3366,6 @@ fn submit_vardct(
     debug_assert_eq!(output_scratch.plan, source.output_plan);
     let restoration_buffers = restoration_planes.map(|planes| RestorationJobBuffers {
         _planes: planes,
-        _pre_restoration_planes: pre_restoration_planes,
-        _pre_restoration_uniforms: pre_restoration_uniforms,
         _gaborish_uniform: gaborish_uniform,
         _epf_sigma: epf_sigma,
         _epf_sigma_uniforms: epf_sigma_uniforms,
@@ -3379,7 +3461,11 @@ fn submit_vardct(
         _external_lf: external_lf,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
+        _component_upsample_planes: component_upsample_planes,
+        _component_upsample_uniforms: component_upsample_uniforms,
         _restoration: restoration_buffers,
+        _frame_upsample_planes: frame_upsample_planes,
+        _frame_upsample_resources: frame_upsample_resources,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });

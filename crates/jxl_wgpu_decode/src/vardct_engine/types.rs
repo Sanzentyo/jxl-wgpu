@@ -5,6 +5,7 @@ use jxl_gpu_formats::{
 use jxl_wgpu::{
     MemoryBudgetError, ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan,
     ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
+    ResidentImageUpsampleError, ResidentImageUpsampleMemoryPlan, ResidentImageUpsampleWeights,
     ResidentVarDctError, ResidentVarDctMemoryPlan, SubmissionPollerError,
 };
 use thiserror::Error;
@@ -81,6 +82,8 @@ pub enum VarDctDecodeError {
     Resident(#[from] ResidentVarDctError),
     #[error(transparent)]
     ChromaUpsample(#[from] ResidentChromaUpsampleError),
+    #[error(transparent)]
+    ImageUpsample(#[from] ResidentImageUpsampleError),
     #[error(transparent)]
     Gaborish(#[from] ResidentGaborishError),
     #[error(transparent)]
@@ -257,16 +260,23 @@ pub struct VarDctDecodeMemoryStats {
     /// physically smaller buffers rather than full-resolution padding.
     pub resident_plane_bytes: [u64; 3],
     pub resident_image_bytes: u64,
-    /// Full-resolution destinations allocated only for shifted components before restoration.
-    pub pre_restoration_upsample_bytes: u64,
+    /// Encoded-resolution destinations allocated for shifted components before restoration or
+    /// frame upsampling.
+    pub component_upsample_bytes: u64,
     /// One 32-byte interpolation uniform for each shifted component.
-    pub pre_restoration_upsample_uniform_bytes: u64,
+    pub component_upsample_uniform_bytes: u64,
     /// Three full-resolution ping-pong destinations shared by Gaborish and EPF.
     pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
     pub epf_sigma_bytes: u64,
     pub epf_sigma_uniform_bytes: u64,
     pub epf_filter_uniform_bytes: u64,
+    /// Three presentation-resolution F32 planes produced by frame upsampling.
+    pub frame_upsample_image_bytes: u64,
+    /// Expanded phase-major 5x5 kernels retained by the fused frame upsampling dispatch.
+    pub frame_upsample_weight_bytes: u64,
+    /// Fused three-plane frame upsampling uniform.
+    pub frame_upsample_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
     /// Packed RGB8 storage retained until the final [`GpuBufferLease`] clone is dropped.
@@ -293,6 +303,7 @@ impl VarDctDecodeMemoryStats {
             gaborish,
             epf_sigma,
             epf_iterations,
+            frame_upsampling,
             resident,
             output,
         } = inputs;
@@ -563,20 +574,21 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let pre_restoration_upsample_bytes = if restoration_scratch {
+        let component_upsample_required = restoration_scratch || frame_upsampling.is_some();
+        let component_upsample_bytes = if component_upsample_required {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
-                    field: "pre-restoration upsample bytes",
+                    field: "component upsample bytes",
                 },
             )?
         } else {
             0
         };
-        let pre_restoration_upsample_uniform_bytes = if restoration_scratch {
+        let component_upsample_uniform_bytes = if component_upsample_required {
             ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
                 .checked_mul(shifted_channel_count)
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "pre-restoration upsample uniform bytes",
+                    field: "component upsample uniform bytes",
                 })?
         } else {
             0
@@ -611,6 +623,23 @@ impl VarDctDecodeMemoryStats {
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "EPF filter uniform bytes",
             })?;
+        let frame_upsample_image_bytes = if frame_upsampling.is_some() {
+            u64::from(packet.profile.presentation_width)
+                .checked_mul(u64::from(packet.profile.presentation_height))
+                .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<f32>() as u64))
+                .and_then(|plane| plane.checked_mul(3))
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "frame upsample image bytes",
+                })?
+        } else {
+            0
+        };
+        let frame_upsample_memory = frame_upsampling
+            .map(ResidentImageUpsampleMemoryPlan::new)
+            .transpose()?;
+        let frame_upsample_weight_bytes = frame_upsample_memory.map_or(0, |plan| plan.weight_bytes);
+        let frame_upsample_uniform_bytes =
+            frame_upsample_memory.map_or(0, |plan| plan.uniform_bytes);
         let resident_transient_bytes = checked_sum(
             resident.iter().map(|plan| plan.total_bytes),
             "resident VarDCT transient bytes",
@@ -645,13 +674,16 @@ impl VarDctDecodeMemoryStats {
             hf_order_table_bytes,
             hf_sink_uniform_bytes,
             resident_image_bytes,
-            pre_restoration_upsample_bytes,
-            pre_restoration_upsample_uniform_bytes,
+            component_upsample_bytes,
+            component_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
             epf_sigma_uniform_bytes,
             epf_filter_uniform_bytes,
+            frame_upsample_image_bytes,
+            frame_upsample_weight_bytes,
+            frame_upsample_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
         ]
@@ -703,13 +735,16 @@ impl VarDctDecodeMemoryStats {
             hf_sink_uniform_bytes,
             resident_plane_bytes,
             resident_image_bytes,
-            pre_restoration_upsample_bytes,
-            pre_restoration_upsample_uniform_bytes,
+            component_upsample_bytes,
+            component_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
             epf_sigma_uniform_bytes,
             epf_filter_uniform_bytes,
+            frame_upsample_image_bytes,
+            frame_upsample_weight_bytes,
+            frame_upsample_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
             output_lease_bytes,
@@ -734,6 +769,7 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) gaborish: bool,
     pub(super) epf_sigma: Option<EpfSigmaMemoryPlan>,
     pub(super) epf_iterations: u32,
+    pub(super) frame_upsampling: Option<&'a ResidentImageUpsampleWeights>,
     pub(super) resident: &'a [ResidentVarDctMemoryPlan],
     pub(super) output: VarDctOutputPlan,
 }

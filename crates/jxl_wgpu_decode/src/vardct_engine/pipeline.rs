@@ -4,7 +4,8 @@ use std::sync::{Arc, atomic::AtomicUsize};
 use jxl_gpu_bitstream::{CodestreamInventory, InventoryLimits, ParseLimits};
 use jxl_wgpu::{
     KernelVariant, MemoryBudget, MemoryBudgetSnapshot, ResidentChromaUpsamplePipeline,
-    ResidentEpfPipeline, ResidentGaborishPipeline, ResidentVarDctRenderer, WgpuBackend,
+    ResidentEpfPipeline, ResidentGaborishPipeline, ResidentImageUpsamplePipeline,
+    ResidentVarDctRenderer, WgpuBackend,
 };
 
 use crate::progressive_dc::ProgressiveDcPipeline;
@@ -33,6 +34,7 @@ pub(super) struct VarDctPipelines {
     pub(super) hf_coefficients: HfCoefficientPipeline,
     pub(super) renderer: ResidentVarDctRenderer,
     pub(super) chroma_upsample: ResidentChromaUpsamplePipeline,
+    pub(super) image_upsample: ResidentImageUpsamplePipeline,
     pub(super) gaborish: ResidentGaborishPipeline,
     pub(super) epf_sigma: EpfSigmaPipeline,
     pub(super) epf: ResidentEpfPipeline,
@@ -52,6 +54,8 @@ impl VarDctPipelines {
             resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
         let chroma_upsample_variant =
             resolve_kernel_variant(backend, "vardct_chroma_upsample", KernelVariant::Tile16x16)?;
+        let image_upsample_variant =
+            resolve_kernel_variant(backend, "vardct_image_upsample", KernelVariant::Tile16x16)?;
         let epf_sigma_variant =
             resolve_kernel_variant(backend, "vardct_epf_sigma", KernelVariant::Lanes64)?;
         let epf_variant = resolve_kernel_variant(backend, "vardct_epf", KernelVariant::Tile16x16)?;
@@ -74,6 +78,10 @@ impl VarDctPipelines {
             chroma_upsample: ResidentChromaUpsamplePipeline::with_variant(
                 device,
                 chroma_upsample_variant,
+            )?,
+            image_upsample: ResidentImageUpsamplePipeline::with_variant(
+                device,
+                image_upsample_variant,
             )?,
             gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,

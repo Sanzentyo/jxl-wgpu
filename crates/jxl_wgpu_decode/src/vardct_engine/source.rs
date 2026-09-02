@@ -8,7 +8,7 @@ use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     KernelVariant, ResidentChromaUpsampleMemoryPlan, ResidentEpfMemoryPlan,
-    ResidentGaborishWeights, ResidentVarDctMemoryPlan, WgpuBackend,
+    ResidentGaborishWeights, ResidentImageUpsampleWeights, ResidentVarDctMemoryPlan, WgpuBackend,
 };
 
 use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
@@ -46,6 +46,7 @@ pub(super) struct VarDctSource {
     pub(super) deferred_hf: Option<DeferredHfCoefficientLayout>,
     pub(super) gaborish: Option<ResidentGaborishWeights>,
     pub(super) epf: Option<VarDctEpfPlan>,
+    pub(super) frame_upsampling: Option<ResidentImageUpsampleWeights>,
     pub(super) output_plan: VarDctOutputPlan,
     pub(super) layout: ImageLayout,
     pub(super) output_transform: VarDctOutputTransform,
@@ -313,14 +314,51 @@ pub(super) fn prepare_source(
         .iter()
         .map(|group| group.artifact_layout)
         .collect::<Vec<_>>();
+    let frame_upsampling = match packet.profile.upsampling {
+        1 => None,
+        factor => {
+            let compact = match factor {
+                2 => inventory
+                    .image_header
+                    .upsampling_weights
+                    .up2
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                4 => inventory
+                    .image_header
+                    .upsampling_weights
+                    .up4
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                8 => inventory
+                    .image_header
+                    .upsampling_weights
+                    .up8
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                _ => {
+                    return Err(VarDctDecodeError::EngineContract {
+                        detail: "parsed frame upsampling factor is not 1, 2, 4, or 8",
+                    });
+                }
+            };
+            Some(ResidentImageUpsampleWeights::new(factor, &compact)?)
+        }
+    };
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
-        packet.profile.width,
-        packet.profile.height,
+        packet.profile.presentation_width,
+        packet.profile.presentation_height,
         &backend.device().limits(),
         options.output_variant,
     )?;
     let layout = ImageLayout::packed(
-        Extent2d::new(packet.profile.width, packet.profile.height),
+        Extent2d::new(
+            packet.profile.presentation_width,
+            packet.profile.presentation_height,
+        ),
         vardct_rgb8_format(),
     )?;
     let (output_transform, quant_biases) = match packet.profile.color_transform {
@@ -416,6 +454,7 @@ pub(super) fn prepare_source(
                 gaborish: gaborish.is_some(),
                 epf_sigma: epf_sigma_memory,
                 epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
+                frame_upsampling: frame_upsampling.as_ref(),
                 resident: &resident_memory,
                 output: output_plan,
             })?;
@@ -481,6 +520,7 @@ pub(super) fn prepare_source(
         deferred_hf,
         gaborish,
         epf,
+        frame_upsampling,
         output_plan,
         layout,
         output_transform,
@@ -620,17 +660,36 @@ fn validate_device_limits(
             true,
         ),
         (
-            "one pre-restoration upsample plane",
-            if memory.pre_restoration_upsample_bytes == 0 {
+            "one component upsample plane",
+            if memory.component_upsample_bytes == 0 {
                 0
             } else {
-                memory.restoration_scratch_bytes / 3
+                let shifted = packet
+                    .profile
+                    .channel_shifts
+                    .into_iter()
+                    .filter(|shift| shift.is_subsampled())
+                    .count() as u64;
+                memory
+                    .component_upsample_bytes
+                    .checked_div(shifted)
+                    .unwrap_or(0)
             },
             true,
         ),
         (
             "one restoration scratch plane",
             memory.restoration_scratch_bytes / 3,
+            true,
+        ),
+        (
+            "one frame upsample plane",
+            memory.frame_upsample_image_bytes / 3,
+            true,
+        ),
+        (
+            "frame upsample weights",
+            memory.frame_upsample_weight_bytes,
             true,
         ),
         ("EPF sigma plane", memory.epf_sigma_bytes, true),
@@ -670,8 +729,8 @@ fn validate_device_limits(
         ),
         ("Gaborish uniform", memory.gaborish_uniform_bytes),
         (
-            "pre-restoration upsample uniform",
-            if memory.pre_restoration_upsample_uniform_bytes == 0 {
+            "component upsample uniform",
+            if memory.component_upsample_uniform_bytes == 0 {
                 0
             } else {
                 ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
@@ -685,6 +744,10 @@ fn validate_device_limits(
             } else {
                 ResidentEpfMemoryPlan::UNIFORM_BYTES
             },
+        ),
+        (
+            "frame upsample uniform",
+            memory.frame_upsample_uniform_bytes,
         ),
         ("output uniform", memory.output_uniform_bytes),
     ] {

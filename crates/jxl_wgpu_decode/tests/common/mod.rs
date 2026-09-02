@@ -249,3 +249,52 @@ pub fn jpeg_transcode_440() -> &'static [u8] {
         LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_440.jxl.hex")));
     BYTES.as_slice()
 }
+
+pub fn cjxl_upsampled_vardct_codestream(width: u32, height: u32, factor: u32) -> Option<Vec<u8>> {
+    assert!(matches!(factor, 2 | 4 | 8));
+    if std::process::Command::new("cjxl")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping upsampled VarDCT oracle: cjxl is not installed");
+        return None;
+    }
+    let nonce = temp_file_nonce();
+    let ppm_path = std::env::temp_dir().join(format!("jxl-wgpu-upsample-{factor}x-{nonce}.ppm"));
+    let jxl_path = std::env::temp_dir().join(format!("jxl-wgpu-upsample-{factor}x-{nonce}.jxl"));
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    if let Some(capacity) = usize::try_from(width)
+        .ok()
+        .and_then(|w| w.checked_mul(height as usize))
+        .and_then(|wh| wh.checked_mul(3))
+    {
+        ppm.reserve(capacity);
+    }
+    for y in 0..height {
+        for x in 0..width {
+            ppm.extend_from_slice(&[
+                (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8,
+                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+                (x.wrapping_mul(5) + y.wrapping_mul(17) + (x ^ y)) as u8,
+            ]);
+        }
+    }
+    std::fs::write(&ppm_path, ppm).unwrap();
+    let resampling = format!("--resampling={factor}");
+    let output = std::process::Command::new("cjxl")
+        .args(["-d", "2", "-e", "7", "-m", "0", "--container=0"])
+        .arg(&resampling)
+        .arg(&ppm_path)
+        .arg(&jxl_path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&ppm_path);
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&jxl_path);
+        panic!("cjxl failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let codestream = std::fs::read(&jxl_path).unwrap();
+    let _ = std::fs::remove_file(&jxl_path);
+    Some(codestream)
+}

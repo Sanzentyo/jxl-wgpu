@@ -925,8 +925,16 @@ pub enum VarDctSectionLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardVarDctProfile {
     pub capability: VarDctFrontendCapability,
+    /// Encoded color-sample width before frame upsampling.
     pub width: u32,
+    /// Encoded color-sample height before frame upsampling.
     pub height: u32,
+    /// Final color-frame width after frame upsampling.
+    pub presentation_width: u32,
+    /// Final color-frame height after frame upsampling.
+    pub presentation_height: u32,
+    /// Frame upsampling factor applied after restoration and before color conversion.
+    pub upsampling: u32,
     pub bits_per_sample: u32,
     pub color_transform: VarDctColorTransform,
     /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
@@ -994,19 +1002,25 @@ impl StandardVarDctProfile {
                 return unsupported(UnsupportedVarDctFeature::FloatingPointSamples);
             }
         };
-        let (width, height) = if role == VarDctFrameRole::Presentation {
-            (frame.width, frame.height)
-        } else {
+        let (width, height) =
             frame
                 .color_sample_extent()
                 .ok_or(VarDctFrontendError::Unsupported {
                     feature: UnsupportedVarDctFeature::ImageDimensions,
-                })?
+                })?;
+        let is_presentation = role != VarDctFrameRole::ProgressiveDcRefinement;
+        let (presentation_width, presentation_height, upsampling) = if is_presentation {
+            (frame.width, frame.height, frame.upsampling)
+        } else {
+            (width, height, 1)
         };
         Ok(Self {
             capability: VarDctFrontendCapability::SinglePassEntropyPackets,
             width,
             height,
+            presentation_width,
+            presentation_height,
+            upsampling,
             bits_per_sample,
             color_transform: if frame.do_ycbcr {
                 VarDctColorTransform::Ycbcr
@@ -1334,11 +1348,10 @@ fn validate_frame(
     if !frame.do_ycbcr && frame.jpeg_upsampling != [0; 3] {
         return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
     }
-    if frame.upsampling != 1
-        || frame
-            .extra_channel_upsampling
-            .iter()
-            .any(|&value| value != 1)
+    if frame
+        .extra_channel_upsampling
+        .iter()
+        .any(|&value| value != 1)
     {
         return unsupported(UnsupportedVarDctFeature::Upsampling);
     }

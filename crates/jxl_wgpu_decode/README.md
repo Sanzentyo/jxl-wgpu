@@ -184,7 +184,9 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
-reference, preview, animation, frame upsampling, spectral progressive pass, or other frame feature.
+reference, preview, animation, spectral progressive pass, or other frame feature. Frame upsampling
+supports 1×, 2×, 4×, and 8× resampling factors, applying fused phase-major 5×5 interpolation across
+three F32 planes before color conversion within the shared frame budget.
 Subsampled YCbCr still rejects adaptive LF smoothing because that LF-domain step needs
 component-aware scheduling. Gaborish and EPF are connected: shifted components use a fused
 horizontal/vertical quarter/three-quarter resident upsample before the full-resolution restoration

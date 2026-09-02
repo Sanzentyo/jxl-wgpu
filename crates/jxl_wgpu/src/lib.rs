@@ -37,6 +37,7 @@ mod readback;
 mod resident_chroma_upsample;
 mod resident_epf;
 mod resident_gaborish;
+mod resident_image_upsample;
 mod resident_vardct;
 mod scheduler;
 mod session;
@@ -88,6 +89,10 @@ pub use resident_epf::{
 pub use resident_gaborish::{
     ResidentGaborishError, ResidentGaborishInputs, ResidentGaborishMemoryPlan,
     ResidentGaborishPipeline, ResidentGaborishWeights,
+};
+pub use resident_image_upsample::{
+    ResidentImageUpsampleError, ResidentImageUpsampleInputs, ResidentImageUpsampleMemoryPlan,
+    ResidentImageUpsamplePipeline, ResidentImageUpsampleResources, ResidentImageUpsampleWeights,
 };
 pub use resident_vardct::{
     ResidentF32Plane, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,

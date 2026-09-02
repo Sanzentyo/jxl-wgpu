@@ -339,6 +339,12 @@ two-axis dispatch, into a non-aliasing full-resolution F32 plane. Geometry, bind
 limits, the 32-byte `Pod` uniform, and every retained destination are checked and included in the
 decoder's shared frame budget; no component or pixel is mapped to the host.
 
+`ResidentImageUpsamplePipeline` provides the resident 2×/4×/8× frame upsampling stage applied after
+restoration and before color conversion. It expands compact symmetric triangle weights into
+`factor²` row-major 5×5 phase kernels on the host, records a fused three-plane compute dispatch
+into presentation-resolution F32 planes, and bounds all geometry, padded strides, and storage bindings
+via a 48-byte `Pod` uniform within the shared frame budget.
+
 The backend validates precision contracts, node arity, plane types/extents/strides, resource
 revisions, transform coverage, dispatch dimensions, shader-visible addresses, and device limits
 before submission. Unsupported render operations, explicit streaming execution, invalid color
