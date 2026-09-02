@@ -3359,6 +3359,7 @@ fn submit_vardct(
             config: VarDctOutputConfig {
                 width: source.packet.profile.presentation_width,
                 height: source.packet.profile.presentation_height,
+                format: source.output_format,
                 transform: source.output_transform,
             },
         },

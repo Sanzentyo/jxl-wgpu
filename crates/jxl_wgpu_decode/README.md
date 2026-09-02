@@ -274,9 +274,10 @@ share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
-The only output descriptor is `vardct_rgb8_format()`: interleaved RGB8 with explicit BT.709/sRGB
-primaries, IEC sRGB transfer, full range, and no YCbCr encoding. It is accepted directly by
-`DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
+The supported output descriptors include `vardct_rgb8_format()`, `vardct_rgba8_format()`,
+`vardct_bgr8_format()`, and `vardct_bgra8_format()`: interleaved RGB8/RGBA8/BGR8/BGRA8 with explicit
+BT.709/sRGB primaries, IEC sRGB transfer, full range, and no YCbCr encoding. They are accepted directly
+by `DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
 intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
 uniform, artifact, coefficient, XYB, optional three-plane restoration scratch, EPF sigma and
 per-pass uniforms, transform-scratch, and
@@ -370,7 +371,7 @@ operation.
 This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
 progressive intermediates, local-tree raw-matrix conformance,
 valid-codestream subsampled-restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
+alternate non-RGB8/RGBA8/BGR8/BGRA8 outputs, ICC/HDR and other bit depths, crop/blend,
 extra channels, other progressive passes, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

@@ -205,6 +205,54 @@ pub fn vardct_rgb8_format() -> PixelFormat {
     )
 }
 
+/// Canonical RGBA8 output supported by [`VarDctSubmissionEngine`].
+#[must_use]
+pub fn vardct_rgba8_format() -> PixelFormat {
+    PixelFormat::rgb8(
+        RgbChannelOrder::Rgba,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
+}
+
+/// Canonical BGR8 output supported by [`VarDctSubmissionEngine`].
+#[must_use]
+pub fn vardct_bgr8_format() -> PixelFormat {
+    PixelFormat::rgb8(
+        RgbChannelOrder::Bgr,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
+}
+
+/// Canonical BGRA8 output supported by [`VarDctSubmissionEngine`].
+#[must_use]
+pub fn vardct_bgra8_format() -> PixelFormat {
+    PixelFormat::rgb8(
+        RgbChannelOrder::Bgra,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
+}
+
 /// Exact GPU buffer accounting for one bounded VarDCT frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctDecodeMemoryStats {

@@ -11,7 +11,7 @@ struct Params {
     bias_cbrt: vec4<f32>,
     scaled_bias: vec4<f32>,
     intensity_scale: f32,
-    _pad0: u32,
+    format_selector: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -133,12 +133,21 @@ fn rgb8_at(pixel: u32) -> vec3<u32> {
     );
 }
 
-fn pack_rgb8_word(word_index: u32) -> u32 {
+const FORMAT_RGB8: u32 = 0u;
+const FORMAT_RGBA8: u32 = 1u;
+const FORMAT_BGR8: u32 = 2u;
+const FORMAT_BGRA8: u32 = 3u;
+
+fn pack_rgb_word(word_index: u32, is_bgr: bool) -> u32 {
     let first_byte = word_index * 4u;
     let first_pixel = first_byte / 3u;
     let phase = first_byte - first_pixel * 3u;
-    let first = rgb8_at(first_pixel);
-    let second = rgb8_at(first_pixel + 1u);
+    var first = rgb8_at(first_pixel);
+    var second = rgb8_at(first_pixel + 1u);
+    if (is_bgr) {
+        first = first.bgr;
+        second = second.bgr;
+    }
 
     if (phase == 0u) {
         return first.r
@@ -160,9 +169,22 @@ fn pack_rgb8_word(word_index: u32) -> u32 {
 
 @compute @workgroup_size(wg_x, wg_y, 1)
 fn pack_rgb8(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let word_index = gid.y * params.dispatch.x + gid.x;
-    if (word_index >= params.image.w) {
-        return;
+    let index = gid.y * params.dispatch.x + gid.x;
+    if (params.format_selector == FORMAT_RGBA8 || params.format_selector == FORMAT_BGRA8) {
+        if (index >= params.image.z) {
+            return;
+        }
+        let color = rgb8_at(index);
+        let is_bgr = params.format_selector == FORMAT_BGRA8;
+        let r = select(color.r, color.b, is_bgr);
+        let g = color.g;
+        let b = select(color.b, color.r, is_bgr);
+        output_words[index] = r | (g << 8u) | (b << 16u) | (255u << 24u);
+    } else {
+        if (index >= params.image.w) {
+            return;
+        }
+        let is_bgr = params.format_selector == FORMAT_BGR8;
+        output_words[index] = pack_rgb_word(index, is_bgr);
     }
-    output_words[word_index] = pack_rgb8_word(word_index);
 }

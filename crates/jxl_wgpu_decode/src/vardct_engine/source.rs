@@ -18,7 +18,9 @@ use crate::vardct_artifact::{
     VarDctArtifactLayout,
 };
 use crate::vardct_frontend::VarDctColorTransform;
-use crate::vardct_output::{VarDctInverseOpsin, VarDctOutputPlan, VarDctOutputTransform};
+use crate::vardct_output::{
+    VarDctInverseOpsin, VarDctOutputFormat, VarDctOutputPlan, VarDctOutputTransform,
+};
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
@@ -27,7 +29,8 @@ use crate::{GpuCodestream, GpuOutputMapping, GpuOutputRequest};
 use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
 use super::types::{
     ADAPTIVE_LF_WORKGROUP_BYTES, DeferredHfCoefficientLayout, PACKET_STATUS_BYTES,
-    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_rgb8_format,
+    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_bgr8_format,
+    vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
 };
 use super::window_plan::{
     AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
@@ -48,6 +51,7 @@ pub(super) struct VarDctSource {
     pub(super) epf: Option<VarDctEpfPlan>,
     pub(super) frame_upsampling: Option<ResidentImageUpsampleWeights>,
     pub(super) output_plan: VarDctOutputPlan,
+    pub(super) output_format: VarDctOutputFormat,
     pub(super) layout: ImageLayout,
     pub(super) output_transform: VarDctOutputTransform,
     pub(super) quant_biases: [f32; 4],
@@ -139,9 +143,21 @@ pub(super) fn prepare_source(
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     options: VarDctPrepareOptions,
 ) -> Result<VarDctSource, VarDctDecodeError> {
-    if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
-        return Err(VarDctDecodeError::UnsupportedOutput);
-    }
+    let output_format = match (request.mapping(), request.format()) {
+        (GpuOutputMapping::Color, format) if format == &vardct_rgb8_format() => {
+            VarDctOutputFormat::Rgb8
+        }
+        (GpuOutputMapping::Color, format) if format == &vardct_rgba8_format() => {
+            VarDctOutputFormat::Rgba8
+        }
+        (GpuOutputMapping::Color, format) if format == &vardct_bgr8_format() => {
+            VarDctOutputFormat::Bgr8
+        }
+        (GpuOutputMapping::Color, format) if format == &vardct_bgra8_format() => {
+            VarDctOutputFormat::Bgra8
+        }
+        _ => return Err(VarDctDecodeError::UnsupportedOutput),
+    };
     if inventory.image_header.orientation != 1 {
         return Err(VarDctDecodeError::UnsupportedOrientation {
             orientation: inventory.image_header.orientation,
@@ -348,6 +364,7 @@ pub(super) fn prepare_source(
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
         packet.profile.presentation_width,
         packet.profile.presentation_height,
+        output_format,
         &backend.device().limits(),
         options.output_variant,
     )?;
@@ -356,7 +373,7 @@ pub(super) fn prepare_source(
             packet.profile.presentation_width,
             packet.profile.presentation_height,
         ),
-        vardct_rgb8_format(),
+        request.format().clone(),
     )?;
     let (output_transform, quant_biases) = match packet.profile.color_transform {
         VarDctColorTransform::Xyb => {
@@ -519,6 +536,7 @@ pub(super) fn prepare_source(
         epf,
         frame_upsampling,
         output_plan,
+        output_format,
         layout,
         output_transform,
         quant_biases,

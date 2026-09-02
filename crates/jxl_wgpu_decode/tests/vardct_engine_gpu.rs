@@ -18,7 +18,9 @@ use jxl_wgpu::{
     ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
     WgpuBackendConfig,
 };
-use jxl_wgpu_decode::vardct::engine::vardct_rgb8_format;
+use jxl_wgpu_decode::vardct::engine::{
+    vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
+};
 use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
@@ -377,6 +379,124 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
     assert_eq!(actual.len(), rust.len());
     let rust_error = maximum_error(actual, &rust);
     assert!(rust_error <= 1);
+}
+
+#[test]
+fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device.clone(),
+        queue.clone(),
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let extent = Extent2d::new(264, 64);
+    let original = common::jpeg_transcode_422();
+    let pixel_count = (extent.width * extent.height) as usize;
+
+    let decode_bytes = |format: PixelFormat| -> Vec<u8> {
+        let mut session = decoder
+            .open(original, GpuOutputRequest::color(format).unwrap())
+            .unwrap();
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        readback.frame.outputs[0].bytes.clone()
+    };
+
+    let rgb8 = decode_bytes(vardct_rgb8_format());
+    assert_eq!(rgb8.len(), pixel_count * 3);
+
+    let rgba8 = decode_bytes(vardct_rgba8_format());
+    assert_eq!(rgba8.len(), pixel_count * 4);
+
+    let bgr8 = decode_bytes(vardct_bgr8_format());
+    assert_eq!(bgr8.len(), pixel_count * 3);
+
+    let bgra8 = decode_bytes(vardct_bgra8_format());
+    assert_eq!(bgra8.len(), pixel_count * 4);
+
+    for i in 0..pixel_count {
+        let r = rgb8[i * 3];
+        let g = rgb8[i * 3 + 1];
+        let b = rgb8[i * 3 + 2];
+
+        assert_eq!(rgba8[i * 4], r);
+        assert_eq!(rgba8[i * 4 + 1], g);
+        assert_eq!(rgba8[i * 4 + 2], b);
+        assert_eq!(rgba8[i * 4 + 3], 255);
+
+        assert_eq!(bgr8[i * 3], b);
+        assert_eq!(bgr8[i * 3 + 1], g);
+        assert_eq!(bgr8[i * 3 + 2], r);
+
+        assert_eq!(bgra8[i * 4], b);
+        assert_eq!(bgra8[i * 4 + 1], g);
+        assert_eq!(bgra8[i * 4 + 2], r);
+        assert_eq!(bgra8[i * 4 + 3], 255);
+    }
+
+    // Also verify on standard XYB VarDCT stream
+    let context = WgpuContext::new(Arc::new(device.clone()), Arc::new(queue.clone())).unwrap();
+    let xyb_original = VarDctEncoder::new(context.clone(), VarDctStrategy::Dct8)
+        .unwrap()
+        .encode(solid_source(&context, VarDctStrategy::Dct8, [123, 45, 67]))
+        .unwrap();
+    let (w, h) = VarDctStrategy::Dct8.block_extent();
+    let xyb_pixels = (w as usize) * (h as usize);
+
+    let decode_xyb_bytes = |format: PixelFormat| -> Vec<u8> {
+        let mut session = decoder
+            .open(&xyb_original, GpuOutputRequest::color(format).unwrap())
+            .unwrap();
+        let frame = session.next_frame().unwrap().unwrap();
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        readback.frame.outputs[0].bytes.clone()
+    };
+
+    let xyb_rgb8 = decode_xyb_bytes(vardct_rgb8_format());
+    let xyb_rgba8 = decode_xyb_bytes(vardct_rgba8_format());
+    let xyb_bgr8 = decode_xyb_bytes(vardct_bgr8_format());
+    let xyb_bgra8 = decode_xyb_bytes(vardct_bgra8_format());
+
+    assert_eq!(xyb_rgb8.len(), xyb_pixels * 3);
+    assert_eq!(xyb_rgba8.len(), xyb_pixels * 4);
+    assert_eq!(xyb_bgr8.len(), xyb_pixels * 3);
+    assert_eq!(xyb_bgra8.len(), xyb_pixels * 4);
+
+    for i in 0..xyb_pixels {
+        let r = xyb_rgb8[i * 3];
+        let g = xyb_rgb8[i * 3 + 1];
+        let b = xyb_rgb8[i * 3 + 2];
+
+        assert_eq!(xyb_rgba8[i * 4], r);
+        assert_eq!(xyb_rgba8[i * 4 + 1], g);
+        assert_eq!(xyb_rgba8[i * 4 + 2], b);
+        assert_eq!(xyb_rgba8[i * 4 + 3], 255);
+
+        assert_eq!(xyb_bgr8[i * 3], b);
+        assert_eq!(xyb_bgr8[i * 3 + 1], g);
+        assert_eq!(xyb_bgr8[i * 3 + 2], r);
+
+        assert_eq!(xyb_bgra8[i * 4], b);
+        assert_eq!(xyb_bgra8[i * 4 + 1], g);
+        assert_eq!(xyb_bgra8[i * 4 + 2], r);
+        assert_eq!(xyb_bgra8[i * 4 + 3], 255);
+    }
 }
 
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {

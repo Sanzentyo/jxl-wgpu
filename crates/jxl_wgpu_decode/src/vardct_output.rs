@@ -75,6 +75,28 @@ impl From<&XybParams> for VarDctInverseOpsin {
     }
 }
 
+/// Color and packing format produced by [`VarDctOutputPacker`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum VarDctOutputFormat {
+    #[default]
+    Rgb8 = 0,
+    Rgba8 = 1,
+    Bgr8 = 2,
+    Bgra8 = 3,
+}
+
+impl VarDctOutputFormat {
+    /// Number of bytes per pixel for this format.
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::Rgb8 | Self::Bgr8 => 3,
+            Self::Rgba8 | Self::Bgra8 => 4,
+        }
+    }
+}
+
 /// Host-known geometry and inverse-opsin metadata for one packed output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarDctOutputConfig {
@@ -82,6 +104,7 @@ pub struct VarDctOutputConfig {
     pub width: u32,
     /// Logical pixel height.
     pub height: u32,
+    pub format: VarDctOutputFormat,
     pub transform: VarDctOutputTransform,
 }
 
@@ -100,7 +123,9 @@ pub struct VarDctOutputInputs<'a> {
 /// Exact byte counts for one fused output operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctOutputMemoryPlan {
-    /// Externally visible RGB byte count, exactly `width * height * 3`.
+    /// Color and packing format.
+    pub format: VarDctOutputFormat,
+    /// Externally visible byte count.
     pub logical_output_bytes: u64,
     /// GPU storage allocation/binding requirement, rounded up to a `u32`.
     pub output_storage_bytes: u64,
@@ -119,9 +144,13 @@ impl VarDctOutputMemoryPlan {
     ///
     /// Returns a typed error for empty geometry, arithmetic overflow, or an
     /// image whose packed addressing cannot be represented by WGSL `u32`.
-    pub fn new(width: u32, height: u32) -> Result<Self, VarDctOutputError> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        format: VarDctOutputFormat,
+    ) -> Result<Self, VarDctOutputError> {
         let (pixel_count, logical_output_bytes, output_storage_bytes) =
-            packed_geometry(width, height)?;
+            packed_geometry(width, height, format)?;
         debug_assert!(pixel_count != 0);
         let uniform_bytes = std::mem::size_of::<VarDctOutputParams>() as u64;
         let transient_bytes = uniform_bytes;
@@ -131,6 +160,7 @@ impl VarDctOutputMemoryPlan {
             },
         )?;
         Ok(Self {
+            format,
             logical_output_bytes,
             output_storage_bytes,
             uniform_bytes,
@@ -165,25 +195,22 @@ impl VarDctOutputPlan {
     pub fn for_limits(
         width: u32,
         height: u32,
+        format: VarDctOutputFormat,
         limits: &wgpu::Limits,
     ) -> Result<Self, VarDctOutputError> {
-        Self::for_limits_with_variant(width, height, limits, DEFAULT_VARIANT)
+        Self::for_limits_with_variant(width, height, format, limits, DEFAULT_VARIANT)
     }
 
     /// Plans a dispatch using the selected 1D workgroup variant.
     pub fn for_limits_with_variant(
         width: u32,
         height: u32,
+        format: VarDctOutputFormat,
         limits: &wgpu::Limits,
         variant: KernelVariant,
     ) -> Result<Self, VarDctOutputError> {
-        let memory = VarDctOutputMemoryPlan::new(width, height)?;
-        validate_required_buffer(
-            "packed RGB8 output",
-            memory.output_storage_bytes,
-            limits,
-            true,
-        )?;
+        let memory = VarDctOutputMemoryPlan::new(width, height, format)?;
+        validate_required_buffer("packed output", memory.output_storage_bytes, limits, true)?;
         if memory.uniform_bytes > limits.max_uniform_buffer_binding_size {
             return Err(VarDctOutputError::UniformBindingLimit {
                 required: memory.uniform_bytes,
@@ -192,10 +219,19 @@ impl VarDctOutputPlan {
         }
         validate_workgroup_variant(variant, limits)?;
 
-        let output_words_u64 = memory.output_storage_bytes / OUTPUT_WORD_BYTES;
+        let output_words_u64 = match format {
+            VarDctOutputFormat::Rgba8 | VarDctOutputFormat::Bgra8 => u64::from(width)
+                .checked_mul(u64::from(height))
+                .ok_or(VarDctOutputError::ArithmeticOverflow {
+                    field: "output pixels",
+                })?,
+            VarDctOutputFormat::Rgb8 | VarDctOutputFormat::Bgr8 => {
+                memory.output_storage_bytes / OUTPUT_WORD_BYTES
+            }
+        };
         let output_words =
             u32::try_from(output_words_u64).map_err(|_| VarDctOutputError::ShaderAddressSpace {
-                field: "packed RGB8 words",
+                field: "packed output words",
                 required: output_words_u64,
                 available: u64::from(u32::MAX),
             })?;
@@ -470,7 +506,8 @@ struct VarDctOutputParams {
     bias_cbrt: [f32; 4],
     scaled_bias: [f32; 4],
     intensity_scale: f32,
-    _padding: [u32; 3],
+    format_selector: u32,
+    _padding: [u32; 2],
 }
 
 fn validate_inputs(
@@ -484,6 +521,7 @@ fn validate_inputs(
     let plan = VarDctOutputPlan::for_limits_with_variant(
         inputs.config.width,
         inputs.config.height,
+        inputs.config.format,
         &device.limits(),
         variant,
     )?;
@@ -577,7 +615,7 @@ fn validate_inputs(
     }
     validate_binding(
         device,
-        "packed RGB8 output",
+        "packed output",
         inputs.output,
         plan.memory.output_storage_bytes,
     )?;
@@ -611,7 +649,8 @@ fn validate_inputs(
             bias_cbrt: [bias_cbrt[0], bias_cbrt[1], bias_cbrt[2], 0.0],
             scaled_bias: [scaled_bias[0], scaled_bias[1], scaled_bias[2], 0.0],
             intensity_scale,
-            _padding: [0; 3],
+            format_selector: inputs.config.format as u32,
+            _padding: [0; 2],
         },
         plan,
     ))
@@ -649,7 +688,11 @@ fn validate_inverse_opsin(inverse: VarDctInverseOpsin) -> Result<(), VarDctOutpu
     Ok(())
 }
 
-fn packed_geometry(width: u32, height: u32) -> Result<(u32, u64, u64), VarDctOutputError> {
+fn packed_geometry(
+    width: u32,
+    height: u32,
+    format: VarDctOutputFormat,
+) -> Result<(u32, u64, u64), VarDctOutputError> {
     if width == 0 || height == 0 {
         return Err(VarDctOutputError::EmptyExtent { width, height });
     }
@@ -664,15 +707,16 @@ fn packed_geometry(width: u32, height: u32) -> Result<(u32, u64, u64), VarDctOut
             required: pixel_count_u64,
             available: u64::from(u32::MAX),
         })?;
+    let bpp = u64::from(format.bytes_per_pixel());
     let logical_output_bytes =
         pixel_count_u64
-            .checked_mul(3)
+            .checked_mul(bpp)
             .ok_or(VarDctOutputError::ArithmeticOverflow {
-                field: "logical RGB8 output bytes",
+                field: "logical output bytes",
             })?;
     if logical_output_bytes > u64::from(u32::MAX) {
         return Err(VarDctOutputError::ShaderAddressSpace {
-            field: "logical RGB8 output bytes",
+            field: "logical output bytes",
             required: logical_output_bytes,
             available: u64::from(u32::MAX),
         });
@@ -681,7 +725,7 @@ fn packed_geometry(width: u32, height: u32) -> Result<(u32, u64, u64), VarDctOut
         .checked_add(OUTPUT_WORD_BYTES - 1)
         .map(|value| value / OUTPUT_WORD_BYTES * OUTPUT_WORD_BYTES)
         .ok_or(VarDctOutputError::ArithmeticOverflow {
-            field: "aligned RGB8 output bytes",
+            field: "aligned output bytes",
         })?;
     Ok((pixel_count, logical_output_bytes, output_storage_bytes))
 }
@@ -822,22 +866,39 @@ mod tests {
 
     #[test]
     fn memory_plan_separates_logical_storage_and_transient_bytes() {
-        let memory = VarDctOutputMemoryPlan::new(5, 3).unwrap();
+        let memory = VarDctOutputMemoryPlan::new(5, 3, VarDctOutputFormat::Rgb8).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
         assert_eq!(memory.uniform_bytes, 176);
         assert_eq!(memory.transient_bytes, 176);
         assert_eq!(memory.total_bytes, 224);
 
-        let plan = VarDctOutputPlan::for_limits(5, 3, &generous_limits()).unwrap();
+        let rgba_memory = VarDctOutputMemoryPlan::new(5, 3, VarDctOutputFormat::Rgba8).unwrap();
+        assert_eq!(rgba_memory.logical_output_bytes, 60);
+        assert_eq!(rgba_memory.output_storage_bytes, 60);
+        assert_eq!(rgba_memory.total_bytes, 236);
+
+        let plan = VarDctOutputPlan::for_limits(5, 3, VarDctOutputFormat::Rgb8, &generous_limits())
+            .unwrap();
         assert_eq!(plan.output_words, 12);
         assert_eq!((plan.workgroups_x, plan.workgroups_y), (1, 1));
         assert_eq!(plan.dispatch_width, WORKGROUP_SIZE);
+
+        let rgba_plan =
+            VarDctOutputPlan::for_limits(5, 3, VarDctOutputFormat::Rgba8, &generous_limits())
+                .unwrap();
+        assert_eq!(rgba_plan.output_words, 15);
     }
 
     #[test]
     fn sixteen_k_output_is_split_across_dispatch_rows() {
-        let plan = VarDctOutputPlan::for_limits(16_384, 16_384, &generous_limits()).unwrap();
+        let plan = VarDctOutputPlan::for_limits(
+            16_384,
+            16_384,
+            VarDctOutputFormat::Rgb8,
+            &generous_limits(),
+        )
+        .unwrap();
         assert_eq!(plan.memory.logical_output_bytes, 805_306_368);
         assert_eq!(plan.output_words, 201_326_592);
         assert_eq!(plan.workgroups_x, 65_535);
@@ -852,7 +913,7 @@ mod tests {
     #[test]
     fn invalid_geometry_and_opsin_have_stable_typed_errors() {
         assert_eq!(
-            VarDctOutputMemoryPlan::new(0, 7).unwrap_err(),
+            VarDctOutputMemoryPlan::new(0, 7, VarDctOutputFormat::Rgb8).unwrap_err(),
             VarDctOutputError::EmptyExtent {
                 width: 0,
                 height: 7
@@ -868,6 +929,7 @@ mod tests {
             VarDctOutputPlan::for_limits_with_variant(
                 1,
                 1,
+                VarDctOutputFormat::Rgb8,
                 &wgpu::Limits::default(),
                 KernelVariant::Tile8x8,
             )
@@ -999,6 +1061,7 @@ mod tests {
                     config: VarDctOutputConfig {
                         width: 3,
                         height: 1,
+                        format: VarDctOutputFormat::Rgb8,
                         transform: VarDctOutputTransform::Xyb(inverse_opsin()),
                     },
                 },
