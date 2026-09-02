@@ -107,6 +107,14 @@ pub struct ResidentImageUpsampleInputs<'a> {
     pub weights: &'a ResidentImageUpsampleWeights,
 }
 
+/// Single input plane, distinct output plane, and interpolation kernels for extra channel upsampling.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidentChannelUpsampleInputs<'a> {
+    pub input: ResidentF32Plane<'a>,
+    pub output: ResidentF32Plane<'a>,
+    pub weights: &'a ResidentImageUpsampleWeights,
+}
+
 /// Buffers created while recording one fused three-plane dispatch.
 pub struct ResidentImageUpsampleResources {
     _weights: wgpu::Buffer,
@@ -346,6 +354,122 @@ impl ResidentImageUpsamplePipeline {
     }
 }
 
+/// Reusable single-plane 2x/4x/8x image/extra-channel interpolation pipeline.
+pub struct ResidentChannelUpsamplePipeline {
+    pipeline: wgpu::ComputePipeline,
+    variant: KernelVariant,
+}
+
+impl ResidentChannelUpsamplePipeline {
+    pub fn new(device: &wgpu::Device) -> Result<Self, ResidentImageUpsampleError> {
+        Self::with_variant(device, KernelVariant::Tile16x16)
+    }
+
+    pub fn with_variant(
+        device: &wgpu::Device,
+        variant: KernelVariant,
+    ) -> Result<Self, ResidentImageUpsampleError> {
+        if variant.is_linear() {
+            return Err(ResidentImageUpsampleError::WorkgroupShape { variant });
+        }
+        variant
+            .validate_for("resident_channel_upsample", &device.limits(), 0)
+            .map_err(|_| ResidentImageUpsampleError::WorkgroupVariant { variant })?;
+        if device.limits().max_storage_buffers_per_shader_stage < 3 {
+            return Err(ResidentImageUpsampleError::StorageBindingCount {
+                available: device.limits().max_storage_buffers_per_shader_stage,
+            });
+        }
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        let module = device.create_shader_module(wgpu::include_wgsl!("../shaders/upsample.wgsl"));
+        let constants = [
+            ("wg_x", f64::from(workgroup_x)),
+            ("wg_y", f64::from(workgroup_y)),
+        ];
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("jxl-wgpu resident channel upsample"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
+            cache: None,
+        });
+        Ok(Self { pipeline, variant })
+    }
+
+    pub fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        inputs: ResidentChannelUpsampleInputs<'_>,
+    ) -> Result<ResidentImageUpsampleResources, ResidentImageUpsampleError> {
+        let params = validate_channel_inputs(device, inputs)?;
+        let plan = ResidentImageUpsampleMemoryPlan::new(inputs.weights)?;
+        let maximum_binding = device.limits().max_storage_buffer_binding_size;
+        if plan.weight_bytes > maximum_binding {
+            return Err(ResidentImageUpsampleError::StorageBindingLimit {
+                role: "weight",
+                required: plan.weight_bytes,
+                available: maximum_binding,
+            });
+        }
+        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu resident channel upsample weights"),
+            contents: bytemuck::cast_slice(&inputs.weights.phase_major),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu resident channel upsample params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("jxl-wgpu resident channel upsample bindings"),
+            layout: &self.pipeline.get_bind_group_layout(0),
+            entries: &[
+                storage_entry(0, inputs.input),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weights.as_entire_binding(),
+                },
+                storage_entry(2, inputs.output),
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let (workgroup_x, workgroup_y) = self.variant.workgroup_size();
+        let dispatch_x = inputs.output.width.div_ceil(workgroup_x);
+        let dispatch_y = inputs.output.height.div_ceil(workgroup_y);
+        let maximum = device.limits().max_compute_workgroups_per_dimension;
+        for (axis, required) in [("x", dispatch_x), ("y", dispatch_y)] {
+            if required > maximum {
+                return Err(ResidentImageUpsampleError::WorkgroupCount {
+                    axis,
+                    required,
+                    available: maximum,
+                });
+            }
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("jxl-wgpu resident channel upsample"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        drop(pass);
+        Ok(ResidentImageUpsampleResources {
+            _weights: weights,
+            _uniform: uniform,
+        })
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct ResidentImageUpsampleParams {
@@ -409,6 +533,49 @@ fn validate_inputs(
         output_stride_y: inputs.outputs[1].effective_stride(),
         output_stride_b: inputs.outputs[2].effective_stride(),
         _padding: 0,
+    })
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct ResidentChannelUpsampleParams {
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
+    input_stride: u32,
+    output_stride: u32,
+    factor: u32,
+    _pad0: u32,
+}
+
+fn validate_channel_inputs(
+    device: &wgpu::Device,
+    inputs: ResidentChannelUpsampleInputs<'_>,
+) -> Result<ResidentChannelUpsampleParams, ResidentImageUpsampleError> {
+    let factor = validated_factor(inputs.weights.factor)?;
+    validate_plane(device, 0, inputs.input)?;
+    validate_plane(device, 1, inputs.output)?;
+    if inputs.output.width.div_ceil(factor) != inputs.input.width
+        || inputs.output.height.div_ceil(factor) != inputs.input.height
+    {
+        return Err(ResidentImageUpsampleError::Extent {
+            input_width: inputs.input.width,
+            input_height: inputs.input.height,
+            output_width: inputs.output.width,
+            output_height: inputs.output.height,
+            factor,
+        });
+    }
+    Ok(ResidentChannelUpsampleParams {
+        input_width: inputs.input.width,
+        input_height: inputs.input.height,
+        output_width: inputs.output.width,
+        output_height: inputs.output.height,
+        input_stride: inputs.input.effective_stride(),
+        output_stride: inputs.output.effective_stride(),
+        factor,
+        _pad0: 0,
     })
 }
 
@@ -496,6 +663,8 @@ fn storage_entry(binding: u32, plane: ResidentF32Plane<'_>) -> wgpu::BindGroupEn
 const _: () = {
     assert!(std::mem::size_of::<ResidentImageUpsampleParams>() == 48);
     assert!(std::mem::align_of::<ResidentImageUpsampleParams>() == 16);
+    assert!(std::mem::size_of::<ResidentChannelUpsampleParams>() == 32);
+    assert!(std::mem::align_of::<ResidentChannelUpsampleParams>() == 16);
 };
 
 #[cfg(test)]
@@ -521,13 +690,18 @@ mod tests {
     fn shader_and_uniform_abi_are_semantically_valid() {
         fn assert_pod<T: Pod>() {}
         assert_pod::<ResidentImageUpsampleParams>();
-        let module =
-            naga::front::wgsl::parse_str(include_str!("../shaders/upsample_rgb.wgsl")).unwrap();
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
-        )
-        .validate(&module)
-        .unwrap();
+        assert_pod::<ResidentChannelUpsampleParams>();
+        for shader in [
+            include_str!("../shaders/upsample_rgb.wgsl"),
+            include_str!("../shaders/upsample.wgsl"),
+        ] {
+            let module = naga::front::wgsl::parse_str(shader).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
     }
 }
