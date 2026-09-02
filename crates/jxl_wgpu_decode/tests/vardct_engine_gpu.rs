@@ -291,32 +291,121 @@ fn frame_upsampling_factors_match_reference_on_gpu() {
     )
     .unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+
+    let mut executed = 0;
+
+    // Test both divisible (257 * factor) and non-divisible odd extents (257 * factor - 1, 129 * factor - 3)
     let factors = [2_u32, 4, 8];
     for factor in factors {
-        let width = 257 * factor;
-        let height = 257 * factor;
-        let Some(encoded) = common::cjxl_upsampled_vardct_codestream(width, height, factor) else {
-            continue;
-        };
-        let extent = Extent2d::new(width, height);
+        for (w_expr, h_expr) in [
+            (257 * factor, 257 * factor),
+            (257 * factor - 1, 129 * factor - 3),
+        ] {
+            let Some(encoded) = common::cjxl_upsampled_vardct_codestream(w_expr, h_expr, factor)
+            else {
+                continue;
+            };
+            let extent = Extent2d::new(w_expr, h_expr);
+            let mut session = decoder
+                .open(
+                    &encoded,
+                    GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                )
+                .unwrap();
+            let memory = session
+                .submission_session()
+                .vardct()
+                .expect("upsampled VarDCT selects the VarDCT submission session")
+                .memory_stats();
+            assert_ne!(
+                memory.frame_upsample_image_bytes, 0,
+                "{factor}x upsampling must allocate frame upsample image bytes"
+            );
+            assert_ne!(
+                memory.frame_upsample_weight_bytes, 0,
+                "{factor}x upsampling must allocate frame upsample weights"
+            );
+            let frame = session.next_frame().unwrap().unwrap();
+            let readback = ImageReadbackPipeline::new(&backend)
+                .submit(frame.output())
+                .unwrap()
+                .wait()
+                .unwrap();
+            let actual = &readback.frame.outputs[0].bytes;
+            let rust = rust_jxl_rgb8(&encoded, extent);
+            assert_eq!(actual.len(), rust.len(), "{factor}x output size");
+            let rust_error = maximum_error(actual, &rust);
+            assert!(
+                rust_error <= 2,
+                "{factor}x upsampled GPU output diverges from Rust jxl by {rust_error}",
+            );
+            if let Some(djxl) = djxl_ppm(&encoded, extent) {
+                let djxl_error = maximum_error(actual, &djxl);
+                assert!(
+                    djxl_error <= 2,
+                    "{factor}x upsampled GPU output diverges from djxl by {djxl_error}",
+                );
+            }
+            executed += 1;
+        }
+    }
+
+    assert!(
+        executed >= 6,
+        "at least 6 frame-upsample cases must be exercised (executed: {executed})"
+    );
+}
+
+#[test]
+fn subsampled_jpeg_transcode_with_frame_upsampling_matches_reference_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+
+    let cases = [
+        (
+            "4:2:0 + 2x frame upsample",
+            Extent2d::new(544, 128),
+            common::jpeg_transcode_420_upsample_2x(),
+        ),
+        (
+            "4:2:2 + 4x frame upsample",
+            Extent2d::new(1088, 256),
+            common::jpeg_transcode_422_upsample_4x(),
+        ),
+    ];
+
+    let mut executed = 0;
+    for (name, extent, encoded) in cases {
         let mut session = decoder
             .open(
-                &encoded,
+                encoded,
                 GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
             )
             .unwrap();
         let memory = session
             .submission_session()
             .vardct()
-            .expect("upsampled VarDCT selects the VarDCT submission session")
+            .expect("subsampled upsampled VarDCT selects the VarDCT submission session")
             .memory_stats();
         assert_ne!(
-            memory.frame_upsample_image_bytes, 0,
-            "{factor}x upsampling must allocate frame upsample image bytes"
+            memory.component_upsample_bytes, 0,
+            "{name}: component upsampling must be budgeted"
         );
         assert_ne!(
-            memory.frame_upsample_weight_bytes, 0,
-            "{factor}x upsampling must allocate frame upsample weights"
+            memory.frame_upsample_image_bytes, 0,
+            "{name}: frame upsampling must be budgeted"
         );
         let frame = session.next_frame().unwrap().unwrap();
         let readback = ImageReadbackPipeline::new(&backend)
@@ -325,21 +414,26 @@ fn frame_upsampling_factors_match_reference_on_gpu() {
             .wait()
             .unwrap();
         let actual = &readback.frame.outputs[0].bytes;
-        let rust = rust_jxl_rgb8(&encoded, extent);
-        assert_eq!(actual.len(), rust.len(), "{factor}x output size");
+        let rust = rust_jxl_rgb8(encoded, extent);
+        assert_eq!(actual.len(), rust.len(), "{name} output byte size");
         let rust_error = maximum_error(actual, &rust);
         assert!(
             rust_error <= 2,
-            "{factor}x upsampled GPU output diverges from Rust jxl by {rust_error}",
+            "{name} GPU output diverges from Rust jxl by {rust_error}",
         );
-        if let Some(djxl) = djxl_ppm(&encoded, extent) {
+        if let Some(djxl) = djxl_ppm(encoded, extent) {
             let djxl_error = maximum_error(actual, &djxl);
             assert!(
                 djxl_error <= 2,
-                "{factor}x upsampled GPU output diverges from djxl by {djxl_error}",
+                "{name} GPU output diverges from djxl by {djxl_error}",
             );
         }
+        executed += 1;
     }
+    assert_eq!(
+        executed, 2,
+        "both 4:2:0 and 4:2:2 upsampled cases must execute"
+    );
 }
 
 #[test]

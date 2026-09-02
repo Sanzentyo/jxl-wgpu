@@ -231,6 +231,11 @@ pub enum ResidentImageUpsampleError {
     },
     #[error("resident image upsampling arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
+    #[error("resident image upsampling {first} and {second} buffers alias")]
+    Aliasing {
+        first: &'static str,
+        second: &'static str,
+    },
 }
 
 /// Reusable fused three-plane 2x/4x/8x image interpolation pipeline.
@@ -520,6 +525,42 @@ fn validate_inputs(
             factor,
         });
     }
+    if planes_alias(&inputs.outputs[0], &inputs.outputs[1]) {
+        return Err(ResidentImageUpsampleError::Aliasing {
+            first: "output plane 0",
+            second: "output plane 1",
+        });
+    }
+    if planes_alias(&inputs.outputs[0], &inputs.outputs[2]) {
+        return Err(ResidentImageUpsampleError::Aliasing {
+            first: "output plane 0",
+            second: "output plane 2",
+        });
+    }
+    if planes_alias(&inputs.outputs[1], &inputs.outputs[2]) {
+        return Err(ResidentImageUpsampleError::Aliasing {
+            first: "output plane 1",
+            second: "output plane 2",
+        });
+    }
+    for (out_idx, out) in inputs.outputs.iter().enumerate() {
+        for (in_idx, input) in inputs.inputs.iter().enumerate() {
+            if planes_alias(out, input) {
+                return Err(ResidentImageUpsampleError::Aliasing {
+                    first: match out_idx {
+                        0 => "output plane 0",
+                        1 => "output plane 1",
+                        _ => "output plane 2",
+                    },
+                    second: match in_idx {
+                        0 => "input plane 0",
+                        1 => "input plane 1",
+                        _ => "input plane 2",
+                    },
+                });
+            }
+        }
+    }
     Ok(ResidentImageUpsampleParams {
         input_width: input.width,
         input_height: input.height,
@@ -567,6 +608,12 @@ fn validate_channel_inputs(
             factor,
         });
     }
+    if planes_alias(&inputs.input, &inputs.output) {
+        return Err(ResidentImageUpsampleError::Aliasing {
+            first: "output plane",
+            second: "input plane",
+        });
+    }
     Ok(ResidentChannelUpsampleParams {
         input_width: inputs.input.width,
         input_height: inputs.input.height,
@@ -577,6 +624,17 @@ fn validate_channel_inputs(
         factor,
         _pad0: 0,
     })
+}
+
+fn planes_alias(a: &ResidentF32Plane<'_>, b: &ResidentF32Plane<'_>) -> bool {
+    if a.storage.buffer != b.storage.buffer {
+        return false;
+    }
+    let a_start = a.storage.offset;
+    let a_end = a_start.saturating_add(a.storage.size.get());
+    let b_start = b.storage.offset;
+    let b_end = b_start.saturating_add(b.storage.size.get());
+    a_start < b_end && b_start < a_end
 }
 
 fn validate_plane(
@@ -675,7 +733,7 @@ mod tests {
     fn compact_weight_shapes_expand_to_every_phase() {
         for (factor, compact_len) in [(2, 15), (4, 55), (8, 210)] {
             let compact = (0..compact_len)
-                .map(|value| value as f32)
+                .map(|value| (value + 1) as f32 * 1.5)
                 .collect::<Vec<_>>();
             let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
             assert_eq!(
@@ -683,6 +741,41 @@ mod tests {
                 factor as usize * factor as usize * 25
             );
             assert_eq!(weights.storage_bytes(), u64::from(factor * factor * 25 * 4));
+
+            let half = (factor / 2) as usize;
+            let factor_usize = factor as usize;
+            let triangle_side = half * 5;
+            for phase_y in 0..half {
+                for phase_x in 0..half {
+                    for ky in 0..5 {
+                        for kx in 0..5 {
+                            let ty = 5 * phase_y + ky;
+                            let tx = 5 * phase_x + kx;
+                            let min = ty.min(tx);
+                            let max = ty.max(tx);
+                            let idx =
+                                triangle_side * min - min * min.saturating_sub(1) / 2 + max - min;
+                            let expected = compact[idx];
+
+                            let p00 = phase_y * factor_usize + phase_x;
+                            assert_eq!(weights.phase_major[p00 * 25 + ky * 5 + kx], expected);
+
+                            let p01 = phase_y * factor_usize + (factor_usize - 1 - phase_x);
+                            assert_eq!(weights.phase_major[p01 * 25 + ky * 5 + (4 - kx)], expected);
+
+                            let p10 = (factor_usize - 1 - phase_y) * factor_usize + phase_x;
+                            assert_eq!(weights.phase_major[p10 * 25 + (4 - ky) * 5 + kx], expected);
+
+                            let p11 = (factor_usize - 1 - phase_y) * factor_usize
+                                + (factor_usize - 1 - phase_x);
+                            assert_eq!(
+                                weights.phase_major[p11 * 25 + (4 - ky) * 5 + (4 - kx)],
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

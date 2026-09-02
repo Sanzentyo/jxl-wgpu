@@ -25,6 +25,7 @@ use crate::vardct_artifact::{GpuVarDctArtifactStatus, HfMetadataLoweringBuffers}
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams};
 use crate::vardct_output::{
     VarDctOutputConfig, VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch,
+    VarDctOutputTransform,
 };
 use crate::vardct_packet::{
     GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
@@ -3296,6 +3297,14 @@ fn submit_vardct(
         } else {
             (restored_planes, None)
         };
+    let components_are_full_resolution = source.frame_upsampling.is_some()
+        || restoration.is_some()
+        || component_upsample_planes.is_some();
+    let presentation_shifts = if components_are_full_resolution {
+        [crate::vardct_frontend::VarDctChannelShift::default(); 3]
+    } else {
+        source.packet.profile.channel_shifts
+    };
     let (output_geometry, output_strides) = if source.frame_upsampling.is_some() {
         (
             [[
@@ -3305,12 +3314,6 @@ fn submit_vardct(
             [source.packet.profile.presentation_width; 3],
         )
     } else {
-        let has_full_components = restoration.is_some() || component_upsample_planes.is_some();
-        let presentation_shifts = if has_full_components {
-            [crate::vardct_frontend::VarDctChannelShift::default(); 3]
-        } else {
-            source.packet.profile.channel_shifts
-        };
         let presentation_geometry = presentation_shifts.map(|shift| {
             shift.shifted_extent(image_width, image_height).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
@@ -3330,6 +3333,12 @@ fn submit_vardct(
         let [stride_x, stride_y, stride_b] = presentation_strides;
         let presentation_strides = [stride_x?, stride_y?, stride_b?];
         (presentation_geometry, presentation_strides)
+    };
+    let output_transform = match source.output_transform {
+        VarDctOutputTransform::Ycbcr { .. } => VarDctOutputTransform::Ycbcr {
+            channel_shifts: presentation_shifts,
+        },
+        transform => transform,
     };
     let output_scratch = pipelines.output.encode(
         device,
@@ -3360,7 +3369,7 @@ fn submit_vardct(
                 width: source.packet.profile.presentation_width,
                 height: source.packet.profile.presentation_height,
                 format: source.output_format,
-                transform: source.output_transform,
+                transform: output_transform,
             },
         },
     )?;

@@ -560,7 +560,7 @@ fn validate_inputs(
     let mut plane_geometry = [[0; 4]; 3];
     for (plane, input) in inputs.planes.into_iter().enumerate() {
         let [required_width, required_height] = required_extents[plane];
-        if input.width < required_width || input.height < required_height {
+        if input.width != required_width || input.height != required_height {
             return Err(VarDctOutputError::InputExtent {
                 plane,
                 width: input.width,

@@ -237,3 +237,270 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
         }
     }
 }
+
+#[test]
+fn resident_upsample_rejects_aliased_buffers() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let device = backend.device();
+
+    let channel_pipeline = ResidentChannelUpsamplePipeline::new(device).unwrap();
+    let image_pipeline = ResidentImageUpsamplePipeline::new(device).unwrap();
+
+    let weights = ResidentImageUpsampleWeights::new(2, &[1.0; 15]).unwrap();
+
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shared test buffer"),
+        size: 1024,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let other_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("other test buffer"),
+        size: 1024,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let plane_in = ResidentF32Plane {
+        storage: ResidentStorageBinding {
+            buffer: &buf,
+            offset: 0,
+            size: std::num::NonZeroU64::new(256).unwrap(),
+        },
+        width: 8,
+        height: 8,
+        stride: 8,
+    };
+    let plane_out_alias = ResidentF32Plane {
+        storage: ResidentStorageBinding {
+            buffer: &buf,
+            offset: 0,
+            size: std::num::NonZeroU64::new(1024).unwrap(),
+        },
+        width: 16,
+        height: 16,
+        stride: 16,
+    };
+    let plane_out_other = ResidentF32Plane {
+        storage: ResidentStorageBinding {
+            buffer: &other_buf,
+            offset: 0,
+            size: std::num::NonZeroU64::new(1024).unwrap(),
+        },
+        width: 16,
+        height: 16,
+        stride: 16,
+    };
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // 1. Channel upsample: input and output alias
+    let err = channel_pipeline.encode(
+        device,
+        &mut encoder,
+        ResidentChannelUpsampleInputs {
+            input: plane_in,
+            output: plane_out_alias,
+            weights: &weights,
+        },
+    );
+    assert!(matches!(
+        err,
+        Err(jxl_wgpu::ResidentImageUpsampleError::Aliasing { .. })
+    ));
+
+    // 2. Image upsample: output planes alias each other
+    let err = image_pipeline.encode(
+        device,
+        &mut encoder,
+        ResidentImageUpsampleInputs {
+            inputs: [plane_in, plane_in, plane_in],
+            outputs: [plane_out_alias, plane_out_alias, plane_out_other],
+            weights: &weights,
+        },
+    );
+    assert!(matches!(
+        err,
+        Err(jxl_wgpu::ResidentImageUpsampleError::Aliasing { .. })
+    ));
+
+    // 3. Image upsample: output aliases input
+    let err = image_pipeline.encode(
+        device,
+        &mut encoder,
+        ResidentImageUpsampleInputs {
+            inputs: [plane_in, plane_in, plane_in],
+            outputs: [plane_out_alias, plane_out_other, plane_out_other],
+            weights: &weights,
+        },
+    );
+    assert!(matches!(
+        err,
+        Err(jxl_wgpu::ResidentImageUpsampleError::Aliasing { .. })
+    ));
+}
+
+#[test]
+fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let device = backend.device();
+    let queue = backend.queue();
+
+    let channel_pipeline = ResidentChannelUpsamplePipeline::new(device).unwrap();
+    let image_pipeline = ResidentImageUpsamplePipeline::new(device).unwrap();
+
+    let test_geometries = [
+        // Tiny and edge dimensions
+        (1_u32, 1_u32, 2_u32, 1_u32, 1_u32),
+        (1_u32, 17_u32, 2_u32, 2_u32, 33_u32),
+        (17_u32, 1_u32, 4_u32, 65_u32, 3_u32),
+        // Odd / non-multiple dimensions
+        (25_u32, 19_u32, 2_u32, 49_u32, 37_u32),
+        (33_u32, 21_u32, 4_u32, 131_u32, 81_u32),
+        (19_u32, 23_u32, 8_u32, 151_u32, 183_u32),
+    ];
+
+    for (in_w, in_h, factor, out_w, out_h) in test_geometries {
+        let compact_count = match factor {
+            2 => 15,
+            4 => 55,
+            8 => 210,
+            _ => unreachable!(),
+        };
+        let compact: Vec<f32> = (0..compact_count).map(|i| 1.0 / ((i + 1) as f32)).collect();
+        let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
+
+        let in_stride = in_w + 3;
+        let out_stride = out_w + 5;
+        let in_scalars = (in_stride * in_h) as usize;
+        let out_scalars = (out_stride * out_h) as usize;
+
+        let in_data: Vec<f32> = (0..in_scalars)
+            .map(|i| ((i * 13 + 7) % 256) as f32 / 255.0)
+            .collect();
+
+        let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("odd extent in"),
+            contents: bytemuck::cast_slice(&in_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let out_buf_channel = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("odd extent out channel"),
+            size: (out_scalars * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_buf_image0 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("odd extent out image 0"),
+            size: (out_scalars * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let out_buf_image1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("odd extent out image 1"),
+            size: (out_scalars * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out_buf_image2 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("odd extent out image 2"),
+            size: (out_scalars * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let plane_in = ResidentF32Plane {
+            storage: ResidentStorageBinding {
+                buffer: &in_buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new((in_scalars * 4) as u64).unwrap(),
+            },
+            width: in_w,
+            height: in_h,
+            stride: in_stride,
+        };
+        let plane_out_chan = ResidentF32Plane {
+            storage: ResidentStorageBinding {
+                buffer: &out_buf_channel,
+                offset: 0,
+                size: std::num::NonZeroU64::new((out_scalars * 4) as u64).unwrap(),
+            },
+            width: out_w,
+            height: out_h,
+            stride: out_stride,
+        };
+        let plane_out_img0 = ResidentF32Plane {
+            storage: ResidentStorageBinding {
+                buffer: &out_buf_image0,
+                offset: 0,
+                size: std::num::NonZeroU64::new((out_scalars * 4) as u64).unwrap(),
+            },
+            width: out_w,
+            height: out_h,
+            stride: out_stride,
+        };
+        let plane_out_img1 = ResidentF32Plane {
+            storage: ResidentStorageBinding {
+                buffer: &out_buf_image1,
+                offset: 0,
+                size: std::num::NonZeroU64::new((out_scalars * 4) as u64).unwrap(),
+            },
+            width: out_w,
+            height: out_h,
+            stride: out_stride,
+        };
+        let plane_out_img2 = ResidentF32Plane {
+            storage: ResidentStorageBinding {
+                buffer: &out_buf_image2,
+                offset: 0,
+                size: std::num::NonZeroU64::new((out_scalars * 4) as u64).unwrap(),
+            },
+            width: out_w,
+            height: out_h,
+            stride: out_stride,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        channel_pipeline
+            .encode(
+                device,
+                &mut encoder,
+                ResidentChannelUpsampleInputs {
+                    input: plane_in,
+                    output: plane_out_chan,
+                    weights: &weights,
+                },
+            )
+            .unwrap();
+        image_pipeline
+            .encode(
+                device,
+                &mut encoder,
+                ResidentImageUpsampleInputs {
+                    inputs: [plane_in, plane_in, plane_in],
+                    outputs: [plane_out_img0, plane_out_img1, plane_out_img2],
+                    weights: &weights,
+                },
+            )
+            .unwrap();
+        queue.submit([encoder.finish()]);
+
+        let channel_floats =
+            readback_plane(device, queue, &out_buf_channel, (out_scalars * 4) as u64);
+        let image_floats = readback_plane(device, queue, &out_buf_image0, (out_scalars * 4) as u64);
+
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let idx = (y * out_stride + x) as usize;
+                assert_eq!(
+                    channel_floats[idx], image_floats[idx],
+                    "mismatch at ({x}, {y}) for geom in={in_w}x{in_h} out={out_w}x{out_h} factor={factor}"
+                );
+            }
+        }
+    }
+}

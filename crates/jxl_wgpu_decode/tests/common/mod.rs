@@ -250,6 +250,42 @@ pub fn jpeg_transcode_440() -> &'static [u8] {
     BYTES.as_slice()
 }
 
+pub fn jpeg_transcode_420_upsample_2x() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_420_upsample_2x.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn jpeg_transcode_422_upsample_4x() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_422_upsample_4x.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn upsample_2x_odd_extent() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/upsample_2x_513x255.jxl.hex")));
+    BYTES.as_slice()
+}
+
+pub fn upsample_4x_small_extent() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/upsample_4x_17x17.jxl.hex")));
+    BYTES.as_slice()
+}
+
+pub fn upsample_8x_small_extent() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> =
+        LazyLock::new(|| decode_hex(include_str!("../../test-data/upsample_8x_25x25.jxl.hex")));
+    BYTES.as_slice()
+}
+
 pub fn cjxl_upsampled_vardct_codestream(width: u32, height: u32, factor: u32) -> Option<Vec<u8>> {
     assert!(matches!(factor, 2 | 4 | 8));
     if std::process::Command::new("cjxl")

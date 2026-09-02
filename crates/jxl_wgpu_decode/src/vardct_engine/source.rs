@@ -17,7 +17,7 @@ use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_frontend::VarDctColorTransform;
+use crate::vardct_frontend::{VarDctChannelShift, VarDctColorTransform};
 use crate::vardct_output::{
     VarDctInverseOpsin, VarDctOutputFormat, VarDctOutputPlan, VarDctOutputTransform,
 };
@@ -401,20 +401,26 @@ pub(super) fn prepare_source(
                 ],
             )
         }
-        VarDctColorTransform::Ycbcr => (
-            VarDctOutputTransform::Ycbcr {
-                channel_shifts: packet.profile.channel_shifts,
-            },
-            // Non-XYB image metadata omits the optional opsin object that otherwise carries these
-            // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32
-            // roundings.
-            [
-                1.0 - 0.054_650_072,
-                1.0 - 0.070_054_5,
-                1.0 - 0.049_935_102,
-                0.145,
-            ],
-        ),
+        VarDctColorTransform::Ycbcr => {
+            let channel_shifts =
+                if gaborish.is_some() || epf.is_some() || frame_upsampling.is_some() {
+                    [VarDctChannelShift::default(); 3]
+                } else {
+                    packet.profile.channel_shifts
+                };
+            (
+                VarDctOutputTransform::Ycbcr { channel_shifts },
+                // Non-XYB image metadata omits the optional opsin object that otherwise carries these
+                // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32
+                // roundings.
+                [
+                    1.0 - 0.054_650_072,
+                    1.0 - 0.070_054_5,
+                    1.0 - 0.049_935_102,
+                    0.145,
+                ],
+            )
+        }
     };
     let resident_memory = packet
         .groups
