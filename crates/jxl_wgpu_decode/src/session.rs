@@ -14,9 +14,9 @@ use jxl_gpu_bitstream::{
 };
 
 use crate::{
-    AnimationMetadata, DecodeProfile, Error, FrameMetadata, GpuCodestream, GpuOutputRequest,
-    InFlightLimiter, InFlightPermit, IncrementalInputBudget, IncrementalInputBudgetSnapshot,
-    Result, input_budget::IncrementalInputPermit,
+    AnimationMetadata, DecodeProfile, Error, ExtraChannelPlan, FrameMetadata, GpuCodestream,
+    GpuOutputRequest, InFlightLimiter, InFlightPermit, IncrementalInputBudget,
+    IncrementalInputBudgetSnapshot, Result, input_budget::IncrementalInputPermit,
 };
 
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
@@ -38,19 +38,28 @@ impl<F> SubmittedGpuFrame<F> {
 pub struct PreparedGpuSession<S> {
     pub profile: DecodeProfile,
     pub metadata: AnimationMetadata,
+    pub extra_channels: ExtraChannelPlan,
     pub session: S,
     resolved_frame_slots: Option<NonZeroUsize>,
 }
 
 impl<S> PreparedGpuSession<S> {
     #[must_use]
-    pub const fn new(profile: DecodeProfile, metadata: AnimationMetadata, session: S) -> Self {
+    pub fn new(profile: DecodeProfile, metadata: AnimationMetadata, session: S) -> Self {
         Self {
             profile,
             metadata,
+            extra_channels: ExtraChannelPlan::default(),
             session,
             resolved_frame_slots: None,
         }
+    }
+
+    /// Sets the extra channel metadata plan for this prepared session.
+    #[must_use]
+    pub fn with_extra_channels(mut self, extra_channels: ExtraChannelPlan) -> Self {
+        self.extra_channels = extra_channels;
+        self
     }
 
     /// Narrows the caller's requested frame window to the number of slots this prepared backend
@@ -678,6 +687,7 @@ pub struct GpuDecodeSession<S: GpuSubmissionSession> {
     request: GpuOutputRequest,
     profile: DecodeProfile,
     metadata: AnimationMetadata,
+    extra_channels: ExtraChannelPlan,
     limiter: InFlightLimiter,
     pending: VecDeque<(InFlightPermit, S::Pending)>,
     submitted_count: usize,
@@ -704,6 +714,7 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
             engine: prepared.session,
             profile: prepared.profile,
             metadata: prepared.metadata,
+            extra_channels: prepared.extra_channels,
             limiter: InFlightLimiter::new(resolved_frame_slots),
             request,
             pending: VecDeque::new(),
@@ -724,6 +735,11 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
     #[must_use]
     pub const fn metadata(&self) -> &AnimationMetadata {
         &self.metadata
+    }
+
+    #[must_use]
+    pub fn extra_channels(&self) -> &ExtraChannelPlan {
+        &self.extra_channels
     }
 
     #[must_use]

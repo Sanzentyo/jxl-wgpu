@@ -30,6 +30,7 @@ mod codestream_data;
 mod entropy;
 mod entropy_window;
 mod error;
+pub mod extra_channel;
 mod inflight;
 mod input_budget;
 mod model;
@@ -72,6 +73,7 @@ pub use error::{
     ModularTransformFeature, ModularTreeError, ProgressiveDcError, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,
 };
+pub use extra_channel::{ExtraChannelInfo, ExtraChannelPlan, ExtraChannelType};
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
     IncrementalInputBudget, IncrementalInputBudgetError, IncrementalInputBudgetSnapshot,
