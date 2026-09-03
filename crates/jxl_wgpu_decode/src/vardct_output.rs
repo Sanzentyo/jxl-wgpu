@@ -122,6 +122,12 @@ impl PackedU8Format {
             }),
         )
     }
+
+    /// Recognizes a canonical packed-u8 pixel format for the fast path, if supported.
+    #[must_use]
+    pub fn recognize(format: &PixelFormat) -> Option<Self> {
+        Self::try_from(format).ok()
+    }
 }
 
 impl TryFrom<&PixelFormat> for PackedU8Format {
