@@ -12,14 +12,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use jxl_gpu_formats::PixelFormat;
 use jxl_gpu_protocol::{
     Border2d, ChromaAxis, EpfParams, EpfPass, Extent2d, GaborishParams, OutputColorEncoding,
     OutputDesc, OutputId, OutputLayout, OutputOrientation, PlaneDesc, PlaneId, PlaneRole,
     PrecisionContract, RenderNode, RenderOp, RenderPlan, ResourceData, ResourceId, ResourceUpdate,
-    SampleType, Scale2d, UpsamplingFactor, XybParams,
+    RgbColorEncoding, SampleType, Scale2d, UpsamplingFactor, XybParams,
 };
-
-use jxl_wgpu::ResidentEpfParameters;
+use jxl_wgpu::{ImageOutputRequest, ResidentEpfParameters};
 
 use crate::vardct_engine::VarDctDecodeError;
 use crate::vardct_frontend::VarDctColorTransform;
@@ -35,6 +35,7 @@ pub struct VarDctRenderTailDesc {
     pub frame_upsampling: Option<UpsamplingFactor>,
     pub upsampling_weights: Option<Vec<f32>>,
     pub xyb_params: Option<XybParams>,
+    pub target_format: Option<PixelFormat>,
 }
 
 /// The compiled render tail plan and initial resources.
@@ -46,9 +47,27 @@ pub struct CompiledVarDctRenderTail {
 }
 
 impl VarDctRenderTailDesc {
+    /// The RGB source color encoding emitted by the render tail for planar/packed conversion.
+    #[must_use]
+    pub fn source_color_encoding(&self) -> RgbColorEncoding {
+        match self.color_transform {
+            VarDctColorTransform::Xyb => RgbColorEncoding::LINEAR_BT709,
+            VarDctColorTransform::Ycbcr => RgbColorEncoding::SRGB_BT709,
+        }
+    }
+
+    /// Creates an [`ImageOutputRequest`] if a target pixel format is specified.
+    #[must_use]
+    pub fn image_output_request(&self) -> Option<ImageOutputRequest> {
+        self.target_format
+            .as_ref()
+            .map(|fmt| ImageOutputRequest::new(self.source_color_encoding(), fmt.clone()))
+    }
+
     /// Builds a verified [`RenderPlan`] that performs all post-inverse stages:
     /// Chroma Upsampling -> Adaptive LF -> Gaborish -> EPF -> Frame Upsampling -> Color Conversion -> Save.
     pub fn compile(self) -> Result<CompiledVarDctRenderTail, VarDctDecodeError> {
+        let source_color_encoding = self.source_color_encoding();
         let mut plan = RenderPlan::default();
         let mut resources = BTreeMap::new();
         let mut next_plane_id = 0_u32;
@@ -325,13 +344,18 @@ impl VarDctRenderTailDesc {
 
         // 7. Output Save
         let output_id = OutputId(0);
+        let color_encoding = if self.target_format.is_some() {
+            OutputColorEncoding::Rgb(source_color_encoding)
+        } else {
+            OutputColorEncoding::NonColor
+        };
         plan.outputs.push(OutputDesc {
             id: output_id,
             extent: final_extent,
             sample_type: SampleType::F32,
             channels: 3,
             layout: OutputLayout::Planar,
-            color_encoding: OutputColorEncoding::NonColor,
+            color_encoding,
         });
 
         plan.nodes.push(RenderNode {
@@ -407,6 +431,7 @@ mod tests {
                             frame_upsampling,
                             upsampling_weights,
                             xyb_params: Some(XybParams::default()),
+                            target_format: None,
                         };
                         let compiled = desc.compile().expect("compilation must succeed");
                         assert!(compiled.plan.validate().is_ok());
@@ -437,6 +462,7 @@ mod tests {
             frame_upsampling: None,
             upsampling_weights: None,
             xyb_params: None,
+            target_format: None,
         };
         let compiled = desc.compile().expect("compilation with chroma subsampling must succeed");
         assert!(compiled.plan.validate().is_ok());
@@ -450,5 +476,49 @@ mod tests {
             .collect();
         // 2 channels * 2 axes = 4 nodes
         assert_eq!(chroma_nodes.len(), 4);
+    }
+
+    #[test]
+    fn render_tail_fuses_packed_u8_image_output_request() {
+        use crate::vardct_output::PackedU8Format;
+
+        let image_extent = Extent2d::new(16, 16);
+        let padded_extent = Extent2d::new(16, 16);
+
+        for format in [
+            PackedU8Format::Rgb,
+            PackedU8Format::Rgba,
+            PackedU8Format::Bgr,
+            PackedU8Format::Bgra,
+        ] {
+            let pixel_format = format.pixel_format();
+            let desc = VarDctRenderTailDesc {
+                image_extent,
+                padded_extent,
+                channel_shifts: [VarDctChannelShift::default(); 3],
+                color_transform: VarDctColorTransform::Xyb,
+                gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+                epf_passes: None,
+                frame_upsampling: None,
+                upsampling_weights: None,
+                xyb_params: Some(XybParams::default()),
+                target_format: Some(pixel_format.clone()),
+            };
+
+            let req = desc.image_output_request().expect("request must be present");
+            assert_eq!(req.source_encoding, RgbColorEncoding::LINEAR_BT709);
+            assert_eq!(req.format, pixel_format);
+
+            // Verify equivalence with PackedU8Format::to_image_output_request
+            let direct_req = format.to_image_output_request(VarDctColorTransform::Xyb);
+            assert_eq!(req, direct_req);
+
+            let compiled = desc.compile().expect("compile render tail");
+            assert_eq!(
+                compiled.plan.outputs[0].color_encoding,
+                OutputColorEncoding::Rgb(RgbColorEncoding::LINEAR_BT709)
+            );
+            assert!(compiled.plan.validate().is_ok());
+        }
     }
 }

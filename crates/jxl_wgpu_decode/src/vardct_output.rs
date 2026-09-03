@@ -130,6 +130,24 @@ impl PackedU8Format {
     pub fn recognize(format: &PixelFormat) -> Option<Self> {
         Self::try_from(format).ok()
     }
+
+    /// Converts this canonical packed format into an [`ImageOutputRequest`] suitable for
+    /// fused [`RenderPlan`] planner execution.
+    #[must_use]
+    pub fn to_image_output_request(
+        self,
+        color_transform: crate::vardct_frontend::VarDctColorTransform,
+    ) -> jxl_wgpu::ImageOutputRequest {
+        let source_encoding = match color_transform {
+            crate::vardct_frontend::VarDctColorTransform::Xyb => {
+                jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709
+            }
+            crate::vardct_frontend::VarDctColorTransform::Ycbcr => {
+                jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709
+            }
+        };
+        jxl_wgpu::ImageOutputRequest::new(source_encoding, self.pixel_format())
+    }
 }
 
 impl TryFrom<&PixelFormat> for PackedU8Format {
