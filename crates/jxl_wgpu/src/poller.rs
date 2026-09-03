@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Maximum number of native submissions admitted to the shared poll worker.
 ///
@@ -36,6 +36,7 @@ struct PollRequest {
 #[cfg(not(target_arch = "wasm32"))]
 struct AdmissionState {
     in_flight: AtomicUsize,
+    total_admitted: AtomicU64,
     worker_running: AtomicBool,
 }
 
@@ -44,6 +45,7 @@ impl AdmissionState {
     fn new() -> Self {
         Self {
             in_flight: AtomicUsize::new(0),
+            total_admitted: AtomicU64::new(0),
             worker_running: AtomicBool::new(true),
         }
     }
@@ -60,6 +62,7 @@ impl AdmissionState {
                 capacity: SUBMISSION_POLLER_CAPACITY,
             })?;
 
+        self.total_admitted.fetch_add(1, Ordering::Relaxed);
         let slot = PollSlot {
             admission: Arc::clone(self),
         };
@@ -234,6 +237,19 @@ impl SubmissionPoller {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.admission.in_flight.load(Ordering::Acquire)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+
+    /// Cumulative count of submissions admitted across all permits.
+    #[must_use]
+    pub fn submission_count(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.admission.total_admitted.load(Ordering::Acquire)
         }
         #[cfg(target_arch = "wasm32")]
         {

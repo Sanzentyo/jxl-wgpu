@@ -450,7 +450,7 @@ fn subsampled_jpeg_transcode_with_frame_upsampling_matches_reference_on_gpu() {
 }
 
 #[test]
-fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negotiation() {
+fn public_decoder_propagates_subsampled_adaptive_lf_error_without_submission() {
     let Some((info, device, queue)) = device() else {
         return;
     };
@@ -483,7 +483,7 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
         "fixture must have exact 4:2:2 subsampling (jpeg_upsampling [0, 2, 0])"
     );
 
-    // 1. Direct frontend negotiation must reject the feature early before any packet parsing
+    // 2. Direct frontend negotiation must reject the feature early before any packet parsing
     let negotiate_err = StandardVarDctProfile::negotiate(&inventory).unwrap_err();
     assert_eq!(
         negotiate_err,
@@ -493,12 +493,19 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
         "frontend negotiation must reject subsampled adaptive LF"
     );
 
-    // 2. Public GpuDecoder::open must route the same typed error without submitting GPU work
+    // 3. Public GpuDecoder::open must route the same typed error without submitting GPU work
     let default_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let submissions_before = backend.submission_count();
     let strict_err = default_decoder.open(
         codestream,
         GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
+    let submissions_after = backend.submission_count();
+    assert_eq!(
+        submissions_before, submissions_after,
+        "early frontend rejection must not submit any GPU work (submission counter must be invariant)"
+    );
+
     let Err(strict_error) = strict_err else {
         panic!("subsampled adaptive LF must be rejected, but opened successfully");
     };
@@ -514,7 +521,7 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
         "strict policy error must be SubsampledAdaptiveLf, got {strict_error:?}"
     );
 
-    // 3. Verify zero GPU submission and zero GPU memory reservation on early rejection
+    // 4. Verify zero GPU memory reservation on early rejection
     assert_eq!(
         default_decoder
             .engine()
@@ -598,7 +605,7 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
     )
     .unwrap();
 
-    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut skip_session = decoder
         .open(
             skip_codestream,
@@ -618,9 +625,15 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
         "completed skip frame must release its reserved memory upon drop"
     );
 
+    let submissions_before_adaptive = backend.submission_count();
     let adaptive_result = decoder.open(
         adaptive_codestream,
         GpuOutputRequest::color(canonical_rgb8()).unwrap(),
+    );
+    let submissions_after_adaptive = backend.submission_count();
+    assert_eq!(
+        submissions_before_adaptive, submissions_after_adaptive,
+        "failed adaptive open must not submit GPU work (submission counter must be invariant)"
     );
     assert!(
         matches!(

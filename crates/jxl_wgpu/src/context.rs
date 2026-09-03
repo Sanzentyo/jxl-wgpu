@@ -269,6 +269,12 @@ impl WgpuBackend {
         &self.poller
     }
 
+    /// Cumulative count of GPU queue submissions admitted by this backend.
+    #[must_use]
+    pub fn submission_count(&self) -> u64 {
+        self.poller.submission_count()
+    }
+
     /// Returns the byte-weighted transient admission budget shared by backend clones.
     #[must_use]
     pub const fn transient_memory_budget(&self) -> &MemoryBudget {

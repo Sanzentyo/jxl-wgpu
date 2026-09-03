@@ -411,3 +411,21 @@ fn rejects_inconsistent_dynamic_section_topology_with_typed_errors() {
         }
     );
 }
+
+#[test]
+fn rejects_subsampled_adaptive_lf_during_negotiation() {
+    let bytes = decode_hex(include_str!("../test-data/jpeg_transcode_422_adaptive_lf.jxl.hex"));
+    let inv = inventory(&bytes);
+    assert_eq!(inv.frames.len(), 1);
+    let frame = &inv.frames[0];
+    assert_eq!(frame.jpeg_upsampling, [0, 2, 0]);
+    assert_eq!(frame.flags & 0x80, 0);
+
+    let err = StandardVarDctProfile::negotiate(&inv).unwrap_err();
+    assert_eq!(
+        err,
+        VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::SubsampledAdaptiveLf,
+        }
+    );
+}
