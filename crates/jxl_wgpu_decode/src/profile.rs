@@ -1821,13 +1821,16 @@ mod tests {
         {
             let mut projected = inventory.clone();
             projected.frames = vec![inventory.frames[frame_index].clone()];
-            let packet =
-                crate::vardct_packet::BoundedVarDctPacketPlan::parse_progressive_dc_source(
-                    &codestream,
-                    &projected,
-                    is_final,
-                )
-                .unwrap();
+            let profile = crate::vardct_frontend::StandardVarDctProfile::negotiate_progressive_dc(
+                &projected, is_final,
+            )
+            .unwrap();
+            let packet = crate::vardct_packet::BoundedVarDctPacketPlan::parse_source(
+                &codestream,
+                &projected,
+                &profile,
+            )
+            .unwrap();
             assert_eq!(
                 (packet.profile.width, packet.profile.height),
                 expected_extent

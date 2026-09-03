@@ -61,6 +61,8 @@ pub enum VarDctDecodeError {
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
     #[error(transparent)]
+    Frontend(#[from] crate::vardct_frontend::VarDctFrontendError),
+    #[error(transparent)]
     Packet(#[from] BoundedVarDctPacketError),
     #[error(transparent)]
     PacketGpu(#[from] GpuVarDctPacketError),

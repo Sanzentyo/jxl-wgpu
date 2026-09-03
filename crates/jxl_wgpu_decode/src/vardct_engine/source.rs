@@ -18,7 +18,9 @@ use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_frontend::{AdaptiveLfPlan, VarDctChannelShift, VarDctColorTransform};
+use crate::vardct_frontend::{
+    AdaptiveLfPlan, StandardVarDctProfile, VarDctChannelShift, VarDctColorTransform,
+};
 use crate::vardct_output::{
     PackedU8Format, VarDctInverseOpsin, VarDctOutputPlan, VarDctOutputTransform,
 };
@@ -179,12 +181,11 @@ pub(super) fn prepare_source(
         1.0,
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
-    let packet = options.progressive_dc_final.map_or_else(
-        || BoundedVarDctPacketPlan::parse_source(&codestream, inventory),
-        |is_final| {
-            BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
-        },
+    let profile = options.progressive_dc_final.map_or_else(
+        || StandardVarDctProfile::negotiate(inventory),
+        |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
     )?;
+    let packet = BoundedVarDctPacketPlan::parse_source(&codestream, inventory, &profile)?;
     let adaptive_lf = packet.profile.adaptive_lf;
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();

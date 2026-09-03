@@ -17,10 +17,10 @@ use crate::modular_tree::{
 };
 use crate::vardct_frontend::{
     BoundedBitInput, HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation,
-    LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
-    VarDctGroupRect, VarDctMetadataReaderError, VarDctPacketError, VarDctSectionLayout,
-    map_metadata_reader_error, metadata_bits, metadata_bool, metadata_f16,
-    parse_hf_metadata_header_reader, parse_lf_group_header_reader, validate_packet_end_bits,
+    LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctGroupRect,
+    VarDctMetadataReaderError, VarDctPacketError, VarDctSectionLayout, map_metadata_reader_error,
+    metadata_bits, metadata_bool, metadata_f16, parse_hf_metadata_header_reader,
+    parse_lf_group_header_reader, validate_packet_end_bits,
 };
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
 
@@ -55,8 +55,6 @@ pub enum UnsupportedVarDctPacketFeature {
 /// Host-side failure before image entropy is submitted to the GPU.
 #[derive(Debug, Error)]
 pub enum BoundedVarDctPacketError {
-    #[error(transparent)]
-    Frontend(#[from] VarDctFrontendError),
     #[error(transparent)]
     Packet(#[from] VarDctPacketError),
     #[error(transparent)]
@@ -414,35 +412,25 @@ impl BoundedVarDctPacketPlan {
     pub fn parse(
         codestream: &[u8],
         inventory: &CodestreamInventory,
+        profile: &StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Slice(codestream), inventory, None)
+        Self::parse_inner(PacketSource::Slice(codestream), inventory, profile)
     }
 
     /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
     pub(crate) fn parse_source(
         source: &GpuCodestream,
         inventory: &CodestreamInventory,
+        profile: &StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, None)
-    }
-
-    pub(crate) fn parse_progressive_dc_source(
-        source: &GpuCodestream,
-        inventory: &CodestreamInventory,
-        is_final: bool,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, Some(is_final))
+        Self::parse_inner(PacketSource::Spans(source), inventory, profile)
     }
 
     fn parse_inner(
         source: PacketSource<'_>,
-        inventory: &CodestreamInventory,
-        progressive_dc_final: Option<bool>,
+        _inventory: &CodestreamInventory,
+        profile: &StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        let profile = progressive_dc_final.map_or_else(
-            || StandardVarDctProfile::negotiate(inventory),
-            |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
-        )?;
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
         }
@@ -532,8 +520,17 @@ impl BoundedVarDctPacketPlan {
                         field: "LF-group index",
                     }
                 })?;
-                let rect = profile.low_frequency_group_rect(u64::from(index))?;
-                let [blocks_x, blocks_y] = profile.padded_group_block_extent(rect)?;
+                let rect = profile
+                    .low_frequency_group_rect(u64::from(index))
+                    .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-group rect",
+                    })?;
+                let [blocks_x, blocks_y] =
+                    profile.padded_group_block_extent(rect).map_err(|_| {
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-group block extent",
+                        }
+                    })?;
                 let block_count = blocks_x.checked_mul(blocks_y).ok_or(
                     BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group block count",
@@ -579,7 +576,10 @@ impl BoundedVarDctPacketPlan {
                         })?;
                 validate_source_packet_end(source, lf_group_end)?;
                 let lf_decoded_symbol_limit = profile
-                    .lf_entropy_channel_block_extents(rect)?
+                    .lf_entropy_channel_block_extents(rect)
+                    .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-entropy block extents",
+                    })?
                     .into_iter()
                     .try_fold(0u32, |total, [width, height]| {
                         width
@@ -689,8 +689,16 @@ impl BoundedVarDctPacketPlan {
                     task_capacity: block_count,
                     coefficient_words,
                     lf_group,
-                    lf_stream_index: profile.lf_quant_stream_index(u64::from(index))?,
-                    hf_stream_index: profile.hf_metadata_stream_index(u64::from(index))?,
+                    lf_stream_index: profile.lf_quant_stream_index(u64::from(index)).map_err(
+                        |_| BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-quant stream index",
+                        },
+                    )?,
+                    hf_stream_index: profile.hf_metadata_stream_index(u64::from(index)).map_err(
+                        |_| BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "HF-metadata stream index",
+                        },
+                    )?,
                     lf_entropy_bit_offset: u32::try_from(lf_token_bit_offset).map_err(|_| {
                         BoundedVarDctPacketError::ArithmeticOverflow {
                             field: "LF image-entropy bit offset",
@@ -751,7 +759,7 @@ impl BoundedVarDctPacketPlan {
                 .is_some_and(MaConfigIr::needs_self_correcting)
         };
         Ok(Self {
-            profile,
+            profile: profile.clone(),
             uniform_transform,
             lf_global: lf_global_packet,
             hf_global,
@@ -1277,7 +1285,12 @@ impl BoundedVarDctGroupPlan {
                 })?,
             ],
             scratch: {
-                let extents = packet.profile.lf_entropy_channel_block_extents(self.rect)?;
+                let extents = packet
+                    .profile
+                    .lf_entropy_channel_block_extents(self.rect)
+                    .map_err(|_| BoundedVarDctPacketError::ArithmeticOverflow {
+                        field: "LF-entropy block extents",
+                    })?;
                 [
                     self.predictor_width_capacity()?,
                     pack_channel_extent(extents[0])?,
@@ -3407,13 +3420,14 @@ mod tests {
         ));
         let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
         let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+        let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
         let storage: Arc<[u8]> = codestream.into();
 
         for split in 0..=storage.len() {
             let source = split_source(Arc::clone(&storage), split);
             assert_eq!(
-                BoundedVarDctPacketPlan::parse_source(&source, &inventory).unwrap(),
+                BoundedVarDctPacketPlan::parse_source(&source, &inventory, &profile).unwrap(),
                 expected,
                 "chunk split {split} changed the VarDCT packet plan"
             );
@@ -3427,7 +3441,8 @@ mod tests {
         ));
         let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
         let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+        let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
         let expected_continuation = expected
             .parse_hf_continuation(&codestream, &expected.groups[0], 67_171)
             .unwrap();
@@ -3439,7 +3454,7 @@ mod tests {
             )
         });
         let source = GpuCodestream::from_spans(spans).unwrap();
-        let actual = BoundedVarDctPacketPlan::parse_source(&source, &inventory).unwrap();
+        let actual = BoundedVarDctPacketPlan::parse_source(&source, &inventory, &profile).unwrap();
         let actual_continuation = actual
             .parse_hf_continuation_source(&source, &actual.groups[0], 67_171)
             .unwrap();

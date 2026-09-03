@@ -282,7 +282,7 @@ fn permuted_toc_is_normalized_to_logical_pass_group_order() {
         assert_eq!(range, physical.bits);
     }
 
-    let packet = BoundedVarDctPacketPlan::parse(&bytes, &inventory).unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(&bytes, &inventory, &profile).unwrap();
     assert_eq!(
         packet.hf_coefficients.unwrap().pass_groups,
         pass_groups.as_slice()

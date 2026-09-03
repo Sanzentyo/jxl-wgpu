@@ -3,6 +3,7 @@ use std::sync::Arc;
 use jxl_gpu_bitstream::{InventoryLimits, ParseLimits};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
 use jxl_gpu_protocol::{Extent2d, TransformKind};
+use jxl_wgpu_decode::vardct::frontend::StandardVarDctProfile;
 use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus, VarDctModularParams,
     VarDctPacketBuffers, VarDctPacketControl, VarDctPacketPipeline, VarDctPacketValidation,
@@ -104,7 +105,8 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
             ..InventoryLimits::default()
         })
         .unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+    let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
     let group = plan.groups.first().unwrap();
     let control = group.packet_control(&plan).unwrap();
 
@@ -242,7 +244,8 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
             ..InventoryLimits::default()
         })
         .unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
+    let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
     assert!(plan.requires_local_tree_staging());
     assert!(plan.groups.len() > 1);
 
