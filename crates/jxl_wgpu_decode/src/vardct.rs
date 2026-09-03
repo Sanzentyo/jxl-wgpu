@@ -40,6 +40,7 @@ pub mod pass_group {
 }
 
 /// Resident XYB or JPEG YCbCr-to-packed-u8 GPU output packing (RGBA8, BGRA8, RGB8, BGR8).
+#[allow(unused_imports, dead_code)]
 pub(crate) mod output {
     pub use crate::vardct_output::*;
 }

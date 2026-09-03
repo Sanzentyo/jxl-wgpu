@@ -12,7 +12,7 @@ use crate::{KernelVariant, ResidentF32Plane};
 /// Note: 1× upsampling is identity (no-op) and completely bypasses the frame
 /// upsampling pipeline rather than executing an interpolation kernel. Only non-identity
 /// factors (2×, 4×, 8×) require weight preparation and GPU pipeline dispatches.
-pub use jxl_gpu_protocol::UpsamplingFactor;
+pub use jxl_gpu_protocol::{StoragePlan, UpsamplingFactor};
 
 impl From<jxl_gpu_protocol::UnsupportedUpsamplingFactor> for ResidentImageUpsampleError {
     fn from(err: jxl_gpu_protocol::UnsupportedUpsamplingFactor) -> Self {
@@ -223,6 +223,28 @@ impl From<&ResidentImageUpsampleWeights> for PreparedUpsamplingMemoryPlan {
 impl From<&PreparedUpsamplingWeights> for PreparedUpsamplingMemoryPlan {
     fn from(weights: &PreparedUpsamplingWeights) -> Self {
         weights.memory_plan()
+    }
+}
+
+impl From<StoragePlan> for PreparedUpsamplingMemoryPlan {
+    fn from(plan: StoragePlan) -> Self {
+        Self {
+            storage_bytes: plan.bytes,
+        }
+    }
+}
+
+impl From<PreparedUpsamplingMemoryPlan> for StoragePlan {
+    fn from(plan: PreparedUpsamplingMemoryPlan) -> Self {
+        Self {
+            bytes: plan.storage_bytes,
+        }
+    }
+}
+
+impl From<UpsamplingFactor> for PreparedUpsamplingMemoryPlan {
+    fn from(factor: UpsamplingFactor) -> Self {
+        factor.weights_storage_plan().into()
     }
 }
 

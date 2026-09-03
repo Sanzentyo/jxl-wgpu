@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 use jxl_gpu_protocol::{
     Extent2d, GroupId, GroupPayload, OutputDesc, OutputId, OutputLayout, PlaneDesc, PlaneId,
     PlaneRole, RenderNode, RenderOp, RenderPlan, ResourceData, ResourceId, ResourceUpdate,
@@ -368,6 +369,44 @@ impl Scheduler {
             planes.insert(desc.id, plane);
         }
 
+        let mut upsample_weights_buffers = BTreeMap::new();
+        for node in &plan.nodes {
+            if let RenderOp::Upsample(params) = &node.op {
+                if !upsample_weights_buffers.contains_key(&params.weights) {
+                    let update = resources.get(&params.weights).ok_or_else(|| {
+                        Error::InvalidPayload(format!(
+                            "Upsample node '{}' is missing weights resource {:?}",
+                            node.name, params.weights
+                        ))
+                    })?;
+                    let weights_slice = match &update.data {
+                        ResourceData::F32(values) => values.as_slice(),
+                        _ => {
+                            return Err(Error::InvalidPayload(format!(
+                                "Upsample node '{}' weights resource must be ResourceData::F32",
+                                node.name
+                            )));
+                        }
+                    };
+                    let factor = usize::from(params.factor.as_u8());
+                    let expected_weights = factor * factor * 25;
+                    if weights_slice.len() != expected_weights {
+                        return Err(Error::InvalidPayload(format!(
+                            "{}x Upsample has {} weights, expected {expected_weights}",
+                            params.factor.as_u8(),
+                            weights_slice.len()
+                        )));
+                    }
+                    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("jxl-wgpu upsample weights"),
+                        contents: bytemuck::cast_slice(weights_slice),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                    upsample_weights_buffers.insert(params.weights, buffer);
+                }
+            }
+        }
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu frame"),
         });
@@ -467,13 +506,21 @@ impl Scheduler {
                             resources,
                         )?,
                         RenderOp::Upsample(params) => {
+                            let weights_buffer = upsample_weights_buffers
+                                .get(&params.weights)
+                                .ok_or_else(|| {
+                                    Error::InvalidPayload(format!(
+                                        "Upsample node '{}' missing prepared weights buffer {:?}",
+                                        node.name, params.weights
+                                    ))
+                                })?;
                             nodes::filters::encode_upsample(
                                 &factory,
                                 &mut encoder,
                                 node,
                                 &planes,
                                 params,
-                                resources,
+                                weights_buffer,
                             )?;
                             1
                         }

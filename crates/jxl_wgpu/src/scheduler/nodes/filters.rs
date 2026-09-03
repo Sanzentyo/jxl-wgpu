@@ -520,7 +520,7 @@ pub(in crate::scheduler) fn encode_upsample(
     node: &RenderNode,
     planes: &BTreeMap<PlaneId, UploadedPlane>,
     upsample: &jxl_gpu_protocol::UpsampleParams,
-    resources: &BTreeMap<jxl_gpu_protocol::ResourceId, jxl_gpu_protocol::ResourceUpdate>,
+    weights: &wgpu::Buffer,
 ) -> Result<()> {
     let device = factory.device;
     let (input, output) = unary_planes(node, planes)?;
@@ -538,38 +538,6 @@ pub(in crate::scheduler) fn encode_upsample(
             upsample.factor.as_u8(), node.name, input.desc.extent, output.desc.extent
         )));
     }
-    let factor_usize = usize::from(upsample.factor.as_u8());
-    let expected_weights = factor_usize
-        .checked_mul(factor_usize)
-        .and_then(|phases| phases.checked_mul(25))
-        .ok_or(Error::BufferSizeOverflow)?;
-    let update = resources.get(&upsample.weights).ok_or_else(|| {
-        Error::InvalidPayload(format!(
-            "Upsample node '{}' is missing weights resource {:?}",
-            node.name, upsample.weights
-        ))
-    })?;
-    let weights_slice = match &update.data {
-        jxl_gpu_protocol::ResourceData::F32(values) => values.as_slice(),
-        _ => {
-            return Err(Error::InvalidPayload(format!(
-                "Upsample node '{}' weights resource must be ResourceData::F32",
-                node.name
-            )));
-        }
-    };
-    if weights_slice.len() != expected_weights {
-        return Err(Error::InvalidPayload(format!(
-            "{}x Upsample has {} weights, expected {expected_weights} phase-major weights",
-            upsample.factor.as_u8(),
-            weights_slice.len()
-        )));
-    }
-    let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("jxl-wgpu upsample weights"),
-        contents: bytemuck::cast_slice(weights_slice),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
     let params = UpsampleUniform {
         input_width: input.desc.extent.width,
         input_height: input.desc.extent.height,

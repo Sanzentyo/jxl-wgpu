@@ -447,6 +447,29 @@ impl From<UpsamplingFactor> for u32 {
     }
 }
 
+/// Storage buffer allocation requirement for a retained or shared resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoragePlan {
+    pub bytes: u64,
+}
+
+impl StoragePlan {
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self { bytes }
+    }
+}
+
+impl UpsamplingFactor {
+    /// Storage buffer plan for the prepared weights of this upsampling factor.
+    #[must_use]
+    pub const fn weights_storage_plan(self) -> StoragePlan {
+        let factor = self.as_u32() as u64;
+        let floats = factor * factor * 25;
+        StoragePlan::new(floats * std::mem::size_of::<f32>() as u64)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpsampleParams {
     pub factor: UpsamplingFactor,
@@ -796,6 +819,30 @@ impl RenderPlan {
             }
         }
         dirty
+    }
+
+    /// Appends an upsampling node to the plan with the canonical 2-sample symmetric border
+    /// and scale matching the factor.
+    pub fn add_upsample_node(
+        &mut self,
+        name: impl Into<std::sync::Arc<str>>,
+        factor: UpsamplingFactor,
+        weights: ResourceId,
+        input: PlaneId,
+        output: PlaneId,
+    ) {
+        let f = factor.as_u8();
+        let node = RenderNode {
+            name: name.into(),
+            op: RenderOp::Upsample(UpsampleParams { factor, weights }),
+            inputs: vec![input],
+            outputs: vec![output],
+            resources: vec![weights],
+            scale: Scale2d::new(f, f),
+            border: Border2d::symmetric(2, 2),
+            precision: PrecisionContract::default(),
+        };
+        self.nodes.push(node);
     }
 }
 

@@ -184,10 +184,8 @@ pub(in crate::scheduler) fn transient_bytes(
             RenderOp::AdaptiveLf(_) => {
                 add_uniform::<AdaptiveLfUniform>(&mut bytes)?;
             }
-            RenderOp::Upsample(params) => {
+            RenderOp::Upsample(_) => {
                 add_uniform::<UpsampleUniform>(&mut bytes)?;
-                let factor = usize::from(params.factor.as_u8());
-                add_slice::<f32>(&mut bytes, factor * factor * 25)?;
             }
             RenderOp::XybToRgb(_) => add_uniform::<XybUniform>(&mut bytes)?,
             RenderOp::YcbcrToRgb => {

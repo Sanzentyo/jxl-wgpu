@@ -7,6 +7,8 @@
 //! For 4-byte formats (RGBA8/BGRA8), each invocation writes one full word (alpha is filled
 //! with 255 for opaque output when no decoded alpha source is connected).
 
+#![allow(dead_code)]
+
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
     ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, PixelFormat,

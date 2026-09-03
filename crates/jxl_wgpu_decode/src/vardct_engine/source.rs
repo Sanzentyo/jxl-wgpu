@@ -151,7 +151,8 @@ pub(super) fn prepare_source(
     options: VarDctPrepareOptions,
 ) -> Result<VarDctSource, VarDctDecodeError> {
     let output_format = match request.mapping() {
-        GpuOutputMapping::Color => PackedU8Format::try_from(request.format())?,
+        GpuOutputMapping::Color => PackedU8Format::recognize(request.format())
+            .ok_or(VarDctDecodeError::UnsupportedOutput)?,
         _ => return Err(VarDctDecodeError::UnsupportedOutput),
     };
     if inventory.image_header.orientation != 1 {

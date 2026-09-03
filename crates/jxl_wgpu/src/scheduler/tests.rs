@@ -908,3 +908,85 @@ fn packed_storage_size_is_checked_against_both_device_limits() {
             if message.contains("260 bytes") && message.contains("limit 256")
     ));
 }
+
+#[test]
+fn upsample_nodes_share_weights_storage_plan_and_uniform_transient_accounting() {
+    use jxl_gpu_protocol::{
+        PlaneDesc, PlaneId, PlaneRole, ResourceData, ResourceId, ResourceUpdate, SampleType,
+        StoragePlan, UpsamplingFactor,
+    };
+    use crate::resident_image_upsample::PreparedUpsamplingMemoryPlan;
+
+    // 1. Verify StoragePlan computation from UpsamplingFactor
+    let factor2 = UpsamplingFactor::X2;
+    let storage_plan = factor2.weights_storage_plan();
+    assert_eq!(storage_plan.bytes, 2 * 2 * 25 * 4); // 400 bytes
+
+    let memory_plan = PreparedUpsamplingMemoryPlan::from(storage_plan);
+    assert_eq!(memory_plan.storage_bytes, 400);
+    assert_eq!(StoragePlan::from(memory_plan), storage_plan);
+
+    // 2. Build RenderPlan with 3 upsampling nodes sharing single weights ResourceId
+    let weights_id = ResourceId(42);
+    let mut plan = RenderPlan::default();
+    plan.planes.push(PlaneDesc {
+        id: PlaneId(1),
+        sample_type: SampleType::F32,
+        extent: Extent2d::new(8, 8),
+        stride: 8,
+        role: PlaneRole::Source,
+    });
+    plan.planes.push(PlaneDesc {
+        id: PlaneId(2),
+        sample_type: SampleType::F32,
+        extent: Extent2d::new(16, 16),
+        stride: 16,
+        role: PlaneRole::Intermediate,
+    });
+    plan.planes.push(PlaneDesc {
+        id: PlaneId(3),
+        sample_type: SampleType::F32,
+        extent: Extent2d::new(8, 8),
+        stride: 8,
+        role: PlaneRole::Source,
+    });
+    plan.planes.push(PlaneDesc {
+        id: PlaneId(4),
+        sample_type: SampleType::F32,
+        extent: Extent2d::new(16, 16),
+        stride: 16,
+        role: PlaneRole::Intermediate,
+    });
+
+    plan.add_upsample_node("upsample_r", factor2, weights_id, PlaneId(1), PlaneId(2));
+    plan.add_upsample_node("upsample_g", factor2, weights_id, PlaneId(3), PlaneId(4));
+
+    // Verify RenderNodes are correctly constructed
+    assert_eq!(plan.nodes.len(), 2);
+    assert_eq!(plan.nodes[0].border, Border2d::symmetric(2, 2));
+    assert_eq!(plan.nodes[0].scale, Scale2d::new(2, 2));
+    assert_eq!(plan.nodes[0].resources, vec![weights_id]);
+    assert_eq!(plan.nodes[1].resources, vec![weights_id]);
+
+    let mut resources = BTreeMap::new();
+    resources.insert(
+        weights_id,
+        ResourceUpdate {
+            id: weights_id,
+            revision: 1,
+            data: ResourceData::F32(vec![0.04; 100]),
+        },
+    );
+
+    let execution = execution(Vec::new(), 0);
+    let groups = BTreeMap::new();
+    let target = OutputTarget {
+        mode: OutputMode::CpuReadback,
+        encoding: OutputEncoding::Original,
+        direct_readback: false,
+    };
+
+    let tb = transient_bytes(&plan, &execution, &groups, &resources, target).unwrap();
+    // 2 upsample nodes each need 1 UpsampleUniform
+    assert_eq!(tb, (size_of::<UpsampleUniform>() * 2) as u64);
+}
