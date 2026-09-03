@@ -25,9 +25,10 @@ use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
 use jxl_wgpu_decode::{
-    AdaptiveLfDisposition, DecodeProfile, Error as DecodeError, GpuDecodeSession, GpuDecoder,
-    GpuOutputRequest, NumericSampleMapping, PrefetchBackpressure, UnsupportedFeaturePolicy,
-    VarDctDecodeError, VarDctSubmissionEngine, WgpuDecodeEngine, WgpuDecodeSubmissionSession,
+    AdaptiveLfDecision, AdaptiveLfDisposition, DecodeDeviation, DecodeProfile,
+    Error as DecodeError, GpuDecodeSession, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
+    PrefetchBackpressure, SubsampledAdaptiveLfPolicy, VarDctDecodeError, VarDctSubmissionEngine,
+    WgpuDecodeEngine, WgpuDecodeSubmissionSession,
 };
 use jxl_wgpu_encode::{
     BufferImageSource, TiledVarDctEncoder, VarDctColorEncoding, VarDctEncoder, VarDctStrategy,
@@ -465,22 +466,20 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         frame.flags & 0x80 == 0,
         "fixture must truly signal adaptive LF smoothing (FLAG_SKIP_ADAPTIVE_LF_SMOOTHING not set)"
     );
-    assert!(
-        frame.jpeg_upsampling.iter().any(|&s| s != 0),
-        "fixture must have subsampled channels"
+    assert_eq!(
+        frame.jpeg_upsampling,
+        [0, 2, 0],
+        "fixture must have exact 4:2:2 subsampling (jpeg_upsampling [0, 2, 0])"
     );
 
-    // 2. Strict policy: must reject with typed UnsupportedSubsampledStage error
-    let strict_engine = VarDctSubmissionEngine::new(backend.clone())
-        .unwrap()
-        .with_unsupported_feature_policy(UnsupportedFeaturePolicy::Strict);
-    let strict_decoder = GpuDecoder::new(strict_engine);
-    let strict_err = strict_decoder.open(
+    // 1. Strict policy (default): must reject unstandardized subsampled adaptive LF with typed error
+    let default_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    let strict_err = default_decoder.open(
         codestream,
         GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
     );
     let Err(strict_error) = strict_err else {
-        panic!("strict policy must reject subsampled adaptive LF, but opened successfully");
+        panic!("default Strict policy must reject subsampled adaptive LF, but opened successfully");
     };
     assert!(
         matches!(
@@ -492,8 +491,11 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         "strict policy error must be UnsupportedSubsampledStage, got {strict_error:?}"
     );
 
-    // 3. Compatibility fallback (default): safely bypasses and records BypassedSubsampled disposition
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    // 2. Compatibility fallback via unified WgpuDecodeEngine selector
+    let engine = WgpuDecodeEngine::new(backend.clone())
+        .unwrap()
+        .with_subsampled_adaptive_lf_policy(SubsampledAdaptiveLfPolicy::CompatibilityFallback);
+    let decoder = GpuDecoder::new(engine);
     let mut session = decoder
         .open(
             codestream,
@@ -502,22 +504,27 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         .unwrap();
 
     let vardct = session.submission_session().vardct().unwrap();
-    assert!(
-        vardct.adaptive_lf_signaled(),
-        "adaptive LF must be recorded as signaled"
+    assert_eq!(
+        vardct.adaptive_lf_decision(),
+        AdaptiveLfDecision {
+            signaled: true,
+            disposition: AdaptiveLfDisposition::BypassedSubsampled,
+        },
+        "decision must record signaled=true and disposition=BypassedSubsampled"
     );
     assert_eq!(
-        vardct.adaptive_lf_disposition(),
-        AdaptiveLfDisposition::BypassedSubsampled,
-        "disposition must be BypassedSubsampled"
-    );
-    assert_eq!(
-        vardct.memory_stats().adaptive_lf_disposition,
-        AdaptiveLfDisposition::BypassedSubsampled,
-        "memory stats disposition must match"
+        vardct.deviations(),
+        &[DecodeDeviation::BypassedSubsampledAdaptiveLf],
+        "session deviations must record BypassedSubsampledAdaptiveLf"
     );
 
     let frame = session.next_frame().unwrap().unwrap();
+    assert_eq!(
+        frame.metadata.deviations,
+        &[DecodeDeviation::BypassedSubsampledAdaptiveLf],
+        "frame metadata deviations must record BypassedSubsampledAdaptiveLf"
+    );
+
     let readback = ImageReadbackPipeline::new(&backend)
         .submit(frame.output())
         .unwrap()
@@ -532,8 +539,8 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         "subsampled adaptive LF codestream output diverges from Rust jxl by {rust_error}"
     );
     // Note: Upstream libjxl (djxl 0.12.0) currently rejects subsampled streams with signaled
-    // adaptive LF (upstream PR #4932 is pending specification clarification). Normative Rust
-    // jxl (PR #861) serves as the ground-truth oracle for this test.
+    // adaptive LF (upstream PR #4932 is pending specification clarification). Rust `jxl`
+    // implementation oracle based on jxl-rs 0.6.0 (PR #861) serves as the interoperability oracle.
 }
 
 #[test]

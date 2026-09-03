@@ -332,8 +332,6 @@ pub struct VarDctDecodeMemoryStats {
     /// All non-output GPU buffers retained through status validation.
     pub transient_bytes: u64,
     pub total_frame_bytes: u64,
-    pub adaptive_lf_signaled: bool,
-    pub adaptive_lf_disposition: AdaptiveLfDisposition,
 }
 
 /// Normative vs compatibility disposition for signaled Adaptive LF smoothing.
@@ -361,16 +359,28 @@ impl AdaptiveLfDisposition {
     }
 }
 
-/// Decoder policy for handling unstandardized or experimental upstream features.
+/// Resolved execution decision for Adaptive LF smoothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdaptiveLfDecision {
+    pub signaled: bool,
+    pub disposition: AdaptiveLfDisposition,
+}
+
+impl AdaptiveLfDecision {
+    #[must_use]
+    pub const fn executes(self) -> bool {
+        matches!(self.disposition, AdaptiveLfDisposition::Executed)
+    }
+}
+
+/// Decoder policy for handling unstandardized subsampled Adaptive LF smoothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum UnsupportedFeaturePolicy {
-    /// Reject unstandardized/unsupported combinations with a typed error.
-    Strict,
-    /// Bypass the stage safely in explicit compatibility mode and record the disposition in session stats.
+pub enum SubsampledAdaptiveLfPolicy {
+    /// Reject unstandardized subsampled adaptive LF combinations with a typed error.
     #[default]
-    ExplicitCompatibilityFallback,
-    /// Execute experimental implementation matching upstream development.
-    Experimental,
+    Strict,
+    /// Bypass the stage safely in compatibility mode to avoid coordinate mismatch.
+    CompatibilityFallback,
 }
 
 impl VarDctDecodeMemoryStats {
@@ -385,8 +395,6 @@ impl VarDctDecodeMemoryStats {
             resource,
             hf_coefficients,
             deferred_hf,
-            adaptive_lf_signaled,
-            adaptive_lf_disposition,
             adaptive_lf_smoothing,
             restoration_scratch,
             gaborish,
@@ -839,8 +847,6 @@ impl VarDctDecodeMemoryStats {
             output_lease_bytes,
             transient_bytes,
             total_frame_bytes,
-            adaptive_lf_signaled,
-            adaptive_lf_disposition,
         })
     }
 }
@@ -855,8 +861,6 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) resource: VarDctResourceLayout,
     pub(super) hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
     pub(super) deferred_hf: Option<&'a DeferredHfCoefficientLayout>,
-    pub(super) adaptive_lf_signaled: bool,
-    pub(super) adaptive_lf_disposition: AdaptiveLfDisposition,
     pub(super) adaptive_lf_smoothing: bool,
     pub(super) restoration_scratch: bool,
     pub(super) gaborish: bool,

@@ -41,16 +41,16 @@ use crate::wgpu_engine::{
     raw_matrix_value_error,
 };
 use crate::{
-    Error as DecodeError, FrameDuration, FrameMetadata, GpuCodestream, GpuPendingFrame,
-    GpuSubmissionSession, Result as DecodeResult, SubmittedGpuFrame,
+    DecodeDeviation, Error as DecodeError, FrameDuration, FrameMetadata, GpuCodestream,
+    GpuPendingFrame, GpuSubmissionSession, Result as DecodeResult, SubmittedGpuFrame,
 };
 
 use super::pipeline::VarDctPipelines;
 use super::restoration::RestorationCursor;
 use super::source::{VarDctSource, check_limit};
 use super::types::{
-    ARTIFACT_STATUS_BYTES, AdaptiveLfDisposition, PACKET_STATUS_BYTES, VarDctDecodeError,
-    VarDctDecodeMemoryStats,
+    ARTIFACT_STATUS_BYTES, AdaptiveLfDecision, AdaptiveLfDisposition, PACKET_STATUS_BYTES,
+    VarDctDecodeError, VarDctDecodeMemoryStats,
 };
 use super::window_plan::{
     HfPacketWindowExecutionPlan, copy_stream_segment, map_codestream_source_error,
@@ -64,6 +64,7 @@ pub struct VarDctDecodeSession {
     pub(super) runtime_stats: Arc<VarDctRuntimeStats>,
     pub(super) source: Option<VarDctSource>,
     pub(super) memory: MemoryBudget,
+    pub(super) adaptive_lf: AdaptiveLfDecision,
 }
 
 #[derive(Debug)]
@@ -79,19 +80,27 @@ impl VarDctDecodeSession {
     }
 
     #[must_use]
-    pub fn adaptive_lf_signaled(&self) -> bool {
-        self.source.as_ref().map_or(
-            self.memory_stats.adaptive_lf_signaled,
-            VarDctSource::adaptive_lf_signaled,
-        )
+    pub const fn adaptive_lf_decision(&self) -> AdaptiveLfDecision {
+        self.adaptive_lf
     }
 
     #[must_use]
-    pub fn adaptive_lf_disposition(&self) -> AdaptiveLfDisposition {
-        self.source.as_ref().map_or(
-            self.memory_stats.adaptive_lf_disposition,
-            VarDctSource::adaptive_lf_disposition,
-        )
+    pub const fn adaptive_lf_signaled(&self) -> bool {
+        self.adaptive_lf.signaled
+    }
+
+    #[must_use]
+    pub const fn adaptive_lf_disposition(&self) -> AdaptiveLfDisposition {
+        self.adaptive_lf.disposition
+    }
+
+    #[must_use]
+    pub fn deviations(&self) -> Vec<DecodeDeviation> {
+        if self.adaptive_lf.disposition == AdaptiveLfDisposition::BypassedSubsampled {
+            vec![DecodeDeviation::BypassedSubsampledAdaptiveLf]
+        } else {
+            Vec::new()
+        }
     }
 
     #[must_use]
@@ -620,6 +629,7 @@ pub struct VarDctPendingFrame {
     deferred_hf_global: bool,
     progressive_dc_extent: Extent2d,
     progressive_dc_stride: u32,
+    adaptive_lf: AdaptiveLfDecision,
 }
 
 enum VarDctPendingStage {
@@ -1986,6 +1996,12 @@ impl VarDctPendingFrame {
                 self.layout.extent.height,
             )],
         );
+        let deviations =
+            if self.adaptive_lf.disposition == AdaptiveLfDisposition::BypassedSubsampled {
+                vec![DecodeDeviation::BypassedSubsampledAdaptiveLf]
+            } else {
+                Vec::new()
+            };
         Ok(SubmittedGpuFrame::new(
             FrameMetadata {
                 index: 0,
@@ -1995,6 +2011,7 @@ impl VarDctPendingFrame {
                 is_last: true,
                 is_keyframe: true,
                 name: std::mem::take(&mut self.frame_name),
+                deviations,
             },
             GpuImageFrame {
                 token: self.token,
@@ -2897,7 +2914,7 @@ fn submit_vardct(
             )?;
             (Vec::new(), None, Some(uniform))
         } else {
-            let lf_destination = if source.adaptive_lf_smoothing {
+            let lf_destination = if source.adaptive_lf_smoothing() {
                 lf_temporary
                     .as_ref()
                     .ok_or(VarDctDecodeError::EngineContract {
@@ -2928,7 +2945,7 @@ fn submit_vardct(
                 })?
                 .resource_params
                 .smoothing_thresholds();
-            let adaptive_lf_uniform = if source.adaptive_lf_smoothing {
+            let adaptive_lf_uniform = if source.adaptive_lf_smoothing() {
                 Some(pipelines.adaptive_lf.encode(
                     device,
                     &mut commands,
@@ -3568,6 +3585,7 @@ fn submit_vardct(
         deferred_hf_global: staged_hf_global,
         progressive_dc_extent,
         progressive_dc_stride: padded_width,
+        adaptive_lf: source.adaptive_lf,
     };
     if source.packet.pending_raw_hf_dequant_side_image().is_some()
         && packet_stage_commands.is_none()

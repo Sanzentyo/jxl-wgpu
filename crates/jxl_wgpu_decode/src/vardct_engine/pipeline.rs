@@ -24,7 +24,7 @@ use crate::{
 
 use super::execution::{VarDctDecodeSession, VarDctRuntimeStats};
 use super::source::{VarDctPrepareOptions, VarDctSource, prepare_source};
-use super::types::{UnsupportedFeaturePolicy, VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
+use super::types::{SubsampledAdaptiveLfPolicy, VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
 
 pub(super) struct VarDctPipelines {
     pub(super) packet: VarDctPacketPipeline,
@@ -122,7 +122,7 @@ pub struct VarDctSubmissionEngine {
     pipelines: Arc<VarDctPipelines>,
     memory: MemoryBudget,
     stream_window_limit: Option<NonZeroU64>,
-    unsupported_feature_policy: UnsupportedFeaturePolicy,
+    subsampled_adaptive_lf_policy: SubsampledAdaptiveLfPolicy,
 }
 
 impl VarDctSubmissionEngine {
@@ -142,19 +142,22 @@ impl VarDctSubmissionEngine {
             pipelines,
             memory,
             stream_window_limit: None,
-            unsupported_feature_policy: UnsupportedFeaturePolicy::default(),
+            subsampled_adaptive_lf_policy: SubsampledAdaptiveLfPolicy::default(),
         })
     }
 
     #[must_use]
-    pub fn with_unsupported_feature_policy(mut self, policy: UnsupportedFeaturePolicy) -> Self {
-        self.unsupported_feature_policy = policy;
+    pub fn with_subsampled_adaptive_lf_policy(
+        mut self,
+        policy: SubsampledAdaptiveLfPolicy,
+    ) -> Self {
+        self.subsampled_adaptive_lf_policy = policy;
         self
     }
 
     #[must_use]
-    pub const fn unsupported_feature_policy(&self) -> UnsupportedFeaturePolicy {
-        self.unsupported_feature_policy
+    pub const fn subsampled_adaptive_lf_policy(&self) -> SubsampledAdaptiveLfPolicy {
+        self.subsampled_adaptive_lf_policy
     }
 
     /// Caps reusable VarDCT entropy uploads.
@@ -211,7 +214,7 @@ impl VarDctSubmissionEngine {
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
                 progressive_dc_final: None,
-                unsupported_feature_policy: self.unsupported_feature_policy,
+                subsampled_adaptive_lf_policy: self.subsampled_adaptive_lf_policy,
             },
         )?;
         self.open_source(source)
@@ -234,7 +237,7 @@ impl VarDctSubmissionEngine {
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
                 progressive_dc_final: Some(is_final),
-                unsupported_feature_policy: self.unsupported_feature_policy,
+                subsampled_adaptive_lf_policy: self.subsampled_adaptive_lf_policy,
             },
         )?;
         self.open_source(source)
@@ -259,6 +262,7 @@ impl VarDctSubmissionEngine {
                 pipelines: Arc::clone(&self.pipelines),
                 memory_stats: source.memory,
                 runtime_stats,
+                adaptive_lf: source.adaptive_lf,
                 source: Some(source),
                 memory: self.memory.clone(),
             },

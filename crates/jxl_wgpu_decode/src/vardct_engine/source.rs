@@ -28,10 +28,10 @@ use crate::{GpuCodestream, GpuOutputMapping, GpuOutputRequest};
 
 use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
 use super::types::{
-    ADAPTIVE_LF_WORKGROUP_BYTES, AdaptiveLfDisposition, DeferredHfCoefficientLayout,
-    PACKET_STATUS_BYTES, UnsupportedFeaturePolicy, VarDctDecodeError, VarDctDecodeMemoryInputs,
-    VarDctDecodeMemoryStats, vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format,
-    vardct_rgba8_format,
+    ADAPTIVE_LF_WORKGROUP_BYTES, AdaptiveLfDecision, AdaptiveLfDisposition,
+    DeferredHfCoefficientLayout, PACKET_STATUS_BYTES, SubsampledAdaptiveLfPolicy,
+    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_bgr8_format,
+    vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
 };
 use super::window_plan::{
     AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
@@ -58,21 +58,14 @@ pub(super) struct VarDctSource {
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
-    pub(super) adaptive_lf_signaled: bool,
-    pub(super) adaptive_lf_disposition: AdaptiveLfDisposition,
-    pub(super) adaptive_lf_smoothing: bool,
+    pub(super) adaptive_lf: AdaptiveLfDecision,
     pub(super) external_lf: Option<ProgressiveDcXybPlanes>,
 }
 
 impl VarDctSource {
     #[must_use]
-    pub(super) const fn adaptive_lf_signaled(&self) -> bool {
-        self.adaptive_lf_signaled
-    }
-
-    #[must_use]
-    pub(super) const fn adaptive_lf_disposition(&self) -> AdaptiveLfDisposition {
-        self.adaptive_lf_disposition
+    pub(super) const fn adaptive_lf_smoothing(&self) -> bool {
+        self.adaptive_lf.executes()
     }
 
     pub(super) fn staged_lf_submission_count(&self) -> usize {
@@ -133,6 +126,36 @@ impl VarDctSource {
     }
 }
 
+pub(super) fn decide_adaptive_lf(
+    signaled: bool,
+    uses_lf_frame: bool,
+    has_subsampled_channels: bool,
+    policy: SubsampledAdaptiveLfPolicy,
+) -> Result<AdaptiveLfDecision, VarDctDecodeError> {
+    let disposition = if !signaled {
+        AdaptiveLfDisposition::NotSignaled
+    } else if uses_lf_frame {
+        AdaptiveLfDisposition::DisabledByProgressiveDc
+    } else if has_subsampled_channels {
+        match policy {
+            SubsampledAdaptiveLfPolicy::Strict => {
+                return Err(VarDctDecodeError::UnsupportedSubsampledStage {
+                    stage: "adaptive LF smoothing",
+                });
+            }
+            SubsampledAdaptiveLfPolicy::CompatibilityFallback => {
+                AdaptiveLfDisposition::BypassedSubsampled
+            }
+        }
+    } else {
+        AdaptiveLfDisposition::Executed
+    };
+    Ok(AdaptiveLfDecision {
+        signaled,
+        disposition,
+    })
+}
+
 pub(super) struct VarDctGroupSource {
     pub(super) control: VarDctPacketControl,
     pub(super) resource_params: VarDctResourceParams,
@@ -147,7 +170,7 @@ pub(super) struct VarDctPrepareOptions {
     pub(super) stream_window_limit: Option<NonZeroU64>,
     pub(super) memory_limit_bytes: u64,
     pub(super) progressive_dc_final: Option<bool>,
-    pub(super) unsupported_feature_policy: UnsupportedFeaturePolicy,
+    pub(super) subsampled_adaptive_lf_policy: SubsampledAdaptiveLfPolicy,
 }
 
 pub(super) fn prepare_source(
@@ -210,23 +233,12 @@ pub(super) fn prepare_source(
         .channel_shifts
         .into_iter()
         .any(|shift| shift.is_subsampled());
-    let adaptive_lf_signaled = packet.profile.adaptive_lf_smoothing;
-    let (adaptive_lf_smoothing, adaptive_lf_disposition) = if packet.profile.uses_lf_frame {
-        (false, AdaptiveLfDisposition::DisabledByProgressiveDc)
-    } else if !adaptive_lf_signaled {
-        (false, AdaptiveLfDisposition::NotSignaled)
-    } else if has_subsampled_channels {
-        (false, AdaptiveLfDisposition::BypassedSubsampled)
-    } else {
-        (true, AdaptiveLfDisposition::Executed)
-    };
-    if options.unsupported_feature_policy == UnsupportedFeaturePolicy::Strict
-        && adaptive_lf_disposition == AdaptiveLfDisposition::BypassedSubsampled
-    {
-        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-            stage: "adaptive LF smoothing",
-        });
-    }
+    let adaptive_lf = decide_adaptive_lf(
+        packet.profile.adaptive_lf_smoothing,
+        packet.profile.uses_lf_frame,
+        has_subsampled_channels,
+        options.subsampled_adaptive_lf_policy,
+    )?;
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -271,7 +283,7 @@ pub(super) fn prepare_source(
         };
         let [group_blocks_x, group_blocks_y] = packet_group.block_extent();
         let block_origin = [packet_group.rect.x / 8, packet_group.rect.y / 8];
-        let lf_offsets = if adaptive_lf_smoothing {
+        let lf_offsets = if adaptive_lf.executes() {
             [0; 3]
         } else {
             resource_layout.lf_offsets
@@ -499,9 +511,7 @@ pub(super) fn prepare_source(
                 resource: resource_layout,
                 hf_coefficients: hf_coefficients.as_ref(),
                 deferred_hf: deferred_hf_plan,
-                adaptive_lf_signaled,
-                adaptive_lf_disposition,
-                adaptive_lf_smoothing,
+                adaptive_lf_smoothing: adaptive_lf.executes(),
                 restoration_scratch: gaborish.is_some() || epf.is_some(),
                 gaborish: gaborish.is_some(),
                 epf_sigma: epf_sigma_memory,
@@ -580,9 +590,7 @@ pub(super) fn prepare_source(
         quant_biases,
         frame_name,
         memory,
-        adaptive_lf_signaled,
-        adaptive_lf_disposition,
-        adaptive_lf_smoothing,
+        adaptive_lf,
         external_lf: None,
     })
 }
