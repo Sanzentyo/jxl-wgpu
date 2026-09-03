@@ -21,6 +21,9 @@ use jxl_wgpu::{
 use jxl_wgpu_decode::vardct::engine::{
     vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
 };
+use jxl_wgpu_decode::vardct::frontend::{
+    StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError,
+};
 use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
@@ -437,7 +440,7 @@ fn subsampled_jpeg_transcode_with_frame_upsampling_matches_reference_on_gpu() {
 }
 
 #[test]
-fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
+fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negotiation() {
     let Some((info, device, queue)) = device() else {
         return;
     };
@@ -470,28 +473,40 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         "fixture must have exact 4:2:2 subsampling (jpeg_upsampling [0, 2, 0])"
     );
 
-    // 1. Strict policy (default): must reject unstandardized subsampled adaptive LF with typed error
+    // 1. Direct frontend negotiation must reject the feature early before any packet parsing
+    let negotiate_err = StandardVarDctProfile::negotiate(&inventory).unwrap_err();
+    assert_eq!(
+        negotiate_err,
+        VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::SubsampledAdaptiveLf,
+        },
+        "frontend negotiation must reject subsampled adaptive LF"
+    );
+
+    // 2. Public GpuDecoder::open must route the same typed error without submitting GPU work
     let default_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let strict_err = default_decoder.open(
         codestream,
         GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
     );
     let Err(strict_error) = strict_err else {
-        panic!("default Strict policy must reject subsampled adaptive LF, but opened successfully");
+        panic!("subsampled adaptive LF must be rejected, but opened successfully");
     };
     assert!(
         matches!(
             strict_error,
-            DecodeError::VarDct(VarDctDecodeError::UnsupportedSubsampledStage {
-                stage: "adaptive LF smoothing",
-            })
+            DecodeError::VarDct(VarDctDecodeError::Packet(
+                BoundedVarDctPacketError::Frontend(VarDctFrontendError::Unsupported {
+                    feature: UnsupportedVarDctFeature::SubsampledAdaptiveLf,
+                })
+            ))
         ),
-        "strict policy error must be UnsupportedSubsampledStage, got {strict_error:?}"
+        "strict policy error must be SubsampledAdaptiveLf, got {strict_error:?}"
     );
 }
 
 #[test]
-fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_fallback_consistency() {
+fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() {
     let skip_codestream = common::jpeg_transcode_422();
     let adaptive_codestream = common::jpeg_transcode_422_adaptive_lf();
 
@@ -535,7 +550,20 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_fallback_consistency() 
         "adaptive fixture must have FLAG_SKIP_ADAPTIVE_LF_SMOOTHING clear"
     );
 
-    // 2. GPU execution: verify fallback output matches skip fixture output
+    // 2. Direct frontend negotiation: skip succeeds, adaptive fails with typed SubsampledAdaptiveLf
+    let skip_profile = StandardVarDctProfile::negotiate(&skip_inv)
+        .expect("skip fixture must negotiate successfully");
+    assert!(!skip_profile.adaptive_lf_smoothing());
+
+    let adaptive_err = StandardVarDctProfile::negotiate(&adaptive_inv).unwrap_err();
+    assert_eq!(
+        adaptive_err,
+        VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::SubsampledAdaptiveLf,
+        }
+    );
+
+    // 3. GPU validation: skip decodes successfully, adaptive rejects before submission
     let Some((info, device, queue)) = device() else {
         return;
     };
@@ -570,13 +598,13 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_fallback_consistency() 
     assert!(
         matches!(
             adaptive_result,
-            Err(DecodeError::VarDct(
-                VarDctDecodeError::UnsupportedSubsampledStage {
-                    stage: "adaptive LF smoothing",
-                }
-            ))
+            Err(DecodeError::VarDct(VarDctDecodeError::Packet(
+                BoundedVarDctPacketError::Frontend(VarDctFrontendError::Unsupported {
+                    feature: UnsupportedVarDctFeature::SubsampledAdaptiveLf,
+                })
+            )))
         ),
-        "adaptive stream must fail open with UnsupportedSubsampledStage"
+        "adaptive stream must fail open before GPU work is submitted"
     );
 }
 
@@ -1845,7 +1873,7 @@ fn assert_multiple_lf_groups(
     let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
     let extent = Extent2d::new(plan.profile.width, plan.profile.height);
     assert_eq!(extent, Extent2d::new(2056, 256));
-    assert_eq!(plan.profile.adaptive_lf_smoothing, adaptive_lf_smoothing);
+    assert_eq!(plan.profile.adaptive_lf_smoothing(), adaptive_lf_smoothing);
     assert_eq!(plan.profile.low_frequency_group_count, 2);
     assert_eq!(plan.profile.group_count, 9);
     assert_eq!(plan.groups.len(), 2);
