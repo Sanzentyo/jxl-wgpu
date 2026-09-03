@@ -433,7 +433,7 @@ decoders within two RGB8 codes across all three resampling factors.
 
 ## Subsampled Adaptive LF negative conformance
 
-`crates/jxl_wgpu_decode/test-data/jpeg_transcode_422_adaptive_lf.jxl.hex` is a checked-in 64×64
+`crates/jxl_wgpu_decode/test-data/jpeg_transcode_422_adaptive_lf.jxl.hex` is a checked-in 264×64
 JPEG-transcode raw codestream fixture (binary SHA-256: `82a197907d41f9b89149461c9ddd2be71be57ff47fe428dbfaa87ed6063b0e4b`)
 paired with `jpeg_transcode_422.jxl.hex` to establish strict negative conformance coverage.
 It combines 4:2:2 horizontal chroma subsampling (`jpeg_upsampling: [0, 2, 0]`) with signaled

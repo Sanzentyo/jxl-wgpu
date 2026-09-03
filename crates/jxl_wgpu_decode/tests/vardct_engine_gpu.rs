@@ -513,6 +513,16 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
         ),
         "strict policy error must be SubsampledAdaptiveLf, got {strict_error:?}"
     );
+
+    // 3. Verify zero GPU submission and zero GPU memory reservation on early rejection
+    assert_eq!(
+        default_decoder
+            .engine()
+            .in_flight_memory_stats()
+            .reserved_bytes,
+        0,
+        "early frontend rejection must not reserve or leak GPU memory budget"
+    );
 }
 
 #[test]
@@ -600,6 +610,13 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
         .expect("next_frame must succeed")
         .expect("frame must be present");
     assert_eq!(skip_frame.metadata.index, 0);
+    drop(skip_frame);
+    drop(skip_session);
+    assert_eq!(
+        decoder.engine().in_flight_memory_stats().reserved_bytes,
+        0,
+        "completed skip frame must release its reserved memory upon drop"
+    );
 
     let adaptive_result = decoder.open(
         adaptive_codestream,
@@ -615,6 +632,11 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
             )))
         ),
         "adaptive stream must fail open before GPU work is submitted"
+    );
+    assert_eq!(
+        decoder.engine().in_flight_memory_stats().reserved_bytes,
+        0,
+        "failed adaptive open must leave zero in-flight reserved memory"
     );
 }
 

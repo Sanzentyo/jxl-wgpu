@@ -8,6 +8,10 @@ use wgpu::util::DeviceExt;
 use crate::{KernelVariant, ResidentF32Plane};
 
 /// Supported non-identity upsampling factor for image and channel interpolation.
+///
+/// Note: 1× upsampling is identity (no-op) and completely bypasses the frame
+/// upsampling pipeline rather than executing an interpolation kernel. Only non-identity
+/// factors (2×, 4×, 8×) require weight preparation and GPU pipeline dispatches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u32)]
 pub enum UpsamplingFactor {
@@ -192,6 +196,9 @@ impl PreparedUpsamplingWeights {
 }
 
 /// Three same-extent input planes, distinct output planes, and their interpolation kernels.
+///
+/// Dispatches are recorded exclusively for non-identity factors (2×, 4×, 8×).
+/// 1× upsampling is identity and completely bypasses the frame upsampling pipeline.
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentImageUpsampleInputs<'a> {
     pub inputs: [ResidentF32Plane<'a>; 3],
@@ -200,6 +207,9 @@ pub struct ResidentImageUpsampleInputs<'a> {
 }
 
 /// Single input plane, distinct output plane, and interpolation kernels for extra channel upsampling.
+///
+/// Dispatches are recorded exclusively for non-identity factors (2×, 4×, 8×).
+/// 1× upsampling is identity and completely bypasses this pipeline.
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentChannelUpsampleInputs<'a> {
     pub input: ResidentF32Plane<'a>,

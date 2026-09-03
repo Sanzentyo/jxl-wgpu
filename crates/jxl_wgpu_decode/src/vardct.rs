@@ -6,7 +6,8 @@
 //! defines the exact, bytemuck-safe storage ABI used to turn
 //! GPU-reconstructed HF metadata into transform tasks, indirect dispatches, and
 //! a GPU coefficient sink. [`output`] packs resident XYB or JPEG YCbCr component
-//! planes as RGB8 without a CPU pixel path.
+//! planes into canonical packed-u8 pixel formats (RGBA8, BGRA8, RGB8, BGR8) without
+//! a CPU pixel path, strictly rejecting non-canonical color descriptors.
 //!
 //! These modules are low-level building blocks. Applications normally reach
 //! them through the crate's decoder session API; they are public so alternate
@@ -38,7 +39,7 @@ pub mod pass_group {
     pub use crate::vardct_pass_group::*;
 }
 
-/// Resident XYB or JPEG YCbCr-to-RGB8 GPU output packing.
+/// Resident XYB or JPEG YCbCr-to-packed-u8 GPU output packing (RGBA8, BGRA8, RGB8, BGR8).
 pub mod output {
     pub use crate::vardct_output::*;
 }
