@@ -85,7 +85,7 @@ pub enum UnsupportedVarDctFeature {
 
 /// Execution plan for Adaptive LF smoothing resolved during frontend negotiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdaptiveLfPlan {
+pub(crate) enum AdaptiveLfPlan {
     /// Adaptive LF smoothing is skipped (not signaled, or disabled by progressive DC).
     Skip,
     /// Adaptive LF smoothing executes on packed 4:4:4 XYB or YCbCr planes.
@@ -941,37 +941,37 @@ pub enum VarDctSectionLayout {
 /// Validated first-stage VarDCT profile. Construction is the capability check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardVarDctProfile {
-    pub capability: VarDctFrontendCapability,
+    pub(crate) capability: VarDctFrontendCapability,
     /// Encoded color-sample width before frame upsampling.
-    pub width: u32,
+    pub(crate) width: u32,
     /// Encoded color-sample height before frame upsampling.
-    pub height: u32,
+    pub(crate) height: u32,
     /// Final color-frame width after frame upsampling.
-    pub presentation_width: u32,
+    pub(crate) presentation_width: u32,
     /// Final color-frame height after frame upsampling.
-    pub presentation_height: u32,
+    pub(crate) presentation_height: u32,
     /// Frame upsampling factor applied after restoration and before color conversion.
-    pub upsampling: u32,
-    pub bits_per_sample: u32,
-    pub color_transform: VarDctColorTransform,
+    pub(crate) upsampling: u32,
+    pub(crate) bits_per_sample: u32,
+    pub(crate) color_transform: VarDctColorTransform,
     /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
-    pub channel_shifts: [VarDctChannelShift; 3],
+    pub(crate) channel_shifts: [VarDctChannelShift; 3],
     /// Raw JPEG component sampling selectors in Cb/X, Y, Cr/B order.
-    pub jpeg_upsampling: [u32; 3],
+    pub(crate) jpeg_upsampling: [u32; 3],
     /// Axis padding required by the JPEG component sampling factors before channel shifts.
-    pub jpeg_block_alignment: [u32; 2],
-    pub group_dimension: u32,
-    pub group_count: u64,
-    pub low_frequency_group_count: u64,
+    pub(crate) jpeg_block_alignment: [u32; 2],
+    pub(crate) group_dimension: u32,
+    pub(crate) group_count: u64,
+    pub(crate) low_frequency_group_count: u64,
     /// Resolved Adaptive LF smoothing execution plan.
-    pub adaptive_lf: AdaptiveLfPlan,
+    pub(crate) adaptive_lf: AdaptiveLfPlan,
     /// Earlier progressive-DC frame supplies the LF image instead of this frame's LF entropy.
-    pub uses_lf_frame: bool,
+    pub(crate) uses_lf_frame: bool,
     /// Progressive-DC level represented by this frame; zero is the final image level.
-    pub lf_level: u32,
+    pub(crate) lf_level: u32,
     /// Validated UTF-8 frame name preserved in authoritative [`crate::FrameMetadata`].
-    pub frame_name: String,
-    pub sections: VarDctSectionLayout,
+    pub(crate) frame_name: String,
+    pub(crate) sections: VarDctSectionLayout,
 }
 
 /// Pixel-space rectangle owned by one LF or pass group.
@@ -1059,6 +1059,101 @@ impl StandardVarDctProfile {
             frame_name,
             sections,
         })
+    }
+
+    #[must_use]
+    pub const fn capability(&self) -> VarDctFrontendCapability {
+        self.capability
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn presentation_width(&self) -> u32 {
+        self.presentation_width
+    }
+
+    #[must_use]
+    pub const fn presentation_height(&self) -> u32 {
+        self.presentation_height
+    }
+
+    #[must_use]
+    pub const fn upsampling(&self) -> u32 {
+        self.upsampling
+    }
+
+    #[must_use]
+    pub const fn bits_per_sample(&self) -> u32 {
+        self.bits_per_sample
+    }
+
+    #[must_use]
+    pub const fn color_transform(&self) -> VarDctColorTransform {
+        self.color_transform
+    }
+
+    #[must_use]
+    pub const fn channel_shifts(&self) -> [VarDctChannelShift; 3] {
+        self.channel_shifts
+    }
+
+    #[must_use]
+    pub fn is_subsampled(&self) -> bool {
+        self.channel_shifts != [VarDctChannelShift::default(); 3]
+    }
+
+    #[must_use]
+    pub const fn jpeg_upsampling(&self) -> [u32; 3] {
+        self.jpeg_upsampling
+    }
+
+    #[must_use]
+    pub const fn jpeg_block_alignment(&self) -> [u32; 2] {
+        self.jpeg_block_alignment
+    }
+
+    #[must_use]
+    pub const fn group_dimension(&self) -> u32 {
+        self.group_dimension
+    }
+
+    #[must_use]
+    pub const fn group_count(&self) -> u64 {
+        self.group_count
+    }
+
+    #[must_use]
+    pub const fn low_frequency_group_count(&self) -> u64 {
+        self.low_frequency_group_count
+    }
+
+    #[must_use]
+    pub const fn uses_lf_frame(&self) -> bool {
+        self.uses_lf_frame
+    }
+
+    #[must_use]
+    pub const fn lf_level(&self) -> u32 {
+        self.lf_level
+    }
+
+    #[must_use]
+    pub fn frame_name(&self) -> &str {
+        &self.frame_name
+    }
+
+    #[must_use]
+    pub fn sections(&self) -> &VarDctSectionLayout {
+        &self.sections
     }
 
     #[must_use]

@@ -1431,7 +1431,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         let group = &plan.groups[0];
         assert_eq!(group.task_capacity, blocks);
         assert!(plan.hf_global.is_some());
-        assert!(plan.profile.group_count >= 2);
+        assert!(plan.profile.group_count() >= 2);
         let hf_coefficients = plan
             .hf_coefficients
             .as_ref()
@@ -1441,7 +1441,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         assert_eq!(hf_coefficients.block_context_map.len(), 39);
         assert_eq!(
             hf_coefficients.pass_groups.len() as u64,
-            plan.profile.group_count
+            plan.profile.group_count()
         );
         assert!(hf_coefficients.metadata.len() >= 28);
         assert_eq!(hf_coefficients.lz77_window_words, 0);
@@ -1910,7 +1910,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
-    let extent = Extent2d::new(plan.profile.width, plan.profile.height);
+    let extent = Extent2d::new(plan.profile.width(), plan.profile.height());
     assert_eq!(extent, Extent2d::new(257, 257));
     assert_eq!(plan.uniform_transform, None);
     assert_eq!(plan.groups.len(), 1);
@@ -1972,11 +1972,11 @@ fn assert_multiple_lf_groups(
         }
     ));
     let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
-    let extent = Extent2d::new(plan.profile.width, plan.profile.height);
+    let extent = Extent2d::new(plan.profile.width(), plan.profile.height());
     assert_eq!(extent, Extent2d::new(2056, 256));
     assert_eq!(plan.profile.adaptive_lf_smoothing(), adaptive_lf_smoothing);
-    assert_eq!(plan.profile.low_frequency_group_count, 2);
-    assert_eq!(plan.profile.group_count, 9);
+    assert_eq!(plan.profile.low_frequency_group_count(), 2);
+    assert_eq!(plan.profile.group_count(), 9);
     assert_eq!(plan.groups.len(), 2);
     assert_eq!(plan.groups[0].rect.x, 0);
     assert_eq!(plan.groups[0].rect.width, 2048);

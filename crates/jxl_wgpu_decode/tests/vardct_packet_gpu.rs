@@ -214,7 +214,8 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
             expected_strategy: plan.uniform_transform,
             expected_lf_samples: block_count * 3,
             block_count,
-            correlation_samples: plan.profile.width.div_ceil(64) * plan.profile.height.div_ceil(64),
+            correlation_samples: plan.profile.width().div_ceil(64)
+                * plan.profile.height().div_ceil(64),
             task_capacity: group.task_capacity,
             expected_global_scale: plan.global_scale,
             expected_quant_lf: plan.quant_lf,

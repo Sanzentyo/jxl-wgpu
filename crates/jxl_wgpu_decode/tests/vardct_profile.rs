@@ -76,12 +76,12 @@ fn custom_lf_global(
 fn accepts_basic_single_entry_without_host_entropy_decode() {
     let bytes = decode_hex(include_str!("../test-data/basic.jxl.hex"));
     let profile = negotiate(&bytes);
-    assert_eq!((profile.width, profile.height), (1, 1));
-    assert_eq!(profile.group_count, 1);
+    assert_eq!((profile.width(), profile.height()), (1, 1));
+    assert_eq!(profile.group_count(), 1);
     assert!(profile.adaptive_lf_smoothing());
     assert_eq!(profile.lf_quant_stream_index(0).unwrap(), 1);
     assert_eq!(profile.hf_metadata_stream_index(0).unwrap(), 3);
-    let VarDctSectionLayout::Single { packet } = profile.sections else {
+    let VarDctSectionLayout::Single { packet } = *profile.sections() else {
         panic!("basic uses a single-entry TOC")
     };
     let prefix = LfGlobalPrefix::parse(&bytes, packet).unwrap();
@@ -160,8 +160,8 @@ fn accepts_green_queen_physical_group_packets() {
         "../../jxl_gpu_bitstream/test-data/green_queen_vardct_e3.jxl.hex"
     ));
     let profile = negotiate(&bytes);
-    assert_eq!((profile.width, profile.height), (438, 589));
-    assert_eq!(profile.group_count, 6);
+    assert_eq!((profile.width(), profile.height()), (438, 589));
+    assert_eq!(profile.group_count(), 6);
     assert!(profile.adaptive_lf_smoothing());
     assert_eq!(profile.lf_quant_stream_index(0).unwrap(), 1);
     assert_eq!(profile.hf_metadata_stream_index(0).unwrap(), 3);
@@ -188,7 +188,7 @@ fn accepts_green_queen_physical_group_packets() {
         lf_groups,
         hf_global,
         pass_groups,
-    } = profile.sections
+    } = profile.sections().clone()
     else {
         panic!("green queen uses a multi-entry TOC")
     };
@@ -262,8 +262,8 @@ fn permuted_toc_is_normalized_to_logical_pass_group_order() {
     );
 
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    assert_eq!((profile.width, profile.height), (438, 589));
-    let VarDctSectionLayout::Sections { pass_groups, .. } = &profile.sections else {
+    assert_eq!((profile.width(), profile.height()), (438, 589));
+    let VarDctSectionLayout::Sections { pass_groups, .. } = profile.sections() else {
         panic!("center-first fixture must expose independent pass-group sections")
     };
     assert_eq!(pass_groups.len() as u64, frame.group_count);
@@ -309,7 +309,7 @@ fn rejects_packets_and_geometries_outside_gpu_bounds() {
         "../../jxl_gpu_bitstream/test-data/green_queen_vardct_e3.jxl.hex"
     ));
     let profile = negotiate(&green);
-    let VarDctSectionLayout::Sections { lf_groups, .. } = profile.sections else {
+    let VarDctSectionLayout::Sections { lf_groups, .. } = profile.sections() else {
         unreachable!()
     };
     let error = LfGroupPrefix::parse(&green, lf_groups[0], u32::MAX, u32::MAX, 1).unwrap_err();
