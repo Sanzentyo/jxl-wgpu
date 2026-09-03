@@ -849,3 +849,89 @@ pub(super) fn check_limit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decide_adaptive_lf_exhaustively_covers_decision_matrix() {
+        for policy in [
+            SubsampledAdaptiveLfPolicy::Strict,
+            SubsampledAdaptiveLfPolicy::CompatibilityFallback,
+        ] {
+            // Case 1 & 2 & 3: Not signaled -> NotSignaled regardless of LF frame or subsampling
+            for uses_lf_frame in [false, true] {
+                for has_subsampled_channels in [false, true] {
+                    let decision =
+                        decide_adaptive_lf(false, uses_lf_frame, has_subsampled_channels, policy)
+                            .expect("not signaled must always succeed");
+                    assert_eq!(
+                        decision,
+                        AdaptiveLfDecision {
+                            signaled: false,
+                            disposition: AdaptiveLfDisposition::NotSignaled,
+                        }
+                    );
+                    assert!(!decision.executes());
+                }
+            }
+
+            // Case 4: Signaled + Progressive DC LF frame -> DisabledByProgressiveDc
+            for has_subsampled_channels in [false, true] {
+                let decision = decide_adaptive_lf(true, true, has_subsampled_channels, policy)
+                    .expect("progressive DC LF frame must succeed");
+                assert_eq!(
+                    decision,
+                    AdaptiveLfDecision {
+                        signaled: true,
+                        disposition: AdaptiveLfDisposition::DisabledByProgressiveDc,
+                    }
+                );
+                assert!(!decision.executes());
+            }
+
+            // Case 5: Signaled + Ordinary frame + 4:4:4 -> Executed
+            let standard_decision = decide_adaptive_lf(true, false, false, policy)
+                .expect("signaled 4:4:4 frame must always execute");
+            assert_eq!(
+                standard_decision,
+                AdaptiveLfDecision {
+                    signaled: true,
+                    disposition: AdaptiveLfDisposition::Executed,
+                }
+            );
+            assert!(standard_decision.executes());
+        }
+
+        // Case 6: Signaled + Subsampled + Strict -> typed UnsupportedSubsampledStage error
+        let strict_err = decide_adaptive_lf(true, false, true, SubsampledAdaptiveLfPolicy::Strict)
+            .expect_err("strict policy must reject subsampled adaptive LF");
+        assert!(
+            matches!(
+                strict_err,
+                VarDctDecodeError::UnsupportedSubsampledStage {
+                    stage: "adaptive LF smoothing",
+                }
+            ),
+            "expected UnsupportedSubsampledStage, got {strict_err:?}"
+        );
+
+        // Case 7: Signaled + Subsampled + CompatibilityFallback -> BypassedSubsampled
+        let fallback_decision = decide_adaptive_lf(
+            true,
+            false,
+            true,
+            SubsampledAdaptiveLfPolicy::CompatibilityFallback,
+        )
+        .expect("fallback policy must safely bypass subsampled adaptive LF");
+        assert_eq!(
+            fallback_decision,
+            AdaptiveLfDecision {
+                signaled: true,
+                disposition: AdaptiveLfDisposition::BypassedSubsampled,
+            }
+        );
+        assert!(!fallback_decision.executes());
+    }
+}
