@@ -229,7 +229,6 @@ pub struct HfCoefficientEntropyPlan {
 pub(crate) struct PendingHfGlobalParse {
     packet: BitRange,
     group_count: u32,
-    block_context: HfBlockContextIr,
     pass_groups: Vec<BitRange>,
     decoded_symbol_limit: u32,
     trailing_pass_group: bool,
@@ -577,9 +576,10 @@ impl BoundedVarDctPacketPlan {
                         rect.width,
                         rect.height,
                     )?;
+                    let local_config;
                     let (hf_config, hf_token_bit_offset) = if hf_header.modular.use_global_tree {
                         (
-                            global_ma_config.clone().ok_or(
+                            global_ma_config.as_ref().ok_or(
                                 BoundedVarDctPacketError::MissingGlobalMaTree {
                                     stage: "HF metadata",
                                 },
@@ -589,13 +589,15 @@ impl BoundedVarDctPacketPlan {
                     } else {
                         let mut tree_reader =
                             source_reader_at(source, hf_header.modular.tree_or_token_bit_offset)?;
-                        parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
+                        local_config = parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?;
+                        (&local_config.0, local_config.1)
                     };
                     let hf_modular = pack_modular_plan(
-                        &hf_config,
+                        hf_config,
                         block_count.max(blocks_x).max(1),
                         hf_decoded_symbol_limit,
                     )?;
+                    let lz77_window_words = hf_modular.lz77_window_words;
                     let continuation = BoundedHfMetadataContinuation {
                         token_bit_offset: u32::try_from(hf_token_bit_offset).map_err(|_| {
                             BoundedVarDctPacketError::ArithmeticOverflow {
@@ -607,17 +609,18 @@ impl BoundedVarDctPacketPlan {
                     };
                     (
                         hf_token_bit_offset,
-                        hf_modular.clone(),
-                        hf_modular.lz77_window_words,
+                        hf_modular,
+                        lz77_window_words,
                         0,
                         Some(continuation),
                     )
                 } else {
                     let mut lf_reader = source_reader_at(source, lf_group_start)?;
                     let lf_header = parse_lf_group_header_reader(&mut lf_reader, lf_group_end)?;
+                    let local_config;
                     let (lf_config, lf_token_bit_offset) = if lf_header.modular.use_global_tree {
                         (
-                            global_ma_config.clone().ok_or(
+                            global_ma_config.as_ref().ok_or(
                                 BoundedVarDctPacketError::MissingGlobalMaTree {
                                     stage: "LF quantization",
                                 },
@@ -627,10 +630,11 @@ impl BoundedVarDctPacketPlan {
                     } else {
                         let mut tree_reader =
                             source_reader_at(source, lf_header.modular.tree_or_token_bit_offset)?;
-                        parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?
+                        local_config = parse_ma_config_at_reader(&mut tree_reader, lf_group_end)?;
+                        (&local_config.0, local_config.1)
                     };
                     let lf_modular =
-                        pack_modular_plan(&lf_config, blocks_x.max(1), lf_decoded_symbol_limit)?;
+                        pack_modular_plan(lf_config, blocks_x.max(1), lf_decoded_symbol_limit)?;
                     let hf_window_words = if let Some(config) = &global_ma_config {
                         config
                             .entropy
@@ -648,10 +652,11 @@ impl BoundedVarDctPacketPlan {
                             },
                         )?
                     };
+                    let lz77_window_words = lf_modular.lz77_window_words.max(hf_window_words);
                     (
                         lf_token_bit_offset,
-                        lf_modular.clone(),
-                        lf_modular.lz77_window_words.max(hf_window_words),
+                        lf_modular,
+                        lz77_window_words,
                         lf_header.extra_precision,
                         None,
                     )
@@ -868,9 +873,10 @@ impl BoundedVarDctPacketPlan {
             group.rect.width,
             group.rect.height,
         )?;
+        let local_config;
         let (config, token_bit_offset) = if prefix.modular.use_global_tree {
             (
-                self.global_ma_config.clone().ok_or(
+                self.global_ma_config.as_ref().ok_or(
                     BoundedVarDctPacketError::MissingGlobalMaTree {
                         stage: "HF metadata",
                     },
@@ -880,7 +886,8 @@ impl BoundedVarDctPacketPlan {
         } else {
             let mut tree_reader =
                 source_reader_at(source, prefix.modular.tree_or_token_bit_offset)?;
-            parse_ma_config_at_reader(&mut tree_reader, packet_end)?
+            local_config = parse_ma_config_at_reader(&mut tree_reader, packet_end)?;
+            (&local_config.0, local_config.1)
         };
         let correlation_samples = group.correlation_samples()?;
         let block_count = prefix.block_width.checked_mul(prefix.block_height).ok_or(
@@ -912,7 +919,7 @@ impl BoundedVarDctPacketPlan {
                 }
             })?,
             block_count: prefix.block_count,
-            modular: pack_modular_plan(&config, distance_multiplier, decoded_symbol_limit)?,
+            modular: pack_modular_plan(config, distance_multiplier, decoded_symbol_limit)?,
         })
     }
 
@@ -1022,7 +1029,6 @@ impl BoundedVarDctPacketPlan {
                 self.pending_hf_global = Some(PendingHfGlobalParse {
                     packet: pending.packet,
                     group_count: pending.group_count,
-                    block_context: pending.block_context,
                     pass_groups: pending.pass_groups,
                     decoded_symbol_limit: pending.decoded_symbol_limit,
                     trailing_pass_group: pending.trailing_pass_group,
@@ -1041,7 +1047,7 @@ impl BoundedVarDctPacketPlan {
                         packet_end,
                         parse: HfCoefficientParseContext {
                             group_count: pending.group_count,
-                            block_context: &pending.block_context,
+                            block_context: &self.hf_block_context,
                             decoded_symbol_limit: pending.decoded_symbol_limit,
                             bit_depth: self.profile.bits_per_sample(),
                             low_frequency_group_count: self.profile.low_frequency_group_count(),
@@ -1916,7 +1922,6 @@ impl HfCoefficientEntropyPlan {
                     PendingHfGlobalParse {
                         packet,
                         group_count: context.group_count,
-                        block_context: context.block_context.clone(),
                         pass_groups,
                         decoded_symbol_limit: context.decoded_symbol_limit,
                         trailing_pass_group,
