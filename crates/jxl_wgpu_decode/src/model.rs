@@ -251,30 +251,28 @@ pub enum F64OutputPolicy {
     ExactF32Widening,
 }
 
-/// Semantic side of a [`GpuOutputRequest`].
+/// Semantic side of a [`GpuOutputItem`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GpuOutputMapping {
     /// The format's explicit color specification determines conversion and packing.
     Color,
     /// A non-color numeric image uses the supplied, explicit sample mapping.
     Numeric(NumericSampleMapping),
+    /// An extra channel (e.g. alpha, depth, spot color) identified by 0-based index.
+    ExtraChannel {
+        index: u32,
+    },
 }
 
-/// Generic GPU output request. No CPU-readable fallback representation exists.
-///
-/// Construction is deliberately split between [`GpuOutputRequest::color`] and
-/// [`GpuOutputRequest::numeric`]. There is no implicit numeric interpretation and no compatibility
-/// constructor which guesses one from the pixel format.
+/// One targeted output buffer description within a [`GpuOutputRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GpuOutputRequest {
-    format: PixelFormat,
-    mapping: GpuOutputMapping,
-    max_frame_slots: NonZeroUsize,
+pub struct GpuOutputItem {
+    pub format: PixelFormat,
+    pub mapping: GpuOutputMapping,
 }
 
-impl GpuOutputRequest {
-    /// Creates a color-bearing output request after semantic classification or recognition of the
-    /// canonical valid-bit-padded RGB/RGBA lossless-Modular descriptor.
+impl GpuOutputItem {
+    /// Creates a color-bearing output target.
     pub fn color(format: PixelFormat) -> Result<Self> {
         if native_modular_format(&format).is_some_and(|native| {
             matches!(
@@ -282,25 +280,33 @@ impl GpuOutputRequest {
                 ModularChannels::Rgb | ModularChannels::Rgba
             )
         }) {
-            return Ok(Self::from_parts(format, GpuOutputMapping::Color));
+            return Ok(Self {
+                format,
+                mapping: GpuOutputMapping::Color,
+            });
         }
         match classify_pixel_format(&format)
             .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
         {
-            PixelFormatClass::Color(_) => Ok(Self::from_parts(format, GpuOutputMapping::Color)),
+            PixelFormatClass::Color(_) => Ok(Self {
+                format,
+                mapping: GpuOutputMapping::Color,
+            }),
             PixelFormatClass::Numeric(_) => Err(Error::NumericMappingRequired),
         }
     }
 
-    /// Creates a non-color output request with an explicit sample mapping. `NativeUnsigned`
-    /// recognizes the canonical valid-bit-padded Gray lossless-Modular descriptor directly.
+    /// Creates a numeric sample output target.
     pub fn numeric(format: PixelFormat, mapping: NumericSampleMapping) -> Result<Self> {
         if mapping == NumericSampleMapping::NativeUnsigned {
             return match native_modular_format(&format) {
                 Some(NativeModularFormat {
                     channels: ModularChannels::Gray,
                     ..
-                }) => Ok(Self::from_parts(format, GpuOutputMapping::Numeric(mapping))),
+                }) => Ok(Self {
+                    format,
+                    mapping: GpuOutputMapping::Numeric(mapping),
+                }),
                 Some(_) => Err(Error::NumericMappingForColorOutput),
                 None => Err(Error::UnsupportedOutputFormat(
                     "native lossless-Modular output requires the canonical unsigned Gray descriptor"
@@ -326,28 +332,104 @@ impl GpuOutputRequest {
                     }
                     _ => {}
                 }
-                Ok(Self::from_parts(format, GpuOutputMapping::Numeric(mapping)))
+                Ok(Self {
+                    format,
+                    mapping: GpuOutputMapping::Numeric(mapping),
+                })
             }
             PixelFormatClass::Color(_) => Err(Error::NumericMappingForColorOutput),
         }
     }
 
-    fn from_parts(format: PixelFormat, mapping: GpuOutputMapping) -> Self {
-        Self {
+    /// Creates an extra channel output target.
+    pub fn extra_channel(format: PixelFormat, index: u32) -> Result<Self> {
+        Ok(Self {
             format,
-            mapping,
+            mapping: GpuOutputMapping::ExtraChannel { index },
+        })
+    }
+}
+
+/// Generic GPU output request supporting one or more simultaneous outputs.
+///
+/// Supports color planes, numeric images, and extra channels simultaneously.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuOutputRequest {
+    outputs: Vec<GpuOutputItem>,
+    max_frame_slots: NonZeroUsize,
+}
+
+impl GpuOutputRequest {
+    /// Creates a single color output request.
+    pub fn color(format: PixelFormat) -> Result<Self> {
+        let item = GpuOutputItem::color(format)?;
+        Ok(Self::from_items(vec![item]))
+    }
+
+    /// Creates a single numeric output request.
+    pub fn numeric(format: PixelFormat, mapping: NumericSampleMapping) -> Result<Self> {
+        let item = GpuOutputItem::numeric(format, mapping)?;
+        Ok(Self::from_items(vec![item]))
+    }
+
+    /// Creates a single extra channel output request.
+    pub fn extra_channel(format: PixelFormat, index: u32) -> Result<Self> {
+        let item = GpuOutputItem::extra_channel(format, index)?;
+        Ok(Self::from_items(vec![item]))
+    }
+
+    /// Creates a request with multiple output targets.
+    pub fn multi(outputs: Vec<GpuOutputItem>) -> Result<Self> {
+        if outputs.is_empty() {
+            return Err(Error::UnsupportedOutputFormat(
+                "at least one output target is required".into(),
+            ));
+        }
+        Ok(Self::from_items(outputs))
+    }
+
+    fn from_items(outputs: Vec<GpuOutputItem>) -> Self {
+        Self {
+            outputs,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
         }
     }
 
+    /// Appends an additional output target to this request.
     #[must_use]
-    pub const fn format(&self) -> &PixelFormat {
-        &self.format
+    pub fn with_output(mut self, item: GpuOutputItem) -> Self {
+        self.outputs.push(item);
+        self
     }
 
+    /// All configured output targets.
     #[must_use]
-    pub const fn mapping(&self) -> GpuOutputMapping {
-        self.mapping
+    pub fn outputs(&self) -> &[GpuOutputItem] {
+        &self.outputs
+    }
+
+    /// The primary (first) output target.
+    #[must_use]
+    pub fn primary_output(&self) -> &GpuOutputItem {
+        &self.outputs[0]
+    }
+
+    /// Canonical format of the primary output (for backwards compatibility).
+    #[must_use]
+    pub fn format(&self) -> &PixelFormat {
+        &self.outputs[0].format
+    }
+
+    /// Mapping of the primary output (for backwards compatibility).
+    #[must_use]
+    pub fn mapping(&self) -> GpuOutputMapping {
+        self.outputs[0].mapping
+    }
+
+    /// Number of output targets in this request.
+    #[must_use]
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
     }
 
     /// Maximum number of slots jointly occupied by queued submissions and caller-held frame
@@ -501,4 +583,85 @@ pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModula
         bits_per_sample: bits_per_sample?,
         storage_bits: storage_bits?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jxl_gpu_formats::{
+        ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, RgbChannelOrder,
+        TransferFunction, YcbcrEncoding,
+    };
+
+    fn test_rgb8() -> PixelFormat {
+        PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        )
+    }
+
+    fn test_gray8() -> PixelFormat {
+        PixelFormat::non_color(
+            jxl_gpu_formats::SampleKind::Unsigned,
+            8,
+            &[jxl_gpu_formats::Channel::X],
+        )
+    }
+
+    #[test]
+    fn single_output_request_backwards_compatible() {
+        let rgb = test_rgb8();
+        let req = GpuOutputRequest::color(rgb.clone()).expect("color request");
+        assert_eq!(req.output_count(), 1);
+        assert_eq!(req.format(), &rgb);
+        assert_eq!(req.mapping(), GpuOutputMapping::Color);
+        assert_eq!(req.primary_output().format, rgb);
+        assert_eq!(req.primary_output().mapping, GpuOutputMapping::Color);
+
+        let gray = test_gray8();
+        let num_req = GpuOutputRequest::numeric(gray.clone(), NumericSampleMapping::NormalizedGray8)
+            .expect("numeric request");
+        assert_eq!(num_req.output_count(), 1);
+        assert_eq!(num_req.format(), &gray);
+        assert_eq!(
+            num_req.mapping(),
+            GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedGray8)
+        );
+    }
+
+    #[test]
+    fn multi_output_request_construction_and_access() {
+        let rgb = test_rgb8();
+        let gray = test_gray8();
+
+        let item0 = GpuOutputItem::color(rgb.clone()).expect("color item");
+        let item1 = GpuOutputItem::extra_channel(gray.clone(), 0).expect("extra channel item");
+
+        let multi = GpuOutputRequest::multi(vec![item0.clone(), item1.clone()]).expect("multi request");
+        assert_eq!(multi.output_count(), 2);
+        assert_eq!(multi.primary_output(), &item0);
+        assert_eq!(multi.format(), &rgb);
+        assert_eq!(multi.mapping(), GpuOutputMapping::Color);
+        assert_eq!(&multi.outputs()[0], &item0);
+        assert_eq!(&multi.outputs()[1], &item1);
+
+        // Test with_output chaining
+        let item2 = GpuOutputItem::extra_channel(gray.clone(), 1).expect("second extra channel");
+        let chained = multi.with_output(item2.clone());
+        assert_eq!(chained.output_count(), 3);
+        assert_eq!(&chained.outputs()[2], &item2);
+    }
+
+    #[test]
+    fn multi_output_request_rejects_empty() {
+        let empty_result = GpuOutputRequest::multi(Vec::new());
+        assert!(empty_result.is_err());
+    }
 }

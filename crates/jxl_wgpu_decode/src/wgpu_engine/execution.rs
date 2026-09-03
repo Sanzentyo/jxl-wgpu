@@ -1156,6 +1156,11 @@ impl OutputPlan {
                     None,
                 )
             }
+            (_, GpuOutputMapping::ExtraChannel { index }) => {
+                return Err(Error::UnsupportedOutputFormat(format!(
+                    "extra channel {index} output mapping is not supported by this engine"
+                )));
+            }
         };
         let output = Self {
             layout: ImageLayout::packed(extent, format)?,
