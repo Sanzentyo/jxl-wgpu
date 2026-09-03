@@ -184,8 +184,8 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
-reference, preview, animation, spectral progressive pass, or other frame feature. Frame upsampling
-and single-plane channel upsampling primitives support 1×, 2×, 4×, and 8× resampling factors, applying phase-major 5×5 interpolation across
+reference, preview, animation, spectral progressive pass, or other frame feature. Planning supports
+identity/no-op and 2×/4×/8× resampling. GPU interpolation kernels execute only 2×, 4×, and 8× factors, applying phase-major 5×5 interpolation across
 GPU-resident F32 planes with fused three-plane (`upsample_rgb.wgsl`) or single-channel (`upsample.wgsl`)
 kernels before color conversion within the shared frame budget (E2E Extra Channel pipeline decode/scheduler/alpha connection remains in progress).
 Subsampled YCbCr strictly rejects unimplemented subsampled adaptive LF smoothing during frontend negotiation with `UnsupportedVarDctFeature::SubsampledAdaptiveLf` before GPU command submission or packet execution.

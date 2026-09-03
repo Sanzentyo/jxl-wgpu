@@ -425,7 +425,7 @@ for all three channels directly in the resident resource vectors.
 
 ## Frame upsampling conformance
 
-`vardct_engine_gpu::frame_upsampling_factors_match_reference_on_gpu` exercises 2×, 4×, and 8× frame
+Planning supports identity/no-op and 2×/4×/8× resampling. GPU interpolation kernels execute only 2×, 4×, and 8× factors. `vardct_engine_gpu::frame_upsampling_factors_match_reference_on_gpu` exercises 2×, 4×, and 8× frame
 upsampling on an actual GPU adapter using `cjxl`-generated test codestreams. The test verifies that
 `memory.frame_upsample_image_bytes` and `memory.frame_upsample_weight_bytes` are accounted for in the
 shared frame memory budget, and that decoded RGB8 outputs match Rust `jxl` and `djxl` reference
