@@ -10,8 +10,8 @@ use jxl_gpu_protocol::{
 };
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
-    MemoryPermit, ResidentChromaShift, ResidentChromaUpsampleInputs, ResidentEpfInputs,
-    ResidentF32Plane, ResidentGaborishInputs, ResidentImageUpsampleInputs,
+    MemoryPermit, PreparedUpsamplingWeights, ResidentChromaShift, ResidentChromaUpsampleInputs,
+    ResidentEpfInputs, ResidentF32Plane, ResidentGaborishInputs, ResidentImageUpsampleInputs,
     ResidentImageUpsampleResources, ResidentStorageBinding, ResidentVarDctInputs,
     ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
     UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
@@ -561,6 +561,7 @@ struct VarDctJobLifetime {
     _component_upsample_uniforms: Vec<wgpu::Buffer>,
     _restoration: Option<RestorationJobBuffers>,
     _frame_upsample_planes: Option<[wgpu::Buffer; 3]>,
+    _frame_upsample_weights: Option<PreparedUpsamplingWeights>,
     _frame_upsample_resources: Option<ResidentImageUpsampleResources>,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: VarDctOutputScratch,
@@ -3255,11 +3256,12 @@ fn submit_vardct(
     let restored_planes = restoration
         .as_ref()
         .map_or(restoration_source, RestorationCursor::current);
-    let (presentation_planes, frame_upsample_resources) =
+    let (presentation_planes, frame_upsample_weights, frame_upsample_resources) =
         if let (Some(weights), Some(output_buffers)) = (
             source.frame_upsampling.as_ref(),
             frame_upsample_planes.as_ref(),
         ) {
+            let prepared = weights.prepare(device)?;
             let presentation_width = source.packet.profile.presentation_width;
             let presentation_height = source.packet.profile.presentation_height;
             let inputs =
@@ -3290,12 +3292,13 @@ fn submit_vardct(
                 ResidentImageUpsampleInputs {
                     inputs,
                     outputs,
-                    weights,
+                    factor: weights.factor(),
+                    weights: prepared.buffer(),
                 },
             )?;
-            (output_buffers, Some(resources))
+            (output_buffers, Some(prepared), Some(resources))
         } else {
-            (restored_planes, None)
+            (restored_planes, None, None)
         };
     let components_are_full_resolution = source.frame_upsampling.is_some()
         || restoration.is_some()
@@ -3475,6 +3478,7 @@ fn submit_vardct(
         _component_upsample_uniforms: component_upsample_uniforms,
         _restoration: restoration_buffers,
         _frame_upsample_planes: frame_upsample_planes,
+        _frame_upsample_weights: frame_upsample_weights,
         _frame_upsample_resources: frame_upsample_resources,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,

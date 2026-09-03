@@ -8,7 +8,8 @@ use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     KernelVariant, ResidentChromaUpsampleMemoryPlan, ResidentEpfMemoryPlan,
-    ResidentGaborishWeights, ResidentImageUpsampleWeights, ResidentVarDctMemoryPlan, WgpuBackend,
+    ResidentGaborishWeights, ResidentImageUpsampleWeights, ResidentVarDctMemoryPlan,
+    UpsamplingFactor, WgpuBackend,
 };
 
 use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
@@ -319,33 +320,33 @@ pub(super) fn prepare_source(
     let frame_upsampling = match packet.profile.upsampling {
         1 => None,
         factor => {
+            let factor = UpsamplingFactor::try_from_u32(factor).map_err(|_| {
+                VarDctDecodeError::EngineContract {
+                    detail: "parsed frame upsampling factor is not 1, 2, 4, or 8",
+                }
+            })?;
             let compact = match factor {
-                2 => inventory
+                UpsamplingFactor::X2 => inventory
                     .image_header
                     .upsampling_weights
                     .up2
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-                4 => inventory
+                UpsamplingFactor::X4 => inventory
                     .image_header
                     .upsampling_weights
                     .up4
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-                8 => inventory
+                UpsamplingFactor::X8 => inventory
                     .image_header
                     .upsampling_weights
                     .up8
                     .iter()
                     .map(|value| value.to_f32())
                     .collect::<Vec<_>>(),
-                _ => {
-                    return Err(VarDctDecodeError::EngineContract {
-                        detail: "parsed frame upsampling factor is not 1, 2, 4, or 8",
-                    });
-                }
             };
             Some(ResidentImageUpsampleWeights::new(factor, &compact)?)
         }

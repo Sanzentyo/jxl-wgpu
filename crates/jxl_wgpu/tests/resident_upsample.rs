@@ -5,7 +5,8 @@ use std::sync::mpsc;
 use jxl_wgpu::{
     DirectReadbackPolicy, ResidentChannelUpsampleInputs, ResidentChannelUpsamplePipeline,
     ResidentF32Plane, ResidentImageUpsampleInputs, ResidentImageUpsamplePipeline,
-    ResidentImageUpsampleWeights, ResidentStorageBinding, WgpuBackend, WgpuBackendConfig,
+    ResidentImageUpsampleWeights, ResidentStorageBinding, UpsamplingFactor, WgpuBackend,
+    WgpuBackendConfig,
 };
 use wgpu::util::DeviceExt;
 
@@ -94,7 +95,9 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
         let mut compact: Vec<f32> = (0..compact_count).map(|i| 1.0 / ((i + 1) as f32)).collect();
         compact[0] = 1.0;
 
-        let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
+        let up_factor = UpsamplingFactor::try_from_u32(factor).unwrap();
+        let weights = ResidentImageUpsampleWeights::new(up_factor, &compact).unwrap();
+        let prepared_weights = weights.prepare(device).unwrap();
 
         // Create GPU buffers
         let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -196,7 +199,8 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
                 ResidentChannelUpsampleInputs {
                     input: channel_input_plane,
                     output: channel_output_plane,
-                    weights: &weights,
+                    factor: up_factor,
+                    weights: prepared_weights.buffer(),
                 },
             )
             .unwrap();
@@ -213,7 +217,8 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
                         channel_input_plane,
                     ],
                     outputs: image_output_planes,
-                    weights: &weights,
+                    factor: up_factor,
+                    weights: prepared_weights.buffer(),
                 },
             )
             .unwrap();
@@ -248,7 +253,8 @@ fn resident_upsample_rejects_aliased_buffers() {
     let channel_pipeline = ResidentChannelUpsamplePipeline::new(device).unwrap();
     let image_pipeline = ResidentImageUpsamplePipeline::new(device).unwrap();
 
-    let weights = ResidentImageUpsampleWeights::new(2, &[1.0; 15]).unwrap();
+    let weights = ResidentImageUpsampleWeights::new(UpsamplingFactor::X2, &[1.0; 15]).unwrap();
+    let prepared = weights.prepare(device).unwrap();
 
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shared test buffer"),
@@ -303,7 +309,8 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentChannelUpsampleInputs {
             input: plane_in,
             output: plane_out_alias,
-            weights: &weights,
+            factor: UpsamplingFactor::X2,
+            weights: prepared.buffer(),
         },
     );
     assert!(matches!(
@@ -318,7 +325,8 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentImageUpsampleInputs {
             inputs: [plane_in, plane_in, plane_in],
             outputs: [plane_out_alias, plane_out_alias, plane_out_other],
-            weights: &weights,
+            factor: UpsamplingFactor::X2,
+            weights: prepared.buffer(),
         },
     );
     assert!(matches!(
@@ -333,7 +341,8 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentImageUpsampleInputs {
             inputs: [plane_in, plane_in, plane_in],
             outputs: [plane_out_alias, plane_out_other, plane_out_other],
-            weights: &weights,
+            factor: UpsamplingFactor::X2,
+            weights: prepared.buffer(),
         },
     );
     assert!(matches!(
@@ -372,7 +381,9 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
             _ => unreachable!(),
         };
         let compact: Vec<f32> = (0..compact_count).map(|i| 1.0 / ((i + 1) as f32)).collect();
-        let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
+        let up_factor = UpsamplingFactor::try_from_u32(factor).unwrap();
+        let weights = ResidentImageUpsampleWeights::new(up_factor, &compact).unwrap();
+        let prepared = weights.prepare(device).unwrap();
 
         let in_stride = in_w + 3;
         let out_stride = out_w + 5;
@@ -472,7 +483,8 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
                 ResidentChannelUpsampleInputs {
                     input: plane_in,
                     output: plane_out_chan,
-                    weights: &weights,
+                    factor: up_factor,
+                    weights: prepared.buffer(),
                 },
             )
             .unwrap();
@@ -483,7 +495,8 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
                 ResidentImageUpsampleInputs {
                     inputs: [plane_in, plane_in, plane_in],
                     outputs: [plane_out_img0, plane_out_img1, plane_out_img2],
-                    weights: &weights,
+                    factor: up_factor,
+                    weights: prepared.buffer(),
                 },
             )
             .unwrap();

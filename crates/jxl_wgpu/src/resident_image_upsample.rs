@@ -7,17 +7,46 @@ use wgpu::util::DeviceExt;
 
 use crate::{KernelVariant, ResidentF32Plane};
 
+/// Supported non-identity upsampling factor for image and channel interpolation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum UpsamplingFactor {
+    X2 = 2,
+    X4 = 4,
+    X8 = 8,
+}
+
+impl UpsamplingFactor {
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn try_from_u32(factor: u32) -> Result<Self, ResidentImageUpsampleError> {
+        match factor {
+            2 => Ok(Self::X2),
+            4 => Ok(Self::X4),
+            8 => Ok(Self::X8),
+            _ => Err(ResidentImageUpsampleError::InvalidFactor { factor }),
+        }
+    }
+}
+
 /// Expanded phase-major JPEG XL interpolation kernels shared by all three planes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResidentImageUpsampleWeights {
-    factor: u32,
+    factor: UpsamplingFactor,
     phase_major: Arc<[f32]>,
 }
 
 impl ResidentImageUpsampleWeights {
     /// Expands the serialized symmetric triangle into `factor²` row-major 5x5 kernels.
-    pub fn new(factor: u32, compact: &[f32]) -> Result<Self, ResidentImageUpsampleError> {
-        let half = validated_factor(factor)? / 2;
+    pub fn new(
+        factor: UpsamplingFactor,
+        compact: &[f32],
+    ) -> Result<Self, ResidentImageUpsampleError> {
+        let factor_u32 = factor.as_u32();
+        let half = factor_u32 / 2;
         let triangle_side = usize::try_from(half * 5).map_err(|_| {
             ResidentImageUpsampleError::ArithmeticOverflow {
                 field: "upsampling weight triangle side",
@@ -31,7 +60,7 @@ impl ResidentImageUpsampleWeights {
             })?;
         if compact.len() != expected {
             return Err(ResidentImageUpsampleError::WeightCount {
-                factor,
+                factor: factor_u32,
                 actual: compact.len(),
                 expected,
             });
@@ -39,15 +68,15 @@ impl ResidentImageUpsampleWeights {
         if let Some(index) = compact.iter().position(|value| !value.is_finite()) {
             return Err(ResidentImageUpsampleError::NonFiniteWeight { index });
         }
-        let phase_count = usize::try_from(factor)
+        let phase_count = usize::try_from(factor_u32)
             .ok()
-            .and_then(|factor| factor.checked_mul(factor))
+            .and_then(|f| f.checked_mul(f))
             .ok_or(ResidentImageUpsampleError::ArithmeticOverflow {
                 field: "upsampling phase count",
             })?;
         let mut phase_major = vec![0.0; phase_count * 25];
         let half_usize = half as usize;
-        let factor_usize = factor as usize;
+        let factor_usize = factor_u32 as usize;
         for phase_y in 0..half_usize {
             for phase_x in 0..half_usize {
                 let destinations = [
@@ -88,14 +117,67 @@ impl ResidentImageUpsampleWeights {
         })
     }
 
+    pub fn new_with_u32(factor: u32, compact: &[f32]) -> Result<Self, ResidentImageUpsampleError> {
+        Self::new(UpsamplingFactor::try_from_u32(factor)?, compact)
+    }
+
     #[must_use]
-    pub const fn factor(&self) -> u32 {
+    pub const fn factor(&self) -> UpsamplingFactor {
         self.factor
+    }
+
+    #[must_use]
+    pub const fn factor_u32(&self) -> u32 {
+        self.factor.as_u32()
     }
 
     #[must_use]
     pub fn storage_bytes(&self) -> u64 {
         self.phase_major.len() as u64 * std::mem::size_of::<f32>() as u64
+    }
+
+    /// Prepares the weights GPU buffer once for shared reuse across dispatches.
+    pub fn prepare(
+        &self,
+        device: &wgpu::Device,
+    ) -> Result<PreparedUpsamplingWeights, ResidentImageUpsampleError> {
+        let storage_bytes = self.storage_bytes();
+        let maximum_binding = device.limits().max_storage_buffer_binding_size;
+        if storage_bytes > maximum_binding {
+            return Err(ResidentImageUpsampleError::StorageBindingLimit {
+                role: "weight",
+                required: storage_bytes,
+                available: maximum_binding,
+            });
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("jxl-wgpu resident upsample weights"),
+            contents: bytemuck::cast_slice(&self.phase_major),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        Ok(PreparedUpsamplingWeights {
+            factor: self.factor,
+            buffer,
+        })
+    }
+}
+
+/// GPU-resident upsampling weights buffer prepared once per frame or channel upsample.
+#[derive(Debug)]
+pub struct PreparedUpsamplingWeights {
+    factor: UpsamplingFactor,
+    buffer: wgpu::Buffer,
+}
+
+impl PreparedUpsamplingWeights {
+    #[must_use]
+    pub const fn factor(&self) -> UpsamplingFactor {
+        self.factor
+    }
+
+    #[must_use]
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
     }
 }
 
@@ -104,7 +186,8 @@ impl ResidentImageUpsampleWeights {
 pub struct ResidentImageUpsampleInputs<'a> {
     pub inputs: [ResidentF32Plane<'a>; 3],
     pub outputs: [ResidentF32Plane<'a>; 3],
-    pub weights: &'a ResidentImageUpsampleWeights,
+    pub factor: UpsamplingFactor,
+    pub weights: &'a wgpu::Buffer,
 }
 
 /// Single input plane, distinct output plane, and interpolation kernels for extra channel upsampling.
@@ -112,18 +195,17 @@ pub struct ResidentImageUpsampleInputs<'a> {
 pub struct ResidentChannelUpsampleInputs<'a> {
     pub input: ResidentF32Plane<'a>,
     pub output: ResidentF32Plane<'a>,
-    pub weights: &'a ResidentImageUpsampleWeights,
+    pub factor: UpsamplingFactor,
+    pub weights: &'a wgpu::Buffer,
 }
 
-/// Buffers created while recording one fused three-plane dispatch.
+/// Transient parameters buffer created while recording one fused three-plane dispatch.
 pub struct ResidentImageUpsampleResources {
-    _weights: wgpu::Buffer,
     _uniform: wgpu::Buffer,
 }
 
-/// Buffers created while recording one single-plane channel dispatch.
+/// Transient parameters buffer created while recording one single-plane channel dispatch.
 pub struct ResidentChannelUpsampleResources {
-    _weights: wgpu::Buffer,
     _uniform: wgpu::Buffer,
 }
 
@@ -325,20 +407,6 @@ impl ResidentImageUpsamplePipeline {
         inputs: ResidentImageUpsampleInputs<'_>,
     ) -> Result<ResidentImageUpsampleResources, ResidentImageUpsampleError> {
         let params = validate_inputs(device, inputs)?;
-        let plan = ResidentImageUpsampleMemoryPlan::new(inputs.weights)?;
-        let maximum_binding = device.limits().max_storage_buffer_binding_size;
-        if plan.weight_bytes > maximum_binding {
-            return Err(ResidentImageUpsampleError::StorageBindingLimit {
-                role: "weight",
-                required: plan.weight_bytes,
-                available: maximum_binding,
-            });
-        }
-        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu resident image upsample weights"),
-            contents: bytemuck::cast_slice(&inputs.weights.phase_major),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu resident image upsample params"),
             contents: bytemuck::bytes_of(&params),
@@ -353,7 +421,7 @@ impl ResidentImageUpsamplePipeline {
                 storage_entry(2, inputs.inputs[2]),
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: weights.as_entire_binding(),
+                    resource: inputs.weights.as_entire_binding(),
                 },
                 storage_entry(4, inputs.outputs[0]),
                 storage_entry(5, inputs.outputs[1]),
@@ -385,10 +453,7 @@ impl ResidentImageUpsamplePipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         drop(pass);
-        Ok(ResidentImageUpsampleResources {
-            _weights: weights,
-            _uniform: uniform,
-        })
+        Ok(ResidentImageUpsampleResources { _uniform: uniform })
     }
 }
 
@@ -446,20 +511,6 @@ impl ResidentChannelUpsamplePipeline {
         inputs: ResidentChannelUpsampleInputs<'_>,
     ) -> Result<ResidentChannelUpsampleResources, ResidentImageUpsampleError> {
         let params = validate_channel_inputs(device, inputs)?;
-        let plan = ResidentChannelUpsampleMemoryPlan::new(inputs.weights)?;
-        let maximum_binding = device.limits().max_storage_buffer_binding_size;
-        if plan.weight_bytes > maximum_binding {
-            return Err(ResidentImageUpsampleError::StorageBindingLimit {
-                role: "weight",
-                required: plan.weight_bytes,
-                available: maximum_binding,
-            });
-        }
-        let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu resident channel upsample weights"),
-            contents: bytemuck::cast_slice(&inputs.weights.phase_major),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu resident channel upsample params"),
             contents: bytemuck::bytes_of(&params),
@@ -472,7 +523,7 @@ impl ResidentChannelUpsamplePipeline {
                 storage_entry(0, inputs.input),
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: weights.as_entire_binding(),
+                    resource: inputs.weights.as_entire_binding(),
                 },
                 storage_entry(2, inputs.output),
                 wgpu::BindGroupEntry {
@@ -502,10 +553,7 @@ impl ResidentChannelUpsamplePipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         drop(pass);
-        Ok(ResidentChannelUpsampleResources {
-            _weights: weights,
-            _uniform: uniform,
-        })
+        Ok(ResidentChannelUpsampleResources { _uniform: uniform })
     }
 }
 
@@ -526,19 +574,11 @@ struct ResidentImageUpsampleParams {
     _padding: u32,
 }
 
-fn validated_factor(factor: u32) -> Result<u32, ResidentImageUpsampleError> {
-    if matches!(factor, 2 | 4 | 8) {
-        Ok(factor)
-    } else {
-        Err(ResidentImageUpsampleError::InvalidFactor { factor })
-    }
-}
-
 fn validate_inputs(
     device: &wgpu::Device,
     inputs: ResidentImageUpsampleInputs<'_>,
 ) -> Result<ResidentImageUpsampleParams, ResidentImageUpsampleError> {
-    let factor = validated_factor(inputs.weights.factor)?;
+    let factor = inputs.factor.as_u32();
     let input = inputs.inputs[0];
     let output = inputs.outputs[0];
     for (plane, candidate) in inputs.inputs.into_iter().chain(inputs.outputs).enumerate() {
@@ -628,7 +668,7 @@ fn validate_channel_inputs(
     device: &wgpu::Device,
     inputs: ResidentChannelUpsampleInputs<'_>,
 ) -> Result<ResidentChannelUpsampleParams, ResidentImageUpsampleError> {
-    let factor = validated_factor(inputs.weights.factor)?;
+    let factor = inputs.factor.as_u32();
     validate_plane(device, 0, inputs.input)?;
     validate_plane(device, 1, inputs.output)?;
     if inputs.output.width.div_ceil(factor) != inputs.input.width
@@ -769,7 +809,7 @@ mod tests {
             let compact = (0..compact_len)
                 .map(|value| (value + 1) as f32 * 1.5)
                 .collect::<Vec<_>>();
-            let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
+            let weights = ResidentImageUpsampleWeights::new_with_u32(factor, &compact).unwrap();
             assert_eq!(
                 weights.phase_major.len(),
                 factor as usize * factor as usize * 25
@@ -835,7 +875,7 @@ mod tests {
     #[test]
     fn memory_plans_account_exact_uniform_sizes() {
         let compact = vec![1.0; 15];
-        let weights = ResidentImageUpsampleWeights::new(2, &compact).unwrap();
+        let weights = ResidentImageUpsampleWeights::new_with_u32(2, &compact).unwrap();
         let image_plan = ResidentImageUpsampleMemoryPlan::new(&weights).unwrap();
         let channel_plan = ResidentChannelUpsampleMemoryPlan::new(&weights).unwrap();
 
