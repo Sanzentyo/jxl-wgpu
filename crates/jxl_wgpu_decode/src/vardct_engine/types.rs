@@ -60,8 +60,6 @@ pub enum VarDctDecodeError {
     InvalidQuantMatrixScale { channel: &'static str, scale: u32 },
     #[error("the XYB image header does not contain an inverse opsin matrix")]
     MissingInverseOpsin,
-    #[error("subsampled VarDCT cannot yet execute the {stage} stage before JPEG upsampling")]
-    UnsupportedSubsampledStage { stage: &'static str },
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
     #[error(transparent)]

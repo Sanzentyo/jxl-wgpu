@@ -78,7 +78,7 @@ fn accepts_basic_single_entry_without_host_entropy_decode() {
     let profile = negotiate(&bytes);
     assert_eq!((profile.width, profile.height), (1, 1));
     assert_eq!(profile.group_count, 1);
-    assert!(profile.adaptive_lf_smoothing);
+    assert!(profile.adaptive_lf_smoothing());
     assert_eq!(profile.lf_quant_stream_index(0).unwrap(), 1);
     assert_eq!(profile.hf_metadata_stream_index(0).unwrap(), 3);
     let VarDctSectionLayout::Single { packet } = profile.sections else {
@@ -162,7 +162,7 @@ fn accepts_green_queen_physical_group_packets() {
     let profile = negotiate(&bytes);
     assert_eq!((profile.width, profile.height), (438, 589));
     assert_eq!(profile.group_count, 6);
-    assert!(profile.adaptive_lf_smoothing);
+    assert!(profile.adaptive_lf_smoothing());
     assert_eq!(profile.lf_quant_stream_index(0).unwrap(), 1);
     assert_eq!(profile.hf_metadata_stream_index(0).unwrap(), 3);
     assert_eq!(
@@ -359,7 +359,7 @@ fn preserves_typed_profile_and_metadata_error_causes() {
     assert!(
         !StandardVarDctProfile::negotiate(&skip_smoothing)
             .unwrap()
-            .adaptive_lf_smoothing
+            .adaptive_lf_smoothing()
     );
 }
 

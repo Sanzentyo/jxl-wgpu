@@ -74,12 +74,29 @@ pub enum UnsupportedVarDctFeature {
     FrameFeatures,
     Ycbcr,
     JpegSubsampling,
+    SubsampledAdaptiveLf,
     Upsampling,
     Cropping,
     Blending,
     FrameReferences,
     ProgressivePasses,
     SectionLayout,
+}
+
+/// Execution plan for Adaptive LF smoothing resolved during frontend negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveLfPlan {
+    /// Adaptive LF smoothing is skipped (not signaled, or disabled by progressive DC).
+    Skip,
+    /// Adaptive LF smoothing executes on packed 4:4:4 XYB or YCbCr planes.
+    ExecutePacked444,
+}
+
+impl AdaptiveLfPlan {
+    #[must_use]
+    pub const fn executes(self) -> bool {
+        matches!(self, Self::ExecutePacked444)
+    }
 }
 
 /// Typed failure from profile negotiation or section packet construction.
@@ -946,9 +963,8 @@ pub struct StandardVarDctProfile {
     pub group_dimension: u32,
     pub group_count: u64,
     pub low_frequency_group_count: u64,
-    /// Whether section F.2's adaptive smoothing pass is required after LF dequantization and
-    /// chroma-from-luma reconstruction.
-    pub adaptive_lf_smoothing: bool,
+    /// Resolved Adaptive LF smoothing execution plan.
+    pub adaptive_lf: AdaptiveLfPlan,
     /// Earlier progressive-DC frame supplies the LF image instead of this frame's LF entropy.
     pub uses_lf_frame: bool,
     /// Progressive-DC level represented by this frame; zero is the final image level.
@@ -1033,12 +1049,21 @@ impl StandardVarDctProfile {
             group_dimension: 128u32 << frame.group_size_shift,
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
-            adaptive_lf_smoothing: frame.flags & 0x80 == 0,
+            adaptive_lf: if frame.flags & 0x80 == 0 && !frame.uses_lf_frame() {
+                AdaptiveLfPlan::ExecutePacked444
+            } else {
+                AdaptiveLfPlan::Skip
+            },
             uses_lf_frame: frame.uses_lf_frame(),
             lf_level: frame.lf_level,
             frame_name,
             sections,
         })
+    }
+
+    #[must_use]
+    pub const fn adaptive_lf_smoothing(&self) -> bool {
+        self.adaptive_lf.executes()
     }
 
     /// Meta-adaptive property-1 stream index for an LF quantization subimage.
@@ -1347,6 +1372,14 @@ fn validate_frame(
     }
     if !frame.do_ycbcr && frame.jpeg_upsampling != [0; 3] {
         return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
+    }
+    let channel_shifts = jpeg_channel_shifts(frame.jpeg_upsampling);
+    let adaptive_lf_signaled = frame.flags & 0x80 == 0;
+    if adaptive_lf_signaled
+        && !frame.uses_lf_frame()
+        && channel_shifts.iter().any(|shift| shift.is_subsampled())
+    {
+        return unsupported(UnsupportedVarDctFeature::SubsampledAdaptiveLf);
     }
     if frame
         .extra_channel_upsampling

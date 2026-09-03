@@ -17,22 +17,10 @@ use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_frontend::{VarDctChannelShift, VarDctColorTransform};
+use crate::vardct_frontend::{AdaptiveLfPlan, VarDctChannelShift, VarDctColorTransform};
 use crate::vardct_output::{
     VarDctInverseOpsin, VarDctOutputFormat, VarDctOutputPlan, VarDctOutputTransform,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum AdaptiveLfPlan {
-    Skip,
-    ExecutePacked444,
-}
-
-impl AdaptiveLfPlan {
-    pub(super) const fn executes(self) -> bool {
-        matches!(self, Self::ExecutePacked444)
-    }
-}
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
@@ -208,22 +196,7 @@ pub(super) fn prepare_source(
             BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
         },
     )?;
-    let has_subsampled_channels = packet
-        .profile
-        .channel_shifts
-        .into_iter()
-        .any(|shift| shift.is_subsampled());
-    let adaptive_lf = if !packet.profile.adaptive_lf_smoothing {
-        AdaptiveLfPlan::Skip
-    } else if packet.profile.uses_lf_frame {
-        AdaptiveLfPlan::Skip
-    } else if has_subsampled_channels {
-        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-            stage: "adaptive LF smoothing",
-        });
-    } else {
-        AdaptiveLfPlan::ExecutePacked444
-    };
+    let adaptive_lf = packet.profile.adaptive_lf;
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
