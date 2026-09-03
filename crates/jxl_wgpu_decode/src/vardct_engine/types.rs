@@ -48,7 +48,7 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
 pub enum VarDctDecodeError {
-    #[error("the bounded VarDCT engine only produces tightly packed sRGB D65 RGB8 output")]
+    #[error("the bounded VarDCT engine does not support the requested output format")]
     UnsupportedOutput,
     #[error("the bounded VarDCT engine does not implement image orientation {orientation}")]
     UnsupportedOrientation { orientation: u32 },

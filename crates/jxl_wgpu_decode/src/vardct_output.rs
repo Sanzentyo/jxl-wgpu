@@ -299,18 +299,18 @@ pub struct VarDctOutputScratch {
     pub plan: VarDctOutputPlan,
 }
 
-/// Typed validation errors for GPU-resident VarDCT RGB8 output.
+/// Typed validation errors for GPU-resident VarDCT packed 8-bit output.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VarDctOutputError {
     /// The logical image has a zero dimension.
-    #[error("VarDCT RGB8 output extent must be nonzero, got {width}x{height}")]
+    #[error("VarDCT packed output extent must be nonzero, got {width}x{height}")]
     EmptyExtent { width: u32, height: u32 },
     /// Checked size arithmetic overflowed.
-    #[error("VarDCT RGB8 output arithmetic overflow while computing {field}")]
+    #[error("VarDCT packed output arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
     /// A value cannot be addressed by WGSL's `u32` indices.
     #[error(
-        "VarDCT RGB8 output {field} needs {required} addressable values, WGSL permits {available}"
+        "VarDCT packed output {field} needs {required} addressable values, WGSL permits {available}"
     )]
     ShaderAddressSpace {
         field: &'static str,
@@ -318,7 +318,9 @@ pub enum VarDctOutputError {
         available: u64,
     },
     /// One F32 plane has a row stride shorter than its width.
-    #[error("VarDCT RGB8 input plane {plane} stride {stride} is shorter than width {width}")]
+    #[error(
+        "VarDCT packed output input plane {plane} stride {stride} is shorter than width {width}"
+    )]
     InputStride {
         plane: usize,
         stride: u32,
@@ -326,7 +328,7 @@ pub enum VarDctOutputError {
     },
     /// One input plane does not cover the component extent required by the color transform.
     #[error(
-        "VarDCT RGB8 input plane {plane} extent {width}x{height} is smaller than required {required_width}x{required_height}"
+        "VarDCT packed output input plane {plane} extent {width}x{height} is smaller than required {required_width}x{required_height}"
     )]
     InputExtent {
         plane: usize,
@@ -336,33 +338,35 @@ pub enum VarDctOutputError {
         required_height: u32,
     },
     /// JPEG component shifts are limited to the one-bit factors defined by the codestream.
-    #[error("VarDCT RGB8 JPEG channel {channel} has invalid shift {horizontal}x{vertical}")]
+    #[error(
+        "VarDCT packed output JPEG channel {channel} has invalid shift {horizontal}x{vertical}"
+    )]
     InvalidJpegShift {
         channel: usize,
         horizontal: u32,
         vertical: u32,
     },
     /// An inverse-opsin field is non-finite.
-    #[error("VarDCT RGB8 inverse-opsin field {field} must be finite")]
+    #[error("VarDCT packed output inverse-opsin field {field} must be finite")]
     NonFiniteParameter { field: &'static str },
     /// The intensity target is finite but not positive.
-    #[error("VarDCT RGB8 intensity target must be positive")]
+    #[error("VarDCT packed output intensity target must be positive")]
     InvalidIntensityTarget,
     /// A buffer does not carry STORAGE usage.
-    #[error("VarDCT RGB8 {role} buffer is missing STORAGE usage")]
+    #[error("VarDCT packed output {role} buffer is missing STORAGE usage")]
     MissingStorageUsage { role: &'static str },
     /// A binding starts at an invalid device-specific offset.
-    #[error("VarDCT RGB8 {role} offset {offset} is not aligned to {alignment}")]
+    #[error("VarDCT packed output {role} offset {offset} is not aligned to {alignment}")]
     BindingOffsetAlignment {
         role: &'static str,
         offset: u64,
         alignment: u64,
     },
     /// A typed array binding does not end at a whole 32-bit word.
-    #[error("VarDCT RGB8 {role} binding size {size} is not four-byte aligned")]
+    #[error("VarDCT packed output {role} binding size {size} is not four-byte aligned")]
     BindingSizeAlignment { role: &'static str, size: u64 },
     /// A subrange exceeds its backing buffer.
-    #[error("VarDCT RGB8 {role} range {offset}..{end} exceeds buffer size {available}")]
+    #[error("VarDCT packed output {role} range {offset}..{end} exceeds buffer size {available}")]
     BindingRange {
         role: &'static str,
         offset: u64,
@@ -370,14 +374,16 @@ pub enum VarDctOutputError {
         available: u64,
     },
     /// A subrange is smaller than its image geometry requires.
-    #[error("VarDCT RGB8 {role} binding needs {required} bytes, has {available}")]
+    #[error("VarDCT packed output {role} binding needs {required} bytes, has {available}")]
     BindingSize {
         role: &'static str,
         required: u64,
         available: u64,
     },
     /// A required allocation exceeds a device buffer limit.
-    #[error("VarDCT RGB8 {role} needs {required} bytes, device buffer limit is {available}")]
+    #[error(
+        "VarDCT packed output {role} needs {required} bytes, device buffer limit is {available}"
+    )]
     BufferLimit {
         role: &'static str,
         required: u64,
@@ -429,7 +435,7 @@ impl VarDctOutputPacker {
     ) -> Result<Self, VarDctOutputError> {
         validate_workgroup_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed RGB8"),
+            label: Some("jxl-wgpu decode VarDCT packed output"),
             source: wgpu::ShaderSource::Wgsl(VAR_DCT_OUTPUT_SHADER.into()),
         });
         let (workgroup_x, workgroup_y) = variant.workgroup_size();
@@ -438,7 +444,7 @@ impl VarDctOutputPacker {
             ("wg_y", f64::from(workgroup_y)),
         ];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed RGB8"),
+            label: Some("jxl-wgpu decode VarDCT packed output"),
             layout: None,
             module: &module,
             entry_point: Some("pack_rgb8"),
@@ -1104,6 +1110,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn fused_vardct_output_packer_matches_scalar_oracle_across_all_formats_and_dimensions() {
         let Some((device, queue)) = test_device() else {
