@@ -68,10 +68,9 @@ overlay the three decoded channels into every aliased resident strategy-matrix t
 Checked-in cjpeg-to-cjxl streams now execute complete non-XYB 4:4:4, 4:2:2, 4:4:0, and 4:2:0
 reconstruction on an actual adapter: component-sized LF/AC planes remain resident, and the output
 kernel applies JPEG XL's quarter/three-quarter edge-replicating upsampling and encoded BT.601 YCbCr
-conversion. Subsampled YCbCr strictly rejects unstandardized subsampled adaptive LF smoothing by
-default, and safely bypasses it under explicit `CompatibilityFallback` policy with an observable
-`DecodeDeviation::BypassedSubsampledAdaptiveLf` to avoid coordinate mismatch, routing dequantized
-coefficients directly to component-exact LF offsets. When restoration is signaled,
+conversion. Subsampled YCbCr strictly rejects unimplemented subsampled adaptive LF smoothing
+during frontend negotiation with `UnsupportedVarDctFeature::SubsampledAdaptiveLf` before GPU command
+submission or packet execution. When restoration is signaled,
 only shifted components expand into budgeted resident planes before the shared Gaborish/EPF ping-pong
 sequence. Public `GpuDecoder` RGB8 output without subsampled restoration matches Rust `jxl` (jxl-rs 0.6.0)
 and `djxl` within one code; a valid subsampled-restoration codestream fixture is still required for

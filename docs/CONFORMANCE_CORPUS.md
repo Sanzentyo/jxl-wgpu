@@ -85,15 +85,13 @@ source with libjpeg-turbo 3.2.0 `cjpeg -quality 90 -sample` values `1x1,1x1,1x1`
 `2x1,1x1,1x1`, and `1x2,1x1,1x1`, then losslessly transcoded by `cjxl` 0.12.0. Their containers
 retain `jbrd` reconstruction data, but this decoder assertion covers the `jxlc` pixels rather than
 claiming bit-identical JPEG reconstruction.
-A companion 4:2:2 fixture (`jpeg_transcode_422_adaptive_lf.jxl.hex`) tests the unstandardized
-combination of 4:2:2 chroma shifts (`jpeg_upsampling: [0, 2, 0]`) with signaled Adaptive LF
-smoothing (`flags & 0x80 == 0`). Under the default `Strict` policy, public `GpuDecoder` rejects
-the stream before GPU submission with a typed `UnsupportedSubsampledStage` error. Under explicit
-`CompatibilityFallback` policy, the decoder safely bypasses adaptive LF to prevent spatial
-coordinate mismatch, records `AdaptiveLfDisposition::BypassedSubsampled` and
-`DecodeDeviation::BypassedSubsampledAdaptiveLf` on the frame metadata and session, and produces
-RGB8 output bit-identical to the corresponding skip fixture (`jpeg_transcode_422.jxl.hex`) and
-within one code of the Rust `jxl` implementation oracle based on jxl-rs 0.6.0 (PR #861).
+A companion negative conformance fixture (`jpeg_transcode_422_adaptive_lf.jxl.hex`) pairs with
+the valid skip fixture (`jpeg_transcode_422.jxl.hex`) to verify exact flag handling and strict
+rejection of the unstandardized combination of 4:2:2 chroma shifts (`jpeg_upsampling: [0, 2, 0]`)
+with signaled Adaptive LF smoothing (`flags & 0x80 == 0`, bit 7 clear). Because subsampled adaptive
+LF smoothing is unimplemented, the frontend strictly rejects the stream during profile negotiation
+with `UnsupportedVarDctFeature::SubsampledAdaptiveLf` before GPU command submission, while the skip
+stream (`flags & 0x80 == 0x80`) successfully negotiates and completes full-pipeline GPU decode.
 The reusable pre-restoration component primitive has a separate actual-adapter differential. It
 executes horizontal, vertical, and fused two-axis interpolation into an odd 5x3 output and compares
 every F32 sample with a scalar quarter/three-quarter, replicated-edge oracle. Naga also validates
@@ -432,6 +430,20 @@ upsampling on an actual GPU adapter using `cjxl`-generated test codestreams. The
 `memory.frame_upsample_image_bytes` and `memory.frame_upsample_weight_bytes` are accounted for in the
 shared frame memory budget, and that decoded RGB8 outputs match Rust `jxl` and `djxl` reference
 decoders within two RGB8 codes across all three resampling factors.
+
+## Subsampled Adaptive LF negative conformance
+
+`crates/jxl_wgpu_decode/test-data/jpeg_transcode_422_adaptive_lf.jxl.hex` is a checked-in 64×64
+JPEG-transcode raw codestream fixture (binary SHA-256: `82a197907d41f9b89149461c9ddd2be71be57ff47fe428dbfaa87ed6063b0e4b`)
+paired with `jpeg_transcode_422.jxl.hex` to establish strict negative conformance coverage.
+It combines 4:2:2 horizontal chroma subsampling (`jpeg_upsampling: [0, 2, 0]`) with signaled
+Adaptive LF smoothing (`flags & 0x80 == 0`, bit 7 clear).
+
+Because subsampled adaptive LF smoothing is unimplemented, `StandardVarDctProfile::negotiate(&inventory)`
+and `GpuDecoder::open` strictly reject this stream during frontend negotiation with typed error
+`UnsupportedVarDctFeature::SubsampledAdaptiveLf` before any GPU command encoder allocation or
+submission occurs. This ensures unstandardized coordinate-mismatched reconstruction is rejected at
+the capability boundary without silent rendering errors or host fallbacks.
 
 ## Bounded Modular stream-window matrix
 
