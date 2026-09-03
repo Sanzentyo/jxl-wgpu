@@ -85,6 +85,15 @@ source with libjpeg-turbo 3.2.0 `cjpeg -quality 90 -sample` values `1x1,1x1,1x1`
 `2x1,1x1,1x1`, and `1x2,1x1,1x1`, then losslessly transcoded by `cjxl` 0.12.0. Their containers
 retain `jbrd` reconstruction data, but this decoder assertion covers the `jxlc` pixels rather than
 claiming bit-identical JPEG reconstruction.
+A companion 4:2:2 fixture (`jpeg_transcode_422_adaptive_lf.jxl.hex`) tests the unstandardized
+combination of 4:2:2 chroma shifts (`jpeg_upsampling: [0, 2, 0]`) with signaled Adaptive LF
+smoothing (`flags & 0x80 == 0`). Under the default `Strict` policy, public `GpuDecoder` rejects
+the stream before GPU submission with a typed `UnsupportedSubsampledStage` error. Under explicit
+`CompatibilityFallback` policy, the decoder safely bypasses adaptive LF to prevent spatial
+coordinate mismatch, records `AdaptiveLfDisposition::BypassedSubsampled` and
+`DecodeDeviation::BypassedSubsampledAdaptiveLf` on the frame metadata and session, and produces
+RGB8 output bit-identical to the corresponding skip fixture (`jpeg_transcode_422.jxl.hex`) and
+within one code of the Rust `jxl` implementation oracle based on jxl-rs 0.6.0 (PR #861).
 The reusable pre-restoration component primitive has a separate actual-adapter differential. It
 executes horizontal, vertical, and fused two-axis interpolation into an odd 5x3 output and compares
 every F32 sample with a scalar quarter/three-quarter, replicated-edge oracle. Naga also validates
