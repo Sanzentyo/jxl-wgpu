@@ -24,6 +24,15 @@ use jxl_wgpu::{ImageOutputRequest, ResidentEpfParameters};
 use crate::vardct_engine::VarDctDecodeError;
 use crate::vardct_frontend::VarDctColorTransform;
 
+/// Output packaging mode for extra alpha channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaOutputMode {
+    /// Pack alpha directly into a 4-channel RGBA / BGRA output (OutputId(0)).
+    PackRgba,
+    /// Save alpha as a separate 1-channel output plane (OutputId(1)).
+    SeparatePlane,
+}
+
 /// Configuration for building the post-inverse VarDCT [`RenderPlan`].
 pub struct VarDctRenderTailDesc {
     pub image_extent: Extent2d,
@@ -36,6 +45,7 @@ pub struct VarDctRenderTailDesc {
     pub upsampling_weights: Option<Vec<f32>>,
     pub xyb_params: Option<XybParams>,
     pub target_format: Option<PixelFormat>,
+    pub alpha_output: Option<AlphaOutputMode>,
 }
 
 /// The compiled render tail plan and initial resources.
@@ -44,6 +54,7 @@ pub struct CompiledVarDctRenderTail {
     pub resources: BTreeMap<ResourceId, ResourceUpdate>,
     pub input_planes: [PlaneId; 3],
     pub sigma_plane: Option<PlaneId>,
+    pub alpha_plane: Option<PlaneId>,
 }
 
 impl VarDctRenderTailDesc {
@@ -110,6 +121,23 @@ impl VarDctRenderTailDesc {
                 role: PlaneRole::ImportedResident,
             });
             Some(sigma_id)
+        } else {
+            None
+        };
+
+        // Optional alpha plane for straight alpha
+        let alpha_plane = if self.alpha_output.is_some() {
+            let alpha_id = alloc_plane_id();
+            let width = self.padded_extent.width;
+            let height = self.padded_extent.height;
+            plan.planes.push(PlaneDesc {
+                id: alpha_id,
+                extent: Extent2d::new(width, height),
+                stride: width,
+                sample_type: SampleType::F32,
+                role: PlaneRole::ImportedResident,
+            });
+            Some(alpha_id)
         } else {
             None
         };
@@ -349,31 +377,122 @@ impl VarDctRenderTailDesc {
         } else {
             OutputColorEncoding::NonColor
         };
-        plan.outputs.push(OutputDesc {
-            id: output_id,
-            extent: final_extent,
-            sample_type: SampleType::F32,
-            channels: 3,
-            layout: OutputLayout::Planar,
-            color_encoding,
-        });
 
-        plan.nodes.push(RenderNode {
-            name: "save_rgb".into(),
-            op: RenderOp::Save(jxl_gpu_protocol::SaveParams {
-                output: output_id,
-                sample_type: SampleType::F32,
-                channels: rgb_outs.to_vec(),
-                layout: OutputLayout::Planar,
-                orientation: OutputOrientation::Identity,
-            }),
-            inputs: rgb_outs.to_vec(),
-            outputs: Vec::new(),
-            resources: Vec::new(),
-            scale: Scale2d::IDENTITY,
-            border: Border2d::ZERO,
-            precision: PrecisionContract::Exact,
-        });
+        match self.alpha_output {
+            Some(AlphaOutputMode::PackRgba) => {
+                let alpha = alpha_plane.expect("alpha plane declared for PackRgba");
+                let mut rgba_outs = rgb_outs.to_vec();
+                rgba_outs.push(alpha);
+
+                plan.outputs.push(OutputDesc {
+                    id: output_id,
+                    extent: final_extent,
+                    sample_type: SampleType::F32,
+                    channels: 4,
+                    layout: OutputLayout::Planar,
+                    color_encoding,
+                });
+
+                plan.nodes.push(RenderNode {
+                    name: "save_rgba".into(),
+                    op: RenderOp::Save(jxl_gpu_protocol::SaveParams {
+                        output: output_id,
+                        sample_type: SampleType::F32,
+                        channels: rgba_outs.clone(),
+                        layout: OutputLayout::Planar,
+                        orientation: OutputOrientation::Identity,
+                    }),
+                    inputs: rgba_outs,
+                    outputs: Vec::new(),
+                    resources: Vec::new(),
+                    scale: Scale2d::IDENTITY,
+                    border: Border2d::ZERO,
+                    precision: PrecisionContract::Exact,
+                });
+            }
+            Some(AlphaOutputMode::SeparatePlane) => {
+                let alpha = alpha_plane.expect("alpha plane declared for SeparatePlane");
+                // Primary RGB output
+                plan.outputs.push(OutputDesc {
+                    id: output_id,
+                    extent: final_extent,
+                    sample_type: SampleType::F32,
+                    channels: 3,
+                    layout: OutputLayout::Planar,
+                    color_encoding,
+                });
+                plan.nodes.push(RenderNode {
+                    name: "save_rgb".into(),
+                    op: RenderOp::Save(jxl_gpu_protocol::SaveParams {
+                        output: output_id,
+                        sample_type: SampleType::F32,
+                        channels: rgb_outs.to_vec(),
+                        layout: OutputLayout::Planar,
+                        orientation: OutputOrientation::Identity,
+                    }),
+                    inputs: rgb_outs.to_vec(),
+                    outputs: Vec::new(),
+                    resources: Vec::new(),
+                    scale: Scale2d::IDENTITY,
+                    border: Border2d::ZERO,
+                    precision: PrecisionContract::Exact,
+                });
+
+                // Separate Alpha output (OutputId(1))
+                let alpha_out_id = OutputId(1);
+                plan.outputs.push(OutputDesc {
+                    id: alpha_out_id,
+                    extent: final_extent,
+                    sample_type: SampleType::F32,
+                    channels: 1,
+                    layout: OutputLayout::Planar,
+                    color_encoding: OutputColorEncoding::NonColor,
+                });
+                plan.nodes.push(RenderNode {
+                    name: "save_alpha".into(),
+                    op: RenderOp::Save(jxl_gpu_protocol::SaveParams {
+                        output: alpha_out_id,
+                        sample_type: SampleType::F32,
+                        channels: vec![alpha],
+                        layout: OutputLayout::Planar,
+                        orientation: OutputOrientation::Identity,
+                    }),
+                    inputs: vec![alpha],
+                    outputs: Vec::new(),
+                    resources: Vec::new(),
+                    scale: Scale2d::IDENTITY,
+                    border: Border2d::ZERO,
+                    precision: PrecisionContract::Exact,
+                });
+            }
+            None => {
+                plan.outputs.push(OutputDesc {
+                    id: output_id,
+                    extent: final_extent,
+                    sample_type: SampleType::F32,
+                    channels: 3,
+                    layout: OutputLayout::Planar,
+                    color_encoding,
+                });
+
+                plan.nodes.push(RenderNode {
+                    name: "save_rgb".into(),
+                    op: RenderOp::Save(jxl_gpu_protocol::SaveParams {
+                        output: output_id,
+                        sample_type: SampleType::F32,
+                        channels: rgb_outs.to_vec(),
+                        layout: OutputLayout::Planar,
+                        orientation: OutputOrientation::Identity,
+                    }),
+                    inputs: rgb_outs.to_vec(),
+                    outputs: Vec::new(),
+                    resources: Vec::new(),
+                    scale: Scale2d::IDENTITY,
+                    border: Border2d::ZERO,
+                    precision: PrecisionContract::Exact,
+                });
+            }
+        }
 
         plan.validate()?;
 
@@ -382,6 +501,7 @@ impl VarDctRenderTailDesc {
             resources,
             input_planes,
             sigma_plane,
+            alpha_plane,
         })
     }
 }
@@ -432,6 +552,7 @@ mod tests {
                             upsampling_weights,
                             xyb_params: Some(XybParams::default()),
                             target_format: None,
+                            alpha_output: None,
                         };
                         let compiled = desc.compile().expect("compilation must succeed");
                         assert!(compiled.plan.validate().is_ok());
@@ -463,6 +584,7 @@ mod tests {
             upsampling_weights: None,
             xyb_params: None,
             target_format: None,
+            alpha_output: None,
         };
         let compiled = desc.compile().expect("compilation with chroma subsampling must succeed");
         assert!(compiled.plan.validate().is_ok());
@@ -503,6 +625,7 @@ mod tests {
                 upsampling_weights: None,
                 xyb_params: Some(XybParams::default()),
                 target_format: Some(pixel_format.clone()),
+                alpha_output: None,
             };
 
             let req = desc.image_output_request().expect("request must be present");
@@ -520,5 +643,68 @@ mod tests {
             );
             assert!(compiled.plan.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn render_tail_compiles_straight_alpha_pack_rgba() {
+        let image_extent = Extent2d::new(16, 16);
+        let padded_extent = Extent2d::new(16, 16);
+
+        let desc = VarDctRenderTailDesc {
+            image_extent,
+            padded_extent,
+            channel_shifts: [VarDctChannelShift::default(); 3],
+            color_transform: VarDctColorTransform::Xyb,
+            gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+            epf_passes: None,
+            frame_upsampling: None,
+            upsampling_weights: None,
+            xyb_params: Some(XybParams::default()),
+            target_format: None,
+            alpha_output: Some(AlphaOutputMode::PackRgba),
+        };
+
+        let compiled = desc.compile().expect("compile pack rgba render tail");
+        assert!(compiled.alpha_plane.is_some());
+        let plan = &compiled.plan;
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.outputs.len(), 1);
+        assert_eq!(plan.outputs[0].channels, 4);
+
+        let save_node = plan.nodes.iter().find(|n| matches!(n.op, RenderOp::Save(_))).unwrap();
+        let RenderOp::Save(save_params) = &save_node.op else { panic!() };
+        assert_eq!(save_params.channels.len(), 4);
+        assert_eq!(save_params.channels[3], compiled.alpha_plane.unwrap());
+    }
+
+    #[test]
+    fn render_tail_compiles_straight_alpha_separate_plane() {
+        let image_extent = Extent2d::new(16, 16);
+        let padded_extent = Extent2d::new(16, 16);
+
+        let desc = VarDctRenderTailDesc {
+            image_extent,
+            padded_extent,
+            channel_shifts: [VarDctChannelShift::default(); 3],
+            color_transform: VarDctColorTransform::Xyb,
+            gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+            epf_passes: None,
+            frame_upsampling: None,
+            upsampling_weights: None,
+            xyb_params: Some(XybParams::default()),
+            target_format: None,
+            alpha_output: Some(AlphaOutputMode::SeparatePlane),
+        };
+
+        let compiled = desc.compile().expect("compile separate plane alpha render tail");
+        assert!(compiled.alpha_plane.is_some());
+        let plan = &compiled.plan;
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.outputs.len(), 2);
+        assert_eq!(plan.outputs[0].channels, 3);
+        assert_eq!(plan.outputs[1].channels, 1);
+
+        let save_nodes: Vec<_> = plan.nodes.iter().filter(|n| matches!(n.op, RenderOp::Save(_))).collect();
+        assert_eq!(save_nodes.len(), 2);
     }
 }

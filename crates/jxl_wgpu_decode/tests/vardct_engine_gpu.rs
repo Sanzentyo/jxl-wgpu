@@ -2732,6 +2732,7 @@ fn vardct_render_tail_executes_on_wgpu_frame_session() {
         upsampling_weights: None,
         xyb_params: Some(XybParams::default()),
         target_format: None,
+        alpha_output: None,
     };
 
     let compiled = desc.compile().expect("compile render tail");
@@ -2852,6 +2853,7 @@ fn vardct_render_tail_fuses_packed_u8_image_output_on_gpu() {
         upsampling_weights: None,
         xyb_params: Some(XybParams::default()),
         target_format: Some(pixel_format),
+        alpha_output: None,
     };
 
     let request = desc.image_output_request().expect("request must be present");
@@ -2905,4 +2907,287 @@ fn vardct_render_tail_fuses_packed_u8_image_output_on_gpu() {
     assert_eq!(output.bytes.len(), sample_count * 3);
     // Values should not be all zeroes
     assert!(output.bytes.iter().any(|&b| b > 0));
+}
+
+#[test]
+fn vardct_render_tail_executes_straight_alpha_separate_plane_on_gpu() {
+    use wgpu::util::DeviceExt;
+    use jxl_gpu_protocol::{
+        FrameSessionDesc, GroupId, GroupPayload, MemoryMode, PrecisionPolicy,
+        RenderIntent, XybParams, PlaneData,
+    };
+    use jxl_wgpu::{ResidentGaborishWeights, ResidentPlaneBinding};
+    use jxl_wgpu_decode::vardct::frontend::{VarDctChannelShift, VarDctColorTransform};
+    use jxl_wgpu_decode::vardct_render_tail::{AlphaOutputMode, VarDctRenderTailDesc};
+
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+
+    let extent = Extent2d::new(16, 16);
+    let sample_count = (extent.width * extent.height) as usize;
+    let initial_x = vec![0.1_f32; sample_count];
+    let initial_y = vec![0.2_f32; sample_count];
+    let initial_b = vec![0.3_f32; sample_count];
+    let initial_alpha = vec![1.0_f32; sample_count]; // Full opacity
+
+    let buf_x = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail X plane"),
+            contents: bytemuck::cast_slice(&initial_x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_y = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail Y plane"),
+            contents: bytemuck::cast_slice(&initial_y),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_b = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail B plane"),
+            contents: bytemuck::cast_slice(&initial_b),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_alpha = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail Alpha plane"),
+            contents: bytemuck::cast_slice(&initial_alpha),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+
+    let desc = VarDctRenderTailDesc {
+        image_extent: extent,
+        padded_extent: extent,
+        channel_shifts: [VarDctChannelShift::default(); 3],
+        color_transform: VarDctColorTransform::Xyb,
+        gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+        epf_passes: None,
+        frame_upsampling: None,
+        upsampling_weights: None,
+        xyb_params: Some(XybParams::default()),
+        target_format: None,
+        alpha_output: Some(AlphaOutputMode::SeparatePlane),
+    };
+
+    let compiled = desc.compile().expect("compile render tail");
+    let alpha_plane = compiled.alpha_plane.expect("alpha plane must be allocated");
+
+    let frame_desc = FrameSessionDesc {
+        frame_extent: extent,
+        group_extent: extent,
+        group_count: 1,
+        precision: PrecisionPolicy::F32Only,
+        memory_mode: MemoryMode::Resident,
+        max_resident_bytes: 16 * 1024 * 1024,
+        max_scratch_bytes: 16 * 1024 * 1024,
+    };
+
+    let mut session = backend
+        .create_session(&frame_desc, compiled.plan)
+        .expect("create frame session for render tail");
+
+    for (_res_id, update) in compiled.resources {
+        session.update_resource(update).expect("update resource");
+    }
+
+    let byte_size = (sample_count * std::mem::size_of::<f32>()) as u64;
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[0], buf_x, 0, byte_size))
+        .expect("import X plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[1], buf_y, 0, byte_size))
+        .expect("import Y plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[2], buf_b, 0, byte_size))
+        .expect("import B plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(alpha_plane, buf_alpha, 0, byte_size))
+        .expect("import Alpha plane");
+
+    session
+        .enqueue(GroupPayload {
+            group: GroupId(0),
+            revision: 0,
+            complete: true,
+            planes: Vec::new(),
+            vardct: None,
+        })
+        .expect("enqueue group");
+
+    let token = session.submit(RenderIntent::Final).expect("submit render tail with alpha");
+    let rendered = session.wait(token).expect("wait rendered frame");
+
+    // Two outputs: Output 0 (RGB, 3 channels) and Output 1 (Alpha, 1 channel)
+    assert_eq!(rendered.outputs.len(), 2);
+
+    let PlaneData::F32(out_rgb) = &rendered.outputs[0].data else {
+        panic!("expected F32 output for RGB");
+    };
+    assert_eq!(out_rgb.len(), sample_count * 3);
+    for &sample in out_rgb {
+        assert!(sample.is_finite());
+    }
+
+    let PlaneData::F32(out_alpha) = &rendered.outputs[1].data else {
+        panic!("expected F32 output for Alpha");
+    };
+    assert_eq!(out_alpha.len(), sample_count);
+    for &sample in out_alpha {
+        assert!((sample - 1.0).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn vardct_render_tail_executes_straight_alpha_pack_rgba_on_gpu() {
+    use wgpu::util::DeviceExt;
+    use jxl_gpu_protocol::{
+        FrameSessionDesc, GroupId, GroupPayload, MemoryMode, PrecisionPolicy,
+        RenderIntent, XybParams, PlaneData,
+    };
+    use jxl_wgpu::{ResidentGaborishWeights, ResidentPlaneBinding};
+    use jxl_wgpu_decode::vardct::frontend::{VarDctChannelShift, VarDctColorTransform};
+    use jxl_wgpu_decode::vardct_render_tail::{AlphaOutputMode, VarDctRenderTailDesc};
+
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+
+    let extent = Extent2d::new(16, 16);
+    let sample_count = (extent.width * extent.height) as usize;
+    let initial_x = vec![0.1_f32; sample_count];
+    let initial_y = vec![0.2_f32; sample_count];
+    let initial_b = vec![0.3_f32; sample_count];
+    let initial_alpha = vec![0.85_f32; sample_count];
+
+    let buf_x = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail X plane"),
+            contents: bytemuck::cast_slice(&initial_x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_y = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail Y plane"),
+            contents: bytemuck::cast_slice(&initial_y),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_b = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail B plane"),
+            contents: bytemuck::cast_slice(&initial_b),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+    let buf_alpha = Arc::new(backend.device().create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("test tail Alpha plane"),
+            contents: bytemuck::cast_slice(&initial_alpha),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        },
+    ));
+
+    let desc = VarDctRenderTailDesc {
+        image_extent: extent,
+        padded_extent: extent,
+        channel_shifts: [VarDctChannelShift::default(); 3],
+        color_transform: VarDctColorTransform::Xyb,
+        gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+        epf_passes: None,
+        frame_upsampling: None,
+        upsampling_weights: None,
+        xyb_params: Some(XybParams::default()),
+        target_format: None,
+        alpha_output: Some(AlphaOutputMode::PackRgba),
+    };
+
+    let compiled = desc.compile().expect("compile render tail");
+    let alpha_plane = compiled.alpha_plane.expect("alpha plane must be allocated");
+
+    let frame_desc = FrameSessionDesc {
+        frame_extent: extent,
+        group_extent: extent,
+        group_count: 1,
+        precision: PrecisionPolicy::F32Only,
+        memory_mode: MemoryMode::Resident,
+        max_resident_bytes: 16 * 1024 * 1024,
+        max_scratch_bytes: 16 * 1024 * 1024,
+    };
+
+    let mut session = backend
+        .create_session(&frame_desc, compiled.plan)
+        .expect("create frame session for render tail");
+
+    for (_res_id, update) in compiled.resources {
+        session.update_resource(update).expect("update resource");
+    }
+
+    let byte_size = (sample_count * std::mem::size_of::<f32>()) as u64;
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[0], buf_x, 0, byte_size))
+        .expect("import X plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[1], buf_y, 0, byte_size))
+        .expect("import Y plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(compiled.input_planes[2], buf_b, 0, byte_size))
+        .expect("import B plane");
+    session
+        .import_resident_plane(ResidentPlaneBinding::new(alpha_plane, buf_alpha, 0, byte_size))
+        .expect("import Alpha plane");
+
+    session
+        .enqueue(GroupPayload {
+            group: GroupId(0),
+            revision: 0,
+            complete: true,
+            planes: Vec::new(),
+            vardct: None,
+        })
+        .expect("enqueue group");
+
+    let token = session.submit(RenderIntent::Final).expect("submit render tail with pack rgba");
+    let rendered = session.wait(token).expect("wait rendered frame");
+
+    // One 4-channel output (RGBA)
+    assert_eq!(rendered.outputs.len(), 1);
+
+    let PlaneData::F32(out_rgba) = &rendered.outputs[0].data else {
+        panic!("expected F32 output for RGBA");
+    };
+    // 16 * 16 * 4 = 1024 samples
+    assert_eq!(out_rgba.len(), sample_count * 4);
+
+    // Verify RGB samples are finite and Alpha samples equal 0.85
+    // Format is Planar: first sample_count is R, then G, then B, then Alpha
+    let alpha_samples = &out_rgba[sample_count * 3..sample_count * 4];
+    for &sample in alpha_samples {
+        assert!((sample - 0.85).abs() < 1e-5);
+    }
 }
