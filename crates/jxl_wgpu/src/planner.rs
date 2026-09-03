@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use jxl_gpu_protocol::{
-    BlendComponent, BlendParams, ChromaAxis, EpfParams, Extent2d, FrameSessionDesc, MemoryMode,
-    PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderNode, RenderOp, RenderOpKind,
-    RenderPlan, ResourceId, SampleType,
+    AdaptiveLfParams, BlendComponent, BlendParams, ChromaAxis, EpfParams, Extent2d,
+    FrameSessionDesc, MemoryMode, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy,
+    RenderNode, RenderOp, RenderOpKind, RenderPlan, ResourceId, SampleType,
 };
 
 use crate::arena::{ArenaPlan, ArenaPlanner};
@@ -36,6 +36,7 @@ impl FusedKernel {
             Self::Single(RenderOpKind::Gaborish) => "gaborish",
             Self::Single(RenderOpKind::Epf) => "epf",
             Self::Single(RenderOpKind::Upsample) => "upsample",
+            Self::Single(RenderOpKind::AdaptiveLf) => "adaptive_lf",
             Self::Single(RenderOpKind::VarDct) => "vardct",
             Self::Single(RenderOpKind::AddNoise) => "add_noise",
             Self::Single(RenderOpKind::XybToRgb) => "xyb_to_rgb",
@@ -365,6 +366,7 @@ fn portable_supported_ops() -> BTreeSet<RenderOpKind> {
         RenderOpKind::Gaborish,
         RenderOpKind::Epf,
         RenderOpKind::Upsample,
+        RenderOpKind::AdaptiveLf,
         RenderOpKind::VarDct,
         RenderOpKind::XybToRgb,
         RenderOpKind::YcbcrToRgb,
@@ -572,6 +574,7 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             }
             Ok(())
         }
+        RenderOp::AdaptiveLf(params) => validate_adaptive_lf(index, node, params, plan),
         RenderOp::VarDct => {
             if !node.inputs.is_empty() || node.outputs.len() != 3 || node.resources.len() != 1 {
                 return Err(Error::InvalidPayload(format!(
@@ -1004,6 +1007,67 @@ fn validate_epf(
         {
             return Err(Error::InvalidPayload(format!(
                 "node {index} EPF sigma plane {sigma_id:?} must be an F32 parameter plane covering at least {required_width}x{required_height} blocks"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_adaptive_lf(
+    index: usize,
+    node: &RenderNode,
+    _params: &AdaptiveLfParams,
+    plan: &RenderPlan,
+) -> Result<()> {
+    if node.inputs.len() != 3 || node.outputs.len() != 3 {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Adaptive LF requires exactly 3 inputs and 3 outputs, got {} inputs and {} outputs",
+            node.inputs.len(),
+            node.outputs.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for &id in node.inputs.iter().chain(&node.outputs) {
+        if !seen.insert(id) {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} Adaptive LF requires distinct non-overlapping input and output planes, duplicate {id:?}"
+            )));
+        }
+    }
+    if !node.resources.is_empty() {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Adaptive LF must not declare late-bound resources"
+        )));
+    }
+    if node.scale != jxl_gpu_protocol::Scale2d::IDENTITY {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Adaptive LF must have identity scale"
+        )));
+    }
+    if node.border != jxl_gpu_protocol::Border2d::default() {
+        return Err(Error::InvalidPayload(format!(
+            "node {index} Adaptive LF must have default zero border"
+        )));
+    }
+    let plane = |id: PlaneId| {
+        plan.planes
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| Error::InvalidPayload(format!("node {index} Adaptive LF names unknown plane {id:?}")))
+    };
+    let expected_extent = plane(node.inputs[0])?.extent;
+    for &id in node.inputs.iter().chain(&node.outputs) {
+        let desc = plane(id)?;
+        if desc.sample_type != SampleType::F32 {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} Adaptive LF plane {id:?} must be F32, got {:?}",
+                desc.sample_type
+            )));
+        }
+        if desc.extent != expected_extent {
+            return Err(Error::InvalidPayload(format!(
+                "node {index} Adaptive LF requires 4:4:4 equal-extent planes; plane {id:?} has {:?}, expected {:?}",
+                desc.extent, expected_extent
             )));
         }
     }
@@ -1874,5 +1938,83 @@ mod tests {
         let sizes = streaming_sizes(&plan, &extents).unwrap();
         assert!(sizes.values().all(|size| *size > 0));
         assert_eq!(parameter_bytes(&plan).unwrap(), 0);
+    }
+
+    #[test]
+    fn validates_adaptive_lf_node_contracts() {
+        let valid_node = node(
+            "adaptive_lf",
+            RenderOp::AdaptiveLf(AdaptiveLfParams {
+                thresholds: [0.1, 0.2, 0.3],
+            }),
+            &[0, 1, 2],
+            &[3, 4, 5],
+            PrecisionContract::default(),
+        );
+        let make_plan = |n: RenderNode, planes: Vec<PlaneDesc>| RenderPlan {
+            planes,
+            nodes: vec![n],
+            outputs: Vec::new(),
+        };
+        let valid_planes = vec![
+            plane(0, PlaneRole::Source, SampleType::F32),
+            plane(1, PlaneRole::Source, SampleType::F32),
+            plane(2, PlaneRole::Source, SampleType::F32),
+            plane(3, PlaneRole::Intermediate, SampleType::F32),
+            plane(4, PlaneRole::Intermediate, SampleType::F32),
+            plane(5, PlaneRole::Intermediate, SampleType::F32),
+        ];
+
+        // Valid plan succeeds
+        assert!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(valid_node.clone(), valid_planes.clone()))
+                .is_ok()
+        );
+
+        // Reject arity mismatch (e.g. 2 inputs)
+        let mut bad_arity = valid_node.clone();
+        bad_arity.inputs = vec![PlaneId(0), PlaneId(1)];
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(bad_arity, valid_planes.clone())),
+            Err(Error::InvalidPayload(_))
+        ));
+
+        // Reject duplicate input plane IDs
+        let mut overlap = valid_node.clone();
+        overlap.inputs = vec![PlaneId(0), PlaneId(0), PlaneId(2)];
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(overlap, valid_planes.clone())),
+            Err(Error::InvalidPayload(_))
+        ));
+
+        // Reject non-F32 plane
+        let mut non_f32_planes = valid_planes.clone();
+        non_f32_planes[0].sample_type = SampleType::I32;
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(valid_node.clone(), non_f32_planes)),
+            Err(Error::InvalidPayload(_))
+        ));
+
+        // Reject subsampled extent mismatch (not 4:4:4)
+        let mut subsampled_planes = valid_planes.clone();
+        subsampled_planes[1].extent = Extent2d::new(8, 16);
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(valid_node.clone(), subsampled_planes)),
+            Err(Error::InvalidPayload(_))
+        ));
+
+        // Reject non-identity scale
+        let mut scaled_node = valid_node.clone();
+        scaled_node.scale = Scale2d::new(2, 2);
+        assert!(matches!(
+            Planner::new(wgpu::Limits::default(), memory())
+                .plan(&frame(MemoryMode::Auto), &make_plan(scaled_node, valid_planes.clone())),
+            Err(Error::InvalidPayload(_))
+        ));
     }
 }

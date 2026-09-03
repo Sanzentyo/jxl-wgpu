@@ -19,6 +19,7 @@ pub(crate) fn capabilities(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> B
             RenderOpKind::Gaborish,
             RenderOpKind::Epf,
             RenderOpKind::Upsample,
+            RenderOpKind::AdaptiveLf,
             RenderOpKind::VarDct,
             RenderOpKind::XybToRgb,
             RenderOpKind::YcbcrToRgb,

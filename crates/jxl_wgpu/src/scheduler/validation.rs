@@ -18,10 +18,10 @@ use crate::vardct;
 use crate::{Error, Result};
 
 use super::{
-    BlendUniform, Chroma2dUniform, ChromaUpsampleUniform, CopyParams, EpfUniform, ExtendUniform,
-    GaborishRgbUniform, GaborishUniform, ImageOutputUniform, ModularParams, OutputEncoding,
-    OutputMode, OutputTarget, PremultiplyUniform, SaveUniform, TransferUniform, UpsampleUniform,
-    XybUniform, YcbcrUniform, stride,
+    AdaptiveLfUniform, BlendUniform, Chroma2dUniform, ChromaUpsampleUniform, CopyParams, EpfUniform,
+    ExtendUniform, GaborishRgbUniform, GaborishUniform, ImageOutputUniform, ModularParams,
+    OutputEncoding, OutputMode, OutputTarget, PremultiplyUniform, SaveUniform, TransferUniform,
+    UpsampleUniform, XybUniform, YcbcrUniform, stride,
 };
 
 pub(super) fn validate(plan: &RenderPlan) -> Result<()> {
@@ -40,6 +40,7 @@ pub(super) fn validate(plan: &RenderPlan) -> Result<()> {
             | RenderOp::Blend(_)
             | RenderOp::PremultiplyAlpha { .. }
             | RenderOp::Extend { .. }
+            | RenderOp::AdaptiveLf(_)
             | RenderOp::Upsample(_) => {}
             RenderOp::Convert {
                 output_type: SampleType::I32 | SampleType::F32,
@@ -179,6 +180,9 @@ pub(in crate::scheduler) fn transient_bytes(
                     &mut bytes,
                     vardct::transient_bytes(plan, node, groups, resources)?,
                 )?;
+            }
+            RenderOp::AdaptiveLf(_) => {
+                add_uniform::<AdaptiveLfUniform>(&mut bytes)?;
             }
             RenderOp::Upsample(params) => {
                 add_uniform::<UpsampleUniform>(&mut bytes)?;

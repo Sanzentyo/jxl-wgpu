@@ -546,6 +546,11 @@ impl Scheduler {
                             )?;
                             1
                         }
+                        RenderOp::AdaptiveLf(_) => {
+                            return Err(Error::Unsupported(
+                                "Adaptive LF node lowering is not yet implemented in scheduler".into(),
+                            ));
+                        }
                         RenderOp::Save(save) => {
                             if !saved_outputs.insert(save.output) {
                                 return Err(Error::InvalidPayload(format!(
@@ -846,6 +851,13 @@ struct GaborishRgbUniform {
     weights_x: [f32; 4],
     weights_y: [f32; 4],
     weights_b: [f32; 4],
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AdaptiveLfUniform {
+    extent_and_offsets: [u32; 4],
+    lf_scale: [f32; 4],
 }
 
 #[repr(C)]

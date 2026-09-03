@@ -207,6 +207,7 @@ pub enum RenderOpKind {
     Gaborish,
     Epf,
     Upsample,
+    AdaptiveLf,
     VarDct,
     AddNoise,
     XybToRgb,
@@ -452,6 +453,11 @@ pub struct UpsampleParams {
     pub weights: ResourceId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdaptiveLfParams {
+    pub thresholds: [f32; 3],
+}
+
 #[derive(Clone, Debug)]
 pub struct XybParams {
     pub opsin_bias: [f32; 3],
@@ -542,6 +548,7 @@ pub enum RenderOp {
     Gaborish(GaborishParams),
     Epf(EpfParams),
     Upsample(UpsampleParams),
+    AdaptiveLf(AdaptiveLfParams),
     /// Dequantize and inverse-transform the strategy buckets in [`VarDctPacket`].
     ///
     /// Transform coverage is carried by each packet bucket rather than summarized as a maximum
@@ -583,6 +590,7 @@ impl RenderOp {
             Self::Gaborish(_) => RenderOpKind::Gaborish,
             Self::Epf(_) => RenderOpKind::Epf,
             Self::Upsample(_) => RenderOpKind::Upsample,
+            Self::AdaptiveLf(_) => RenderOpKind::AdaptiveLf,
             Self::VarDct => RenderOpKind::VarDct,
             Self::AddNoise { .. } => RenderOpKind::AddNoise,
             Self::XybToRgb(_) => RenderOpKind::XybToRgb,
