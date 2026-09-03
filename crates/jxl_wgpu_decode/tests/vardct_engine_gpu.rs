@@ -12,17 +12,37 @@ use jxl_gpu_bitstream::{
     ParseLimits, RestorationFilterInventory,
 };
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
+use jxl_gpu_formats::{
+    ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, RgbChannelOrder,
+    TransferFunction, YcbcrEncoding,
+};
 use jxl_gpu_protocol::{Extent2d, TransformKind};
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
     ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
     WgpuBackendConfig,
 };
-use jxl_wgpu_decode::VarDctOutputFormat;
-use jxl_wgpu_decode::vardct::engine::vardct_output_format;
 use jxl_wgpu_decode::vardct::frontend::{
     StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError,
 };
+
+fn canonical_format(order: RgbChannelOrder) -> PixelFormat {
+    PixelFormat::rgb8(
+        order,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
+}
+
+fn canonical_rgb8() -> PixelFormat {
+    canonical_format(RgbChannelOrder::Rgb)
+}
 use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
@@ -237,10 +257,7 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
     ];
     for (name, encoded, resident_plane_bytes) in cases {
         let mut session = decoder
-            .open(
-                encoded,
-                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-            )
+            .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
             .unwrap();
         let memory = session
             .submission_session()
@@ -309,11 +326,7 @@ fn frame_upsampling_factors_match_reference_on_gpu() {
             };
             let extent = Extent2d::new(w_expr, h_expr);
             let mut session = decoder
-                .open(
-                    &encoded,
-                    GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8))
-                        .unwrap(),
-                )
+                .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
                 .unwrap();
             let memory = session
                 .submission_session()
@@ -392,10 +405,7 @@ fn subsampled_jpeg_transcode_with_frame_upsampling_matches_reference_on_gpu() {
     let mut executed = 0;
     for (name, extent, encoded) in cases {
         let mut session = decoder
-            .open(
-                encoded,
-                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-            )
+            .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
             .unwrap();
         let memory = session
             .submission_session()
@@ -487,7 +497,7 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
     let default_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let strict_err = default_decoder.open(
         codestream,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
     let Err(strict_error) = strict_err else {
         panic!("subsampled adaptive LF must be rejected, but opened successfully");
@@ -582,7 +592,7 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
     let mut skip_session = decoder
         .open(
             skip_codestream,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+            GpuOutputRequest::color(canonical_rgb8()).unwrap(),
         )
         .expect("skip stream must open");
     let skip_frame = skip_session
@@ -593,7 +603,7 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
 
     let adaptive_result = decoder.open(
         adaptive_codestream,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
     assert!(
         matches!(
@@ -641,16 +651,16 @@ fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
         readback.frame.outputs[0].bytes.clone()
     };
 
-    let rgb8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Rgb8));
+    let rgb8 = decode_bytes(canonical_rgb8());
     assert_eq!(rgb8.len(), pixel_count * 3);
 
-    let rgba8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Rgba8));
+    let rgba8 = decode_bytes(canonical_format(RgbChannelOrder::Rgba));
     assert_eq!(rgba8.len(), pixel_count * 4);
 
-    let bgr8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Bgr8));
+    let bgr8 = decode_bytes(canonical_format(RgbChannelOrder::Bgr));
     assert_eq!(bgr8.len(), pixel_count * 3);
 
-    let bgra8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Bgra8));
+    let bgra8 = decode_bytes(canonical_format(RgbChannelOrder::Bgra));
     assert_eq!(bgra8.len(), pixel_count * 4);
 
     for i in 0..pixel_count {
@@ -695,10 +705,10 @@ fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
         readback.frame.outputs[0].bytes.clone()
     };
 
-    let xyb_rgb8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Rgb8));
-    let xyb_rgba8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Rgba8));
-    let xyb_bgr8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Bgr8));
-    let xyb_bgra8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Bgra8));
+    let xyb_rgb8 = decode_xyb_bytes(canonical_rgb8());
+    let xyb_rgba8 = decode_xyb_bytes(canonical_format(RgbChannelOrder::Rgba));
+    let xyb_bgr8 = decode_xyb_bytes(canonical_format(RgbChannelOrder::Bgr));
+    let xyb_bgra8 = decode_xyb_bytes(canonical_format(RgbChannelOrder::Bgra));
 
     assert_eq!(xyb_rgb8.len(), xyb_pixels * 3);
     assert_eq!(xyb_rgba8.len(), xyb_pixels * 4);
@@ -724,6 +734,130 @@ fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
         assert_eq!(xyb_bgra8[i * 4 + 2], r);
         assert_eq!(xyb_bgra8[i * 4 + 3], 255);
     }
+}
+
+#[test]
+fn public_decoder_strictly_rejects_non_canonical_output_descriptors() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let codestream = common::jpeg_transcode_422();
+
+    // 1. Display-P3 RGB8
+    let p3 = PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::DisplayP3,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    );
+    let err = decoder.open(codestream, GpuOutputRequest::color(p3).unwrap());
+    assert!(
+        matches!(
+            err,
+            Err(DecodeError::VarDct(VarDctDecodeError::UnsupportedOutput))
+        ),
+        "Display-P3 descriptor must be strictly rejected without silent relabeling"
+    );
+
+    // 2. BT.2020 RGB8
+    let bt2020 = PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt2020,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    );
+    let err = decoder.open(codestream, GpuOutputRequest::color(bt2020).unwrap());
+    assert!(
+        matches!(
+            err,
+            Err(DecodeError::VarDct(VarDctDecodeError::UnsupportedOutput))
+        ),
+        "BT.2020 descriptor must be strictly rejected"
+    );
+
+    // 3. Linear RGB8
+    let linear = PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Linear,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    );
+    let err = decoder.open(codestream, GpuOutputRequest::color(linear).unwrap());
+    assert!(
+        matches!(
+            err,
+            Err(DecodeError::VarDct(VarDctDecodeError::UnsupportedOutput))
+        ),
+        "Linear descriptor must be strictly rejected"
+    );
+
+    // 4. Limited-range RGB8
+    let limited = PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Limited,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    );
+    let err = decoder.open(codestream, GpuOutputRequest::color(limited).unwrap());
+    assert!(
+        matches!(
+            err,
+            Err(DecodeError::VarDct(VarDctDecodeError::UnsupportedOutput))
+        ),
+        "Limited-range descriptor must be strictly rejected"
+    );
+
+    // 5. Planar RGB8
+    let planar = PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        true,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    );
+    let err = decoder.open(codestream, GpuOutputRequest::color(planar).unwrap());
+    assert!(
+        matches!(
+            err,
+            Err(DecodeError::VarDct(VarDctDecodeError::UnsupportedOutput))
+        ),
+        "Planar descriptor must be strictly rejected"
+    );
 }
 
 fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
@@ -986,8 +1120,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
             dct8_packet = Some(encoded.clone());
         }
         let oracle = djxl_ppm(&encoded, extent);
-        let request =
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap();
+        let request = GpuOutputRequest::color(canonical_rgb8()).unwrap();
         let mut session = if index == 0 {
             let session = open_incremental(&decoder, &encoded, request);
             let codestream_bytes = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
@@ -1019,10 +1152,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
             decoder.incremental_input_budget().snapshot().reserved_bytes,
             0
         );
-        assert_eq!(
-            frame.output().outputs[0].layout.format,
-            vardct_output_format(VarDctOutputFormat::Rgb8)
-        );
+        assert_eq!(frame.output().outputs[0].layout.format, canonical_rgb8());
         assert_eq!(
             decoder.engine().in_flight_memory_stats().reserved_bytes,
             memory.output_lease_bytes
@@ -1113,7 +1243,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
 
     let error = match decoder.open(
         &corrupted,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     ) {
         Err(error) => error,
         Ok(_) => panic!("corrupt local MA metadata must be rejected before submission"),
@@ -1170,7 +1300,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     let mut session = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
     assert_eq!(
         decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -1207,10 +1337,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
     let mut abandoned = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
@@ -1243,10 +1370,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
         *byte ^= 0xa5;
     }
     let mut damaged_session = decoder
-        .open(
-            &damaged,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&damaged, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let error = damaged_session.next_frame().unwrap_err();
     assert!(
@@ -1332,10 +1456,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         assert_eq!(control.capacities[3], blocks);
 
         let mut session = decoder
-            .open(
-                &encoded,
-                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-            )
+            .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
             .unwrap();
         let memory = session
             .submission_session()
@@ -1430,10 +1551,7 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
     assert_ne!(descriptors[0].offset, descriptors[1].offset);
 
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
     let readback = ImageReadbackPipeline::new(&backend)
@@ -1480,10 +1598,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let expected = rust_jxl_rgb8(encoded, extent);
 
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let vardct = session.submission_session().vardct().unwrap();
     let memory = vardct.memory_stats();
@@ -1510,10 +1625,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
     let mut async_session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
         .unwrap()
@@ -1551,10 +1663,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
         *byte ^= 0x5a;
     }
     let mut damaged_session = decoder
-        .open(
-            &damaged,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&damaged, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     assert!(matches!(
         damaged_session.next_frame(),
@@ -1564,10 +1673,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
     let mut abandoned = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
@@ -1607,7 +1713,7 @@ fn vardct_stream_windows_adapt_to_the_shared_frame_budget() {
     .unwrap();
     let encoded = common::green_queen_vardct_nonzero_ac();
     let reference = rust_jxl_rgb8(encoded, Extent2d::new(438, 589));
-    let request = GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap();
+    let request = GpuOutputRequest::color(canonical_rgb8()).unwrap();
     let memory_at_limit = |limit| {
         let decoder = GpuDecoder::new(
             VarDctSubmissionEngine::new(backend.clone())
@@ -1757,10 +1863,7 @@ fn libjxl_center_first_permuted_toc_matches_reference_on_gpu() {
     assert_ne!(physical_group_order, (0..6).collect::<Vec<_>>());
 
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
     let readback = ImageReadbackPipeline::new(&backend)
@@ -1824,10 +1927,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
         .collect::<Vec<_>>();
     assert_eq!(custom_orders, [0, 1]);
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
     let readback = ImageReadbackPipeline::new(&backend)
@@ -1904,10 +2004,7 @@ fn assert_multiple_lf_groups(
     };
     let decoder = GpuDecoder::new(engine);
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let vardct = session
         .submission_session()
@@ -2016,7 +2113,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut session = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
     assert_eq!(
         decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -2097,10 +2194,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 
     let mut async_session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
         .unwrap()
@@ -2119,7 +2213,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut abandoned = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+        GpuOutputRequest::color(canonical_rgb8()).unwrap(),
     );
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert_eq!(
@@ -2171,10 +2265,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
         *byte ^= 0xa5;
     }
     let mut damaged_session = decoder
-        .open(
-            &damaged,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&damaged, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let error = damaged_session.next_frame().unwrap_err();
     assert!(matches!(
@@ -2235,10 +2326,7 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
     ));
 
     let mut session = decoder
-        .open(
-            encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let memory = session
         .submission_session()
@@ -2314,10 +2402,7 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
         }
 
         let mut session = decoder
-            .open(
-                encoded,
-                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-            )
+            .open(encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
             .unwrap();
         let memory = session
             .submission_session()
@@ -2386,10 +2471,7 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
     .unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     assert!(matches!(
         session.submission_session(),
@@ -2416,10 +2498,7 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
     );
 
     let mut blocking_session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let blocking_frame = blocking_session.next_frame().unwrap().unwrap();
     assert!(blocking_session.next_frame().unwrap().is_none());
@@ -2446,10 +2525,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     assert!(matches!(
         session.submission_session(),
@@ -2483,10 +2559,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
     );
 
     let mut async_session = decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
         .unwrap()
@@ -2511,10 +2584,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
 
     let probe_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut probe = probe_decoder
-        .open(
-            &encoded,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
-        )
+        .open(&encoded, GpuOutputRequest::color(canonical_rgb8()).unwrap())
         .unwrap();
     probe.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     let initial_reservation = probe_decoder

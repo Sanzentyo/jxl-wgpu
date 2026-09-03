@@ -1,5 +1,4 @@
-use crate::vardct_output::VarDctOutputFormat;
-use jxl_gpu_formats::{LayoutError, PixelFormat};
+use jxl_gpu_formats::LayoutError;
 use jxl_wgpu::{
     MemoryBudgetError, ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan,
     ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
@@ -185,12 +184,6 @@ pub enum VarDctDecodeError {
         #[source]
         source: wgpu::MapRangeError,
     },
-}
-
-/// Canonical packed 8-bit output format supported by [`VarDctSubmissionEngine`].
-#[must_use]
-pub fn vardct_output_format(format: VarDctOutputFormat) -> PixelFormat {
-    format.pixel_format()
 }
 
 /// Exact GPU buffer accounting for one bounded VarDCT frame.

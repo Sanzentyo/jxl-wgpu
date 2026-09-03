@@ -9,9 +9,8 @@
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ChromaLocation2d, ChromaSubsampling, ColorModel, ColorRange, ColorSpace, ColorSpec,
-    ColorSpecification, PixelFormat, PlaneSampling, RgbChannelOrder, SampleKind, Swizzle,
-    TransferFunction, YcbcrEncoding,
+    ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, PixelFormat,
+    RgbChannelOrder, Swizzle, TransferFunction, YcbcrEncoding,
 };
 use jxl_gpu_protocol::XybParams;
 use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
@@ -82,26 +81,23 @@ impl From<&XybParams> for VarDctInverseOpsin {
     }
 }
 
-/// Color and packing format produced by [`VarDctOutputPacker`].
-///
-/// Note: Opaque RGBA8/BGRA8 output; alpha is filled with 255 when no decoded alpha source is connected.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Canonical packed 8-bit output format supported by the fast output packer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
-pub enum VarDctOutputFormat {
-    #[default]
-    Rgb8 = 0,
-    Rgba8 = 1,
-    Bgr8 = 2,
-    Bgra8 = 3,
+pub(crate) enum PackedU8Format {
+    Rgb = 0,
+    Rgba = 1,
+    Bgr = 2,
+    Bgra = 3,
 }
 
-impl VarDctOutputFormat {
+impl PackedU8Format {
     /// Number of bytes per pixel for this format.
     #[must_use]
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
-            Self::Rgb8 | Self::Bgr8 => 3,
-            Self::Rgba8 | Self::Bgra8 => 4,
+            Self::Rgb | Self::Bgr => 3,
+            Self::Rgba | Self::Bgra => 4,
         }
     }
 
@@ -109,10 +105,10 @@ impl VarDctOutputFormat {
     #[must_use]
     pub fn pixel_format(self) -> PixelFormat {
         let order = match self {
-            Self::Rgb8 => RgbChannelOrder::Rgb,
-            Self::Rgba8 => RgbChannelOrder::Rgba,
-            Self::Bgr8 => RgbChannelOrder::Bgr,
-            Self::Bgra8 => RgbChannelOrder::Bgra,
+            Self::Rgb => RgbChannelOrder::Rgb,
+            Self::Rgba => RgbChannelOrder::Rgba,
+            Self::Bgr => RgbChannelOrder::Bgr,
+            Self::Bgra => RgbChannelOrder::Bgra,
         };
         PixelFormat::rgb8(
             order,
@@ -126,52 +122,25 @@ impl VarDctOutputFormat {
             }),
         )
     }
-
-    /// Matches and normalizes a candidate [`PixelFormat`] into a supported packed-u8 format.
-    #[must_use]
-    pub fn try_from_pixel_format(format: &PixelFormat) -> Option<Self> {
-        if format.model != ColorModel::Rgb
-            || format.sample_kind != SampleKind::Unsigned
-            || format.chroma_subsampling != ChromaSubsampling::None
-            || format.planes.len() != 1
-        {
-            return None;
-        }
-        let plane = &format.planes[0];
-        if plane.sampling != PlaneSampling::FULL || plane.pixels_per_element != 1 {
-            return None;
-        }
-        match format.swizzle {
-            Swizzle::XYZ1
-                if plane.words.len() == 3 && plane.words.iter().all(|w| w.bits() == 8) =>
-            {
-                Some(Self::Rgb8)
-            }
-            Swizzle::XYZW
-                if plane.words.len() == 4 && plane.words.iter().all(|w| w.bits() == 8) =>
-            {
-                Some(Self::Rgba8)
-            }
-            Swizzle::ZYX1
-                if plane.words.len() == 3 && plane.words.iter().all(|w| w.bits() == 8) =>
-            {
-                Some(Self::Bgr8)
-            }
-            Swizzle::ZYXW
-                if plane.words.len() == 4 && plane.words.iter().all(|w| w.bits() == 8) =>
-            {
-                Some(Self::Bgra8)
-            }
-            _ => None,
-        }
-    }
 }
 
-impl TryFrom<&PixelFormat> for VarDctOutputFormat {
-    type Error = ();
+impl TryFrom<&PixelFormat> for PackedU8Format {
+    type Error = crate::vardct_engine::VarDctDecodeError;
 
     fn try_from(format: &PixelFormat) -> Result<Self, Self::Error> {
-        Self::try_from_pixel_format(format).ok_or(())
+        let candidate = match format.swizzle {
+            Swizzle::XYZ1 => Self::Rgb,
+            Swizzle::XYZW => Self::Rgba,
+            Swizzle::ZYX1 => Self::Bgr,
+            Swizzle::ZYXW => Self::Bgra,
+            _ => return Err(crate::vardct_engine::VarDctDecodeError::UnsupportedOutput),
+        };
+
+        if format == &candidate.pixel_format() {
+            Ok(candidate)
+        } else {
+            Err(crate::vardct_engine::VarDctDecodeError::UnsupportedOutput)
+        }
     }
 }
 
@@ -182,7 +151,7 @@ pub struct VarDctOutputConfig {
     pub width: u32,
     /// Logical pixel height.
     pub height: u32,
-    pub format: VarDctOutputFormat,
+    pub(crate) format: PackedU8Format,
     pub transform: VarDctOutputTransform,
 }
 
@@ -203,7 +172,7 @@ pub struct VarDctOutputInputs<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctOutputMemoryPlan {
     /// Color and packing format.
-    pub format: VarDctOutputFormat,
+    pub(crate) format: PackedU8Format,
     /// Externally visible byte count.
     pub logical_output_bytes: u64,
     /// GPU storage allocation/binding requirement, rounded up to a `u32`.
@@ -223,10 +192,10 @@ impl VarDctOutputMemoryPlan {
     ///
     /// Returns a typed error for empty geometry, arithmetic overflow, or an
     /// image whose packed addressing cannot be represented by WGSL `u32`.
-    pub fn new(
+    pub(crate) fn new(
         width: u32,
         height: u32,
-        format: VarDctOutputFormat,
+        format: PackedU8Format,
     ) -> Result<Self, VarDctOutputError> {
         let (pixel_count, logical_output_bytes, output_storage_bytes) =
             packed_geometry(width, height, format)?;
@@ -271,20 +240,21 @@ impl VarDctOutputPlan {
     ///
     /// Returns a typed limit or arithmetic error if the output cannot be
     /// represented by a single WebGPU storage binding and dispatch.
-    pub fn for_limits(
+    #[cfg(test)]
+    pub(crate) fn for_limits(
         width: u32,
         height: u32,
-        format: VarDctOutputFormat,
+        format: PackedU8Format,
         limits: &wgpu::Limits,
     ) -> Result<Self, VarDctOutputError> {
         Self::for_limits_with_variant(width, height, format, limits, DEFAULT_VARIANT)
     }
 
     /// Plans a dispatch using the selected 1D workgroup variant.
-    pub fn for_limits_with_variant(
+    pub(crate) fn for_limits_with_variant(
         width: u32,
         height: u32,
-        format: VarDctOutputFormat,
+        format: PackedU8Format,
         limits: &wgpu::Limits,
         variant: KernelVariant,
     ) -> Result<Self, VarDctOutputError> {
@@ -296,15 +266,24 @@ impl VarDctOutputPlan {
                 available: limits.max_uniform_buffer_binding_size,
             });
         }
-        validate_workgroup_variant(variant, limits)?;
-
+        let (workgroup_x, workgroup_y) = variant.workgroup_size();
+        if workgroup_y != 1 {
+            return Err(VarDctOutputError::WorkgroupShape { variant });
+        }
+        variant
+            .validate_for("vardct_output", limits, 0)
+            .map_err(|_| VarDctOutputError::WorkgroupSizeLimit {
+                required: workgroup_x,
+                max_invocations: limits.max_compute_invocations_per_workgroup,
+                max_size_x: limits.max_compute_workgroup_size_x,
+            })?;
         let output_words_u64 = match format {
-            VarDctOutputFormat::Rgba8 | VarDctOutputFormat::Bgra8 => u64::from(width)
+            PackedU8Format::Rgba | PackedU8Format::Bgra => u64::from(width)
                 .checked_mul(u64::from(height))
                 .ok_or(VarDctOutputError::ArithmeticOverflow {
                     field: "output pixels",
                 })?,
-            VarDctOutputFormat::Rgb8 | VarDctOutputFormat::Bgr8 => {
+            PackedU8Format::Rgb | PackedU8Format::Bgr => {
                 memory.output_storage_bytes / OUTPUT_WORD_BYTES
             }
         };
@@ -782,7 +761,7 @@ fn validate_inverse_opsin(inverse: VarDctInverseOpsin) -> Result<(), VarDctOutpu
 fn packed_geometry(
     width: u32,
     height: u32,
-    format: VarDctOutputFormat,
+    format: PackedU8Format,
 ) -> Result<(u32, u64, u64), VarDctOutputError> {
     if width == 0 || height == 0 {
         return Err(VarDctOutputError::EmptyExtent { width, height });
@@ -957,39 +936,34 @@ mod tests {
 
     #[test]
     fn memory_plan_separates_logical_storage_and_transient_bytes() {
-        let memory = VarDctOutputMemoryPlan::new(5, 3, VarDctOutputFormat::Rgb8).unwrap();
+        let memory = VarDctOutputMemoryPlan::new(5, 3, PackedU8Format::Rgb).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
         assert_eq!(memory.uniform_bytes, 176);
         assert_eq!(memory.transient_bytes, 176);
         assert_eq!(memory.total_bytes, 224);
 
-        let rgba_memory = VarDctOutputMemoryPlan::new(5, 3, VarDctOutputFormat::Rgba8).unwrap();
+        let rgba_memory = VarDctOutputMemoryPlan::new(5, 3, PackedU8Format::Rgba).unwrap();
         assert_eq!(rgba_memory.logical_output_bytes, 60);
         assert_eq!(rgba_memory.output_storage_bytes, 60);
         assert_eq!(rgba_memory.total_bytes, 236);
 
-        let plan = VarDctOutputPlan::for_limits(5, 3, VarDctOutputFormat::Rgb8, &generous_limits())
-            .unwrap();
+        let plan =
+            VarDctOutputPlan::for_limits(5, 3, PackedU8Format::Rgb, &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
         assert_eq!((plan.workgroups_x, plan.workgroups_y), (1, 1));
         assert_eq!(plan.dispatch_width, WORKGROUP_SIZE);
 
         let rgba_plan =
-            VarDctOutputPlan::for_limits(5, 3, VarDctOutputFormat::Rgba8, &generous_limits())
-                .unwrap();
+            VarDctOutputPlan::for_limits(5, 3, PackedU8Format::Rgba, &generous_limits()).unwrap();
         assert_eq!(rgba_plan.output_words, 15);
     }
 
     #[test]
     fn sixteen_k_output_is_split_across_dispatch_rows() {
-        let plan = VarDctOutputPlan::for_limits(
-            16_384,
-            16_384,
-            VarDctOutputFormat::Rgb8,
-            &generous_limits(),
-        )
-        .unwrap();
+        let plan =
+            VarDctOutputPlan::for_limits(16_384, 16_384, PackedU8Format::Rgb, &generous_limits())
+                .unwrap();
         assert_eq!(plan.memory.logical_output_bytes, 805_306_368);
         assert_eq!(plan.output_words, 201_326_592);
         assert_eq!(plan.workgroups_x, 65_535);
@@ -1004,7 +978,7 @@ mod tests {
     #[test]
     fn invalid_geometry_and_opsin_have_stable_typed_errors() {
         assert_eq!(
-            VarDctOutputMemoryPlan::new(0, 7, VarDctOutputFormat::Rgb8).unwrap_err(),
+            VarDctOutputMemoryPlan::new(0, 7, PackedU8Format::Rgb).unwrap_err(),
             VarDctOutputError::EmptyExtent {
                 width: 0,
                 height: 7
@@ -1020,7 +994,7 @@ mod tests {
             VarDctOutputPlan::for_limits_with_variant(
                 1,
                 1,
-                VarDctOutputFormat::Rgb8,
+                PackedU8Format::Rgb,
                 &wgpu::Limits::default(),
                 KernelVariant::Tile8x8,
             )
@@ -1152,7 +1126,7 @@ mod tests {
                     config: VarDctOutputConfig {
                         width: 3,
                         height: 1,
-                        format: VarDctOutputFormat::Rgb8,
+                        format: PackedU8Format::Rgb,
                         transform: VarDctOutputTransform::Xyb(inverse_opsin()),
                     },
                 },
@@ -1205,7 +1179,7 @@ mod tests {
             y_plane: &[f32],
             cb_plane: &[f32],
             cr_plane: &[f32],
-            format: VarDctOutputFormat,
+            format: PackedU8Format,
         ) -> Vec<u8> {
             let capacity =
                 (width as usize) * (height as usize) * (format.bytes_per_pixel() as usize);
@@ -1224,16 +1198,16 @@ mod tests {
                     let g_u8 = (g * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
                     let b_u8 = (b * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
                     match format {
-                        VarDctOutputFormat::Rgb8 => {
+                        PackedU8Format::Rgb => {
                             out.extend_from_slice(&[r_u8, g_u8, b_u8]);
                         }
-                        VarDctOutputFormat::Rgba8 => {
+                        PackedU8Format::Rgba => {
                             out.extend_from_slice(&[r_u8, g_u8, b_u8, 255]);
                         }
-                        VarDctOutputFormat::Bgr8 => {
+                        PackedU8Format::Bgr => {
                             out.extend_from_slice(&[b_u8, g_u8, r_u8]);
                         }
-                        VarDctOutputFormat::Bgra8 => {
+                        PackedU8Format::Bgra => {
                             out.extend_from_slice(&[b_u8, g_u8, r_u8, 255]);
                         }
                     }
@@ -1250,10 +1224,10 @@ mod tests {
         ];
 
         let formats = [
-            VarDctOutputFormat::Rgb8,
-            VarDctOutputFormat::Rgba8,
-            VarDctOutputFormat::Bgr8,
-            VarDctOutputFormat::Bgra8,
+            PackedU8Format::Rgb,
+            PackedU8Format::Rgba,
+            PackedU8Format::Bgr,
+            PackedU8Format::Bgra,
         ];
 
         use std::num::NonZeroU64;
@@ -1388,5 +1362,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn packed_u8_format_strictly_rejects_non_canonical_descriptors() {
+        use jxl_gpu_formats::{
+            Channel, ColorRange, ColorSpace, ColorSpecification, PackingField, PackingWord,
+            TransferFunction,
+        };
+
+        let canonical_rgb = PackedU8Format::Rgb.pixel_format();
+        assert_eq!(
+            PackedU8Format::try_from(&canonical_rgb).unwrap(),
+            PackedU8Format::Rgb
+        );
+
+        let canonical_rgba = PackedU8Format::Rgba.pixel_format();
+        assert_eq!(
+            PackedU8Format::try_from(&canonical_rgba).unwrap(),
+            PackedU8Format::Rgba
+        );
+
+        let canonical_bgr = PackedU8Format::Bgr.pixel_format();
+        assert_eq!(
+            PackedU8Format::try_from(&canonical_bgr).unwrap(),
+            PackedU8Format::Bgr
+        );
+
+        let canonical_bgra = PackedU8Format::Bgra.pixel_format();
+        assert_eq!(
+            PackedU8Format::try_from(&canonical_bgra).unwrap(),
+            PackedU8Format::Bgra
+        );
+
+        // 1. Display-P3 RGB8
+        let p3 = PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::DisplayP3,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        );
+        assert!(PackedU8Format::try_from(&p3).is_err());
+
+        // 2. BT.2020 RGB8
+        let bt2020 = PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt2020,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        );
+        assert!(PackedU8Format::try_from(&bt2020).is_err());
+
+        // 3. Linear RGB8
+        let linear = PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Linear,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        );
+        assert!(PackedU8Format::try_from(&linear).is_err());
+
+        // 4. Limited-range RGB8
+        let limited = PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Limited,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        );
+        assert!(PackedU8Format::try_from(&limited).is_err());
+
+        // 5. ColorSpecification::Default
+        let mut default_spec = canonical_rgb.clone();
+        default_spec.color_spec = ColorSpecification::Default;
+        assert!(PackedU8Format::try_from(&default_spec).is_err());
+
+        // 6. ColorSpecification::Undefined
+        let mut undefined_spec = canonical_rgb.clone();
+        undefined_spec.color_spec = ColorSpecification::Undefined;
+        assert!(PackedU8Format::try_from(&undefined_spec).is_err());
+
+        // 7. Planar RGB8
+        let planar = PixelFormat::rgb8(
+            RgbChannelOrder::Rgb,
+            true,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        );
+        assert!(PackedU8Format::try_from(&planar).is_err());
+
+        // 8. Channel field is X/X/X in 3-word format
+        let mut xxx = canonical_rgb.clone();
+        xxx.planes[0].words = vec![
+            PackingWord::channel(Channel::X, 8),
+            PackingWord::channel(Channel::X, 8),
+            PackingWord::channel(Channel::X, 8),
+        ];
+        assert!(PackedU8Format::try_from(&xxx).is_err());
+
+        // 9. Padding in 8-bit word
+        let mut padding = canonical_rgb.clone();
+        padding.planes[0].words = vec![
+            PackingWord::channel(Channel::X, 8),
+            PackingWord::channel(Channel::Y, 8),
+            PackingWord {
+                fields: vec![PackingField::padding(8)],
+            },
+        ];
+        assert!(PackedU8Format::try_from(&padding).is_err());
+
+        // 10. Channel order in words does not match swizzle (e.g. ZYX words with XYZ1 swizzle)
+        let mut mismatched_words = canonical_rgb.clone();
+        mismatched_words.planes[0].words = vec![
+            PackingWord::channel(Channel::Z, 8),
+            PackingWord::channel(Channel::Y, 8),
+            PackingWord::channel(Channel::X, 8),
+        ];
+        assert!(PackedU8Format::try_from(&mismatched_words).is_err());
     }
 }

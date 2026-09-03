@@ -11,17 +11,32 @@ use jxl::api::{
     JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlPixelFormat, ProcessingResult, states,
 };
 use jxl_gpu_bitstream::{BitWriter, FiniteF16};
+use jxl_gpu_formats::{
+    ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, PixelFormat,
+    RgbChannelOrder, TransferFunction, YcbcrEncoding,
+};
 use jxl_gpu_formats::{ImageLayout, PitchLinearPlaneLayout};
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     AdapterFingerprint, AutotuneProfile, ImageReadbackPipeline, KernelPolicy, KernelVariant,
     TunedKernel, WgpuBackend, WgpuBackendConfig,
 };
-use jxl_wgpu_decode::{
-    GpuDecoder, GpuOutputRequest, VarDctOutputFormat, vardct::packet::BoundedVarDctPacketPlan,
-    vardct_output_format,
-};
+use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, vardct::packet::BoundedVarDctPacketPlan};
 use wgpu::util::DeviceExt;
+
+fn canonical_rgb8() -> PixelFormat {
+    PixelFormat::rgb8(
+        RgbChannelOrder::Rgb,
+        false,
+        ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::Bt709,
+            encoding: YcbcrEncoding::Undefined,
+            transfer: TransferFunction::Srgb,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        }),
+    )
+}
 
 use crate::prefix::{PrefixCode, RAW_SYMBOLS};
 
@@ -1186,7 +1201,7 @@ fn custom_lf_metadata_gpu_encoder_and_decoders_agree() {
     let mut session = gpu_decoder
         .open(
             &codestream,
-            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+            GpuOutputRequest::color(canonical_rgb8()).unwrap(),
         )
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
@@ -1390,7 +1405,7 @@ fn tiled_dct8_rust_jxl_djxl_and_cjxl_oracles_cover_group_edges() {
         let mut gpu_session = gpu_decoder
             .open(
                 &codestream,
-                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
+                GpuOutputRequest::color(canonical_rgb8()).unwrap(),
             )
             .unwrap();
         let gpu_frame = gpu_session.next_frame().unwrap().unwrap();

@@ -15,7 +15,6 @@ mod tests;
 mod types;
 mod window_plan;
 
-pub use crate::vardct_output::VarDctOutputFormat;
 pub use execution::{VarDctDecodeSession, VarDctPendingFrame};
 pub use pipeline::VarDctSubmissionEngine;
-pub use types::{VarDctDecodeError, VarDctDecodeMemoryStats, vardct_output_format};
+pub use types::{VarDctDecodeError, VarDctDecodeMemoryStats};
