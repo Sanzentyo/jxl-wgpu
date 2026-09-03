@@ -1,9 +1,10 @@
 use jxl_gpu_formats::LayoutError;
 use jxl_wgpu::{
-    MemoryBudgetError, ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan,
-    ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
-    ResidentImageUpsampleError, ResidentImageUpsampleMemoryPlan, ResidentImageUpsampleWeights,
-    ResidentVarDctError, ResidentVarDctMemoryPlan, SubmissionPollerError,
+    ImageUpsampleDispatchMemoryPlan, MemoryBudgetError, PreparedUpsamplingMemoryPlan,
+    ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan, ResidentEpfError,
+    ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
+    ResidentImageUpsampleError, ResidentImageUpsampleWeights, ResidentVarDctError,
+    ResidentVarDctMemoryPlan, SubmissionPollerError,
 };
 use thiserror::Error;
 
@@ -613,12 +614,14 @@ impl VarDctDecodeMemoryStats {
         } else {
             0
         };
-        let frame_upsample_memory = frame_upsampling
-            .map(ResidentImageUpsampleMemoryPlan::new)
-            .transpose()?;
-        let frame_upsample_weight_bytes = frame_upsample_memory.map_or(0, |plan| plan.weight_bytes);
-        let frame_upsample_uniform_bytes =
-            frame_upsample_memory.map_or(0, |plan| plan.uniform_bytes);
+        let frame_upsample_weight_bytes = frame_upsampling
+            .map(|weights| PreparedUpsamplingMemoryPlan::from(weights).storage_bytes)
+            .unwrap_or(0);
+        let frame_upsample_uniform_bytes = if frame_upsampling.is_some() {
+            ImageUpsampleDispatchMemoryPlan::UNIFORM_BYTES
+        } else {
+            0
+        };
         let resident_transient_bytes = checked_sum(
             resident.iter().map(|plan| plan.total_bytes),
             "resident VarDCT transient bytes",

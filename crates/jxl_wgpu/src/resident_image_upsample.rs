@@ -137,6 +137,11 @@ impl ResidentImageUpsampleWeights {
         self.phase_major.len() as u64 * std::mem::size_of::<f32>() as u64
     }
 
+    #[must_use]
+    pub fn memory_plan(&self) -> PreparedUpsamplingMemoryPlan {
+        PreparedUpsamplingMemoryPlan::new(self.storage_bytes())
+    }
+
     /// Prepares the weights GPU buffer once for shared reuse across dispatches.
     pub fn prepare(
         &self,
@@ -176,6 +181,11 @@ impl PreparedUpsamplingWeights {
         self.factor
     }
 
+    #[must_use]
+    pub fn memory_plan(&self) -> PreparedUpsamplingMemoryPlan {
+        PreparedUpsamplingMemoryPlan::new(self.buffer.size())
+    }
+
     pub(crate) fn as_entire_binding(&self) -> wgpu::BindingResource<'_> {
         self.buffer.as_entire_binding()
     }
@@ -207,55 +217,74 @@ pub struct ResidentChannelUpsampleResources {
     _uniform: wgpu::Buffer,
 }
 
-/// Exact retained allocation for one fused image interpolation dispatch.
+/// Exact retained allocation for one prepared GPU upsampling weights buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResidentImageUpsampleMemoryPlan {
-    pub weight_bytes: u64,
-    pub uniform_bytes: u64,
-    pub total_bytes: u64,
+pub struct PreparedUpsamplingMemoryPlan {
+    pub storage_bytes: u64,
 }
 
-impl ResidentImageUpsampleMemoryPlan {
-    pub const UNIFORM_BYTES: u64 = std::mem::size_of::<ResidentImageUpsampleParams>() as u64;
-
-    pub fn new(weights: &ResidentImageUpsampleWeights) -> Result<Self, ResidentImageUpsampleError> {
-        let weight_bytes = weights.storage_bytes();
-        let total_bytes = weight_bytes.checked_add(Self::UNIFORM_BYTES).ok_or(
-            ResidentImageUpsampleError::ArithmeticOverflow {
-                field: "image upsampling retained bytes",
-            },
-        )?;
-        Ok(Self {
-            weight_bytes,
-            uniform_bytes: Self::UNIFORM_BYTES,
-            total_bytes,
-        })
+impl PreparedUpsamplingMemoryPlan {
+    #[must_use]
+    pub const fn new(storage_bytes: u64) -> Self {
+        Self { storage_bytes }
     }
 }
 
-/// Exact retained allocation for one single-plane channel interpolation dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResidentChannelUpsampleMemoryPlan {
-    pub weight_bytes: u64,
-    pub uniform_bytes: u64,
-    pub total_bytes: u64,
+impl From<&ResidentImageUpsampleWeights> for PreparedUpsamplingMemoryPlan {
+    fn from(weights: &ResidentImageUpsampleWeights) -> Self {
+        weights.memory_plan()
+    }
 }
 
-impl ResidentChannelUpsampleMemoryPlan {
+impl From<&PreparedUpsamplingWeights> for PreparedUpsamplingMemoryPlan {
+    fn from(weights: &PreparedUpsamplingWeights) -> Self {
+        weights.memory_plan()
+    }
+}
+
+/// Exact transient uniform allocation for one fused three-plane image interpolation dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageUpsampleDispatchMemoryPlan {
+    pub uniform_bytes: u64,
+}
+
+impl ImageUpsampleDispatchMemoryPlan {
+    pub const UNIFORM_BYTES: u64 = std::mem::size_of::<ResidentImageUpsampleParams>() as u64;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            uniform_bytes: Self::UNIFORM_BYTES,
+        }
+    }
+}
+
+impl Default for ImageUpsampleDispatchMemoryPlan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exact transient uniform allocation for one single-plane channel interpolation dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelUpsampleDispatchMemoryPlan {
+    pub uniform_bytes: u64,
+}
+
+impl ChannelUpsampleDispatchMemoryPlan {
     pub const UNIFORM_BYTES: u64 = std::mem::size_of::<ResidentChannelUpsampleParams>() as u64;
 
-    pub fn new(weights: &ResidentImageUpsampleWeights) -> Result<Self, ResidentImageUpsampleError> {
-        let weight_bytes = weights.storage_bytes();
-        let total_bytes = weight_bytes.checked_add(Self::UNIFORM_BYTES).ok_or(
-            ResidentImageUpsampleError::ArithmeticOverflow {
-                field: "channel upsampling retained bytes",
-            },
-        )?;
-        Ok(Self {
-            weight_bytes,
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
             uniform_bytes: Self::UNIFORM_BYTES,
-            total_bytes,
-        })
+        }
+    }
+}
+
+impl Default for ChannelUpsampleDispatchMemoryPlan {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -878,12 +907,12 @@ mod tests {
     fn memory_plans_account_exact_uniform_sizes() {
         let compact = vec![1.0; 15];
         let weights = ResidentImageUpsampleWeights::new(UpsamplingFactor::X2, &compact).unwrap();
-        let image_plan = ResidentImageUpsampleMemoryPlan::new(&weights).unwrap();
-        let channel_plan = ResidentChannelUpsampleMemoryPlan::new(&weights).unwrap();
+        let weight_plan = PreparedUpsamplingMemoryPlan::from(&weights);
+        let image_plan = ImageUpsampleDispatchMemoryPlan::new();
+        let channel_plan = ChannelUpsampleDispatchMemoryPlan::new();
 
+        assert_eq!(weight_plan.storage_bytes, weights.storage_bytes());
         assert_eq!(image_plan.uniform_bytes, 48);
         assert_eq!(channel_plan.uniform_bytes, 32);
-        assert_eq!(image_plan.total_bytes, weights.storage_bytes() + 48);
-        assert_eq!(channel_plan.total_bytes, weights.storage_bytes() + 32);
     }
 }

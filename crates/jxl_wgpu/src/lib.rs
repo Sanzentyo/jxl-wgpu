@@ -91,10 +91,11 @@ pub use resident_gaborish::{
     ResidentGaborishPipeline, ResidentGaborishWeights,
 };
 pub use resident_image_upsample::{
-    PreparedUpsamplingWeights, ResidentChannelUpsampleInputs, ResidentChannelUpsampleMemoryPlan,
+    ChannelUpsampleDispatchMemoryPlan, ImageUpsampleDispatchMemoryPlan,
+    PreparedUpsamplingMemoryPlan, PreparedUpsamplingWeights, ResidentChannelUpsampleInputs,
     ResidentChannelUpsamplePipeline, ResidentChannelUpsampleResources, ResidentImageUpsampleError,
-    ResidentImageUpsampleInputs, ResidentImageUpsampleMemoryPlan, ResidentImageUpsamplePipeline,
-    ResidentImageUpsampleResources, ResidentImageUpsampleWeights, UpsamplingFactor,
+    ResidentImageUpsampleInputs, ResidentImageUpsamplePipeline, ResidentImageUpsampleResources,
+    ResidentImageUpsampleWeights, UpsamplingFactor,
 };
 pub use resident_vardct::{
     ResidentF32Plane, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,
