@@ -70,7 +70,7 @@ impl VarDctSource {
     }
 
     pub(super) fn staged_lf_submission_count(&self) -> usize {
-        if self.packet.profile.uses_lf_frame {
+        if self.packet.profile.uses_lf_frame() {
             0
         } else {
             self.lf_packet_windows
@@ -88,7 +88,7 @@ impl VarDctSource {
                 // own submission as the resumable HF-global parser discovers it.
                 return 1;
             }
-            if self.packet.profile.uses_lf_frame {
+            if self.packet.profile.uses_lf_frame() {
                 return 2;
             }
             let coefficient_batches = self.hf_coefficients.as_ref().map_or(0, |coefficients| {
@@ -186,7 +186,7 @@ pub(super) fn prepare_source(
         |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
     )?;
     let packet = BoundedVarDctPacketPlan::parse_source(&codestream, profile)?;
-    let adaptive_lf = packet.profile.adaptive_lf;
+    let adaptive_lf = packet.profile.adaptive_lf();
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -211,10 +211,10 @@ pub(super) fn prepare_source(
         blocks_x,
         blocks_y,
         packet.total_task_capacity()?,
-        packet.profile.channel_shifts,
+        packet.profile.channel_shifts(),
     )?;
-    let correlation_width = packet.profile.width.div_ceil(64);
-    let pass_group_dim_blocks = packet.profile.group_dimension.checked_div(8).ok_or(
+    let correlation_width = packet.profile.width().div_ceil(64);
+    let pass_group_dim_blocks = packet.profile.group_dimension().checked_div(8).ok_or(
         VarDctDecodeError::ArithmeticOverflow {
             field: "pass-group block dimension",
         },
@@ -239,7 +239,7 @@ pub(super) fn prepare_source(
         let resource_params = VarDctResourceParams::new(VarDctResourceConfig {
             block_extent: [group_blocks_x, group_blocks_y],
             output_origin: block_origin,
-            channel_shifts: packet.profile.channel_shifts,
+            channel_shifts: packet.profile.channel_shifts(),
             lf_offsets,
             lf_strides: resource_layout.lf_strides,
             apply_chroma_from_luma: packet.profile.uses_chroma_from_luma(),
@@ -276,7 +276,7 @@ pub(super) fn prepare_source(
             quant_offset,
             correlation_offset,
             global_scale: packet.global_scale,
-            channel_shifts: packet.profile.channel_shifts,
+            channel_shifts: packet.profile.channel_shifts(),
             lf_offsets: resource_layout.lf_offsets,
             lf_strides: resource_layout.lf_strides,
             matrix_offsets: resource_layout.matrix_offsets,
@@ -317,7 +317,7 @@ pub(super) fn prepare_source(
         .iter()
         .map(|group| group.artifact_layout)
         .collect::<Vec<_>>();
-    let frame_upsampling = match packet.profile.upsampling {
+    let frame_upsampling = match packet.profile.upsampling() {
         1 => None,
         factor => {
             let factor = UpsamplingFactor::try_from(factor).map_err(|_| {
@@ -352,20 +352,20 @@ pub(super) fn prepare_source(
         }
     };
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
-        packet.profile.presentation_width,
-        packet.profile.presentation_height,
+        packet.profile.presentation_width(),
+        packet.profile.presentation_height(),
         output_format,
         &backend.device().limits(),
         options.output_variant,
     )?;
     let layout = ImageLayout::packed(
         Extent2d::new(
-            packet.profile.presentation_width,
-            packet.profile.presentation_height,
+            packet.profile.presentation_width(),
+            packet.profile.presentation_height(),
         ),
         output_format.pixel_format(),
     )?;
-    let (output_transform, quant_biases) = match packet.profile.color_transform {
+    let (output_transform, quant_biases) = match packet.profile.color_transform() {
         VarDctColorTransform::Xyb => {
             let opsin = inventory
                 .image_header
@@ -396,7 +396,7 @@ pub(super) fn prepare_source(
                 if gaborish.is_some() || epf.is_some() || frame_upsampling.is_some() {
                     [VarDctChannelShift::default(); 3]
                 } else {
-                    packet.profile.channel_shifts
+                    packet.profile.channel_shifts()
                 };
             (
                 VarDctOutputTransform::Ycbcr { channel_shifts },
@@ -424,7 +424,7 @@ pub(super) fn prepare_source(
                 .transpose()?
                 .flatten();
             let combined_packet_windows = (!staged_local_trees
-                && !packet.profile.uses_lf_frame
+                && !packet.profile.uses_lf_frame()
                 && packet.pending_raw_hf_dequant_side_image().is_none())
             .then(|| {
                 CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
@@ -504,7 +504,7 @@ pub(super) fn prepare_source(
     };
     if packet.requires_hf_global_staging()
         && combined_packet_windows.is_none()
-        && !packet.profile.uses_lf_frame
+        && !packet.profile.uses_lf_frame()
     {
         for (packet_group, group) in packet.groups.iter().zip(&mut groups) {
             group.control = packet_group.lf_stage_control(&packet)?;
@@ -517,7 +517,7 @@ pub(super) fn prepare_source(
         &groups,
         hf_coefficients.as_ref(),
     )?;
-    let frame_name = packet.profile.frame_name.clone();
+    let frame_name = packet.profile.frame_name().to_string();
     Ok(VarDctSource {
         codestream,
         packet,
@@ -617,7 +617,7 @@ fn validate_device_limits(
         })
         .unwrap_or(0);
     let modular_metadata_binding_bytes =
-        if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
+        if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame() {
             packet
                 .groups
                 .iter()
@@ -678,7 +678,7 @@ fn validate_device_limits(
             } else {
                 let shifted = packet
                     .profile
-                    .channel_shifts
+                    .channel_shifts()
                     .into_iter()
                     .filter(|shift| shift.is_subsampled())
                     .count() as u64;

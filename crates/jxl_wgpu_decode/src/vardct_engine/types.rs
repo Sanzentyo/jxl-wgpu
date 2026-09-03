@@ -310,7 +310,7 @@ impl VarDctDecodeMemoryStats {
             }
         })?)?;
         let modular_metadata_words =
-            if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
+            if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame() {
                 packet.groups.iter().try_fold(0_u64, |total, group| {
                     let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
                         VarDctDecodeError::ArithmeticOverflow {
@@ -479,13 +479,13 @@ impl VarDctDecodeMemoryStats {
                 field: "LF temporary bytes",
             },
         )?;
-        let lf_temporary_bytes = if packet.profile.uses_lf_frame || !adaptive_lf_smoothing {
+        let lf_temporary_bytes = if packet.profile.uses_lf_frame() || !adaptive_lf_smoothing {
             0
         } else {
             lf_temporary_bytes
         };
         let resource_bytes = resource.bytes();
-        let resource_uniform_bytes = if packet.profile.uses_lf_frame {
+        let resource_uniform_bytes = if packet.profile.uses_lf_frame() {
             0
         } else {
             group_count
@@ -494,7 +494,7 @@ impl VarDctDecodeMemoryStats {
                     field: "resource uniform bytes",
                 })?
         };
-        let progressive_dc_pack_uniform_bytes = if packet.profile.uses_lf_frame {
+        let progressive_dc_pack_uniform_bytes = if packet.profile.uses_lf_frame() {
             std::mem::size_of::<ProgressiveDcPackParams>() as u64
         } else {
             0
@@ -522,7 +522,7 @@ impl VarDctDecodeMemoryStats {
                 field: "artifact uniform bytes",
             })?;
         let [blocks_x, blocks_y] = packet.block_extent();
-        let resident_plane_bytes = packet.profile.channel_shifts.map(|shift| {
+        let resident_plane_bytes = packet.profile.channel_shifts().map(|shift| {
             u64::from(blocks_x >> shift.horizontal)
                 .checked_mul(8)
                 .and_then(|width| {
@@ -552,7 +552,7 @@ impl VarDctDecodeMemoryStats {
             })?;
         let shifted_channel_count = packet
             .profile
-            .channel_shifts
+            .channel_shifts()
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
@@ -606,8 +606,8 @@ impl VarDctDecodeMemoryStats {
                 field: "EPF filter uniform bytes",
             })?;
         let frame_upsample_image_bytes = if frame_upsampling.is_some() {
-            u64::from(packet.profile.presentation_width)
-                .checked_mul(u64::from(packet.profile.presentation_height))
+            u64::from(packet.profile.presentation_width())
+                .checked_mul(u64::from(packet.profile.presentation_height()))
                 .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<f32>() as u64))
                 .and_then(|plane| plane.checked_mul(3))
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -781,13 +781,13 @@ impl DeferredHfCoefficientLayout {
         if !packet.requires_deferred_hf_coefficients() {
             return Ok(None);
         }
-        let pass_group_count = usize::try_from(packet.profile.group_count).map_err(|_| {
+        let pass_group_count = usize::try_from(packet.profile.group_count()).map_err(|_| {
             VarDctDecodeError::ArithmeticOverflow {
                 field: "deferred HF pass-group count",
             }
         })?;
         let mut local_counts = vec![0_u64; packet.groups.len()];
-        for global_group_index in 0..packet.profile.group_count {
+        for global_group_index in 0..packet.profile.group_count() {
             let lf_group = packet
                 .profile
                 .low_frequency_group_index_for_pass_group(global_group_index)
@@ -812,9 +812,9 @@ impl DeferredHfCoefficientLayout {
         }
         let max_group_blocks = packet
             .profile
-            .group_dimension
+            .group_dimension()
             .div_ceil(8)
-            .checked_mul(packet.profile.group_dimension.div_ceil(8))
+            .checked_mul(packet.profile.group_dimension().div_ceil(8))
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "deferred HF pass-group block count",
             })?;

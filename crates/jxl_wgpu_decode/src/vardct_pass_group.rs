@@ -188,9 +188,9 @@ impl HfCoefficientExecutionPlan {
                 field: "pass-group count",
             }
         })?;
-        if u64::from(group_count) != packet.profile.group_count {
+        if u64::from(group_count) != packet.profile.group_count() {
             return Err(HfCoefficientPlanError::PassGroupCount {
-                expected: packet.profile.group_count,
+                expected: packet.profile.group_count(),
                 actual: u64::from(group_count),
             });
         }
@@ -287,7 +287,7 @@ impl HfCoefficientExecutionPlan {
                     coeff_shift: 0,
                     global_group_index,
                     block_context,
-                    channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
+                    channel_shifts: packet.profile.channel_shifts().into_iter().enumerate().fold(
                         0u32,
                         |packed, (channel, shift)| {
                             packed

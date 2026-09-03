@@ -1831,10 +1831,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                (packet.profile.width, packet.profile.height),
+                (packet.profile.width(), packet.profile.height()),
                 expected_extent
             );
-            assert!(packet.profile.uses_lf_frame);
+            assert!(packet.profile.uses_lf_frame());
             assert!(
                 packet
                     .groups

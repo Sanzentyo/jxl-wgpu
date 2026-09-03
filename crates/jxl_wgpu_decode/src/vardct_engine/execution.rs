@@ -106,7 +106,7 @@ impl VarDctDecodeSession {
             .source
             .as_mut()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
-        if !source.packet.profile.uses_lf_frame {
+        if !source.packet.profile.uses_lf_frame() {
             return Err(VarDctDecodeError::UnexpectedProgressiveDcSource);
         }
         let [expected_width, expected_height] = source.packet.block_extent();
@@ -2238,7 +2238,7 @@ fn submit_vardct(
     let staged_local_trees = source.packet.requires_local_tree_staging();
     let staged_hf_global =
         source.packet.requires_hf_global_staging() && source.combined_packet_windows.is_none();
-    let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame;
+    let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame();
     let modular_metadata = if group_specific_metadata {
         source
             .packet
@@ -2462,7 +2462,7 @@ fn submit_vardct(
         let shifted = source
             .packet
             .profile
-            .channel_shifts
+            .channel_shifts()
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
@@ -2472,7 +2472,7 @@ fn submit_vardct(
             .checked_div(shifted)
             .unwrap_or(0);
         std::array::from_fn(|channel| {
-            if source.packet.profile.channel_shifts[channel].is_subsampled() {
+            if source.packet.profile.channel_shifts()[channel].is_subsampled() {
                 storage(
                     labels[channel],
                     full_plane_bytes,
@@ -2817,7 +2817,7 @@ fn submit_vardct(
                 control: &buffers.packet_control,
                 modular_params: &buffers.modular_params,
             };
-            if source.packet.profile.uses_lf_frame {
+            if source.packet.profile.uses_lf_frame() {
                 if staged_hf_global {
                     pipelines
                         .packet
@@ -2865,7 +2865,7 @@ fn submit_vardct(
     let [blocks_x, blocks_y] = source.packet.block_extent();
     let external_lf = source.external_lf.clone();
     let (resource_uniforms, adaptive_lf_uniform, progressive_dc_uniform) =
-        if source.packet.profile.uses_lf_frame {
+        if source.packet.profile.uses_lf_frame() {
             let planes = external_lf
                 .as_ref()
                 .ok_or(VarDctDecodeError::MissingProgressiveDcSource)?;
@@ -3102,8 +3102,8 @@ fn submit_vardct(
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "padded output height",
         })?;
-    let correlation_width = source.packet.profile.width.div_ceil(64);
-    let correlation_height = source.packet.profile.height.div_ceil(64);
+    let correlation_width = source.packet.profile.width().div_ceil(64);
+    let correlation_height = source.packet.profile.height().div_ceil(64);
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
     for ((packet_group, group), buffers) in source
         .packet
@@ -3123,7 +3123,7 @@ fn submit_vardct(
                     &resident_planes,
                     padded_width,
                     padded_height,
-                    source.packet.profile.channel_shifts,
+                    source.packet.profile.channel_shifts(),
                 )?,
                 indirect: &buffers.artifact,
                 indirect_base_offset: u64::from(group.artifact_layout.indirect_offset_words) * 4,
@@ -3143,12 +3143,12 @@ fn submit_vardct(
             },
         )?);
     }
-    let image_width = source.packet.profile.width;
-    let image_height = source.packet.profile.height;
+    let image_width = source.packet.profile.width();
+    let image_height = source.packet.profile.height();
     let mut component_upsample_uniforms = Vec::new();
     if let Some(upsampled) = &component_upsample_planes {
         for channel in 0..3 {
-            let shift = source.packet.profile.channel_shifts[channel];
+            let shift = source.packet.profile.channel_shifts()[channel];
             if !shift.is_subsampled() {
                 continue;
             }
@@ -3262,8 +3262,8 @@ fn submit_vardct(
             frame_upsample_planes.as_ref(),
         ) {
             let prepared = weights.prepare(device)?;
-            let presentation_width = source.packet.profile.presentation_width;
-            let presentation_height = source.packet.profile.presentation_height;
+            let presentation_width = source.packet.profile.presentation_width();
+            let presentation_height = source.packet.profile.presentation_height();
             let inputs =
                 resident_image_planes(restored_planes, image_width, image_height, padded_width)?;
             let outputs = [
@@ -3305,15 +3305,15 @@ fn submit_vardct(
     let presentation_shifts = if components_are_full_resolution {
         [crate::vardct_frontend::VarDctChannelShift::default(); 3]
     } else {
-        source.packet.profile.channel_shifts
+        source.packet.profile.channel_shifts()
     };
     let (output_geometry, output_strides) = if source.frame_upsampling.is_some() {
         (
             [[
-                source.packet.profile.presentation_width,
-                source.packet.profile.presentation_height,
+                source.packet.profile.presentation_width(),
+                source.packet.profile.presentation_height(),
             ]; 3],
-            [source.packet.profile.presentation_width; 3],
+            [source.packet.profile.presentation_width(); 3],
         )
     } else {
         let presentation_geometry = presentation_shifts.map(|shift| {
@@ -3368,8 +3368,8 @@ fn submit_vardct(
             ],
             output: resident_binding(&output)?,
             config: VarDctOutputConfig {
-                width: source.packet.profile.presentation_width,
-                height: source.packet.profile.presentation_height,
+                width: source.packet.profile.presentation_width(),
+                height: source.packet.profile.presentation_height(),
                 format: source.output_format,
                 transform: output_transform,
             },
@@ -3500,7 +3500,7 @@ fn submit_vardct(
             })?;
         expected_groups.push(VarDctGroupValidation {
             uniform_transform: source.packet.uniform_transform,
-            expected_lf_samples: if source.packet.profile.uses_lf_frame {
+            expected_lf_samples: if source.packet.profile.uses_lf_frame() {
                 0
             } else {
                 group_source
@@ -3534,8 +3534,8 @@ fn submit_vardct(
     let layout = source.layout.clone();
     let frame_name = source.frame_name.clone();
     let progressive_dc_extent = Extent2d {
-        width: source.packet.profile.width,
-        height: source.packet.profile.height,
+        width: source.packet.profile.width(),
+        height: source.packet.profile.height(),
     };
     let mut pending = VarDctPendingFrame {
         backend: backend.clone(),
@@ -3582,7 +3582,7 @@ fn submit_vardct(
             let submission =
                 submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
             if staged_hf_global || source.packet.pending_raw_hf_dequant_side_image().is_some() {
-                if source.packet.profile.uses_lf_frame {
+                if source.packet.profile.uses_lf_frame() {
                     (submission, None, deferred_commands)
                 } else {
                     let deferred = deferred_commands.ok_or(VarDctDecodeError::EngineContract {

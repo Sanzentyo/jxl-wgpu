@@ -938,40 +938,61 @@ pub enum VarDctSectionLayout {
     },
 }
 
+/// Precomputed, validated geometry and stream metadata for one LF group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedLfGroup {
+    pub index: u32,
+    pub section: BitRange,
+    pub rect: VarDctGroupRect,
+    pub padded_block_extent: [u32; 2],
+    pub lf_stream_index: u32,
+    pub hf_stream_index: u32,
+}
+
+/// Precomputed section location for one pass group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedPassGroup {
+    pub group_index: u32,
+    pub pass_index: u32,
+    pub section: BitRange,
+}
+
 /// Validated first-stage VarDCT profile. Construction is the capability check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardVarDctProfile {
-    pub(crate) capability: VarDctFrontendCapability,
+    capability: VarDctFrontendCapability,
     /// Encoded color-sample width before frame upsampling.
-    pub(crate) width: u32,
+    width: u32,
     /// Encoded color-sample height before frame upsampling.
-    pub(crate) height: u32,
+    height: u32,
     /// Final color-frame width after frame upsampling.
-    pub(crate) presentation_width: u32,
+    presentation_width: u32,
     /// Final color-frame height after frame upsampling.
-    pub(crate) presentation_height: u32,
+    presentation_height: u32,
     /// Frame upsampling factor applied after restoration and before color conversion.
-    pub(crate) upsampling: u32,
-    pub(crate) bits_per_sample: u32,
-    pub(crate) color_transform: VarDctColorTransform,
+    upsampling: u32,
+    bits_per_sample: u32,
+    color_transform: VarDctColorTransform,
     /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
-    pub(crate) channel_shifts: [VarDctChannelShift; 3],
+    channel_shifts: [VarDctChannelShift; 3],
     /// Raw JPEG component sampling selectors in Cb/X, Y, Cr/B order.
-    pub(crate) jpeg_upsampling: [u32; 3],
+    jpeg_upsampling: [u32; 3],
     /// Axis padding required by the JPEG component sampling factors before channel shifts.
-    pub(crate) jpeg_block_alignment: [u32; 2],
-    pub(crate) group_dimension: u32,
-    pub(crate) group_count: u64,
-    pub(crate) low_frequency_group_count: u64,
+    jpeg_block_alignment: [u32; 2],
+    group_dimension: u32,
+    group_count: u64,
+    low_frequency_group_count: u64,
     /// Resolved Adaptive LF smoothing execution plan.
-    pub(crate) adaptive_lf: AdaptiveLfPlan,
+    adaptive_lf: AdaptiveLfPlan,
     /// Earlier progressive-DC frame supplies the LF image instead of this frame's LF entropy.
-    pub(crate) uses_lf_frame: bool,
+    uses_lf_frame: bool,
     /// Progressive-DC level represented by this frame; zero is the final image level.
-    pub(crate) lf_level: u32,
+    lf_level: u32,
     /// Validated UTF-8 frame name preserved in authoritative [`crate::FrameMetadata`].
-    pub(crate) frame_name: String,
-    pub(crate) sections: VarDctSectionLayout,
+    frame_name: String,
+    sections: VarDctSectionLayout,
+    lf_groups: Box<[ValidatedLfGroup]>,
+    pass_groups: Box<[ValidatedPassGroup]>,
 }
 
 /// Pixel-space rectangle owned by one LF or pass group.
@@ -1030,6 +1051,91 @@ impl StandardVarDctProfile {
         } else {
             (width, height, 1)
         };
+        let group_dimension = 128u32 << frame.group_size_shift;
+        let jpeg_shifts = jpeg_channel_shifts(frame.jpeg_upsampling);
+        let jpeg_alignment = jpeg_block_alignment(frame.jpeg_upsampling);
+        let adaptive_lf = if frame.flags & 0x80 == 0 && !frame.uses_lf_frame() {
+            AdaptiveLfPlan::ExecutePacked444
+        } else {
+            AdaptiveLfPlan::Skip
+        };
+        let uses_lf_frame = frame.uses_lf_frame();
+        let lf_level = frame.lf_level;
+        let low_frequency_group_count = frame.low_frequency_group_count;
+        let group_count = frame.group_count;
+        let color_transform = if frame.do_ycbcr {
+            VarDctColorTransform::Ycbcr
+        } else {
+            VarDctColorTransform::Xyb
+        };
+
+        let lf_dimension = group_dimension
+            .checked_mul(8)
+            .ok_or(VarDctFrontendError::Unsupported {
+                feature: UnsupportedVarDctFeature::ImageDimensions,
+            })?;
+        let lf_group_sections: &[BitRange] = match &sections {
+            VarDctSectionLayout::Single { packet } => std::slice::from_ref(packet),
+            VarDctSectionLayout::Sections { lf_groups, .. } => lf_groups.as_slice(),
+        };
+        let mut validated_lf_groups = Vec::with_capacity(lf_group_sections.len());
+        for (index_usize, &section) in lf_group_sections.iter().enumerate() {
+            let index = u32::try_from(index_usize).map_err(|_| VarDctFrontendError::Unsupported {
+                feature: UnsupportedVarDctFeature::ImageDimensions,
+            })?;
+            let rect = group_rect(
+                width,
+                height,
+                lf_dimension,
+                u64::from(index),
+                low_frequency_group_count,
+            )?;
+            let padded_block_extent = [
+                align_up_power_of_two(rect.width.div_ceil(8), jpeg_alignment[0])?,
+                align_up_power_of_two(rect.height.div_ceil(8), jpeg_alignment[1])?,
+            ];
+            let lf_stream_index = checked_stream_index(
+                u64::from(index),
+                low_frequency_group_count,
+                1,
+                0,
+            )?;
+            let hf_stream_index = checked_stream_index(
+                u64::from(index),
+                low_frequency_group_count,
+                1,
+                2,
+            )?;
+            validated_lf_groups.push(ValidatedLfGroup {
+                index,
+                section,
+                rect,
+                padded_block_extent,
+                lf_stream_index,
+                hf_stream_index,
+            });
+        }
+        let lf_groups: Box<[ValidatedLfGroup]> = validated_lf_groups.into_boxed_slice();
+
+        let pass_group_sections: &[BitRange] = match &sections {
+            VarDctSectionLayout::Single { .. } => &[][..],
+            VarDctSectionLayout::Sections { pass_groups, .. } => pass_groups.as_slice(),
+        };
+        let mut validated_pass_groups = Vec::with_capacity(pass_group_sections.len());
+        for (group_index_usize, &section) in pass_group_sections.iter().enumerate() {
+            let group_index = u32::try_from(group_index_usize).map_err(|_| {
+                VarDctFrontendError::Unsupported {
+                    feature: UnsupportedVarDctFeature::ImageDimensions,
+                }
+            })?;
+            validated_pass_groups.push(ValidatedPassGroup {
+                group_index,
+                pass_index: 0,
+                section,
+            });
+        }
+        let pass_groups: Box<[ValidatedPassGroup]> = validated_pass_groups.into_boxed_slice();
+
         Ok(Self {
             capability: VarDctFrontendCapability::SinglePassEntropyPackets,
             width,
@@ -1038,26 +1144,20 @@ impl StandardVarDctProfile {
             presentation_height,
             upsampling,
             bits_per_sample,
-            color_transform: if frame.do_ycbcr {
-                VarDctColorTransform::Ycbcr
-            } else {
-                VarDctColorTransform::Xyb
-            },
-            channel_shifts: jpeg_channel_shifts(frame.jpeg_upsampling),
+            color_transform,
+            channel_shifts: jpeg_shifts,
             jpeg_upsampling: frame.jpeg_upsampling,
-            jpeg_block_alignment: jpeg_block_alignment(frame.jpeg_upsampling),
-            group_dimension: 128u32 << frame.group_size_shift,
-            group_count: frame.group_count,
-            low_frequency_group_count: frame.low_frequency_group_count,
-            adaptive_lf: if frame.flags & 0x80 == 0 && !frame.uses_lf_frame() {
-                AdaptiveLfPlan::ExecutePacked444
-            } else {
-                AdaptiveLfPlan::Skip
-            },
-            uses_lf_frame: frame.uses_lf_frame(),
-            lf_level: frame.lf_level,
+            jpeg_block_alignment: jpeg_alignment,
+            group_dimension,
+            group_count,
+            low_frequency_group_count,
+            adaptive_lf,
+            uses_lf_frame,
+            lf_level,
             frame_name,
             sections,
+            lf_groups,
+            pass_groups,
         })
     }
 
@@ -1159,6 +1259,21 @@ impl StandardVarDctProfile {
     #[must_use]
     pub const fn adaptive_lf_smoothing(&self) -> bool {
         self.adaptive_lf.executes()
+    }
+
+    #[must_use]
+    pub(crate) const fn adaptive_lf(&self) -> AdaptiveLfPlan {
+        self.adaptive_lf
+    }
+
+    #[must_use]
+    pub fn lf_groups(&self) -> &[ValidatedLfGroup] {
+        &self.lf_groups
+    }
+
+    #[must_use]
+    pub fn pass_groups(&self) -> &[ValidatedPassGroup] {
+        &self.pass_groups
     }
 
     /// Meta-adaptive property-1 stream index for an LF quantization subimage.
