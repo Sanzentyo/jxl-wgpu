@@ -60,6 +60,8 @@ pub enum VarDctDecodeError {
     MissingInverseOpsin,
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
+    #[error("unsupported alpha dimension shift {0}")]
+    UnsupportedAlphaShift(u32),
     #[error(transparent)]
     Frontend(#[from] crate::vardct_frontend::VarDctFrontendError),
     #[error(transparent)]

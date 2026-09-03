@@ -46,6 +46,8 @@ pub struct VarDctRenderTailDesc {
     pub xyb_params: Option<XybParams>,
     pub target_format: Option<PixelFormat>,
     pub alpha_output: Option<AlphaOutputMode>,
+    pub alpha_dimension_shift: u32,
+    pub alpha_upsampling_weights: Option<Vec<f32>>,
 }
 
 /// The compiled render tail plan and initial resources.
@@ -128,8 +130,9 @@ impl VarDctRenderTailDesc {
         // Optional alpha plane for straight alpha
         let alpha_plane = if self.alpha_output.is_some() {
             let alpha_id = alloc_plane_id();
-            let width = self.padded_extent.width;
-            let height = self.padded_extent.height;
+            let shift = self.alpha_dimension_shift;
+            let width = (self.padded_extent.width >> shift).max(1);
+            let height = (self.padded_extent.height >> shift).max(1);
             plan.planes.push(PlaneDesc {
                 id: alpha_id,
                 extent: Extent2d::new(width, height),
@@ -370,7 +373,59 @@ impl VarDctRenderTailDesc {
             }
         }
 
-        // 7. Output Save
+        // 7. Alpha Upsampling (if downsampled)
+        let resolved_alpha = if let Some(in_alpha) = alpha_plane {
+            if self.alpha_dimension_shift > 0 {
+                let factor = match self.alpha_dimension_shift {
+                    1 => UpsamplingFactor::X2,
+                    2 => UpsamplingFactor::X4,
+                    3 => UpsamplingFactor::X8,
+                    _ => {
+                        return Err(VarDctDecodeError::UnsupportedAlphaShift(
+                            self.alpha_dimension_shift,
+                        ));
+                    }
+                };
+                let out_id = alloc_plane_id();
+                plan.planes.push(PlaneDesc {
+                    id: out_id,
+                    extent: final_extent,
+                    stride: final_extent.width,
+                    sample_type: SampleType::F32,
+                    role: PlaneRole::Intermediate,
+                });
+
+                let weights_res = ResourceId(888);
+                let floats = self.alpha_upsampling_weights.clone().unwrap_or_else(|| {
+                    let n = (factor.as_u32() * factor.as_u32() * 25) as usize;
+                    vec![1.0 / (factor.as_u32() * factor.as_u32()) as f32; n]
+                });
+                resources.insert(
+                    weights_res,
+                    ResourceUpdate {
+                        id: weights_res,
+                        revision: 1,
+                        data: ResourceData::F32(floats),
+                    },
+                );
+
+                plan.add_upsample_node(
+                    "alpha_upsample",
+                    factor,
+                    weights_res,
+                    in_alpha,
+                    out_id,
+                );
+
+                Some(out_id)
+            } else {
+                Some(in_alpha)
+            }
+        } else {
+            None
+        };
+
+        // 8. Output Save
         let output_id = OutputId(0);
         let color_encoding = if self.target_format.is_some() {
             OutputColorEncoding::Rgb(source_color_encoding)
@@ -380,7 +435,7 @@ impl VarDctRenderTailDesc {
 
         match self.alpha_output {
             Some(AlphaOutputMode::PackRgba) => {
-                let alpha = alpha_plane.expect("alpha plane declared for PackRgba");
+                let alpha = resolved_alpha.expect("alpha plane declared for PackRgba");
                 let mut rgba_outs = rgb_outs.to_vec();
                 rgba_outs.push(alpha);
 
@@ -411,7 +466,7 @@ impl VarDctRenderTailDesc {
                 });
             }
             Some(AlphaOutputMode::SeparatePlane) => {
-                let alpha = alpha_plane.expect("alpha plane declared for SeparatePlane");
+                let alpha = resolved_alpha.expect("alpha plane declared for SeparatePlane");
                 // Primary RGB output
                 plan.outputs.push(OutputDesc {
                     id: output_id,
@@ -553,6 +608,8 @@ mod tests {
                             xyb_params: Some(XybParams::default()),
                             target_format: None,
                             alpha_output: None,
+                            alpha_dimension_shift: 0,
+                            alpha_upsampling_weights: None,
                         };
                         let compiled = desc.compile().expect("compilation must succeed");
                         assert!(compiled.plan.validate().is_ok());
@@ -585,6 +642,8 @@ mod tests {
             xyb_params: None,
             target_format: None,
             alpha_output: None,
+            alpha_dimension_shift: 0,
+            alpha_upsampling_weights: None,
         };
         let compiled = desc.compile().expect("compilation with chroma subsampling must succeed");
         assert!(compiled.plan.validate().is_ok());
@@ -626,6 +685,8 @@ mod tests {
                 xyb_params: Some(XybParams::default()),
                 target_format: Some(pixel_format.clone()),
                 alpha_output: None,
+                alpha_dimension_shift: 0,
+                alpha_upsampling_weights: None,
             };
 
             let req = desc.image_output_request().expect("request must be present");
@@ -662,6 +723,8 @@ mod tests {
             xyb_params: Some(XybParams::default()),
             target_format: None,
             alpha_output: Some(AlphaOutputMode::PackRgba),
+            alpha_dimension_shift: 0,
+            alpha_upsampling_weights: None,
         };
 
         let compiled = desc.compile().expect("compile pack rgba render tail");
@@ -694,6 +757,8 @@ mod tests {
             xyb_params: Some(XybParams::default()),
             target_format: None,
             alpha_output: Some(AlphaOutputMode::SeparatePlane),
+            alpha_dimension_shift: 0,
+            alpha_upsampling_weights: None,
         };
 
         let compiled = desc.compile().expect("compile separate plane alpha render tail");
@@ -706,5 +771,42 @@ mod tests {
 
         let save_nodes: Vec<_> = plan.nodes.iter().filter(|n| matches!(n.op, RenderOp::Save(_))).collect();
         assert_eq!(save_nodes.len(), 2);
+    }
+
+    #[test]
+    fn render_tail_upsamples_downsampled_alpha() {
+        let image_extent = Extent2d::new(16, 16);
+        let padded_extent = Extent2d::new(16, 16);
+
+        for shift in [1, 2, 3] {
+            let desc = VarDctRenderTailDesc {
+                image_extent,
+                padded_extent,
+                channel_shifts: [VarDctChannelShift::default(); 3],
+                color_transform: VarDctColorTransform::Xyb,
+                gaborish_weights: Some(ResidentGaborishWeights::DEFAULT),
+                epf_passes: None,
+                frame_upsampling: None,
+                upsampling_weights: None,
+                xyb_params: Some(XybParams::default()),
+                target_format: None,
+                alpha_output: Some(AlphaOutputMode::PackRgba),
+                alpha_dimension_shift: shift,
+                alpha_upsampling_weights: None,
+            };
+
+            let compiled = desc.compile().expect("compile downsampled alpha render tail");
+            assert!(compiled.alpha_plane.is_some());
+            let plan = &compiled.plan;
+            assert!(plan.validate().is_ok());
+
+            // Check that an alpha upsampling node was inserted
+            let alpha_node = plan
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, RenderOp::Upsample(_)))
+                .expect("upsample node must be present");
+            assert_eq!(alpha_node.inputs[0], compiled.alpha_plane.unwrap());
+        }
     }
 }

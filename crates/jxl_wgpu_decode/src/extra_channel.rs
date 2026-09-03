@@ -9,7 +9,7 @@
 //! dimensional shifts, bit depths, and provides plan validation for rendering pipelines.
 
 use jxl_gpu_bitstream::{ExtraChannelInventory, ExtraChannelTypeInventory, SampleBitDepth};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, UpsamplingFactor};
 
 use crate::{Error, Result};
 
@@ -116,6 +116,19 @@ impl ExtraChannelInfo {
             (image_extent.width >> self.dimension_shift).max(1),
             (image_extent.height >> self.dimension_shift).max(1),
         )
+    }
+
+    /// Returns the upsampling factor needed to restore this channel to full resolution,
+    /// or `None` if it is already full resolution (`dimension_shift == 0`).
+    #[must_use]
+    pub const fn upsampling_factor(&self) -> Option<UpsamplingFactor> {
+        match self.dimension_shift {
+            0 => None,
+            1 => Some(UpsamplingFactor::X2),
+            2 => Some(UpsamplingFactor::X4),
+            3 => Some(UpsamplingFactor::X8),
+            _ => None,
+        }
     }
 }
 
