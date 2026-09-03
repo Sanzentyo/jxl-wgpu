@@ -22,9 +22,9 @@ pub(super) struct VarDctEpfHeader {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct VarDctEpfPlan {
-    pub(super) sigma_groups: Vec<EpfSigmaConfig>,
-    pub(super) passes: Vec<ResidentEpfParameters>,
+pub(crate) struct VarDctEpfPlan {
+    pub(crate) sigma_groups: Vec<EpfSigmaConfig>,
+    pub(crate) passes: Vec<ResidentEpfParameters>,
 }
 
 impl VarDctEpfHeader {

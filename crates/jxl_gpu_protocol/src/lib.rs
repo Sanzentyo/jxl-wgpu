@@ -120,6 +120,8 @@ pub struct Border2d {
 }
 
 impl Border2d {
+    pub const ZERO: Self = Self::symmetric(0, 0);
+
     pub const fn symmetric(x: u16, y: u16) -> Self {
         Self {
             left: x,
@@ -489,6 +491,20 @@ pub struct XybParams {
     pub opsin_bias: [f32; 3],
     pub inverse_opsin_matrix: [[f32; 3]; 3],
     pub intensity_target: f32,
+}
+
+impl Default for XybParams {
+    fn default() -> Self {
+        Self {
+            opsin_bias: [-0.003_793_073_4; 3],
+            inverse_opsin_matrix: [
+                [11.031_567, -9.866_944, -0.164_622_99],
+                [-3.254_147_3, 4.418_770_3, -0.164_622_99],
+                [-3.658_851_4, 2.712_923, 1.945_928_2],
+            ],
+            intensity_target: 255.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

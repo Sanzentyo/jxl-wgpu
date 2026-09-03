@@ -8,7 +8,7 @@
 
 mod execution;
 mod pipeline;
-mod restoration;
+pub(crate) mod restoration;
 mod source;
 #[cfg(test)]
 mod tests;

@@ -53,6 +53,7 @@ mod vardct_packet;
 mod vardct_pass_group;
 mod vardct_resource;
 mod vardct_side_image;
+pub mod vardct_render_tail;
 mod wgpu_engine;
 
 pub mod vardct;

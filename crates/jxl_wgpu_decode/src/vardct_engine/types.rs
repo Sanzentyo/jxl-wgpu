@@ -94,6 +94,8 @@ pub enum VarDctDecodeError {
     ProgressiveDc(#[from] ProgressiveDcGpuError),
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    #[error(transparent)]
+    Plan(#[from] jxl_gpu_protocol::PlanError),
     #[error("VarDCT GPU memory backpressure: {0}")]
     MemoryBackpressure(#[from] MemoryBudgetError),
     #[error("VarDCT GPU submission-poll backpressure: {0}")]
