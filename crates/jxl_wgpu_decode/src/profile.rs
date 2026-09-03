@@ -1827,8 +1827,7 @@ mod tests {
             .unwrap();
             let packet = crate::vardct_packet::BoundedVarDctPacketPlan::parse_source(
                 &codestream,
-                &projected,
-                &profile,
+                profile,
             )
             .unwrap();
             assert_eq!(

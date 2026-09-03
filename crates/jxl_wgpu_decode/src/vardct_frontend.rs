@@ -1156,18 +1156,6 @@ impl StandardVarDctProfile {
         &self.sections
     }
 
-    /// Parses bounded scalar metadata from a codestream using this already-negotiated profile.
-    pub fn parse_packet(
-        &self,
-        codestream: &[u8],
-        inventory: &CodestreamInventory,
-    ) -> Result<
-        crate::vardct_packet::BoundedVarDctPacketPlan,
-        crate::vardct_packet::BoundedVarDctPacketError,
-    > {
-        crate::vardct_packet::BoundedVarDctPacketPlan::parse(codestream, inventory, self)
-    }
-
     #[must_use]
     pub const fn adaptive_lf_smoothing(&self) -> bool {
         self.adaptive_lf.executes()

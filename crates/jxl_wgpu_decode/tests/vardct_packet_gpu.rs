@@ -106,7 +106,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
         })
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, profile).unwrap();
     let group = plan.groups.first().unwrap();
     let control = group.packet_control(&plan).unwrap();
 
@@ -245,7 +245,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
         })
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, profile).unwrap();
     assert!(plan.requires_local_tree_staging());
     assert!(plan.groups.len() > 1);
 

@@ -1272,7 +1272,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         })
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory, &profile).unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), profile).unwrap();
     let entropy_bit = usize::try_from(packet.entropy_bit_offset).unwrap();
     let modular_header_bit = entropy_bit + 2;
     corrupted[modular_header_bit / 8] ^= 1 << (modular_header_bit % 8);
@@ -1310,7 +1310,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&encoded, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&encoded, profile).unwrap();
     assert_eq!(plan.uniform_transform, Some(TransformKind::Dct32x32));
     assert!(plan.hf_global.is_none());
     assert!(!plan.requires_local_tree_staging());
@@ -1462,8 +1462,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             })
             .unwrap();
         let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-        let plan =
-            BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory, &profile).unwrap();
+        let plan = BoundedVarDctPacketPlan::parse(parsed.codestream(), profile).unwrap();
         let blocks = extent.width.div_ceil(8) * extent.height.div_ceil(8);
         assert_eq!(plan.uniform_transform, None);
         assert_eq!(plan.groups.len(), 1);
@@ -1577,7 +1576,7 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(encoded, profile).unwrap();
     assert!(plan.needs_self_correcting);
     let hf = plan.hf_coefficients.as_ref().unwrap();
     assert_eq!(hf.pass_groups.len(), 6);
@@ -1686,7 +1685,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let packet = BoundedVarDctPacketPlan::parse(encoded, &inventory, &profile).unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(encoded, profile).unwrap();
     let damaged_range = packet
         .hf_coefficients
         .as_ref()
@@ -1951,7 +1950,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(encoded, profile).unwrap();
     let extent = Extent2d::new(plan.profile.width(), plan.profile.height());
     assert_eq!(extent, Extent2d::new(257, 257));
     assert_eq!(plan.uniform_transform, None);
@@ -2014,7 +2013,7 @@ fn assert_multiple_lf_groups(
         }
     ));
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(encoded, profile).unwrap();
     let extent = Extent2d::new(plan.profile.width(), plan.profile.height());
     assert_eq!(extent, Extent2d::new(2056, 256));
     assert_eq!(plan.profile.adaptive_lf_smoothing(), adaptive_lf_smoothing);
@@ -2296,7 +2295,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
         })
         .unwrap();
     let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory, &profile).unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(&encoded, profile).unwrap();
     let group = packet.groups.first().unwrap();
     let group_end = group.lf_group.end().unwrap();
     let damage_bit = group.lf_group.offset + (group_end - group.lf_group.offset) * 9 / 10;

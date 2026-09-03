@@ -185,7 +185,7 @@ pub(super) fn prepare_source(
         || StandardVarDctProfile::negotiate(inventory),
         |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
     )?;
-    let packet = BoundedVarDctPacketPlan::parse_source(&codestream, inventory, &profile)?;
+    let packet = BoundedVarDctPacketPlan::parse_source(&codestream, profile)?;
     let adaptive_lf = packet.profile.adaptive_lf;
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();

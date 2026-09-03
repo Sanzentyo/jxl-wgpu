@@ -1,7 +1,7 @@
 //! GPU entropy frontend for the bounded standard VarDCT packet profile.
 
 use bytemuck::{Pod, Zeroable};
-use jxl_gpu_bitstream::{BitRange, BitReader, CodestreamInventory};
+use jxl_gpu_bitstream::{BitRange, BitReader};
 use jxl_gpu_protocol::TransformKind;
 use jxl_oxide_common::Bundle;
 use jxl_vardct::{DequantMatrixSet, DequantMatrixSetParams};
@@ -122,7 +122,7 @@ pub enum GpuVarDctPacketError {
 }
 
 /// Parsed host metadata and untouched image entropy for one strict packet.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct BoundedVarDctPacketPlan {
     pub profile: StandardVarDctProfile,
     /// A transform enforced for the single-entry packet form. Sectioned packets carry a
@@ -411,25 +411,22 @@ impl BoundedVarDctPacketPlan {
     /// Parses bounded scalar metadata only. Image symbols remain encoded for the GPU.
     pub fn parse(
         codestream: &[u8],
-        inventory: &CodestreamInventory,
-        profile: &StandardVarDctProfile,
+        profile: StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Slice(codestream), inventory, profile)
+        Self::parse_inner(PacketSource::Slice(codestream), profile)
     }
 
     /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
     pub(crate) fn parse_source(
         source: &GpuCodestream,
-        inventory: &CodestreamInventory,
-        profile: &StandardVarDctProfile,
+        profile: StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, profile)
+        Self::parse_inner(PacketSource::Spans(source), profile)
     }
 
     fn parse_inner(
         source: PacketSource<'_>,
-        _inventory: &CodestreamInventory,
-        profile: &StandardVarDctProfile,
+        profile: StandardVarDctProfile,
     ) -> Result<Self, BoundedVarDctPacketError> {
         if profile.bits_per_sample != 8 {
             return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
@@ -759,7 +756,7 @@ impl BoundedVarDctPacketPlan {
                 .is_some_and(MaConfigIr::needs_self_correcting)
         };
         Ok(Self {
-            profile: profile.clone(),
+            profile,
             uniform_transform,
             lf_global: lf_global_packet,
             hf_global,
@@ -3420,14 +3417,18 @@ mod tests {
         ));
         let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
         let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-        let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(
+            &codestream,
+            StandardVarDctProfile::negotiate(&inventory).unwrap(),
+        )
+        .unwrap();
         let storage: Arc<[u8]> = codestream.into();
 
         for split in 0..=storage.len() {
             let source = split_source(Arc::clone(&storage), split);
+            let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
             assert_eq!(
-                BoundedVarDctPacketPlan::parse_source(&source, &inventory, &profile).unwrap(),
+                BoundedVarDctPacketPlan::parse_source(&source, profile).unwrap(),
                 expected,
                 "chunk split {split} changed the VarDCT packet plan"
             );
@@ -3441,8 +3442,11 @@ mod tests {
         ));
         let parsed = jxl_gpu_bitstream::parse(&codestream, Default::default()).unwrap();
         let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-        let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
-        let expected = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
+        let expected = BoundedVarDctPacketPlan::parse(
+            &codestream,
+            StandardVarDctProfile::negotiate(&inventory).unwrap(),
+        )
+        .unwrap();
         let expected_continuation = expected
             .parse_hf_continuation(&codestream, &expected.groups[0], 67_171)
             .unwrap();
@@ -3454,7 +3458,11 @@ mod tests {
             )
         });
         let source = GpuCodestream::from_spans(spans).unwrap();
-        let actual = BoundedVarDctPacketPlan::parse_source(&source, &inventory, &profile).unwrap();
+        let actual = BoundedVarDctPacketPlan::parse_source(
+            &source,
+            StandardVarDctProfile::negotiate(&inventory).unwrap(),
+        )
+        .unwrap();
         let actual_continuation = actual
             .parse_hf_continuation_source(&source, &actual.groups[0], 67_171)
             .unwrap();

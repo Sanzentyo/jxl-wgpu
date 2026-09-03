@@ -425,7 +425,7 @@ fn custom_lf_metadata_roundtrips_through_the_standard_control_plane() {
             .unwrap();
     let profile =
         jxl_wgpu_decode::vardct::frontend::StandardVarDctProfile::negotiate(&inventory).unwrap();
-    let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory, &profile).unwrap();
+    let plan = BoundedVarDctPacketPlan::parse(&codestream, profile).unwrap();
     assert_eq!(plan.lf_dequantization.multipliers, [0.0625, 0.125, 0.25]);
     assert_eq!(plan.lf_correlation.colour_factor, 256);
     assert_eq!(plan.lf_correlation.base, [-0.5, 0.5]);
