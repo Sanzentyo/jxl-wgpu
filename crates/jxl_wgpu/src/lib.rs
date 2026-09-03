@@ -91,7 +91,8 @@ pub use resident_gaborish::{
     ResidentGaborishPipeline, ResidentGaborishWeights,
 };
 pub use resident_image_upsample::{
-    ResidentChannelUpsampleInputs, ResidentChannelUpsamplePipeline, ResidentImageUpsampleError,
+    ResidentChannelUpsampleInputs, ResidentChannelUpsampleMemoryPlan,
+    ResidentChannelUpsamplePipeline, ResidentChannelUpsampleResources, ResidentImageUpsampleError,
     ResidentImageUpsampleInputs, ResidentImageUpsampleMemoryPlan, ResidentImageUpsamplePipeline,
     ResidentImageUpsampleResources, ResidentImageUpsampleWeights,
 };

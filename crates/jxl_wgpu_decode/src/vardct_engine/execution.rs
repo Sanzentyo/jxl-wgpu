@@ -49,7 +49,8 @@ use super::pipeline::VarDctPipelines;
 use super::restoration::RestorationCursor;
 use super::source::{VarDctSource, check_limit};
 use super::types::{
-    ARTIFACT_STATUS_BYTES, PACKET_STATUS_BYTES, VarDctDecodeError, VarDctDecodeMemoryStats,
+    ARTIFACT_STATUS_BYTES, AdaptiveLfDisposition, PACKET_STATUS_BYTES, VarDctDecodeError,
+    VarDctDecodeMemoryStats,
 };
 use super::window_plan::{
     HfPacketWindowExecutionPlan, copy_stream_segment, map_codestream_source_error,
@@ -75,6 +76,22 @@ impl VarDctDecodeSession {
     #[must_use]
     pub const fn memory_stats(&self) -> VarDctDecodeMemoryStats {
         self.memory_stats
+    }
+
+    #[must_use]
+    pub fn adaptive_lf_signaled(&self) -> bool {
+        self.source.as_ref().map_or(
+            self.memory_stats.adaptive_lf_signaled,
+            VarDctSource::adaptive_lf_signaled,
+        )
+    }
+
+    #[must_use]
+    pub fn adaptive_lf_disposition(&self) -> AdaptiveLfDisposition {
+        self.source.as_ref().map_or(
+            self.memory_stats.adaptive_lf_disposition,
+            VarDctSource::adaptive_lf_disposition,
+        )
     }
 
     #[must_use]

@@ -24,7 +24,7 @@ use crate::{
 
 use super::execution::{VarDctDecodeSession, VarDctRuntimeStats};
 use super::source::{VarDctPrepareOptions, VarDctSource, prepare_source};
-use super::types::{VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
+use super::types::{UnsupportedFeaturePolicy, VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
 
 pub(super) struct VarDctPipelines {
     pub(super) packet: VarDctPacketPipeline,
@@ -122,6 +122,7 @@ pub struct VarDctSubmissionEngine {
     pipelines: Arc<VarDctPipelines>,
     memory: MemoryBudget,
     stream_window_limit: Option<NonZeroU64>,
+    unsupported_feature_policy: UnsupportedFeaturePolicy,
 }
 
 impl VarDctSubmissionEngine {
@@ -141,7 +142,19 @@ impl VarDctSubmissionEngine {
             pipelines,
             memory,
             stream_window_limit: None,
+            unsupported_feature_policy: UnsupportedFeaturePolicy::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_unsupported_feature_policy(mut self, policy: UnsupportedFeaturePolicy) -> Self {
+        self.unsupported_feature_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn unsupported_feature_policy(&self) -> UnsupportedFeaturePolicy {
+        self.unsupported_feature_policy
     }
 
     /// Caps reusable VarDCT entropy uploads.
@@ -198,6 +211,7 @@ impl VarDctSubmissionEngine {
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
                 progressive_dc_final: None,
+                unsupported_feature_policy: self.unsupported_feature_policy,
             },
         )?;
         self.open_source(source)
@@ -220,6 +234,7 @@ impl VarDctSubmissionEngine {
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
                 progressive_dc_final: Some(is_final),
+                unsupported_feature_policy: self.unsupported_feature_policy,
             },
         )?;
         self.open_source(source)

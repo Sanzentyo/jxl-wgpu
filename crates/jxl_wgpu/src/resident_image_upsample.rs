@@ -121,6 +121,12 @@ pub struct ResidentImageUpsampleResources {
     _uniform: wgpu::Buffer,
 }
 
+/// Buffers created while recording one single-plane channel dispatch.
+pub struct ResidentChannelUpsampleResources {
+    _weights: wgpu::Buffer,
+    _uniform: wgpu::Buffer,
+}
+
 /// Exact retained allocation for one fused image interpolation dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidentImageUpsampleMemoryPlan {
@@ -136,7 +142,33 @@ impl ResidentImageUpsampleMemoryPlan {
         let weight_bytes = weights.storage_bytes();
         let total_bytes = weight_bytes.checked_add(Self::UNIFORM_BYTES).ok_or(
             ResidentImageUpsampleError::ArithmeticOverflow {
-                field: "upsampling retained bytes",
+                field: "image upsampling retained bytes",
+            },
+        )?;
+        Ok(Self {
+            weight_bytes,
+            uniform_bytes: Self::UNIFORM_BYTES,
+            total_bytes,
+        })
+    }
+}
+
+/// Exact retained allocation for one single-plane channel interpolation dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentChannelUpsampleMemoryPlan {
+    pub weight_bytes: u64,
+    pub uniform_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl ResidentChannelUpsampleMemoryPlan {
+    pub const UNIFORM_BYTES: u64 = std::mem::size_of::<ResidentChannelUpsampleParams>() as u64;
+
+    pub fn new(weights: &ResidentImageUpsampleWeights) -> Result<Self, ResidentImageUpsampleError> {
+        let weight_bytes = weights.storage_bytes();
+        let total_bytes = weight_bytes.checked_add(Self::UNIFORM_BYTES).ok_or(
+            ResidentImageUpsampleError::ArithmeticOverflow {
+                field: "channel upsampling retained bytes",
             },
         )?;
         Ok(Self {
@@ -164,9 +196,9 @@ pub enum ResidentImageUpsampleError {
     #[error("resident image upsampling workgroup variant {variant:?} exceeds device limits")]
     WorkgroupVariant { variant: KernelVariant },
     #[error(
-        "resident image upsampling requires seven storage bindings, device permits {available}"
+        "resident image upsampling requires {required} storage bindings, device permits {available}"
     )]
-    StorageBindingCount { available: u32 },
+    StorageBindingCount { required: u32, available: u32 },
     #[error("resident image upsampling plane {plane} has invalid {width}x{height} stride {stride}")]
     PlaneGeometry {
         plane: usize,
@@ -261,6 +293,7 @@ impl ResidentImageUpsamplePipeline {
             .map_err(|_| ResidentImageUpsampleError::WorkgroupVariant { variant })?;
         if device.limits().max_storage_buffers_per_shader_stage < 7 {
             return Err(ResidentImageUpsampleError::StorageBindingCount {
+                required: 7,
                 available: device.limits().max_storage_buffers_per_shader_stage,
             });
         }
@@ -382,6 +415,7 @@ impl ResidentChannelUpsamplePipeline {
             .map_err(|_| ResidentImageUpsampleError::WorkgroupVariant { variant })?;
         if device.limits().max_storage_buffers_per_shader_stage < 3 {
             return Err(ResidentImageUpsampleError::StorageBindingCount {
+                required: 3,
                 available: device.limits().max_storage_buffers_per_shader_stage,
             });
         }
@@ -410,9 +444,9 @@ impl ResidentChannelUpsamplePipeline {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         inputs: ResidentChannelUpsampleInputs<'_>,
-    ) -> Result<ResidentImageUpsampleResources, ResidentImageUpsampleError> {
+    ) -> Result<ResidentChannelUpsampleResources, ResidentImageUpsampleError> {
         let params = validate_channel_inputs(device, inputs)?;
-        let plan = ResidentImageUpsampleMemoryPlan::new(inputs.weights)?;
+        let plan = ResidentChannelUpsampleMemoryPlan::new(inputs.weights)?;
         let maximum_binding = device.limits().max_storage_buffer_binding_size;
         if plan.weight_bytes > maximum_binding {
             return Err(ResidentImageUpsampleError::StorageBindingLimit {
@@ -468,7 +502,7 @@ impl ResidentChannelUpsamplePipeline {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         drop(pass);
-        Ok(ResidentImageUpsampleResources {
+        Ok(ResidentChannelUpsampleResources {
             _weights: weights,
             _uniform: uniform,
         })
@@ -796,5 +830,18 @@ mod tests {
             .validate(&module)
             .unwrap();
         }
+    }
+
+    #[test]
+    fn memory_plans_account_exact_uniform_sizes() {
+        let compact = vec![1.0; 15];
+        let weights = ResidentImageUpsampleWeights::new(2, &compact).unwrap();
+        let image_plan = ResidentImageUpsampleMemoryPlan::new(&weights).unwrap();
+        let channel_plan = ResidentChannelUpsampleMemoryPlan::new(&weights).unwrap();
+
+        assert_eq!(image_plan.uniform_bytes, 48);
+        assert_eq!(channel_plan.uniform_bytes, 32);
+        assert_eq!(image_plan.total_bytes, weights.storage_bytes() + 48);
+        assert_eq!(channel_plan.total_bytes, weights.storage_bytes() + 32);
     }
 }

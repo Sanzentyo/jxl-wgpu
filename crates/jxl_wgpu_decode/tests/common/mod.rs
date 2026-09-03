@@ -244,6 +244,15 @@ pub fn jpeg_transcode_422() -> &'static [u8] {
     BYTES.as_slice()
 }
 
+pub fn jpeg_transcode_422_adaptive_lf() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_422_adaptive_lf.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
 pub fn jpeg_transcode_440() -> &'static [u8] {
     static BYTES: LazyLock<Vec<u8>> =
         LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_440.jxl.hex")));

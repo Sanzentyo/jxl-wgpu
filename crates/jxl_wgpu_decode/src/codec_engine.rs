@@ -21,8 +21,8 @@ use jxl_wgpu::{
 use crate::{
     Error, GpuCodestream, GpuDecoder, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, ProgressiveDcError, Result, SubmittedGpuFrame,
-    VarDctDecodeSession, VarDctPendingFrame, VarDctSubmissionEngine, WgpuDecodeSession,
-    WgpuPendingFrame, WgpuSubmissionEngine,
+    UnsupportedFeaturePolicy, VarDctDecodeSession, VarDctPendingFrame, VarDctSubmissionEngine,
+    WgpuDecodeSession, WgpuPendingFrame, WgpuSubmissionEngine,
 };
 
 /// One physical frame in a progressive-DC dependency chain.
@@ -214,6 +214,18 @@ impl WgpuDecodeEngine {
         self.modular = self.modular.with_stream_window_limit(limit);
         self.vardct = self.vardct.with_stream_window_limit(limit);
         self
+    }
+
+    /// Sets the policy for handling unstandardized or experimental upstream features.
+    #[must_use]
+    pub fn with_unsupported_feature_policy(mut self, policy: UnsupportedFeaturePolicy) -> Self {
+        self.vardct = self.vardct.with_unsupported_feature_policy(policy);
+        self
+    }
+
+    #[must_use]
+    pub const fn unsupported_feature_policy(&self) -> UnsupportedFeaturePolicy {
+        self.vardct.unsupported_feature_policy()
     }
 
     /// Explicit low-level Modular engine access for diagnostics and cache policy.

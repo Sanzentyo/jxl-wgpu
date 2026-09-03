@@ -60,6 +60,8 @@ pub enum VarDctDecodeError {
     InvalidQuantMatrixScale { channel: &'static str, scale: u32 },
     #[error("the XYB image header does not contain an inverse opsin matrix")]
     MissingInverseOpsin,
+    #[error("subsampled VarDCT cannot yet execute the {stage} stage before JPEG upsampling")]
+    UnsupportedSubsampledStage { stage: &'static str },
     #[error("the bounded VarDCT engine requires exactly one image frame")]
     MissingFrame,
     #[error(transparent)]
@@ -330,6 +332,45 @@ pub struct VarDctDecodeMemoryStats {
     /// All non-output GPU buffers retained through status validation.
     pub transient_bytes: u64,
     pub total_frame_bytes: u64,
+    pub adaptive_lf_signaled: bool,
+    pub adaptive_lf_disposition: AdaptiveLfDisposition,
+}
+
+/// Normative vs compatibility disposition for signaled Adaptive LF smoothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveLfDisposition {
+    /// FrameHeader did not signal adaptive LF smoothing (FLAG_SKIP_ADAPTIVE_LF_SMOOTHING was set).
+    NotSignaled,
+    /// Adaptive LF smoothing is executed on the GPU.
+    Executed,
+    /// Adaptive LF smoothing was signaled in FrameHeader, but bypassed because stream uses subsampled channels.
+    BypassedSubsampled,
+    /// Adaptive LF smoothing was disabled because stream uses progressive DC LF frame.
+    DisabledByProgressiveDc,
+}
+
+impl AdaptiveLfDisposition {
+    #[must_use]
+    pub const fn is_executed(self) -> bool {
+        matches!(self, Self::Executed)
+    }
+
+    #[must_use]
+    pub const fn is_bypassed(self) -> bool {
+        matches!(self, Self::BypassedSubsampled)
+    }
+}
+
+/// Decoder policy for handling unstandardized or experimental upstream features.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnsupportedFeaturePolicy {
+    /// Reject unstandardized/unsupported combinations with a typed error.
+    Strict,
+    /// Bypass the stage safely in explicit compatibility mode and record the disposition in session stats.
+    #[default]
+    ExplicitCompatibilityFallback,
+    /// Execute experimental implementation matching upstream development.
+    Experimental,
 }
 
 impl VarDctDecodeMemoryStats {
@@ -344,6 +385,8 @@ impl VarDctDecodeMemoryStats {
             resource,
             hf_coefficients,
             deferred_hf,
+            adaptive_lf_signaled,
+            adaptive_lf_disposition,
             adaptive_lf_smoothing,
             restoration_scratch,
             gaborish,
@@ -796,6 +839,8 @@ impl VarDctDecodeMemoryStats {
             output_lease_bytes,
             transient_bytes,
             total_frame_bytes,
+            adaptive_lf_signaled,
+            adaptive_lf_disposition,
         })
     }
 }
@@ -810,6 +855,8 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) resource: VarDctResourceLayout,
     pub(super) hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
     pub(super) deferred_hf: Option<&'a DeferredHfCoefficientLayout>,
+    pub(super) adaptive_lf_signaled: bool,
+    pub(super) adaptive_lf_disposition: AdaptiveLfDisposition,
     pub(super) adaptive_lf_smoothing: bool,
     pub(super) restoration_scratch: bool,
     pub(super) gaborish: bool,

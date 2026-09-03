@@ -1,9 +1,11 @@
-//! Fused GPU-resident XYB/YCbCr reconstruction and packed RGB8 output.
+//! Fused GPU-resident XYB/YCbCr reconstruction and packed 8-bit output.
 //!
-//! The kernel assigns one invocation to each output `u32`. That ownership rule
-//! removes byte-level read/modify/write races while retaining the externally
-//! visible tightly packed `RGBRGB...` byte layout. The allocation may contain
-//! up to three zero padding bytes after the logical image payload.
+//! Supports RGB8, RGBA8, BGR8, and BGRA8 packings. For 3-byte formats (RGB8/BGR8), the kernel
+//! assigns one invocation to each output `u32`. That ownership rule removes byte-level
+//! read/modify/write races while retaining the externally visible tightly packed byte layout.
+//! The allocation may contain up to three zero padding bytes after the logical image payload.
+//! For 4-byte formats (RGBA8/BGRA8), each invocation writes one full word (alpha is filled
+//! with 255 for opaque output when no decoded alpha source is connected).
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::XybParams;
@@ -43,7 +45,7 @@ impl VarDctOutputPlane<'_> {
     }
 }
 
-/// Color transform fused into the final packed RGB8 kernel.
+/// Color transform fused into the final packed 8-bit kernel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VarDctOutputTransform {
     /// JPEG XL XYB inverse followed by the sRGB transfer function.
@@ -76,6 +78,8 @@ impl From<&XybParams> for VarDctInverseOpsin {
 }
 
 /// Color and packing format produced by [`VarDctOutputPacker`].
+///
+/// Note: Opaque RGBA8/BGRA8 output; alpha is filled with 255 when no decoded alpha source is connected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum VarDctOutputFormat {
@@ -113,8 +117,9 @@ pub struct VarDctOutputConfig {
 pub struct VarDctOutputInputs<'a> {
     /// X, Y, and B F32 planes, in that order.
     pub planes: [VarDctOutputPlane<'a>; 3],
-    /// Packed output storage. Its logical bytes are tightly interleaved RGB8;
-    /// its allocated/bound length is rounded up to four bytes.
+    /// Packed output storage. For 3-byte formats (RGB8/BGR8), logical bytes are tightly
+    /// interleaved and allocation length is rounded up to four bytes; for 4-byte formats
+    /// (RGBA8/BGRA8), storage is word-aligned with opaque alpha (255).
     pub output: ResidentStorageBinding<'a>,
     /// Output geometry and inverse-opsin metadata.
     pub config: VarDctOutputConfig,
@@ -963,34 +968,34 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::None,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("jxl-wgpu VarDCT output packer test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_packer_owns_words_and_zeroes_tail_padding() {
         use std::num::NonZeroU64;
         use std::sync::mpsc;
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let Ok(adapter) =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::None,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            }))
-        else {
-            eprintln!("skipping VarDCT RGB8 packer GPU test: no adapter");
-            return;
-        };
-        let Ok((device, queue)) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("jxl-wgpu VarDCT RGB8 packer test"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            }))
-        else {
-            eprintln!("skipping VarDCT RGB8 packer GPU test: device request failed");
+        let Some((device, queue)) = test_device() else {
+            eprintln!("skipping VarDCT RGB8 packer GPU test: device unavailable");
             return;
         };
         let storage_plane = |label, samples: &[f32]| {
@@ -1097,5 +1102,202 @@ mod tests {
             &[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0],
             "RGB primaries exercise all three word phases and tail padding"
         );
+    }
+
+    #[test]
+    fn fused_vardct_output_packer_matches_scalar_oracle_across_all_formats_and_dimensions() {
+        let Some((device, queue)) = test_device() else {
+            return;
+        };
+        let packer = VarDctOutputPacker::new(&device).unwrap();
+
+        // Scalar oracle for YCbCr 4:4:4 identity-scale color transform and clamping
+        fn scalar_pack(
+            width: u32,
+            height: u32,
+            y_plane: &[f32],
+            cb_plane: &[f32],
+            cr_plane: &[f32],
+            format: VarDctOutputFormat,
+        ) -> Vec<u8> {
+            let mut out = Vec::new();
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) as usize;
+                    let luma = y_plane[idx] + 128.0 / 255.0;
+                    let cb = cb_plane[idx];
+                    let cr = cr_plane[idx];
+                    // Standard JPEG YCbCr to linear RGB in WGSL
+                    let r = luma + 1.402 * cr;
+                    let g = luma - (0.114 * 1.772 / 0.587) * cb - (0.299 * 1.402 / 0.587) * cr;
+                    let b = luma + 1.772 * cb;
+                    let r_u8 = (r * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+                    let g_u8 = (g * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+                    let b_u8 = (b * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+                    match format {
+                        VarDctOutputFormat::Rgb8 => {
+                            out.extend_from_slice(&[r_u8, g_u8, b_u8]);
+                        }
+                        VarDctOutputFormat::Rgba8 => {
+                            out.extend_from_slice(&[r_u8, g_u8, b_u8, 255]);
+                        }
+                        VarDctOutputFormat::Bgr8 => {
+                            out.extend_from_slice(&[b_u8, g_u8, r_u8]);
+                        }
+                        VarDctOutputFormat::Bgra8 => {
+                            out.extend_from_slice(&[b_u8, g_u8, r_u8, 255]);
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let test_dimensions = [
+            (1_u32, 1_u32), // 1 pixel
+            (2_u32, 1_u32), // 2 pixels: 6 bytes RGB (non-multiple of 4)
+            (5_u32, 3_u32), // 15 pixels: odd width, non-multiple rows
+            (8_u32, 4_u32), // 32 pixels
+        ];
+
+        let formats = [
+            VarDctOutputFormat::Rgb8,
+            VarDctOutputFormat::Rgba8,
+            VarDctOutputFormat::Bgr8,
+            VarDctOutputFormat::Bgra8,
+        ];
+
+        use std::num::NonZeroU64;
+        use std::sync::mpsc;
+
+        for &(width, height) in &test_dimensions {
+            let pixel_count = (width * height) as usize;
+            // Samples including clamp edges: negative values and > 1.0 values
+            let y_data: Vec<f32> = (0..pixel_count)
+                .map(|i| {
+                    if i % 4 == 0 {
+                        -0.2
+                    } else if i % 4 == 1 {
+                        1.3
+                    } else {
+                        (i as f32) / (pixel_count as f32)
+                    }
+                })
+                .collect();
+            let cb_data: Vec<f32> = (0..pixel_count).map(|i| (i as f32 * 0.1) - 0.05).collect();
+            let cr_data: Vec<f32> = (0..pixel_count).map(|i| 0.05 - (i as f32 * 0.08)).collect();
+
+            let y_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test Y"),
+                contents: bytemuck::cast_slice(&y_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let cb_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test Cb"),
+                contents: bytemuck::cast_slice(&cb_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let cr_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("test Cr"),
+                contents: bytemuck::cast_slice(&cr_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+            fn binding(buffer: &wgpu::Buffer) -> ResidentStorageBinding<'_> {
+                ResidentStorageBinding {
+                    buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(buffer.size()).unwrap(),
+                }
+            }
+
+            for &format in &formats {
+                let bytes_per_px = format.bytes_per_pixel() as u64;
+                let logical_bytes = (pixel_count as u64) * bytes_per_px;
+                let storage_bytes = logical_bytes.div_ceil(4) * 4;
+
+                let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("test out"),
+                    size: storage_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("test staging"),
+                    size: storage_bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                packer
+                    .encode(
+                        &device,
+                        &mut encoder,
+                        VarDctOutputInputs {
+                            planes: [
+                                VarDctOutputPlane {
+                                    storage: binding(&cb_buf),
+                                    width,
+                                    height,
+                                    stride: width,
+                                },
+                                VarDctOutputPlane {
+                                    storage: binding(&y_buf),
+                                    width,
+                                    height,
+                                    stride: width,
+                                },
+                                VarDctOutputPlane {
+                                    storage: binding(&cr_buf),
+                                    width,
+                                    height,
+                                    stride: width,
+                                },
+                            ],
+                            output: binding(&output_buf),
+                            config: VarDctOutputConfig {
+                                width,
+                                height,
+                                format,
+                                transform: VarDctOutputTransform::Ycbcr {
+                                    channel_shifts: [VarDctChannelShift::default(); 3],
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+
+                encoder.copy_buffer_to_buffer(&output_buf, 0, &staging, 0, storage_bytes);
+                let submission = queue.submit([encoder.finish()]);
+
+                let (sender, receiver) = mpsc::sync_channel(1);
+                staging
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |res| {
+                        let _ = sender.send(res);
+                    });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: None,
+                    })
+                    .unwrap();
+                receiver.recv().unwrap().unwrap();
+
+                let view = staging.slice(..).get_mapped_range().expect("mapped output");
+                let actual = &(&*view)[..logical_bytes as usize];
+                let expected = scalar_pack(width, height, &y_data, &cb_data, &cr_data, format);
+
+                for (idx, (&act, &exp)) in actual.iter().zip(&expected).enumerate() {
+                    let diff = (act as i16 - exp as i16).abs();
+                    assert!(
+                        diff <= 1,
+                        "mismatch at byte {idx} for geom {width}x{height} format {format:?}: actual={act}, expected={exp}"
+                    );
+                }
+            }
+        }
     }
 }
