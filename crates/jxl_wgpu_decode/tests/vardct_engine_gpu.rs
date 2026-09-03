@@ -544,6 +544,129 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
 }
 
 #[test]
+fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_fallback_consistency() {
+    let skip_codestream = common::jpeg_transcode_422();
+    let adaptive_codestream = common::jpeg_transcode_422_adaptive_lf();
+
+    // 1. Bitstream inventory comparison: identical geometry and 4:2:2 chroma shifts, divergent flag
+    let skip_parsed = jxl_gpu_bitstream::parse(skip_codestream, ParseLimits::default()).unwrap();
+    let adaptive_parsed =
+        jxl_gpu_bitstream::parse(adaptive_codestream, ParseLimits::default()).unwrap();
+    let skip_inv = skip_parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let adaptive_inv = adaptive_parsed
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+
+    assert_eq!(skip_inv.frames.len(), 1);
+    assert_eq!(adaptive_inv.frames.len(), 1);
+    let skip_frame = &skip_inv.frames[0];
+    let adaptive_frame = &adaptive_inv.frames[0];
+
+    // Assert exact 4:2:2 subsampling on both fixtures
+    assert_eq!(
+        skip_frame.jpeg_upsampling,
+        [0, 2, 0],
+        "skip fixture must have exact 4:2:2 subsampling"
+    );
+    assert_eq!(
+        adaptive_frame.jpeg_upsampling,
+        [0, 2, 0],
+        "adaptive fixture must have exact 4:2:2 subsampling"
+    );
+
+    // Verify intentional flag divergence: skip has bit 7 set (skip=true), adaptive has bit 7 clear (skip=false)
+    assert_ne!(
+        skip_frame.flags & 0x80,
+        0,
+        "skip fixture must have FLAG_SKIP_ADAPTIVE_LF_SMOOTHING set"
+    );
+    assert_eq!(
+        adaptive_frame.flags & 0x80,
+        0,
+        "adaptive fixture must have FLAG_SKIP_ADAPTIVE_LF_SMOOTHING clear"
+    );
+
+    // 2. GPU execution: verify fallback output matches skip fixture output
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+
+    let read_frame = |codestream, policy| {
+        let engine = WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_subsampled_adaptive_lf_policy(policy);
+        let decoder = GpuDecoder::new(engine);
+        let mut session = decoder
+            .open(
+                codestream,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        let vardct = session.submission_session().vardct().unwrap();
+        let decision = vardct.adaptive_lf_decision();
+        let deviations = vardct.deviations().to_vec();
+        let frame = session.next_frame().unwrap().unwrap();
+        assert_eq!(frame.metadata.deviations, deviations);
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        (
+            readback.frame.outputs[0].bytes.clone(),
+            decision,
+            deviations,
+        )
+    };
+
+    let (skip_output, skip_decision, skip_deviations) =
+        read_frame(skip_codestream, SubsampledAdaptiveLfPolicy::Strict);
+    assert_eq!(
+        skip_decision,
+        AdaptiveLfDecision {
+            signaled: false,
+            disposition: AdaptiveLfDisposition::NotSignaled,
+        }
+    );
+    assert!(skip_deviations.is_empty());
+
+    let (fallback_output, fallback_decision, fallback_deviations) = read_frame(
+        adaptive_codestream,
+        SubsampledAdaptiveLfPolicy::CompatibilityFallback,
+    );
+    assert_eq!(
+        fallback_decision,
+        AdaptiveLfDecision {
+            signaled: true,
+            disposition: AdaptiveLfDisposition::BypassedSubsampled,
+        }
+    );
+    assert_eq!(
+        fallback_deviations,
+        &[DecodeDeviation::BypassedSubsampledAdaptiveLf]
+    );
+
+    // Since fallback safely bypasses adaptive LF, the pipeline execution must produce
+    // identical RGB8 output to the stream that explicitly skipped adaptive LF smoothing.
+    assert_eq!(
+        skip_output, fallback_output,
+        "compatibility fallback on adaptive LF stream must match explicit skip stream output"
+    );
+}
+
+#[test]
 fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
     let Some((info, device, queue)) = device() else {
         return;
