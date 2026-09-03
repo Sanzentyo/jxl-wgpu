@@ -222,3 +222,113 @@ fn adaptive_lf_odd_tail_matches_scalar_oracle_on_gpu() {
         }
     }
 }
+
+#[test]
+fn subsampled_adaptive_lf_smoothing_matches_scalar_on_gpu() {
+    use jxl_wgpu_decode::vardct::frontend::VarDctChannelShift;
+    use jxl_wgpu_decode::vardct::lf::{AdaptiveLfPipeline, AdaptiveLfBuffers, SubsampledAdaptiveLfLayout};
+
+    let Some(backend) = backend() else {
+        return;
+    };
+    let device = backend.device();
+    let queue = backend.queue();
+
+    // 4:2:0 Subsampling: ch0(X) = 8x8, ch1(Y) = 16x16, ch2(B) = 8x8
+    let shifts = [
+        VarDctChannelShift { horizontal: 1, vertical: 1 },
+        VarDctChannelShift { horizontal: 0, vertical: 0 },
+        VarDctChannelShift { horizontal: 1, vertical: 1 },
+    ];
+    let layout = SubsampledAdaptiveLfLayout::new(16, 16, shifts);
+
+    let lf_scale = [0.2f32, 0.3f32, 0.4f32];
+    let pipeline = AdaptiveLfPipeline::new(device);
+
+    for channel in [0, 1, 2] {
+        let extent = layout.channel_extent(channel);
+        let width = extent.width as usize;
+        let height = extent.height as usize;
+        let count = width * height;
+
+        let mut input = Vec::with_capacity(count);
+        for y in 0..height {
+            for x in 0..width {
+                let v = ((x * 17 + y * 23) % 256) as f32 / 255.0;
+                input.push([v, v * 0.9, v * 0.8, 0.0]);
+            }
+        }
+
+        let expected = scalar_smoothing(width, height, &input, lf_scale);
+
+        let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("subsampled LF input"),
+            contents: bytemuck::cast_slice(&input),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("subsampled LF output"),
+            size: (count * std::mem::size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("subsampled LF staging"),
+            size: (count * std::mem::size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let params = layout.channel_params(channel, 0, 0, lf_scale);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("subsampled LF encoder"),
+        });
+        let _uniform = pipeline.encode(
+            device,
+            &mut encoder,
+            AdaptiveLfBuffers {
+                input: &in_buf,
+                output: &out_buf,
+            },
+            params,
+        );
+        encoder.copy_buffer_to_buffer(
+            &out_buf,
+            0,
+            &staging,
+            0,
+            (count * std::mem::size_of::<[f32; 4]>()) as u64,
+        );
+
+        let submission = queue.submit(Some(encoder.finish()));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .expect("poll subsampled adaptive LF readback");
+        receiver
+            .recv()
+            .expect("subsampled adaptive LF callback")
+            .expect("map subsampled adaptive LF output");
+
+        let mapped = staging.slice(..).get_mapped_range().expect("mapped range");
+        let actual = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped);
+
+        for (index, (expected_val, actual_val)) in expected.iter().zip(actual).enumerate() {
+            let ch = channel;
+            let tolerance = 2.0e-6f32.max(expected_val[ch].abs() * 2.0e-6);
+            assert!(
+                (actual_val[ch] - expected_val[ch]).abs() <= tolerance,
+                "ch {channel} sample {index}: GPU {}, scalar {}, tolerance {tolerance}",
+                actual_val[ch],
+                expected_val[ch],
+            );
+        }
+    }
+}

@@ -90,12 +90,17 @@ pub(crate) enum AdaptiveLfPlan {
     Skip,
     /// Adaptive LF smoothing executes on packed 4:4:4 XYB or YCbCr planes.
     ExecutePacked444,
+    /// Adaptive LF smoothing executes on subsampled chroma channels with aligned sampling.
+    #[allow(dead_code)]
+    ExecuteSubsampled {
+        channel_shifts: [VarDctChannelShift; 3],
+    },
 }
 
 impl AdaptiveLfPlan {
     #[must_use]
     pub const fn executes(self) -> bool {
-        matches!(self, Self::ExecutePacked444)
+        matches!(self, Self::ExecutePacked444 | Self::ExecuteSubsampled { .. })
     }
 }
 
