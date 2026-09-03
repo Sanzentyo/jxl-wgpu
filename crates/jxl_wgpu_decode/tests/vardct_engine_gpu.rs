@@ -3348,3 +3348,209 @@ fn vardct_render_tail_executes_downsampled_alpha_upsample_on_gpu() {
         assert!(sample > 0.0);
     }
 }
+
+#[test]
+fn multi_extra_channel_and_frame_blend_pipeline_on_gpu() {
+    use wgpu::util::DeviceExt;
+    use jxl_gpu_protocol::{
+        BlendMode, Border2d, Extent2d, FrameSessionDesc, GroupId, GroupPayload, MemoryMode,
+        OutputDesc, OutputId, OutputLayout, OutputOrientation, PlaneData, PlaneDesc, PlaneId,
+        PlaneRole, PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp,
+        RenderPlan, SampleType, SaveParams, Scale2d,
+    };
+    use jxl_wgpu::ResidentPlaneBinding;
+    use jxl_wgpu_decode::extra_channel::FrameBlendSpecification;
+
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend = WgpuBackend::from_device(
+        device,
+        queue,
+        info,
+        WgpuBackendConfig {
+            enable_timestamps: false,
+            ..WgpuBackendConfig::default()
+        },
+    )
+    .unwrap();
+
+    let extent = Extent2d::new(16, 16);
+    let sample_count = (extent.width * extent.height) as usize;
+
+    let base_color = vec![0.2_f32; sample_count];
+    let source_color = vec![0.8_f32; sample_count];
+    let base_alpha = vec![1.0_f32; sample_count];
+    let source_alpha = vec![0.5_f32; sample_count];
+    let depth_data = vec![0.4_f32; sample_count];
+
+    let buf_base = Arc::new(backend.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test base plane"),
+        contents: bytemuck::cast_slice(&base_color),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    }));
+    let buf_source = Arc::new(backend.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test source plane"),
+        contents: bytemuck::cast_slice(&source_color),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    }));
+    let buf_base_a = Arc::new(backend.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test base alpha"),
+        contents: bytemuck::cast_slice(&base_alpha),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    }));
+    let buf_source_a = Arc::new(backend.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test source alpha"),
+        contents: bytemuck::cast_slice(&source_alpha),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    }));
+    let buf_depth = Arc::new(backend.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("test depth plane"),
+        contents: bytemuck::cast_slice(&depth_data),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    }));
+
+    // Build RenderPlan with FrameBlendSpecification
+    let mut plan = RenderPlan::default();
+    let p_base = PlaneId(0);
+    let p_source = PlaneId(1);
+    let p_base_a = PlaneId(2);
+    let p_source_a = PlaneId(3);
+    let p_depth = PlaneId(4);
+    let p_blended = PlaneId(5);
+
+    for (id, is_intermediate) in [
+        (p_base, false),
+        (p_source, false),
+        (p_base_a, false),
+        (p_source_a, false),
+        (p_depth, false),
+        (p_blended, true),
+    ] {
+        plan.planes.push(PlaneDesc {
+            id,
+            extent,
+            stride: extent.width,
+            sample_type: SampleType::F32,
+            role: if is_intermediate { PlaneRole::Intermediate } else { PlaneRole::ImportedResident },
+        });
+    }
+
+    let blend_spec = FrameBlendSpecification {
+        mode: BlendMode::BlendAbove,
+        clamp: true,
+        alpha_associated: false,
+        base_plane: p_base,
+        source_plane: p_source,
+        base_alpha_plane: Some(p_base_a),
+        source_alpha_plane: Some(p_source_a),
+        target_plane: p_blended,
+    };
+    plan.nodes.push(blend_spec.build_render_node("blend_node"));
+
+    // Output 0: Blended color
+    plan.outputs.push(OutputDesc {
+        id: OutputId(0),
+        extent,
+        sample_type: SampleType::F32,
+        channels: 1,
+        layout: OutputLayout::Planar,
+        color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+    });
+    plan.nodes.push(RenderNode {
+        name: "save_blended".into(),
+        op: RenderOp::Save(SaveParams {
+            output: OutputId(0),
+            sample_type: SampleType::F32,
+            channels: vec![p_blended],
+            layout: OutputLayout::Planar,
+            orientation: OutputOrientation::Identity,
+        }),
+        inputs: vec![p_blended],
+        outputs: Vec::new(),
+        resources: Vec::new(),
+        scale: Scale2d::IDENTITY,
+        border: Border2d::ZERO,
+        precision: PrecisionContract::Exact,
+    });
+
+    // Output 1: Extra Channel (Depth)
+    plan.outputs.push(OutputDesc {
+        id: OutputId(1),
+        extent,
+        sample_type: SampleType::F32,
+        channels: 1,
+        layout: OutputLayout::Planar,
+        color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+    });
+    plan.nodes.push(RenderNode {
+        name: "save_depth".into(),
+        op: RenderOp::Save(SaveParams {
+            output: OutputId(1),
+            sample_type: SampleType::F32,
+            channels: vec![p_depth],
+            layout: OutputLayout::Planar,
+            orientation: OutputOrientation::Identity,
+        }),
+        inputs: vec![p_depth],
+        outputs: Vec::new(),
+        resources: Vec::new(),
+        scale: Scale2d::IDENTITY,
+        border: Border2d::ZERO,
+        precision: PrecisionContract::Exact,
+    });
+
+    plan.validate().expect("plan validation");
+
+    let frame_desc = FrameSessionDesc {
+        frame_extent: extent,
+        group_extent: extent,
+        group_count: 1,
+        precision: PrecisionPolicy::F32Only,
+        memory_mode: MemoryMode::Resident,
+        max_resident_bytes: 16 * 1024 * 1024,
+        max_scratch_bytes: 16 * 1024 * 1024,
+    };
+
+    let mut session = backend
+        .create_session(&frame_desc, Arc::new(plan))
+        .expect("create frame session for blend tail");
+
+    let byte_size = (sample_count * std::mem::size_of::<f32>()) as u64;
+    session.import_resident_plane(ResidentPlaneBinding::new(p_base, buf_base, 0, byte_size)).unwrap();
+    session.import_resident_plane(ResidentPlaneBinding::new(p_source, buf_source, 0, byte_size)).unwrap();
+    session.import_resident_plane(ResidentPlaneBinding::new(p_base_a, buf_base_a, 0, byte_size)).unwrap();
+    session.import_resident_plane(ResidentPlaneBinding::new(p_source_a, buf_source_a, 0, byte_size)).unwrap();
+    session.import_resident_plane(ResidentPlaneBinding::new(p_depth, buf_depth, 0, byte_size)).unwrap();
+
+    session
+        .enqueue(GroupPayload {
+            group: GroupId(0),
+            revision: 0,
+            complete: true,
+            planes: Vec::new(),
+            vardct: None,
+        })
+        .unwrap();
+
+    let token = session.submit(RenderIntent::Final).expect("submit blend frame");
+    let rendered = session.wait(token).expect("wait rendered blend");
+
+    assert_eq!(rendered.outputs.len(), 2);
+
+    let PlaneData::F32(out_blended) = &rendered.outputs[0].data else { panic!() };
+    assert_eq!(out_blended.len(), sample_count);
+    // Formula for BlendAbove (straight alpha):
+    // out = (src * src_a + base * base_a * (1 - src_a)) / out_a
+    // where out_a = src_a + base_a * (1 - src_a) = 0.5 + 1.0 * 0.5 = 1.0
+    // out = 0.8 * 0.5 + 0.2 * 1.0 * 0.5 = 0.4 + 0.1 = 0.5
+    for &sample in out_blended {
+        assert!((sample - 0.5).abs() < 1e-3, "expected ~0.5, got {sample}");
+    }
+
+    let PlaneData::F32(out_depth) = &rendered.outputs[1].data else { panic!() };
+    assert_eq!(out_depth.len(), sample_count);
+    for &sample in out_depth {
+        assert!((sample - 0.4).abs() < 1e-4, "expected 0.4, got {sample}");
+    }
+}

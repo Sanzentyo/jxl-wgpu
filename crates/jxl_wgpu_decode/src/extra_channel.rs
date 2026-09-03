@@ -9,7 +9,10 @@
 //! dimensional shifts, bit depths, and provides plan validation for rendering pipelines.
 
 use jxl_gpu_bitstream::{ExtraChannelInventory, ExtraChannelTypeInventory, SampleBitDepth};
-use jxl_gpu_protocol::{Extent2d, UpsamplingFactor};
+use jxl_gpu_protocol::{
+    BlendComponent, BlendMode, BlendParams, Border2d, Extent2d, OutputId, PlaneId,
+    PrecisionContract, RenderNode, RenderOp, Scale2d, UpsamplingFactor,
+};
 
 use crate::{Error, Result};
 
@@ -230,6 +233,85 @@ impl ExtraChannelPlan {
     }
 }
 
+/// Extra channel descriptor for routing and composition within a render tail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtraChannelDescriptor {
+    pub info: ExtraChannelInfo,
+    /// Mode of output routing for this extra channel.
+    pub output_mode: ExtraChannelOutputRouting,
+}
+
+/// Output routing mode for an extra channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtraChannelOutputRouting {
+    /// Save as an independent single-channel output target.
+    SeparateOutput(OutputId),
+    /// Pack into primary RGBA output (only valid for Alpha channels).
+    PackPrimaryAlpha,
+    /// Do not save directly (used solely for intermediate blending/composition).
+    InternalOnly,
+}
+
+/// Specification for blending a source frame plane onto a base plane.
+#[derive(Clone, Debug)]
+pub struct FrameBlendSpecification {
+    pub mode: BlendMode,
+    pub clamp: bool,
+    pub alpha_associated: bool,
+    pub base_plane: PlaneId,
+    pub source_plane: PlaneId,
+    pub base_alpha_plane: Option<PlaneId>,
+    pub source_alpha_plane: Option<PlaneId>,
+    pub target_plane: PlaneId,
+}
+
+impl FrameBlendSpecification {
+    /// Builds a [`RenderNode`] executing this blend specification.
+    pub fn build_render_node(&self, name: impl Into<std::sync::Arc<str>>) -> RenderNode {
+        let (component, inputs) = if let (Some(base_alpha), Some(source_alpha)) =
+            (self.base_alpha_plane, self.source_alpha_plane)
+        {
+            (
+                BlendComponent::Color {
+                    alpha_associated: self.alpha_associated,
+                },
+                vec![
+                    self.base_plane,
+                    self.source_plane,
+                    base_alpha,
+                    source_alpha,
+                ],
+            )
+        } else {
+            (
+                BlendComponent::Color {
+                    alpha_associated: false,
+                },
+                vec![self.base_plane, self.source_plane],
+            )
+        };
+
+        RenderNode {
+            name: name.into(),
+            op: RenderOp::Blend(BlendParams {
+                mode: self.mode,
+                component,
+                clamp: self.clamp,
+            }),
+            inputs,
+            outputs: vec![self.target_plane],
+            resources: Vec::new(),
+            scale: Scale2d::IDENTITY,
+            border: Border2d::ZERO,
+            precision: PrecisionContract::Float {
+                absolute: 1.0e-6,
+                relative: 1.0e-6,
+                rmse: 1.0e-6,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +378,100 @@ mod tests {
 
         let result = ExtraChannelPlan::from_inventory(&inv);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn multi_extra_channel_plan_and_routing() {
+        use jxl_gpu_bitstream::FiniteF32;
+
+        let inv = vec![
+            ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::Alpha { associated: false },
+                bit_depth: SampleBitDepth::Integer { bits_per_sample: 8 },
+                dimension_shift: 0,
+                name_bytes: b"alpha".to_vec(),
+            },
+            ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::Depth,
+                bit_depth: SampleBitDepth::Integer { bits_per_sample: 16 },
+                dimension_shift: 1,
+                name_bytes: b"depth".to_vec(),
+            },
+            ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::SpotColour {
+                    red: FiniteF32::from_f32(1.0).unwrap(),
+                    green: FiniteF32::from_f32(0.5).unwrap(),
+                    blue: FiniteF32::from_f32(0.0).unwrap(),
+                    solidity: FiniteF32::from_f32(0.8).unwrap(),
+                },
+                bit_depth: SampleBitDepth::Integer { bits_per_sample: 8 },
+                dimension_shift: 0,
+                name_bytes: b"spot".to_vec(),
+            },
+        ];
+
+        let plan = ExtraChannelPlan::from_inventory(&inv).expect("multi plan creation");
+        assert_eq!(plan.len(), 3);
+        assert!(plan.has_alpha());
+
+        let descriptors = vec![
+            ExtraChannelDescriptor {
+                info: plan.channel(0).unwrap().clone(),
+                output_mode: ExtraChannelOutputRouting::PackPrimaryAlpha,
+            },
+            ExtraChannelDescriptor {
+                info: plan.channel(1).unwrap().clone(),
+                output_mode: ExtraChannelOutputRouting::SeparateOutput(OutputId(1)),
+            },
+            ExtraChannelDescriptor {
+                info: plan.channel(2).unwrap().clone(),
+                output_mode: ExtraChannelOutputRouting::SeparateOutput(OutputId(2)),
+            },
+        ];
+
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].output_mode, ExtraChannelOutputRouting::PackPrimaryAlpha);
+        assert_eq!(descriptors[1].output_mode, ExtraChannelOutputRouting::SeparateOutput(OutputId(1)));
+        assert_eq!(descriptors[2].output_mode, ExtraChannelOutputRouting::SeparateOutput(OutputId(2)));
+    }
+
+    #[test]
+    fn frame_blend_specification_builds_valid_node() {
+        let blend_spec = FrameBlendSpecification {
+            mode: BlendMode::BlendAbove,
+            clamp: true,
+            alpha_associated: false,
+            base_plane: PlaneId(10),
+            source_plane: PlaneId(11),
+            base_alpha_plane: Some(PlaneId(12)),
+            source_alpha_plane: Some(PlaneId(13)),
+            target_plane: PlaneId(14),
+        };
+
+        let node = blend_spec.build_render_node("test_blend");
+        assert_eq!(&*node.name, "test_blend");
+        assert_eq!(node.inputs.len(), 4);
+        assert_eq!(node.inputs, vec![PlaneId(10), PlaneId(11), PlaneId(12), PlaneId(13)]);
+        assert_eq!(node.outputs, vec![PlaneId(14)]);
+
+        let RenderOp::Blend(params) = &node.op else { panic!("expected blend op") };
+        assert_eq!(params.mode, BlendMode::BlendAbove);
+        assert!(params.clamp);
+        assert_eq!(params.component, BlendComponent::Color { alpha_associated: false });
+
+        // Without alpha
+        let blend_no_alpha = FrameBlendSpecification {
+            mode: BlendMode::Add,
+            clamp: false,
+            alpha_associated: false,
+            base_plane: PlaneId(20),
+            source_plane: PlaneId(21),
+            base_alpha_plane: None,
+            source_alpha_plane: None,
+            target_plane: PlaneId(22),
+        };
+        let node_no_alpha = blend_no_alpha.build_render_node("add_no_alpha");
+        assert_eq!(node_no_alpha.inputs.len(), 2);
+        assert_eq!(node_no_alpha.inputs, vec![PlaneId(20), PlaneId(21)]);
     }
 }

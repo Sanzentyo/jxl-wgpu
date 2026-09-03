@@ -73,7 +73,10 @@ pub use error::{
     ModularTransformFeature, ModularTreeError, ProgressiveDcError, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,
 };
-pub use extra_channel::{ExtraChannelInfo, ExtraChannelPlan, ExtraChannelType};
+pub use extra_channel::{
+    ExtraChannelDescriptor, ExtraChannelInfo, ExtraChannelOutputRouting, ExtraChannelPlan,
+    ExtraChannelType, FrameBlendSpecification,
+};
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
     IncrementalInputBudget, IncrementalInputBudgetError, IncrementalInputBudgetSnapshot,
