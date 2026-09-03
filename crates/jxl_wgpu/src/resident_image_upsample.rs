@@ -12,37 +12,11 @@ use crate::{KernelVariant, ResidentF32Plane};
 /// Note: 1× upsampling is identity (no-op) and completely bypasses the frame
 /// upsampling pipeline rather than executing an interpolation kernel. Only non-identity
 /// factors (2×, 4×, 8×) require weight preparation and GPU pipeline dispatches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u32)]
-pub enum UpsamplingFactor {
-    X2 = 2,
-    X4 = 4,
-    X8 = 8,
-}
+pub use jxl_gpu_protocol::UpsamplingFactor;
 
-impl UpsamplingFactor {
-    #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
-
-impl TryFrom<u32> for UpsamplingFactor {
-    type Error = ResidentImageUpsampleError;
-
-    fn try_from(factor: u32) -> Result<Self, Self::Error> {
-        match factor {
-            2 => Ok(Self::X2),
-            4 => Ok(Self::X4),
-            8 => Ok(Self::X8),
-            _ => Err(ResidentImageUpsampleError::InvalidFactor { factor }),
-        }
-    }
-}
-
-impl From<UpsamplingFactor> for u32 {
-    fn from(factor: UpsamplingFactor) -> Self {
-        factor as Self
+impl From<jxl_gpu_protocol::UnsupportedUpsamplingFactor> for ResidentImageUpsampleError {
+    fn from(err: jxl_gpu_protocol::UnsupportedUpsamplingFactor) -> Self {
+        Self::InvalidFactor { factor: err.factor }
     }
 }
 
@@ -842,7 +816,7 @@ mod tests {
 
     #[test]
     fn compact_weight_shapes_expand_to_every_phase() {
-        for (factor_u32, compact_len) in [(2, 15), (4, 55), (8, 210)] {
+        for (factor_u32, compact_len) in [(2_u32, 15_usize), (4_u32, 55_usize), (8_u32, 210_usize)] {
             let compact = (0..compact_len)
                 .map(|value| (value + 1) as f32 * 1.5)
                 .collect::<Vec<_>>();

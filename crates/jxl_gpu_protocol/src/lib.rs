@@ -378,11 +378,78 @@ pub trait RenderResourceProvider: Send + Sync {
     fn snapshot(&self, plane: Option<&PlaneDesc>) -> Result<ResourceData, BackendError>;
 }
 
-#[derive(Clone, Debug)]
+/// Non-identity 2×, 4×, or 8× upsampling factor for image and channel interpolation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum UpsamplingFactor {
+    X2 = 2,
+    X4 = 4,
+    X8 = 8,
+}
+
+impl UpsamplingFactor {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u8 as u32
+    }
+}
+
+/// Error returned when an upsampling factor is not 2, 4, or 8.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("unsupported upsampling factor {factor}; expected 2, 4, or 8")]
+pub struct UnsupportedUpsamplingFactor {
+    pub factor: u32,
+}
+
+impl TryFrom<u8> for UpsamplingFactor {
+    type Error = UnsupportedUpsamplingFactor;
+
+    fn try_from(factor: u8) -> Result<Self, Self::Error> {
+        match factor {
+            2 => Ok(Self::X2),
+            4 => Ok(Self::X4),
+            8 => Ok(Self::X8),
+            _ => Err(UnsupportedUpsamplingFactor {
+                factor: u32::from(factor),
+            }),
+        }
+    }
+}
+
+impl TryFrom<u32> for UpsamplingFactor {
+    type Error = UnsupportedUpsamplingFactor;
+
+    fn try_from(factor: u32) -> Result<Self, Self::Error> {
+        match factor {
+            2 => Ok(Self::X2),
+            4 => Ok(Self::X4),
+            8 => Ok(Self::X8),
+            _ => Err(UnsupportedUpsamplingFactor { factor }),
+        }
+    }
+}
+
+impl From<UpsamplingFactor> for u8 {
+    fn from(factor: UpsamplingFactor) -> Self {
+        factor as Self
+    }
+}
+
+impl From<UpsamplingFactor> for u32 {
+    fn from(factor: UpsamplingFactor) -> Self {
+        factor as u32
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpsampleParams {
-    pub factor: u8,
-    /// Phase-major 5x5 kernels. Custom transform data is intentionally not compiled into WGSL.
-    pub weights: Arc<[f32]>,
+    pub factor: UpsamplingFactor,
+    pub weights: ResourceId,
 }
 
 #[derive(Clone, Debug)]
@@ -1258,12 +1325,12 @@ mod tests {
                 RenderNode {
                     name: "upsample".into(),
                     op: RenderOp::Upsample(UpsampleParams {
-                        factor: 2,
-                        weights: vec![0.0; 4 * 25].into(),
+                        factor: UpsamplingFactor::X2,
+                        weights: ResourceId(0),
                     }),
                     inputs: vec![PlaneId(0)],
                     outputs: vec![PlaneId(1)],
-                    resources: Vec::new(),
+                    resources: vec![ResourceId(0)],
                     scale: Scale2d::new(2, 2),
                     border: Border2d::symmetric(2, 2),
                     precision: PrecisionContract::default(),

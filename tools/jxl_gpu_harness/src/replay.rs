@@ -9,7 +9,7 @@ use jxl_gpu_protocol::{
     GroupPayload, HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData, PlaneDesc,
     PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderIntent, RenderNode, RenderOp,
     RenderPlan, ResourceData, ResourceId, ResourceUpdate, SampleType, SaveParams, Scale2d,
-    UpsampleParams,
+    UpsampleParams, UpsamplingFactor,
 };
 
 use crate::capture::{
@@ -285,10 +285,31 @@ impl WgpuReplayJob {
                     color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
                 }],
             },
-            resources: epf_resource
-                .into_iter()
-                .map(|resource| resource.update)
-                .collect(),
+            resources: {
+                let mut res = epf_resource
+                    .into_iter()
+                    .map(|resource| resource.update)
+                    .collect::<Vec<_>>();
+                if let OperationKind::Upsample = capture.metadata.operation.kind {
+                    let factor = capture
+                        .metadata
+                        .operation
+                        .parameters
+                        .get("factor")
+                        .copied()
+                        .unwrap_or(2.0) as usize;
+                    let mut weights = vec![0.0_f32; factor * factor * 25];
+                    weights
+                        .chunks_exact_mut(25)
+                        .for_each(|phase| phase[12] = 1.0);
+                    res.push(ResourceUpdate {
+                        id: ResourceId(0),
+                        revision: 0,
+                        data: ResourceData::F32(weights),
+                    });
+                }
+                res
+            },
             payload: GroupPayload {
                 group: GroupId(0),
                 revision: 0,
@@ -553,14 +574,13 @@ fn operation_nodes(
                     "unsupported upsample factor {factor}"
                 )));
             }
-            let factor = factor as u8;
-            let mut weights = vec![0.0_f32; usize::from(factor) * usize::from(factor) * 25];
-            weights
-                .chunks_exact_mut(25)
-                .for_each(|phase| phase[12] = 1.0);
+            let factor_u8 = factor as u8;
+            let factor_enum = UpsamplingFactor::try_from(factor_u8)
+                .map_err(|_| Error::InvalidMetadata(format!("{factor}x upsampling is not supported")))?;
+            let weights_res_id = ResourceId(0);
             let params = UpsampleParams {
-                factor,
-                weights: weights.into(),
+                factor: factor_enum,
+                weights: weights_res_id,
             };
             Ok(inputs
                 .iter()
@@ -572,8 +592,8 @@ fn operation_nodes(
                     op: RenderOp::Upsample(params.clone()),
                     inputs: vec![input],
                     outputs: vec![output],
-                    resources: Vec::new(),
-                    scale: Scale2d::new(factor, factor),
+                    resources: vec![weights_res_id],
+                    scale: Scale2d::new(factor_u8, factor_u8),
                     border: Border2d::symmetric(2, 2),
                     precision: float_contract,
                 })

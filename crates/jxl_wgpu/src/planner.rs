@@ -526,28 +526,21 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
         RenderOp::ChromaUpsample { axis } => validate_chroma_upsample(index, node, plan, *axis),
         RenderOp::Epf(params) => validate_epf(index, node, params, plan),
         RenderOp::Upsample(params) => {
-            let factor = usize::from(params.factor);
-            let expected = factor
-                .checked_mul(factor)
-                .and_then(|phases| phases.checked_mul(25))
-                .ok_or(Error::BufferSizeOverflow)?;
-            if !matches!(params.factor, 2 | 4 | 8) || params.weights.len() != expected {
+            let factor = params.factor.as_u8();
+            if node.scale.x != factor || node.scale.y != factor {
                 return Err(Error::InvalidPayload(format!(
-                    "node {index} has factor {} with {} weights; expected 2/4/8 and {expected} weights",
-                    params.factor,
-                    params.weights.len()
+                    "node {index} scale does not match its {factor}x upsampling factor",
                 )));
             }
-            if node.scale.x != params.factor || node.scale.y != params.factor {
+            if !node.resources.contains(&params.weights) {
                 return Err(Error::InvalidPayload(format!(
-                    "node {index} scale does not match its {}x upsampling factor",
-                    params.factor
+                    "node {index} {factor}x upsampling must declare weights resource {:?}",
+                    params.weights,
                 )));
             }
             if node.border != jxl_gpu_protocol::Border2d::symmetric(2, 2) {
                 return Err(Error::InvalidPayload(format!(
-                    "node {index} {}x upsampling requires a two-sample symmetric border",
-                    params.factor
+                    "node {index} {factor}x upsampling requires a two-sample symmetric border",
                 )));
             }
             let ([input_id], [output_id]) = (node.inputs.as_slice(), node.outputs.as_slice())
@@ -566,7 +559,7 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
                 .iter()
                 .find(|plane| plane.id == *output_id)
                 .ok_or(Error::MissingPlane(*output_id))?;
-            let factor = u32::from(params.factor);
+            let factor = params.factor.as_u32();
             if input.sample_type != SampleType::F32
                 || output.sample_type != SampleType::F32
                 || output.extent.width.div_ceil(factor) != input.extent.width
@@ -574,7 +567,7 @@ fn validate_operation(index: usize, node: &RenderNode, plan: &RenderPlan) -> Res
             {
                 return Err(Error::InvalidPayload(format!(
                     "node {index} {}x upsampling requires F32 planes and a possibly odd-cropped extent, got {:?} -> {:?}",
-                    params.factor, input.extent, output.extent
+                    params.factor.as_u8(), input.extent, output.extent
                 )));
             }
             Ok(())
@@ -1304,7 +1297,7 @@ fn joined_label(nodes: &[RenderNode]) -> String {
 mod tests {
     use jxl_gpu_protocol::{
         Border2d, ChromaAxis, OutputDesc, OutputId, OutputLayout, PlaneDesc, PrecisionContract,
-        RenderOp, SaveParams, Scale2d, UpsampleParams,
+        RenderOp, SaveParams, Scale2d, UpsampleParams, UpsamplingFactor,
     };
 
     use super::*;
@@ -1561,13 +1554,14 @@ mod tests {
         let mut upsample = node(
             "odd upsample",
             RenderOp::Upsample(UpsampleParams {
-                factor: 2,
-                weights: weights.into(),
+                factor: UpsamplingFactor::X2,
+                weights: jxl_gpu_protocol::ResourceId(0),
             }),
             &[0],
             &[1],
             PrecisionContract::default(),
         );
+        upsample.resources = vec![jxl_gpu_protocol::ResourceId(0)];
         upsample.scale = Scale2d::new(2, 2);
         upsample.border = Border2d::symmetric(2, 2);
         let upsample_plan = RenderPlan {
@@ -1833,14 +1827,15 @@ mod tests {
         plan.nodes[0] = node(
             "upsample",
             RenderOp::Upsample(UpsampleParams {
-                factor: 2,
-                weights: vec![0.0; 99].into(),
+                factor: UpsamplingFactor::X2,
+                weights: jxl_gpu_protocol::ResourceId(0),
             }),
             &[0],
             &[1],
             PrecisionContract::default(),
         );
-        plan.nodes[0].scale = Scale2d::new(2, 2);
+        plan.nodes[0].resources = vec![jxl_gpu_protocol::ResourceId(0)];
+        plan.nodes[0].scale = Scale2d::new(4, 4);
         assert!(matches!(
             Planner::new(wgpu::Limits::default(), memory()).plan(&frame(MemoryMode::Auto), &plan),
             Err(Error::InvalidPayload(_))

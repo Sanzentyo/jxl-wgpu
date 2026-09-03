@@ -473,6 +473,7 @@ impl Scheduler {
                                 node,
                                 &planes,
                                 params,
+                                resources,
                             )?;
                             1
                         }

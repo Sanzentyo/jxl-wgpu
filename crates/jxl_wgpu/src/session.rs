@@ -820,7 +820,7 @@ mod tests {
         GaborishParams, HostPlane, MemoryMode, OutputDesc, OutputId, OutputLayout, PlaneData,
         PlaneDesc, PlaneId, PlaneRole, PrecisionContract, PrecisionPolicy, RenderNode, RenderOp,
         SaveParams, Scale2d, TransferFunction as ProtocolTransferFunction, TransferParams,
-        UpsampleParams, XybParams,
+        UpsampleParams, UpsamplingFactor, XybParams,
     };
 
     fn test_backend() -> Option<WgpuBackend> {
@@ -2868,14 +2868,15 @@ mod tests {
                     let mut node = render_node(
                         "upsample",
                         RenderOp::Upsample(UpsampleParams {
-                            factor: 2,
-                            weights: weights.into(),
+                            factor: UpsamplingFactor::X2,
+                            weights: ResourceId(0),
                         }),
                         &[3],
                         &[4],
                         Scale2d::new(2, 2),
                         PrecisionContract::default(),
                     );
+                    node.resources = vec![ResourceId(0)];
                     node.border = Border2d::symmetric(2, 2);
                     node
                 },
@@ -2934,6 +2935,13 @@ mod tests {
         let mut session = backend
             .create_session(&frame_desc(two), plan)
             .expect("create portable shader session");
+        session
+            .update_resource(ResourceUpdate {
+                id: ResourceId(0),
+                revision: 0,
+                data: ResourceData::F32(weights),
+            })
+            .expect("update upsample weights resource");
         session
             .enqueue(GroupPayload {
                 group: GroupId(0),
@@ -3009,17 +3017,19 @@ mod tests {
                 ],
                 nodes: vec![
                     {
+                        let factor_enum = UpsamplingFactor::try_from(factor).unwrap();
                         let mut node = render_node(
                             "upsample",
                             RenderOp::Upsample(UpsampleParams {
-                                factor,
-                                weights: weights.into(),
+                                factor: factor_enum,
+                                weights: ResourceId(0),
                             }),
                             &[0],
                             &[1],
                             Scale2d::new(factor, factor),
                             PrecisionContract::default(),
                         );
+                        node.resources = vec![ResourceId(0)];
                         node.border = Border2d::symmetric(2, 2);
                         node
                     },
@@ -3050,6 +3060,13 @@ mod tests {
             let mut session = backend
                 .create_session(&frame_desc(output_extent), plan)
                 .expect("create upsample session");
+            session
+                .update_resource(ResourceUpdate {
+                    id: ResourceId(0),
+                    revision: 0,
+                    data: ResourceData::F32(weights),
+                })
+                .expect("update upsample weights resource");
             session
                 .enqueue(GroupPayload {
                     group: GroupId(0),

@@ -520,6 +520,7 @@ pub(in crate::scheduler) fn encode_upsample(
     node: &RenderNode,
     planes: &BTreeMap<PlaneId, UploadedPlane>,
     upsample: &jxl_gpu_protocol::UpsampleParams,
+    resources: &BTreeMap<jxl_gpu_protocol::ResourceId, jxl_gpu_protocol::ResourceUpdate>,
 ) -> Result<()> {
     let device = factory.device;
     let (input, output) = unary_planes(node, planes)?;
@@ -528,35 +529,45 @@ pub(in crate::scheduler) fn encode_upsample(
             "Upsample requires F32 input and output".into(),
         ));
     }
-    if !matches!(upsample.factor, 2 | 4 | 8) {
-        return Err(Error::Unsupported(format!(
-            "{}x upsampling is unsupported",
-            upsample.factor
-        )));
-    }
-    let factor = u32::from(upsample.factor);
+    let factor = upsample.factor.as_u32();
     if output.desc.extent.width.div_ceil(factor) != input.desc.extent.width
         || output.desc.extent.height.div_ceil(factor) != input.desc.extent.height
     {
         return Err(Error::InvalidPayload(format!(
             "{}x Upsample extent mismatch in '{}': {:?} -> {:?}; expected a possibly odd-cropped extent",
-            upsample.factor, node.name, input.desc.extent, output.desc.extent
+            upsample.factor.as_u8(), node.name, input.desc.extent, output.desc.extent
         )));
     }
-    let expected_weights = usize::from(upsample.factor)
-        .checked_mul(usize::from(upsample.factor))
+    let factor_usize = usize::from(upsample.factor.as_u8());
+    let expected_weights = factor_usize
+        .checked_mul(factor_usize)
         .and_then(|phases| phases.checked_mul(25))
         .ok_or(Error::BufferSizeOverflow)?;
-    if upsample.weights.len() != expected_weights {
+    let update = resources.get(&upsample.weights).ok_or_else(|| {
+        Error::InvalidPayload(format!(
+            "Upsample node '{}' is missing weights resource {:?}",
+            node.name, upsample.weights
+        ))
+    })?;
+    let weights_slice = match &update.data {
+        jxl_gpu_protocol::ResourceData::F32(values) => values.as_slice(),
+        _ => {
+            return Err(Error::InvalidPayload(format!(
+                "Upsample node '{}' weights resource must be ResourceData::F32",
+                node.name
+            )));
+        }
+    };
+    if weights_slice.len() != expected_weights {
         return Err(Error::InvalidPayload(format!(
             "{}x Upsample has {} weights, expected {expected_weights} phase-major weights",
-            upsample.factor,
-            upsample.weights.len()
+            upsample.factor.as_u8(),
+            weights_slice.len()
         )));
     }
     let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("jxl-wgpu upsample weights"),
-        contents: bytemuck::cast_slice(&upsample.weights),
+        contents: bytemuck::cast_slice(weights_slice),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let params = UpsampleUniform {

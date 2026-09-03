@@ -39,14 +39,8 @@ pub(super) fn validate(plan: &RenderPlan) -> Result<()> {
             | RenderOp::TransferFunction(_)
             | RenderOp::Blend(_)
             | RenderOp::PremultiplyAlpha { .. }
-            | RenderOp::Extend { .. } => {}
-            RenderOp::Upsample(params) if matches!(params.factor, 2 | 4 | 8) => {}
-            RenderOp::Upsample(params) => {
-                return Err(Error::Unsupported(format!(
-                    "{}x upsampling is not supported; expected 2, 4, or 8",
-                    params.factor
-                )));
-            }
+            | RenderOp::Extend { .. }
+            | RenderOp::Upsample(_) => {}
             RenderOp::Convert {
                 output_type: SampleType::I32 | SampleType::F32,
             } => {}
@@ -90,6 +84,7 @@ pub(super) fn validate_resources(
         match &node.op {
             RenderOp::Epf(params) => validate_epf_resource(plan, node, params, resources)?,
             RenderOp::VarDct => {}
+            RenderOp::Upsample(params) => validate_upsample_resource(node, params, resources)?,
             _ if node.resources.is_empty() => {}
             _ => {
                 return Err(Error::Unsupported(format!(
@@ -100,6 +95,40 @@ pub(super) fn validate_resources(
         }
     }
     Ok(())
+}
+
+fn validate_upsample_resource(
+    node: &RenderNode,
+    params: &jxl_gpu_protocol::UpsampleParams,
+    resources: &BTreeMap<ResourceId, ResourceUpdate>,
+) -> Result<()> {
+    if node.resources.as_slice() != [params.weights] {
+        return Err(Error::InvalidPayload(format!(
+            "Upsample node {} must declare only weights resource {:?}",
+            node.name, params.weights
+        )));
+    }
+    let update = resources.get(&params.weights).ok_or_else(|| {
+        Error::InvalidPayload(format!(
+            "Upsample node {} is missing weights resource {:?}",
+            node.name, params.weights
+        ))
+    })?;
+    let factor = usize::from(params.factor.as_u8());
+    let expected = factor * factor * 25;
+    match &update.data {
+        jxl_gpu_protocol::ResourceData::F32(values) if values.len() == expected => Ok(()),
+        jxl_gpu_protocol::ResourceData::F32(values) => Err(Error::InvalidPayload(format!(
+            "Upsample node {} weights resource {:?} has {} weights; expected {expected}",
+            node.name,
+            params.weights,
+            values.len()
+        ))),
+        _ => Err(Error::InvalidPayload(format!(
+            "Upsample node {} weights resource {:?} must be ResourceData::F32",
+            node.name, params.weights
+        ))),
+    }
 }
 
 pub(super) fn validate_transient_budget(
@@ -153,7 +182,8 @@ pub(in crate::scheduler) fn transient_bytes(
             }
             RenderOp::Upsample(params) => {
                 add_uniform::<UpsampleUniform>(&mut bytes)?;
-                add_slice::<f32>(&mut bytes, params.weights.len())?;
+                let factor = usize::from(params.factor.as_u8());
+                add_slice::<f32>(&mut bytes, factor * factor * 25)?;
             }
             RenderOp::XybToRgb(_) => add_uniform::<XybUniform>(&mut bytes)?,
             RenderOp::YcbcrToRgb => {
