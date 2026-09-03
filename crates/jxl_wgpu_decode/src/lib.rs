@@ -79,9 +79,9 @@ pub use jxl_gpu_bitstream::ParseLimits;
 pub use jxl_gpu_formats::{ImageLayout, PixelFormat};
 pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
-    AnimationMetadata, DecodeDeviation, DecodeProfile, F64OutputPolicy, FrameDuration,
-    FrameMetadata, FrameTimebase, GpuOutputMapping, GpuOutputRequest, ModularChannels,
-    ModularGrouping, ModularPredictionProfile, ModularPredictor, NumericSampleMapping,
+    AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration, FrameMetadata, FrameTimebase,
+    GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping, ModularPredictionProfile,
+    ModularPredictor, NumericSampleMapping,
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;
@@ -92,10 +92,9 @@ pub use session::{
     PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession, SubmittedGpuFrame,
 };
 pub use vardct_engine::{
-    AdaptiveLfDecision, AdaptiveLfDisposition, SubsampledAdaptiveLfPolicy, VarDctDecodeError,
-    VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctOutputFormat, VarDctPendingFrame,
-    VarDctSubmissionEngine, vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format,
-    vardct_rgba8_format,
+    VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctOutputFormat,
+    VarDctPendingFrame, VarDctSubmissionEngine, vardct_bgr8_format, vardct_bgra8_format,
+    vardct_rgb8_format, vardct_rgba8_format,
 };
 pub use wgpu_engine::{
     F64OutputPath, ModularEntropyCoding, ModularOutputSpecialization,

@@ -73,7 +73,6 @@ fn frame(index: usize, is_last: bool) -> SubmittedGpuFrame<MockGpuFrame> {
             is_last,
             is_keyframe: index == 0,
             name: format!("frame-{index}"),
-            deviations: Vec::new(),
         },
         MockGpuFrame {
             resource_id: index as u64,
@@ -229,7 +228,6 @@ impl GpuSubmissionSession for TimecodeSession {
                 is_last: true,
                 is_keyframe: true,
                 name: "timecoded".into(),
-                deviations: Vec::new(),
             },
             MockGpuFrame { resource_id: 99 },
         )))))
@@ -393,7 +391,6 @@ impl GpuSubmissionSession for PendingSession {
                     is_last: true,
                     is_keyframe: true,
                     name: String::new(),
-                    deviations: Vec::new(),
                 },
                 MockGpuFrame { resource_id: 7 },
             )),
@@ -534,7 +531,6 @@ impl GpuSubmissionSession for PrefetchAnimationSession {
                     is_last: index + 1 == self.frame_count,
                     is_keyframe: index == 0,
                     name: format!("prefetched-{index}"),
-                    deviations: Vec::new(),
                 },
                 MockGpuFrame {
                     resource_id: u64::try_from(index).unwrap(),

@@ -21,8 +21,8 @@ use jxl_wgpu::{
 use crate::{
     Error, GpuCodestream, GpuDecoder, GpuOutputRequest, GpuPendingFrame, GpuSubmissionEngine,
     GpuSubmissionSession, PreparedGpuSession, ProgressiveDcError, Result, SubmittedGpuFrame,
-    SubsampledAdaptiveLfPolicy, VarDctDecodeSession, VarDctPendingFrame, VarDctSubmissionEngine,
-    WgpuDecodeSession, WgpuPendingFrame, WgpuSubmissionEngine,
+    VarDctDecodeSession, VarDctPendingFrame, VarDctSubmissionEngine, WgpuDecodeSession,
+    WgpuPendingFrame, WgpuSubmissionEngine,
 };
 
 /// One physical frame in a progressive-DC dependency chain.
@@ -214,21 +214,6 @@ impl WgpuDecodeEngine {
         self.modular = self.modular.with_stream_window_limit(limit);
         self.vardct = self.vardct.with_stream_window_limit(limit);
         self
-    }
-
-    /// Sets the policy for handling unstandardized subsampled Adaptive LF smoothing.
-    #[must_use]
-    pub fn with_subsampled_adaptive_lf_policy(
-        mut self,
-        policy: SubsampledAdaptiveLfPolicy,
-    ) -> Self {
-        self.vardct = self.vardct.with_subsampled_adaptive_lf_policy(policy);
-        self
-    }
-
-    #[must_use]
-    pub const fn subsampled_adaptive_lf_policy(&self) -> SubsampledAdaptiveLfPolicy {
-        self.vardct.subsampled_adaptive_lf_policy()
     }
 
     /// Explicit low-level Modular engine access for diagnostics and cache policy.

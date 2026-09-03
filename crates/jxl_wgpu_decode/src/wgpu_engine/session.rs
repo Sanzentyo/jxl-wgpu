@@ -246,7 +246,6 @@ impl WgpuPendingFrame {
                 is_last: true,
                 is_keyframe: true,
                 name: String::new(),
-                deviations: Vec::new(),
             },
             GpuImageFrame {
                 token: self.token,

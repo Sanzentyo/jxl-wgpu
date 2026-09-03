@@ -25,9 +25,8 @@ use jxl_wgpu_decode::vardct::packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError,
 };
 use jxl_wgpu_decode::{
-    AdaptiveLfDecision, AdaptiveLfDisposition, DecodeDeviation, DecodeProfile,
-    Error as DecodeError, GpuDecodeSession, GpuDecoder, GpuOutputRequest, NumericSampleMapping,
-    PrefetchBackpressure, SubsampledAdaptiveLfPolicy, VarDctDecodeError, VarDctSubmissionEngine,
+    DecodeProfile, Error as DecodeError, GpuDecodeSession, GpuDecoder, GpuOutputRequest,
+    NumericSampleMapping, PrefetchBackpressure, VarDctDecodeError, VarDctSubmissionEngine,
     WgpuDecodeEngine, WgpuDecodeSubmissionSession,
 };
 use jxl_wgpu_encode::{
@@ -452,7 +451,6 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         },
     )
     .unwrap();
-    let extent = Extent2d::new(264, 64);
     let codestream = common::jpeg_transcode_422_adaptive_lf();
 
     // 1. Assert fixture invariants: truly signaled adaptive LF smoothing on subsampled JPEG
@@ -490,57 +488,6 @@ fn subsampled_jpeg_with_adaptive_lf_flag_decodes_successfully_on_gpu() {
         ),
         "strict policy error must be UnsupportedSubsampledStage, got {strict_error:?}"
     );
-
-    // 2. Compatibility fallback via unified WgpuDecodeEngine selector
-    let engine = WgpuDecodeEngine::new(backend.clone())
-        .unwrap()
-        .with_subsampled_adaptive_lf_policy(SubsampledAdaptiveLfPolicy::CompatibilityFallback);
-    let decoder = GpuDecoder::new(engine);
-    let mut session = decoder
-        .open(
-            codestream,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-        )
-        .unwrap();
-
-    let vardct = session.submission_session().vardct().unwrap();
-    assert_eq!(
-        vardct.adaptive_lf_decision(),
-        AdaptiveLfDecision {
-            signaled: true,
-            disposition: AdaptiveLfDisposition::BypassedSubsampled,
-        },
-        "decision must record signaled=true and disposition=BypassedSubsampled"
-    );
-    assert_eq!(
-        vardct.deviations(),
-        &[DecodeDeviation::BypassedSubsampledAdaptiveLf],
-        "session deviations must record BypassedSubsampledAdaptiveLf"
-    );
-
-    let frame = session.next_frame().unwrap().unwrap();
-    assert_eq!(
-        frame.metadata.deviations,
-        &[DecodeDeviation::BypassedSubsampledAdaptiveLf],
-        "frame metadata deviations must record BypassedSubsampledAdaptiveLf"
-    );
-
-    let readback = ImageReadbackPipeline::new(&backend)
-        .submit(frame.output())
-        .unwrap()
-        .wait()
-        .unwrap();
-    let actual = &readback.frame.outputs[0].bytes;
-    let rust = rust_jxl_rgb8(codestream, extent);
-    assert_eq!(actual.len(), rust.len());
-    let rust_error = maximum_error(actual, &rust);
-    assert!(
-        rust_error <= 1,
-        "subsampled adaptive LF codestream output diverges from Rust jxl by {rust_error}"
-    );
-    // Note: Upstream libjxl (djxl 0.12.0) currently rejects subsampled streams with signaled
-    // adaptive LF (upstream PR #4932 is pending specification clarification). Rust `jxl`
-    // implementation oracle based on jxl-rs 0.6.0 (PR #861) serves as the interoperability oracle.
 }
 
 #[test]
@@ -603,66 +550,33 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_fallback_consistency() 
     )
     .unwrap();
 
-    let read_frame = |codestream, policy| {
-        let engine = WgpuDecodeEngine::new(backend.clone())
-            .unwrap()
-            .with_subsampled_adaptive_lf_policy(policy);
-        let decoder = GpuDecoder::new(engine);
-        let mut session = decoder
-            .open(
-                codestream,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-            )
-            .unwrap();
-        let vardct = session.submission_session().vardct().unwrap();
-        let decision = vardct.adaptive_lf_decision();
-        let deviations = vardct.deviations().to_vec();
-        let frame = session.next_frame().unwrap().unwrap();
-        assert_eq!(frame.metadata.deviations, deviations);
-        let readback = ImageReadbackPipeline::new(&backend)
-            .submit(frame.output())
-            .unwrap()
-            .wait()
-            .unwrap();
-        (
-            readback.frame.outputs[0].bytes.clone(),
-            decision,
-            deviations,
+    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let mut skip_session = decoder
+        .open(
+            skip_codestream,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
         )
-    };
+        .expect("skip stream must open");
+    let skip_frame = skip_session
+        .next_frame()
+        .expect("next_frame must succeed")
+        .expect("frame must be present");
+    assert_eq!(skip_frame.metadata.index, 0);
 
-    let (skip_output, skip_decision, skip_deviations) =
-        read_frame(skip_codestream, SubsampledAdaptiveLfPolicy::Strict);
-    assert_eq!(
-        skip_decision,
-        AdaptiveLfDecision {
-            signaled: false,
-            disposition: AdaptiveLfDisposition::NotSignaled,
-        }
-    );
-    assert!(skip_deviations.is_empty());
-
-    let (fallback_output, fallback_decision, fallback_deviations) = read_frame(
+    let adaptive_result = decoder.open(
         adaptive_codestream,
-        SubsampledAdaptiveLfPolicy::CompatibilityFallback,
+        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
     );
-    assert_eq!(
-        fallback_decision,
-        AdaptiveLfDecision {
-            signaled: true,
-            disposition: AdaptiveLfDisposition::BypassedSubsampled,
-        }
-    );
-    assert_eq!(
-        fallback_deviations,
-        &[DecodeDeviation::BypassedSubsampledAdaptiveLf]
-    );
-
-    // Since fallback safely bypasses adaptive LF, the pipeline execution must produce
-    // identical RGB8 output to the stream that explicitly skipped adaptive LF smoothing.
-    assert_eq!(
-        skip_output, fallback_output,
-        "compatibility fallback on adaptive LF stream must match explicit skip stream output"
+    assert!(
+        matches!(
+            adaptive_result,
+            Err(DecodeError::VarDct(
+                VarDctDecodeError::UnsupportedSubsampledStage {
+                    stage: "adaptive LF smoothing",
+                }
+            ))
+        ),
+        "adaptive stream must fail open with UnsupportedSubsampledStage"
     );
 }
 

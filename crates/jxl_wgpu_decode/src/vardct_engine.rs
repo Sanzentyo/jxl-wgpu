@@ -19,7 +19,6 @@ pub use crate::vardct_output::VarDctOutputFormat;
 pub use execution::{VarDctDecodeSession, VarDctPendingFrame};
 pub use pipeline::VarDctSubmissionEngine;
 pub use types::{
-    AdaptiveLfDecision, AdaptiveLfDisposition, SubsampledAdaptiveLfPolicy, VarDctDecodeError,
-    VarDctDecodeMemoryStats, vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format,
-    vardct_rgba8_format,
+    VarDctDecodeError, VarDctDecodeMemoryStats, vardct_bgr8_format, vardct_bgra8_format,
+    vardct_rgb8_format, vardct_rgba8_format,
 };

@@ -151,14 +151,6 @@ impl FrameDuration {
     }
 }
 
-/// Normative or specification deviations applied during decode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DecodeDeviation {
-    /// Adaptive LF smoothing was signaled in FrameHeader on a subsampled stream, but was bypassed
-    /// under compatibility fallback policy to avoid spatial coordinate mismatch.
-    BypassedSubsampledAdaptiveLf,
-}
-
 /// Metadata attached to one GPU-resident presentation frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameMetadata {
@@ -174,7 +166,6 @@ pub struct FrameMetadata {
     pub is_last: bool,
     pub is_keyframe: bool,
     pub name: String,
-    pub deviations: Vec<DecodeDeviation>,
 }
 
 /// Stream-wide presentation and animation metadata parsed by the GPU frontend.

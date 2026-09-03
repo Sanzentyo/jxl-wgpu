@@ -334,55 +334,6 @@ pub struct VarDctDecodeMemoryStats {
     pub total_frame_bytes: u64,
 }
 
-/// Normative vs compatibility disposition for signaled Adaptive LF smoothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdaptiveLfDisposition {
-    /// FrameHeader did not signal adaptive LF smoothing (FLAG_SKIP_ADAPTIVE_LF_SMOOTHING was set).
-    NotSignaled,
-    /// Adaptive LF smoothing is executed on the GPU.
-    Executed,
-    /// Adaptive LF smoothing was signaled in FrameHeader, but bypassed because stream uses subsampled channels.
-    BypassedSubsampled,
-    /// Adaptive LF smoothing was disabled because stream uses progressive DC LF frame.
-    DisabledByProgressiveDc,
-}
-
-impl AdaptiveLfDisposition {
-    #[must_use]
-    pub const fn is_executed(self) -> bool {
-        matches!(self, Self::Executed)
-    }
-
-    #[must_use]
-    pub const fn is_bypassed(self) -> bool {
-        matches!(self, Self::BypassedSubsampled)
-    }
-}
-
-/// Resolved execution decision for Adaptive LF smoothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdaptiveLfDecision {
-    pub signaled: bool,
-    pub disposition: AdaptiveLfDisposition,
-}
-
-impl AdaptiveLfDecision {
-    #[must_use]
-    pub const fn executes(self) -> bool {
-        matches!(self.disposition, AdaptiveLfDisposition::Executed)
-    }
-}
-
-/// Decoder policy for handling unstandardized subsampled Adaptive LF smoothing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SubsampledAdaptiveLfPolicy {
-    /// Reject unstandardized subsampled adaptive LF combinations with a typed error.
-    #[default]
-    Strict,
-    /// Bypass the stage safely in compatibility mode to avoid coordinate mismatch.
-    CompatibilityFallback,
-}
-
 impl VarDctDecodeMemoryStats {
     pub(super) fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
         let VarDctDecodeMemoryInputs {

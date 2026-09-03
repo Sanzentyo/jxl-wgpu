@@ -21,6 +21,18 @@ use crate::vardct_frontend::{VarDctChannelShift, VarDctColorTransform};
 use crate::vardct_output::{
     VarDctInverseOpsin, VarDctOutputFormat, VarDctOutputPlan, VarDctOutputTransform,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdaptiveLfPlan {
+    Skip,
+    ExecutePacked444,
+}
+
+impl AdaptiveLfPlan {
+    pub(super) const fn executes(self) -> bool {
+        matches!(self, Self::ExecutePacked444)
+    }
+}
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
@@ -28,8 +40,7 @@ use crate::{GpuCodestream, GpuOutputMapping, GpuOutputRequest};
 
 use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
 use super::types::{
-    ADAPTIVE_LF_WORKGROUP_BYTES, AdaptiveLfDecision, AdaptiveLfDisposition,
-    DeferredHfCoefficientLayout, PACKET_STATUS_BYTES, SubsampledAdaptiveLfPolicy,
+    ADAPTIVE_LF_WORKGROUP_BYTES, DeferredHfCoefficientLayout, PACKET_STATUS_BYTES,
     VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_bgr8_format,
     vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
 };
@@ -58,7 +69,7 @@ pub(super) struct VarDctSource {
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
-    pub(super) adaptive_lf: AdaptiveLfDecision,
+    pub(super) adaptive_lf: AdaptiveLfPlan,
     pub(super) external_lf: Option<ProgressiveDcXybPlanes>,
 }
 
@@ -126,36 +137,6 @@ impl VarDctSource {
     }
 }
 
-pub(super) fn decide_adaptive_lf(
-    signaled: bool,
-    uses_lf_frame: bool,
-    has_subsampled_channels: bool,
-    policy: SubsampledAdaptiveLfPolicy,
-) -> Result<AdaptiveLfDecision, VarDctDecodeError> {
-    let disposition = if !signaled {
-        AdaptiveLfDisposition::NotSignaled
-    } else if uses_lf_frame {
-        AdaptiveLfDisposition::DisabledByProgressiveDc
-    } else if has_subsampled_channels {
-        match policy {
-            SubsampledAdaptiveLfPolicy::Strict => {
-                return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-                    stage: "adaptive LF smoothing",
-                });
-            }
-            SubsampledAdaptiveLfPolicy::CompatibilityFallback => {
-                AdaptiveLfDisposition::BypassedSubsampled
-            }
-        }
-    } else {
-        AdaptiveLfDisposition::Executed
-    };
-    Ok(AdaptiveLfDecision {
-        signaled,
-        disposition,
-    })
-}
-
 pub(super) struct VarDctGroupSource {
     pub(super) control: VarDctPacketControl,
     pub(super) resource_params: VarDctResourceParams,
@@ -170,7 +151,6 @@ pub(super) struct VarDctPrepareOptions {
     pub(super) stream_window_limit: Option<NonZeroU64>,
     pub(super) memory_limit_bytes: u64,
     pub(super) progressive_dc_final: Option<bool>,
-    pub(super) subsampled_adaptive_lf_policy: SubsampledAdaptiveLfPolicy,
 }
 
 pub(super) fn prepare_source(
@@ -233,12 +213,17 @@ pub(super) fn prepare_source(
         .channel_shifts
         .into_iter()
         .any(|shift| shift.is_subsampled());
-    let adaptive_lf = decide_adaptive_lf(
-        packet.profile.adaptive_lf_smoothing,
-        packet.profile.uses_lf_frame,
-        has_subsampled_channels,
-        options.subsampled_adaptive_lf_policy,
-    )?;
+    let adaptive_lf = if !packet.profile.adaptive_lf_smoothing {
+        AdaptiveLfPlan::Skip
+    } else if packet.profile.uses_lf_frame {
+        AdaptiveLfPlan::Skip
+    } else if has_subsampled_channels {
+        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
+            stage: "adaptive LF smoothing",
+        });
+    } else {
+        AdaptiveLfPlan::ExecutePacked444
+    };
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -848,90 +833,4 @@ pub(super) fn check_limit(
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decide_adaptive_lf_exhaustively_covers_decision_matrix() {
-        for policy in [
-            SubsampledAdaptiveLfPolicy::Strict,
-            SubsampledAdaptiveLfPolicy::CompatibilityFallback,
-        ] {
-            // Case 1 & 2 & 3: Not signaled -> NotSignaled regardless of LF frame or subsampling
-            for uses_lf_frame in [false, true] {
-                for has_subsampled_channels in [false, true] {
-                    let decision =
-                        decide_adaptive_lf(false, uses_lf_frame, has_subsampled_channels, policy)
-                            .expect("not signaled must always succeed");
-                    assert_eq!(
-                        decision,
-                        AdaptiveLfDecision {
-                            signaled: false,
-                            disposition: AdaptiveLfDisposition::NotSignaled,
-                        }
-                    );
-                    assert!(!decision.executes());
-                }
-            }
-
-            // Case 4: Signaled + Progressive DC LF frame -> DisabledByProgressiveDc
-            for has_subsampled_channels in [false, true] {
-                let decision = decide_adaptive_lf(true, true, has_subsampled_channels, policy)
-                    .expect("progressive DC LF frame must succeed");
-                assert_eq!(
-                    decision,
-                    AdaptiveLfDecision {
-                        signaled: true,
-                        disposition: AdaptiveLfDisposition::DisabledByProgressiveDc,
-                    }
-                );
-                assert!(!decision.executes());
-            }
-
-            // Case 5: Signaled + Ordinary frame + 4:4:4 -> Executed
-            let standard_decision = decide_adaptive_lf(true, false, false, policy)
-                .expect("signaled 4:4:4 frame must always execute");
-            assert_eq!(
-                standard_decision,
-                AdaptiveLfDecision {
-                    signaled: true,
-                    disposition: AdaptiveLfDisposition::Executed,
-                }
-            );
-            assert!(standard_decision.executes());
-        }
-
-        // Case 6: Signaled + Subsampled + Strict -> typed UnsupportedSubsampledStage error
-        let strict_err = decide_adaptive_lf(true, false, true, SubsampledAdaptiveLfPolicy::Strict)
-            .expect_err("strict policy must reject subsampled adaptive LF");
-        assert!(
-            matches!(
-                strict_err,
-                VarDctDecodeError::UnsupportedSubsampledStage {
-                    stage: "adaptive LF smoothing",
-                }
-            ),
-            "expected UnsupportedSubsampledStage, got {strict_err:?}"
-        );
-
-        // Case 7: Signaled + Subsampled + CompatibilityFallback -> BypassedSubsampled
-        let fallback_decision = decide_adaptive_lf(
-            true,
-            false,
-            true,
-            SubsampledAdaptiveLfPolicy::CompatibilityFallback,
-        )
-        .expect("fallback policy must safely bypass subsampled adaptive LF");
-        assert_eq!(
-            fallback_decision,
-            AdaptiveLfDecision {
-                signaled: true,
-                disposition: AdaptiveLfDisposition::BypassedSubsampled,
-            }
-        );
-        assert!(!fallback_decision.executes());
-    }
 }
