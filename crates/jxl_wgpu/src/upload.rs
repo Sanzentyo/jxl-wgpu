@@ -18,6 +18,32 @@ pub(crate) struct UploadedPlane {
     pub padded_size: u64,
 }
 
+/// A caller-provided GPU buffer bound directly to an `ImportedResident` plane.
+#[derive(Clone, Debug)]
+pub struct ResidentPlaneBinding {
+    pub plane: jxl_gpu_protocol::PlaneId,
+    pub buffer: Arc<wgpu::Buffer>,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl ResidentPlaneBinding {
+    #[must_use]
+    pub fn new(
+        plane: jxl_gpu_protocol::PlaneId,
+        buffer: Arc<wgpu::Buffer>,
+        offset: u64,
+        size: u64,
+    ) -> Self {
+        Self {
+            plane,
+            buffer,
+            offset,
+            size,
+        }
+    }
+}
+
 impl UploadedPlane {
     pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
         wgpu::BindingResource::Buffer(wgpu::BufferBinding {

@@ -10,14 +10,15 @@ use std::sync::Arc;
 use jxl_gpu_protocol::{BackendError, FrameSession};
 use jxl_gpu_protocol::{
     ChangedRegions, Extent2d, FrameSessionDesc, GroupId, GroupPayload, OutputId, OutputLayout,
-    Region, RenderIntent, RenderPlan, RenderedFrame, ResourceData, ResourceId, ResourceUpdate,
-    SampleType, SubmissionToken,
+    PlaneId, PlaneRole, Region, RenderIntent, RenderPlan, RenderedFrame, ResourceData, ResourceId,
+    ResourceUpdate, SampleType, SubmissionToken,
 };
 
 use crate::buffer_pool::PooledBuffer;
 use crate::context::WgpuBackend;
 use crate::readback::{ReadbackRequest, resolve_outputs};
 use crate::scheduler::Scheduler;
+use crate::upload::{self, ResidentPlaneBinding};
 use crate::video::{
     CpuImageFrame, GpuBufferLease, GpuImageFrame, GpuImageOutput, ImageOutputRequest,
     ImageReadbackRequest, resolve_image_outputs,
@@ -144,6 +145,7 @@ pub struct WgpuFrameSession {
     execution: ExecutionPlan,
     groups: BTreeMap<GroupId, GroupPayload>,
     resources: BTreeMap<ResourceId, ResourceUpdate>,
+    imported_planes: BTreeMap<PlaneId, ResidentPlaneBinding>,
     pending: BTreeMap<SubmissionToken, PendingSubmission>,
     next_token: u64,
     last_submission_stats: Option<WgpuSubmissionStats>,
@@ -157,6 +159,7 @@ impl std::fmt::Debug for WgpuFrameSession {
             .field("frame", &self.frame)
             .field("group_count", &self.groups.len())
             .field("resource_count", &self.resources.len())
+            .field("imported_plane_count", &self.imported_planes.len())
             .field("pending_count", &self.pending.len())
             .field("pending_transient_bytes", &self.pending_transient_bytes)
             .field("last_submission_stats", &self.last_submission_stats)
@@ -180,6 +183,7 @@ impl WgpuFrameSession {
             execution,
             groups: BTreeMap::new(),
             resources: BTreeMap::new(),
+            imported_planes: BTreeMap::new(),
             pending: BTreeMap::new(),
             next_token: 1,
             last_submission_stats: None,
@@ -189,6 +193,34 @@ impl WgpuFrameSession {
 
     pub const fn last_submission_stats(&self) -> Option<WgpuSubmissionStats> {
         self.last_submission_stats
+    }
+
+    /// Imports an externally held GPU-resident buffer directly into an `ImportedResident` plane.
+    ///
+    /// This bypasses arena slot allocation and host memory uploads. The bound buffer must outlive
+    /// any submission that references this plane.
+    pub fn import_resident_plane(&mut self, binding: ResidentPlaneBinding) -> Result<()> {
+        let Some(desc) = self.plan.planes.iter().find(|plane| plane.id == binding.plane) else {
+            return Err(Error::InvalidPayload(format!(
+                "imported plane {:?} is not declared in render plan",
+                binding.plane
+            )));
+        };
+        if desc.role != PlaneRole::ImportedResident {
+            return Err(Error::InvalidPayload(format!(
+                "plane {:?} has role {:?}, expected ImportedResident",
+                binding.plane, desc.role
+            )));
+        }
+        let required_bytes = upload::plane_logical_size(desc)?;
+        if binding.size < required_bytes {
+            return Err(Error::InvalidPayload(format!(
+                "imported plane {:?} buffer size {} is smaller than required {}",
+                binding.plane, binding.size, required_bytes
+            )));
+        }
+        self.imported_planes.insert(binding.plane, binding);
+        Ok(())
     }
 
     /// Conservative sum of explicit transient bytes for tokens that have not
@@ -286,6 +318,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
         )?;
         let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode(
@@ -294,6 +327,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
         )?;
         Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
@@ -339,6 +373,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
         )?;
         let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
         let encoded = Scheduler::encode_gpu(
@@ -347,6 +382,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
         )?;
         Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
         let stats = WgpuSubmissionStats {
@@ -410,6 +446,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
             &request,
         )?;
         let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
@@ -419,6 +456,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
             &request,
         )?;
         Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
@@ -466,6 +504,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
             &request,
         )?;
         let (memory_permit, poll_permit) = self.admit_submission(estimated_transient)?;
@@ -475,6 +514,7 @@ impl WgpuFrameSession {
             &self.execution,
             &self.groups,
             &self.resources,
+            &self.imported_planes,
             &request,
         )?;
         Self::validate_transient_estimate(estimated_transient, encoded.transient_bytes)?;
@@ -538,6 +578,16 @@ impl WgpuFrameSession {
                         "final submission is missing a VarDCT packet for group {id:?}"
                     )));
                 }
+            }
+        }
+        for plane in &self.plan.planes {
+            if plane.role == PlaneRole::ImportedResident
+                && !self.imported_planes.contains_key(&plane.id)
+            {
+                return Err(Error::InvalidPayload(format!(
+                    "submission is missing imported resident plane {:?}",
+                    plane.id
+                )));
             }
         }
         Ok(())
@@ -3221,5 +3271,119 @@ mod tests {
             ),
             [1.0, 1.25, 1.75, 2.5, 3.5]
         );
+    }
+
+    #[test]
+    fn imported_resident_plane_bypasses_arena_and_executes_on_gpu() {
+        use wgpu::util::DeviceExt;
+
+        let Some(backend) = test_backend() else {
+            return;
+        };
+
+        let extent = Extent2d::new(4, 4);
+        let values: Vec<f32> = (0..16).map(|v| v as f32).collect();
+
+        // 1. Create external GPU buffer with initial values
+        let external_buffer = Arc::new(backend.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("external imported resident plane"),
+                contents: bytemuck::cast_slice(&values),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            },
+        ));
+
+        // 2. Build RenderPlan declaring PlaneRole::ImportedResident
+        let output_id = OutputId(0);
+        let plan = Arc::new(RenderPlan {
+            planes: vec![
+                plane_desc(0, extent, SampleType::F32, PlaneRole::ImportedResident),
+                plane_desc(1, extent, SampleType::F32, PlaneRole::Intermediate),
+            ],
+            nodes: vec![
+                render_node(
+                    "copy_imported",
+                    RenderOp::Copy,
+                    &[0],
+                    &[1],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::default(),
+                ),
+                render_node(
+                    "save_imported",
+                    RenderOp::Save(SaveParams {
+                        output: output_id,
+                        sample_type: SampleType::F32,
+                        channels: vec![PlaneId(1)],
+                        layout: OutputLayout::Planar,
+                        orientation: jxl_gpu_protocol::OutputOrientation::Identity,
+                    }),
+                    &[1],
+                    &[],
+                    Scale2d::IDENTITY,
+                    PrecisionContract::Exact,
+                ),
+            ],
+            outputs: vec![OutputDesc {
+                id: output_id,
+                extent,
+                sample_type: SampleType::F32,
+                channels: 1,
+                layout: OutputLayout::Planar,
+                color_encoding: jxl_gpu_protocol::OutputColorEncoding::NonColor,
+            }],
+            ..Default::default()
+        });
+
+        // 3. Create session and verify arena allocation bypass
+        let mut session = backend
+            .create_session(&frame_desc(extent), plan)
+            .expect("create session with imported resident plane");
+
+        // Plane 0 must NOT be in arena allocations
+        assert!(
+            session.execution.arena.allocation(PlaneId(0)).is_none(),
+            "ImportedResident plane must bypass arena slot allocation"
+        );
+        // Plane 1 must be in arena allocations
+        assert!(
+            session.execution.arena.allocation(PlaneId(1)).is_some(),
+            "Intermediate plane must be allocated in arena"
+        );
+
+        // 4. Submitting before importing must fail with typed error
+        session
+            .enqueue(GroupPayload {
+                group: GroupId(0),
+                revision: 0,
+                complete: true,
+                planes: Vec::new(),
+                vardct: None,
+            })
+            .expect("enqueue group");
+
+        let unimported_err = session.submit(RenderIntent::Final).unwrap_err();
+        assert!(
+            matches!(unimported_err, Error::InvalidPayload(msg) if msg.contains("missing imported resident plane PlaneId(0)"))
+        );
+
+        // 5. Import the resident plane and submit
+        let byte_size = (values.len() * std::mem::size_of::<f32>()) as u64;
+        let binding = ResidentPlaneBinding::new(PlaneId(0), external_buffer, 0, byte_size);
+        session
+            .import_resident_plane(binding)
+            .expect("import resident plane");
+
+        let token = session
+            .submit(RenderIntent::Final)
+            .expect("submit with imported resident plane");
+        let rendered = session.wait(token).expect("readback output");
+
+        let PlaneData::F32(out_values) = &rendered.outputs[0].data else {
+            panic!("expected F32 output");
+        };
+        assert_eq!(*out_values, values, "output values must match imported buffer values exactly");
     }
 }

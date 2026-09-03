@@ -18,7 +18,9 @@ use crate::buffer_pool::PooledBuffer;
 use crate::context::WgpuBackend;
 use crate::planner::{ExecutionPlan, FusedKernel};
 use crate::readback::{ReadbackRequest, stage_output};
-use crate::upload::{UploadedPlane, plane_in_slot, upload_plane_to_slot};
+use crate::upload::{
+    ResidentPlaneBinding, UploadedPlane, plane_in_slot, upload_plane_to_slot,
+};
 use crate::vardct;
 use crate::video::{
     ImageOutputRequest, ImageReadbackRequest, PackedImageOutput, stage_image_output,
@@ -115,6 +117,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
             backend,
@@ -122,6 +125,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::CpuReadback,
             OutputEncoding::Original,
         )
@@ -136,6 +140,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
     ) -> Result<u64> {
         Self::preflight_with_mode(
             backend,
@@ -143,6 +148,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::CpuReadback,
             OutputEncoding::Original,
         )
@@ -155,6 +161,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
             backend,
@@ -162,6 +169,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::GpuOnly,
             OutputEncoding::Original,
         )
@@ -175,6 +183,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
     ) -> Result<u64> {
         Self::preflight_with_mode(
             backend,
@@ -182,6 +191,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::GpuOnly,
             OutputEncoding::Original,
         )
@@ -194,6 +204,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         request: &ImageOutputRequest,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
@@ -202,6 +213,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::CpuReadback,
             OutputEncoding::Image(request),
         )
@@ -215,6 +227,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         request: &ImageOutputRequest,
     ) -> Result<u64> {
         Self::preflight_with_mode(
@@ -223,6 +236,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::CpuReadback,
             OutputEncoding::Image(request),
         )
@@ -235,6 +249,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         request: &ImageOutputRequest,
     ) -> Result<EncodedSubmission> {
         Self::encode_with_mode(
@@ -243,6 +258,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::GpuOnly,
             OutputEncoding::Image(request),
         )
@@ -256,6 +272,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         request: &ImageOutputRequest,
     ) -> Result<u64> {
         Self::preflight_with_mode(
@@ -264,6 +281,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             OutputMode::GpuOnly,
             OutputEncoding::Image(request),
         )
@@ -276,6 +294,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        _imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         output_mode: OutputMode,
         output_encoding: OutputEncoding<'a>,
     ) -> Result<(OutputTarget<'a>, u64)> {
@@ -299,6 +318,7 @@ impl Scheduler {
         execution: &ExecutionPlan,
         groups: &BTreeMap<GroupId, GroupPayload>,
         resources: &BTreeMap<ResourceId, ResourceUpdate>,
+        imported_planes: &BTreeMap<PlaneId, ResidentPlaneBinding>,
         output_mode: OutputMode,
         output_encoding: OutputEncoding<'_>,
     ) -> Result<EncodedSubmission> {
@@ -309,6 +329,7 @@ impl Scheduler {
             execution,
             groups,
             resources,
+            imported_planes,
             output_mode,
             output_encoding,
         )?;
@@ -337,6 +358,22 @@ impl Scheduler {
         let mut planes = BTreeMap::new();
 
         for desc in &plan.planes {
+            if desc.role == PlaneRole::ImportedResident {
+                let binding = imported_planes.get(&desc.id).ok_or_else(|| {
+                    Error::Execution(format!(
+                        "scheduler is missing imported resident plane {:?}",
+                        desc.id
+                    ))
+                })?;
+                let plane = UploadedPlane {
+                    desc: desc.clone(),
+                    buffer: Arc::clone(&binding.buffer),
+                    offset: binding.offset,
+                    padded_size: binding.size,
+                };
+                planes.insert(desc.id, plane);
+                continue;
+            }
             let Some(allocation) = execution.arena.allocation(desc.id) else {
                 continue;
             };

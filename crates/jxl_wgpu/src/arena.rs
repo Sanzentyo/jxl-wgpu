@@ -152,6 +152,9 @@ impl ArenaPlanner {
         };
         let mut requests = Vec::new();
         for plane in &plan.planes {
+            if plane.role == PlaneRole::ImportedResident {
+                continue;
+            }
             let Some(mut lifetime) = graph_lifetimes.get(&plane.id).copied() else {
                 continue;
             };

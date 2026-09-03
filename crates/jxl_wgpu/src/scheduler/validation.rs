@@ -363,6 +363,12 @@ pub(super) fn validate_execution(
         }
     }
     for plane in required {
+        let Some(desc) = planes.get(&plane) else {
+            continue;
+        };
+        if desc.role == PlaneRole::ImportedResident {
+            continue;
+        }
         if execution.arena.allocation(plane).is_none() {
             return Err(Error::Execution(format!(
                 "resident arena has no allocation for required plane {plane:?}"

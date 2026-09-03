@@ -172,6 +172,9 @@ pub enum PlaneRole {
     Intermediate,
     Parameter,
     Output,
+    /// Pre-allocated GPU-resident plane supplied directly by the caller.
+    /// Bypasses arena slot allocation and host upload copying.
+    ImportedResident,
 }
 
 /// Description of a single planar image allocation.
@@ -705,7 +708,12 @@ impl RenderPlan {
         let mut available: BTreeSet<_> = self
             .planes
             .iter()
-            .filter(|plane| matches!(plane.role, PlaneRole::Source | PlaneRole::Parameter))
+            .filter(|plane| {
+                matches!(
+                    plane.role,
+                    PlaneRole::Source | PlaneRole::Parameter | PlaneRole::ImportedResident
+                )
+            })
             .map(|plane| plane.id)
             .collect();
         let mut written = BTreeSet::new();
@@ -740,7 +748,10 @@ impl RenderPlan {
             }
             for output in &node.outputs {
                 let output_desc = planes.get(output).ok_or(PlanError::UnknownPlane(*output))?;
-                if matches!(output_desc.role, PlaneRole::Source | PlaneRole::Parameter) {
+                if matches!(
+                    output_desc.role,
+                    PlaneRole::Source | PlaneRole::Parameter | PlaneRole::ImportedResident
+                ) {
                     return Err(PlanError::ReadOnlyPlaneWritten {
                         node: node_index,
                         plane: *output,
