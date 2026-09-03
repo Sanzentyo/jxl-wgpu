@@ -18,7 +18,8 @@ use jxl_wgpu::{
     TunedKernel, WgpuBackend, WgpuBackendConfig,
 };
 use jxl_wgpu_decode::{
-    GpuDecoder, GpuOutputRequest, vardct::packet::BoundedVarDctPacketPlan, vardct_rgb8_format,
+    GpuDecoder, GpuOutputRequest, VarDctOutputFormat, vardct::packet::BoundedVarDctPacketPlan,
+    vardct_output_format,
 };
 use wgpu::util::DeviceExt;
 
@@ -1185,7 +1186,7 @@ fn custom_lf_metadata_gpu_encoder_and_decoders_agree() {
     let mut session = gpu_decoder
         .open(
             &codestream,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
@@ -1389,7 +1390,7 @@ fn tiled_dct8_rust_jxl_djxl_and_cjxl_oracles_cover_group_edges() {
         let mut gpu_session = gpu_decoder
             .open(
                 &codestream,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
             )
             .unwrap();
         let gpu_frame = gpu_session.next_frame().unwrap().unwrap();

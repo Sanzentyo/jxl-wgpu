@@ -18,9 +18,8 @@ use jxl_wgpu::{
     ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
     WgpuBackendConfig,
 };
-use jxl_wgpu_decode::vardct::engine::{
-    vardct_bgr8_format, vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
-};
+use jxl_wgpu_decode::VarDctOutputFormat;
+use jxl_wgpu_decode::vardct::engine::vardct_output_format;
 use jxl_wgpu_decode::vardct::frontend::{
     StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError,
 };
@@ -240,7 +239,7 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
         let mut session = decoder
             .open(
                 encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
             )
             .unwrap();
         let memory = session
@@ -312,7 +311,8 @@ fn frame_upsampling_factors_match_reference_on_gpu() {
             let mut session = decoder
                 .open(
                     &encoded,
-                    GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                    GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8))
+                        .unwrap(),
                 )
                 .unwrap();
             let memory = session
@@ -394,7 +394,7 @@ fn subsampled_jpeg_transcode_with_frame_upsampling_matches_reference_on_gpu() {
         let mut session = decoder
             .open(
                 encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
             )
             .unwrap();
         let memory = session
@@ -487,7 +487,7 @@ fn subsampled_jpeg_with_adaptive_lf_flag_is_strictly_rejected_at_frontend_negoti
     let default_decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let strict_err = default_decoder.open(
         codestream,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     );
     let Err(strict_error) = strict_err else {
         panic!("subsampled adaptive LF must be rejected, but opened successfully");
@@ -582,7 +582,7 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
     let mut skip_session = decoder
         .open(
             skip_codestream,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .expect("skip stream must open");
     let skip_frame = skip_session
@@ -593,7 +593,7 @@ fn paired_skip_and_adaptive_lf_fixtures_verify_flags_and_negative_conformance() 
 
     let adaptive_result = decoder.open(
         adaptive_codestream,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     );
     assert!(
         matches!(
@@ -641,16 +641,16 @@ fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
         readback.frame.outputs[0].bytes.clone()
     };
 
-    let rgb8 = decode_bytes(vardct_rgb8_format());
+    let rgb8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Rgb8));
     assert_eq!(rgb8.len(), pixel_count * 3);
 
-    let rgba8 = decode_bytes(vardct_rgba8_format());
+    let rgba8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Rgba8));
     assert_eq!(rgba8.len(), pixel_count * 4);
 
-    let bgr8 = decode_bytes(vardct_bgr8_format());
+    let bgr8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Bgr8));
     assert_eq!(bgr8.len(), pixel_count * 3);
 
-    let bgra8 = decode_bytes(vardct_bgra8_format());
+    let bgra8 = decode_bytes(vardct_output_format(VarDctOutputFormat::Bgra8));
     assert_eq!(bgra8.len(), pixel_count * 4);
 
     for i in 0..pixel_count {
@@ -695,10 +695,10 @@ fn vardct_decodes_to_rgba8_bgr8_and_bgra8_formats_on_gpu() {
         readback.frame.outputs[0].bytes.clone()
     };
 
-    let xyb_rgb8 = decode_xyb_bytes(vardct_rgb8_format());
-    let xyb_rgba8 = decode_xyb_bytes(vardct_rgba8_format());
-    let xyb_bgr8 = decode_xyb_bytes(vardct_bgr8_format());
-    let xyb_bgra8 = decode_xyb_bytes(vardct_bgra8_format());
+    let xyb_rgb8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Rgb8));
+    let xyb_rgba8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Rgba8));
+    let xyb_bgr8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Bgr8));
+    let xyb_bgra8 = decode_xyb_bytes(vardct_output_format(VarDctOutputFormat::Bgra8));
 
     assert_eq!(xyb_rgb8.len(), xyb_pixels * 3);
     assert_eq!(xyb_rgba8.len(), xyb_pixels * 4);
@@ -986,7 +986,8 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
             dct8_packet = Some(encoded.clone());
         }
         let oracle = djxl_ppm(&encoded, extent);
-        let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+        let request =
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap();
         let mut session = if index == 0 {
             let session = open_incremental(&decoder, &encoded, request);
             let codestream_bytes = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
@@ -1020,7 +1021,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         );
         assert_eq!(
             frame.output().outputs[0].layout.format,
-            vardct_rgb8_format()
+            vardct_output_format(VarDctOutputFormat::Rgb8)
         );
         assert_eq!(
             decoder.engine().in_flight_memory_stats().reserved_bytes,
@@ -1112,7 +1113,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
 
     let error = match decoder.open(
         &corrupted,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     ) {
         Err(error) => error,
         Ok(_) => panic!("corrupt local MA metadata must be rejected before submission"),
@@ -1169,7 +1170,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     let mut session = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     );
     assert_eq!(
         decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -1208,7 +1209,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     let mut abandoned = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
@@ -1244,7 +1245,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     let mut damaged_session = decoder
         .open(
             &damaged,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let error = damaged_session.next_frame().unwrap_err();
@@ -1333,7 +1334,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
         let mut session = decoder
             .open(
                 &encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
             )
             .unwrap();
         let memory = session
@@ -1431,7 +1432,7 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
@@ -1481,7 +1482,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let vardct = session.submission_session().vardct().unwrap();
@@ -1511,7 +1512,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let mut async_session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
@@ -1552,7 +1553,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let mut damaged_session = decoder
         .open(
             &damaged,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     assert!(matches!(
@@ -1565,7 +1566,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
     let mut abandoned = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
@@ -1606,7 +1607,7 @@ fn vardct_stream_windows_adapt_to_the_shared_frame_budget() {
     .unwrap();
     let encoded = common::green_queen_vardct_nonzero_ac();
     let reference = rust_jxl_rgb8(encoded, Extent2d::new(438, 589));
-    let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+    let request = GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap();
     let memory_at_limit = |limit| {
         let decoder = GpuDecoder::new(
             VarDctSubmissionEngine::new(backend.clone())
@@ -1758,7 +1759,7 @@ fn libjxl_center_first_permuted_toc_matches_reference_on_gpu() {
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
@@ -1825,7 +1826,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let frame = session.next_frame().unwrap().unwrap();
@@ -1905,7 +1906,7 @@ fn assert_multiple_lf_groups(
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let vardct = session
@@ -2015,7 +2016,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut session = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     );
     assert_eq!(
         decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -2098,7 +2099,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut async_session = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
@@ -2118,7 +2119,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut abandoned = open_incremental(
         &decoder,
         &encoded,
-        GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
     );
     abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert_eq!(
@@ -2172,7 +2173,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
     let mut damaged_session = decoder
         .open(
             &damaged,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let error = damaged_session.next_frame().unwrap_err();
@@ -2236,7 +2237,7 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
     let mut session = decoder
         .open(
             encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let memory = session
@@ -2315,7 +2316,7 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
         let mut session = decoder
             .open(
                 encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+                GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
             )
             .unwrap();
         let memory = session
@@ -2387,7 +2388,7 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
     let mut session = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     assert!(matches!(
@@ -2417,7 +2418,7 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
     let mut blocking_session = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let blocking_frame = blocking_session.next_frame().unwrap().unwrap();
@@ -2447,7 +2448,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
     let mut session = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     assert!(matches!(
@@ -2484,7 +2485,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
     let mut async_session = decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     let async_frame = pollster::block_on(async_session.next_frame_async())
@@ -2512,7 +2513,7 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
     let mut probe = probe_decoder
         .open(
             &encoded,
-            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            GpuOutputRequest::color(vardct_output_format(VarDctOutputFormat::Rgb8)).unwrap(),
         )
         .unwrap();
     probe.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();

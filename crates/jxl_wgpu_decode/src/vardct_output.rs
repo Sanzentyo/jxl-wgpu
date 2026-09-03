@@ -8,6 +8,11 @@
 //! with 255 for opaque output when no decoded alpha source is connected).
 
 use bytemuck::{Pod, Zeroable};
+use jxl_gpu_formats::{
+    ChromaLocation2d, ChromaSubsampling, ColorModel, ColorRange, ColorSpace, ColorSpec,
+    ColorSpecification, PixelFormat, PlaneSampling, RgbChannelOrder, SampleKind, Swizzle,
+    TransferFunction, YcbcrEncoding,
+};
 use jxl_gpu_protocol::XybParams;
 use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
@@ -98,6 +103,75 @@ impl VarDctOutputFormat {
             Self::Rgb8 | Self::Bgr8 => 3,
             Self::Rgba8 | Self::Bgra8 => 4,
         }
+    }
+
+    /// Canonical [`PixelFormat`] representation for this VarDCT packed format.
+    #[must_use]
+    pub fn pixel_format(self) -> PixelFormat {
+        let order = match self {
+            Self::Rgb8 => RgbChannelOrder::Rgb,
+            Self::Rgba8 => RgbChannelOrder::Rgba,
+            Self::Bgr8 => RgbChannelOrder::Bgr,
+            Self::Bgra8 => RgbChannelOrder::Bgra,
+        };
+        PixelFormat::rgb8(
+            order,
+            false,
+            ColorSpecification::Defined(ColorSpec {
+                space: ColorSpace::Bt709,
+                encoding: YcbcrEncoding::Undefined,
+                transfer: TransferFunction::Srgb,
+                range: ColorRange::Full,
+                chroma_location: ChromaLocation2d::BOTH,
+            }),
+        )
+    }
+
+    /// Matches and normalizes a candidate [`PixelFormat`] into a supported packed-u8 format.
+    #[must_use]
+    pub fn try_from_pixel_format(format: &PixelFormat) -> Option<Self> {
+        if format.model != ColorModel::Rgb
+            || format.sample_kind != SampleKind::Unsigned
+            || format.chroma_subsampling != ChromaSubsampling::None
+            || format.planes.len() != 1
+        {
+            return None;
+        }
+        let plane = &format.planes[0];
+        if plane.sampling != PlaneSampling::FULL || plane.pixels_per_element != 1 {
+            return None;
+        }
+        match format.swizzle {
+            Swizzle::XYZ1
+                if plane.words.len() == 3 && plane.words.iter().all(|w| w.bits() == 8) =>
+            {
+                Some(Self::Rgb8)
+            }
+            Swizzle::XYZW
+                if plane.words.len() == 4 && plane.words.iter().all(|w| w.bits() == 8) =>
+            {
+                Some(Self::Rgba8)
+            }
+            Swizzle::ZYX1
+                if plane.words.len() == 3 && plane.words.iter().all(|w| w.bits() == 8) =>
+            {
+                Some(Self::Bgr8)
+            }
+            Swizzle::ZYXW
+                if plane.words.len() == 4 && plane.words.iter().all(|w| w.bits() == 8) =>
+            {
+                Some(Self::Bgra8)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<&PixelFormat> for VarDctOutputFormat {
+    type Error = ();
+
+    fn try_from(format: &PixelFormat) -> Result<Self, Self::Error> {
+        Self::try_from_pixel_format(format).ok_or(())
     }
 }
 
@@ -390,21 +464,25 @@ pub enum VarDctOutputError {
         available: u64,
     },
     /// A required storage binding exceeds the device binding limit.
-    #[error("VarDCT RGB8 {role} needs {required} bytes, storage binding limit is {available}")]
+    #[error(
+        "VarDCT packed output {role} needs {required} bytes, storage binding limit is {available}"
+    )]
     StorageBindingLimit {
         role: &'static str,
         required: u64,
         available: u64,
     },
     /// The 176-byte uniform exceeds an unusual device limit.
-    #[error("VarDCT RGB8 uniform needs {required} bytes, uniform binding limit is {available}")]
+    #[error(
+        "VarDCT packed output uniform needs {required} bytes, uniform binding limit is {available}"
+    )]
     UniformBindingLimit { required: u64, available: u64 },
     /// Output packing requires a one-dimensional workgroup.
-    #[error("VarDCT RGB8 output requires a linear workgroup, got {variant:?}")]
+    #[error("VarDCT packed output requires a linear workgroup, got {variant:?}")]
     WorkgroupShape { variant: KernelVariant },
     /// The selected output workgroup cannot run on the device.
     #[error(
-        "VarDCT RGB8 workgroup needs {required} X invocations, device permits {max_invocations} total and {max_size_x} in X"
+        "VarDCT packed output workgroup needs {required} X invocations, device permits {max_invocations} total and {max_size_x} in X"
     )]
     WorkgroupSizeLimit {
         required: u32,
@@ -412,7 +490,9 @@ pub enum VarDctOutputError {
         max_size_x: u32,
     },
     /// A two-dimensional linearization still exceeds the device's Y limit.
-    #[error("VarDCT RGB8 dispatch needs {required_y} Y workgroups, device permits {available}")]
+    #[error(
+        "VarDCT packed output dispatch needs {required_y} Y workgroups, device permits {available}"
+    )]
     DispatchLimit { required_y: u32, available: u32 },
 }
 
@@ -447,7 +527,7 @@ impl VarDctOutputPacker {
             label: Some("jxl-wgpu decode VarDCT packed output"),
             layout: None,
             module: &module,
-            entry_point: Some("pack_rgb8"),
+            entry_point: Some("pack_packed_u8"),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &constants,
                 ..Default::default()
@@ -475,12 +555,12 @@ impl VarDctOutputPacker {
     ) -> Result<VarDctOutputScratch, VarDctOutputError> {
         let (params, plan) = validate_inputs(device, inputs, self.variant)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed RGB8 params"),
+            label: Some("jxl-wgpu decode VarDCT packed u8 params"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed RGB8 bindings"),
+            label: Some("jxl-wgpu decode VarDCT packed u8 bindings"),
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[
                 binding_entry(0, inputs.planes[0].storage),
@@ -494,7 +574,7 @@ impl VarDctOutputPacker {
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed RGB8"),
+            label: Some("jxl-wgpu decode VarDCT packed u8"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
@@ -1127,7 +1207,9 @@ mod tests {
             cr_plane: &[f32],
             format: VarDctOutputFormat,
         ) -> Vec<u8> {
-            let mut out = Vec::new();
+            let capacity =
+                (width as usize) * (height as usize) * (format.bytes_per_pixel() as usize);
+            let mut out = Vec::with_capacity(capacity);
             for y in 0..height {
                 for x in 0..width {
                     let idx = (y * width + x) as usize;

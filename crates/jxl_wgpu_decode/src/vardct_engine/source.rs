@@ -29,8 +29,7 @@ use crate::{GpuCodestream, GpuOutputMapping, GpuOutputRequest};
 use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
 use super::types::{
     ADAPTIVE_LF_WORKGROUP_BYTES, DeferredHfCoefficientLayout, PACKET_STATUS_BYTES,
-    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_bgr8_format,
-    vardct_bgra8_format, vardct_rgb8_format, vardct_rgba8_format,
+    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats,
 };
 use super::window_plan::{
     AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
@@ -148,19 +147,9 @@ pub(super) fn prepare_source(
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     options: VarDctPrepareOptions,
 ) -> Result<VarDctSource, VarDctDecodeError> {
-    let output_format = match (request.mapping(), request.format()) {
-        (GpuOutputMapping::Color, format) if format == &vardct_rgb8_format() => {
-            VarDctOutputFormat::Rgb8
-        }
-        (GpuOutputMapping::Color, format) if format == &vardct_rgba8_format() => {
-            VarDctOutputFormat::Rgba8
-        }
-        (GpuOutputMapping::Color, format) if format == &vardct_bgr8_format() => {
-            VarDctOutputFormat::Bgr8
-        }
-        (GpuOutputMapping::Color, format) if format == &vardct_bgra8_format() => {
-            VarDctOutputFormat::Bgra8
-        }
+    let output_format = match request.mapping() {
+        GpuOutputMapping::Color => VarDctOutputFormat::try_from_pixel_format(request.format())
+            .ok_or(VarDctDecodeError::UnsupportedOutput)?,
         _ => return Err(VarDctDecodeError::UnsupportedOutput),
     };
     if inventory.image_header.orientation != 1 {

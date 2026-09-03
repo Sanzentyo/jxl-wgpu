@@ -274,8 +274,8 @@ share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
-The supported output descriptors include `vardct_rgb8_format()`, `vardct_rgba8_format()`,
-`vardct_bgr8_format()`, and `vardct_bgra8_format()`: interleaved RGB8/RGBA8/BGR8/BGRA8 with explicit
+The supported output descriptor is `vardct_output_format(VarDctOutputFormat::...)` (supporting `Rgb8`, `Rgba8`,
+`Bgr8`, and `Bgra8`): interleaved RGB8/RGBA8/BGR8/BGRA8 with explicit
 BT.709/sRGB primaries, IEC sRGB transfer, full range, and no YCbCr encoding. They are accepted directly
 by `DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
 intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,

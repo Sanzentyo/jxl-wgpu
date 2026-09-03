@@ -168,7 +168,7 @@ fn pack_rgb_word(word_index: u32, is_bgr: bool) -> u32 {
 }
 
 @compute @workgroup_size(wg_x, wg_y, 1)
-fn pack_rgb8(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pack_packed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = gid.y * params.dispatch.x + gid.x;
     if (params.format_selector == FORMAT_RGBA8 || params.format_selector == FORMAT_BGRA8) {
         if (index >= params.image.z) {
