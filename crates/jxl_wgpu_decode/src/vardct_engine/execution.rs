@@ -3292,8 +3292,7 @@ fn submit_vardct(
                 ResidentImageUpsampleInputs {
                     inputs,
                     outputs,
-                    factor: weights.factor(),
-                    weights: prepared.buffer(),
+                    weights: &prepared,
                 },
             )?;
             (output_buffers, Some(prepared), Some(resources))

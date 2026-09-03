@@ -319,7 +319,7 @@ pub(super) fn prepare_source(
     let frame_upsampling = match packet.profile.upsampling {
         1 => None,
         factor => {
-            let factor = UpsamplingFactor::try_from_u32(factor).map_err(|_| {
+            let factor = UpsamplingFactor::try_from(factor).map_err(|_| {
                 VarDctDecodeError::EngineContract {
                     detail: "parsed frame upsampling factor is not 1, 2, 4, or 8",
                 }

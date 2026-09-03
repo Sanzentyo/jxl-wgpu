@@ -95,7 +95,7 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
         let mut compact: Vec<f32> = (0..compact_count).map(|i| 1.0 / ((i + 1) as f32)).collect();
         compact[0] = 1.0;
 
-        let up_factor = UpsamplingFactor::try_from_u32(factor).unwrap();
+        let up_factor = UpsamplingFactor::try_from(factor).unwrap();
         let weights = ResidentImageUpsampleWeights::new(up_factor, &compact).unwrap();
         let prepared_weights = weights.prepare(device).unwrap();
 
@@ -199,8 +199,7 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
                 ResidentChannelUpsampleInputs {
                     input: channel_input_plane,
                     output: channel_output_plane,
-                    factor: up_factor,
-                    weights: prepared_weights.buffer(),
+                    weights: &prepared_weights,
                 },
             )
             .unwrap();
@@ -217,8 +216,7 @@ fn resident_channel_upsample_matches_image_upsample_on_gpu() {
                         channel_input_plane,
                     ],
                     outputs: image_output_planes,
-                    factor: up_factor,
-                    weights: prepared_weights.buffer(),
+                    weights: &prepared_weights,
                 },
             )
             .unwrap();
@@ -309,8 +307,7 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentChannelUpsampleInputs {
             input: plane_in,
             output: plane_out_alias,
-            factor: UpsamplingFactor::X2,
-            weights: prepared.buffer(),
+            weights: &prepared,
         },
     );
     assert!(matches!(
@@ -325,8 +322,7 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentImageUpsampleInputs {
             inputs: [plane_in, plane_in, plane_in],
             outputs: [plane_out_alias, plane_out_alias, plane_out_other],
-            factor: UpsamplingFactor::X2,
-            weights: prepared.buffer(),
+            weights: &prepared,
         },
     );
     assert!(matches!(
@@ -341,8 +337,7 @@ fn resident_upsample_rejects_aliased_buffers() {
         ResidentImageUpsampleInputs {
             inputs: [plane_in, plane_in, plane_in],
             outputs: [plane_out_alias, plane_out_other, plane_out_other],
-            factor: UpsamplingFactor::X2,
-            weights: prepared.buffer(),
+            weights: &prepared,
         },
     );
     assert!(matches!(
@@ -381,7 +376,7 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
             _ => unreachable!(),
         };
         let compact: Vec<f32> = (0..compact_count).map(|i| 1.0 / ((i + 1) as f32)).collect();
-        let up_factor = UpsamplingFactor::try_from_u32(factor).unwrap();
+        let up_factor = UpsamplingFactor::try_from(factor).unwrap();
         let weights = ResidentImageUpsampleWeights::new(up_factor, &compact).unwrap();
         let prepared = weights.prepare(device).unwrap();
 
@@ -483,8 +478,7 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
                 ResidentChannelUpsampleInputs {
                     input: plane_in,
                     output: plane_out_chan,
-                    factor: up_factor,
-                    weights: prepared.buffer(),
+                    weights: &prepared,
                 },
             )
             .unwrap();
@@ -495,8 +489,7 @@ fn resident_upsample_supports_arbitrary_and_odd_extents_on_gpu() {
                 ResidentImageUpsampleInputs {
                     inputs: [plane_in, plane_in, plane_in],
                     outputs: [plane_out_img0, plane_out_img1, plane_out_img2],
-                    factor: up_factor,
-                    weights: prepared.buffer(),
+                    weights: &prepared,
                 },
             )
             .unwrap();

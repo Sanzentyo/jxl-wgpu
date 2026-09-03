@@ -21,14 +21,24 @@ impl UpsamplingFactor {
     pub const fn as_u32(self) -> u32 {
         self as u32
     }
+}
 
-    pub const fn try_from_u32(factor: u32) -> Result<Self, ResidentImageUpsampleError> {
+impl TryFrom<u32> for UpsamplingFactor {
+    type Error = ResidentImageUpsampleError;
+
+    fn try_from(factor: u32) -> Result<Self, Self::Error> {
         match factor {
             2 => Ok(Self::X2),
             4 => Ok(Self::X4),
             8 => Ok(Self::X8),
             _ => Err(ResidentImageUpsampleError::InvalidFactor { factor }),
         }
+    }
+}
+
+impl From<UpsamplingFactor> for u32 {
+    fn from(factor: UpsamplingFactor) -> Self {
+        factor as Self
     }
 }
 
@@ -117,18 +127,9 @@ impl ResidentImageUpsampleWeights {
         })
     }
 
-    pub fn new_with_u32(factor: u32, compact: &[f32]) -> Result<Self, ResidentImageUpsampleError> {
-        Self::new(UpsamplingFactor::try_from_u32(factor)?, compact)
-    }
-
     #[must_use]
     pub const fn factor(&self) -> UpsamplingFactor {
         self.factor
-    }
-
-    #[must_use]
-    pub const fn factor_u32(&self) -> u32 {
-        self.factor.as_u32()
     }
 
     #[must_use]
@@ -175,9 +176,8 @@ impl PreparedUpsamplingWeights {
         self.factor
     }
 
-    #[must_use]
-    pub fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+    pub(crate) fn as_entire_binding(&self) -> wgpu::BindingResource<'_> {
+        self.buffer.as_entire_binding()
     }
 }
 
@@ -186,8 +186,7 @@ impl PreparedUpsamplingWeights {
 pub struct ResidentImageUpsampleInputs<'a> {
     pub inputs: [ResidentF32Plane<'a>; 3],
     pub outputs: [ResidentF32Plane<'a>; 3],
-    pub factor: UpsamplingFactor,
-    pub weights: &'a wgpu::Buffer,
+    pub weights: &'a PreparedUpsamplingWeights,
 }
 
 /// Single input plane, distinct output plane, and interpolation kernels for extra channel upsampling.
@@ -195,8 +194,7 @@ pub struct ResidentImageUpsampleInputs<'a> {
 pub struct ResidentChannelUpsampleInputs<'a> {
     pub input: ResidentF32Plane<'a>,
     pub output: ResidentF32Plane<'a>,
-    pub factor: UpsamplingFactor,
-    pub weights: &'a wgpu::Buffer,
+    pub weights: &'a PreparedUpsamplingWeights,
 }
 
 /// Transient parameters buffer created while recording one fused three-plane dispatch.
@@ -578,7 +576,7 @@ fn validate_inputs(
     device: &wgpu::Device,
     inputs: ResidentImageUpsampleInputs<'_>,
 ) -> Result<ResidentImageUpsampleParams, ResidentImageUpsampleError> {
-    let factor = inputs.factor.as_u32();
+    let factor = inputs.weights.factor.as_u32();
     let input = inputs.inputs[0];
     let output = inputs.outputs[0];
     for (plane, candidate) in inputs.inputs.into_iter().chain(inputs.outputs).enumerate() {
@@ -668,7 +666,7 @@ fn validate_channel_inputs(
     device: &wgpu::Device,
     inputs: ResidentChannelUpsampleInputs<'_>,
 ) -> Result<ResidentChannelUpsampleParams, ResidentImageUpsampleError> {
-    let factor = inputs.factor.as_u32();
+    let factor = inputs.weights.factor.as_u32();
     validate_plane(device, 0, inputs.input)?;
     validate_plane(device, 1, inputs.output)?;
     if inputs.output.width.div_ceil(factor) != inputs.input.width
@@ -805,19 +803,23 @@ mod tests {
 
     #[test]
     fn compact_weight_shapes_expand_to_every_phase() {
-        for (factor, compact_len) in [(2, 15), (4, 55), (8, 210)] {
+        for (factor_u32, compact_len) in [(2, 15), (4, 55), (8, 210)] {
             let compact = (0..compact_len)
                 .map(|value| (value + 1) as f32 * 1.5)
                 .collect::<Vec<_>>();
-            let weights = ResidentImageUpsampleWeights::new_with_u32(factor, &compact).unwrap();
+            let factor = UpsamplingFactor::try_from(factor_u32).unwrap();
+            let weights = ResidentImageUpsampleWeights::new(factor, &compact).unwrap();
             assert_eq!(
                 weights.phase_major.len(),
-                factor as usize * factor as usize * 25
+                factor_u32 as usize * factor_u32 as usize * 25
             );
-            assert_eq!(weights.storage_bytes(), u64::from(factor * factor * 25 * 4));
+            assert_eq!(
+                weights.storage_bytes(),
+                u64::from(factor_u32 * factor_u32 * 25 * 4)
+            );
 
-            let half = (factor / 2) as usize;
-            let factor_usize = factor as usize;
+            let half = (factor_u32 / 2) as usize;
+            let factor_usize = factor_u32 as usize;
             let triangle_side = half * 5;
             for phase_y in 0..half {
                 for phase_x in 0..half {
@@ -875,7 +877,7 @@ mod tests {
     #[test]
     fn memory_plans_account_exact_uniform_sizes() {
         let compact = vec![1.0; 15];
-        let weights = ResidentImageUpsampleWeights::new_with_u32(2, &compact).unwrap();
+        let weights = ResidentImageUpsampleWeights::new(UpsamplingFactor::X2, &compact).unwrap();
         let image_plan = ResidentImageUpsampleMemoryPlan::new(&weights).unwrap();
         let channel_plan = ResidentChannelUpsampleMemoryPlan::new(&weights).unwrap();
 
