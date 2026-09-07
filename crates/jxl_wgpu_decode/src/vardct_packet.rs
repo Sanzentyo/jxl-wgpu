@@ -17,9 +17,9 @@ use crate::modular_tree::{
 };
 use crate::vardct_frontend::{
     BoundedBitInput, HfBlockContextIr, HfGlobalPrefix, LfChannelCorrelation,
-    LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctFrontendError,
-    VarDctGroupRect, VarDctMetadataReaderError, VarDctPacketError, VarDctSectionLayout,
-    map_metadata_reader_error, metadata_bits, metadata_bool, metadata_f16,
+    LfChannelDequantization, LfGlobalPrefix, StandardVarDctProfile, VarDctColorTransform,
+    VarDctFrontendError, VarDctGroupRect, VarDctMetadataReaderError, VarDctPacketError,
+    VarDctSectionLayout, map_metadata_reader_error, metadata_bits, metadata_bool, metadata_f16,
     parse_hf_metadata_header_reader, parse_lf_group_header_reader, validate_packet_end_bits,
 };
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
@@ -42,8 +42,13 @@ pub(crate) const WEIGHTED_PACKET_EXECUTION_STATE_BYTES: u64 = 128;
 pub enum UnsupportedVarDctPacketFeature {
     #[error("the combined one-entry VarDCT packet cannot address multiple LF groups")]
     CombinedPacketMultipleLfGroups,
-    #[error("the bounded VarDCT decoder currently accepts 8-bit samples")]
-    BitDepth,
+    #[error(
+        "GPU VarDCT accepts 1–16-bit XYB or 8-bit YCbCr input, got {bits_per_sample}-bit {color_transform:?}"
+    )]
+    BitDepth {
+        bits_per_sample: u32,
+        color_transform: VarDctColorTransform,
+    },
     #[error(
         "the MA tree uses previous-channel property {property}; the heterogeneous VarDCT metadata layout is not implemented"
     )]
@@ -447,8 +452,15 @@ impl BoundedVarDctPacketPlan {
             || StandardVarDctProfile::negotiate(inventory),
             |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
         )?;
-        if profile.bits_per_sample != 8 {
-            return Err(UnsupportedVarDctPacketFeature::BitDepth.into());
+        if !(1..=16).contains(&profile.bits_per_sample)
+            || (profile.color_transform == VarDctColorTransform::Ycbcr
+                && profile.bits_per_sample != 8)
+        {
+            return Err(UnsupportedVarDctPacketFeature::BitDepth {
+                bits_per_sample: profile.bits_per_sample,
+                color_transform: profile.color_transform,
+            }
+            .into());
         }
         let (lf_global_packet, lf_group_packets, hf_global, pass_groups) = match &profile.sections {
             VarDctSectionLayout::Single { packet } => {

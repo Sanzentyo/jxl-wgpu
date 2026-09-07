@@ -330,3 +330,42 @@ pub fn vardct_oriented_jpeg() -> Vec<u8> {
         "../../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"
     ))
 }
+
+pub fn vardct_depth_rgb(bits: u32) -> Vec<u8> {
+    const FIXTURES: [&str; 16] = [
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_1.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_2.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_3.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_4.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_5.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_6.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_7.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_8.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_9.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_10.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_11.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_12.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_13.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_14.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_15.jxl.hex"),
+        include_str!("../../test-data/testsrc_vardct_depth_rgb_16.jxl.hex"),
+    ];
+    assert!((1..=16).contains(&bits));
+    decode_hex(FIXTURES[(bits - 1) as usize])
+}
+
+pub fn vardct_depth_combined(name: &str) -> Vec<u8> {
+    decode_hex(match name {
+        "gray_12_upsample" => {
+            include_str!("../../test-data/testsrc_vardct_depth_gray_12_upsample.jxl.hex")
+        }
+        "gray_16_dc" => include_str!("../../test-data/testsrc_vardct_depth_gray_16_dc.jxl.hex"),
+        "rgb_16_multilf" => {
+            include_str!("../../test-data/testsrc_vardct_depth_rgb_16_multilf.jxl.hex")
+        }
+        "rgb_16_single" => {
+            include_str!("../../test-data/testsrc_vardct_depth_rgb_16_single.jxl.hex")
+        }
+        _ => panic!("unknown integer-depth fixture: {name}"),
+    })
+}

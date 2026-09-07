@@ -146,15 +146,15 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 ### Bounded standard VarDCT engine
 
 The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two bounded
-standard packet topologies. A one-entry zero-AC TOC retains the original single regular 8x8,
-16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC covers one or
+standard packet topologies. A one-entry TOC stages LF and HF metadata before parsing its general
+HF-global and AC continuation, with transforms selected from the decoded strategy map. A sectioned TOC covers one or
 more independently bounded LF groups with GPU-decoded mixed maps of any of JPEG XL's 27 regular
 and special strategies across one or more 256-pixel pass groups. Those pass groups may carry real HF coefficients across one through eleven spectral/refinement passes
 using any of the 13 natural or entropy-coded custom coefficient-order families. Scanline and
 entropy-coded center-first TOC order are both accepted: inventory retains physical section ranges
 and the frontend normalizes them to logical group order before assigning pixel rectangles and
-per-group scratch. The explicit section topology removes the ambiguity with a one-entry
-single-transform packet. The sectioned form supports odd and asymmetric pixel extents across LF
+per-group scratch. The explicit section topology distinguishes combined and separately addressable
+packet ranges. The sectioned form supports odd and asymmetric pixel extents across LF
 group boundaries while keeping edge padding internal to GPU storage; 2056x256 is the checked
 two-LF-group boundary case.
 HF-global metadata is represented as shared block contexts/matrices plus `HfCoefficientPass`
@@ -166,8 +166,9 @@ before the single inverse-transform/restoration/output sequence. Every status mu
 the final image becomes authoritative. Three checked-in spectral/quantized fixtures cover ordinary
 and 256-byte windowed execution, 37-byte transport chunks, odd extents, center-first order, and two
 LF groups; both CPU oracles agree within one RGB8 code on Apple M5.
-Both forms return one final 8-bit still frame; a one-entry TOC has one pass, while sectioned TOCs retain every declared pass. The main profile is XYB; a
-non-XYB JPEG-reconstruction profile accepts encoded YCbCr and the codestream's component sampling
+Both forms return one final RGB8 still frame; a one-entry TOC has one pass, while sectioned TOCs
+retain every declared pass. The main XYB profile accepts integer source depths 1 through 16; a
+non-XYB JPEG-reconstruction profile accepts 8-bit encoded YCbCr and the codestream's component sampling
 selectors. The packet contract
 accepts either adaptive LF smoothing or its standard skip flag, every 3-bit X/B frame
 quant-matrix scale, every normative default or parametric custom dequantization matrix encoding,
@@ -211,6 +212,16 @@ and AC traversal include MCU-padded edge blocks. Late host matrix uploads exclud
 already decoded on GPU, including every transposed and AFV alias. Whole-input blocking and bounded
 fragmented-input async results match Rust `jxl` and `djxl` within one RGB8 code, with exact equality
 between upload policies and complete budget release.
+
+The source depth describes the original integer samples and does not rescale the normalized XYB
+reconstruction or constrain the RGB8 output to that source precision. Sixteen 257×33 spectral
+fixtures check every accepted depth, and four additional fixtures combine 12/16-bit input with
+grayscale, orientation, resampling, multiple LF groups, recursive DC, and a single-entry TOC.
+Whole and 256-byte-window async outputs match both CPU oracles within one RGB8 code. The `djxl`
+oracle requests sRGB PFM to preserve floating-point reconstruction before one test-only RGB8
+quantization; PNM's source-depth quantization would invalidate this comparison for low-bit inputs.
+Unsupported integer depths retain both the declared depth and color transform in the typed packet
+error. Floating-point source metadata and integer depths above 16 remain unsupported.
 
 Ordinary frame upsampling uses the image header's standard or custom 2×/4×/8× weights. The
 profile separates encoded `width`/`height` from presented `output_width`/`output_height`; LF/HF,

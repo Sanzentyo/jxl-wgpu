@@ -94,6 +94,11 @@ also verify padded edge blocks and preservation of GPU-decoded raw quantization 
 HF-global metadata continuations. These paths return packed RGB8 and match both reference decoders
 within one code value under whole and bounded asynchronous input.
 
+XYB VarDCT accepts every integer source depth from 1 through 16 and returns normalized RGB8.
+Twenty synthetic fixtures cover every depth, plus high-depth grayscale, orientation, resampling,
+multiple LF groups, and recursive DC. Both reference decoders agree within one RGB8 code; the
+non-XYB YCbCr profile remains limited to 8-bit input, and floating-point source metadata is pending.
+
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.
 Decoder output buffers carry cloneable memory leases, so dropping a session cannot free its budget

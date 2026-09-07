@@ -416,6 +416,63 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## VarDCT integer source depths
+
+Twenty synthetic fixtures under `crates/jxl_wgpu_decode/test-data/` exercise XYB input at every
+integer depth from 1 through 16, with RGB8 output. The binary P6/P5 source header declares
+`MAX = (1 << bits) - 1`. Samples occupy one byte at depths 1–8 and a big-endian two-byte word at
+depths 9–16. Zero-based coordinates generate the following values; gray uses `R`:
+
+```text
+R = (613*x + 107*y + 43*(x XOR y)) & MAX
+G = ((153*x) XOR (271*y)) & MAX
+B = (259*x + 307*y + 31*(x XOR y)) & MAX
+```
+
+libjxl 0.12.0 runs `cjxl source.pnm output.jxl -d 2 -e 7 -m 0 --container=0 -x
+exif=orientation.exif` with the minimal TIFF orientation described below, plus these options.
+Every `rgb_N` fixture has two spatial groups, three spectral passes, and options
+`--progressive_ac --progressive_dc=0`. Extents precede orientation.
+
+| Suffix after `testsrc_vardct_depth_` | Bits | Source extent / orientation / options | Binary SHA-256 |
+|---|---:|---|---|
+| `rgb_1.jxl.hex` | 1 | 257×33 / 1 / spectral | `65aecbc37e485bf399c612547d9752596c9ac82dab4d1349c6ccb83b295430f9` |
+| `rgb_2.jxl.hex` | 2 | 257×33 / 1 / spectral | `846d800161accbfdddc5a0b198b77732f90f9f2ec0e3dfa9607e0d9f95f04b7c` |
+| `rgb_3.jxl.hex` | 3 | 257×33 / 1 / spectral | `b48984eacce71b84ff52d1a88e27235ef785b0d2a6195bab4c8160ff78459437` |
+| `rgb_4.jxl.hex` | 4 | 257×33 / 1 / spectral | `51f651e83042b6fcf347966566f243f0bebc083fed75b9413ef143199b2aa64b` |
+| `rgb_5.jxl.hex` | 5 | 257×33 / 1 / spectral | `d9f88d6ee9680058b4388e774167a9a389ddb39dd076e0520e6d55b8e7881b39` |
+| `rgb_6.jxl.hex` | 6 | 257×33 / 1 / spectral | `735400c4a2a6bdc608187726bee5941e5b5c528ec26717c2c36e9964701a76ed` |
+| `rgb_7.jxl.hex` | 7 | 257×33 / 1 / spectral | `7fc3f9fd5ac605fc7a3d6156a6d7fe5f9f761ce3969eb9aef2348d8162c9d13c` |
+| `rgb_8.jxl.hex` | 8 | 257×33 / 1 / spectral | `7f522c8d2cb4eb897a421e0fbe20675f8f29528214d8d36b9656be9d6775fd39` |
+| `rgb_9.jxl.hex` | 9 | 257×33 / 1 / spectral | `44977b41815ee2c3cd9045bffa3eaa20ce925ee2af317ccfe9e4314a62efbd08` |
+| `rgb_10.jxl.hex` | 10 | 257×33 / 1 / spectral | `016ab61e04c3d9721591a933f3d54980f5ae2d7e40e0fb3ef002173372edf509` |
+| `rgb_11.jxl.hex` | 11 | 257×33 / 1 / spectral | `06a029f625e2d0ac83061e310552e343afdd99d824dc0f12232a54dcde62e8ee` |
+| `rgb_12.jxl.hex` | 12 | 257×33 / 1 / spectral | `5f26c7f3530bc698e5369c6afffe3ee27e9c611b6d5d8f1f6627eb512e05aaf6` |
+| `rgb_13.jxl.hex` | 13 | 257×33 / 1 / spectral | `3d444138bb812a292e352fbabc31a29119e4a77081577c4c6b5a0be1539a635f` |
+| `rgb_14.jxl.hex` | 14 | 257×33 / 1 / spectral | `2b93c518d74062748a0d79cae02f86ce02b87b208df25a34b023a1b38e97435c` |
+| `rgb_15.jxl.hex` | 15 | 257×33 / 1 / spectral | `d7356549f5177e5c8cfe64b191434ea01fb484bec78361552d56170ad98edcd7` |
+| `rgb_16.jxl.hex` | 16 | 257×33 / 1 / spectral | `eb7bca07295ce574b65bfe9983481887fbe6d8e252311ca407d7409f273262c2` |
+| `gray_12_upsample.jxl.hex` | 12 | 515×259 / 8 / `--resampling=4 --progressive_ac --progressive_dc=0` | `6cfb82a6cef26f6b141454882bbeb581fb788d65a4d1844bab1c4bf6954adfda` |
+| `gray_16_dc.jxl.hex` | 16 | 1024×128 / 6 / `--qprogressive_ac --progressive_dc=2` | `2751fd92259cb0bce58e33d6655761445ccea41fe897e10d8e3358323632aee4` |
+| `rgb_16_multilf.jxl.hex` | 16 | 2056×17 / 5 / `--qprogressive_ac --progressive_dc=0` | `d88119a3dc7a561130a52c0bb6136c08f898f9947229748d137cd450845009da` |
+| `rgb_16_single.jxl.hex` | 16 | 17×9 / 7 / `--progressive_dc=0` | `f59ff8deca38827921476f2fe3146e6fe60b1f8add15951dfd3353faacf2846c` |
+
+`every_integer_depth_through_sixteen_decodes_xyb_to_rgb8_on_gpu` verifies the declared integer
+depth and per-pass shifts for all sixteen sources.
+`high_integer_depths_combine_with_grayscale_orientation_resampling_and_dc` additionally covers
+a rotated 4× grayscale frame, a three-frame grayscale DC chain, two LF groups, and a single-entry
+TOC. Both tests run whole-input blocking and fragmented-input async decoding with 256-byte entropy
+windows. The upload policies must agree byte-for-byte, output extents must account for orientation,
+gray pixels must have equal RGB channels, and all memory reservations must be released.
+
+On Apple M5/Metal (2026-09-07), every case differs from Rust `jxl` and installed `djxl` by at most
+one RGB8 code. The `djxl` comparison uses explicitly sRGB float PFM, reads its declared endianness,
+reverses bottom-first rows, and rounds/clamps each float to RGB8 once. This avoids PNM's original-depth
+quantization, which would discard the lossy reconstruction precision for low-depth sources.
+The profile test checks typed rejection of out-of-range XYB and non-8-bit YCbCr depths while
+retaining the original depth and color transform. These fixtures do not claim integer input above
+16 bits, floating-point source metadata, non-8-bit YCbCr input, or non-RGB8 VarDCT output.
+
 ## VarDCT grayscale and orientation
 
 Fifteen synthetic fixtures in `crates/jxl_wgpu_decode/test-data/` exercise packed RGB8 presentation.

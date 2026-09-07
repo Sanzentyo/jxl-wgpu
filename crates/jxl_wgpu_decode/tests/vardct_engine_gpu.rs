@@ -204,7 +204,7 @@ fn assert_presentation_matches_oracles(
     extent: Extent2d,
 ) -> Vec<u8> {
     let expected = rust_jxl_rgb8(encoded, extent);
-    let djxl = djxl_ppm(encoded, extent);
+    let djxl = djxl_rgb8(encoded, extent);
     let mut whole_output = None;
     for cap in [u64::MAX, 256] {
         let decoder = GpuDecoder::new(
@@ -360,6 +360,85 @@ fn jpeg_subsampling_is_expanded_in_codestream_coordinates_before_orientation() {
 }
 
 #[test]
+fn every_integer_depth_through_sixteen_decodes_xyb_to_rgb8_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    eprintln!("integer VarDCT adapter: {info:?}");
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    for bits in 1..=16 {
+        let encoded = common::vardct_depth_rgb(bits);
+        let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        assert!(inventory.image_header.xyb_encoded);
+        assert_eq!(
+            inventory.image_header.bit_depth,
+            jxl_gpu_bitstream::SampleBitDepth::Integer {
+                bits_per_sample: bits
+            }
+        );
+        let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+        assert_eq!(packet.profile.bits_per_sample, bits);
+        assert_eq!(packet.profile.coefficient_shifts, [0, 0, 0]);
+        assert_presentation_matches_oracles(
+            &backend,
+            &format!("RGB {bits}-bit"),
+            &encoded,
+            Extent2d::new(257, 33),
+        );
+    }
+}
+
+#[test]
+fn high_integer_depths_combine_with_grayscale_orientation_resampling_and_dc() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    for (name, bits, extent, orientation, upsampling, frame_count) in [
+        ("gray_12_upsample", 12, Extent2d::new(515, 259), 8, 4, 1),
+        ("gray_16_dc", 16, Extent2d::new(1024, 128), 6, 1, 3),
+        ("rgb_16_multilf", 16, Extent2d::new(2056, 17), 5, 1, 1),
+        ("rgb_16_single", 16, Extent2d::new(17, 9), 7, 1, 1),
+    ] {
+        let encoded = common::vardct_depth_combined(name);
+        let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        assert_eq!(
+            inventory.image_header.bit_depth,
+            jxl_gpu_bitstream::SampleBitDepth::Integer {
+                bits_per_sample: bits
+            }
+        );
+        assert_eq!(inventory.image_header.grayscale, name.starts_with("gray"));
+        assert_eq!(inventory.image_header.orientation, orientation);
+        assert_eq!(inventory.frames.len(), frame_count);
+        assert_eq!(inventory.frames.last().unwrap().upsampling, upsampling);
+        if name == "rgb_16_multilf" {
+            let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+            assert_eq!(packet.profile.low_frequency_group_count, 2);
+        }
+        let output_extent = OutputOrientation::from_exif_value(orientation)
+            .unwrap()
+            .map_extent(extent);
+        let pixels = assert_presentation_matches_oracles(&backend, name, &encoded, output_extent);
+        if inventory.image_header.grayscale {
+            assert!(
+                pixels
+                    .chunks_exact(3)
+                    .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+            );
+        }
+    }
+}
+
+#[test]
 fn frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu() {
     let Some((info, device, queue)) = device() else {
         return;
@@ -412,7 +491,7 @@ fn frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu() {
             );
         }
         let expected = rust_jxl_rgb8(&encoded, extent);
-        let djxl = djxl_ppm(&encoded, extent);
+        let djxl = djxl_rgb8(&encoded, extent);
         let mut whole_output = None;
         for cap in [u64::MAX, 256] {
             let decoder = GpuDecoder::new(
@@ -570,7 +649,7 @@ fn progressive_ac_passes_accumulate_with_independent_tables_on_gpu() {
             );
         }
         let expected = rust_jxl_rgb8(encoded, extent);
-        let djxl = djxl_ppm(encoded, extent);
+        let djxl = djxl_rgb8(encoded, extent);
         let mut whole_output = None;
         for cap in [u64::MAX, 256] {
             let decoder = GpuDecoder::new(
@@ -670,7 +749,7 @@ fn progressive_ac_combines_with_recursive_gpu_resident_dc() {
     );
     let extent = Extent2d::new(1024, 128);
     let expected = rust_jxl_rgb8(encoded, extent);
-    let djxl = djxl_ppm(encoded, extent);
+    let djxl = djxl_rgb8(encoded, extent);
     for cap in [u64::MAX, 256] {
         let decoder = GpuDecoder::new(
             WgpuDecodeEngine::new(backend.clone())
@@ -852,7 +931,7 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
             rust_error <= 1,
             "{name} JPEG-transcode GPU output diverges from Rust jxl by {rust_error}",
         );
-        if let Some(djxl) = djxl_ppm(encoded, extent) {
+        if let Some(djxl) = djxl_rgb8(encoded, extent) {
             let djxl_error = maximum_error(actual, &djxl);
             assert!(
                 djxl_error <= 1,
@@ -862,7 +941,7 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
     }
 }
 
-fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
+fn djxl_rgb8(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
     fn next_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> &'a [u8] {
         loop {
             while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
@@ -902,10 +981,22 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
         DJXL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     );
     let input = std::env::temp_dir().join(format!("jxl-wgpu-vardct-{nonce}.jxl"));
-    let output = std::env::temp_dir().join(format!("jxl-wgpu-vardct-{nonce}.ppm"));
+    // PNM integer output retains the source depth, even when requesting eight-bit samples.
+    // Preserve the decoder's full precision in PFM, then quantize the sRGB samples once.
+    let output = std::env::temp_dir().join(format!("jxl-wgpu-vardct-{nonce}.pfm"));
+    let inventory = jxl_gpu_bitstream::parse(codestream, ParseLimits::default())
+        .unwrap()
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let color_space = if inventory.image_header.grayscale {
+        "--color_space=Gra_D65_Rel_SRG"
+    } else {
+        "--color_space=RGB_D65_SRG_Rel_SRG"
+    };
     std::fs::write(&input, codestream).unwrap();
     let command = std::process::Command::new("djxl")
         .args([&input, &output])
+        .arg(color_space)
         .output()
         .unwrap();
     assert!(
@@ -913,52 +1004,58 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
         "djxl rejected bounded VarDCT packet: {}",
         String::from_utf8_lossy(&command.stderr)
     );
-    let ppm = std::fs::read(&output).unwrap();
+    let pfm = std::fs::read(&output).unwrap();
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
     let mut cursor = 0;
-    let channels = match next_token(&ppm, &mut cursor) {
-        b"P5" => 1,
-        b"P6" => 3,
-        magic => panic!("djxl emitted unsupported PNM magic {magic:?}"),
+    let channels = match next_token(&pfm, &mut cursor) {
+        b"Pf" => 1,
+        b"PF" => 3,
+        magic => panic!("djxl emitted unsupported PFM magic {magic:?}"),
     };
     assert_eq!(
-        std::str::from_utf8(next_token(&ppm, &mut cursor))
+        std::str::from_utf8(next_token(&pfm, &mut cursor))
             .unwrap()
             .parse::<u32>()
             .unwrap(),
         extent.width
     );
     assert_eq!(
-        std::str::from_utf8(next_token(&ppm, &mut cursor))
+        std::str::from_utf8(next_token(&pfm, &mut cursor))
             .unwrap()
             .parse::<u32>()
             .unwrap(),
         extent.height
     );
-    let maximum = std::str::from_utf8(next_token(&ppm, &mut cursor))
+    let scale = std::str::from_utf8(next_token(&pfm, &mut cursor))
         .unwrap()
-        .parse::<u32>()
+        .parse::<f32>()
         .unwrap();
-    if ppm.get(cursor..cursor + 2) == Some(b"\r\n") {
+    assert_eq!(scale.abs(), 1.0);
+    if pfm.get(cursor..cursor + 2) == Some(b"\r\n") {
         cursor += 2;
     } else {
-        assert!(ppm.get(cursor).is_some_and(u8::is_ascii_whitespace));
+        assert!(pfm.get(cursor).is_some_and(u8::is_ascii_whitespace));
         cursor += 1;
     }
-    let pixels = &ppm[cursor..];
-    let pixels: Vec<u8> = match maximum {
-        255 => pixels.to_vec(),
-        65_535 => pixels
-            .chunks_exact(2)
-            .map(|pair| {
-                let value = u16::from_be_bytes([pair[0], pair[1]]);
-                ((u32::from(value) + 128) / 257) as u8
-            })
-            .collect(),
-        _ => panic!("djxl PPM uses unsupported maximum {maximum}"),
-    };
-    assert_eq!(pixels.len(), extent.area().unwrap() * channels);
+    let samples = &pfm[cursor..];
+    assert_eq!(samples.len(), extent.area().unwrap() * channels * 4);
+    // PFM stores the bottom row first; its scale sign selects the float byte order.
+    let pixels: Vec<u8> = samples
+        .chunks_exact(extent.width as usize * channels * 4)
+        .rev()
+        .flat_map(|row| row.chunks_exact(4))
+        .map(|sample| {
+            let bytes = sample.try_into().unwrap();
+            let value = if scale.is_sign_negative() {
+                f32::from_le_bytes(bytes)
+            } else {
+                f32::from_be_bytes(bytes)
+            };
+            assert!(value.is_finite());
+            (value * 255.0).round().clamp(0.0, 255.0) as u8
+        })
+        .collect();
     Some(if channels == 1 {
         pixels.into_iter().flat_map(|value| [value; 3]).collect()
     } else {
@@ -1131,7 +1228,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
         if strategy == VarDctStrategy::Dct8 {
             dct8_packet = Some(encoded.clone());
         }
-        let oracle = djxl_ppm(&encoded, extent);
+        let oracle = djxl_rgb8(&encoded, extent);
         let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
         let mut session = if index == 0 {
             let session = open_incremental(&decoder, &encoded, request);
@@ -1342,7 +1439,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     let actual = &readback.frame.outputs[0].bytes;
     let rust = rust_jxl_rgb8(&encoded, extent);
     assert!(maximum_error(actual, &rust) <= 1);
-    if let Some(djxl) = djxl_ppm(&encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(&encoded, extent) {
         assert!(maximum_error(actual, &djxl) <= 1);
     }
     drop(readback);
@@ -1514,7 +1611,7 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             extent.width,
             extent.height,
         );
-        if let Some(djxl) = djxl_ppm(&encoded, extent) {
+        if let Some(djxl) = djxl_rgb8(&encoded, extent) {
             assert!(
                 maximum_error(actual, &djxl) <= 1,
                 "{}x{} tiled GPU output diverges from djxl",
@@ -1591,7 +1688,7 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
         maximum_error(actual, &rust) <= 1,
         "nonzero-AC GPU output diverges from Rust jxl",
     );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(encoded, extent) {
         assert!(
             maximum_error(actual, &djxl) <= 1,
             "nonzero-AC GPU output diverges from djxl",
@@ -1916,7 +2013,7 @@ fn libjxl_center_first_permuted_toc_matches_reference_on_gpu() {
         rust_error <= 1,
         "center-first GPU output diverges from Rust jxl by {rust_error}",
     );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(encoded, extent) {
         let djxl_error = maximum_error(actual, &djxl);
         assert!(
             djxl_error <= 1,
@@ -1982,7 +2079,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
         rust_error <= 1,
         "mixed-strategy GPU output diverges from Rust jxl by {rust_error}",
     );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(encoded, extent) {
         let djxl_error = maximum_error(actual, &djxl);
         assert!(
             djxl_error <= 1,
@@ -2100,7 +2197,7 @@ fn assert_multiple_lf_groups(
         rust_error <= 1,
         "multiple-LF-group GPU output diverges from Rust jxl by {rust_error}",
     );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(encoded, extent) {
         let djxl_error = maximum_error(actual, &djxl);
         assert!(
             djxl_error <= 1,
@@ -2223,7 +2320,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
         rust_error <= 1,
         "local-tree GPU output diverges from Rust jxl by {rust_error}",
     );
-    if let Some(djxl) = djxl_ppm(&encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(&encoded, extent) {
         let djxl_error = maximum_error(actual, &djxl);
         assert!(
             djxl_error <= 1,
@@ -2406,7 +2503,7 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
         maximum_error(actual, &rust) <= 1,
         "resident Gaborish output diverges from Rust jxl",
     );
-    if let Some(djxl) = djxl_ppm(encoded, extent) {
+    if let Some(djxl) = djxl_rgb8(encoded, extent) {
         assert!(
             maximum_error(actual, &djxl) <= 1,
             "resident Gaborish output diverges from djxl",
@@ -2490,7 +2587,7 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
             rust_error <= 1,
             "resident EPF{iterations} output diverges from Rust jxl by {rust_error}",
         );
-        if let Some(djxl) = djxl_ppm(encoded, extent) {
+        if let Some(djxl) = djxl_rgb8(encoded, extent) {
             let djxl_error = maximum_error(actual, &djxl);
             assert!(
                 djxl_error <= 1,

@@ -40,3 +40,10 @@ orientation metadata supplies the codestream orientation; no external photograph
 included. Exact patterns, options, hashes, and validation are in `docs/CONFORMANCE_CORPUS.md`.
 Grayscale luminance projection follows the bounded matrix composition described by libjxl's
 `lib/jxl/dec_xyb.cc` and Rust `jxl` 0.6.0's `src/render/stages/xyb.rs`.
+
+`test-data/testsrc_vardct_depth_*.jxl.hex` are twenty synthetic integer-depth RGB/gray patterns
+encoded with libjxl 0.12.0 (BSD-3-Clause). Exact source formulas, depths, options, binary hashes,
+and GPU validation are recorded in `docs/CONFORMANCE_CORPUS.md`. The development-only `djxl` oracle
+uses PFM float output with explicit sRGB encoding; byte order and bottom-first row interpretation
+follow libjxl's `lib/extras/enc/pnm.cc`. Production does not invoke that decoder or parse image pixels
+on the host.

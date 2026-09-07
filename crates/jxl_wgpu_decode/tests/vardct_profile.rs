@@ -1,10 +1,14 @@
-use jxl_gpu_bitstream::{BitRange, BitWriter, FrameSectionKind, InventoryLimits, parse};
+use jxl_gpu_bitstream::{
+    BitRange, BitWriter, FrameSectionKind, InventoryLimits, SampleBitDepth, parse,
+};
 use jxl_wgpu_decode::vardct::frontend::{
     HfGlobalPrefix, HfMetadataPrefix, LfGlobalPrefix, LfGroupPrefix, ModularChannelPlan,
-    StandardVarDctProfile, UnsupportedVarDctFeature, VarDctFrontendError, VarDctPacketError,
-    VarDctSectionLayout,
+    StandardVarDctProfile, UnsupportedVarDctFeature, VarDctColorTransform, VarDctFrontendError,
+    VarDctPacketError, VarDctSectionLayout,
 };
-use jxl_wgpu_decode::vardct::packet::BoundedVarDctPacketPlan;
+use jxl_wgpu_decode::vardct::packet::{
+    BoundedVarDctPacketError, BoundedVarDctPacketPlan, UnsupportedVarDctPacketFeature,
+};
 
 fn decode_hex(source: &str) -> Vec<u8> {
     let digits: Vec<_> = source
@@ -30,6 +34,37 @@ fn inventory(bytes: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
         .unwrap()
         .codestream_inventory(InventoryLimits::default())
         .unwrap()
+}
+
+#[test]
+fn unsupported_integer_depth_errors_preserve_the_declared_depth_and_color_domain() {
+    let cases = [
+        (
+            include_str!("../test-data/testsrc_vardct_depth_rgb_16_single.jxl.hex"),
+            VarDctColorTransform::Xyb,
+            [0, 17, 31],
+        ),
+        (
+            include_str!("../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"),
+            VarDctColorTransform::Ycbcr,
+            [1, 10, 16],
+        ),
+    ];
+    for (hex, expected_transform, depths) in cases {
+        let bytes = decode_hex(hex);
+        let mut inventory = inventory(&bytes);
+        assert!(BoundedVarDctPacketPlan::parse(&bytes, &inventory).is_ok());
+        for bits_per_sample in depths {
+            inventory.image_header.bit_depth = SampleBitDepth::Integer { bits_per_sample };
+            let error = BoundedVarDctPacketPlan::parse(&bytes, &inventory).unwrap_err();
+            assert!(matches!(error,
+                BoundedVarDctPacketError::Unsupported(UnsupportedVarDctPacketFeature::BitDepth {
+                    bits_per_sample: actual_depth,
+                    color_transform,
+                }) if actual_depth == bits_per_sample && color_transform == expected_transform
+            ));
+        }
+    }
 }
 
 #[test]
