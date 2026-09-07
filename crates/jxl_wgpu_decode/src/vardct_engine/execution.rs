@@ -3336,6 +3336,7 @@ fn submit_vardct(
                 },
             ],
             output: resident_binding(&output)?,
+            layout: &source.layout,
             config: source.output_config,
         },
     )?;

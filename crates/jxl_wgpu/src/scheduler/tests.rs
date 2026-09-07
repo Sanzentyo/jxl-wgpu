@@ -657,7 +657,7 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
         ],
     });
     assert_wgsl_fields(
-        include_str!("../../shaders/rgb_to_image.wgsl"),
+        crate::image_output::RGB_TO_IMAGE_SHADER,
         "Params",
         &[
             "width",

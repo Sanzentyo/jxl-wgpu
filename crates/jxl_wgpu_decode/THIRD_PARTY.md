@@ -47,3 +47,9 @@ and GPU validation are recorded in `docs/CONFORMANCE_CORPUS.md`. The development
 uses PFM float output with explicit sRGB encoding; byte order and bottom-first row interpretation
 follow libjxl's `lib/extras/enc/pnm.cc`. Production does not invoke that decoder or parse image pixels
 on the host.
+
+The VarDCT color-output tests use the existing `jxl_gpu_formats` `cpu-reference` feature only in
+development. They feed it float RGB reconstructed by Rust `jxl` or libjxl `djxl`, then compare
+stored codes and padding against the production GPU pipeline. Display-P3 and BT.2020 cases request
+those exact output profiles from `djxl`. Common shader color/packing code is shared with
+`jxl_wgpu`, rather than duplicated in the decoder.

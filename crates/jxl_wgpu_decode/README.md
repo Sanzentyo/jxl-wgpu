@@ -166,7 +166,7 @@ before the single inverse-transform/restoration/output sequence. Every status mu
 the final image becomes authoritative. Three checked-in spectral/quantized fixtures cover ordinary
 and 256-byte windowed execution, 37-byte transport chunks, odd extents, center-first order, and two
 LF groups; both CPU oracles agree within one RGB8 code on Apple M5.
-Both forms return one final RGB8 still frame; a one-entry TOC has one pass, while sectioned TOCs
+Both forms return one final still frame in the requested color layout; a one-entry TOC has one pass, while sectioned TOCs
 retain every declared pass. The main XYB profile accepts integer source depths 1 through 16; a
 non-XYB JPEG-reconstruction profile accepts 8-bit encoded YCbCr and the codestream's component sampling
 selectors. The packet contract
@@ -196,11 +196,12 @@ must declare the standard sRGB/D65
 RGB or grayscale presentation encoding, no ICC profile or extra channel, and no crop, blend,
 reference, preview, animation, or other unsupported frame feature.
 
-All image orientations 1–8 are normalized while packing RGB8. `VarDctOutputConfig` explicitly
+All image orientations 1–8 are normalized before target chroma subsampling and packing. `VarDctOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
 Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
-in codestream coordinates. The 176-byte output uniform carries the orientation and oriented row
-width without additional image allocations or submissions. Odd 257×17 three-pass fixtures cover
+in codestream coordinates. The shared 176-byte output uniform carries geometry and orientation,
+while a 144-byte source uniform describes XYB/JPEG reconstruction. No intermediate RGB image or
+additional submission is needed. Odd 257×17 three-pass fixtures cover
 every orientation; the packer also checks both one-pixel axes and zero tail padding.
 
 Grayscale XYB uses the linear sRGB luminance projection folded into the inverse-opsin matrix before
@@ -330,10 +331,29 @@ share the final map; cleared downstream buffers and zeroed indirect
 dispatch records make a rejected packet non-authoritative rather than an unchecked render. There
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
-The only output descriptor is `vardct_rgb8_format()`: interleaved RGB8 with explicit BT.709/sRGB
-primaries, IEC sRGB transfer, full range, and no YCbCr encoding. It is accepted directly by
-`DisplayPipeline::submit_image`, which produces a GPU-resident linear-BT.709 texture without an
-intermediate CPU readback. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
+`vardct_rgb8_format()` remains a convenience descriptor. The engine accepts the shared color output
+families: all 20 color VPI pitch-linear layouts; planar/interleaved RGB/BGR/RGBA/BGRA8; Y8/Y16;
+planar or semiplanar 4:4:4/4:2:2/4:2:0 YCbCr at 8/10/12/16 bits; and packed YUYV/UYVY. Primary
+conversion supports D65 BT.709, BT.2020, and Display-P3; transfers are Linear, sRGB/SYCC, BT.709,
+and BT.2020. Output YCbCr selects BT.601/709/2020 NCL or BT.2020 constant luminance, full/limited
+range, and supported centered/cosited chroma locations. RGB requires full range, and alpha is
+opaque because extra-channel input remains unsupported.
+
+The codec source fragment reconstructs unclipped linear BT.709 from XYB, or encoded sRGB from
+JPEG components, inside the render backend's shared word-owned output shader. Chroma sampling
+therefore follows orientation and full-precision reconstruction before one final quantization.
+`VarDctOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
+byte length and four-byte storage rounding. Separate 176-byte output and 144-byte source uniforms
+cost 320 bytes in total and are checked individually against binding limits. Padded rows, unaligned
+plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
+Thirty layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
+three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`
+color output within one RGB8 code. Numeric/float RGB output, arbitrary ICC output, and explicit
+luminance mapping for PQ/HLG remain typed gaps; relative SDR is never relabeled as HDR.
+
+These color outputs are accepted directly by `DisplayPipeline::submit_image`, which produces a
+GPU-resident linear-BT.709 texture without an intermediate CPU readback; wide-gamut output requires
+the float display descriptor. `VarDctDecodeMemoryStats` accounts every upload, metadata, status,
 uniform, artifact, coefficient, XYB, optional three-plane restoration scratch, EPF sigma and
 per-pass uniforms, transform-scratch, and
 output byte. By default those bytes use

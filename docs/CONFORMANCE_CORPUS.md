@@ -416,6 +416,39 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Shared VarDCT color output
+
+The decoder and render graph use one shared GPU color/layout lowering and word-owned packing
+fragment. `vardct_engine_gpu/color_output.rs` reuses the checked-in depth/orientation fixtures below;
+no new image provenance is introduced. `generic_color_outputs_preserve_oriented_high_depth_vardct_precision`
+tests all 20 color VPI pitch-linear forms plus I444/I422/I420, NV21/NV42, P010/P012/P016,
+12-bit planar I420, and linear BGRA: 30 layout/transfer choices. The input is the 16-bit,
+two-LF-group fixture with orientation 5, producing 17×2056 pixels. Source float RGB from Rust `jxl`
+and explicit-sRGB `djxl` PFM is independently converted by the development-only scalar
+`jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
+
+Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
+cap. Exact layout metadata, shared 320-byte output/source uniform accounting, four-byte-rounded
+output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
+budget release are required. Comparisons operate on stored sample codes rather than individual
+bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
+difference is one code at 8–12 bits; at 16 bits it is one versus Rust `jxl` and three versus `djxl`.
+The regression threshold is one at 8–12 bits and four at 16 bits (less than 0.000062 normalized).
+
+`generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc` repeats I420, P016, and linear
+BGRA for rotated 12-bit gray with 4× resampling, a three-frame 16-bit gray DC chain, and the odd
+oriented 4:2:0 JPEG transcode. `generic_color_output_converts_d65_primaries_against_djxl` requests
+Display-P3/sRGB and BT.2020/BT.709 output, compares planar BGRA against `djxl` PFM explicitly
+requested as `RGB_D65_DCI_Rel_SRG` and `RGB_D65_202_Rel_709`, and observes at most one code of
+difference. Existing RGB8 dual-oracle cases continue to pass through the shared shader.
+
+The packer GPU test checks 3×1 and 1×3 in every orientation with interleaved RGB and padded planar
+RGB/RGBA. Plane starts can be unaligned and occupy a preceding plane's unused final-row tail;
+payload, opaque alpha, zero padding, and untouched output guard bytes are checked independently.
+Typed negative tests reject inconsistent extents/logical sizes, limited-range RGB, and PQ/HLG
+without an explicit luminance mapping. Numeric/float RGB output, arbitrary ICC conversion, HDR
+luminance mapping, Modular orientation, and extra-channel decoding remain separate coverage gaps.
+
 ## VarDCT integer source depths
 
 Twenty synthetic fixtures under `crates/jxl_wgpu_decode/test-data/` exercise XYB input at every

@@ -138,6 +138,16 @@ logical byte size. Odd chroma extents use checked ceil division. Centered siting
 subsampling footprint; cosited output uses the top-left luma position. Numeric representation,
 matrix, range, and siting are never inferred from an ambiguous descriptor.
 
+The render graph and VarDCT decoder share `ImageOutputParams`, `ImageOutputSource`, and
+`IMAGE_OUTPUT_SHADER`. The fixed 176-byte uniform validates target layout, source coordinates,
+color conversion, and WGSL addressing. Producers supply a `source_rgb_at` shader fragment, so
+VarDCT can fuse XYB/JPEG reconstruction directly into the same word-owned packing entry point.
+Its extra source uniform is separately budgeted; no intermediate RGB image is required. Every
+producer still owns validation of its input bindings and source-specific plane strides.
+Plane range checks end at the last row's payload, allowing a following plane inside unused row-tail
+capacity without suppressing its writes. Output words beyond the logical payload are rejected
+before byte-address multiplication, and final partial-word padding is zero.
+
 These contracts describe portable pitch-linear buffers. Vendor block-linear memory and native
 multi-plane texture handles are outside WebGPU's portable buffer model.
 

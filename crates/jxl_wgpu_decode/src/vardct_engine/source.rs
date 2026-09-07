@@ -20,7 +20,8 @@ use crate::vardct_artifact::{
 };
 use crate::vardct_frontend::VarDctColorTransform;
 use crate::vardct_output::{
-    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputPlan, VarDctOutputTransform,
+    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputMemoryPlan, VarDctOutputPlan,
+    VarDctOutputTransform,
 };
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
@@ -30,7 +31,7 @@ use crate::{GpuCodestream, GpuOutputMapping, GpuOutputRequest};
 use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
 use super::types::{
     ADAPTIVE_LF_WORKGROUP_BYTES, DeferredHfCoefficientLayout, PACKET_STATUS_BYTES,
-    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats, vardct_rgb8_format,
+    VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats,
 };
 use super::window_plan::{
     AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
@@ -141,7 +142,7 @@ pub(super) fn prepare_source(
     inventory: &jxl_gpu_bitstream::CodestreamInventory,
     options: VarDctPrepareOptions,
 ) -> Result<VarDctSource, VarDctDecodeError> {
-    if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
+    if request.mapping() != GpuOutputMapping::Color {
         return Err(VarDctDecodeError::UnsupportedOutput);
     }
     let orientation = OutputOrientation::from_exif_value(inventory.image_header.orientation)
@@ -343,12 +344,6 @@ pub(super) fn prepare_source(
             &compact,
         )?)
     };
-    let output_plan = VarDctOutputPlan::for_limits_with_variant(
-        packet.profile.output_width,
-        packet.profile.output_height,
-        &backend.device().limits(),
-        options.output_variant,
-    )?;
     let (output_transform, quant_biases) = match packet.profile.color_transform {
         VarDctColorTransform::Xyb => {
             let opsin = inventory
@@ -415,7 +410,13 @@ pub(super) fn prepare_source(
         orientation,
         transform: output_transform,
     };
-    let layout = ImageLayout::packed(output_config.output_extent(), vardct_rgb8_format())?;
+    let layout = ImageLayout::packed(output_config.output_extent(), request.format().clone())?;
+    output_config.validate_layout(&layout)?;
+    let output_plan = VarDctOutputPlan::for_limits_with_variant(
+        &layout,
+        &backend.device().limits(),
+        options.output_variant,
+    )?;
     let resident_memory = packet
         .groups
         .iter()
@@ -703,7 +704,7 @@ fn validate_device_limits(
             memory.frame_upsample_weight_bytes,
             true,
         ),
-        ("packed RGB8 output", memory.output_lease_bytes, true),
+        ("packed color output", memory.output_lease_bytes, true),
     ] {
         check_limit(resource, required, limits.max_buffer_size)?;
         if storage {
@@ -755,7 +756,14 @@ fn validate_device_limits(
                 ResidentEpfMemoryPlan::UNIFORM_BYTES
             },
         ),
-        ("output uniform", memory.output_uniform_bytes),
+        (
+            "shared output uniform",
+            VarDctOutputMemoryPlan::UNIFORM_BINDING_BYTES[0],
+        ),
+        (
+            "VarDCT source uniform",
+            VarDctOutputMemoryPlan::UNIFORM_BINDING_BYTES[1],
+        ),
         (
             "frame upsample uniform",
             if memory.frame_upsample_uniform_bytes == 0 {

@@ -1,9 +1,4 @@
-override wg_x: u32 = 256u;
-override wg_y: u32 = 1u;
-
-struct Params {
-    image: vec4<u32>,
-    dispatch: vec4<u32>,
+struct VarDctSourceParams {
     plane_geometry: array<vec4<u32>, 3>,
     matrix_r: vec4<f32>,
     matrix_g: vec4<f32>,
@@ -11,48 +6,22 @@ struct Params {
     bias_cbrt: vec4<f32>,
     scaled_bias: vec4<f32>,
     intensity_scale: f32,
+    mode: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
-@group(0) @binding(0) var<storage, read> x_plane: array<f32>;
-@group(0) @binding(1) var<storage, read> y_plane: array<f32>;
-@group(0) @binding(2) var<storage, read> b_plane: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
-@group(0) @binding(4) var<uniform> params: Params;
-
-fn signed_value(magnitude: f32, source: f32) -> f32 {
-    return select(magnitude, -magnitude, source < 0.0);
-}
-
-fn linear_to_srgb(value: f32) -> f32 {
-    let magnitude = abs(value);
-    let encoded = select(
-        1.055 * pow(magnitude, 1.0 / 2.4) - 0.055,
-        12.92 * magnitude,
-        magnitude <= 0.0031308,
-    );
-    return signed_value(encoded, value);
-}
-
-fn quantize_srgb8(value: f32) -> u32 {
-    return u32(clamp(floor(linear_to_srgb(value) * 255.0 + 0.5), 0.0, 255.0));
-}
-
-fn quantize_encoded8(value: f32) -> u32 {
-    return u32(clamp(floor(value * 255.0 + 0.5), 0.0, 255.0));
-}
+@group(0) @binding(5) var<uniform> source_params: VarDctSourceParams;
 
 fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
-    let index = y * params.plane_geometry[channel].x + x;
-    if (channel == 0u) { return x_plane[index]; }
-    if (channel == 1u) { return y_plane[index]; }
-    return b_plane[index];
+    let index = y * source_params.plane_geometry[channel].x + x;
+    if (channel == 0u) { return bitcast<f32>(source_r[index]); }
+    if (channel == 1u) { return bitcast<f32>(source_g[index]); }
+    return bitcast<f32>(source_b[index]);
 }
 
 fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
-    let geometry = params.plane_geometry[channel];
+    let geometry = source_params.plane_geometry[channel];
     let horizontal_shift = geometry.w & 1u;
     let vertical_shift = (geometry.w >> 1u) & 1u;
     var x0 = x;
@@ -90,41 +59,18 @@ fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
     return mix(top, bottom, y_weight);
 }
 
-fn rgb8_at(pixel: u32) -> vec3<u32> {
-    if (pixel >= params.image.z) {
-        return vec3<u32>(0u);
-    }
-
-    let output_y = pixel / params.dispatch.w;
-    let output_x = pixel - output_y * params.dispatch.w;
-    var column = output_x;
-    var row = output_y;
-    // Invert the orientation mapping: each invocation owns output words while
-    // the input planes, including subsampled JPEG components, remain unrotated.
-    switch (params.dispatch.z) {
-        case 2u: { column = params.image.x - 1u - output_x; }
-        case 3u: {
-            column = params.image.x - 1u - output_x;
-            row = params.image.y - 1u - output_y;
-        }
-        case 4u: { row = params.image.y - 1u - output_y; }
-        case 5u: { column = output_y; row = output_x; }
-        case 6u: { column = output_y; row = params.image.y - 1u - output_x; }
-        case 7u: {
-            column = params.image.x - 1u - output_y;
-            row = params.image.y - 1u - output_x;
-        }
-        case 8u: { column = params.image.x - 1u - output_y; row = output_x; }
-        default: {}
-    }
-    if (params.dispatch.y == 1u) {
+fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
+    let coordinate = source_coordinate(vec2<u32>(min(output_x, params.width - 1u), min(output_y, params.height - 1u)));
+    let column = coordinate.x;
+    let row = coordinate.y;
+    if source_params.mode == 1u {
         let cb = jpeg_sample(0u, column, row);
         let y = jpeg_sample(1u, column, row) + 128.0 / 255.0;
         let cr = jpeg_sample(2u, column, row);
-        return vec3<u32>(
-            quantize_encoded8(y + 1.402 * cr),
-            quantize_encoded8(y - (0.114 * 1.772 / 0.587) * cb - (0.299 * 1.402 / 0.587) * cr),
-            quantize_encoded8(y + 1.772 * cb),
+        return vec3<f32>(
+            y + 1.402 * cr,
+            y - (0.114 * 1.772 / 0.587) * cb - (0.299 * 1.402 / 0.587) * cr,
+            y + 1.772 * cb,
         );
     }
     let x = plane_value(0u, column, row);
@@ -135,54 +81,16 @@ fn rgb8_at(pixel: u32) -> vec3<u32> {
     // reconstruct biased LMS, apply the sign-preserving cube, then the
     // codestream-selected inverse opsin matrix.
     let mixed = vec3<f32>(
-        y + x - params.bias_cbrt.x,
-        y - x - params.bias_cbrt.y,
-        b - params.bias_cbrt.z,
+        y + x - source_params.bias_cbrt.x,
+        y - x - source_params.bias_cbrt.y,
+        b - source_params.bias_cbrt.z,
     );
-    let lms = mixed * mixed * (mixed * params.intensity_scale)
-        + params.scaled_bias.xyz;
+    let lms = mixed * mixed * (mixed * source_params.intensity_scale)
+        + source_params.scaled_bias.xyz;
     let linear_rgb = vec3<f32>(
-        dot(params.matrix_r.xyz, lms),
-        dot(params.matrix_g.xyz, lms),
-        dot(params.matrix_b.xyz, lms),
+        dot(source_params.matrix_r.xyz, lms),
+        dot(source_params.matrix_g.xyz, lms),
+        dot(source_params.matrix_b.xyz, lms),
     );
-    return vec3<u32>(
-        quantize_srgb8(linear_rgb.r),
-        quantize_srgb8(linear_rgb.g),
-        quantize_srgb8(linear_rgb.b),
-    );
-}
-
-fn pack_rgb8_word(word_index: u32) -> u32 {
-    let first_byte = word_index * 4u;
-    let first_pixel = first_byte / 3u;
-    let phase = first_byte - first_pixel * 3u;
-    let first = rgb8_at(first_pixel);
-    let second = rgb8_at(first_pixel + 1u);
-
-    if (phase == 0u) {
-        return first.r
-            | (first.g << 8u)
-            | (first.b << 16u)
-            | (second.r << 24u);
-    }
-    if (phase == 1u) {
-        return first.g
-            | (first.b << 8u)
-            | (second.r << 16u)
-            | (second.g << 24u);
-    }
-    return first.b
-        | (second.r << 8u)
-        | (second.g << 16u)
-        | (second.b << 24u);
-}
-
-@compute @workgroup_size(wg_x, wg_y, 1)
-fn pack_rgb8(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let word_index = gid.y * params.dispatch.x + gid.x;
-    if (word_index >= params.image.w) {
-        return;
-    }
-    output_words[word_index] = pack_rgb8_word(word_index);
+    return linear_rgb;
 }

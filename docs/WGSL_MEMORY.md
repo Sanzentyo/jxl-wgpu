@@ -86,7 +86,7 @@ name shown in parentheses.
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
 | `jxl_wgpu/extend.wgsl` | `ExtendUniform` / `Params` | image/frame dimensions, 3 strides, signed origin, `has_reference`, 2 pads | 48 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
-| `jxl_wgpu/rgb_to_image.wgsl` | `ImageOutputUniform` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad, three padded primary-matrix rows | 176 | 4 | uniform |
+| `jxl_wgpu/image_output.wgsl` | `ImageOutputParams` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad, three padded primary-matrix rows | 176 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
 | `jxl_wgpu/display_numeric.wgsl` | `DisplayNumericParams` / `NumericParams` | dimensions/type/depth/components, plane offset/stride, visualization/non-finite/transfer/clamp, reserved word, `scale, bias`, 2 pads | 64 | 4 | uniform |
 | `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer`, three padded source-linear-to-BT.709 matrix rows | 144 | 4 | uniform |
@@ -95,7 +95,7 @@ name shown in parentheses.
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, X LF stride, 3 pads, `quant_biases[4]`, then Y/B LF bases and strides | 144 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry, three source channel extents/bases, three destination stride/origin/base records, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 144 | 16 | uniform |
-| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctOutputParams` / `Params` | unrotated width/height, pixel/word counts; dispatch width, transform, Exif orientation, oriented row width; 3 component stride/extent/shift records; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, 3 pads | 176 | 16 | uniform |
+| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctSourceParams` | 3 component stride/extent/shift records; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 144 | 16 | uniform binding 5; shared 176-byte output parameters occupy binding 4 |
 | `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, three channel shift/LF-base/stride records, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 288 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
@@ -205,7 +205,7 @@ The table below states the default workgroup configuration for each entry point:
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
 | `vardct_large_encoder::quantize_blocks` | source/params RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid axes and source/artifact ranges; 1,024 bytes workgroup storage |
 | `vardct_large_encoder::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
-| `vardct_output` (decoder) | X/Y/B or Cb/Y/Cr planes RO, output RW, U | 256x1 | Tier A (`KernelVariant` 1-D) | 176-byte uniform bounds each component extent/stride and transform mode; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after inverse opsin+sRGB or encoded BT.601 conversion, fusing normative JPEG 2× component interpolation when restoration did not already produce full-resolution planes |
+| `vardct_output` (decoder) | X/Y/B or Cb/Y/Cr planes RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 176-byte output uniform plus 144-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
@@ -339,15 +339,26 @@ the pending job until final validation, and are checked against device limits an
 adaptive frame budget before allocation. Single-entry TOCs always use LF and HF-global cursor maps
 and retain conservative HF storage; image dimensions no longer imply a transform strategy.
 
-VarDCT orientation is fused into the final output packer. The 176-byte uniform's `image` at offset
-0 retains unrotated geometry; `dispatch` at offset 16 carries the dispatch width, transform mode,
-1–8 orientation, and oriented pixel row width. Component geometry remains at offset 32. Each output
-word resolves its pixels back to codestream coordinates before sampling XYB or subsampled JPEG
-planes. Orientation allocates no additional plane or uniform and adds no submission; output
-layouts and valid regions carry the transposed extent. Both one-pixel axes exercise every
-orientation and verify zero padding. Grayscale luminance is folded into the scalar inverse-matrix
-metadata, so the same shader and memory contract apply. Progressive-DC planes retain their
-unoriented three-channel shape even for grayscale presentation.
+VarDCT and the render graph share `ImageOutputParams` and the `image_output.wgsl` fragment.
+Its 176-byte uniform at binding 4 retains output/input dimensions at offsets 0/8, source strides
+at 16, target layout fields from 28, logical bytes at 104, dispatch width at 108, zero-based
+orientation at 112, source/target transfer at 116/120, and padded primary-matrix rows at 128/144/160.
+The codec source fragment adds a 144-byte, 16-byte-aligned `VarDctSourceParams` at binding 5:
+component geometry starts at 0, inverse matrix rows at 48/64/80, cube-root/scaled biases at 96/112,
+intensity scale at 128, and transform mode at 132. The two bindings are individually limit-checked;
+`output_uniform_bytes` and transient admission charge their full 320 bytes.
+
+Each output word resolves its samples back to codestream coordinates before XYB/JPEG reconstruction.
+Target chroma subsampling averages only valid oriented pixels, then packing quantizes once into
+8/10/12/16-bit codes. A source fragment supplies unclipped linear BT.709 for XYB or encoded sRGB
+for JPEG; no intermediate RGB allocation or queue submission is added. The requested `ImageLayout`
+defines output lease bytes, plane gaps, row pitches, and four-byte final storage rounding. Range
+checks stop at the last row payload instead of treating unused row-tail capacity as part of a plane,
+and dispatch padding exits before multiplying a word index into a byte index. The GPU test covers
+both one-pixel axes in all orientations with interleaved and padded RGB/RGBA planes, unaligned
+plane starts, opaque alpha, zero internal/tail padding, and unchanged guard bytes outside storage.
+Grayscale luminance stays folded into inverse-matrix metadata. Progressive-DC planes retain their
+unoriented three-channel shape even for gray presentation or a non-RGB output request.
 
 Staged HF metadata and AC traversal use the checked MCU-padded block grid for subsampled JPEG
 edges. Late host uploads of default/parametric matrices use coalesced vector ranges that exclude

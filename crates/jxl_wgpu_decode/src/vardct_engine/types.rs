@@ -48,7 +48,7 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
 pub enum VarDctDecodeError {
-    #[error("the bounded VarDCT engine only produces tightly packed sRGB D65 RGB8 output")]
+    #[error("the VarDCT engine requires a color output mapping")]
     UnsupportedOutput,
     #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]
     InvalidOrientation { orientation: u32 },
@@ -278,7 +278,7 @@ pub struct VarDctDecodeMemoryStats {
     pub epf_filter_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
-    /// Packed RGB8 storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
+    /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// All non-output GPU buffers retained through status validation.
     pub transient_bytes: u64,

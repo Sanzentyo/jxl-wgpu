@@ -30,8 +30,9 @@ mod pipeline;
 mod tests;
 mod validation;
 
+use crate::image_output::ImageOutputParams as ImageOutputUniform;
 #[cfg(test)]
-use nodes::io::prepare_image_output;
+use crate::image_output::prepare_image_output;
 use pipeline::PipelineFactory;
 #[cfg(test)]
 use validation::transient_bytes;
@@ -990,46 +991,6 @@ struct SaveUniform {
     layout: u32,
     orientation: u32,
     _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ImageOutputUniform {
-    width: u32,
-    height: u32,
-    source_width: u32,
-    source_height: u32,
-    r_stride: u32,
-    g_stride: u32,
-    b_stride: u32,
-    kind: u32,
-    channels: u32,
-    order: u32,
-    matrix: u32,
-    range: u32,
-    siting_x: u32,
-    siting_y: u32,
-    subsample_x: u32,
-    subsample_y: u32,
-    bits: u32,
-    storage_bits: u32,
-    plane0_offset: u32,
-    plane0_stride: u32,
-    plane1_offset: u32,
-    plane1_stride: u32,
-    plane2_offset: u32,
-    plane2_stride: u32,
-    plane3_offset: u32,
-    plane3_stride: u32,
-    logical_size: u32,
-    dispatch_width: u32,
-    orientation: u32,
-    source_transfer: u32,
-    target_transfer: u32,
-    _padding: u32,
-    primaries_r: [f32; 4],
-    primaries_g: [f32; 4],
-    primaries_b: [f32; 4],
 }
 
 const _: () = {

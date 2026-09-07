@@ -33,6 +33,8 @@ use jxl_wgpu_encode::{
 };
 use wgpu::util::DeviceExt;
 
+#[path = "vardct_engine_gpu/color_output.rs"]
+mod color_output;
 mod common;
 
 static DJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +152,22 @@ fn tiled_source(context: &WgpuContext, extent: Extent2d) -> BufferImageSource {
 }
 
 fn rust_jxl_rgb8(codestream: &[u8], extent: Extent2d) -> Vec<u8> {
+    rust_jxl_pixels(codestream, extent, JxlPixelFormat::rgb8(0), 1)
+}
+
+fn rust_jxl_rgb_f32(codestream: &[u8], extent: Extent2d) -> Vec<f32> {
+    rust_jxl_pixels(codestream, extent, JxlPixelFormat::rgb_f32(0), 4)
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+fn rust_jxl_pixels(
+    codestream: &[u8],
+    extent: Extent2d,
+    format: JxlPixelFormat,
+    sample_bytes: usize,
+) -> Vec<u8> {
     let mut input = codestream;
     let mut decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
     let mut decoder = loop {
@@ -162,18 +180,18 @@ fn rust_jxl_rgb8(codestream: &[u8], extent: Extent2d) -> Vec<u8> {
         decoder.basic_info().size,
         (extent.width as usize, extent.height as usize)
     );
-    decoder.set_pixel_format(JxlPixelFormat::rgb8(0));
+    decoder.set_pixel_format(format);
     let mut frame = loop {
         match decoder.process(&mut input, None).unwrap() {
             ProcessingResult::Complete { result } => break result,
             ProcessingResult::NeedsMoreInput { fallback, .. } => decoder = fallback,
         }
     };
-    let mut pixels = vec![0u8; extent.area().unwrap() * 3];
+    let mut pixels = vec![0u8; extent.area().unwrap() * 3 * sample_bytes];
     let mut buffers = [JxlOutputBuffer::new(
         &mut pixels,
         extent.height as usize,
-        extent.width as usize * 3,
+        extent.width as usize * 3 * sample_bytes,
     )];
     loop {
         match frame.process(&mut input, &mut buffers, None).unwrap() {
@@ -942,6 +960,23 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
 }
 
 fn djxl_rgb8(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
+    djxl_rgb_f32(codestream, extent).map(|samples| {
+        samples
+            .into_iter()
+            .map(|value| (value * 255.0).round().clamp(0.0, 255.0) as u8)
+            .collect()
+    })
+}
+
+fn djxl_rgb_f32(codestream: &[u8], extent: Extent2d) -> Option<Vec<f32>> {
+    djxl_rgb_f32_with_color(codestream, extent, None)
+}
+
+fn djxl_rgb_f32_with_color(
+    codestream: &[u8],
+    extent: Extent2d,
+    color: Option<&str>,
+) -> Option<Vec<f32>> {
     fn next_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> &'a [u8] {
         loop {
             while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
@@ -989,14 +1024,14 @@ fn djxl_rgb8(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let color_space = if inventory.image_header.grayscale {
-        "--color_space=Gra_D65_Rel_SRG"
+        "Gra_D65_Rel_SRG"
     } else {
-        "--color_space=RGB_D65_SRG_Rel_SRG"
+        "RGB_D65_SRG_Rel_SRG"
     };
     std::fs::write(&input, codestream).unwrap();
     let command = std::process::Command::new("djxl")
         .args([&input, &output])
-        .arg(color_space)
+        .arg(format!("--color_space={}", color.unwrap_or(color_space)))
         .output()
         .unwrap();
     assert!(
@@ -1041,7 +1076,7 @@ fn djxl_rgb8(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
     let samples = &pfm[cursor..];
     assert_eq!(samples.len(), extent.area().unwrap() * channels * 4);
     // PFM stores the bottom row first; its scale sign selects the float byte order.
-    let pixels: Vec<u8> = samples
+    let pixels: Vec<f32> = samples
         .chunks_exact(extent.width as usize * channels * 4)
         .rev()
         .flat_map(|row| row.chunks_exact(4))
@@ -1053,7 +1088,7 @@ fn djxl_rgb8(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
                 f32::from_be_bytes(bytes)
             };
             assert!(value.is_finite());
-            (value * 255.0).round().clamp(0.0, 255.0) as u8
+            value
         })
         .collect();
     Some(if channels == 1 {

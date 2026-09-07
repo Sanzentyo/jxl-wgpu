@@ -28,6 +28,7 @@ mod capability;
 mod context;
 mod display;
 mod error;
+mod image_output;
 mod memory_budget;
 mod metrics;
 mod pipeline_cache;
@@ -59,6 +60,7 @@ pub use display::{
     NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy,
 };
 pub use error::{Error, Result};
+pub use image_output::{IMAGE_OUTPUT_SHADER, ImageOutputParams, ImageOutputSource};
 pub use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaLocation, ChromaLocation2d, ChromaOrder, ChromaSubsampling,
     ColorModel, ColorRange, ColorSpace, ColorSpec, ColorSpecification, ImageLayout, Packed422Order,
