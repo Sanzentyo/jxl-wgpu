@@ -19,6 +19,10 @@ mod stream;
 
 #[cfg(test)]
 mod test_fixtures {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     pub(crate) fn cjxl_progressive_dc() -> Option<Vec<u8>> {
         if std::process::Command::new("cjxl")
             .arg("--version")
@@ -29,12 +33,13 @@ mod test_fixtures {
             return None;
         }
         let nonce = format!(
-            "{}-{}",
+            "{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            CJXL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         );
         let ppm_path = std::env::temp_dir().join(format!("jxl-wgpu-lf-chain-{nonce}.ppm"));
         let jxl_path = std::env::temp_dir().join(format!("jxl-wgpu-lf-chain-{nonce}.jxl"));
