@@ -292,7 +292,12 @@ fn parse_modular_profile(
             .into());
         }
     };
-    let channels = match (image.grayscale, image.extra_channel_count) {
+    // XYB Modular dependency frames always contain Y/X/B, including when the final image's
+    // presentation encoding is grayscale. Only non-XYB Modular stores a single gray plane.
+    let channels = match (
+        image.grayscale && !image.xyb_encoded,
+        image.extra_channel_count,
+    ) {
         (true, 0) => ModularChannels::Gray,
         (false, 0) => ModularChannels::Rgb,
         (false, 1) => ModularChannels::Rgba,

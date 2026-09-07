@@ -95,6 +95,7 @@ name shown in parentheses.
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, X LF stride, 3 pads, `quant_biases[4]`, then Y/B LF bases and strides | 144 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry, three source channel extents/bases, three destination stride/origin/base records, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 144 | 16 | uniform |
+| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctOutputParams` / `Params` | unrotated width/height, pixel/word counts; dispatch width, transform, Exif orientation, oriented row width; 3 component stride/extent/shift records; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, 3 pads | 176 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, three channel shift/LF-base/stride records, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 288 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
@@ -337,6 +338,22 @@ borders and crops right/bottom output edges before color conversion. These alloc
 the pending job until final validation, and are checked against device limits and the same
 adaptive frame budget before allocation. Single-entry TOCs always use LF and HF-global cursor maps
 and retain conservative HF storage; image dimensions no longer imply a transform strategy.
+
+VarDCT orientation is fused into the final output packer. The 176-byte uniform's `image` at offset
+0 retains unrotated geometry; `dispatch` at offset 16 carries the dispatch width, transform mode,
+1–8 orientation, and oriented pixel row width. Component geometry remains at offset 32. Each output
+word resolves its pixels back to codestream coordinates before sampling XYB or subsampled JPEG
+planes. Orientation allocates no additional plane or uniform and adds no submission; output
+layouts and valid regions carry the transposed extent. Both one-pixel axes exercise every
+orientation and verify zero padding. Grayscale luminance is folded into the scalar inverse-matrix
+metadata, so the same shader and memory contract apply. Progressive-DC planes retain their
+unoriented three-channel shape even for grayscale presentation.
+
+Staged HF metadata and AC traversal use the checked MCU-padded block grid for subsampled JPEG
+edges. Late host uploads of default/parametric matrices use coalesced vector ranges that exclude
+GPU-reconstructed raw matrices and every aliased transform. They cannot overwrite LF resources
+or the AFV basis. Raw side-image scratch can therefore be released after its mapped status without
+retaining a second matrix copy or repeating image entropy.
 
 Spectral/refinement AC uses one immutable entropy bundle and one order bundle for all passes.
 Each entropy descriptor rebases its internal configuration/tree/table offsets when appended; each

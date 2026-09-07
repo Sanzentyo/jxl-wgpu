@@ -250,6 +250,8 @@ impl HfCoefficientExecutionPlan {
                     let rect = packet
                         .profile
                         .pass_group_rect(u64::from(global_group_index))?;
+                    let [block_width, block_height] =
+                        packet.profile.padded_group_block_extent(rect)?;
                     let local_x = rect.x.checked_sub(lf_group.rect.x).ok_or(
                         HfCoefficientPlanError::ArithmeticOverflow {
                             field: "local pass-group x origin",
@@ -290,8 +292,8 @@ impl HfCoefficientExecutionPlan {
                         status_index: local_group_index,
                         block_origin_x: local_x / 8,
                         block_origin_y: local_y / 8,
-                        block_width: rect.width.div_ceil(8),
-                        block_height: rect.height.div_ceil(8),
+                        block_width,
+                        block_height,
                         blocks_per_row,
                         block_task_map_offset_words: artifact.block_task_map_offset_words,
                         num_hf_presets: entropy.num_hf_presets,

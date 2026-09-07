@@ -50,8 +50,8 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 pub enum VarDctDecodeError {
     #[error("the bounded VarDCT engine only produces tightly packed sRGB D65 RGB8 output")]
     UnsupportedOutput,
-    #[error("the bounded VarDCT engine does not implement image orientation {orientation}")]
-    UnsupportedOrientation { orientation: u32 },
+    #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]
+    InvalidOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
     UnsupportedColorEncoding,
     #[error("the VarDCT frame declares invalid EPF iteration count {iterations}")]

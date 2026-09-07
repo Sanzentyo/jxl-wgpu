@@ -95,8 +95,28 @@ fn rgb8_at(pixel: u32) -> vec3<u32> {
         return vec3<u32>(0u);
     }
 
-    let row = pixel / params.image.x;
-    let column = pixel - row * params.image.x;
+    let output_y = pixel / params.dispatch.w;
+    let output_x = pixel - output_y * params.dispatch.w;
+    var column = output_x;
+    var row = output_y;
+    // Invert the orientation mapping: each invocation owns output words while
+    // the input planes, including subsampled JPEG components, remain unrotated.
+    switch (params.dispatch.z) {
+        case 2u: { column = params.image.x - 1u - output_x; }
+        case 3u: {
+            column = params.image.x - 1u - output_x;
+            row = params.image.y - 1u - output_y;
+        }
+        case 4u: { row = params.image.y - 1u - output_y; }
+        case 5u: { column = output_y; row = output_x; }
+        case 6u: { column = output_y; row = params.image.y - 1u - output_x; }
+        case 7u: {
+            column = params.image.x - 1u - output_y;
+            row = params.image.y - 1u - output_x;
+        }
+        case 8u: { column = params.image.x - 1u - output_y; row = output_x; }
+        default: {}
+    }
     if (params.dispatch.y == 1u) {
         let cb = jpeg_sample(0u, column, row);
         let y = jpeg_sample(1u, column, row) + 128.0 / 255.0;

@@ -298,3 +298,35 @@ pub fn vardct_upsampling(name: &str) -> Vec<u8> {
         _ => panic!("unknown upsampling fixture: {name}"),
     })
 }
+
+pub fn vardct_orientation(value: u32) -> Vec<u8> {
+    decode_hex(match value {
+        1 => include_str!("../../test-data/testsrc_vardct_orientation_1.jxl.hex"),
+        2 => include_str!("../../test-data/testsrc_vardct_orientation_2.jxl.hex"),
+        3 => include_str!("../../test-data/testsrc_vardct_orientation_3.jxl.hex"),
+        4 => include_str!("../../test-data/testsrc_vardct_orientation_4.jxl.hex"),
+        5 => include_str!("../../test-data/testsrc_vardct_orientation_5.jxl.hex"),
+        6 => include_str!("../../test-data/testsrc_vardct_orientation_6.jxl.hex"),
+        7 => include_str!("../../test-data/testsrc_vardct_orientation_7.jxl.hex"),
+        8 => include_str!("../../test-data/testsrc_vardct_orientation_8.jxl.hex"),
+        _ => panic!("unknown orientation fixture: {value}"),
+    })
+}
+
+pub fn vardct_gray(name: &str) -> Vec<u8> {
+    decode_hex(match name {
+        "single" => include_str!("../../test-data/testsrc_vardct_gray_single.jxl.hex"),
+        "progressive" => include_str!("../../test-data/testsrc_vardct_gray_progressive.jxl.hex"),
+        "upsample" => include_str!("../../test-data/testsrc_vardct_gray_upsample.jxl.hex"),
+        "multilf" => include_str!("../../test-data/testsrc_vardct_gray_multilf.jxl.hex"),
+        "dc_ac" => include_str!("../../test-data/testsrc_vardct_gray_dc_ac.jxl.hex"),
+        "jpeg" => include_str!("../../test-data/testsrc_vardct_gray_jpeg.jxl.hex"),
+        _ => panic!("unknown grayscale fixture: {name}"),
+    })
+}
+
+pub fn vardct_oriented_jpeg() -> Vec<u8> {
+    decode_hex(include_str!(
+        "../../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"
+    ))
+}

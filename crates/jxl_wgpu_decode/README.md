@@ -192,8 +192,25 @@ state machine owns every LF submission, both aggregate status maps, and the init
 admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-group `cjxl` output
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
-presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
+RGB or grayscale presentation encoding, no ICC profile or extra channel, and no crop, blend,
 reference, preview, animation, or other unsupported frame feature.
+
+All image orientations 1–8 are normalized while packing RGB8. `VarDctOutputConfig` explicitly
+separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
+Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
+in codestream coordinates. The 176-byte output uniform carries the orientation and oriented row
+width without additional image allocations or submissions. Odd 257×17 three-pass fixtures cover
+every orientation; the packer also checks both one-pixel axes and zero tail padding.
+
+Grayscale XYB uses the linear sRGB luminance projection folded into the inverse-opsin matrix before
+the sRGB transfer function, producing equal RGB channels. The Modular root of a grayscale
+progressive-DC chain still reconstructs three internal XYB channels. Six grayscale fixtures cover
+a single-entry image, quantized passes, 4× frame resampling, two LF groups, recursive DC+AC, and a
+non-XYB JPEG transcode. A 173×101 oriented 4:2:0 JPEG-transcode case verifies that both HF metadata
+and AC traversal include MCU-padded edge blocks. Late host matrix uploads exclude raw matrices
+already decoded on GPU, including every transposed and AFV alias. Whole-input blocking and bounded
+fragmented-input async results match Rust `jxl` and `djxl` within one RGB8 code, with exact equality
+between upload policies and complete budget release.
 
 Ordinary frame upsampling uses the image header's standard or custom 2×/4×/8× weights. The
 profile separates encoded `width`/`height` from presented `output_width`/`output_height`; LF/HF,

@@ -21,9 +21,7 @@ use crate::progressive_dc::{
 };
 use crate::vardct_artifact::{GpuVarDctArtifactStatus, HfMetadataLoweringBuffers};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams};
-use crate::vardct_output::{
-    VarDctOutputConfig, VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch,
-};
+use crate::vardct_output::{VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch};
 use crate::vardct_packet::{
     GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
     VarDctPacketValidation,
@@ -1460,11 +1458,21 @@ impl VarDctPendingFrame {
                 .resource_layout
                 .validate_dequant_matrix_words(words)
                 .map_err(VarDctDecodeError::from)?;
-            self.backend.queue().write_buffer(
-                &lifetime._resources,
-                source.resource_layout.dequant_matrix_byte_offset(),
-                bytemuck::cast_slice(words),
-            );
+            let raw_matrices = entropy
+                .raw_dequant_matrices
+                .iter()
+                .map(|matrix| matrix.matrix_index)
+                .collect::<Vec<_>>();
+            let layout = source.resource_layout;
+            for range in layout.host_dequant_matrix_ranges(&raw_matrices) {
+                let start = (range.start - layout.matrix_offsets[0]) as usize;
+                let end = (range.end - layout.matrix_offsets[0]) as usize;
+                self.backend.queue().write_buffer(
+                    &lifetime._resources,
+                    u64::from(range.start) * 16,
+                    bytemuck::cast_slice(&words[start..end]),
+                );
+            }
         }
         let deferred = source
             .deferred_hf
@@ -3328,11 +3336,7 @@ fn submit_vardct(
                 },
             ],
             output: resident_binding(&output)?,
-            config: VarDctOutputConfig {
-                width: output_width,
-                height: output_height,
-                transform: source.output_transform,
-            },
+            config: source.output_config,
         },
     )?;
     debug_assert_eq!(output_scratch.plan, source.output_plan);

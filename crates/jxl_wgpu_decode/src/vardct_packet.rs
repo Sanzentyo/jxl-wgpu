@@ -589,8 +589,8 @@ impl BoundedVarDctPacketPlan {
                     let hf_header = parse_hf_metadata_header_reader(
                         &mut hf_reader,
                         lf_group_end,
-                        rect.width,
-                        rect.height,
+                        blocks_x,
+                        blocks_y,
                     )?;
                     let (hf_config, hf_token_bit_offset) = if hf_header.modular.use_global_tree {
                         (
@@ -878,8 +878,8 @@ impl BoundedVarDctPacketPlan {
         let prefix = parse_hf_metadata_header_reader(
             &mut prefix_reader,
             packet_end,
-            group.rect.width,
-            group.rect.height,
+            group.padded_block_extent[0],
+            group.padded_block_extent[1],
         )?;
         let (config, token_bit_offset) = if prefix.modular.use_global_tree {
             (

@@ -435,6 +435,35 @@ pub enum OutputOrientation {
 }
 
 impl OutputOrientation {
+    /// Interprets the 1–8 orientation value shared by JPEG XL and Exif.
+    pub const fn from_exif_value(value: u32) -> Option<Self> {
+        Some(match value {
+            1 => Self::Identity,
+            2 => Self::FlipHorizontal,
+            3 => Self::Rotate180,
+            4 => Self::FlipVertical,
+            5 => Self::Transpose,
+            6 => Self::Rotate90Cw,
+            7 => Self::AntiTranspose,
+            8 => Self::Rotate90Ccw,
+            _ => return None,
+        })
+    }
+
+    /// Returns the corresponding JPEG XL / Exif orientation value.
+    pub const fn to_exif_value(self) -> u32 {
+        match self {
+            Self::Identity => 1,
+            Self::FlipHorizontal => 2,
+            Self::Rotate180 => 3,
+            Self::FlipVertical => 4,
+            Self::Transpose => 5,
+            Self::Rotate90Cw => 6,
+            Self::AntiTranspose => 7,
+            Self::Rotate90Ccw => 8,
+        }
+    }
+
     pub const fn is_transposing(self) -> bool {
         matches!(
             self,

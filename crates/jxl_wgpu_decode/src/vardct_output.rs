@@ -6,7 +6,7 @@
 //! up to three zero padding bytes after the logical image payload.
 
 use bytemuck::{Pod, Zeroable};
-use jxl_gpu_protocol::XybParams;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation, XybParams};
 use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
 
@@ -78,11 +78,18 @@ impl From<&XybParams> for VarDctInverseOpsin {
 /// Host-known geometry and inverse-opsin metadata for one packed output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarDctOutputConfig {
-    /// Logical pixel width.
-    pub width: u32,
-    /// Logical pixel height.
-    pub height: u32,
+    /// Logical image extent after resampling, before orientation.
+    pub extent: Extent2d,
+    /// Maps input coordinates into the display-oriented packed output.
+    pub orientation: OutputOrientation,
     pub transform: VarDctOutputTransform,
+}
+
+impl VarDctOutputConfig {
+    /// Extent of the packed output, including transposition for orientations 5–8.
+    pub const fn output_extent(self) -> Extent2d {
+        self.orientation.map_extent(self.extent)
+    }
 }
 
 /// GPU bindings consumed by [`VarDctOutputPacker::encode`].
@@ -461,7 +468,9 @@ impl VarDctOutputPacker {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct VarDctOutputParams {
+    // Unoriented width/height, pixel count, output word count.
     image: [u32; 4],
+    // Dispatch row width, transform mode, Exif orientation, oriented pixel row width.
     dispatch: [u32; 4],
     plane_geometry: [[u32; 4]; 3],
     matrix_r: [f32; 4],
@@ -482,13 +491,13 @@ fn validate_inputs(
         validate_inverse_opsin(inverse)?;
     }
     let plan = VarDctOutputPlan::for_limits_with_variant(
-        inputs.config.width,
-        inputs.config.height,
+        inputs.config.extent.width,
+        inputs.config.extent.height,
         &device.limits(),
         variant,
     )?;
-    let pixel_count_u64 = u64::from(inputs.config.width)
-        .checked_mul(u64::from(inputs.config.height))
+    let pixel_count_u64 = u64::from(inputs.config.extent.width)
+        .checked_mul(u64::from(inputs.config.extent.height))
         .ok_or(VarDctOutputError::ArithmeticOverflow {
             field: "VarDCT output pixel count",
         })?;
@@ -500,7 +509,9 @@ fn validate_inputs(
         })?;
 
     let required_extents = match inputs.config.transform {
-        VarDctOutputTransform::Xyb(_) => [[inputs.config.width, inputs.config.height]; 3],
+        VarDctOutputTransform::Xyb(_) => {
+            [[inputs.config.extent.width, inputs.config.extent.height]; 3]
+        }
         VarDctOutputTransform::Ycbcr { channel_shifts } => {
             let mut extents = [[0; 2]; 3];
             for (channel, shift) in channel_shifts.into_iter().enumerate() {
@@ -512,8 +523,8 @@ fn validate_inputs(
                     });
                 }
                 extents[channel] = [
-                    inputs.config.width.div_ceil(1 << shift.horizontal),
-                    inputs.config.height.div_ceil(1 << shift.vertical),
+                    inputs.config.extent.width.div_ceil(1 << shift.horizontal),
+                    inputs.config.extent.height.div_ceil(1 << shift.vertical),
                 ];
             }
             extents
@@ -598,12 +609,17 @@ fn validate_inputs(
     Ok((
         VarDctOutputParams {
             image: [
-                inputs.config.width,
-                inputs.config.height,
+                inputs.config.extent.width,
+                inputs.config.extent.height,
                 pixel_count,
                 plan.output_words,
             ],
-            dispatch: [plan.dispatch_width, mode, 0, 0],
+            dispatch: [
+                plan.dispatch_width,
+                mode,
+                inputs.config.orientation.to_exif_value(),
+                inputs.config.output_extent().width,
+            ],
             plane_geometry,
             matrix_r: matrix_row(matrix[0]),
             matrix_g: matrix_row(matrix[1]),
@@ -773,6 +789,8 @@ const fn matrix_row(row: [f32; 3]) -> [f32; 4] {
 const _: () = {
     assert!(std::mem::size_of::<VarDctOutputParams>() == 176);
     assert!(std::mem::align_of::<VarDctOutputParams>() == 16);
+    assert!(std::mem::offset_of!(VarDctOutputParams, dispatch) == 16);
+    assert!(std::mem::offset_of!(VarDctOutputParams, plane_geometry) == 32);
 };
 
 #[cfg(test)]
@@ -902,7 +920,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn gpu_packer_owns_words_and_zeroes_tail_padding() {
+    fn gpu_packer_orients_one_pixel_axes_and_zeroes_tail_padding() {
         use std::num::NonZeroU64;
         use std::sync::mpsc;
 
@@ -966,73 +984,88 @@ mod tests {
                 size: NonZeroU64::new(buffer.size()).unwrap(),
             }
         }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("VarDCT RGB8 test commands"),
-        });
         let packer = VarDctOutputPacker::new(&device).unwrap();
-        let scratch = packer
-            .encode(
-                &device,
-                &mut encoder,
-                VarDctOutputInputs {
-                    planes: [
-                        VarDctOutputPlane {
-                            storage: binding(&x),
-                            width: 3,
-                            height: 1,
-                            stride: 3,
+        for extent in [Extent2d::new(3, 1), Extent2d::new(1, 3)] {
+            for value in 1..=8 {
+                let orientation = OutputOrientation::from_exif_value(value).unwrap();
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("VarDCT RGB8 test commands"),
+                });
+                let scratch = packer
+                    .encode(
+                        &device,
+                        &mut encoder,
+                        VarDctOutputInputs {
+                            planes: [
+                                VarDctOutputPlane {
+                                    storage: binding(&x),
+                                    width: extent.width,
+                                    height: extent.height,
+                                    stride: extent.width,
+                                },
+                                VarDctOutputPlane {
+                                    storage: binding(&y),
+                                    width: extent.width,
+                                    height: extent.height,
+                                    stride: extent.width,
+                                },
+                                VarDctOutputPlane {
+                                    storage: binding(&b),
+                                    width: extent.width,
+                                    height: extent.height,
+                                    stride: extent.width,
+                                },
+                            ],
+                            output: binding(&output),
+                            config: VarDctOutputConfig {
+                                extent,
+                                orientation,
+                                transform: VarDctOutputTransform::Xyb(inverse_opsin()),
+                            },
                         },
-                        VarDctOutputPlane {
-                            storage: binding(&y),
-                            width: 3,
-                            height: 1,
-                            stride: 3,
-                        },
-                        VarDctOutputPlane {
-                            storage: binding(&b),
-                            width: 3,
-                            height: 1,
-                            stride: 3,
-                        },
-                    ],
-                    output: binding(&output),
-                    config: VarDctOutputConfig {
-                        width: 3,
-                        height: 1,
-                        transform: VarDctOutputTransform::Xyb(inverse_opsin()),
-                    },
-                },
-            )
-            .expect("record fused VarDCT RGB8 output");
-        assert_eq!(scratch.plan.memory.logical_output_bytes, 9);
-        assert_eq!(scratch.plan.memory.output_storage_bytes, 12);
-        assert_eq!(scratch.uniform.size(), 176);
-        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 12);
-        let submission = queue.submit([encoder.finish()]);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .expect("poll fused VarDCT RGB8 output");
-        receiver
-            .recv()
-            .expect("VarDCT RGB8 map callback")
-            .expect("map VarDCT RGB8 output");
-        let mapped = staging
-            .slice(..)
-            .get_mapped_range()
-            .expect("mapped VarDCT RGB8 output");
-        assert_eq!(
-            &*mapped,
-            &[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0],
-            "RGB primaries exercise all three word phases and tail padding"
-        );
+                    )
+                    .expect("record fused VarDCT RGB8 output");
+                assert_eq!(scratch.plan.memory.logical_output_bytes, 9);
+                assert_eq!(scratch.plan.memory.output_storage_bytes, 12);
+                assert_eq!(scratch.uniform.size(), 176);
+                encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 12);
+                let submission = queue.submit([encoder.finish()]);
+                let (sender, receiver) = mpsc::sync_channel(1);
+                staging
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = sender.send(result);
+                    });
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: None,
+                    })
+                    .expect("poll fused VarDCT RGB8 output");
+                receiver
+                    .recv()
+                    .expect("VarDCT RGB8 map callback")
+                    .expect("map VarDCT RGB8 output");
+                let mapped = staging
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("mapped VarDCT RGB8 output");
+                // These gold sequences use the physical row/column direction of each orientation,
+                // independently of the shader's inverse-coordinate mapping.
+                let reversed = if extent.width == 3 {
+                    matches!(value, 2 | 3 | 7 | 8)
+                } else {
+                    matches!(value, 3 | 4 | 6 | 7)
+                };
+                let expected = if reversed {
+                    [0, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0]
+                } else {
+                    [255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0]
+                };
+                assert_eq!(&*mapped, &expected, "{extent:?}, orientation {value}");
+                drop(mapped);
+                staging.unmap();
+            }
+        }
     }
 }

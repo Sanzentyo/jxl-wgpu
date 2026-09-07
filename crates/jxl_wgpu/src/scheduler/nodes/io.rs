@@ -613,16 +613,7 @@ fn allocate_output_buffer(
     }
 }
 const fn orientation_code(orientation: OutputOrientation) -> u32 {
-    match orientation {
-        OutputOrientation::Identity => 0,
-        OutputOrientation::FlipHorizontal => 1,
-        OutputOrientation::Rotate180 => 2,
-        OutputOrientation::FlipVertical => 3,
-        OutputOrientation::Transpose => 4,
-        OutputOrientation::Rotate90Cw => 5,
-        OutputOrientation::AntiTranspose => 6,
-        OutputOrientation::Rotate90Ccw => 7,
-    }
+    orientation.to_exif_value() - 1
 }
 pub(in crate::scheduler) fn encode_copy_ids(
     factory: &PipelineFactory<'_>,

@@ -32,3 +32,11 @@ RGB patterns encoded by libjxl 0.12.0 (BSD-3-Clause). The per-pass HF descriptor
 coefficient accumulation follow the reference field ordering in the sources above and libjxl's
 `lib/jxl/dec_group.cc`. No CPU coefficient or pixel decoding is used in production. Exact source
 patterns, encoder commands, hashes, and adapter/oracle results are in `docs/CONFORMANCE_CORPUS.md`.
+
+`test-data/testsrc_vardct_orientation_*.jxl.hex`, `testsrc_vardct_gray_*.jxl.hex`, and
+`testsrc_vardct_jpeg_orientation_6.jxl.hex` contain synthetic RGB/gray patterns encoded with libjxl
+0.12.0. The JPEG cases first use libjpeg-turbo `cjpeg` 3.2.0 at quality 90. Minimal synthetic Exif
+orientation metadata supplies the codestream orientation; no external photograph or metadata is
+included. Exact patterns, options, hashes, and validation are in `docs/CONFORMANCE_CORPUS.md`.
+Grayscale luminance projection follows the bounded matrix composition described by libjxl's
+`lib/jxl/dec_xyb.cc` and Rust `jxl` 0.6.0's `src/render/stages/xyb.rs`.

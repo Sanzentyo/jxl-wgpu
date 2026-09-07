@@ -12,7 +12,7 @@ use jxl_gpu_bitstream::{
     ParseLimits, RestorationFilterInventory,
 };
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
     ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
@@ -185,11 +185,178 @@ fn rust_jxl_rgb8(codestream: &[u8], extent: Extent2d) -> Vec<u8> {
 }
 
 fn maximum_error(left: &[u8], right: &[u8]) -> u8 {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "oracle image byte counts must match"
+    );
     left.iter()
         .zip(right)
         .map(|(&left, &right)| left.abs_diff(right))
         .max()
         .unwrap_or(0)
+}
+
+fn assert_presentation_matches_oracles(
+    backend: &WgpuBackend,
+    name: &str,
+    encoded: &[u8],
+    extent: Extent2d,
+) -> Vec<u8> {
+    let expected = rust_jxl_rgb8(encoded, extent);
+    let djxl = djxl_ppm(encoded, extent);
+    let mut whole_output = None;
+    for cap in [u64::MAX, 256] {
+        let decoder = GpuDecoder::new(
+            WgpuDecodeEngine::new(backend.clone())
+                .unwrap()
+                .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+        );
+        let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+        let mut session = if cap == 256 {
+            open_incremental(&decoder, encoded, request)
+        } else {
+            decoder.open(encoded, request).unwrap()
+        };
+        let frame = if cap == 256 {
+            pollster::block_on(session.next_frame_async())
+                .unwrap()
+                .unwrap()
+        } else {
+            session.next_frame().unwrap().unwrap()
+        };
+        assert!(session.next_frame().unwrap().is_none());
+        assert_eq!(frame.output().outputs[0].layout.extent, extent);
+        let readback = ImageReadbackPipeline::new(backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(readback.frame.outputs[0].layout.extent, extent);
+        let actual = &readback.frame.outputs[0].bytes;
+        let error = maximum_error(actual, &expected);
+        assert!(error <= 1, "{name}, cap {cap}: Rust jxl error {error}");
+        if let Some(djxl) = &djxl {
+            let error = maximum_error(actual, djxl);
+            assert!(error <= 1, "{name}, cap {cap}: djxl error {error}");
+        }
+        if let Some(whole) = &whole_output {
+            assert_eq!(actual, whole, "{name}: bounded windows changed pixels");
+        } else {
+            whole_output = Some(actual.clone());
+        }
+        eprintln!("{name}, cap {cap}: max error {error}");
+        drop(readback);
+        drop(frame);
+        drop(session);
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+    whole_output.unwrap()
+}
+
+#[test]
+fn all_eight_orientations_normalize_multigroup_progressive_output_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    eprintln!("orientation adapter: {info:?}");
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    for value in 1..=8 {
+        let encoded = common::vardct_orientation(value);
+        let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        assert_eq!(inventory.image_header.orientation, value);
+        let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+        assert_eq!((packet.profile.width, packet.profile.height), (257, 17));
+        assert_eq!(packet.profile.group_count, 2);
+        assert_eq!(packet.profile.coefficient_shifts, [0, 0, 0]);
+        let orientation = OutputOrientation::from_exif_value(value).unwrap();
+        let extent = orientation.map_extent(Extent2d::new(257, 17));
+        assert_presentation_matches_oracles(
+            &backend,
+            &format!("orientation {value}"),
+            &encoded,
+            extent,
+        );
+    }
+}
+
+#[test]
+fn grayscale_presentation_combines_orientation_resampling_and_progressive_dc_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    eprintln!("grayscale adapter: {info:?}");
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    for (name, coded_extent, orientation, upsampling, frame_count) in [
+        ("single", Extent2d::new(17, 9), 3, 1, 1),
+        ("progressive", Extent2d::new(257, 129), 1, 1, 1),
+        ("upsample", Extent2d::new(515, 259), 8, 4, 1),
+        ("multilf", Extent2d::new(2056, 17), 5, 1, 1),
+        ("dc_ac", Extent2d::new(1024, 128), 6, 1, 3),
+        ("jpeg", Extent2d::new(173, 101), 8, 1, 1),
+    ] {
+        let encoded = common::vardct_gray(name);
+        let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        assert!(inventory.image_header.grayscale);
+        assert_eq!(inventory.image_header.xyb_encoded, name != "jpeg");
+        assert_eq!(inventory.image_header.orientation, orientation);
+        assert_eq!(inventory.frames.len(), frame_count);
+        assert_eq!(inventory.frames.last().unwrap().upsampling, upsampling);
+        if frame_count == 1 {
+            let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+            if name == "multilf" {
+                assert_eq!(packet.profile.low_frequency_group_count, 2);
+            }
+            if name == "progressive" {
+                assert_eq!(packet.profile.coefficient_shifts, [1, 0]);
+            }
+        }
+        let extent = OutputOrientation::from_exif_value(orientation)
+            .unwrap()
+            .map_extent(coded_extent);
+        let pixels = assert_presentation_matches_oracles(&backend, name, &encoded, extent);
+        assert!(
+            pixels
+                .chunks_exact(3)
+                .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2]),
+            "{name}: grayscale must have no chromatic residuals"
+        );
+    }
+}
+
+#[test]
+fn jpeg_subsampling_is_expanded_in_codestream_coordinates_before_orientation() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let encoded = common::vardct_oriented_jpeg();
+    let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+        .unwrap()
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    assert!(!inventory.image_header.xyb_encoded);
+    assert_eq!(inventory.image_header.orientation, 6);
+    let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+    let shifts = packet.profile.channel_shifts;
+    assert_eq!((shifts[0].horizontal, shifts[0].vertical), (1, 1));
+    assert_eq!(shifts[1], Default::default());
+    assert_eq!(shifts[0], shifts[2]);
+    assert_presentation_matches_oracles(
+        &backend,
+        "oriented JPEG 420",
+        &encoded,
+        Extent2d::new(101, 173),
+    );
 }
 
 #[test]
@@ -750,7 +917,11 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
     let mut cursor = 0;
-    assert_eq!(next_token(&ppm, &mut cursor), b"P6");
+    let channels = match next_token(&ppm, &mut cursor) {
+        b"P5" => 1,
+        b"P6" => 3,
+        magic => panic!("djxl emitted unsupported PNM magic {magic:?}"),
+    };
     assert_eq!(
         std::str::from_utf8(next_token(&ppm, &mut cursor))
             .unwrap()
@@ -776,7 +947,7 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
         cursor += 1;
     }
     let pixels = &ppm[cursor..];
-    Some(match maximum {
+    let pixels: Vec<u8> = match maximum {
         255 => pixels.to_vec(),
         65_535 => pixels
             .chunks_exact(2)
@@ -786,6 +957,12 @@ fn djxl_ppm(codestream: &[u8], extent: Extent2d) -> Option<Vec<u8>> {
             })
             .collect(),
         _ => panic!("djxl PPM uses unsupported maximum {maximum}"),
+    };
+    assert_eq!(pixels.len(), extent.area().unwrap() * channels);
+    Some(if channels == 1 {
+        pixels.into_iter().flat_map(|value| [value; 3]).collect()
+    } else {
+        pixels
     })
 }
 

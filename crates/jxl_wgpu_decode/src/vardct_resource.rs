@@ -226,9 +226,32 @@ impl VarDctResourceLayout {
         Ok(())
     }
 
-    #[must_use]
-    pub(crate) const fn dequant_matrix_byte_offset(self) -> u64 {
-        self.matrix_offsets[0] as u64 * 16
+    /// Coalesced absolute vector ranges that may be initialized from host scalar metadata.
+    /// Raw matrices already reconstructed into the resource buffer on GPU must survive later
+    /// HF-global parser continuations, including every transposed/AFV strategy alias.
+    pub(crate) fn host_dequant_matrix_ranges(
+        self,
+        raw_matrix_indices: &[usize],
+    ) -> Vec<std::ops::Range<u32>> {
+        let mut ranges = Vec::new();
+        let mut start = self.matrix_offsets[0];
+        for (index, transform) in TransformKind::ALL.into_iter().enumerate() {
+            if raw_matrix_indices.contains(&hf_matrix_param_index(transform)) {
+                let end = self.matrix_offsets[index];
+                if start < end {
+                    ranges.push(start..end);
+                }
+                start = self
+                    .matrix_offsets
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(self.afv_basis_offset);
+            }
+        }
+        if start < self.afv_basis_offset {
+            ranges.push(start..self.afv_basis_offset);
+        }
+        ranges
     }
 }
 
@@ -612,6 +635,54 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_host_matrix_uploads_preserve_raw_matrices_and_all_strategy_aliases() {
+        let layout = VarDctResourceLayout::new(4, 2, 1).unwrap();
+        let ranges = layout.host_dequant_matrix_ranges(&[0, 6, 10]);
+        assert!(ranges.windows(2).all(|pair| pair[0].end < pair[1].start));
+        let mut uploaded = vec![false; layout.vector_count as usize];
+        for range in ranges {
+            uploaded[range.start as usize..range.end as usize].fill(true);
+        }
+        let raw_transforms = [
+            TransformKind::Dct8,
+            TransformKind::Dct8x16,
+            TransformKind::Dct16x8,
+            TransformKind::Afv0,
+            TransformKind::Afv1,
+            TransformKind::Afv2,
+            TransformKind::Afv3,
+        ];
+        for (index, transform) in TransformKind::ALL.into_iter().enumerate() {
+            let start = layout.matrix_offsets[index] as usize;
+            let end = start + transform.pixel_extent().area().unwrap();
+            let expected = !raw_transforms.contains(&transform);
+            assert!(
+                uploaded[start..end].iter().all(|&value| value == expected),
+                "{transform:?}"
+            );
+        }
+        assert!(
+            uploaded[..layout.matrix_offsets[0] as usize]
+                .iter()
+                .all(|&value| !value)
+        );
+        assert!(
+            uploaded[layout.afv_basis_offset as usize..]
+                .iter()
+                .all(|&value| !value)
+        );
+        assert_eq!(
+            layout.host_dequant_matrix_ranges(&[]),
+            vec![layout.matrix_offsets[0]..layout.afv_basis_offset],
+        );
+        assert!(
+            layout
+                .host_dequant_matrix_ranges(&(0..17).collect::<Vec<_>>())
+                .is_empty()
+        );
+    }
 
     #[test]
     fn layout_and_shader_are_bounded() {

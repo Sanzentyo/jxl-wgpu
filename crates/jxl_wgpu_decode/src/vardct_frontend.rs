@@ -63,7 +63,6 @@ pub enum UnsupportedVarDctFeature {
     ImageDimensions,
     FloatingPointSamples,
     NonXybImage,
-    GrayscaleImage,
     EmbeddedIcc,
     ExtraChannels,
     Preview,
@@ -610,12 +609,10 @@ pub(crate) fn parse_lf_group_header_reader(
 pub(crate) fn parse_hf_metadata_header_reader(
     reader: &mut impl BitInput,
     packet_end: u64,
-    lf_width: u32,
-    lf_height: u32,
+    block_width: u32,
+    block_height: u32,
 ) -> Result<HfMetadataHeaderPrefix, VarDctPacketError> {
     let mut reader = BoundedBitInput::new(reader, packet_end);
-    let block_width = lf_width.div_ceil(8);
-    let block_height = lf_height.div_ceil(8);
     let block_area = block_width
         .checked_mul(block_height)
         .ok_or(VarDctPacketError::GeometryOverflow)?;
@@ -938,7 +935,7 @@ pub struct StandardVarDctProfile {
     /// Encoded color-sample extent before frame upsampling.
     pub width: u32,
     pub height: u32,
-    /// Presented extent at this progressive-DC level, after frame upsampling.
+    /// Logical extent at this progressive-DC level, after frame upsampling, before orientation.
     pub output_width: u32,
     pub output_height: u32,
     pub upsampling: u32,
@@ -1277,13 +1274,10 @@ fn validate_image(inventory: &CodestreamInventory) -> Result<(), VarDctFrontendE
     {
         return unsupported(UnsupportedVarDctFeature::ImageDimensions);
     }
-    if image.grayscale {
-        return unsupported(UnsupportedVarDctFeature::GrayscaleImage);
-    }
     if !matches!(
         image.colour_encoding,
         ColourEncodingInventory::Enumerated {
-            colour_space: ColourSpaceInventory::Rgb,
+            colour_space: ColourSpaceInventory::Rgb | ColourSpaceInventory::Grey,
             ..
         }
     ) {

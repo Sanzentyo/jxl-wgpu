@@ -5,7 +5,7 @@ use jxl_gpu_bitstream::{
     WhitePointInventory,
 };
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{
     KernelVariant, ResidentChromaUpsampleMemoryPlan, ResidentEpfMemoryPlan,
     ResidentGaborishWeights, ResidentUpsampleKernel, ResidentUpsamplePipeline,
@@ -19,7 +19,9 @@ use crate::vardct_artifact::{
     VarDctArtifactLayout,
 };
 use crate::vardct_frontend::VarDctColorTransform;
-use crate::vardct_output::{VarDctInverseOpsin, VarDctOutputPlan, VarDctOutputTransform};
+use crate::vardct_output::{
+    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputPlan, VarDctOutputTransform,
+};
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
@@ -50,7 +52,7 @@ pub(super) struct VarDctSource {
     pub(super) frame_upsample: Option<ResidentUpsampleKernel>,
     pub(super) output_plan: VarDctOutputPlan,
     pub(super) layout: ImageLayout,
-    pub(super) output_transform: VarDctOutputTransform,
+    pub(super) output_config: VarDctOutputConfig,
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
@@ -142,15 +144,14 @@ pub(super) fn prepare_source(
     if request.mapping() != GpuOutputMapping::Color || request.format() != &vardct_rgb8_format() {
         return Err(VarDctDecodeError::UnsupportedOutput);
     }
-    if inventory.image_header.orientation != 1 {
-        return Err(VarDctDecodeError::UnsupportedOrientation {
+    let orientation = OutputOrientation::from_exif_value(inventory.image_header.orientation)
+        .ok_or(VarDctDecodeError::InvalidOrientation {
             orientation: inventory.image_header.orientation,
-        });
-    }
+        })?;
     if !matches!(
         inventory.image_header.colour_encoding,
         ColourEncodingInventory::Enumerated {
-            colour_space: ColourSpaceInventory::Rgb,
+            colour_space: ColourSpaceInventory::Rgb | ColourSpaceInventory::Grey,
             white_point: WhitePointInventory::D65,
             primaries: PrimariesInventory::Srgb,
             transfer_function: TransferFunctionInventory::Srgb,
@@ -348,22 +349,34 @@ pub(super) fn prepare_source(
         &backend.device().limits(),
         options.output_variant,
     )?;
-    let layout = ImageLayout::packed(
-        Extent2d::new(packet.profile.output_width, packet.profile.output_height),
-        vardct_rgb8_format(),
-    )?;
     let (output_transform, quant_biases) = match packet.profile.color_transform {
         VarDctColorTransform::Xyb => {
             let opsin = inventory
                 .image_header
                 .opsin_inverse_matrix
                 .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
+            let matrix = opsin
+                .inverse_matrix
+                .map(|row| row.map(|value| value.to_f32()));
+            // Gray is reconstructed from linear sRGB luminance before applying the transfer
+            // function. Folding that projection into the inverse matrix makes all output
+            // channels identical, including when quantization leaves chromatic XYB residuals.
+            let inverse_opsin_matrix = if inventory.image_header.grayscale {
+                let luma = std::array::from_fn(|column| {
+                    [0.2126_f64, 0.7152, 0.0722]
+                        .into_iter()
+                        .zip(matrix)
+                        .map(|(weight, row)| weight * f64::from(row[column]))
+                        .sum::<f64>() as f32
+                });
+                [luma; 3]
+            } else {
+                matrix
+            };
             (
                 VarDctOutputTransform::Xyb(VarDctInverseOpsin {
                     opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
-                    inverse_opsin_matrix: opsin
-                        .inverse_matrix
-                        .map(|row| row.map(|value| value.to_f32())),
+                    inverse_opsin_matrix,
                     intensity_target: inventory
                         .image_header
                         .tone_mapping
@@ -397,6 +410,12 @@ pub(super) fn prepare_source(
             ],
         ),
     };
+    let output_config = VarDctOutputConfig {
+        extent: Extent2d::new(packet.profile.output_width, packet.profile.output_height),
+        orientation,
+        transform: output_transform,
+    };
+    let layout = ImageLayout::packed(output_config.output_extent(), vardct_rgb8_format())?;
     let resident_memory = packet
         .groups
         .iter()
@@ -517,7 +536,7 @@ pub(super) fn prepare_source(
         frame_upsample,
         output_plan,
         layout,
-        output_transform,
+        output_config,
         quant_biases,
         frame_name,
         memory,

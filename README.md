@@ -87,6 +87,13 @@ across every pass. Checked-in three-pass spectral, two-pass refinement, and recu
 streams match Rust `jxl` and `djxl` within one RGB8 code on Apple M5, including bounded uploads and
 fragmented input. Intermediate pass presentation is still pending.
 
+VarDCT grayscale and RGB images now normalize all eight image orientations in the final GPU output
+pass. Grayscale XYB reconstructs linear luminance before the sRGB transfer function, including
+resampled and recursive progressive-DC images. Oriented grayscale and 4:2:0 JPEG-transcode fixtures
+also verify padded edge blocks and preservation of GPU-decoded raw quantization matrices across
+HF-global metadata continuations. These paths return packed RGB8 and match both reference decoders
+within one code value under whole and bounded asynchronous input.
+
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.
 Decoder output buffers carry cloneable memory leases, so dropping a session cannot free its budget
