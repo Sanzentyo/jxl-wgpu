@@ -174,7 +174,7 @@ fn write_numeric_sample(x: u32, y: u32, sample: u32) {
     for (var component = 0u; component < params.output.w; component += 1u) {
         let offset = pixel_offset + component * bytes_per_component;
         if params.format.w == 4u {
-            write_word(offset, bitcast<u32>(f32(sample) / f32(params.source_masks.x)));
+            write_word(offset, bitcast<u32>(f32(bitcast<i32>(sample)) / f32(params.source_masks.x)));
             continue;
         }
         if params.output.x == 0u {
@@ -370,7 +370,13 @@ fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
         write_packed_422(x, y, source_sample(0u, source_x, source_y));
         return;
     }
-    let sample = source_sample(0u, source_x, source_y);
+    var sample = 0u;
+    if params.format.w == 4u {
+        // Scalar normalization preserves signed working samples outside the nominal range.
+        sample = arena[params.source_offsets.x + source_y * params.source_strides.x + source_x];
+    } else {
+        sample = source_sample(0u, source_x, source_y);
+    }
     write_gray_pixel(x, y, sample);
     write_chroma(x, y);
 }

@@ -39,6 +39,7 @@ use crate::{
     GpuSubmissionSession, Result as DecodeResult, SubmittedGpuFrame,
 };
 
+use super::output::VarDctFrameOutput;
 use super::pipeline::VarDctPipelines;
 use super::restoration::RestorationCursor;
 use super::source::{VarDctSource, check_limit};
@@ -50,7 +51,7 @@ use super::window_plan::{
 };
 
 /// One-frame submission state for [`crate::VarDctSubmissionEngine`].
-pub struct ColorDecodeSession {
+pub struct FrameDecodeSession {
     pub(super) backend: WgpuBackend,
     pub(super) pipelines: Arc<VarDctPipelines>,
     pub(super) memory_stats: VarDctDecodeMemoryStats,
@@ -65,7 +66,7 @@ pub(super) struct VarDctRuntimeStats {
     pub(super) hf_packet_stream_batch_count: AtomicUsize,
 }
 
-impl ColorDecodeSession {
+impl FrameDecodeSession {
     #[must_use]
     pub const fn memory_stats(&self) -> VarDctDecodeMemoryStats {
         self.memory_stats
@@ -100,19 +101,19 @@ impl ColorDecodeSession {
     }
 }
 
-impl std::fmt::Debug for ColorDecodeSession {
+impl std::fmt::Debug for FrameDecodeSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ColorDecodeSession")
+            .debug_struct("FrameDecodeSession")
             .field("submitted", &self.source.is_none())
             .field("memory_stats", &self.memory_stats())
             .finish_non_exhaustive()
     }
 }
 
-impl GpuSubmissionSession for ColorDecodeSession {
+impl GpuSubmissionSession for FrameDecodeSession {
     type Frame = GpuImageFrame;
-    type Pending = ColorPendingFrame;
+    type Pending = FramePendingFrame;
 
     fn submit_next(&mut self) -> DecodeResult<Option<Self::Pending>> {
         let Some(source) = self.source.as_ref() else {
@@ -505,6 +506,7 @@ struct VarDctGroupJobBuffers {
     artifact_uniform: wgpu::Buffer,
 }
 
+#[derive(Default)]
 struct PostTransformJobBuffers {
     _restoration_planes: Option<[wgpu::Buffer; 3]>,
     _pre_restoration_planes: Option<[wgpu::Buffer; 3]>,
@@ -516,6 +518,38 @@ struct PostTransformJobBuffers {
     _frame_upsample_planes: Option<[wgpu::Buffer; 3]>,
     _frame_upsample_weights: Option<ResidentUpsampleWeights>,
     _frame_upsample_uniforms: Vec<wgpu::Buffer>,
+}
+
+enum FrameOutputScratch {
+    Color {
+        _scratch: VarDctOutputScratch,
+    },
+    Extra {
+        scratch: crate::modular_scalar_output::ModularScalarOutputScratch,
+    },
+}
+
+impl FrameOutputScratch {
+    fn status_bytes(&self) -> u64 {
+        match self {
+            Self::Color { .. } => 0,
+            Self::Extra { .. } => {
+                crate::modular_scalar_output::ModularScalarOutputPlan::STATUS_BYTES
+            }
+        }
+    }
+
+    fn copy_status(&self, encoder: &mut wgpu::CommandEncoder, staging: &wgpu::Buffer) {
+        if let Self::Extra { scratch } = self {
+            encoder.copy_buffer_to_buffer(
+                &scratch.status,
+                0,
+                staging,
+                staging.size() - self.status_bytes(),
+                self.status_bytes(),
+            );
+        }
+    }
 }
 
 struct VarDctJobLifetime {
@@ -533,12 +567,12 @@ struct VarDctJobLifetime {
     _adaptive_lf_uniform: Option<wgpu::Buffer>,
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
-    _alpha: Option<super::staging::ResidentModularAlpha>,
+    _extra_plane: Option<super::staging::ResidentModularPlane>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
-    _resident_planes: [wgpu::Buffer; 3],
+    _resident_planes: Option<[wgpu::Buffer; 3]>,
     _post_transform: PostTransformJobBuffers,
     _resident_scratch: Vec<ResidentVarDctScratch>,
-    _output_scratch: VarDctOutputScratch,
+    _output_scratch: FrameOutputScratch,
 }
 
 impl Drop for VarDctJobLifetime {
@@ -562,7 +596,7 @@ struct VarDctGroupValidation {
 }
 
 /// Submitted VarDCT frame awaiting one aggregate map of every LF/pass-group status record.
-pub struct ColorPendingFrame {
+pub struct FramePendingFrame {
     pub(super) backend: WgpuBackend,
     pub(super) pipelines: Arc<VarDctPipelines>,
     pub(super) memory: MemoryBudget,
@@ -602,10 +636,10 @@ enum VarDctPendingStage {
     },
 }
 
-impl std::fmt::Debug for ColorPendingFrame {
+impl std::fmt::Debug for FramePendingFrame {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ColorPendingFrame")
+            .debug_struct("FramePendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
             .field("lf_group_count", &self.expected_groups.len())
@@ -622,7 +656,7 @@ impl std::fmt::Debug for ColorPendingFrame {
     }
 }
 
-impl ColorPendingFrame {
+impl FramePendingFrame {
     #[must_use]
     pub(crate) fn dependency_submission_ready(&self) -> bool {
         matches!(self.stage, VarDctPendingStage::Final { .. })
@@ -644,7 +678,10 @@ impl ColorPendingFrame {
             .as_ref()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
         ProgressiveDcXybPlanes::from_buffers(
-            lifetime._resident_planes.clone(),
+            lifetime
+                ._resident_planes
+                .clone()
+                .ok_or(VarDctDecodeError::UnvalidatedOutputNotSubmitted)?,
             self.progressive_dc_extent.width,
             self.progressive_dc_extent.height,
             self.progressive_dc_stride,
@@ -1697,7 +1734,9 @@ impl ColorPendingFrame {
                         field: "deferred HF status end",
                     })?;
         }
-        if status_offset != source.memory.validation_staging_bytes {
+        if status_offset + lifetime._output_scratch.status_bytes()
+            != source.memory.validation_staging_bytes
+        {
             return Err(VarDctDecodeError::EngineContract {
                 detail: "deferred HF status aggregation disagrees with admitted staging",
             }
@@ -1918,11 +1957,13 @@ impl ColorPendingFrame {
                 }
             }
         }
-        let hf_status_bytes = mapped
-            .get(hf_offset..)
-            .ok_or(VarDctDecodeError::StatusAbi {
-                status: "HF coefficient",
-            })?;
+        let hf_end = mapped.len() - lifetime._output_scratch.status_bytes() as usize;
+        let hf_status_bytes =
+            mapped
+                .get(hf_offset..hf_end)
+                .ok_or(VarDctDecodeError::StatusAbi {
+                    status: "HF coefficient",
+                })?;
         let hf_statuses = bytemuck::try_cast_slice::<u8, GpuHfCoefficientStatus>(hf_status_bytes)
             .map_err(|_| VarDctDecodeError::StatusAbi {
             status: "HF coefficient",
@@ -1939,6 +1980,12 @@ impl ColorPendingFrame {
             .zip(hf_statuses.iter().copied())
         {
             status.validate(group).map_err(VarDctDecodeError::from)?;
+        }
+        if matches!(lifetime._output_scratch, FrameOutputScratch::Extra { .. }) {
+            crate::modular_scalar_output::ModularScalarOutputScratch::validate_status(
+                &mapped[hf_end..],
+            )
+            .map_err(VarDctDecodeError::from)?;
         }
         drop(mapped);
         let output_id = OutputId(0);
@@ -1976,7 +2023,7 @@ impl ColorPendingFrame {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl GpuPendingFrame for ColorPendingFrame {
+impl GpuPendingFrame for FramePendingFrame {
     type Frame = GpuImageFrame;
 
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
@@ -2043,7 +2090,7 @@ impl GpuPendingFrame for ColorPendingFrame {
 }
 
 #[cfg(target_arch = "wasm32")]
-impl GpuPendingFrame for ColorPendingFrame {
+impl GpuPendingFrame for FramePendingFrame {
     type Frame = GpuImageFrame;
 
     fn poll_complete(
@@ -2204,7 +2251,7 @@ fn submit_vardct(
     mut source: VarDctSource,
     permits: VarDctMemoryPermits,
     poll_permit: SubmissionPollPermit,
-) -> Result<ColorPendingFrame, VarDctDecodeError> {
+) -> Result<FramePendingFrame, VarDctDecodeError> {
     let device = backend.device();
     let codestream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT codestream"),
@@ -2428,12 +2475,14 @@ fn submit_vardct(
         "jxl-wgpu VarDCT Y plane",
         "jxl-wgpu VarDCT B plane",
     ];
-    let resident_planes = std::array::from_fn(|channel| {
-        storage(
-            image_labels[channel],
-            source.memory.resident_plane_bytes[channel],
-            wgpu::BufferUsages::COPY_DST,
-        )
+    let resident_planes = source.output.is_color().then(|| {
+        std::array::from_fn(|channel| {
+            storage(
+                image_labels[channel],
+                source.memory.resident_plane_bytes[channel],
+                wgpu::BufferUsages::COPY_DST,
+            )
+        })
     });
     let pre_restoration_planes = (source.memory.pre_restoration_upsample_bytes != 0).then(|| {
         let labels = [
@@ -2457,7 +2506,7 @@ fn submit_vardct(
                     wgpu::BufferUsages::empty(),
                 )
             } else {
-                resident_planes[channel].clone()
+                resident_planes.as_ref().expect("color planes")[channel].clone()
             }
         })
     });
@@ -2502,7 +2551,7 @@ fn submit_vardct(
         output_usage |= wgpu::BufferUsages::MAP_READ;
     }
     let output = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("jxl-wgpu VarDCT packed RGB8 output"),
+        label: Some("jxl-wgpu VarDCT packed output"),
         size: source.memory.output_lease_bytes,
         usage: output_usage,
         mapped_at_creation: false,
@@ -2520,14 +2569,12 @@ fn submit_vardct(
     if let Some(lf_temporary) = &lf_temporary {
         packet_commands.clear_buffer(lf_temporary, 0, None);
     }
-    for buffer in [
-        &resident_planes[0],
-        &resident_planes[1],
-        &resident_planes[2],
-        output.as_ref(),
-    ] {
-        packet_commands.clear_buffer(buffer, 0, None);
+    if let Some(planes) = &resident_planes {
+        for buffer in planes {
+            packet_commands.clear_buffer(buffer, 0, None);
+        }
     }
+    packet_commands.clear_buffer(output.as_ref(), 0, None);
     for group in &group_buffers {
         for buffer in [
             &group.reconstructed,
@@ -3075,266 +3122,314 @@ fn submit_vardct(
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
             field: "padded output width",
         })?;
-    let padded_height = blocks_y
-        .checked_mul(8)
-        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-            field: "padded output height",
-        })?;
-    let correlation_width = source.packet.profile.width.div_ceil(64);
-    let correlation_height = source.packet.profile.height.div_ceil(64);
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
-    for ((packet_group, group), buffers) in source
-        .packet
-        .groups
-        .iter()
-        .zip(&source.groups)
-        .zip(&group_buffers)
-    {
-        resident_scratch.push(pipelines.renderer.encode(
-            device,
-            &mut commands,
-            ResidentVarDctInputs {
-                coefficients: resident_binding(&buffers.coefficients)?,
-                artifact: resident_binding(&buffers.artifact)?,
-                resources: resident_binding(&resources)?,
-                outputs: resident_shifted_image_planes(
-                    &resident_planes,
-                    padded_width,
-                    padded_height,
-                    source.packet.profile.channel_shifts,
-                )?,
-                indirect: &buffers.artifact,
-                indirect_base_offset: u64::from(group.artifact_layout.indirect_offset_words) * 4,
-                config: ResidentVarDctRenderConfig {
-                    task_capacity: packet_group.task_capacity,
-                    scratch_scalars: packet_group.coefficient_words(),
-                    task_word_offset: group.artifact_layout.tasks_offset_words,
-                    bucket_word_offset: group.artifact_layout.buckets_offset_words,
-                    quant_offset: group.quant_offset,
-                    correlation_offset: source.resource_layout.correlation_offset,
-                    lf_offsets: source.resource_layout.lf_offsets,
-                    lf_strides: source.resource_layout.lf_strides,
-                    correlation_width,
-                    correlation_height,
-                    quant_biases: source.quant_biases,
-                },
-            },
-        )?);
-    }
-    let image_width = source.packet.profile.width;
-    let image_height = source.packet.profile.height;
-    let mut pre_restoration_uniforms = Vec::new();
-    if let Some(upsampled) = &pre_restoration_planes {
-        for channel in 0..3 {
-            let shift = source.packet.profile.channel_shifts[channel];
-            if !shift.is_subsampled() {
-                continue;
+    let (output_scratch, post_transform_buffers) = match source.output {
+        VarDctFrameOutput::Color { config, plan } => {
+            let resident_planes =
+                resident_planes
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "color output lacks its resident planes",
+                    })?;
+            let padded_height =
+                blocks_y
+                    .checked_mul(8)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "padded output height",
+                    })?;
+            let correlation_width = source.packet.profile.width.div_ceil(64);
+            let correlation_height = source.packet.profile.height.div_ceil(64);
+
+            for ((packet_group, group), buffers) in source
+                .packet
+                .groups
+                .iter()
+                .zip(&source.groups)
+                .zip(&group_buffers)
+            {
+                resident_scratch.push(pipelines.renderer.encode(
+                    device,
+                    &mut commands,
+                    ResidentVarDctInputs {
+                        coefficients: resident_binding(&buffers.coefficients)?,
+                        artifact: resident_binding(&buffers.artifact)?,
+                        resources: resident_binding(&resources)?,
+                        outputs: resident_shifted_image_planes(
+                            resident_planes,
+                            padded_width,
+                            padded_height,
+                            source.packet.profile.channel_shifts,
+                        )?,
+                        indirect: &buffers.artifact,
+                        indirect_base_offset: u64::from(
+                            group.artifact_layout.indirect_offset_words,
+                        ) * 4,
+                        config: ResidentVarDctRenderConfig {
+                            task_capacity: packet_group.task_capacity,
+                            scratch_scalars: packet_group.coefficient_words(),
+                            task_word_offset: group.artifact_layout.tasks_offset_words,
+                            bucket_word_offset: group.artifact_layout.buckets_offset_words,
+                            quant_offset: group.quant_offset,
+                            correlation_offset: source.resource_layout.correlation_offset,
+                            lf_offsets: source.resource_layout.lf_offsets,
+                            lf_strides: source.resource_layout.lf_strides,
+                            correlation_width,
+                            correlation_height,
+                            quant_biases: source.quant_biases,
+                        },
+                    },
+                )?);
             }
-            let [input_width, input_height] = shift
-                .shifted_extent(image_width, image_height)
-                .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "pre-restoration input extent",
-                })?;
-            pre_restoration_uniforms.push(pipelines.chroma_upsample.encode(
+            let image_width = source.packet.profile.width;
+            let image_height = source.packet.profile.height;
+            let mut pre_restoration_uniforms = Vec::new();
+            if let Some(upsampled) = &pre_restoration_planes {
+                for channel in 0..3 {
+                    let shift = source.packet.profile.channel_shifts[channel];
+                    if !shift.is_subsampled() {
+                        continue;
+                    }
+                    let [input_width, input_height] = shift
+                        .shifted_extent(image_width, image_height)
+                        .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                            field: "pre-restoration input extent",
+                        })?;
+                    pre_restoration_uniforms.push(pipelines.chroma_upsample.encode(
+                        device,
+                        &mut commands,
+                        ResidentChromaUpsampleInputs {
+                            input: ResidentF32Plane {
+                                storage: resident_binding(&resident_planes[channel])?,
+                                width: input_width,
+                                height: input_height,
+                                stride: padded_width >> shift.horizontal,
+                            },
+                            output: ResidentF32Plane {
+                                storage: resident_binding(&upsampled[channel])?,
+                                width: image_width,
+                                height: image_height,
+                                stride: padded_width,
+                            },
+                            shift: ResidentChromaShift {
+                                horizontal: shift.horizontal != 0,
+                                vertical: shift.vertical != 0,
+                            },
+                        },
+                    )?);
+                }
+            }
+            let restoration_source = pre_restoration_planes.as_ref().unwrap_or(resident_planes);
+            let mut restoration = restoration_planes
+                .as_ref()
+                .map(|scratch| RestorationCursor::new(restoration_source, scratch));
+            let gaborish_uniform = match (source.gaborish, restoration.as_mut()) {
+                (Some(weights), Some(restoration)) => {
+                    let (input_buffers, output_buffers) = restoration.advance();
+                    let uniform = pipelines.gaborish.encode(
+                        device,
+                        &mut commands,
+                        ResidentGaborishInputs {
+                            inputs: resident_image_planes(
+                                input_buffers,
+                                image_width,
+                                image_height,
+                                padded_width,
+                            )?,
+                            outputs: resident_image_planes(
+                                output_buffers,
+                                image_width,
+                                image_height,
+                                padded_width,
+                            )?,
+                            weights,
+                        },
+                    )?;
+                    Some(uniform)
+                }
+                (None, _) => None,
+                (Some(_), None) => unreachable!("Gaborish requires restoration scratch planes"),
+            };
+            let mut epf_uniforms =
+                Vec::with_capacity(source.epf.as_ref().map_or(0, |plan| plan.passes.len()));
+            if let Some(epf) = &source.epf {
+                let restoration = restoration
+                    .as_mut()
+                    .unwrap_or_else(|| unreachable!("EPF requires restoration scratch planes"));
+                let sigma_buffer = epf_sigma
+                    .as_ref()
+                    .unwrap_or_else(|| unreachable!("EPF requires a sigma plane"));
+                let sigma = ResidentF32Plane {
+                    storage: resident_binding(sigma_buffer)?,
+                    width: blocks_x,
+                    height: blocks_y,
+                    stride: blocks_x,
+                };
+                for &parameters in &epf.passes {
+                    let (input_buffers, output_buffers) = restoration.advance();
+                    epf_uniforms.push(pipelines.epf.encode(
+                        device,
+                        &mut commands,
+                        ResidentEpfInputs {
+                            inputs: resident_image_planes(
+                                input_buffers,
+                                image_width,
+                                image_height,
+                                padded_width,
+                            )?,
+                            outputs: resident_image_planes(
+                                output_buffers,
+                                image_width,
+                                image_height,
+                                padded_width,
+                            )?,
+                            sigma,
+                            parameters,
+                        },
+                    )?);
+                }
+            }
+            let presentation_planes = restoration
+                .as_ref()
+                .map_or(restoration_source, RestorationCursor::current);
+            let mut frame_upsample_uniforms = Vec::new();
+            if let (Some(upsampled), Some(weights)) =
+                (&frame_upsample_planes, &frame_upsample_weights)
+            {
+                for channel in 0..3 {
+                    frame_upsample_uniforms.push(pipelines.frame_upsample.encode(
+                        device,
+                        &mut commands,
+                        ResidentUpsampleInputs {
+                            input: ResidentF32Plane {
+                                storage: resident_binding(&presentation_planes[channel])?,
+                                width: image_width,
+                                height: image_height,
+                                stride: padded_width,
+                            },
+                            output: ResidentF32Plane {
+                                storage: resident_binding(&upsampled[channel])?,
+                                width: source.packet.profile.output_width,
+                                height: source.packet.profile.output_height,
+                                stride: source.packet.profile.output_width,
+                            },
+                            weights,
+                        },
+                    )?);
+                }
+            }
+            let presentation_planes = frame_upsample_planes
+                .as_ref()
+                .unwrap_or(presentation_planes);
+            let presentation_shifts = if restoration.is_some() || frame_upsample_planes.is_some() {
+                [crate::vardct_frontend::VarDctChannelShift::default(); 3]
+            } else {
+                source.packet.profile.channel_shifts
+            };
+            let output_width = source.packet.profile.output_width;
+            let output_height = source.packet.profile.output_height;
+            let presentation_stride = if frame_upsample_planes.is_some() {
+                output_width
+            } else {
+                padded_width
+            };
+            let presentation_geometry = presentation_shifts.map(|shift| {
+                shift.shifted_extent(output_width, output_height).ok_or(
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "presentation channel extent",
+                    },
+                )
+            });
+            let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
+            let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
+            let presentation_strides = presentation_shifts.map(|shift| {
+                presentation_stride.checked_shr(shift.horizontal).ok_or(
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "presentation channel stride",
+                    },
+                )
+            });
+            let [stride_x, stride_y, stride_b] = presentation_strides;
+            let presentation_strides = [stride_x?, stride_y?, stride_b?];
+            let output_scratch = pipelines.output.encode(
                 device,
                 &mut commands,
-                ResidentChromaUpsampleInputs {
-                    input: ResidentF32Plane {
-                        storage: resident_binding(&resident_planes[channel])?,
-                        width: input_width,
-                        height: input_height,
-                        stride: padded_width >> shift.horizontal,
-                    },
-                    output: ResidentF32Plane {
-                        storage: resident_binding(&upsampled[channel])?,
-                        width: image_width,
-                        height: image_height,
-                        stride: padded_width,
-                    },
-                    shift: ResidentChromaShift {
-                        horizontal: shift.horizontal != 0,
-                        vertical: shift.vertical != 0,
-                    },
-                },
-            )?);
-        }
-    }
-    let restoration_source = pre_restoration_planes.as_ref().unwrap_or(&resident_planes);
-    let mut restoration = restoration_planes
-        .as_ref()
-        .map(|scratch| RestorationCursor::new(restoration_source, scratch));
-    let gaborish_uniform = match (source.gaborish, restoration.as_mut()) {
-        (Some(weights), Some(restoration)) => {
-            let (input_buffers, output_buffers) = restoration.advance();
-            let uniform = pipelines.gaborish.encode(
-                device,
-                &mut commands,
-                ResidentGaborishInputs {
-                    inputs: resident_image_planes(
-                        input_buffers,
-                        image_width,
-                        image_height,
-                        padded_width,
-                    )?,
-                    outputs: resident_image_planes(
-                        output_buffers,
-                        image_width,
-                        image_height,
-                        padded_width,
-                    )?,
-                    weights,
+                VarDctOutputInputs {
+                    alpha: source
+                        .extra_plane
+                        .as_ref()
+                        .map(super::staging::ResidentModularPlane::alpha_binding)
+                        .transpose()?,
+                    planes: [
+                        VarDctOutputPlane {
+                            storage: resident_binding(&presentation_planes[0])?,
+                            width: presentation_geometry[0][0],
+                            height: presentation_geometry[0][1],
+                            stride: presentation_strides[0],
+                        },
+                        VarDctOutputPlane {
+                            storage: resident_binding(&presentation_planes[1])?,
+                            width: presentation_geometry[1][0],
+                            height: presentation_geometry[1][1],
+                            stride: presentation_strides[1],
+                        },
+                        VarDctOutputPlane {
+                            storage: resident_binding(&presentation_planes[2])?,
+                            width: presentation_geometry[2][0],
+                            height: presentation_geometry[2][1],
+                            stride: presentation_strides[2],
+                        },
+                    ],
+                    output: resident_binding(&output)?,
+                    layout: &source.layout,
+                    config,
                 },
             )?;
-            Some(uniform)
+            debug_assert_eq!(output_scratch.plan, plan);
+            let post_transform_buffers = PostTransformJobBuffers {
+                _restoration_planes: restoration_planes,
+                _pre_restoration_planes: pre_restoration_planes,
+                _pre_restoration_uniforms: pre_restoration_uniforms,
+                _gaborish_uniform: gaborish_uniform,
+                _epf_sigma: epf_sigma,
+                _epf_sigma_uniforms: epf_sigma_uniforms,
+                _epf_uniforms: epf_uniforms,
+                _frame_upsample_planes: frame_upsample_planes,
+                _frame_upsample_weights: frame_upsample_weights,
+                _frame_upsample_uniforms: frame_upsample_uniforms,
+            };
+            (
+                FrameOutputScratch::Color {
+                    _scratch: output_scratch,
+                },
+                post_transform_buffers,
+            )
         }
-        (None, _) => None,
-        (Some(_), None) => unreachable!("Gaborish requires restoration scratch planes"),
-    };
-    let mut epf_uniforms =
-        Vec::with_capacity(source.epf.as_ref().map_or(0, |plan| plan.passes.len()));
-    if let Some(epf) = &source.epf {
-        let restoration = restoration
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("EPF requires restoration scratch planes"));
-        let sigma_buffer = epf_sigma
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("EPF requires a sigma plane"));
-        let sigma = ResidentF32Plane {
-            storage: resident_binding(sigma_buffer)?,
-            width: blocks_x,
-            height: blocks_y,
-            stride: blocks_x,
-        };
-        for &parameters in &epf.passes {
-            let (input_buffers, output_buffers) = restoration.advance();
-            epf_uniforms.push(pipelines.epf.encode(
+        VarDctFrameOutput::Extra { index, plan } => {
+            let extra =
+                source
+                    .extra_plane
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "scalar output lacks its selected resident extra plane",
+                    })?;
+            if plan.config.bits != extra.bits || index != extra.index {
+                return Err(VarDctDecodeError::EntropyWindowContract {
+                    detail: "scalar output precision differs from the selected extra plane",
+                });
+            }
+            let scratch = pipelines.scalar_output.encode(
                 device,
                 &mut commands,
-                ResidentEpfInputs {
-                    inputs: resident_image_planes(
-                        input_buffers,
-                        image_width,
-                        image_height,
-                        padded_width,
-                    )?,
-                    outputs: resident_image_planes(
-                        output_buffers,
-                        image_width,
-                        image_height,
-                        padded_width,
-                    )?,
-                    sigma,
-                    parameters,
-                },
-            )?);
+                plan,
+                extra.plane,
+                resident_binding(extra.arena.as_wgpu_buffer())?,
+                resident_binding(&output)?,
+            )?;
+            (
+                FrameOutputScratch::Extra { scratch },
+                PostTransformJobBuffers::default(),
+            )
         }
-    }
-    let presentation_planes = restoration
-        .as_ref()
-        .map_or(restoration_source, RestorationCursor::current);
-    let mut frame_upsample_uniforms = Vec::new();
-    if let (Some(upsampled), Some(weights)) = (&frame_upsample_planes, &frame_upsample_weights) {
-        for channel in 0..3 {
-            frame_upsample_uniforms.push(pipelines.frame_upsample.encode(
-                device,
-                &mut commands,
-                ResidentUpsampleInputs {
-                    input: ResidentF32Plane {
-                        storage: resident_binding(&presentation_planes[channel])?,
-                        width: image_width,
-                        height: image_height,
-                        stride: padded_width,
-                    },
-                    output: ResidentF32Plane {
-                        storage: resident_binding(&upsampled[channel])?,
-                        width: source.packet.profile.output_width,
-                        height: source.packet.profile.output_height,
-                        stride: source.packet.profile.output_width,
-                    },
-                    weights,
-                },
-            )?);
-        }
-    }
-    let presentation_planes = frame_upsample_planes
-        .as_ref()
-        .unwrap_or(presentation_planes);
-    let presentation_shifts = if restoration.is_some() || frame_upsample_planes.is_some() {
-        [crate::vardct_frontend::VarDctChannelShift::default(); 3]
-    } else {
-        source.packet.profile.channel_shifts
-    };
-    let output_width = source.packet.profile.output_width;
-    let output_height = source.packet.profile.output_height;
-    let presentation_stride = if frame_upsample_planes.is_some() {
-        output_width
-    } else {
-        padded_width
-    };
-    let presentation_geometry = presentation_shifts.map(|shift| {
-        shift.shifted_extent(output_width, output_height).ok_or(
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "presentation channel extent",
-            },
-        )
-    });
-    let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
-    let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
-    let presentation_strides = presentation_shifts.map(|shift| {
-        presentation_stride.checked_shr(shift.horizontal).ok_or(
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "presentation channel stride",
-            },
-        )
-    });
-    let [stride_x, stride_y, stride_b] = presentation_strides;
-    let presentation_strides = [stride_x?, stride_y?, stride_b?];
-    let output_scratch = pipelines.output.encode(
-        device,
-        &mut commands,
-        VarDctOutputInputs {
-            alpha: source
-                .alpha
-                .as_ref()
-                .map(super::staging::ResidentModularAlpha::binding)
-                .transpose()?,
-            planes: [
-                VarDctOutputPlane {
-                    storage: resident_binding(&presentation_planes[0])?,
-                    width: presentation_geometry[0][0],
-                    height: presentation_geometry[0][1],
-                    stride: presentation_strides[0],
-                },
-                VarDctOutputPlane {
-                    storage: resident_binding(&presentation_planes[1])?,
-                    width: presentation_geometry[1][0],
-                    height: presentation_geometry[1][1],
-                    stride: presentation_strides[1],
-                },
-                VarDctOutputPlane {
-                    storage: resident_binding(&presentation_planes[2])?,
-                    width: presentation_geometry[2][0],
-                    height: presentation_geometry[2][1],
-                    stride: presentation_strides[2],
-                },
-            ],
-            output: resident_binding(&output)?,
-            layout: &source.layout,
-            config: source.output_config,
-        },
-    )?;
-    debug_assert_eq!(output_scratch.plan, source.output_plan);
-    let post_transform_buffers = PostTransformJobBuffers {
-        _restoration_planes: restoration_planes,
-        _pre_restoration_planes: pre_restoration_planes,
-        _pre_restoration_uniforms: pre_restoration_uniforms,
-        _gaborish_uniform: gaborish_uniform,
-        _epf_sigma: epf_sigma,
-        _epf_sigma_uniforms: epf_sigma_uniforms,
-        _epf_uniforms: epf_uniforms,
-        _frame_upsample_planes: frame_upsample_planes,
-        _frame_upsample_weights: frame_upsample_weights,
-        _frame_upsample_uniforms: frame_upsample_uniforms,
     };
     let packet_status_end = source.memory.packet_status_bytes;
     let artifact_status_end = packet_status_end
@@ -3382,8 +3477,12 @@ fn submit_vardct(
                         field: "HF status staging offset",
                     })?;
         }
-        debug_assert_eq!(offset, source.memory.validation_staging_bytes);
+        debug_assert_eq!(
+            offset + output_scratch.status_bytes(),
+            source.memory.validation_staging_bytes
+        );
     }
+    output_scratch.copy_status(&mut commands, &status_staging);
 
     let after_coefficients = commands.finish();
     let (downstream_commands, mut deferred_commands) =
@@ -3424,7 +3523,7 @@ fn submit_vardct(
         _adaptive_lf_uniform: adaptive_lf_uniform,
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
-        _alpha: source.alpha.take(),
+        _extra_plane: source.extra_plane.take(),
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
         _post_transform: post_transform_buffers,
@@ -3485,7 +3584,7 @@ fn submit_vardct(
         width: source.packet.profile.width,
         height: source.packet.profile.height,
     };
-    let mut pending = ColorPendingFrame {
+    let mut pending = FramePendingFrame {
         backend: backend.clone(),
         pipelines,
         memory,

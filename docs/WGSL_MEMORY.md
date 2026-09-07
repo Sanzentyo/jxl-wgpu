@@ -78,6 +78,7 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
 | `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu_decode/modular_rct` | `ModularRctParams` / `Params` | three in-place plane `width,height,row_stride,word_offset` records, then RCT type and 3 reserved words | 64 | 16 | uniform |
+| `jxl_wgpu_decode/modular_scalar_output.wgsl` | `ScalarParams` | source width/height/word stride/offset; destination width/height/byte stride/offset; maximum code/component bytes/float flag/orientation; logical bytes/output words/dispatch width/pad | 64 | 16 | uniform binding 2; a separate four-byte atomic status at binding 3 records unrepresentable native samples |
 | `jxl_wgpu/upsample.wgsl` | `UpsampleUniform` or resident `UpsampleParams` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, factor, _pad0` | 32 | 4 / 16 | uniform |
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/xyb_to_rgb.wgsl` | `XybUniform` / `Params` | dimensions/6 strides, three padded inverse-opsin rows, padded cube-root bias, padded scaled bias, `intensity_scale`, 3 pads | 128 | 4 | uniform |
@@ -134,7 +135,9 @@ a selected extra channel. Gray+alpha can bind the gray view three times without 
 Per-view masks retain each channel's original integer precision: alpha normalizes independently
 for F32 and rescales with integer rounding for native output. The prediction/inverse descriptor
 depth remains the image's working depth. Scalar normalized unsigned output uses numeric mapping 4
-and one F32 component; no color transfer is applied. The enlarged uniform is charged through
+and one F32 component; signed working values divide by the declared maximum without clipping,
+wrapping or color transfer. Its source read bypasses the unsigned-code range rejection used by
+native integer output. The enlarged uniform is charged through
 `size_of::<ModularFinalizeParams>()` for each existing finalizer, adding no buffer or submission.
 All entropy channels, inverse arenas and jobs retain their existing budget/lifetime ownership even
 when only one plane is selected. Public declaration/name vectors remain host metadata, outside
@@ -218,6 +221,7 @@ The table below states the default workgroup configuration for each entry point:
 | `extend` | frame/reference RO, full-canvas output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | exact u32 word copy for I32/F32; checked signed origin, crop, target extent and optional reference canvas |
 | `save` | source RO, packed output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked orientation and exact packed allocation |
 | `rgb_to_image` | R/G/B RO, packed output RW, U | 256x1 | Tier A (`KernelVariant` 1-D) | checked linear word count is split into a legal 2-D dispatch; shader checks `logical_size` before stores |
+| `modular_scalar_output::pack` (decoder) | signed arena RO, packed output/status RW, U | 256x1 | Tier A (`KernelVariant` linear) | one invocation owns four output bytes; checked source view, oriented rows, binding offsets, padding and 2-D dispatch bounds; native sample-range failure is sticky and joins final frame validation |
 | `display_rgb` | source RO, destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; logical samples and final source address fit the bound range/WGSL `u32` |
 | `display_numeric` | source words RO, destination T, U; native-F64 variant also binds the same source as F64 RO | 16x16 | Tier A (`KernelVariant` 2-D) | exact pitch-linear plane range/stride and WGSL `u32` addresses; explicit sample kind, affine mapping, non-finite handling, clamp, transfer, and channel visualization |
 | `display_image` | source RO, RGBA8 or RGBA16F destination T, U | 16x16 | Tier A (`KernelVariant` 2-D) | source must have `STORAGE`; each pitch-linear plane and its final address is bounded; wide-gamut/HDR requires float output |
@@ -462,19 +466,29 @@ before advancing to color; a whole stream keeps entropy and inverses in one subm
 single-symbol Prefix streams use only a four-byte sentinel at byte-aligned endpoints.
 Arena and transient bytes have separate permits, both acquired before allocation. The map
 callback retains the job and both reservations even when the pending frame is abandoned. After
-status/entropy/cursor validation, transient buffers retire and the first-alpha arena lease moves
-into the color job lifetime. Non-alpha arenas retire immediately. Color preflight subtracts the
+status/entropy/cursor validation, transient buffers retire and the first-alpha or explicitly
+selected extra plane retains the arena lease through the frame job. An unused arena retires
+immediately. Frame preflight subtracts the
 retained arena from its available per-frame limit; every subsequently discovered LF/HF/raw-table
 allocation still uses the same shared budget. Only the 16-byte status crosses to the host.
 
-Public `VarDctDecodeSession::memory_stats()` is the optional color-stage plan, published after
+Public `VarDctDecodeSession::memory_stats()` is the optional frame-stage plan, published after
 cursor validation. It excludes the separately owned global arena; `global_modular_memory_stats()`
 reports initial-stage buffer bytes and `in_flight_memory_stats()` is authoritative for live bytes.
 Seven public fixtures cover single/multi-entry TOCs, multiple AC passes, independent alpha depths,
 Apply/Keep and fragmented input. Entropy failure never exposes a color frame; cancellation,
 initial admission/retry, middle-window cancellation, budget-driven upload reduction and undersized
 window/budget rejection have actual-adapter tests. Internal
-plane readback remains test-only. LF/AC-distributed and scalar extra output need further integration.
+plane readback remains test-only. LF/AC-distributed extras need further integration.
+
+Scalar VarDCT output retains complete LF/HF/AC validation and its coefficient/metadata resources,
+but allocates no resident color planes, inverse-transform scratch, restoration or color-resampling
+resources. Its 64-byte packing uniform and four-byte status are transient; the four-byte status
+tail joins the existing aggregate map, and packed output uses the normal output lease. Native
+range failures become `ModularScalarOutputError::SampleOutOfRange` before validated delivery.
+The packer reads the retained integer view directly, writes each output word once (including zero
+padding), and uses shared orientation helpers. No extra submission or intermediate color image
+is introduced. The same seven public fixtures select all 32 extra planes in both output modes.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,

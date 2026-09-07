@@ -1,0 +1,207 @@
+//! Color presentation and independently selected scalar output share frame validation.
+use super::restoration::restoration_config;
+use super::types::VarDctDecodeError;
+use crate::modular_scalar_output::{ModularScalarOutputConfig, ModularScalarOutputPlan};
+use crate::vardct_frontend::VarDctColorTransform;
+use crate::vardct_output::{
+    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputPlan, VarDctOutputTransform,
+};
+use crate::{GpuOutputMapping, GpuOutputRequest};
+use jxl_gpu_bitstream::{
+    ColourEncodingInventory, ColourSpaceInventory, PrimariesInventory, TransferFunctionInventory,
+    WhitePointInventory,
+};
+use jxl_gpu_formats::ImageLayout;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
+use jxl_wgpu::{KernelVariant, WgpuBackend};
+
+#[derive(Clone, Copy)]
+pub(super) enum VarDctFrameOutput {
+    Color {
+        config: VarDctOutputConfig,
+        plan: VarDctOutputPlan,
+    },
+    Extra {
+        index: u32,
+        plan: ModularScalarOutputPlan,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FrameOutputMemory {
+    pub storage_bytes: u64,
+    pub uniform_bytes: u64,
+    pub status_bytes: u64,
+}
+
+impl VarDctFrameOutput {
+    pub(super) fn is_color(self) -> bool {
+        matches!(self, Self::Color { .. })
+    }
+    pub(super) fn memory(self) -> FrameOutputMemory {
+        match self {
+            Self::Color { plan, .. } => FrameOutputMemory {
+                storage_bytes: plan.memory.output_storage_bytes,
+                uniform_bytes: plan.memory.uniform_bytes,
+                status_bytes: 0,
+            },
+            Self::Extra { plan, .. } => FrameOutputMemory {
+                storage_bytes: plan.storage_bytes,
+                uniform_bytes: ModularScalarOutputPlan::UNIFORM_BYTES,
+                status_bytes: ModularScalarOutputPlan::STATUS_BYTES,
+            },
+        }
+    }
+}
+
+pub(super) struct VarDctPresentation {
+    pub(super) output: VarDctFrameOutput,
+    pub(super) layout: ImageLayout,
+    pub(super) quant_biases: [f32; 4],
+}
+
+pub(super) fn prepare_presentation(
+    backend: &WgpuBackend,
+    inventory: &jxl_gpu_bitstream::CodestreamInventory,
+    request: &GpuOutputRequest,
+    profile: &crate::vardct_frontend::StandardVarDctProfile,
+    variant: KernelVariant,
+) -> Result<VarDctPresentation, VarDctDecodeError> {
+    let orientation = OutputOrientation::from_exif_value(inventory.image_header.orientation)
+        .ok_or(VarDctDecodeError::InvalidOrientation {
+            orientation: inventory.image_header.orientation,
+        })?;
+    let orientation = request.orientation_policy().resolve(orientation);
+    if let Some(index) = request.extra_channel() {
+        let extra = inventory
+            .image_header
+            .extra_channels
+            .get(index as usize)
+            .ok_or(VarDctDecodeError::ExtraChannelIndex {
+                index,
+                count: inventory.image_header.extra_channels.len(),
+            })?;
+        let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } = extra.bit_depth else {
+            return Err(VarDctDecodeError::UnsupportedOutput);
+        };
+        let GpuOutputMapping::Numeric(mapping) = request.mapping() else {
+            return Err(VarDctDecodeError::UnsupportedOutput);
+        };
+        let config = ModularScalarOutputConfig {
+            extent: Extent2d::new(profile.output_width, profile.output_height),
+            orientation,
+            bits: bits_per_sample,
+            mapping,
+        };
+        let layout = ImageLayout::packed(
+            orientation.map_extent(config.extent),
+            request.format().clone(),
+        )?;
+        let plan =
+            ModularScalarOutputPlan::new(config, &layout, &backend.device().limits(), variant)?;
+        return Ok(VarDctPresentation {
+            output: VarDctFrameOutput::Extra { index, plan },
+            layout,
+            quant_biases: [0.0; 4],
+        });
+    }
+    if request.mapping() != GpuOutputMapping::Color {
+        return Err(VarDctDecodeError::UnsupportedOutput);
+    }
+
+    if !matches!(
+        inventory.image_header.colour_encoding,
+        ColourEncodingInventory::Enumerated {
+            colour_space: ColourSpaceInventory::Rgb | ColourSpaceInventory::Grey,
+            white_point: WhitePointInventory::D65,
+            primaries: PrimariesInventory::Srgb,
+            transfer_function: TransferFunctionInventory::Srgb,
+            rendering_intent: _,
+        }
+    ) {
+        return Err(VarDctDecodeError::UnsupportedColorEncoding);
+    }
+    let frame = inventory
+        .frames
+        .first()
+        .ok_or(VarDctDecodeError::MissingFrame)?;
+    let (gaborish, epf) = restoration_config(frame.restoration_filter)?;
+    let (output_transform, quant_biases) = match profile.color_transform {
+        VarDctColorTransform::Xyb => {
+            let opsin = inventory
+                .image_header
+                .opsin_inverse_matrix
+                .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
+            let matrix = opsin
+                .inverse_matrix
+                .map(|row| row.map(|value| value.to_f32()));
+            // Gray is reconstructed from linear sRGB luminance before applying the transfer
+            // function. Folding that projection into the inverse matrix makes all output
+            // channels identical, including when quantization leaves chromatic XYB residuals.
+            let inverse_opsin_matrix = if inventory.image_header.grayscale {
+                let luma = std::array::from_fn(|column| {
+                    [0.2126_f64, 0.7152, 0.0722]
+                        .into_iter()
+                        .zip(matrix)
+                        .map(|(weight, row)| weight * f64::from(row[column]))
+                        .sum::<f64>() as f32
+                });
+                [luma; 3]
+            } else {
+                matrix
+            };
+            (
+                VarDctOutputTransform::Xyb(VarDctInverseOpsin {
+                    opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
+                    inverse_opsin_matrix,
+                    intensity_target: inventory
+                        .image_header
+                        .tone_mapping
+                        .intensity_target
+                        .to_f32(),
+                }),
+                [
+                    opsin.quant_bias[0].to_f32(),
+                    opsin.quant_bias[1].to_f32(),
+                    opsin.quant_bias[2].to_f32(),
+                    opsin.quant_bias_numerator.to_f32(),
+                ],
+            )
+        }
+        VarDctColorTransform::Ycbcr => (
+            VarDctOutputTransform::Ycbcr {
+                channel_shifts: if gaborish.is_some() || epf.is_some() || profile.upsampling != 1 {
+                    [Default::default(); 3]
+                } else {
+                    profile.channel_shifts
+                },
+            },
+            // Non-XYB image metadata omits the optional opsin object that otherwise carries these
+            // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32
+            // roundings.
+            [
+                1.0 - 0.054_650_072,
+                1.0 - 0.070_054_5,
+                1.0 - 0.049_935_102,
+                0.145,
+            ],
+        ),
+    };
+    let output_config = VarDctOutputConfig {
+        extent: Extent2d::new(profile.output_width, profile.output_height),
+        orientation,
+        transform: output_transform,
+    };
+    let layout = ImageLayout::packed(output_config.output_extent(), request.format().clone())?;
+    output_config.validate_layout(&layout)?;
+    let output_plan =
+        VarDctOutputPlan::for_limits_with_variant(&layout, &backend.device().limits(), variant)?;
+    Ok(VarDctPresentation {
+        output: VarDctFrameOutput::Color {
+            config: output_config,
+            plan: output_plan,
+        },
+        layout,
+        quant_biases,
+    })
+}

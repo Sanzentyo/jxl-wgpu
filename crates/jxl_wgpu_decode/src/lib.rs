@@ -38,6 +38,7 @@ mod modular_finalize;
 mod modular_inverse;
 mod modular_palette;
 pub mod modular_rct;
+mod modular_scalar_output;
 mod modular_side_image;
 pub mod modular_squeeze;
 mod modular_transform;
@@ -91,6 +92,7 @@ pub use model::{
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;
+pub use modular_scalar_output::ModularScalarOutputError;
 pub use progressive_dc::ProgressiveDcGpuError;
 pub use session::{
     GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,

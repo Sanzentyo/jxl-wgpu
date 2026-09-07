@@ -5,6 +5,8 @@ use jxl_wgpu_decode::{OrientationPolicy, SpotColorPolicy};
 
 #[path = "../common/extra_channel_oracle.rs"]
 mod oracle;
+#[path = "extra_channels/scalar.rs"]
+mod scalar;
 
 fn fixtures() -> [(&'static str, &'static str); 7] {
     [

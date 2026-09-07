@@ -17,7 +17,7 @@ use crate::vardct_artifact::{
 };
 use crate::vardct_epf::{EpfSigmaError, EpfSigmaMemoryPlan};
 use crate::vardct_lf::AdaptiveLfParams;
-use crate::vardct_output::{VarDctOutputError, VarDctOutputPlan};
+use crate::vardct_output::VarDctOutputError;
 use crate::vardct_packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
     VarDctModularParams, VarDctPacketControl, packet_execution_state_bytes,
@@ -58,8 +58,12 @@ pub enum VarDctDecodeError {
         cursor: u32,
         packet_end: u32,
     },
-    #[error("the VarDCT engine requires a color output mapping")]
+    #[error("VarDCT output requires color or an explicitly selected scalar extra channel")]
     UnsupportedOutput,
+    #[error("extra-channel index {index} is outside the {count} declared channels")]
+    ExtraChannelIndex { index: u32, count: usize },
+    #[error(transparent)]
+    ScalarOutput(#[from] crate::ModularScalarOutputError),
     #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]
     InvalidOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
@@ -288,6 +292,8 @@ pub struct VarDctDecodeMemoryStats {
     pub epf_filter_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
+    /// Scalar sample-range status, included again as a four-byte aggregate staging tail.
+    pub output_status_bytes: u64,
     /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// All non-output GPU buffers retained through status validation.
@@ -313,6 +319,7 @@ impl VarDctDecodeMemoryStats {
             epf_sigma,
             epf_iterations,
             resident,
+            render_color,
             output,
         } = inputs;
         fn checked_sum(
@@ -466,6 +473,7 @@ impl VarDctDecodeMemoryStats {
         let validation_staging_bytes = packet_status_bytes
             .checked_add(artifact_status_bytes)
             .and_then(|bytes| bytes.checked_add(hf_status_bytes))
+            .and_then(|bytes| bytes.checked_add(output.status_bytes))
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "VarDCT validation staging bytes",
             })?;
@@ -561,7 +569,11 @@ impl VarDctDecodeMemoryStats {
                 })
         });
         let [resident_x, resident_y, resident_b] = resident_plane_bytes;
-        let resident_plane_bytes = [resident_x?, resident_y?, resident_b?];
+        let resident_plane_bytes = if render_color {
+            [resident_x?, resident_y?, resident_b?]
+        } else {
+            [0; 3]
+        };
         let resident_image_bytes =
             checked_sum(resident_plane_bytes, "resident component image bytes")?;
         let full_plane_bytes = u64::from(blocks_x)
@@ -581,7 +593,8 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let expand_components = restoration_scratch || packet.profile.upsampling != 1;
+        let expand_components =
+            render_color && (restoration_scratch || packet.profile.upsampling != 1);
         let pre_restoration_upsample_bytes = if expand_components {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
@@ -635,7 +648,7 @@ impl VarDctDecodeMemoryStats {
             "resident VarDCT transient bytes",
         )?;
         let (frame_upsample_bytes, frame_upsample_weight_bytes, frame_upsample_uniform_bytes) =
-            if packet.profile.upsampling == 1 {
+            if !render_color || packet.profile.upsampling == 1 {
                 (0, 0, 0)
             } else {
                 let bytes = u64::from(packet.profile.output_width)
@@ -651,8 +664,9 @@ impl VarDctDecodeMemoryStats {
                     3 * ResidentUpsamplePipeline::UNIFORM_BYTES,
                 )
             };
-        let output_uniform_bytes = output.memory.uniform_bytes;
-        let output_lease_bytes = output.memory.output_storage_bytes;
+        let output_uniform_bytes = output.uniform_bytes;
+        let output_status_bytes = output.status_bytes;
+        let output_lease_bytes = output.storage_bytes;
         let transient_bytes = [
             codestream_bytes,
             modular_metadata_bytes,
@@ -693,6 +707,7 @@ impl VarDctDecodeMemoryStats {
             epf_filter_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
+            output_status_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, |total, value| {
@@ -754,6 +769,7 @@ impl VarDctDecodeMemoryStats {
             epf_filter_uniform_bytes,
             resident_transient_bytes,
             output_uniform_bytes,
+            output_status_bytes,
             output_lease_bytes,
             transient_bytes,
             total_frame_bytes,
@@ -777,7 +793,8 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) epf_sigma: Option<EpfSigmaMemoryPlan>,
     pub(super) epf_iterations: u32,
     pub(super) resident: &'a [ResidentVarDctMemoryPlan],
-    pub(super) output: VarDctOutputPlan,
+    pub(super) render_color: bool,
+    pub(super) output: super::output::FrameOutputMemory,
 }
 
 #[derive(Clone, Copy, Debug)]

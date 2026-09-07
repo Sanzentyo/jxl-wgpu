@@ -282,7 +282,7 @@ impl AnimationMetadata {
     }
 }
 
-/// Numeric interpretation applied while writing a decoded non-color Modular sample.
+/// Numeric interpretation applied while writing a decoded non-color sample.
 ///
 /// This mapping is explicit because a [`PixelFormat`] with `ColorModel::NonColor` carries storage
 /// shape, not normalization semantics.
@@ -290,10 +290,13 @@ impl AnimationMetadata {
 pub enum NumericSampleMapping {
     /// Preserve the decoded unsigned integer code exactly in the low valid bits of the canonical
     /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
-    /// codestream depth must match.
+    /// codestream depth must match. Working samples outside that unsigned range return a typed
+    /// error rather than wrapping or clipping.
     NativeUnsigned,
     /// Divide a 1–16-bit unsigned source by its own maximum code into scalar F32 storage.
     /// No transfer function or color conversion is applied, including for extra channels.
+    /// Signed working samples outside the declared unsigned range remain outside `[0, 1]`;
+    /// normalization does not wrap or clamp them.
     NormalizedUnsigned,
     /// Maps the decoded integer code `gray` in `[0, 255]` across the destination's nonnegative
     /// range. Unsigned integers use `[0, MAX]`; signed integers use `[0, MAX]` (never negative);

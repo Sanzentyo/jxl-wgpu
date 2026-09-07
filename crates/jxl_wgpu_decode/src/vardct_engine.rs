@@ -7,6 +7,7 @@
 //! entropy fallback runs on the CPU.
 
 mod execution;
+mod output;
 mod pipeline;
 mod restoration;
 mod source;

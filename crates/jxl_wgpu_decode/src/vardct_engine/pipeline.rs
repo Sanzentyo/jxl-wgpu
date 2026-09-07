@@ -8,6 +8,7 @@ use jxl_wgpu::{
     ResidentVarDctRenderer, WgpuBackend,
 };
 
+use crate::modular_scalar_output::ModularScalarOutputPipeline;
 use crate::progressive_dc::ProgressiveDcPipeline;
 use crate::vardct_artifact::HfMetadataLoweringPipeline;
 use crate::vardct_epf::EpfSigmaPipeline;
@@ -22,7 +23,7 @@ use crate::{
     PreparedGpuSession, Result as DecodeResult,
 };
 
-use super::execution::{ColorDecodeSession, VarDctRuntimeStats};
+use super::execution::{FrameDecodeSession, VarDctRuntimeStats};
 use super::source::{VarDctPrepareOptions, VarDctSource, prepare_packet_source};
 use super::staging::VarDctDecodeSession;
 use super::types::{VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
@@ -40,6 +41,7 @@ pub(super) struct VarDctPipelines {
     pub(super) epf_sigma: EpfSigmaPipeline,
     pub(super) epf: ResidentEpfPipeline,
     pub(super) output: VarDctOutputPacker,
+    pub(super) scalar_output: ModularScalarOutputPipeline,
     pub(super) progressive_dc: ProgressiveDcPipeline,
     pub(super) raw_hf_dequant: RawHfDequantSideImagePipeline,
     pub(super) output_variant: KernelVariant,
@@ -85,6 +87,7 @@ impl VarDctPipelines {
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
             output: VarDctOutputPacker::with_variant(device, output_variant)?,
+            scalar_output: ModularScalarOutputPipeline::new(device, output_variant),
             progressive_dc: ProgressiveDcPipeline::with_policy(device, backend.kernel_policy())?,
             raw_hf_dequant: RawHfDequantSideImagePipeline::new(backend, raw_hf_dequant_variant),
             output_variant,
@@ -278,7 +281,7 @@ impl VarDctSubmissionEngine {
         Ok(PreparedGpuSession::new(
             profile,
             AnimationMetadata::still(extent),
-            VarDctDecodeSession::ready(ColorDecodeSession {
+            VarDctDecodeSession::ready(FrameDecodeSession {
                 backend: self.backend.clone(),
                 pipelines: Arc::clone(&self.pipelines),
                 memory_stats: source.memory,

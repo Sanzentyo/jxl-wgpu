@@ -420,18 +420,24 @@ conversion. The 256-byte entropy ABI, 16-byte status and 64-byte matrix overlay 
 
 The public VarDCT producer now executes global Modular extras as an initial GPU stage. A checked
 16-byte status supplies the exact next LF bit position, or validates padding at the end of an
-independent LF-global section. Only then is the color allocation/dispatch plan constructed.
+independent LF-global section. Only then is the frame allocation/dispatch plan constructed.
 The first unassociated alpha plane stays in its original signed integer arena through the final
 color submission; the packer uses its own bit depth and applies orientation without a plane copy.
-Other declared extra planes are decoded and validated but scalar delivery is not connected yet.
+`GpuOutputRequest::with_extra_channel` can instead select any declared global extra plane as
+native unsigned or normalized scalar F32 output, including non-alpha and multiple-alpha images.
+The complete LF/HF/AC stream still validates before delivery. Color inverse transforms,
+restoration, resampling and resident color image buffers are omitted from that frame plan.
+One word-owned packing dispatch reads the selected plane in its original arena and applies the
+requested orientation. Native unsigned output preserves representable codes exactly and rejects
+out-of-range samples; scalar F32 preserves signed normalization without clipping or color transfer.
 Explicit `SpotColorPolicy::Preserve` requests base color; default spot rendering and unknown
 non-optional channel interpretation return typed errors.
 
-`VarDctDecodeSession::memory_stats()` now returns `Option<VarDctDecodeMemoryStats>`: the color
+`VarDctDecodeSession::memory_stats()` returns `Option<VarDctDecodeMemoryStats>`: the frame
 plan is absent until the global cursor validates. `global_modular_memory_stats()` reports exact
 initial-stage reusable stream, arena and total buffer bytes. Both stages share the engine budget, while
 `in_flight_memory_stats()` includes every live permit. Submission counts grow as stages become
-known. A pending global stage cannot expose an unvalidated color frame. Dropping it retains GPU
+known. A pending global stage cannot expose an unvalidated frame. Dropping it retains GPU
 buffers and permits in the map callback until completion. Color metadata reports the actual
 1–16-bit source depth and preserves all extra-channel declarations.
 
@@ -451,7 +457,11 @@ Window geometry is generated on demand in constant host space, including empty s
 Prefix streams. The initial-stage planner reduces the upload against total budget capacity; an
 explicit cap below 40 bytes returns `StreamWindowTooSmall`, and an insufficient minimum allocation
 returns `MemoryBudgetTooSmall`. Live reservations remain retryable submission backpressure.
-Public LF/AC-group-distributed extras, scalar delivery, associated alpha, and
+The scalar tail reserves a 64-byte uniform, a four-byte range status and four more bytes in the
+existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
+public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
+corrupting a later AC section still fails the scalar request after the global stream succeeds.
+Public LF/AC-group-distributed extras, associated alpha, and
 shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
 
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
@@ -633,8 +643,8 @@ operation.
 This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-non-color numeric output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-distributed/scalar extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+numeric color-channel output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
+distributed extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

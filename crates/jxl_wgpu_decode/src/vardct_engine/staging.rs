@@ -27,7 +27,7 @@ use crate::{
     SubmittedGpuFrame,
 };
 
-use super::execution::{ColorDecodeSession, ColorPendingFrame, MapCompletion, VarDctRuntimeStats};
+use super::execution::{FrameDecodeSession, FramePendingFrame, MapCompletion, VarDctRuntimeStats};
 use super::pipeline::VarDctPipelines;
 use super::source::{VarDctPrepareOptions, prepare_packet_source};
 use super::types::{VarDctDecodeError, VarDctDecodeMemoryStats};
@@ -43,14 +43,17 @@ pub struct VarDctGlobalModularMemoryStats {
     pub total_bytes: u64,
 }
 
-pub(super) struct ResidentModularAlpha {
-    arena: GpuBufferLease,
-    plane: GpuModularChannelLayout,
-    bits: u32,
+pub(super) struct ResidentModularPlane {
+    pub(super) index: u32,
+    pub(super) arena: GpuBufferLease,
+    pub(super) plane: GpuModularChannelLayout,
+    pub(super) bits: u32,
 }
 
-impl ResidentModularAlpha {
-    pub(super) fn binding(&self) -> std::result::Result<VarDctOutputAlpha<'_>, VarDctDecodeError> {
+impl ResidentModularPlane {
+    pub(super) fn alpha_binding(
+        &self,
+    ) -> std::result::Result<VarDctOutputAlpha<'_>, VarDctDecodeError> {
         Ok(VarDctOutputAlpha {
             storage: ResidentStorageBinding::entire(self.arena.as_wgpu_buffer())?,
             width: self.plane.width,
@@ -75,29 +78,29 @@ struct GlobalSource {
 }
 
 enum PreparedStage {
-    Color(Box<ColorDecodeSession>),
+    Frame(Box<FrameDecodeSession>),
     Global(Box<GlobalSource>),
 }
 
-/// One frame whose preparation may require a global Modular GPU cursor before its color plan.
+/// One frame whose preparation may require a global Modular GPU cursor before its remaining frame plan.
 pub struct VarDctDecodeSession {
     backend: WgpuBackend,
     memory: MemoryBudget,
     prepared: Option<PreparedStage>,
     runtime: Arc<VarDctRuntimeStats>,
-    color_memory: Arc<Mutex<Option<VarDctDecodeMemoryStats>>>,
+    frame_memory: Arc<Mutex<Option<VarDctDecodeMemoryStats>>>,
     global_memory: Option<VarDctGlobalModularMemoryStats>,
 }
 
 impl VarDctDecodeSession {
-    pub(super) fn ready(session: ColorDecodeSession) -> Self {
+    pub(super) fn ready(session: FrameDecodeSession) -> Self {
         Self {
             backend: session.backend.clone(),
             memory: session.memory.clone(),
             runtime: Arc::clone(&session.runtime_stats),
-            color_memory: Arc::new(Mutex::new(Some(session.memory_stats()))),
+            frame_memory: Arc::new(Mutex::new(Some(session.memory_stats()))),
             global_memory: None,
-            prepared: Some(PreparedStage::Color(Box::new(session))),
+            prepared: Some(PreparedStage::Frame(Box::new(session))),
         }
     }
 
@@ -112,12 +115,10 @@ impl VarDctDecodeSession {
         let backend = engine.backend.clone();
         let memory = engine.memory.clone();
         let pipelines = Arc::clone(&engine.pipelines);
-        if request.mapping() != GpuOutputMapping::Color {
-            return Err(VarDctDecodeError::UnsupportedOutput.into());
-        }
         if inventory.image_header.extra_channels.iter().any(|extra| {
             extra.channel_type == ExtraChannelTypeInventory::NonOptional
-                || (request.spot_color_policy() == SpotColorPolicy::Render
+                || (request.mapping() == GpuOutputMapping::Color
+                    && request.spot_color_policy() == SpotColorPolicy::Render
                     && matches!(
                         extra.channel_type,
                         ExtraChannelTypeInventory::SpotColour { .. }
@@ -127,7 +128,7 @@ impl VarDctDecodeSession {
                 "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
         }
         let profile = packet.profile();
-        let presentation = super::source::prepare_presentation(
+        let presentation = super::output::prepare_presentation(
             &backend,
             inventory,
             request,
@@ -192,7 +193,7 @@ impl VarDctDecodeSession {
                 submissions_per_frame: Arc::new(AtomicUsize::new(1)),
                 hf_packet_stream_batch_count: AtomicUsize::new(0),
             }),
-            color_memory: Arc::new(Mutex::new(None)),
+            frame_memory: Arc::new(Mutex::new(None)),
             global_memory: Some(global_memory),
             prepared: Some(PreparedStage::Global(Box::new(GlobalSource {
                 codestream,
@@ -210,12 +211,12 @@ impl VarDctDecodeSession {
             .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
     }
 
-    /// Color-stage allocation plan. It becomes available after global Modular cursor validation.
+    /// Frame-stage allocation plan. It becomes available after global Modular cursor validation.
     /// This excludes the independently tracked global arena; use the budget snapshot for live bytes.
     #[must_use]
     pub fn memory_stats(&self) -> Option<VarDctDecodeMemoryStats> {
         *self
-            .color_memory
+            .frame_memory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -243,7 +244,7 @@ impl VarDctDecodeSession {
         planes: ProgressiveDcXybPlanes,
     ) -> std::result::Result<(), VarDctDecodeError> {
         match self.prepared.as_mut() {
-            Some(PreparedStage::Color(session)) => session.set_progressive_dc_source(planes),
+            Some(PreparedStage::Frame(session)) => session.set_progressive_dc_source(planes),
             _ => Err(VarDctDecodeError::UnexpectedProgressiveDcSource),
         }
     }
@@ -253,7 +254,7 @@ impl std::fmt::Debug for VarDctDecodeSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarDctDecodeSession")
             .field("submitted", &self.prepared.is_none())
-            .field("color_memory", &self.memory_stats())
+            .field("frame_memory", &self.memory_stats())
             .field("global_memory", &self.global_memory)
             .finish_non_exhaustive()
     }
@@ -267,11 +268,11 @@ impl GpuSubmissionSession for VarDctDecodeSession {
             return Ok(None);
         };
         let state = match prepared {
-            PreparedStage::Color(session) => {
+            PreparedStage::Frame(session) => {
                 let Some(pending) = session.submit_next()? else {
                     return Ok(None);
                 };
-                PendingStage::Color(Box::new(pending))
+                PendingStage::Frame(Box::new(pending))
             }
             PreparedStage::Global(source) => {
                 let poll = self
@@ -317,7 +318,7 @@ impl GpuSubmissionSession for VarDctDecodeSession {
             backend: self.backend.clone(),
             memory: self.memory.clone(),
             runtime: Arc::clone(&self.runtime),
-            color_memory: Arc::clone(&self.color_memory),
+            frame_memory: Arc::clone(&self.frame_memory),
             state,
         }))
     }
@@ -364,7 +365,7 @@ enum PendingStage {
         lifetime: Arc<GlobalLifetime>,
         completion: Arc<MapCompletion>,
     },
-    Color(Box<ColorPendingFrame>),
+    Frame(Box<FramePendingFrame>),
     Consumed,
 }
 
@@ -373,7 +374,7 @@ pub struct VarDctPendingFrame {
     backend: WgpuBackend,
     memory: MemoryBudget,
     runtime: Arc<VarDctRuntimeStats>,
-    color_memory: Arc<Mutex<Option<VarDctDecodeMemoryStats>>>,
+    frame_memory: Arc<Mutex<Option<VarDctDecodeMemoryStats>>>,
     state: PendingStage,
 }
 
@@ -384,7 +385,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
                 "stage",
                 &match self.state {
                     PendingStage::Global { .. } => "global-modular",
-                    PendingStage::Color(_) => "color",
+                    PendingStage::Frame(_) => "frame",
                     PendingStage::Consumed => "consumed",
                 },
             )
@@ -484,37 +485,45 @@ impl VarDctPendingFrame {
             };
             return Ok(());
         }
-        let alpha = source
-            .inventory
-            .image_header
-            .extra_channels
-            .iter()
-            .enumerate()
-            .find(|(_, extra)| {
-                matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
-            })
-            .map(|(index, extra)| {
-                let SampleBitDepth::Integer { bits_per_sample } = extra.bit_depth else {
-                    unreachable!("integer extra-channel profile");
-                };
-                ResidentModularAlpha {
-                    arena: lifetime.arena.clone(),
-                    plane: plan.final_planes[index],
-                    bits: bits_per_sample,
-                }
+        let extra_index = source
+            .request
+            .extra_channel()
+            .map(|index| index as usize)
+            .or_else(|| {
+                source
+                    .inventory
+                    .image_header
+                    .extra_channels
+                    .iter()
+                    .position(|extra| {
+                        matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
+                    })
             });
+        let extra_plane = extra_index.map(|index| {
+            let SampleBitDepth::Integer { bits_per_sample } =
+                source.inventory.image_header.extra_channels[index].bit_depth
+            else {
+                unreachable!("integer extra-channel profile");
+            };
+            ResidentModularPlane {
+                index: index as u32,
+                arena: lifetime.arena.clone(),
+                plane: plan.final_planes[index],
+                bits: bits_per_sample,
+            }
+        });
         drop(lifetime);
         let mut options = source.options;
         options.memory_limit_bytes = options.memory_limit_bytes.saturating_sub(
-            alpha
+            extra_plane
                 .as_ref()
-                .map_or(0, |alpha| alpha.arena.reserved_bytes()),
+                .map_or(0, |plane| plane.arena.reserved_bytes()),
         );
         let packet = source
             .packet
             .resume(&source.codestream, status.cursor)
             .map_err(VarDctDecodeError::from)?;
-        let mut color = prepare_packet_source(
+        let mut frame = prepare_packet_source(
             &self.backend,
             source.codestream,
             &source.request,
@@ -522,45 +531,45 @@ impl VarDctPendingFrame {
             options,
             packet,
         )?;
-        color.alpha = alpha;
+        frame.extra_plane = extra_plane;
         *self
-            .color_memory
+            .frame_memory
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(color.memory);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(frame.memory);
         self.runtime
             .submissions_per_frame
-            .fetch_add(color.submissions_per_frame(), Ordering::AcqRel);
-        let mut session = ColorDecodeSession {
+            .fetch_add(frame.submissions_per_frame(), Ordering::AcqRel);
+        let mut session = FrameDecodeSession {
             backend: self.backend.clone(),
             pipelines: source.pipelines,
-            memory_stats: color.memory,
+            memory_stats: frame.memory,
             runtime_stats: Arc::clone(&self.runtime),
-            source: Some(color),
+            source: Some(frame),
             memory: self.memory.clone(),
         };
         let pending = session
             .submit_next()?
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
-        self.state = PendingStage::Color(Box::new(pending));
+        self.state = PendingStage::Frame(Box::new(pending));
         Ok(())
     }
     pub(crate) fn submissions_per_frame_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.runtime.submissions_per_frame)
     }
     pub(crate) fn dependency_submission_ready(&self) -> bool {
-        matches!(&self.state, PendingStage::Color(pending) if pending.dependency_submission_ready())
+        matches!(&self.state, PendingStage::Frame(pending) if pending.dependency_submission_ready())
     }
     pub(crate) fn progressive_dc_planes(
         &self,
     ) -> std::result::Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
         match &self.state {
-            PendingStage::Color(pending) => pending.progressive_dc_planes(),
+            PendingStage::Frame(pending) => pending.progressive_dc_planes(),
             _ => Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted),
         }
     }
     pub fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
         match &self.state {
-            PendingStage::Color(pending) => pending.unvalidated_gpu_frame(),
+            PendingStage::Frame(pending) => pending.unvalidated_gpu_frame(),
             _ => Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted.into()),
         }
     }
@@ -571,7 +580,7 @@ impl VarDctPendingFrame {
             self.resume_global(mapping)?;
         }
         match &mut self.state {
-            PendingStage::Color(pending) => pending.wait_until_dependency_submitted(),
+            PendingStage::Frame(pending) => pending.wait_until_dependency_submitted(),
             _ => Err(VarDctDecodeError::CompletionConsumed.into()),
         }
     }
@@ -594,7 +603,7 @@ impl VarDctPendingFrame {
             }
         }
         match &mut self.state {
-            PendingStage::Color(pending) => pending.poll_until_dependency_submitted(context),
+            PendingStage::Frame(pending) => pending.poll_until_dependency_submitted(context),
             _ => Poll::Ready(Err(VarDctDecodeError::CompletionConsumed.into())),
         }
     }
@@ -609,7 +618,7 @@ impl GpuPendingFrame for VarDctPendingFrame {
             self.resume_global(mapping)?;
         }
         match self.state {
-            PendingStage::Color(pending) => (*pending).wait(),
+            PendingStage::Frame(pending) => (*pending).wait(),
             _ => Err(VarDctDecodeError::CompletionConsumed.into()),
         }
     }
@@ -634,7 +643,7 @@ impl GpuPendingFrame for VarDctPendingFrame {
             }
         }
         match &mut self.state {
-            PendingStage::Color(pending) => Pin::new(pending.as_mut()).poll_complete(context),
+            PendingStage::Frame(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             _ => Poll::Ready(Err(VarDctDecodeError::CompletionConsumed.into())),
         }
     }

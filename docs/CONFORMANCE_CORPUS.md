@@ -1162,8 +1162,28 @@ without consuming the source, canceled callback ownership after multiple windows
 fixture zeroes only entropy bits 885..3436 of `rgba`, preserving both descriptors and later color
 data; GPU status rejects it before a color plan or frame is exposed. Color planning remains absent
 until global cursor validation; later LF/HF descriptors retain their separately admitted dynamic
-bytes. Public scalar extra delivery, LF/AC-distributed or shifted samples and associated alpha
+bytes. LF/AC-distributed or shifted samples and associated alpha
 remain gaps. No production picture data or entropy token crosses to a CPU decoder.
+
+`tests/vardct_engine_gpu/extra_channels/scalar.rs` selects all 32 extra planes in those seven
+fixtures. Native unsigned output with Keep orientation equals the source formula exactly at each
+declaration's depth; normalized F32 with Apply orientation and fragmented 1024-byte-window input
+matches Rust `jxl` and native libjxl within `2e-7` absolute. Requests include spot data under the
+default policy, since scalar selection does not request color rendering. Memory assertions show
+zero color planes, inverse-transform scratch, restoration and resampling allocations, a 64-byte
+output uniform and four-byte output status. All reservations retire after frame/session release.
+Wrong indices/depths fail before admission. A progressive fixture whose final AC section is zeroed
+still validates the global extra stream, then returns `HfCoefficientGpu` without a scalar frame.
+
+The standalone scalar packer test checks 320 combinations of five integer precisions, four
+extents (including both one-sample axes and a forced 2-D dispatch), all eight orientations and
+both mappings. It supplies signed negative/overshoot values, nonzero source/binding/plane offsets,
+padded source/output rows and guard bytes. Native out-of-range values set a typed rejection;
+normalized F32 retains them and agrees with signed scalar division within two ULPs on Metal.
+Padding and outside-binding guard bytes remain exact. The existing Modular finalizer runs beside
+each F32 case with the same oracle and a successful status, covering its corrected signed source
+read. Host tests reject precision mismatch, overflowing rows and insufficient storage/dispatch/
+uniform limits, and Naga validates the new shader and 64-byte aligned uniform ABI.
 
 The six internal fixtures additionally run through a 40-byte stream cap (1024 bytes for the large
 transformed image). Every original plane, decoded sample count and absolute unaligned cursor is
@@ -1175,12 +1195,25 @@ reconstructs 27 constant samples from a zero-bit single-symbol Prefix descriptor
 unaligned starts, empty ranges, boundary lengths and a u32-sized entropy range described lazily
 without allocating its more than 134 million potential window records.
 
-The 2026-09-08 Apple M5/Metal validation covers all 268 decoder tests and 390 tests in the rest
+The bounded-global checkpoint on 2026-09-08 Apple M5/Metal covered 268 decoder tests and 390 tests in the rest
 of the workspace, plus warning-free Clippy/rustdoc, Rust 1.89, the six-crate WASM check, reference
 and Metal harness verification, and indexed codec/readback. GPU suites were validated serially.
 An earlier default-parallel decoder run failed two cancellation assertions and left several Metal
 waits pending; the complete 44-test `wgpu_gray8` target subsequently passed with
 `--test-threads=1`. Concurrent-suite stability remains unverified by this run.
+
+The scalar-output validation reproduced one cancellation assertion even with serial tests:
+the sequence test counted retained bytes after its own `Device::poll`, while the backend worker
+could still be executing callbacks extracted by a concurrent poll. The callbacks already release
+their job ownership before publishing completion. The test now waits for native poll permits to
+retire before asserting exactly the caller-held lease, then zero bytes after its release. This
+fixes the synchronization assumption without relaxing byte counts or changing production lifetime
+ownership; it does not establish the cause of the earlier pending Metal waits.
+
+The scalar-delivery checkpoint covers 273 decoder tests (272 in the full run plus the corrected
+cancellation test's targeted rerun) and 390 tests elsewhere in the workspace. One manual allocation
+benchmark remains ignored. Formatting, workspace check, warning-free Clippy/rustdoc, Rust 1.89,
+six-crate WASM, both 18-case reference/Metal harnesses and indexed codec/readback pass.
 
 | File | Encoded bytes after hex decoding | SHA-256 of encoded file |
 |---|---:|---|

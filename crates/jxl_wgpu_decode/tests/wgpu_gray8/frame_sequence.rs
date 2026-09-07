@@ -804,6 +804,24 @@ fn floating_frame_sequences_can_keep_codestream_coordinates() {
 
 #[test]
 fn sequence_admission_retries_and_cancellation_preserve_byte_and_frame_ownership() {
+    fn wait_for_callbacks(backend: &WgpuBackend) {
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .unwrap();
+        // Device::poll can return while another polling thread runs callbacks it already
+        // extracted. Abandoned prefetched frames retire in those callbacks; the native poll
+        // permit is released only after they return. Observe that boundary before counting leases.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while backend.submission_poller().in_flight() != 0 && std::time::Instant::now() < deadline {
+            backend.device().poll(wgpu::PollType::Poll).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(backend.submission_poller().in_flight(), 0);
+    }
     let Some(backend) = backend() else {
         return;
     };
@@ -851,13 +869,7 @@ fn sequence_admission_retries_and_cancellation_preserve_byte_and_frame_ownership
         let lease = frame.output().outputs[0].buffer.clone();
         drop(frame);
         drop(session);
-        backend
-            .device()
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .unwrap();
+        wait_for_callbacks(&backend);
         assert_eq!(
             decoder.incremental_input_budget().snapshot().reserved_bytes,
             0
@@ -873,24 +885,11 @@ fn sequence_admission_retries_and_cancellation_preserve_byte_and_frame_ownership
         let mut cancelled = incremental(&decoder, &encoded, request(&case));
         cancelled.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
         drop(cancelled);
-        backend
-            .device()
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .unwrap();
+        wait_for_callbacks(&backend);
         assert_eq!(
             decoder.incremental_input_budget().snapshot().reserved_bytes,
             0
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
-            && std::time::Instant::now() < deadline
-        {
-            backend.device().poll(wgpu::PollType::Poll).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
 }
