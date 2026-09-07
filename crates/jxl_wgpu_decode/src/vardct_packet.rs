@@ -1025,10 +1025,10 @@ impl BoundedVarDctPacketPlan {
                 .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                     field: "raw HF dequantization packet end",
                 })?;
-        if entropy_end < pending.side_image.token_bit_offset {
+        if entropy_end < pending.side_image.image.token_bit_offset {
             return Err(BoundedVarDctPacketError::HfContinuationBeforeLf {
                 cursor: entropy_end,
-                lf_start: pending.side_image.token_bit_offset,
+                lf_start: pending.side_image.image.token_bit_offset,
             });
         }
         if u64::from(entropy_end) > packet_end {
@@ -3130,14 +3130,18 @@ mod tests {
     fn libjxl_jpeg_transcode_exposes_a_general_modular_raw_matrix_plan() {
         let (_, plan, packet_end) = jpeg_transcode_raw_matrix_fixture();
 
-        assert_eq!(plan.stream_index, 4);
+        assert_eq!(plan.image.stream_index, 4);
         assert_eq!(
-            plan.final_planes.map(|plane| [plane.width, plane.height]),
+            plan.image
+                .final_planes
+                .iter()
+                .map(|plane| [plane.width, plane.height])
+                .collect::<Vec<_>>(),
             [[8, 8]; 3]
         );
-        assert_eq!(plan.decoded_words, 8 * 8 * 3);
+        assert_eq!(plan.image.decoded_words, 8 * 8 * 3);
         assert!((plan.denominator - 1.0 / 2040.0).abs() < 1e-7);
-        assert!(plan.token_bit_offset < packet_end);
+        assert!(plan.image.token_bit_offset < packet_end);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3234,9 +3238,9 @@ mod tests {
 
         let status = job.finish_status().unwrap();
         assert!(raw_matrix_status_ok(status.code));
-        assert_eq!(status.decoded_samples, plan.decoded_words);
+        assert_eq!(status.decoded_samples, plan.image.decoded_words);
         assert_eq!(status.expected_cursor, packet_end);
-        assert!((plan.token_bit_offset..=packet_end).contains(&status.cursor));
+        assert!((plan.image.token_bit_offset..=packet_end).contains(&status.cursor));
 
         let mapped = resource_staging.slice(..).get_mapped_range().unwrap();
         let actual = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped);
@@ -3246,7 +3250,8 @@ mod tests {
             .unwrap();
         let matrix_offset = layout.matrix_offsets[transform_index] as usize;
         let sample_count =
-            usize::try_from(plan.final_planes[0].width * plan.final_planes[0].height).unwrap();
+            usize::try_from(plan.image.final_planes[0].width * plan.image.final_planes[0].height)
+                .unwrap();
         let actual_matrix = &actual[matrix_offset..matrix_offset + sample_count];
         let initial_matrix = &initial_resources[matrix_offset..matrix_offset + sample_count];
         const CHROMA: [u32; 64] = [

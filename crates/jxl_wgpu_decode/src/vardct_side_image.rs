@@ -5,15 +5,10 @@
 //! metadata begins. This module lowers that local header into the same topology, MA-tree,
 //! previous-channel reference, and inverse-transform contracts used by the main Modular decoder.
 
-use crate::modular_inverse::{ModularInversePlan, plan_modular_inverse};
-use crate::modular_transform::{
-    GpuModularChannelLayout, ModularChannelTopology, ModularTransformLimits,
-    PackedModularChannelMetadata, parse_modular_transforms,
-};
-use crate::modular_tree::{
-    BitInput, MaConfigIr, MaTreeLimits, PackedModularMetadata, WpHeaderIr, parse_ma_config,
-};
-use crate::vardct_frontend::{metadata_bool, metadata_f16};
+use crate::modular_side_image::ModularSideImagePlan;
+use crate::modular_transform::{ModularChannelTopology, ModularTransformLimits};
+use crate::modular_tree::{BitInput, MaConfigIr};
+use crate::vardct_frontend::metadata_f16;
 use crate::vardct_packet::BoundedVarDctPacketError;
 
 const RAW_MATRIX_COUNT: usize = 17;
@@ -22,19 +17,8 @@ const RAW_MATRIX_COUNT: usize = 17;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawHfDequantSideImagePlan {
     pub matrix_index: usize,
-    pub bit_depth: u32,
     pub denominator: f32,
-    pub stream_index: u32,
-    pub token_bit_offset: u32,
-    pub wp_header: WpHeaderIr,
-    pub metadata: Vec<u32>,
-    pub needs_self_correcting: bool,
-    pub channel_metadata: PackedModularChannelMetadata,
-    pub inverse_plan: ModularInversePlan,
-    pub final_planes: [GpuModularChannelLayout; 3],
-    pub decoded_words: u32,
-    pub maximum_width: u32,
-    pub lz77_window_words: u32,
+    pub image: ModularSideImagePlan,
 }
 
 impl RawHfDequantSideImagePlan {
@@ -59,67 +43,6 @@ impl RawHfDequantSideImagePlan {
             });
         }
 
-        let use_global_tree = metadata_bool(reader, "raw HF dequantization matrix MA tree")?;
-        let wp_header = WpHeaderIr::parse(reader).map_err(map_modular_error)?;
-        let limits = ModularTransformLimits::default();
-        let initial_topology =
-            ModularChannelTopology::full_resolution(width, height, bit_depth, 3, limits)
-                .map_err(map_modular_error)?;
-        let transform_plan = parse_modular_transforms(reader, initial_topology, limits)
-            .map_err(map_modular_error)?;
-        let ma_config = if use_global_tree {
-            global_ma_config
-                .ok_or(BoundedVarDctPacketError::MissingGlobalMaTree {
-                    stage: "raw HF dequantization matrix",
-                })?
-                .clone()
-        } else {
-            parse_ma_config(reader, MaTreeLimits::default()).map_err(map_modular_error)?
-        };
-        let token_bit_offset = u32::try_from(reader.bit_offset()).map_err(|_| {
-            BoundedVarDctPacketError::ArithmeticOverflow {
-                field: "raw HF dequantization matrix entropy bit offset",
-            }
-        })?;
-        let channel_metadata = transform_plan
-            .topology
-            .gpu_entropy_channels(ma_config.maximum_tree_property())
-            .map_err(map_modular_error)?;
-        let decoded_words = channel_metadata
-            .channels
-            .last()
-            .map_or(0, |channel| channel.decoded_end);
-        let maximum_width = channel_metadata
-            .channels
-            .iter()
-            .map(|channel| channel.width)
-            .max()
-            .ok_or(BoundedVarDctPacketError::HfDequantMatrixValue {
-                matrix: matrix_index,
-                reason: "raw Modular topology has no entropy channels",
-            })?;
-        let inverse_plan = plan_modular_inverse(&transform_plan).map_err(map_modular_error)?;
-        let final_planes: [GpuModularChannelLayout; 3] = inverse_plan
-            .final_gpu_layouts()
-            .try_into()
-            .map_err(|_| BoundedVarDctPacketError::HfDequantMatrixValue {
-                matrix: matrix_index,
-                reason: "raw Modular inverse does not produce three channels",
-            })?;
-        if final_planes.iter().any(|plane| {
-            plane.width != width || plane.height != height || plane.hshift != 0 || plane.vshift != 0
-        }) {
-            return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
-                matrix: matrix_index,
-                reason: "raw Modular inverse does not restore the matrix extent",
-            });
-        }
-        let lz77_window_words = ma_config
-            .entropy
-            .lz77_window_words(maximum_width, decoded_words)
-            .map_err(map_modular_error)?;
-        let PackedModularMetadata { words: metadata } =
-            ma_config.pack_gpu_metadata().map_err(map_modular_error)?;
         let low_frequency_group_count = u32::try_from(low_frequency_group_count).map_err(|_| {
             BoundedVarDctPacketError::ArithmeticOverflow {
                 field: "raw HF dequantization matrix LF-group count",
@@ -133,27 +56,48 @@ impl RawHfDequantSideImagePlan {
                 field: "raw HF dequantization matrix stream index",
             })?;
 
+        let topology = ModularChannelTopology::full_resolution(
+            width,
+            height,
+            bit_depth,
+            3,
+            ModularTransformLimits::default(),
+        )
+        .map_err(map_modular_error)?;
+        let image = ModularSideImagePlan::parse(
+            reader,
+            topology,
+            bit_depth,
+            stream_index,
+            global_ma_config,
+        )
+        .map_err(map_modular_error)?;
+        if image.final_planes.len() != 3
+            || image.final_planes.iter().any(|plane| {
+                plane.width != width
+                    || plane.height != height
+                    || plane.hshift != 0
+                    || plane.vshift != 0
+            })
+        {
+            return Err(BoundedVarDctPacketError::HfDequantMatrixValue {
+                matrix: matrix_index,
+                reason: "raw Modular inverse does not restore the matrix extent",
+            });
+        }
         Ok(Self {
             matrix_index,
-            bit_depth,
             denominator,
-            stream_index,
-            token_bit_offset,
-            wp_header,
-            metadata,
-            needs_self_correcting: ma_config.needs_self_correcting(),
-            channel_metadata,
-            inverse_plan,
-            final_planes,
-            decoded_words,
-            maximum_width,
-            lz77_window_words,
+            image,
         })
     }
 }
 
 fn map_modular_error(error: crate::Error) -> BoundedVarDctPacketError {
     match error {
+        crate::Error::MissingGlobalMaTree { .. } => BoundedVarDctPacketError::MissingGlobalMaTree {
+            stage: "raw HF dequantization matrix",
+        },
         crate::Error::Bitstream(source) => BoundedVarDctPacketError::Bitstream(source),
         source => BoundedVarDctPacketError::ModularTree(source.to_string()),
     }
@@ -234,16 +178,20 @@ mod tests {
                 .unwrap();
 
         assert_eq!(plan.matrix_index, 6);
-        assert_eq!(plan.stream_index, 22);
-        assert_eq!(plan.token_bit_offset, 20);
+        assert_eq!(plan.image.stream_index, 22);
+        assert_eq!(plan.image.token_bit_offset, 20);
         assert_eq!(
-            plan.final_planes.map(|plane| [plane.width, plane.height]),
+            plan.image
+                .final_planes
+                .iter()
+                .map(|plane| [plane.width, plane.height])
+                .collect::<Vec<_>>(),
             [[16, 8]; 3]
         );
-        assert_eq!(plan.decoded_words, 16 * 8 * 3);
-        assert_eq!(plan.maximum_width, 16);
-        assert_eq!(plan.inverse_plan.jobs(), &[]);
-        assert!(!plan.needs_self_correcting);
+        assert_eq!(plan.image.decoded_words, 16 * 8 * 3);
+        assert_eq!(plan.image.maximum_width, 16);
+        assert_eq!(plan.image.inverse_plan.jobs(), &[]);
+        assert!(!plan.image.needs_self_correcting);
     }
 
     #[test]

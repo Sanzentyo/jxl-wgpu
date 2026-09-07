@@ -38,6 +38,7 @@ mod modular_finalize;
 mod modular_inverse;
 mod modular_palette;
 pub mod modular_rct;
+mod modular_side_image;
 pub mod modular_squeeze;
 mod modular_transform;
 mod modular_tree;

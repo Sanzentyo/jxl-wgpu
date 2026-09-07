@@ -1112,3 +1112,50 @@ composition remain full-format gates. WebGPU evidence is compilation only.
 | `extras_gray_alpha.jxl.hex` | 4165 | `7dc247d04103486429dde631fd522e276657ec3fe837af2071aec766389ddab2` |
 | `extras_rgba.jxl.hex` | 8251 | `ebd817ddfb26ee8e07c3af133e5d7b19a3f534b40051a1bac41d7f8284c1a79d` |
 | `extras_transformed.jxl.hex` | 769485 | `a352bd19c118c5704a99455144b95910abe352cd14f62402ab9469c38371d57b` |
+
+## Resident VarDCT Modular substream staging
+
+`generate_extra_channels.c OUTPUT_DIRECTORY --vardct` uses libjxl 0.12.0 to generate six
+VarDCT streams at distance 1 with lossless extra channels (distance 0). Original integer depths,
+extra types/names, source formulas and spot/CFA metadata are the same as the Modular extra corpus
+above. The first five cases use effort 1 and the final case effort 7; patches are disabled. All
+six have a single TOC entry and their extra samples reside in the global Modular substream.
+
+| Suffix | Original extent and color depth | Extras | Orientation | Token start / ending cursor in codestream bits | Entropy samples / meta channels |
+|---|---|---|---:|---|---|
+| `data_only` | 17×1 RGB8 | Depth16, SelectionMask1 | 6 | 910 / 1243 | 45 / 1 |
+| `rgb12` | 33×7 RGB12 | Nine planes listed above | 6 | 2393 / 18537 | 2079 / 0 |
+| `gray8` | 33×7 Gray8 | Nine planes listed above | 8 | 2408 / 18732 | 2079 / 0 |
+| `gray_alpha` | 37×9 Gray16 | Alpha5 | 5 | 812 / 2430 | 333 / 0 |
+| `rgba` | 63×9 RGB8 | Alpha5 | 3 | 885 / 3436 | 567 / 0 |
+| `transformed` | 127×129 RGB12 | Nine planes listed above | 7 | 24012 / 551118 | 148077 / 2 |
+
+`wgpu_engine::side_image::modular::tests` parses only bounded header/MA/transform descriptors,
+then uses the same resident executor as the production raw matrix path. All extra integer planes
+equal the deterministic original codes exactly. Once normalized by each declaration's maximum,
+they agree with both Rust `jxl` 0.6.0 and optional native libjxl within `2e-7` absolute. The shared
+test-only CPU helpers are in `tests/common/extra_channel_oracle.rs`; orientation is reversed only
+for reference lookup, while the resident planes remain in codestream coordinates.
+
+The GPU validates entropy termination and returns an absolute bit cursor without byte alignment;
+the following LF header is parsed at that cursor. The 17×1 case has a two-channel Palette, and
+the effort-7 case has Palette metadata planes of widths 502 and 128. Meta channels always belong
+to the global substream, including widths beyond a 256-pixel pass group. These fixtures therefore
+exercise one-, two- and nine-plane outputs and inverse Palette reconstruction independently of
+the raw-matrix three-plane overlay. Core buffer/uniform bytes match the precomputed reservation,
+and all reserved bytes are released after completion. Apple M5/Metal is the executed adapter.
+
+This is internal substream evidence. Public VarDCT extra-channel decode is still rejected; the
+pre-LF continuation, LF/AC-group distribution, progressive passes, output/alpha binding, scalar
+delivery, and session cancellation/admission remain integration gates. The test-only readback
+does not introduce a CPU image path or bypass public profile admission. Production raw matrix
+execution retains its existing public pixel-oracle, memory and continuation tests.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `vardct_extras_data_only.jxl.hex` | 293 | `29c6d297ca5dcb8e70f508fac4df01eae85487bf7b1923dc52d5121905ccc084` |
+| `vardct_extras_gray8.jxl.hex` | 2616 | `e4291f404b542f7f376346e506976463401aaf0aeddca95155ef9ba4abcdce81` |
+| `vardct_extras_gray_alpha.jxl.hex` | 465 | `719ebc5ebcadeb5b484bf1465b8558907b54996aa1bce2f0b00d53cc5d80d00f` |
+| `vardct_extras_rgb12.jxl.hex` | 2634 | `235ee8ec0156ded99ecd66281d12747429053a710a8f50494cb39808333e2db4` |
+| `vardct_extras_rgba.jxl.hex` | 1607 | `d0e532f5d2eec3aa2a9465332a0743b927f2c72d0bdabbfd42a6c93685353c3f` |
+| `vardct_extras_transformed.jxl.hex` | 81790 | `c5af1524af32e6ec9d87bc66118d37551a51615a6c22c902c41a05f61742359f` |

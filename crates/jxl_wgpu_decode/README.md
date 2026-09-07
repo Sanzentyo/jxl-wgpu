@@ -409,6 +409,22 @@ separable quarter/three-quarter JPEG upsampling with replicated edges followed b
 YCbCr-to-RGB conversion. Actual-GPU RGB8 differs from Rust `jxl` and optional `djxl` by at most one
 code. A local-tree raw conformance fixture, uncommon asymmetric component sampling, and subsampled
 restoration remain gaps.
+
+`ModularSideImagePlan` and `wgpu_engine::side_image::modular` now own the shared substream
+descriptor, entropy/inverse recording, exact allocation size and mapped absolute cursor. The
+raw-matrix layer supplies only its denominator, alias targets and overlay. Recording keeps the
+resident arena available to a downstream consumer before the final status copy; arbitrary
+one-, two-, three- or many-plane topologies share the same descriptor-based GPU executor.
+The common executor retains original samples as signed integer words and performs no color
+conversion. The 256-byte entropy ABI, 16-byte status and 64-byte matrix overlay ABI are unchanged.
+
+Six VarDCT fixtures from `generate_extra_channels.c --vardct` exercise the shared substream
+executor directly. Every global extra plane matches its deterministic original integer codes;
+normalized values match Rust `jxl` and libjxl within `2e-7`. Coverage includes eight extra types,
+multiple alpha, independent depths, Gray+alpha, a Palette with a 502-sample metadata channel, and
+the unpadded bit cursor of the following LF header. This establishes internal staging evidence.
+The public VarDCT producer still rejects extra channels while pre-LF scheduling, LF/AC-group
+distribution, resident color/alpha binding and scalar delivery are being connected.
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic

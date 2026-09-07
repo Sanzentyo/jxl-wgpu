@@ -1,12 +1,15 @@
 /* Offline libjxl 0.12 fixture generator; production never links this CPU codec.
  * cc generate_extra_channels.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-extras
- * /tmp/jxl-extras OUTPUT_DIRECTORY
+ * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+static int vardct;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static const JxlExtraChannelType types[] = {
@@ -29,7 +32,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   JxlBasicInfo info; JxlEncoderInitBasicInfo(&info);
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
   info.num_color_channels = colors; info.num_extra_channels = extras;
-  info.uses_original_profile = JXL_TRUE; info.orientation = (JxlOrientation)orientation;
+  info.uses_original_profile = !vardct; info.orientation = (JxlOrientation)orientation;
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
     JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : types[c], &ec);
@@ -44,9 +47,12 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderSetColorEncoding(enc, &color));
   JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, NULL);
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, effort));
-  check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, 1));
+  check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
-  check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
+  if (vardct) {
+    check(JxlEncoderSetFrameDistance(settings, 1.0f));
+    for (uint32_t c=0; c<extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0.0f));
+  } else check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
   size_t pixels = (size_t)width * height;
   float* data = malloc(pixels * colors * sizeof(float));
   if (!data) exit(2);
@@ -61,7 +67,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     check(JxlEncoderSetExtraChannelBuffer(settings, &format, data, pixels * sizeof(float), c));
   }
   free(data); JxlEncoderCloseInput(enc);
-  char path[1024]; snprintf(path, sizeof(path), "%s/extras_%s.jxl.hex", dir, name);
+  char path[1024]; snprintf(path, sizeof(path), "%s/%sextras_%s.jxl.hex", dir, vardct ? "vardct_" : "", name);
   FILE* out = fopen(path, "w"); if (!out) exit(2);
   JxlEncoderStatus status; size_t written = 0;
   do {
@@ -80,7 +86,17 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) return 2;
+  if (argc != 2 && (argc != 3 || strcmp(argv[2], "--vardct"))) return 2;
+  vardct = argc == 3;
+  if (vardct) {
+    generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0);
+    generate(argv[1], "rgb12", 33, 7, 3, 12, 9, 6, 1, 0);
+    generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0);
+    generate(argv[1], "gray_alpha", 37, 9, 1, 16, 1, 5, 1, 1);
+    generate(argv[1], "rgba", 63, 9, 3, 8, 1, 3, 1, 1);
+    generate(argv[1], "transformed", 127, 129, 3, 12, 9, 7, 7, 0);
+    return 0;
+  }
   generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0);
   generate(argv[1], "rgb12", 259, 17, 3, 12, 9, 6, 1, 0);
   generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0);

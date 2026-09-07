@@ -3688,8 +3688,8 @@ fn validate_raw_hf_dequant_status(
         });
     }
     if !raw_matrix_status_ok(status.code)
-        || status.decoded_samples != plan.decoded_words
-        || status.cursor < plan.token_bit_offset
+        || status.decoded_samples != plan.image.decoded_words
+        || status.cursor < plan.image.token_bit_offset
         || status.cursor > packet_end
         || status.expected_cursor != packet_end
     {
@@ -3697,7 +3697,7 @@ fn validate_raw_hf_dequant_status(
             matrix: plan.matrix_index,
             code: status.code,
             decoded_samples: status.decoded_samples,
-            expected_samples: plan.decoded_words,
+            expected_samples: plan.image.decoded_words,
             cursor: status.cursor,
             expected_cursor: status.expected_cursor,
         });

@@ -434,6 +434,22 @@ copy of only the current HF-global packet
 range; its bytes are included in the same permit, and mapped cursors are rebased to absolute
 codestream bits before parsing resumes.
 
+The common `ModularSideImagePlan` separates image geometry, transformed meta-channel count,
+MA/channel descriptors, original plane views, inverse jobs and entropy bounds from the raw-matrix
+denominator and targets. `wgpu_engine::side_image::modular` records entropy plus inverse jobs into
+one encoder and leaves the resident arena and sticky status available for a subsequent consumer.
+Finishing recording copies the final status and owns the command buffer. The raw-matrix wrapper
+adds its overlay to that encoder and retains/charges exactly its 64-byte uniform; existing stage
+admission and callback lifetimes are preserved. The common arena also permits GPU copies for
+downstream plane delivery. Its contents stay integer words, without sample normalization or color
+conversion. No WGSL record size, binding count, workgroup memory or matrix submission count changes.
+
+The internal VarDCT global-extra differential uses the same production executor with one, two or
+nine final planes, including Palette metadata wider than 256 samples. Core allocations exactly
+match the admitted byte count and release at job completion; test-only source/readback buffers
+are outside that core reservation. Public extra-channel session admission, cancellation and
+multi-section retention still require integration and separate conformance evidence.
+
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,
 Weighted-predictor, and aligned execution-state tail. Pass-group lanes copy only validated row
