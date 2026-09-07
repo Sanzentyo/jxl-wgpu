@@ -48,6 +48,23 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
 pub enum VarDctDecodeError {
+    #[error(
+        "global Modular entropy needs a {required_bytes}-byte binding, exceeding the {limit_bytes}-byte window cap; its window continuation is not yet connected"
+    )]
+    GlobalModularWindow {
+        required_bytes: u64,
+        limit_bytes: u64,
+    },
+    #[error(
+        "global Modular entropy failed with code {code}, {decoded_samples}/{expected_samples} samples at bit {cursor}/{packet_end}"
+    )]
+    GlobalModularStatus {
+        code: u32,
+        decoded_samples: u32,
+        expected_samples: u32,
+        cursor: u32,
+        packet_end: u32,
+    },
     #[error("the VarDCT engine requires a color output mapping")]
     UnsupportedOutput,
     #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]

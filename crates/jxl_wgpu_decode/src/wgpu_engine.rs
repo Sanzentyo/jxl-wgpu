@@ -10,8 +10,9 @@ mod types;
 
 pub use session::{WgpuDecodeSession, WgpuPendingFrame};
 pub(crate) use side_image::{
-    RawHfDequantSideImageJob, RawHfDequantSideImagePipeline, RawHfDequantSideImageStatus,
-    raw_matrix_status_ok, raw_matrix_value_error,
+    ModularSideImageJob, ModularSideImagePipeline, RawHfDequantSideImageJob,
+    RawHfDequantSideImagePipeline, RawHfDequantSideImageStatus, raw_matrix_status_ok,
+    raw_matrix_value_error,
 };
 pub use types::WgpuSubmissionEngine;
 pub use types::{

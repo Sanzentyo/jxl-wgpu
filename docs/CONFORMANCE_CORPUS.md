@@ -504,7 +504,7 @@ and explicit-sRGB `djxl` PFM is independently converted by the development-only 
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
 
 Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
-cap. Exact layout metadata, shared 320-byte output/source uniform accounting, four-byte-rounded
+cap. Exact layout metadata, shared 336-byte output/source uniform accounting, four-byte-rounded
 output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
 budget release are required. Comparisons operate on stored sample codes rather than individual
 bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
@@ -1115,11 +1115,11 @@ composition remain full-format gates. WebGPU evidence is compilation only.
 
 ## Resident VarDCT Modular substream staging
 
-`generate_extra_channels.c OUTPUT_DIRECTORY --vardct` uses libjxl 0.12.0 to generate six
+`generate_extra_channels.c OUTPUT_DIRECTORY --vardct` uses libjxl 0.12.0 to generate seven
 VarDCT streams at distance 1 with lossless extra channels (distance 0). Original integer depths,
 extra types/names, source formulas and spot/CFA metadata are the same as the Modular extra corpus
-above. The first five cases use effort 1 and the final case effort 7; patches are disabled. All
-six have a single TOC entry and their extra samples reside in the global Modular substream.
+above. The first five cases use effort 1 and the transformed/progressive cases effort 7; patches are disabled.
+The original six have a single TOC entry and their extra samples reside in the global Modular substream.
 
 | Suffix | Original extent and color depth | Extras | Orientation | Token start / ending cursor in codestream bits | Entropy samples / meta channels |
 |---|---|---|---:|---|---|
@@ -1145,11 +1145,25 @@ exercise one-, two- and nine-plane outputs and inverse Palette reconstruction in
 the raw-matrix three-plane overlay. Core buffer/uniform bytes match the precomputed reservation,
 and all reserved bytes are released after completion. Apple M5/Metal is the executed adapter.
 
-This is internal substream evidence. Public VarDCT extra-channel decode is still rejected; the
-pre-LF continuation, LF/AC-group distribution, progressive passes, output/alpha binding, scalar
-delivery, and session cancellation/admission remain integration gates. The test-only readback
-does not introduce a CPU image path or bypass public profile admission. Production raw matrix
-execution retains its existing public pixel-oracle, memory and continuation tests.
+`tests/vardct_engine_gpu/extra_channels.rs` now also drives all six through the public decoder.
+It adds `rgba_progressive` (63×9 RGB8+Alpha5, orientation 2, effort 7, `PROGRESSIVE_AC=1`), whose
+independent LF-global section exercises byte-padding validation before multi-pass color decoding.
+All seven use blocking Apply and fragmented asynchronous Keep, preserve exact extra-channel
+metadata and actual color depth, and reconstruct F32 RGBA against Rust `jxl` and native libjxl.
+Observed Rust color maxAE is at most `3.37e-5` in encoded sRGB; first-alpha F32 values agree exactly
+on Apple M5/Metal. The test thresholds are `3e-4` for Rust color, `2e-3` for native color and `2e-7`
+for alpha. The standalone output test additionally supplies negative/overshoot signed Alpha5
+samples at a nonzero word offset across all eight orientations and both single-pixel axes; F32
+retains signed normalization and U8 clamps during packing rather than wrapping by a depth mask.
+
+Memory tests check exact initial reservation, typed caller-window/budget rejection, backpressure
+without consuming the source, canceled callback ownership, retry and final release. A corruption
+fixture zeroes only entropy bits 885..3436 of `rgba`, preserving both descriptors and later color
+data; GPU status rejects it before a color plan or frame is exposed. Color planning remains absent
+until global cursor validation; later LF/HF descriptors retain their separately admitted dynamic
+bytes. Public scalar extra delivery, LF/AC-distributed or shifted samples, associated alpha and
+window continuation inside this global substream remain gaps. No production picture data or
+entropy token crosses to a CPU decoder.
 
 | File | Encoded bytes after hex decoding | SHA-256 of encoded file |
 |---|---:|---|
@@ -1159,3 +1173,4 @@ execution retains its existing public pixel-oracle, memory and continuation test
 | `vardct_extras_rgb12.jxl.hex` | 2634 | `235ee8ec0156ded99ecd66281d12747429053a710a8f50494cb39808333e2db4` |
 | `vardct_extras_rgba.jxl.hex` | 1607 | `d0e532f5d2eec3aa2a9465332a0743b927f2c72d0bdabbfd42a6c93685353c3f` |
 | `vardct_extras_transformed.jxl.hex` | 81790 | `c5af1524af32e6ec9d87bc66118d37551a51615a6c22c902c41a05f61742359f` |
+| `vardct_extras_rgba_progressive.jxl.hex` | 1531 | `5151de6b5f7826080cc0f520b3e9ef6d469043463db26d1bf2ae91b73d7bcf81` |

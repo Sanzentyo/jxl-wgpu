@@ -22,8 +22,9 @@ use crate::{
     PreparedGpuSession, Result as DecodeResult,
 };
 
-use super::execution::{VarDctDecodeSession, VarDctRuntimeStats};
-use super::source::{VarDctPrepareOptions, VarDctSource, prepare_source};
+use super::execution::{ColorDecodeSession, VarDctRuntimeStats};
+use super::source::{VarDctPrepareOptions, VarDctSource, prepare_packet_source};
+use super::staging::VarDctDecodeSession;
 use super::types::{VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
 
 pub(super) struct VarDctPipelines {
@@ -115,9 +116,9 @@ fn resolve_kernel_variant(
 /// GPU-only submission engine for the bounded standard regular-VarDCT profile.
 #[derive(Clone)]
 pub struct VarDctSubmissionEngine {
-    backend: WgpuBackend,
-    pipelines: Arc<VarDctPipelines>,
-    memory: MemoryBudget,
+    pub(super) backend: WgpuBackend,
+    pub(super) pipelines: Arc<VarDctPipelines>,
+    pub(super) memory: MemoryBudget,
     stream_window_limit: Option<NonZeroU64>,
 }
 
@@ -185,19 +186,12 @@ impl VarDctSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        let source = prepare_source(
-            &self.backend,
+        self.open_role(
             codestream,
             request,
             inventory,
-            VarDctPrepareOptions {
-                output_variant: self.pipelines.output_variant,
-                stream_window_limit: self.stream_window_limit,
-                memory_limit_bytes: self.memory.snapshot().limit_bytes,
-                role: crate::vardct_frontend::VarDctFrameRole::Presentation,
-            },
-        )?;
-        self.open_source(source)
+            crate::vardct_frontend::VarDctFrameRole::Presentation,
+        )
     }
 
     pub(crate) fn open_progressive_dc_with_inventory_data(
@@ -207,23 +201,16 @@ impl VarDctSubmissionEngine {
         inventory: &CodestreamInventory,
         is_final: bool,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        let source = prepare_source(
-            &self.backend,
+        self.open_role(
             codestream,
             request,
             inventory,
-            VarDctPrepareOptions {
-                output_variant: self.pipelines.output_variant,
-                stream_window_limit: self.stream_window_limit,
-                memory_limit_bytes: self.memory.snapshot().limit_bytes,
-                role: if is_final {
-                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
-                } else {
-                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
-                },
+            if is_final {
+                crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
+            } else {
+                crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
             },
-        )?;
-        self.open_source(source)
+        )
     }
 
     pub(crate) fn open_frame_with_inventory_data(
@@ -232,19 +219,47 @@ impl VarDctSubmissionEngine {
         request: &GpuOutputRequest,
         inventory: &CodestreamInventory,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        let source = prepare_source(
-            &self.backend,
+        self.open_role(
             codestream,
             request,
             inventory,
-            VarDctPrepareOptions {
-                output_variant: self.pipelines.output_variant,
-                stream_window_limit: self.stream_window_limit,
-                memory_limit_bytes: self.memory.snapshot().limit_bytes,
-                role: crate::vardct_frontend::VarDctFrameRole::Frame,
-            },
-        )?;
-        self.open_source(source)
+            crate::vardct_frontend::VarDctFrameRole::Frame,
+        )
+    }
+
+    fn open_role(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+        role: crate::vardct_frontend::VarDctFrameRole,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        let options = VarDctPrepareOptions {
+            output_variant: self.pipelines.output_variant,
+            stream_window_limit: self.stream_window_limit,
+            memory_limit_bytes: self.memory.snapshot().limit_bytes,
+        };
+        match crate::vardct_packet::BoundedVarDctPacketPlan::begin_frame_source(
+            &codestream,
+            inventory,
+            role,
+        )
+        .map_err(VarDctDecodeError::from)?
+        {
+            crate::vardct_packet::VarDctPacketPreparation::Ready(packet) => {
+                self.open_source(prepare_packet_source(
+                    &self.backend,
+                    codestream,
+                    request,
+                    inventory,
+                    options,
+                    *packet,
+                )?)
+            }
+            crate::vardct_packet::VarDctPacketPreparation::GlobalModular(packet) => {
+                VarDctDecodeSession::global(self, codestream, inventory, request, *packet, options)
+            }
+        }
     }
 
     fn open_source(
@@ -252,7 +267,9 @@ impl VarDctSubmissionEngine {
         source: VarDctSource,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
         let extent = source.layout.extent;
-        let profile = DecodeProfile::VarDct { bits_per_sample: 8 };
+        let profile = DecodeProfile::VarDct {
+            bits_per_sample: source.packet.profile.bits_per_sample as u8,
+        };
         let submissions_per_frame = source.submissions_per_frame();
         let runtime_stats = Arc::new(VarDctRuntimeStats {
             submissions_per_frame: Arc::new(AtomicUsize::new(submissions_per_frame)),
@@ -261,14 +278,14 @@ impl VarDctSubmissionEngine {
         Ok(PreparedGpuSession::new(
             profile,
             AnimationMetadata::still(extent),
-            VarDctDecodeSession {
+            VarDctDecodeSession::ready(ColorDecodeSession {
                 backend: self.backend.clone(),
                 pipelines: Arc::clone(&self.pipelines),
                 memory_stats: source.memory,
                 runtime_stats,
                 source: Some(source),
                 memory: self.memory.clone(),
-            },
+            }),
         )
         .with_resolved_frame_slots(NonZeroUsize::new(1).expect("one is nonzero")))
     }

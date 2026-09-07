@@ -58,6 +58,14 @@ pub enum UnsupportedVarDctPacketFeature {
 /// Host-side failure before image entropy is submitted to the GPU.
 #[derive(Debug, Error)]
 pub enum BoundedVarDctPacketError {
+    #[error("global Modular image entropy requires GPU cursor continuation before LF parsing")]
+    GlobalModularRequiresGpu,
+    #[error("VarDCT extra-channel LF/AC group distribution is not yet connected")]
+    DistributedModularExtras,
+    #[error("VarDCT extra-channel resampling and LF-frame reuse are not yet connected")]
+    GlobalModularGeometry,
+    #[error("global Modular entropy leaves non-padding data in LF-global")]
+    GlobalModularTrailingBits,
     #[error(transparent)]
     Frontend(#[from] VarDctFrontendError),
     #[error(transparent)]
@@ -418,106 +426,80 @@ fn pack_modular_plan(
     })
 }
 
-impl BoundedVarDctPacketPlan {
-    /// Parses bounded scalar metadata only. Image symbols remain encoded for the GPU.
-    pub fn parse(
-        codestream: &[u8],
-        inventory: &CodestreamInventory,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(
-            PacketSource::Slice(codestream),
-            inventory,
-            crate::vardct_frontend::VarDctFrameRole::Presentation,
-        )
-    }
+pub(crate) enum VarDctPacketPreparation {
+    Ready(Box<BoundedVarDctPacketPlan>),
+    GlobalModular(Box<PendingGlobalModular>),
+}
 
-    /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
-    pub(crate) fn parse_source(
-        source: &GpuCodestream,
-        inventory: &CodestreamInventory,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(
-            PacketSource::Spans(source),
-            inventory,
-            crate::vardct_frontend::VarDctFrameRole::Presentation,
-        )
-    }
+struct VarDctPacketPrefix {
+    profile: StandardVarDctProfile,
+    lf_global_packet: BitRange,
+    lf_group_packets: Vec<BitRange>,
+    hf_global: Option<BitRange>,
+    pass_groups: Vec<BitRange>,
+    lf_global: LfGlobalPrefix,
+    global_ma_config: Option<MaConfigIr>,
+    lf_global_end: u64,
+}
 
-    pub(crate) fn parse_frame_source(
-        source: &GpuCodestream,
-        inventory: &CodestreamInventory,
-        role: crate::vardct_frontend::VarDctFrameRole,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, role)
-    }
+pub(crate) struct PendingGlobalModular {
+    prefix: VarDctPacketPrefix,
+    pub(crate) image: crate::modular_side_image::ModularSideImagePlan,
+}
 
-    fn parse_inner(
-        source: PacketSource<'_>,
-        inventory: &CodestreamInventory,
-        role: crate::vardct_frontend::VarDctFrameRole,
-    ) -> Result<Self, BoundedVarDctPacketError> {
-        let profile = StandardVarDctProfile::negotiate_for_role(inventory, role)?;
-        if !(1..=16).contains(&profile.bits_per_sample)
-            || (profile.color_transform == VarDctColorTransform::Ycbcr
-                && profile.bits_per_sample != 8)
-        {
-            return Err(UnsupportedVarDctPacketFeature::BitDepth {
-                bits_per_sample: profile.bits_per_sample,
-                color_transform: profile.color_transform,
+impl PendingGlobalModular {
+    pub(crate) fn profile(&self) -> &StandardVarDctProfile {
+        &self.prefix.profile
+    }
+    pub(crate) fn packet_end(&self) -> Result<u32, BoundedVarDctPacketError> {
+        u32::try_from(self.prefix.lf_global_end).map_err(|_| {
+            BoundedVarDctPacketError::ArithmeticOverflow {
+                field: "global Modular packet end",
             }
-            .into());
-        }
-        let (lf_global_packet, lf_group_packets, hf_global, pass_groups) = match &profile.sections {
-            VarDctSectionLayout::Single { packet } => {
-                if profile.low_frequency_group_count != 1 {
-                    return Err(
-                        UnsupportedVarDctPacketFeature::CombinedPacketMultipleLfGroups.into(),
-                    );
-                }
-                (*packet, vec![*packet], None, Vec::new())
-            }
-            VarDctSectionLayout::Sections {
-                lf_global,
-                lf_groups,
-                hf_global,
-                pass_groups,
-            } => (
-                *lf_global,
-                lf_groups.clone(),
-                Some(*hf_global),
-                pass_groups.clone(),
-            ),
-        };
-        let lf_global_end =
-            lf_global_packet
-                .end()
-                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "LF-global end",
-                })?;
-        validate_source_packet_end(source, lf_global_end)?;
-        let mut lf_global_reader = source_reader_at(source, lf_global_packet.offset)?;
-        let lf_global = LfGlobalPrefix::parse_reader(&mut lf_global_reader, lf_global_end)?;
-        let (global_ma_config, descriptor_end) =
-            if let Some(tree_offset) = lf_global.global_ma_tree_bit_offset {
-                let mut tree_reader = source_reader_at(source, tree_offset)?;
-                let (config, end) = parse_ma_config_at_reader(&mut tree_reader, lf_global_end)?;
-                (Some(config), end)
-            } else {
-                (None, lf_global.suffix_bit_offset)
-            };
-        let lf_global_end =
-            lf_global_packet
-                .end()
-                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
-                    field: "LF-global end",
-                })?;
-        if descriptor_end > lf_global_end {
+        })
+    }
+    pub(crate) fn resume(
+        self,
+        source: &GpuCodestream,
+        cursor: u32,
+    ) -> Result<BoundedVarDctPacketPlan, BoundedVarDctPacketError> {
+        let cursor = u64::from(cursor);
+        if cursor < u64::from(self.image.token_bit_offset) || cursor > self.prefix.lf_global_end {
             return Err(VarDctPacketError::PacketBoundary {
-                cursor: descriptor_end,
-                packet_end: lf_global_end,
+                cursor,
+                packet_end: self.prefix.lf_global_end,
             }
             .into());
         }
+        if self.prefix.hf_global.is_some()
+            && (cursor.div_ceil(8) * 8 != self.prefix.lf_global_end
+                || !source
+                    .bits_are_zero(cursor, self.prefix.lf_global_end)
+                    .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?)
+        {
+            return Err(BoundedVarDctPacketError::GlobalModularTrailingBits);
+        }
+        self.prefix.finish(PacketSource::Spans(source), cursor)
+    }
+}
+
+impl VarDctPacketPrefix {
+    fn finish(
+        self,
+        source: PacketSource<'_>,
+        modular_end: u64,
+    ) -> Result<BoundedVarDctPacketPlan, BoundedVarDctPacketError> {
+        let Self {
+            profile,
+            lf_global_packet,
+            lf_group_packets,
+            hf_global,
+            pass_groups,
+            lf_global,
+            global_ma_config,
+            lf_global_end: _,
+        } = self;
+        let descriptor_end = modular_end;
         let words = global_ma_config
             .as_ref()
             .map(pack_ma_metadata)
@@ -757,7 +739,7 @@ impl BoundedVarDctPacketPlan {
                 .as_ref()
                 .is_some_and(MaConfigIr::needs_self_correcting)
         };
-        Ok(Self {
+        Ok(BoundedVarDctPacketPlan {
             profile,
             lf_global: lf_global_packet,
             hf_global,
@@ -774,6 +756,191 @@ impl BoundedVarDctPacketPlan {
             global_ma_config,
             pending_hf_global,
         })
+    }
+}
+
+impl BoundedVarDctPacketPlan {
+    /// Parses bounded scalar metadata only. Image symbols remain encoded for the GPU.
+    pub fn parse(
+        codestream: &[u8],
+        inventory: &CodestreamInventory,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(
+            PacketSource::Slice(codestream),
+            inventory,
+            crate::vardct_frontend::VarDctFrameRole::Presentation,
+        )
+    }
+
+    /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
+    #[cfg(test)]
+    pub(crate) fn parse_source(
+        source: &GpuCodestream,
+        inventory: &CodestreamInventory,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(
+            PacketSource::Spans(source),
+            inventory,
+            crate::vardct_frontend::VarDctFrameRole::Presentation,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_frame_source(
+        source: &GpuCodestream,
+        inventory: &CodestreamInventory,
+        role: crate::vardct_frontend::VarDctFrameRole,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        Self::parse_inner(PacketSource::Spans(source), inventory, role)
+    }
+
+    fn parse_inner(
+        source: PacketSource<'_>,
+        inventory: &CodestreamInventory,
+        role: crate::vardct_frontend::VarDctFrameRole,
+    ) -> Result<Self, BoundedVarDctPacketError> {
+        match Self::begin_inner(source, inventory, role)? {
+            VarDctPacketPreparation::Ready(packet) => Ok(*packet),
+            VarDctPacketPreparation::GlobalModular(_) => {
+                Err(BoundedVarDctPacketError::GlobalModularRequiresGpu)
+            }
+        }
+    }
+
+    pub(crate) fn begin_frame_source(
+        source: &GpuCodestream,
+        inventory: &CodestreamInventory,
+        role: crate::vardct_frontend::VarDctFrameRole,
+    ) -> Result<VarDctPacketPreparation, BoundedVarDctPacketError> {
+        Self::begin_inner(PacketSource::Spans(source), inventory, role)
+    }
+
+    fn begin_inner(
+        source: PacketSource<'_>,
+        inventory: &CodestreamInventory,
+        role: crate::vardct_frontend::VarDctFrameRole,
+    ) -> Result<VarDctPacketPreparation, BoundedVarDctPacketError> {
+        let profile = StandardVarDctProfile::negotiate_for_role(inventory, role)?;
+        if !(1..=16).contains(&profile.bits_per_sample)
+            || (profile.color_transform == VarDctColorTransform::Ycbcr
+                && profile.bits_per_sample != 8)
+        {
+            return Err(UnsupportedVarDctPacketFeature::BitDepth {
+                bits_per_sample: profile.bits_per_sample,
+                color_transform: profile.color_transform,
+            }
+            .into());
+        }
+        let (lf_global_packet, lf_group_packets, hf_global, pass_groups) = match &profile.sections {
+            VarDctSectionLayout::Single { packet } => {
+                if profile.low_frequency_group_count != 1 {
+                    return Err(
+                        UnsupportedVarDctPacketFeature::CombinedPacketMultipleLfGroups.into(),
+                    );
+                }
+                (*packet, vec![*packet], None, Vec::new())
+            }
+            VarDctSectionLayout::Sections {
+                lf_global,
+                lf_groups,
+                hf_global,
+                pass_groups,
+            } => (
+                *lf_global,
+                lf_groups.clone(),
+                Some(*hf_global),
+                pass_groups.clone(),
+            ),
+        };
+        let lf_global_end =
+            lf_global_packet
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-global end",
+                })?;
+        validate_source_packet_end(source, lf_global_end)?;
+        let mut lf_global_reader = source_reader_at(source, lf_global_packet.offset)?;
+        let lf_global = LfGlobalPrefix::parse_reader(&mut lf_global_reader, lf_global_end)?;
+        let (global_ma_config, descriptor_end) =
+            if let Some(tree_offset) = lf_global.global_ma_tree_bit_offset {
+                let mut tree_reader = source_reader_at(source, tree_offset)?;
+                let (config, end) = parse_ma_config_at_reader(&mut tree_reader, lf_global_end)?;
+                (Some(config), end)
+            } else {
+                (None, lf_global.suffix_bit_offset)
+            };
+        let lf_global_end =
+            lf_global_packet
+                .end()
+                .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
+                    field: "LF-global end",
+                })?;
+        if descriptor_end > lf_global_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: descriptor_end,
+                packet_end: lf_global_end,
+            }
+            .into());
+        }
+        let prefix = VarDctPacketPrefix {
+            profile,
+            lf_global_packet,
+            lf_group_packets,
+            hf_global,
+            pass_groups,
+            lf_global,
+            global_ma_config,
+            lf_global_end,
+        };
+        if inventory.image_header.extra_channels.is_empty() {
+            return prefix
+                .finish(source, descriptor_end)
+                .map(|packet| VarDctPacketPreparation::Ready(Box::new(packet)));
+        }
+        let profile = &prefix.profile;
+        if profile.upsampling != 1 || profile.lf_level != 0 || profile.uses_lf_frame {
+            return Err(BoundedVarDctPacketError::GlobalModularGeometry);
+        }
+        let topology = crate::modular_transform::ModularChannelTopology::full_resolution(
+            profile.output_width,
+            profile.output_height,
+            profile.bits_per_sample,
+            inventory.image_header.extra_channel_count,
+            crate::modular_transform::ModularTransformLimits::default(),
+        )
+        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let mut reader = source_reader_at(source, descriptor_end)?;
+        let mut reader = BoundedBitInput::new(&mut reader, lf_global_end);
+        let image = crate::modular_side_image::ModularSideImagePlan::parse(
+            &mut reader,
+            topology,
+            profile.bits_per_sample,
+            0,
+            prefix.global_ma_config.as_ref(),
+        )
+        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        if u64::from(image.token_bit_offset) > lf_global_end {
+            return Err(VarDctPacketError::PacketBoundary {
+                cursor: u64::from(image.token_bit_offset),
+                packet_end: lf_global_end,
+            }
+            .into());
+        }
+        if image
+            .channel_metadata
+            .channels
+            .iter()
+            .enumerate()
+            .any(|(index, c)| {
+                index >= image.meta_channel_count
+                    && (c.width > profile.group_dimension || c.height > profile.group_dimension)
+            })
+        {
+            return Err(BoundedVarDctPacketError::DistributedModularExtras);
+        }
+        Ok(VarDctPacketPreparation::GlobalModular(Box::new(
+            PendingGlobalModular { prefix, image },
+        )))
     }
 
     #[must_use]

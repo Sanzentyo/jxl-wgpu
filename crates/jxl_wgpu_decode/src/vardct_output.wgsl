@@ -1,5 +1,6 @@
 struct VarDctSourceParams {
     plane_geometry: array<vec4<u32>, 3>,
+    alpha_geometry: vec4<u32>,
     matrix_r: vec4<f32>,
     matrix_g: vec4<f32>,
     matrix_b: vec4<f32>,
@@ -12,6 +13,7 @@ struct VarDctSourceParams {
 };
 
 @group(0) @binding(5) var<uniform> source_params: VarDctSourceParams;
+@group(0) @binding(6) var<storage, read> source_alpha: array<u32>;
 
 fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
     let index = y * source_params.plane_geometry[channel].x + x;
@@ -60,7 +62,10 @@ fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
 }
 
 fn source_alpha_at(x: u32, y: u32) -> f32 {
-    return 1.0;
+    let alpha = source_params.alpha_geometry;
+    if alpha.w == 0u { return 1.0; }
+    let coordinate = source_coordinate(vec2<u32>(x, y));
+    return f32(bitcast<i32>(source_alpha[alpha.x + coordinate.y * alpha.y + coordinate.x])) / f32(alpha.z);
 }
 
 fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {

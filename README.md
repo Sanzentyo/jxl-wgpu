@@ -130,11 +130,14 @@ available as data; `SpotColorPolicy::Preserve` explicitly requests base color, w
 rendering is still unsupported. Six libjxl fixtures cover multiple alpha, depth, selection mask,
 spot color, CFA, thermal, black, and optional planes, including transformed multi-group input.
 
-VarDCT side-image execution now separates a shared Modular substream plan and resident executor
-from raw quantization-matrix overlay. Six internal GPU fixtures reconstruct global extra-channel
-planes and the following LF header cursor, including independent depths and Palette metadata
-wider than a pass group. Source codes are exact and normalized planes agree with Rust `jxl` and
-libjxl. Public VarDCT extra-channel output and LF/AC-group integration remain pending.
+VarDCT now reconstructs global Modular extra-channel streams before parsing the following LF
+header. Only a validated GPU ending cursor advances the color decoder. Its first unassociated
+alpha plane remains resident, and the fused output kernel normalizes its independent precision.
+Seven libjxl fixtures cover Gray/RGB at 8/12/16-bit source depths, multiple alpha declarations,
+Palette metadata wider than a pass group, single-entry and progressive multi-entry TOCs,
+orientation Apply/Keep, and fragmented asynchronous input. Scalar extra-plane delivery,
+LF/AC-group-distributed extras, shifted/resampled or associated alpha, and bounded continuation
+inside this global substream remain pending. An entropy-window cap is enforced before submission.
 
 Modular also normalizes orientations 1–8 on the GPU, including exact native RGB/RGBA and 12/16-bit
 samples, all 30 Gray8 VPI color/numeric outputs, Palette/Squeeze, and one-pixel axes. Its frontend

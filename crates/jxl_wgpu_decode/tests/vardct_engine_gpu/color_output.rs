@@ -290,12 +290,12 @@ fn check_formats(
                 decoder.open(encoded, request).unwrap()
             };
             if let Some(vardct) = session.submission_session().vardct() {
-                let memory = vardct.memory_stats();
+                let memory = vardct.memory_stats().unwrap();
                 assert_eq!(
                     memory.output_lease_bytes,
                     expected.layout.logical_size.div_ceil(4) * 4
                 );
-                assert_eq!(memory.output_uniform_bytes, 320);
+                assert_eq!(memory.output_uniform_bytes, 336);
             }
             let frame = if cap == 256 {
                 pollster::block_on(session.next_frame_async())

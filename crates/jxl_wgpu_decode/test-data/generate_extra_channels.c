@@ -27,7 +27,7 @@ static uint32_t code(uint32_t x, uint32_t y, uint32_t c, uint32_t bits) {
 }
 
 static void generate(const char* dir, const char* name, uint32_t width, uint32_t height,
-    uint32_t colors, uint32_t bits, uint32_t extras, int orientation, int effort, int alpha_only) {
+    uint32_t colors, uint32_t bits, uint32_t extras, int orientation, int effort, int alpha_only, int progressive) {
   JxlEncoder* enc = JxlEncoderCreate(NULL);
   JxlBasicInfo info; JxlEncoderInitBasicInfo(&info);
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
@@ -49,6 +49,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, effort));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
+  if (progressive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
   if (vardct) {
     check(JxlEncoderSetFrameDistance(settings, 1.0f));
     for (uint32_t c=0; c<extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0.0f));
@@ -89,19 +90,20 @@ int main(int argc, char** argv) {
   if (argc != 2 && (argc != 3 || strcmp(argv[2], "--vardct"))) return 2;
   vardct = argc == 3;
   if (vardct) {
-    generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0);
-    generate(argv[1], "rgb12", 33, 7, 3, 12, 9, 6, 1, 0);
-    generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0);
-    generate(argv[1], "gray_alpha", 37, 9, 1, 16, 1, 5, 1, 1);
-    generate(argv[1], "rgba", 63, 9, 3, 8, 1, 3, 1, 1);
-    generate(argv[1], "transformed", 127, 129, 3, 12, 9, 7, 7, 0);
+    generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0, 0);
+    generate(argv[1], "rgb12", 33, 7, 3, 12, 9, 6, 1, 0, 0);
+    generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0, 0);
+    generate(argv[1], "gray_alpha", 37, 9, 1, 16, 1, 5, 1, 1, 0);
+    generate(argv[1], "rgba", 63, 9, 3, 8, 1, 3, 1, 1, 0);
+    generate(argv[1], "transformed", 127, 129, 3, 12, 9, 7, 7, 0, 0);
+    generate(argv[1], "rgba_progressive", 63, 9, 3, 8, 1, 2, 7, 1, 1);
     return 0;
   }
-  generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0);
-  generate(argv[1], "rgb12", 259, 17, 3, 12, 9, 6, 1, 0);
-  generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0);
-  generate(argv[1], "gray_alpha", 257, 9, 1, 16, 1, 5, 1, 1);
-  generate(argv[1], "rgba", 259, 9, 3, 8, 1, 3, 1, 1);
-  generate(argv[1], "transformed", 515, 259, 3, 12, 9, 7, 7, 0);
+  generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0, 0);
+  generate(argv[1], "rgb12", 259, 17, 3, 12, 9, 6, 1, 0, 0);
+  generate(argv[1], "gray8", 33, 7, 1, 8, 9, 8, 1, 0, 0);
+  generate(argv[1], "gray_alpha", 257, 9, 1, 16, 1, 5, 1, 1, 0);
+  generate(argv[1], "rgba", 259, 9, 3, 8, 1, 3, 1, 1, 0);
+  generate(argv[1], "transformed", 515, 259, 3, 12, 9, 7, 7, 0, 0);
   return 0;
 }

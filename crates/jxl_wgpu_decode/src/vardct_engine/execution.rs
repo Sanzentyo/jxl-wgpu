@@ -7,12 +7,11 @@ use std::task::{Context, Poll, Waker};
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
 use jxl_wgpu::{
-    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
-    MemoryPermit, ResidentChromaShift, ResidentChromaUpsampleInputs, ResidentEpfInputs,
-    ResidentF32Plane, ResidentGaborishInputs, ResidentStorageBinding, ResidentUpsampleInputs,
-    ResidentUpsampleWeights, ResidentVarDctInputs, ResidentVarDctRenderConfig,
-    ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
-    UnvalidatedGpuImageOutput, WgpuBackend,
+    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryPermit, ResidentChromaShift,
+    ResidentChromaUpsampleInputs, ResidentEpfInputs, ResidentF32Plane, ResidentGaborishInputs,
+    ResidentStorageBinding, ResidentUpsampleInputs, ResidentUpsampleWeights, ResidentVarDctInputs,
+    ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
+    UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
@@ -51,7 +50,7 @@ use super::window_plan::{
 };
 
 /// One-frame submission state for [`crate::VarDctSubmissionEngine`].
-pub struct VarDctDecodeSession {
+pub struct ColorDecodeSession {
     pub(super) backend: WgpuBackend,
     pub(super) pipelines: Arc<VarDctPipelines>,
     pub(super) memory_stats: VarDctDecodeMemoryStats,
@@ -66,31 +65,10 @@ pub(super) struct VarDctRuntimeStats {
     pub(super) hf_packet_stream_batch_count: AtomicUsize,
 }
 
-impl VarDctDecodeSession {
+impl ColorDecodeSession {
     #[must_use]
     pub const fn memory_stats(&self) -> VarDctDecodeMemoryStats {
         self.memory_stats
-    }
-
-    #[must_use]
-    pub fn in_flight_memory_stats(&self) -> MemoryBudgetSnapshot {
-        self.memory.snapshot()
-    }
-
-    #[must_use]
-    pub fn submissions_per_frame(&self) -> usize {
-        self.runtime_stats
-            .submissions_per_frame
-            .load(Ordering::Acquire)
-    }
-
-    /// Exact staged HF packet batch count once the LF cursor map has completed. It is zero before
-    /// that dynamic plan exists and when every HF packet binds the retained whole codestream.
-    #[must_use]
-    pub fn hf_packet_stream_batch_count(&self) -> usize {
-        self.runtime_stats
-            .hf_packet_stream_batch_count
-            .load(Ordering::Acquire)
     }
 
     pub(crate) fn set_progressive_dc_source(
@@ -122,19 +100,19 @@ impl VarDctDecodeSession {
     }
 }
 
-impl std::fmt::Debug for VarDctDecodeSession {
+impl std::fmt::Debug for ColorDecodeSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("VarDctDecodeSession")
+            .debug_struct("ColorDecodeSession")
             .field("submitted", &self.source.is_none())
             .field("memory_stats", &self.memory_stats())
             .finish_non_exhaustive()
     }
 }
 
-impl GpuSubmissionSession for VarDctDecodeSession {
+impl GpuSubmissionSession for ColorDecodeSession {
     type Frame = GpuImageFrame;
-    type Pending = VarDctPendingFrame;
+    type Pending = ColorPendingFrame;
 
     fn submit_next(&mut self) -> DecodeResult<Option<Self::Pending>> {
         let Some(source) = self.source.as_ref() else {
@@ -555,6 +533,7 @@ struct VarDctJobLifetime {
     _adaptive_lf_uniform: Option<wgpu::Buffer>,
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
+    _alpha: Option<super::staging::ResidentModularAlpha>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: [wgpu::Buffer; 3],
     _post_transform: PostTransformJobBuffers,
@@ -583,7 +562,7 @@ struct VarDctGroupValidation {
 }
 
 /// Submitted VarDCT frame awaiting one aggregate map of every LF/pass-group status record.
-pub struct VarDctPendingFrame {
+pub struct ColorPendingFrame {
     pub(super) backend: WgpuBackend,
     pub(super) pipelines: Arc<VarDctPipelines>,
     pub(super) memory: MemoryBudget,
@@ -623,10 +602,10 @@ enum VarDctPendingStage {
     },
 }
 
-impl std::fmt::Debug for VarDctPendingFrame {
+impl std::fmt::Debug for ColorPendingFrame {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("VarDctPendingFrame")
+            .debug_struct("ColorPendingFrame")
             .field("token", &self.token)
             .field("layout", &self.layout)
             .field("lf_group_count", &self.expected_groups.len())
@@ -643,11 +622,7 @@ impl std::fmt::Debug for VarDctPendingFrame {
     }
 }
 
-impl VarDctPendingFrame {
-    pub(crate) fn submissions_per_frame_counter(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.runtime_stats.submissions_per_frame)
-    }
-
+impl ColorPendingFrame {
     #[must_use]
     pub(crate) fn dependency_submission_ready(&self) -> bool {
         matches!(self.stage, VarDctPendingStage::Final { .. })
@@ -1806,10 +1781,13 @@ impl VarDctPendingFrame {
                         },
                     )?;
                 }
-                let total_submissions = source
-                    .staged_lf_submission_count()
+                // The known count already includes LF/HF packets and any preceding Modular
+                // stages. Each newly discovered coefficient batch adds one queue submission.
+                let total_submissions = self
+                    .runtime_stats
+                    .submissions_per_frame
+                    .load(Ordering::Acquire)
                     .checked_add(batch_count)
-                    .and_then(|count| count.checked_add(2))
                     .ok_or(VarDctDecodeError::ArithmeticOverflow {
                         field: "deferred HF submission count",
                     })?;
@@ -1998,7 +1976,7 @@ impl VarDctPendingFrame {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl GpuPendingFrame for VarDctPendingFrame {
+impl GpuPendingFrame for ColorPendingFrame {
     type Frame = GpuImageFrame;
 
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
@@ -2065,7 +2043,7 @@ impl GpuPendingFrame for VarDctPendingFrame {
 }
 
 #[cfg(target_arch = "wasm32")]
-impl GpuPendingFrame for VarDctPendingFrame {
+impl GpuPendingFrame for ColorPendingFrame {
     type Frame = GpuImageFrame;
 
     fn poll_complete(
@@ -2223,10 +2201,10 @@ fn submit_vardct(
     pipelines: Arc<VarDctPipelines>,
     memory: MemoryBudget,
     runtime_stats: Arc<VarDctRuntimeStats>,
-    source: VarDctSource,
+    mut source: VarDctSource,
     permits: VarDctMemoryPermits,
     poll_permit: SubmissionPollPermit,
-) -> Result<VarDctPendingFrame, VarDctDecodeError> {
+) -> Result<ColorPendingFrame, VarDctDecodeError> {
     let device = backend.device();
     let codestream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("jxl-wgpu VarDCT codestream"),
@@ -3315,6 +3293,11 @@ fn submit_vardct(
         device,
         &mut commands,
         VarDctOutputInputs {
+            alpha: source
+                .alpha
+                .as_ref()
+                .map(super::staging::ResidentModularAlpha::binding)
+                .transpose()?,
             planes: [
                 VarDctOutputPlane {
                     storage: resident_binding(&presentation_planes[0])?,
@@ -3441,6 +3424,7 @@ fn submit_vardct(
         _adaptive_lf_uniform: adaptive_lf_uniform,
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
+        _alpha: source.alpha.take(),
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
         _post_transform: post_transform_buffers,
@@ -3501,7 +3485,7 @@ fn submit_vardct(
         width: source.packet.profile.width,
         height: source.packet.profile.height,
     };
-    let mut pending = VarDctPendingFrame {
+    let mut pending = ColorPendingFrame {
         backend: backend.clone(),
         pipelines,
         memory,
@@ -3620,7 +3604,7 @@ fn submit_vardct(
 }
 
 #[derive(Default)]
-struct MapCompletion {
+pub(super) struct MapCompletion {
     state: Mutex<MapState>,
     condition: Condvar,
 }
@@ -3632,7 +3616,7 @@ struct MapState {
 }
 
 impl MapCompletion {
-    fn complete(&self, result: Result<(), String>) {
+    pub(super) fn complete(&self, result: Result<(), String>) {
         let waker = {
             let mut state = lock_unpoisoned(&self.state);
             if state.result.is_some() {
@@ -3647,7 +3631,7 @@ impl MapCompletion {
         }
     }
 
-    fn poll(&self, context: &Context<'_>) -> Option<Result<(), String>> {
+    pub(super) fn poll(&self, context: &Context<'_>) -> Option<Result<(), String>> {
         let mut state = lock_unpoisoned(&self.state);
         if state.result.is_none() {
             state.waker = Some(context.waker().clone());
@@ -3656,7 +3640,7 @@ impl MapCompletion {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait(&self) -> Result<(), String> {
+    pub(super) fn wait(&self) -> Result<(), String> {
         let mut state = lock_unpoisoned(&self.state);
         while state.result.is_none() {
             state = self

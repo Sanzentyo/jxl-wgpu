@@ -10,11 +10,12 @@ mod execution;
 mod pipeline;
 mod restoration;
 mod source;
+mod staging;
 #[cfg(test)]
 mod tests;
 mod types;
 mod window_plan;
 
-pub use execution::{VarDctDecodeSession, VarDctPendingFrame};
 pub use pipeline::VarDctSubmissionEngine;
+pub use staging::{VarDctDecodeSession, VarDctGlobalModularMemoryStats, VarDctPendingFrame};
 pub use types::{VarDctDecodeError, VarDctDecodeMemoryStats, vardct_rgb8_format};

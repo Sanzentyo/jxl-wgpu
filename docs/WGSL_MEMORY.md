@@ -95,7 +95,7 @@ name shown in parentheses.
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, X LF stride, 3 pads, `quant_biases[4]`, then Y/B LF bases and strides | 144 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry, three source channel extents/bases, three destination stride/origin/base records, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 144 | 16 | uniform |
-| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctSourceParams` | 3 component stride/extent/shift records; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 144 | 16 | uniform binding 5; shared 176-byte output parameters occupy binding 4 |
+| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctSourceParams` | 3 component stride/extent/shift records; alpha offset/stride/maximum/enabled; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 160 | 16 | uniform binding 5; shared 176-byte output parameters occupy binding 4 |
 | `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, three channel shift/LF-base/stride records, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 288 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
@@ -230,7 +230,7 @@ The table below states the default workgroup configuration for each entry point:
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
 | `vardct_large_encoder::quantize_blocks` | source/params RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid axes and source/artifact ranges; 1,024 bytes workgroup storage |
 | `vardct_large_encoder::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
-| `vardct_output` (decoder) | X/Y/B or Cb/Y/Cr planes RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 176-byte output uniform plus 144-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
+| `vardct_output` (decoder) | X/Y/B or Cb/Y/Cr planes and integer alpha RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 176-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
@@ -371,10 +371,15 @@ at 16, target layout fields from 28, logical bytes at 104, dispatch width at 108
 orientation at 112, source/target transfer at 116/120, identity-color flag at 124, and padded
 primary-matrix rows at 128/144/160. The identity flag bypasses a redundant EOTF/OETF round trip
 when both transfer and primaries match.
-The codec source fragment adds a 144-byte, 16-byte-aligned `VarDctSourceParams` at binding 5:
-component geometry starts at 0, inverse matrix rows at 48/64/80, cube-root/scaled biases at 96/112,
-intensity scale at 128, and transform mode at 132. The two bindings are individually limit-checked;
-`output_uniform_bytes` and transient admission charge their full 320 bytes.
+The codec source fragment adds a 160-byte, 16-byte-aligned `VarDctSourceParams` at binding 5:
+component geometry starts at 0, alpha offset/stride/maximum/enabled at 48, inverse matrix rows at
+64/80/96, cube-root/scaled biases at 112/128, intensity scale at 144, and transform mode at 148.
+The two uniform bindings are individually limit-checked; `output_uniform_bytes` and transient
+admission charge their full 336 bytes. Read-only storage binding 6 supplies optional signed i32
+alpha. Planning and pipeline creation require five storage bindings. Opaque output reuses the first read-only color binding with the alpha flag disabled, adding
+no allocation. Source geometry, offsets, depth and last addressed word are checked before encoding.
+Alpha conversion divides the signed sample by its declared maximum; it never masks/wraps negative
+values or overshoot. F32 preserves these values, while integer output clamps at final quantization.
 
 Each output word resolves its samples back to codestream coordinates before XYB/JPEG reconstruction.
 Target chroma subsampling averages only valid oriented pixels, then packing quantizes once into
@@ -387,7 +392,7 @@ defines output lease bytes, plane gaps, row pitches, and four-byte final storage
 checks stop at the last row payload instead of treating unused row-tail capacity as part of a plane,
 and dispatch padding exits before multiplying a word index into a byte index. The GPU test covers
 both one-pixel axes in all orientations with interleaved and padded RGB/RGBA planes, unaligned
-plane starts, opaque alpha, zero internal/tail padding, and unchanged guard bytes outside storage.
+plane starts, opaque and signed independently normalized alpha, zero internal/tail padding, and unchanged guard bytes outside storage.
 Grayscale luminance stays folded into inverse-matrix metadata. Progressive-DC planes retain their
 unoriented three-channel shape even for gray presentation or a non-RGB output request.
 
@@ -442,13 +447,26 @@ Finishing recording copies the final status and owns the command buffer. The raw
 adds its overlay to that encoder and retains/charges exactly its 64-byte uniform; existing stage
 admission and callback lifetimes are preserved. The common arena also permits GPU copies for
 downstream plane delivery. Its contents stay integer words, without sample normalization or color
-conversion. No WGSL record size, binding count, workgroup memory or matrix submission count changes.
+conversion. The shared entropy/status and raw-matrix ABIs, workgroup memory and matrix submission counts remain unchanged.
 
-The internal VarDCT global-extra differential uses the same production executor with one, two or
-nine final planes, including Palette metadata wider than 256 samples. Core allocations exactly
-match the admitted byte count and release at job completion; test-only source/readback buffers
-are outside that core reservation. Public extra-channel session admission, cancellation and
-multi-section retention still require integration and separate conformance evidence.
+The global VarDCT extra-channel stage uses the common executor directly from encoded host spans,
+copying only the checked word-aligned packet suffix into its budgeted GPU stream buffer. It does
+not first allocate another whole-codestream GPU buffer. The caller's window/device caps apply;
+continuation within that substream is not yet connected, so a smaller cap returns a typed error.
+Arena and transient bytes have separate permits, both acquired before allocation. The map
+callback retains the job and both reservations even when the pending frame is abandoned. After
+status/entropy/cursor validation, transient buffers retire and the first-alpha arena lease moves
+into the color job lifetime. Non-alpha arenas retire immediately. Color preflight subtracts the
+retained arena from its available per-frame limit; every subsequently discovered LF/HF/raw-table
+allocation still uses the same shared budget. Only the 16-byte status crosses to the host.
+
+Public `VarDctDecodeSession::memory_stats()` is the optional color-stage plan, published after
+cursor validation. It excludes the separately owned global arena; `global_modular_memory_stats()`
+reports initial-stage buffer bytes and `in_flight_memory_stats()` is authoritative for live bytes.
+Seven public fixtures cover single/multi-entry TOCs, multiple AC passes, independent alpha depths,
+Apply/Keep and fragmented input. Entropy failure never exposes a color frame; cancellation,
+initial admission/retry and explicit window/budget rejection have actual-adapter tests. Internal
+plane readback remains test-only. LF/AC-distributed and scalar extra output need further integration.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,

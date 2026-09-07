@@ -1210,9 +1210,11 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
         DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
             "lossless Modular profile must use 1 through 16 bits per sample and 1 through 3 passes",
         )),
-        DecodeProfile::VarDct { bits_per_sample: 8 } => Ok(()),
+        DecodeProfile::VarDct {
+            bits_per_sample: 1..=16,
+        } => Ok(()),
         DecodeProfile::VarDct { .. } => Err(Error::EngineContract(
-            "the bounded VarDCT profile requires 8-bit samples",
+            "the VarDCT profile requires 1 through 16 bits per sample",
         )),
     }
 }

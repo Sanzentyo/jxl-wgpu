@@ -418,13 +418,32 @@ one-, two-, three- or many-plane topologies share the same descriptor-based GPU 
 The common executor retains original samples as signed integer words and performs no color
 conversion. The 256-byte entropy ABI, 16-byte status and 64-byte matrix overlay ABI are unchanged.
 
-Six VarDCT fixtures from `generate_extra_channels.c --vardct` exercise the shared substream
-executor directly. Every global extra plane matches its deterministic original integer codes;
-normalized values match Rust `jxl` and libjxl within `2e-7`. Coverage includes eight extra types,
-multiple alpha, independent depths, Gray+alpha, a Palette with a 502-sample metadata channel, and
-the unpadded bit cursor of the following LF header. This establishes internal staging evidence.
-The public VarDCT producer still rejects extra channels while pre-LF scheduling, LF/AC-group
-distribution, resident color/alpha binding and scalar delivery are being connected.
+The public VarDCT producer now executes global Modular extras as an initial GPU stage. A checked
+16-byte status supplies the exact next LF bit position, or validates padding at the end of an
+independent LF-global section. Only then is the color allocation/dispatch plan constructed.
+The first unassociated alpha plane stays in its original signed integer arena through the final
+color submission; the packer uses its own bit depth and applies orientation without a plane copy.
+Other declared extra planes are decoded and validated but scalar delivery is not connected yet.
+Explicit `SpotColorPolicy::Preserve` requests base color; default spot rendering and unknown
+non-optional channel interpretation return typed errors.
+
+`VarDctDecodeSession::memory_stats()` now returns `Option<VarDctDecodeMemoryStats>`: the color
+plan is absent until the global cursor validates. `global_modular_memory_stats()` reports exact
+initial-stage stream, arena and total buffer bytes. Both stages share the engine budget, while
+`in_flight_memory_stats()` includes every live permit. Submission counts grow as stages become
+known. A pending global stage cannot expose an unvalidated color frame. Dropping it retains GPU
+buffers and permits in the map callback until completion. Color metadata reports the actual
+1–16-bit source depth and preserves all extra-channel declarations.
+
+Six internal substream fixtures still compare every reconstructed plane to exact source codes
+and Rust `jxl`/libjxl. Seven public fixtures add color and first-alpha comparisons, including a
+progressive multi-entry stream, synchronous and fragmented asynchronous input, Apply/Keep,
+entropy corruption, memory backpressure/retry and cancellation. The common executor retains its
+256-byte entropy/16-byte status ABI; fused output uses a 160-byte source uniform and a read-only
+alpha binding. Public LF/AC-group-distributed extras, scalar delivery, associated alpha,
+shifted/resampled/float samples and global-substream window continuation remain gaps. An explicit
+window cap smaller than this stage's binding returns `GlobalModularWindow` before GPU allocation.
+
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic
@@ -605,7 +624,7 @@ This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 non-color numeric output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-extra channels and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+distributed/scalar extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

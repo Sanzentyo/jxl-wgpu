@@ -36,6 +36,8 @@ use wgpu::util::DeviceExt;
 #[path = "vardct_engine_gpu/color_output.rs"]
 mod color_output;
 mod common;
+#[path = "vardct_engine_gpu/extra_channels.rs"]
+mod extra_channels;
 
 static DJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -527,7 +529,8 @@ fn frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu() {
                 .submission_session()
                 .vardct()
                 .unwrap()
-                .memory_stats();
+                .memory_stats()
+                .unwrap();
             assert_eq!(
                 memory.frame_upsample_bytes,
                 u64::from(extent.width) * u64::from(extent.height) * 12
@@ -695,7 +698,8 @@ fn progressive_ac_passes_accumulate_with_independent_tables_on_gpu() {
                 .submission_session()
                 .vardct()
                 .unwrap()
-                .memory_stats();
+                .memory_stats()
+                .unwrap();
             assert_eq!(
                 memory.hf_status_bytes,
                 packet.profile.group_count * entropy.passes.len() as u64 * 32
@@ -928,7 +932,8 @@ fn jpeg_transcode_sampling_layouts_match_reference_on_gpu() {
             .submission_session()
             .vardct()
             .expect("JPEG reconstruction selects the VarDCT submission session")
-            .memory_stats();
+            .memory_stats()
+            .unwrap();
         assert_eq!(memory.resident_plane_bytes, resident_plane_bytes, "{name}");
         assert_eq!(
             memory.resident_image_bytes,
@@ -1283,7 +1288,8 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
             .submission_session()
             .vardct()
             .expect("VarDCT input selects the VarDCT submission session")
-            .memory_stats();
+            .memory_stats()
+            .unwrap();
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
         let frame = if index == 0 {
             pollster::block_on(session.next_frame_async())
@@ -1453,7 +1459,7 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
         codestream_bytes
     );
     let vardct = session.submission_session().vardct().unwrap();
-    let memory = vardct.memory_stats();
+    let memory = vardct.memory_stats().unwrap();
     assert!(memory.deferred_hf_modular_metadata);
     assert!(memory.packet_stream_window_bytes > 0);
     assert!(memory.packet_stream_window_bytes <= 40);
@@ -1616,7 +1622,8 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .submission_session()
             .vardct()
             .expect("VarDCT input selects the VarDCT submission session")
-            .memory_stats();
+            .memory_stats()
+            .unwrap();
         assert_eq!(
             memory.resident_image_bytes,
             u64::from(extent.width.div_ceil(8) * 8) * u64::from(extent.height.div_ceil(8) * 8) * 12,
@@ -1761,7 +1768,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
         )
         .unwrap();
     let vardct = session.submission_session().vardct().unwrap();
-    let memory = vardct.memory_stats();
+    let memory = vardct.memory_stats().unwrap();
     assert!(memory.packet_stream_window_bytes > 0);
     assert!(memory.packet_stream_window_bytes <= 256);
     assert!(memory.packet_stream_batch_count > 1);
@@ -1887,7 +1894,7 @@ fn vardct_stream_windows_adapt_to_the_shared_frame_budget() {
                 .with_stream_window_limit(NonZeroU64::new(limit).unwrap()),
         );
         let session = decoder.open(encoded, request.clone()).unwrap();
-        session.submission_session().memory_stats()
+        session.submission_session().memory_stats().unwrap()
     };
     let minimum = memory_at_limit(40);
     let configured = memory_at_limit(256);
@@ -1903,7 +1910,7 @@ fn vardct_stream_windows_adapt_to_the_shared_frame_budget() {
     assert_eq!(engine.stream_window_limit(), NonZeroU64::new(256));
     let decoder = GpuDecoder::new(engine);
     let mut session = decoder.open(encoded, request.clone()).unwrap();
-    let memory = session.submission_session().memory_stats();
+    let memory = session.submission_session().memory_stats().unwrap();
     assert!(memory.resolved_stream_window_limit_bytes >= 40);
     assert!(memory.resolved_stream_window_limit_bytes < 256);
     assert_eq!(memory.resolved_stream_window_limit_bytes % 4, 0);
@@ -2184,7 +2191,7 @@ fn assert_multiple_lf_groups(
         .submission_session()
         .vardct()
         .expect("multiple LF groups select the VarDCT submission session");
-    let memory = vardct.memory_stats();
+    let memory = vardct.memory_stats().unwrap();
     if let Some(stream_window_limit) = stream_window_limit {
         assert!(!memory.deferred_hf_modular_metadata);
         assert!(memory.packet_stream_window_bytes > 0);
@@ -2297,7 +2304,7 @@ fn ordinary_cjxl_local_trees_resume_lf_and_hf_across_bounded_packet_windows() {
         .submission_session()
         .vardct()
         .expect("ordinary cjxl selects the VarDCT submission session");
-    let memory = vardct.memory_stats();
+    let memory = vardct.memory_stats().unwrap();
     assert!(memory.deferred_hf_modular_metadata);
     assert!(memory.packet_stream_window_bytes > 0);
     assert!(memory.packet_stream_window_bytes <= 256);
@@ -2515,7 +2522,8 @@ fn libjxl_gaborish_executes_between_resident_vardct_and_output_pack() {
         .submission_session()
         .vardct()
         .expect("VarDCT input selects the VarDCT submission session")
-        .memory_stats();
+        .memory_stats()
+        .unwrap();
     assert_eq!(
         memory.restoration_scratch_bytes,
         memory.resident_image_bytes
@@ -2594,7 +2602,8 @@ fn libjxl_epf2_and_epf3_execute_on_odd_resident_extent() {
             .submission_session()
             .vardct()
             .expect("EPF fixture selects the VarDCT submission session")
-            .memory_stats();
+            .memory_stats()
+            .unwrap();
         assert_eq!(
             memory.restoration_scratch_bytes,
             memory.resident_image_bytes

@@ -1276,7 +1276,20 @@ fn validate_image(
     if image.embedded_icc.is_some() {
         return unsupported(UnsupportedVarDctFeature::EmbeddedIcc);
     }
-    if image.extra_channel_count != 0 || !image.extra_channels.is_empty() {
+    if image.extra_channel_count as usize != image.extra_channels.len()
+        || image.extra_channels.iter().any(|extra| {
+            !matches!(
+                extra.bit_depth,
+                SampleBitDepth::Integer {
+                    bits_per_sample: 1..=16
+                }
+            ) || extra.dimension_shift != 0
+                || matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: true }
+                )
+        })
+    {
         return unsupported(UnsupportedVarDctFeature::ExtraChannels);
     }
     if image.preview_size.is_some() {
@@ -1349,6 +1362,7 @@ fn validate_frame(
         return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
     }
     if !matches!(frame.upsampling, 1 | 2 | 4 | 8)
+        || frame.extra_channel_upsampling.len() != inventory.image_header.extra_channels.len()
         || frame
             .extra_channel_upsampling
             .iter()
@@ -1370,7 +1384,11 @@ fn validate_frame(
             || frame.color_blend.source != 0
             || frame.color_blend.alpha_channel.is_some()
             || frame.color_blend.clamp
-            || !frame.extra_channel_blends.is_empty())
+            || frame.extra_channel_blends.len() != inventory.image_header.extra_channels.len()
+            || frame
+                .extra_channel_blends
+                .iter()
+                .any(|blend| *blend != jxl_gpu_bitstream::FrameBlendInfo::default()))
     {
         return unsupported(UnsupportedVarDctFeature::Blending);
     }

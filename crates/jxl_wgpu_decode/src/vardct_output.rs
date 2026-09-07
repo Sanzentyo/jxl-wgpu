@@ -134,6 +134,8 @@ impl VarDctOutputConfig {
 pub struct VarDctOutputInputs<'a> {
     /// X, Y, and B F32 planes, in that order.
     pub planes: [VarDctOutputPlane<'a>; 3],
+    /// Optional full-resolution, unassociated integer alpha reconstructed by Modular.
+    pub alpha: Option<VarDctOutputAlpha<'a>>,
     /// Output storage for the requested pitch-linear layout;
     /// its allocated/bound length is rounded up to four bytes.
     pub output: ResidentStorageBinding<'a>,
@@ -141,6 +143,17 @@ pub struct VarDctOutputInputs<'a> {
     pub layout: &'a ImageLayout,
     /// Output geometry and inverse-opsin metadata.
     pub config: VarDctOutputConfig,
+}
+
+/// An integer opacity plane in a resident Modular arena. Samples occupy one word each.
+#[derive(Clone, Copy, Debug)]
+pub struct VarDctOutputAlpha<'a> {
+    pub storage: ResidentStorageBinding<'a>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub word_offset: u32,
+    pub bits_per_sample: u32,
 }
 
 /// Exact byte counts for one fused output operation.
@@ -225,6 +238,7 @@ impl VarDctOutputPlan {
         limits: &wgpu::Limits,
         variant: KernelVariant,
     ) -> Result<Self, VarDctOutputError> {
+        validate_storage_bindings(limits)?;
         let memory = VarDctOutputMemoryPlan::new(layout)?;
         validate_required_buffer(
             "packed color output",
@@ -299,12 +313,21 @@ fn validate_workgroup_variant(
         })
 }
 
+fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), VarDctOutputError> {
+    if limits.max_storage_buffers_per_shader_stage < 5 {
+        return Err(VarDctOutputError::StorageBindingCount {
+            available: limits.max_storage_buffers_per_shader_stage,
+        });
+    }
+    Ok(())
+}
+
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct VarDctOutputScratch {
     /// The shared 176-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
-    /// The 144-byte inverse-opsin/JPEG source parameter buffer.
+    /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
     /// Exact output/transient accounting and dispatch geometry.
     pub plan: VarDctOutputPlan,
@@ -313,6 +336,10 @@ pub struct VarDctOutputScratch {
 /// Typed validation errors for GPU-resident VarDCT color output.
 #[derive(Debug, thiserror::Error)]
 pub enum VarDctOutputError {
+    #[error("VarDCT output needs five storage bindings, device permits {available}")]
+    StorageBindingCount { available: u32 },
+    #[error("VarDCT alpha requires 1–16-bit integer samples, got {bits}")]
+    InvalidAlphaBitDepth { bits: u32 },
     /// The common output contract rejected color or layout metadata.
     #[error(transparent)]
     ImageOutput(#[from] jxl_wgpu::Error),
@@ -441,6 +468,7 @@ impl VarDctOutputPacker {
         device: &wgpu::Device,
         variant: KernelVariant,
     ) -> Result<Self, VarDctOutputError> {
+        validate_storage_bindings(&device.limits())?;
         validate_workgroup_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jxl-wgpu decode VarDCT packed color"),
@@ -508,6 +536,12 @@ impl VarDctOutputPacker {
                     binding: 5,
                     resource: source_uniform.as_entire_binding(),
                 },
+                binding_entry(
+                    6,
+                    inputs
+                        .alpha
+                        .map_or(inputs.planes[0].storage, |alpha| alpha.storage),
+                ),
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -530,6 +564,7 @@ impl VarDctOutputPacker {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct VarDctSourceParams {
     plane_geometry: [[u32; 4]; 3],
+    alpha_geometry: [u32; 4],
     matrix_r: [f32; 4],
     matrix_g: [f32; 4],
     matrix_b: [f32; 4],
@@ -640,6 +675,53 @@ fn validate_inputs(
         plan.memory.output_storage_bytes,
     )?;
 
+    let alpha_geometry = if let Some(alpha) = inputs.alpha {
+        if !(1..=16).contains(&alpha.bits_per_sample) {
+            return Err(VarDctOutputError::InvalidAlphaBitDepth {
+                bits: alpha.bits_per_sample,
+            });
+        }
+        if alpha.width < inputs.config.extent.width || alpha.height < inputs.config.extent.height {
+            return Err(VarDctOutputError::InputExtent {
+                plane: 3,
+                width: alpha.width,
+                height: alpha.height,
+                required_width: inputs.config.extent.width,
+                required_height: inputs.config.extent.height,
+            });
+        }
+        if alpha.stride < alpha.width {
+            return Err(VarDctOutputError::InputStride {
+                plane: 3,
+                stride: alpha.stride,
+                width: alpha.width,
+            });
+        }
+        let end = u64::from(inputs.config.extent.height - 1)
+            .checked_mul(u64::from(alpha.stride))
+            .and_then(|value| value.checked_add(u64::from(alpha.word_offset)))
+            .and_then(|value| value.checked_add(u64::from(inputs.config.extent.width)))
+            .ok_or(VarDctOutputError::ArithmeticOverflow {
+                field: "alpha addressing",
+            })?;
+        if end > u64::from(u32::MAX) {
+            return Err(VarDctOutputError::ShaderAddressSpace {
+                field: "alpha plane scalars",
+                required: end,
+                available: u64::from(u32::MAX),
+            });
+        }
+        validate_binding(device, "alpha input", alpha.storage, end * 4)?;
+        [
+            alpha.word_offset,
+            alpha.stride,
+            (1 << alpha.bits_per_sample) - 1,
+            1,
+        ]
+    } else {
+        [0; 4]
+    };
+
     let (mode, matrix, bias_cbrt, scaled_bias, intensity_scale) = match inputs.config.transform {
         VarDctOutputTransform::Xyb(inverse) => {
             let intensity_scale = 255.0 / inverse.intensity_target;
@@ -656,6 +738,7 @@ fn validate_inputs(
     Ok((
         VarDctSourceParams {
             plane_geometry,
+            alpha_geometry,
             matrix_r: matrix_row(matrix[0]),
             matrix_g: matrix_row(matrix[1]),
             matrix_b: matrix_row(matrix[2]),
@@ -811,9 +894,9 @@ const fn matrix_row(row: [f32; 3]) -> [f32; 4] {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<VarDctSourceParams>() == 144);
+    assert!(std::mem::size_of::<VarDctSourceParams>() == 160);
     assert!(std::mem::align_of::<VarDctSourceParams>() == 16);
-    assert!(std::mem::offset_of!(VarDctSourceParams, mode) == 132);
+    assert!(std::mem::offset_of!(VarDctSourceParams, mode) == 148);
     assert!(std::mem::offset_of!(VarDctSourceParams, plane_geometry) == 0);
 };
 
@@ -857,7 +940,7 @@ mod tests {
     fn wgsl_and_uniform_abi_validate() {
         fn assert_pod<T: Pod>() {}
         assert_pod::<VarDctSourceParams>();
-        assert_eq!(std::mem::size_of::<VarDctSourceParams>(), 144);
+        assert_eq!(std::mem::size_of::<VarDctSourceParams>(), 160);
         assert_eq!(std::mem::align_of::<VarDctSourceParams>(), 16);
 
         let module = naga::front::wgsl::parse_str(&vardct_output_shader())
@@ -868,6 +951,23 @@ mod tests {
         )
         .validate(&module)
         .expect("VarDCT output WGSL validates with portable capabilities");
+        assert_eq!(
+            module
+                .global_variables
+                .iter()
+                .filter(|(_, variable)| matches!(
+                    variable.space,
+                    naga::AddressSpace::Storage { .. }
+                ))
+                .count(),
+            5
+        );
+        let mut limits = generous_limits();
+        limits.max_storage_buffers_per_shader_stage = 4;
+        assert!(matches!(
+            VarDctOutputPlan::for_limits(&rgb_layout(5, 3), &limits),
+            Err(VarDctOutputError::StorageBindingCount { available: 4 })
+        ));
     }
 
     #[test]
@@ -875,9 +975,9 @@ mod tests {
         let memory = VarDctOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 320);
-        assert_eq!(memory.transient_bytes, 320);
-        assert_eq!(memory.total_bytes, 368);
+        assert_eq!(memory.uniform_bytes, 336);
+        assert_eq!(memory.transient_bytes, 336);
+        assert_eq!(memory.total_bytes, 384);
 
         let plan = VarDctOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -1045,6 +1145,13 @@ mod tests {
             "VarDCT color test B",
             &[0.471_659, 0.437_076_93, 0.666_139_84],
         );
+        // Modular reconstruction is signed and can overshoot the declared sample range.
+        // F32 output preserves it; integer output clamps during final quantization.
+        let alpha = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("VarDCT signed alpha with prefix"),
+            contents: bytemuck::cast_slice(&[99_i32, 99, -7, 17, 40]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let output = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VarDCT color test output"),
             size: 128,
@@ -1109,6 +1216,14 @@ mod tests {
                             &device,
                             &mut encoder,
                             VarDctOutputInputs {
+                                alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
+                                    storage: binding(&alpha),
+                                    width: extent.width,
+                                    height: extent.height,
+                                    stride: extent.width,
+                                    word_offset: 2,
+                                    bits_per_sample: 5,
+                                }),
                                 planes: [
                                     VarDctOutputPlane {
                                         storage: binding(&x),
@@ -1148,7 +1263,7 @@ mod tests {
                         layout.logical_size.div_ceil(4) * 4
                     );
                     assert_eq!(scratch.uniform.size(), 176);
-                    assert_eq!(scratch.source_uniform.size(), 144);
+                    assert_eq!(scratch.source_uniform.size(), 160);
                     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);
                     let (sender, receiver) = mpsc::sync_channel(1);
@@ -1196,8 +1311,11 @@ mod tests {
                                 let offset = plane.offset as usize
                                     + y * plane.row_stride as usize
                                     + x * sample_bytes;
+                                let alpha_value = [-7.0_f32, 17.0, 40.0]
+                                    [if reversed { 2 - pixel } else { pixel }]
+                                    / 31.0;
                                 let expected_code = if channel == 3 {
-                                    255
+                                    (alpha_value.clamp(0.0, 1.0) * 255.0).round() as u8
                                 } else {
                                     expected[pixel * 3 + channel]
                                 };
@@ -1205,7 +1323,11 @@ mod tests {
                                     let actual = f32::from_le_bytes(
                                         mapped[offset..offset + 4].try_into().unwrap(),
                                     );
-                                    let expected = f32::from(expected_code) / 255.0;
+                                    let expected = if channel == 3 {
+                                        alpha_value
+                                    } else {
+                                        f32::from(expected_code) / 255.0
+                                    };
                                     assert!(
                                         (actual - expected).abs() < 2e-5,
                                         "float primary sample {actual} != {expected}"

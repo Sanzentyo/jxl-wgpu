@@ -98,8 +98,8 @@ pub use session::{
     PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession, SubmittedGpuFrame,
 };
 pub use vardct_engine::{
-    VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession, VarDctPendingFrame,
-    VarDctSubmissionEngine, vardct_rgb8_format,
+    VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession,
+    VarDctGlobalModularMemoryStats, VarDctPendingFrame, VarDctSubmissionEngine, vardct_rgb8_format,
 };
 pub use wgpu_engine::{
     F64OutputPath, ModularEntropyCoding, ModularOutputSpecialization,

@@ -10,7 +10,7 @@ use super::types::STATUS_OK;
 use crate::vardct_resource::{VarDctResourceLayout, hf_matrix_param_index};
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
 use crate::{Error, Result};
-use modular::ModularSideImagePipeline;
+pub(crate) use modular::{ModularSideImageJob, ModularSideImagePipeline};
 pub(crate) use modular::{
     ModularSideImageJob as RawHfDequantSideImageJob,
     ModularSideImageStatus as RawHfDequantSideImageStatus,
@@ -42,6 +42,9 @@ pub(crate) struct RawHfDequantSideImagePipeline {
     variant: KernelVariant,
 }
 impl RawHfDequantSideImagePipeline {
+    pub(crate) fn modular(&self) -> &ModularSideImagePipeline {
+        &self.image
+    }
     pub(crate) fn new(backend: &WgpuBackend, variant: KernelVariant) -> Self {
         let module = backend
             .device()
