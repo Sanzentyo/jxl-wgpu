@@ -88,6 +88,7 @@ pub(crate) struct ModularFinalizeParams {
     region: [u32; 4],
     source_offsets: [u32; 4],
     source_strides: [u32; 4],
+    source_masks: [u32; 4],
     output: [u32; 4],
     format: [u32; 4],
     plane01: [u32; 4],
@@ -97,7 +98,7 @@ pub(crate) struct ModularFinalizeParams {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ModularFinalizeParams>() == 160);
+    assert!(std::mem::size_of::<ModularFinalizeParams>() == 176);
     assert!(std::mem::align_of::<ModularFinalizeParams>() == 16);
 };
 
@@ -141,12 +142,14 @@ impl ModularFinalizeParams {
         }
         let mut source_offsets = [0u32; 4];
         let mut source_strides = [0u32; 4];
+        let mut source_masks = [0u32; 4];
         for (index, plane) in source_planes.iter().copied().enumerate() {
             if plane.width != extent.width
                 || plane.height != extent.height
                 || plane.hshift != 0
                 || plane.vshift != 0
-                || plane.bit_depth != u32::from(source_bits)
+                || !(1..=16).contains(&plane.bit_depth)
+                || (index < 3 && plane.bit_depth != u32::from(source_bits))
                 || plane.row_stride_words < plane.width
                 || plane.reserved != 0
             {
@@ -170,6 +173,7 @@ impl ModularFinalizeParams {
             }
             source_offsets[index] = plane.word_offset;
             source_strides[index] = plane.row_stride_words;
+            source_masks[index] = (1 << plane.bit_depth) - 1;
         }
         let output_extent = region.orientation.map_extent(region.canvas_extent);
         validate_output(output_extent, source_channels, source_bits, output)?;
@@ -189,6 +193,7 @@ impl ModularFinalizeParams {
             region: [region.origin_x, region.origin_y, region.status_index, 0],
             source_offsets,
             source_strides,
+            source_masks,
             output: [
                 output.kind,
                 output.transfer,
@@ -273,32 +278,33 @@ fn validate_output(
                 reason: "invalid floating-point RGB output mapping",
             });
         }
-        return validate_output_planes(extent, source_channels, output);
+        return validate_output_planes(extent, output);
     }
-    if source_channels != 1 {
-        if output.kind != 9
-            || output.channels != source_channels
-            || output.bits != u32::from(source_bits)
-            || output.numeric_mapping != 3
-            || !matches!(output.storage_bits, 8 | 16)
-        {
-            return Err(ModularFinalizeError::InvalidParams {
-                reason: "multichannel sources require matching native Modular output",
-            });
-        }
-        return validate_output_planes(extent, source_channels, output);
+    if output.kind == 8
+        && output.bits == 32
+        && output.numeric_mapping == 4
+        && source_channels == 1
+        && output.channels == 1
+        && output.storage_bits == 32
+    {
+        return validate_output_planes(extent, output);
     }
     if output.kind == 9 {
-        if output.channels != 1
+        if !matches!(output.channels, 1 | 3 | 4)
             || output.bits != u32::from(source_bits)
             || output.numeric_mapping != 3
             || !matches!(output.storage_bits, 8 | 16)
         {
             return Err(ModularFinalizeError::InvalidParams {
-                reason: "native Gray output does not match its source",
+                reason: "native Modular output has an invalid depth or channel mapping",
             });
         }
-        return validate_output_planes(extent, source_channels, output);
+        return validate_output_planes(extent, output);
+    }
+    if source_channels != 1 {
+        return Err(ModularFinalizeError::InvalidParams {
+            reason: "multichannel sources require native Modular or F32 RGB output",
+        });
     }
     if source_bits != 8 {
         return Err(ModularFinalizeError::InvalidParams {
@@ -322,12 +328,11 @@ fn validate_output(
             });
         }
     }
-    validate_output_planes(extent, source_channels, output)
+    validate_output_planes(extent, output)
 }
 
 fn validate_output_planes(
     extent: Extent2d,
-    source_channels: u32,
     output: ModularFinalizeOutput,
 ) -> Result<(), ModularFinalizeError> {
     let bytes_per_storage = output.storage_bits / 8;
@@ -397,7 +402,7 @@ fn validate_output_planes(
                 extent.height,
                 extent
                     .width
-                    .checked_mul(source_channels)
+                    .checked_mul(output.channels)
                     .and_then(|samples| samples.checked_mul(bytes_per_storage))
                     .ok_or(ModularFinalizeError::InvalidParams {
                         reason: "native output row size overflows u32",
@@ -800,7 +805,7 @@ mod tests {
 
     #[test]
     fn uniform_and_wgsl_abis_validate_semantically() {
-        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 160);
+        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 176);
         assert_eq!(std::mem::align_of::<ModularFinalizeParams>(), 16);
         fn assert_pod<T: Pod>() {}
         assert_pod::<ModularFinalizeParams>();

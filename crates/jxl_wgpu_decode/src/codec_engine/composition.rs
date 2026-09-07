@@ -61,6 +61,21 @@ impl CompositionSession {
         request: &GpuOutputRequest,
         plan: &FrameExecutionPlan,
     ) -> Result<Self> {
+        if request.extra_channel().is_some()
+            || inventory.image_header.extra_channels.len() > 1
+            || inventory.image_header.extra_channels.iter().any(|extra| {
+                !matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: false }
+                )
+            })
+        {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::ExtraChannels,
+                "general extra-channel frame composition is not yet connected",
+            )
+            .into());
+        }
         validate(inventory, plan)?;
         let image = &inventory.image_header;
         let working = GpuOutputRequest::color(PixelFormat::rgb_f32(

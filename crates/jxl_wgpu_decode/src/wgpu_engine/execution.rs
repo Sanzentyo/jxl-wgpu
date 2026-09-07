@@ -858,6 +858,8 @@ pub(super) fn modular_finalize_params(
 ) -> Result<ModularFinalizeParams> {
     let finalize_output = modular_finalize_output(output)?;
     let resident = resident_entropy_plan(profile, group_index)?;
+    let selection = &output.source_channels;
+    let planes = selection.select(&resident.inverse_plan.final_gpu_layouts())?;
     ModularFinalizeParams::new(
         ModularFinalizeRegion {
             source_extent: Extent2d::new(group.width, group.height),
@@ -868,8 +870,8 @@ pub(super) fn modular_finalize_params(
             status_index: u32::try_from(group_index)
                 .map_err(|_| Error::backend("Modular finalizer status index exceeds u32"))?,
         },
-        profile.bits_per_sample,
-        &resident.inverse_plan.final_gpu_layouts(),
+        selection.bits,
+        &planes,
         resident.inverse_plan.arena_words(),
         finalize_output,
     )
@@ -887,6 +889,8 @@ pub(super) fn modular_frame_finalize_params(
     } else {
         0
     };
+    let selection = &output.source_channels;
+    let planes = selection.select(&frame_plan.inverse_plan.final_gpu_layouts())?;
     ModularFinalizeParams::new(
         ModularFinalizeRegion {
             source_extent: Extent2d::new(profile.width, profile.height),
@@ -896,8 +900,8 @@ pub(super) fn modular_frame_finalize_params(
             origin_y: 0,
             status_index,
         },
-        profile.bits_per_sample,
-        &frame_plan.inverse_plan.final_gpu_layouts(),
+        selection.bits,
+        &planes,
         frame_plan.inverse_plan.arena_words(),
         modular_finalize_output(output)?,
     )
@@ -954,6 +958,7 @@ pub(super) enum OutputKind {
 }
 
 pub(super) struct OutputPlan {
+    pub(super) source_channels: super::channels::OutputChannels,
     pub(super) layout: ImageLayout,
     pub(super) source_extent: Extent2d,
     pub(super) orientation: OutputOrientation,
@@ -999,6 +1004,10 @@ impl OutputPlan {
                     )));
                 }
                 let output = Self {
+                    source_channels: super::channels::OutputChannels::identity(
+                        source_channels,
+                        source_bits,
+                    ),
                     layout: ImageLayout::packed(extent, format)?,
                     source_extent,
                     orientation,
@@ -1025,7 +1034,12 @@ impl OutputPlan {
                 ..
             })
         );
-        if !float_rgb && (source_channels != crate::ModularChannels::Gray || source_bits != 8) {
+        let normalized_unsigned = request.mapping()
+            == GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned);
+        if !float_rgb
+            && !normalized_unsigned
+            && (source_channels != crate::ModularChannels::Gray || source_bits != 8)
+        {
             return Err(Error::UnsupportedOutputFormat(
                 "RGB/RGBA and non-8-bit Modular sources require matching native output or RGB(A) F32"
                     .into(),
@@ -1049,6 +1063,22 @@ impl OutputPlan {
             numeric_mapping,
             f64_output_path,
         ) = match (class, request.mapping()) {
+            (
+                PixelFormatClass::Numeric(numeric),
+                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned),
+            ) if source_channels == crate::ModularChannels::Gray
+                && numeric.sample_kind == SampleKind::Float
+                && numeric.bits_per_component == 32
+                && numeric.components == 1 =>
+            {
+                (OutputKind::NumericFloat, 0, false, 1, 0, 32, 32, 4, None)
+            }
+            (
+                PixelFormatClass::Numeric(_),
+                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned),
+            ) => {
+                return Err(Error::UnsupportedOutputFormat("normalized unsigned samples require a scalar F32 destination and a scalar source".into()));
+            }
             (
                 PixelFormatClass::Numeric(numeric),
                 GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedGray8),
@@ -1201,6 +1231,10 @@ impl OutputPlan {
             }
         };
         let output = Self {
+            source_channels: super::channels::OutputChannels::identity(
+                source_channels,
+                source_bits,
+            ),
             layout: ImageLayout::packed(extent, format)?,
             source_extent,
             orientation,

@@ -455,7 +455,8 @@ from the independent scalar packing oracle by at most one stored code at 8/16 bi
 Exact output lease sizes and full budget release are checked after each frame.
 
 Negative metadata tests cover invalid orientations, unsupported color, associated alpha,
-dimension shifts, mismatched alpha depths, extra-channel resampling, and restoration. The frontend
+dimension shifts, floating-point extra metadata, extra-channel resampling, and restoration.
+Independent integer alpha depths now have positive coverage below. The frontend
 accepts supported metadata semantics instead of comparing a fixed image-header bit representation.
 Separate bitstream tests cover small/default header forms and typed unknown image/frame/restoration
 extension rejection, including empty unknown payloads and bounded extension lengths.
@@ -968,6 +969,8 @@ layered still). Recursive DC adds two hidden LF producers to each of three full-
 | `rgb12` | 257×9 | Modular RGB12, 8 | Native valid-bit packing after composition |
 | `rgba8` | 33×7 | Modular RGBA8, 5 | Alpha zero/full/fractional values and independent sources |
 | `rgba16` | 33×7 | Modular RGBA16, 2 | Unassociated high-depth alpha and extended alpha sums |
+| `gray_alpha` | 259×17 | Modular Gray16+Alpha5, 8 | Gray expansion and independently normalized alpha through every blend |
+| `rgba_mixed_depth` | 33×7 | Modular RGB12+Alpha5, 6 | Mixed-depth alpha rescaling after composition |
 | `still` | 37×13 | Modular Gray8, 7 | All nine layers coalesce into one still |
 | `vardct` | 259×17 | XYB VarDCT RGB8, 6 | Progressive AC, crop/restoration/color composition |
 | `vardct_gray` | 37×13 | XYB VarDCT Gray8, 8 | Gray presentation as RGB |
@@ -981,8 +984,8 @@ are generated integer samples. libjxl's public API disallows save slot 3, and it
 encoder does not accept these tiny crop layers, so DC is requested only for the three full-canvas
 layers. These encoder limitations are not treated as decoder grammar restrictions.
 
-`composed_sequences_validate_every_layer_and_match_two_decoders` checks all nine ordinary cases:
-87 physical producers and 49 presentations, including six LF producers. Whole blocking and
+`composed_sequences_validate_every_layer_and_match_two_decoders` checks all eleven ordinary cases:
+105 physical producers and 61 presentations, including six LF producers. Whole blocking and
 4096-byte entropy-window / 137-byte fragmented async outputs are identical. Native 8/12/16-bit
 outputs differ by at most one code from each oracle; the Rust oracle is requested in F32 and
 quantized once. `floating_composition_packs_only_after_blending_and_orientation` compares applied
@@ -991,6 +994,12 @@ The error is measured in linear light for RGB and directly for alpha, divided by
 `max(1, abs(reference))` to cover extended values: below `3e-6` for Modular and `1e-4` for
 VarDCT-containing sequences. This is a scaled error bound, not a claim of that absolute accuracy
 at arbitrary HDR magnitude or a test of floating-point JPEG XL source metadata.
+
+The two independent-alpha-depth fixtures use normalized F32 input to libjxl with integer original
+precision, retaining the existing source formulas and a separate five-bit alpha maximum. The
+Gray+alpha PAM oracle contains two components; the test adapter replicates its gray component
+into RGB before comparison with the requested RGBA output. Both oracle comparisons use the
+ordinary native/F32 tolerances above, including crops, independent sources and retained alpha sums.
 
 The separate clamp regression retains `350/255` after Add, then multiplies by `191/255` at original
 coordinate (253,6). It verifies `350*191/(255*255)` before quantization (absolute error below
@@ -1023,11 +1032,83 @@ composition, pre-transform patches, and the official decoder conformance gate re
 |---|---:|---|
 | `composition_gray.jxl.hex` | 15919 | `26967f970494c2ffa969990878050fdc867bcde4642a995bd6b17ea4d3dcf7a5` |
 | `composition_gray_clamp.jxl.hex` | 15919 | `2a6eb8614b9d3ade28d4d52c309f2d4324a1d5883ff4882b84fe19d529223bf6` |
+| `composition_gray_alpha.jxl.hex` | 27761 | `5ec4090112c60cc51122b02db1bede1d1dc3678af0ad7812405bed6a4565fde0` |
 | `composition_mixed.jxl.hex` | 51326 | `7127a68b3c70d4467a423843b04bea676ec55c9d56eeb691cc9194372f378d3f` |
 | `composition_rgb12.jxl.hex` | 47572 | `352e440c21c5700e50c9484057fde2e36ac76db9869cfc417938a9033d511117` |
 | `composition_rgba16.jxl.hex` | 11227 | `76b3ba2a8fcf9ee805409f0167f774c5c9d41e0c477671c9a551c2ea884cb537` |
 | `composition_rgba8.jxl.hex` | 10045 | `75bc2e24a3fc2db76e823aa859764d4fa4bd5137fa30e8b629765e67b7dad851` |
+| `composition_rgba_mixed_depth.jxl.hex` | 11098 | `429f39ac6f53608aa302dffe8585e35d18a5a2842d1d0981c32fa2c2cec0837f` |
 | `composition_still.jxl.hex` | 3717 | `29a2ee4309f3a5ba5ac2528344f895e0b9927b0c71e993a82894fed76102f9ea` |
 | `composition_vardct.jxl.hex` | 22274 | `c63af30024305c6cf48a63e6f893456e147610c6eed9a51edc3ace0b8a1a68eb` |
 | `composition_vardct_dc.jxl.hex` | 418651 | `0cecab8c95ab07a947fa3331fbe7d9214d37c83c829599ec684d69880c68b6d8` |
 | `composition_vardct_gray.jxl.hex` | 3883 | `156e04469e6d86705972b03e65f80c942bb557c2de946d5f058cda6ed37462c5` |
+
+## Modular extra-channel planes and independent precision
+
+`test-data/generate_extra_channels.c` creates six lossless Modular fixtures with libjxl 0.12.0.
+It supplies normalized F32 input while declaring integer original precision and enumerated sRGB,
+with patches disabled. The production decoder does not link libjxl or run CPU image reconstruction.
+
+| Fixture suffix | Codestream extent | Color depth | Extra declarations | Orientation | Effort |
+|---|---|---:|---|---:|---:|
+| `data_only` | 17×1 | RGB8 | Depth16, SelectionMask1 | 6 | 1 |
+| `rgb12` | 259×17 | RGB12 | Nine planes listed below | 6 | 1 |
+| `gray8` | 33×7 | Gray8 | Nine planes listed below | 8 | 1 |
+| `gray_alpha` | 257×9 | Gray16 | Alpha5 | 5 | 1 |
+| `rgba` | 259×9 | RGB8 | Alpha5 | 3 | 1 |
+| `transformed` | 515×259 | RGB12 | Nine planes listed below | 7 | 7 |
+
+The nine-plane order is Depth16, SelectionMask1, Alpha7, SpotColor12, CFA4, Thermal8, Black6,
+Optional10, Alpha15. Names are `plane-{index}-depth-{bits}`; spot RGBA is `(0.25, 0.5, 0.75, 0.5)`
+and CFA index is 3. All alpha is unassociated and all original dimensional shifts are zero.
+For maximum code `M = 2^bits - 1`, each plane is zero when `x % 11 == 0`, `M` when the remainder
+is one, and `(193*x + 317*y + 97*c + (x ^ y)*(23+c)) & M` otherwise. Color channels start at
+`c = 0`; extra channels follow the one or three color planes. Every integer code is reproducible
+without storing a reference image.
+
+`tests/wgpu_gray8/extra_channels.rs` selects every extra plane using native unsigned output with
+Keep orientation and normalized scalar F32 with Apply orientation. Native output is exactly equal
+to the source formula. F32 differs from both Rust `jxl` and libjxl by less than `2e-7` absolute.
+The final extra-channel request for each fixture additionally uses a 4096-byte GPU entropy window
+and 137-byte fragmented input with async completion; it still reconstructs every source channel.
+Public metadata equals the full inventory, and profile counts distinguish color, extra and total
+channels. The effort-7 case asserts multiple inverse operations in the production execution plan.
+The 17×1 data-only case also proves that a zero-depth MA tree with one leaf and no decisions is
+valid; the public profile validator previously rejected it.
+
+Color tests explicitly preserve spot data and request base RGBA as F32 and native integers at the
+image depth. F32 matches both decoders within `2e-7`; native samples exactly match once-quantized
+Rust F32. This covers first-alpha selection at extra index 2, additional alpha planes, Gray+alpha
+expansion, independent alpha normalization/rescaling, and opaque virtual alpha for data-only extras.
+Default spot rendering remains a typed unsupported result; `SpotColorPolicy::Preserve` explicitly
+selects base color, and individual spot planes remain available through scalar data requests.
+
+The pinned Rust `jxl` 0.6.0 exposes `adjust_orientation` but does not consume that option in its
+render pipeline. For Keep-coordinate reference values, the test inverts the returned oriented
+plane using the independently shared test coordinate mapping; source-formula equality additionally
+checks the native GPU coordinates. `test-data/decode_extra_channels.c` requests oriented F32 RGBA
+and every F32 extra plane from libjxl with spot rendering disabled. This oracle is compiled only
+when `pkg-config` can locate libjxl; compilation or decoding failures then fail the tests.
+Both CPU oracles ran on the recorded native Apple M5/Metal adapter with libjxl 0.12.0.
+
+Negative and lifetime tests cover out-of-bounds extra indices, source-count overflow, color formats
+incorrectly used for scalar selection, unsupported default spot rendering, admission retry after
+reserving the available GPU byte budget, scalar selection from unsupported composed extras,
+fragmented input ownership, pending cancellation and
+caller-retained output clones. Original prediction geometry keeps the image working depth, while
+the finalizer's per-view masks apply independently declared original depths, matching the
+[libjxl Modular decoder](https://github.com/libjxl/libjxl/blob/main/lib/jxl/dec_modular.cc).
+
+These fixtures cover nominal unsigned 1–16-bit full-resolution Modular samples. Associated alpha,
+shifted/resampled extras, floating and wider precision, extended Modular sample ranges, reserved
+extra-channel meanings, actual spot rendering, VarDCT side images and general extra-channel frame
+composition remain full-format gates. WebGPU evidence is compilation only.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `extras_data_only.jxl.hex` | 230 | `593e5b5e8b0ff3000a87750722056550598389df95e65577a4fad31e5d81f71a` |
+| `extras_rgb12.jxl.hex` | 42598 | `8d3670e7559cf146f8898d5273ed0197035ed19a9b2f387e2d90eba85cd49237` |
+| `extras_gray8.jxl.hex` | 2831 | `a1e081afa962f42e2c0fb009b294cf2660b9e78ba3545e377ecff718305cf2df` |
+| `extras_gray_alpha.jxl.hex` | 4165 | `7dc247d04103486429dde631fd522e276657ec3fe837af2071aec766389ddab2` |
+| `extras_rgba.jxl.hex` | 8251 | `ebd817ddfb26ee8e07c3af133e5d7b19a3f534b40051a1bac41d7f8284c1a79d` |
+| `extras_transformed.jxl.hex` | 769485 | `a352bd19c118c5704a99455144b95910abe352cd14f62402ab9469c38371d57b` |

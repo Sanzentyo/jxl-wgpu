@@ -105,6 +105,7 @@ impl FrameExecutionPlan {
         } else {
             AnimationMetadata::still(extent)
         };
+        metadata.extra_channels = image.extra_channels.clone();
         let mut references = [None; 4];
         let mut nodes = Vec::with_capacity(inventory.frames.len());
         let mut presentations = Vec::new();

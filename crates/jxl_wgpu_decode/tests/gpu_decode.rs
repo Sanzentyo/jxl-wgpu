@@ -49,7 +49,7 @@ fn assert_jxl_signature(codestream: &GpuCodestream) {
 fn fixed_profile(bits_per_sample: u8, predictor: ModularPredictor) -> DecodeProfile {
     DecodeProfile::ModularLossless {
         bits_per_sample,
-        channels: ModularChannels::Gray,
+        channels: ModularChannels::Gray.into(),
         prediction: ModularPredictionProfile::Fixed { predictor },
         grouping: ModularGrouping::SingleGroup,
         passes: 1,

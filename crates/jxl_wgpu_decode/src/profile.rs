@@ -15,7 +15,8 @@ use crate::modular_transform::{
 };
 use crate::modular_tree::BitInput;
 use crate::{
-    Error, GpuCodestream, ModularChannels, Result, UnsupportedCodestreamFeature, UnsupportedProfile,
+    Error, GpuCodestream, ModularChannelCounts, ModularChannels, Result,
+    UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 use crate::{
     ModularTransformFeature,
@@ -57,7 +58,8 @@ pub(crate) struct StandardModularProfile {
     pub height: u32,
     pub orientation: OutputOrientation,
     pub bits_per_sample: u8,
-    pub channels: ModularChannels,
+    pub channels: ModularChannelCounts,
+    pub extra_channels: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
     pub pass_count: u32,
     pub group_columns: u32,
     pub group_rows: u32,
@@ -137,15 +139,14 @@ impl ModularMaConfig {
 // Admission depends on pixel semantics, never on one encoder's choice of bit representation.
 fn validate_image_header(
     image: &ImageHeaderInventory,
-    channels: ModularChannels,
-    bits_per_sample: u8,
+    channels: ModularChannelCounts,
 ) -> Result<OutputOrientation> {
     let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
         Error::InvalidImageOrientation {
             value: image.orientation,
         },
     )?;
-    let colour_space = if channels == ModularChannels::Gray {
+    let colour_space = if channels.color_count() == 1 {
         ColourSpaceInventory::Grey
     } else {
         ColourSpaceInventory::Rgb
@@ -165,21 +166,24 @@ fn validate_image_header(
         )
         .into());
     }
-    let alpha_count = usize::from(channels == ModularChannels::Rgba);
-    if image.extra_channels.len() != alpha_count
-        || image.extra_channel_count as usize != alpha_count
+    if image.extra_channels.len() != channels.extra_count() as usize
+        || image.extra_channel_count != channels.extra_count()
         || image.extra_channels.iter().any(|extra| {
-            extra.channel_type != (ExtraChannelTypeInventory::Alpha { associated: false })
-                || extra.bit_depth
-                    != (SampleBitDepth::Integer {
-                        bits_per_sample: u32::from(bits_per_sample),
-                    })
-                || extra.dimension_shift != 0
+            !matches!(
+                extra.bit_depth,
+                SampleBitDepth::Integer {
+                    bits_per_sample: 1..=16
+                }
+            ) || extra.dimension_shift != 0
+                || matches!(
+                    extra.channel_type,
+                    ExtraChannelTypeInventory::Alpha { associated: true }
+                )
         })
     {
         return Err(UnsupportedProfile::new(
             UnsupportedCodestreamFeature::ExtraChannels,
-            "native RGBA requires one unassociated full-resolution alpha channel with matching depth",
+            "Modular extra channels require full-resolution 1–16-bit integer samples; associated alpha is not yet connected",
         ).into());
     }
     Ok(orientation)
@@ -239,21 +243,10 @@ fn parse_modular_profile(
     };
     // XYB Modular dependency frames always contain Y/X/B, including when the final image's
     // presentation encoding is grayscale. Only non-XYB Modular stores a single gray plane.
-    let channels = match (
+    let channels = ModularChannelCounts::new(
         image.grayscale && !image.xyb_encoded,
         image.extra_channel_count,
-    ) {
-        (true, 0) => ModularChannels::Gray,
-        (false, 0) => ModularChannels::Rgb,
-        (false, 1) => ModularChannels::Rgba,
-        _ => {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::ExtraChannels,
-                "the lossless Modular GPU profile supports Gray, RGB, or one RGBA alpha channel",
-            )
-            .into());
-        }
-    };
+    )?;
     if (image.animation.is_some() && purpose == ModularProfilePurpose::Presentation)
         || image.preview_size.is_some()
         || inventory.frames.len() != 1
@@ -265,10 +258,10 @@ fn parse_modular_profile(
             if image.xyb_encoded {
                 return unsupported("the lossless Modular GPU profile does not use XYB metadata");
             }
-            validate_image_header(image, channels, bits_per_sample)?
+            validate_image_header(image, channels)?
         }
         ModularProfilePurpose::ProgressiveDc => {
-            if !image.xyb_encoded || channels != ModularChannels::Rgb {
+            if !image.xyb_encoded || channels != ModularChannels::Rgb.into() {
                 return unsupported(
                     "a progressive-DC Modular producer requires three XYB color channels",
                 );
@@ -304,10 +297,7 @@ fn parse_modular_profile(
         || (purpose != ModularProfilePurpose::Frame
             && (frame.color_blend != FrameBlendInfo::default()
                 || frame.extra_channel_blends
-                    != vec![
-                        FrameBlendInfo::default();
-                        usize::from(channels == ModularChannels::Rgba)
-                    ]));
+                    != vec![FrameBlendInfo::default(); image.extra_channels.len()]));
     let role_is_invalid = match purpose {
         ModularProfilePurpose::Presentation => {
             frame.frame_type != FrameType::Regular
@@ -844,7 +834,13 @@ fn parse_modular_profile(
         group.sample_count()?;
     }
 
-    let generalized_channels = frame_plan_seed.is_some()
+    let conventional_alpha = image.extra_channels.is_empty()
+        || (image.extra_channels.len() == 1
+            && image.extra_channels[0].channel_type
+                == (ExtraChannelTypeInventory::Alpha { associated: false })
+            && image.extra_channels[0].bit_depth == image.bit_depth);
+    let generalized_channels = !conventional_alpha
+        || frame_plan_seed.is_some()
         || concrete_transform_plans
             .iter()
             .any(|(plan, _, _)| uses_generalized_channel_layout(channels, plan));
@@ -925,6 +921,7 @@ fn parse_modular_profile(
         orientation,
         bits_per_sample,
         channels,
+        extra_channels: image.extra_channels.clone(),
         pass_count: frame.num_passes,
         group_columns,
         group_rows,
@@ -1008,14 +1005,17 @@ fn collect_required_entries<T>(entries: Vec<Option<T>>, name: &'static str) -> R
 }
 
 pub(crate) fn uses_generalized_channel_layout(
-    channels: ModularChannels,
+    channels: ModularChannelCounts,
     transform_plan: &ModularTransformPlan,
 ) -> bool {
     !matches!(
-        (channels, transform_plan.transforms.as_slice()),
-        (ModularChannels::Gray, [])
+        (
+            channels.conventional(),
+            transform_plan.transforms.as_slice()
+        ),
+        (Some(ModularChannels::Gray), [])
             | (
-                ModularChannels::Rgb | ModularChannels::Rgba,
+                Some(ModularChannels::Rgb | ModularChannels::Rgba),
                 [ModularTransformIr::Rct(ModularRct {
                     begin_channel: 0,
                     rct_type: 6,
@@ -1241,7 +1241,7 @@ fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<[Finite
 
 fn parse_dc_global_ir(
     reader: &mut impl BitInput,
-    channels: ModularChannels,
+    channels: ModularChannelCounts,
     width: u32,
     height: u32,
     bit_depth: u32,
@@ -1298,7 +1298,7 @@ fn parse_dc_global_ir(
 }
 
 fn validate_stock_modular_transform_plan(
-    channels: ModularChannels,
+    channels: ModularChannelCounts,
     width: u32,
     height: u32,
     bit_depth: u32,
@@ -1322,7 +1322,10 @@ fn validate_stock_modular_transform_plan(
     // This proves that every entropy-visible channel has a portable u32 WGSL address before any
     // backend allocation. The generalized transformed-channel executor will retain this table.
     let _gpu_channel_layout = transform_plan.topology.gpu_layout()?;
-    match (channels, transform_plan.transforms.as_slice()) {
+    match (
+        channels.conventional(),
+        transform_plan.transforms.as_slice(),
+    ) {
         (_, []) if topology_is_direct => {
             let inverse = plan_modular_inverse(transform_plan)?;
             if u64::from(inverse.entropy_words()) != expected_sample_count
@@ -1337,7 +1340,7 @@ fn validate_stock_modular_transform_plan(
             }
         }
         (
-            ModularChannels::Rgb | ModularChannels::Rgba,
+            Some(ModularChannels::Rgb | ModularChannels::Rgba),
             [
                 ModularTransformIr::Rct(ModularRct {
                     begin_channel: 0,
@@ -1500,7 +1503,7 @@ mod tests {
         for value in 1..=8 {
             image.orientation = value;
             assert_eq!(
-                validate_image_header(image, ModularChannels::Rgba, 16)
+                validate_image_header(image, ModularChannels::Rgba.into())
                     .unwrap()
                     .to_exif_value(),
                 value
@@ -1508,7 +1511,7 @@ mod tests {
         }
         image.orientation = 9;
         assert!(matches!(
-            validate_image_header(image, ModularChannels::Rgba, 16),
+            validate_image_header(image, ModularChannels::Rgba.into()),
             Err(Error::InvalidImageOrientation { value: 9 })
         ));
         image.orientation = 1;
@@ -1517,7 +1520,7 @@ mod tests {
             colour_space: ColourSpaceInventory::Rgb,
         };
         assert!(
-            matches!(validate_image_header(image, ModularChannels::Rgba, 16),
+            matches!(validate_image_header(image, ModularChannels::Rgba.into()),
             Err(Error::UnsupportedProfile(ref error)) if error.feature == UnsupportedCodestreamFeature::ColorEncoding)
         );
         image.colour_encoding = encoding;
@@ -1528,27 +1531,30 @@ mod tests {
                 ..alpha.clone()
             },
             jxl_gpu_bitstream::ExtraChannelInventory {
-                channel_type: ExtraChannelTypeInventory::Depth,
-                ..alpha.clone()
-            },
-            jxl_gpu_bitstream::ExtraChannelInventory {
                 dimension_shift: 1,
                 ..alpha.clone()
             },
             jxl_gpu_bitstream::ExtraChannelInventory {
-                bit_depth: SampleBitDepth::Integer {
-                    bits_per_sample: 12,
+                bit_depth: SampleBitDepth::Float {
+                    bits_per_sample: 32,
+                    exponent_bits_per_sample: 8,
                 },
                 ..alpha.clone()
             },
         ] {
             image.extra_channels[0] = invalid;
             assert!(
-                matches!(validate_image_header(image, ModularChannels::Rgba, 16),
+                matches!(validate_image_header(image, ModularChannels::Rgba.into()),
                 Err(Error::UnsupportedProfile(ref error)) if error.feature == UnsupportedCodestreamFeature::ExtraChannels)
             );
         }
         image.extra_channels[0] = alpha;
+        let mut distinct = image.clone();
+        distinct.extra_channels[0].bit_depth = SampleBitDepth::Integer {
+            bits_per_sample: 12,
+        };
+        distinct.extra_channels[0].channel_type = ExtraChannelTypeInventory::Depth;
+        validate_image_header(&distinct, ModularChannels::Rgba.into()).unwrap();
         let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
         let source = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
         parse_standard_modular_profile(&source, &inventory).unwrap();
@@ -1737,7 +1743,8 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Gray, 9, 5, 8, &squeeze).unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Gray.into(), 9, 5, 8, &squeeze)
+            .unwrap();
         let squeeze_inverse = plan_modular_inverse(&squeeze).unwrap();
         assert_eq!(squeeze_inverse.entropy_words(), 45);
         assert_eq!(squeeze_inverse.jobs().len(), 1);
@@ -1753,7 +1760,7 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Rgb, 7, 3, 8, &rct).unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Rgb.into(), 7, 3, 8, &rct).unwrap();
         let rct_inverse = plan_modular_inverse(&rct).unwrap();
         assert_eq!(rct_inverse.entropy_words(), 63);
         assert_eq!(rct_inverse.jobs().len(), 1);
@@ -1774,7 +1781,8 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Rgb, 11, 7, 8, &palette).unwrap();
+        validate_stock_modular_transform_plan(ModularChannels::Rgb.into(), 11, 7, 8, &palette)
+            .unwrap();
         let palette_inverse = plan_modular_inverse(&palette).unwrap();
         assert_eq!(palette_inverse.jobs().len(), 3);
         assert_eq!(palette_inverse.final_planes().len(), 3);

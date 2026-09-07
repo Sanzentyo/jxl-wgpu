@@ -84,9 +84,23 @@ fn cases() -> [Case; 9] {
     ]
 }
 
-fn composition_cases() -> [Case; 9] {
+fn composition_cases() -> [Case; 11] {
     use LosslessModularFormat::{Gray, Rgb, Rgba};
     [
+        (
+            "gray_alpha",
+            include_str!("../../test-data/composition_gray_alpha.jxl.hex"),
+            Rgba,
+            16,
+            false,
+        ),
+        (
+            "rgba_mixed_depth",
+            include_str!("../../test-data/composition_rgba_mixed_depth.jxl.hex"),
+            Rgba,
+            12,
+            false,
+        ),
         (
             "gray",
             include_str!("../../test-data/composition_gray.jxl.hex"),
@@ -299,7 +313,7 @@ fn samples(bytes: &[u8], bits: u8) -> Vec<u16> {
     }
 }
 
-fn incremental(
+pub(super) fn incremental(
     decoder: &GpuDecoder<WgpuDecodeEngine>,
     encoded: &[u8],
     request: GpuOutputRequest,
@@ -496,6 +510,8 @@ fn djxl_frames(case: &Case, encoded: &[u8]) -> Option<Vec<Vec<u16>>> {
                 .flat_map(|pixel| {
                     let color = if depth == 1 && case.format == LosslessModularFormat::Rgb {
                         vec![pixel[0]; 3]
+                    } else if depth == 2 && case.format == LosslessModularFormat::Rgba {
+                        vec![pixel[0], pixel[0], pixel[0], pixel[1]]
                     } else {
                         pixel.to_vec()
                     };
@@ -663,7 +679,7 @@ fn modular_and_vardct_sequences_preserve_pixels_timing_and_bounded_input_lifetim
     }
 }
 
-fn keep_codestream_order<T: Clone>(
+pub(super) fn keep_codestream_order<T: Clone>(
     values: &[T],
     extent: Extent2d,
     channels: usize,

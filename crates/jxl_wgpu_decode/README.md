@@ -14,14 +14,15 @@ The low-level `WgpuSubmissionEngine` implements a standards-only lossless Modula
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
-- one final still frame with 1-16-bit integer Gray, RGB, or RGBA lossless Modular samples over any
-  bounded 128/256/512/1024-pixel pass-group grid and one through three passes;
+- one final still frame with 1–16-bit integer Gray or RGB lossless Modular samples and arbitrary
+  full-resolution integer extra channels with independent 1–16-bit precision, over a bounded
+  128/256/512/1024-pixel pass-group grid and one through three passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
   entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
 - shared DC-global RCT/Palette/Squeeze and per-LF/pass-subimage RCT/Palette/Squeeze stacks, including
-  nonempty DC-global sample channels, group-edge geometry, and one full-resolution unassociated
-  alpha channel for RGBA; no restoration filters, other extra channels, or references.
+  nonempty DC-global sample channels and group-edge geometry; alpha must be unassociated,
+  and restoration filters and references remain outside this low-level still engine.
 
 Presentation normalizes all eight image orientations in the GPU writer. The source canvas and
 group origins remain in codestream coordinates; output layout and changed regions use the oriented
@@ -44,14 +45,42 @@ by their actual bit depth after inverse transforms; gray expands to RGB, missing
 and decoded alpha normalizes independently of the RGB transfer. This path currently accepts
 explicit full-range BT.709 primaries and sRGB/SYCC, Linear, BT.709 or BT.2020 transfer functions.
 It preserves the existing native integer output contracts and uses the same resident output leases.
-Floating-point JPEG XL source metadata, additional source color domains and other extra channels
-remain unsupported.
+Gray+alpha and independent alpha precision use the same path. Floating-point JPEG XL source
+metadata and additional source color domains remain unsupported.
+
+Codestream topology is separate from native pixel formats: `DecodeProfile::ModularLossless`
+contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
+`ModularChannels` describes native Gray/RGB/RGBA output arrangements. `AnimationMetadata::extra_channels`
+preserves declaration order, names, original depths and type-specific metadata. Color output uses
+the first alpha declaration regardless of its position among other extras; native RGBA rescales
+alpha to the output depth, while F32 normalizes it by its own depth. Missing alpha is opaque.
+
+`GpuOutputRequest::with_extra_channel(index)` selects a zero-based extra-channel declaration.
+Use a canonical native unsigned Gray format at that channel's depth for exact integer codes,
+or a scalar F32 descriptor with `NumericSampleMapping::NormalizedUnsigned` for codes divided by
+that channel's unsigned maximum. Scalar data receives orientation but no color transfer:
+
+```rust,ignore
+let request = GpuOutputRequest::numeric(
+    PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+    NumericSampleMapping::NormalizedUnsigned,
+)?.with_extra_channel(2)?;
+```
+
+All source channels still pass through GPU entropy decoding and inverse transforms before output
+selection. Selecting one plane adds no CPU image path or intermediate image copy. Unknown
+non-optional extras cannot silently be omitted from color interpretation. Spot-color data can be
+selected like other extras; `with_spot_color_policy(SpotColorPolicy::Preserve)` explicitly returns
+the base color. Default `Render` rejects spot images until the spot rendering stage is connected.
+Six checked-in libjxl fixtures cover eight extra-channel types, multiple alpha planes, a Gray+alpha
+topology, independent depths, a one-leaf MA tree, and transformed multi-group streams. Native
+planes match source codes exactly, and F32 matches Rust `jxl` and the optional libjxl C oracle.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
-reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, unassociated matching-depth
-full-resolution alpha, all orientations, intrinsic-size hints, and named alpha declarations can
-use the supported reconstruction path. Unsupported ICC/color, associated/dimension-shifted or
-mismatched-depth alpha, extra-channel resampling, and restoration remain rejected. Unknown image,
+reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, full-resolution integer extras,
+all orientations, intrinsic-size hints, and named channel declarations can use the supported
+reconstruction path. Unsupported ICC/color, associated alpha, dimension shifts, extra-channel
+resampling, and restoration remain rejected. Unknown image,
 frame, and restoration extension selectors are typed inventory errors before any GPU work.
 Twenty-three checked-in libjxl fixtures compare exact native samples with their deterministic
 source and Rust jxl, plus exact Gray/RGB samples from djxl. Twelve gray fixtures cover all 30 VPI formats under both whole blocking
@@ -111,7 +140,7 @@ its first retired range for the restored output. The real progressive-DC LF2 fix
 parameters to 37 jobs and three final full-resolution planes within twice its entropy sample count.
 An RCT/Squeeze/RCT test emits five ordered jobs and executes them in one command encoder, copying all
 three noncontiguous final planes into one staging map. Production scheduling applies a concrete
-group-local inverse plan and a 160-byte region-aware finalizer as soon as each group's final entropy
+group-local inverse plan and a 176-byte region-aware finalizer as soon as each group's final entropy
 segment finishes when no cross-group transform is present. For DC-global Palette/Squeeze, channels
 with both transformed shifts at least three are decoded by LF-group subimages first; channels with
 either shift below three are decoded by pass-group subimages. Each subimage finishes its local
@@ -176,7 +205,8 @@ channels whose horizontal and vertical transformed shifts are both at least thre
 the remaining channels, including asymmetric shifts. LF streams execute before nonempty pass
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through three passes produce an exact final
-image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular, non-alpha extra channels,
+image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular,
+shifted/resampled extras, associated alpha,
 patches, splines, and noise remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -234,9 +264,10 @@ admission failures preserve the source for retry. As with staged VarDCT, an allo
 after a presentation starts is terminal for that pending frame. References, uniforms, sources,
 and outputs stay budgeted across callbacks and cancellation. No CPU pixels are read for blending.
 
-Ten new libjxl fixtures cover all five blend modes, separate alpha sources, negative and oversized
+Twelve libjxl fixtures cover all five blend modes, separate alpha sources, negative and oversized
 crops, fully off-canvas frames, empty slots, reference overwrites, layered stills, mixed JPEG/Modular,
-and recursive DC. Nine match Rust `jxl` and `djxl` within one native output code. F32 comparison
+and recursive DC, including Gray16+Alpha5 and RGB12+Alpha5. Eleven match Rust `jxl` and `djxl`
+within one native output code. F32 comparison
 uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` for Modular and
 `1e-4` for VarDCT-containing sequences. A separate Multiply-clamp case verifies extended reference
 values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.

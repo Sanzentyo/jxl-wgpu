@@ -1197,7 +1197,8 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
                 ..
             } if node_count != 0
                 && leaf_context_count != 0
-                && max_depth != 0
+                && max_depth <= decision_node_count
+                && (max_depth == 0) == (decision_node_count == 0)
                 && decision_node_count.checked_add(leaf_context_count) == Some(node_count) =>
             {
                 Ok(())
@@ -1293,7 +1294,7 @@ mod tests {
     fn modular_profile_accepts_only_the_negotiated_progressive_pass_range() {
         let profile = |passes| DecodeProfile::ModularLossless {
             bits_per_sample: 8,
-            channels: crate::ModularChannels::Gray,
+            channels: crate::ModularChannels::Gray.into(),
             prediction: crate::ModularPredictionProfile::Fixed {
                 predictor: crate::ModularPredictor::Gradient,
             },

@@ -116,17 +116,30 @@ name shown in parentheses.
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
 
-The Modular finalizer has its own 160-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
-binding 2. Ten `vec4<u32>` records contain the source extent, region/status, four source offsets,
-four source strides, output/format fields, two plane offset/stride pairs, logical/chroma bounds,
-and the complete unrotated canvas width/height, oriented output width, and orientation. The final
-canvas record starts at byte 144. Ordinary entropy parameter records are 256 bytes; their final
-canvas width, canvas height, and orientation words are at offsets 244, 248, and 252. Compile-time
+The Modular finalizer has its own 176-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
+binding 2. Eleven `vec4<u32>` records contain the source extent, region/status, four source offsets,
+four source strides, four source masks, output/format fields, two plane offset/stride pairs,
+logical/chroma bounds, and the complete unrotated canvas width/height, oriented output width,
+and orientation. Source masks start at byte 64 and the canvas record starts at byte 160.
+Ordinary entropy parameter records are 256 bytes; their final canvas width, canvas height,
+and orientation words are at offsets 244, 248, and 252. Compile-time
 Rust sizes/alignment, byte-order assertions, Naga validation, and actual-device output cover both.
 Exact uniform/parameter sizes feed the existing transient-budget plans; no rotated image arena is
 allocated. Mirrored/transposed groups select atomic byte updates. Packed 4:2:2 assigns two bytes
 to each source pixel, with the odd final pixel owning the tail pair; no group overwrites another
 group's luma word. Native and converted output use the oriented layout's bounds.
+
+Output-channel selection binds up to four views from the complete inverse result, or one view for
+a selected extra channel. Gray+alpha can bind the gray view three times without copying samples.
+Per-view masks retain each channel's original integer precision: alpha normalizes independently
+for F32 and rescales with integer rounding for native output. The prediction/inverse descriptor
+depth remains the image's working depth. Scalar normalized unsigned output uses numeric mapping 4
+and one F32 component; no color transfer is applied. The enlarged uniform is charged through
+`size_of::<ModularFinalizeParams>()` for each existing finalizer, adding no buffer or submission.
+All entropy channels, inverse arenas and jobs retain their existing budget/lifetime ownership even
+when only one plane is selected. Public declaration/name vectors remain host metadata, outside
+the GPU byte budget. Invalid selection is rejected before admission; retry, cancellation and
+caller-held output clones have actual-GPU lifetime coverage.
 
 ### Values that intentionally are not `Pod`
 
@@ -380,9 +393,10 @@ unoriented three-channel shape even for gray presentation or a non-RGB output re
 
 Modular's ordinary and inverse-stage writers use output kinds 5/6 with 32-bit samples for F32 RGB.
 They normalize the 1–16-bit integer planes after inverse reconstruction, preserve alpha separately,
-and store complete word-aligned float components. Their 256-byte ordinary records and 160-byte
-finalizer uniforms do not grow. Output planning charges the complete 3/4-component F32 layout,
-validates all four-byte alignments and source/target plane bounds, and includes sample width in
+and store complete word-aligned float components. Ordinary records remain 256 bytes; finalizer
+uniforms are now 176 bytes with independent selected-channel masks. Output planning charges the
+complete 3/4-component F32 layout, validates all four-byte alignments and source/target plane bounds,
+and includes sample width in
 group-isolation proofs. `OrientationPolicy::Keep` lowers output orientation to identity while
 retaining the checked source extent. It adds no buffer or submission and does not change LF storage.
 

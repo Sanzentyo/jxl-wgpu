@@ -287,7 +287,7 @@ impl WgpuSubmissionEngine {
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_progressive_dc_modular_profile(&codestream, inventory)?;
         let internal_request = GpuOutputRequest::color(native_modular_pixel_format(
-            profile.channels,
+            crate::ModularChannels::Rgb,
             profile.bits_per_sample,
         )?)?
         .with_max_frame_slots(request.max_frame_slots());
@@ -308,8 +308,15 @@ impl WgpuSubmissionEngine {
         &self,
         codestream: Arc<GpuCodestream>,
         request: &GpuOutputRequest,
-        profile: StandardModularProfile,
+        mut profile: StandardModularProfile,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        let output_channels = super::channels::OutputChannels::negotiate(&profile, request)?;
+        profile.generalized_channels |= !output_channels.direct(&profile)
+            || request.extra_channel().is_some()
+            || matches!(
+                request.mapping(),
+                crate::GpuOutputMapping::Numeric(crate::NumericSampleMapping::NormalizedUnsigned)
+            );
         if profile.resident_entropy_plans.len() != profile.entropy_groups.len() {
             return Err(Error::EngineContract(
                 "Modular entropy plans do not match the LF/pass stream inventory",
@@ -417,14 +424,15 @@ impl WgpuSubmissionEngine {
             .transpose()?;
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
         let extent = Extent2d::new(profile.width, profile.height);
-        let output = OutputPlan::new(
+        let mut output = OutputPlan::new(
             extent,
             profile.orientation,
             request,
-            profile.channels,
-            profile.bits_per_sample,
+            output_channels.format_channels,
+            output_channels.bits,
             self.capabilities(),
         )?;
+        output.source_channels = output_channels;
         let output_write_path = if generalized_channels {
             OutputWritePath::AtomicBytes
         } else {
@@ -619,7 +627,10 @@ impl WgpuSubmissionEngine {
                 },
                 passes: profile.pass_count,
             },
-            AnimationMetadata::still(output.layout.extent),
+            AnimationMetadata {
+                extra_channels: profile.extra_channels.clone(),
+                ..AnimationMetadata::still(output.layout.extent)
+            },
             WgpuDecodeSession {
                 backend: self.backend.clone(),
                 pipeline,

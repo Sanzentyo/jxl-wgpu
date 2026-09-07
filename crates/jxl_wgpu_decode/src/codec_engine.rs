@@ -267,6 +267,14 @@ impl WgpuDecodeEngine {
         request: &GpuOutputRequest,
         inventory: &jxl_gpu_bitstream::CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        if let Some(index) = request.extra_channel()
+            && index as usize >= inventory.image_header.extra_channels.len()
+        {
+            return Err(Error::ExtraChannelIndex {
+                index,
+                count: inventory.image_header.extra_channel_count,
+            });
+        }
         let plan = crate::FrameExecutionPlan::negotiate_with_orientation(
             inventory,
             request.orientation_policy(),

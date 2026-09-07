@@ -9,6 +9,7 @@ struct Params {
     region: vec4<u32>,
     source_offsets: vec4<u32>,
     source_strides: vec4<u32>,
+    source_masks: vec4<u32>,
     // output kind, transfer, limited range, component count
     output: vec4<u32>,
     // channel order, component bits, storage bits, numeric mapping
@@ -78,7 +79,7 @@ fn source_sample(channel: u32, x: u32, y: u32) -> u32 {
             + y * params.source_strides[channel]
             + x
     ]);
-    if raw < 0i || u32(raw) > source_mask() {
+    if raw < 0i || u32(raw) > params.source_masks[channel] {
         reject_output_mapping();
         return 0u;
     }
@@ -98,11 +99,18 @@ fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
     let bytes_per_component = params.format.z / 8u;
     let pixel_offset = params.plane01.x
         + y * params.plane01.y
-        + x * params.extent.z * bytes_per_component;
-    for (var channel = 0u; channel < params.extent.z; channel += 1u) {
+        + x * params.output.w * bytes_per_component;
+    for (var channel = 0u; channel < params.output.w; channel += 1u) {
+        var value = source_mask();
+        if channel < 3u || params.extent.z == 4u {
+            let source_channel = select(channel, 0u, params.extent.z == 1u && channel < 3u);
+            value = source_sample(source_channel, source_x, source_y);
+            let mask = params.source_masks[source_channel];
+            if mask != source_mask() { value = (value * source_mask() + mask / 2u) / mask; }
+        }
         write_stored_code(
             pixel_offset + channel * bytes_per_component,
-            source_sample(channel, source_x, source_y),
+            value,
         );
     }
 }
@@ -165,6 +173,10 @@ fn write_numeric_sample(x: u32, y: u32, sample: u32) {
         + x * params.output.w * bytes_per_component;
     for (var component = 0u; component < params.output.w; component += 1u) {
         let offset = pixel_offset + component * bytes_per_component;
+        if params.format.w == 4u {
+            write_word(offset, bitcast<u32>(f32(sample) / f32(params.source_masks.x)));
+            continue;
+        }
         if params.output.x == 0u {
             let value = normalized_unsigned(sample, params.format.y);
             if params.format.y == 8u {
@@ -234,7 +246,7 @@ fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
             let channel = select(canonical, 0u, params.extent.z == 1u);
             value = target_nonlinear(source_sample(channel, source_x, source_y));
         } else if params.extent.z == 4u {
-            value = f32(source_sample(3u, source_x, source_y)) / f32(source_mask());
+            value = f32(source_sample(3u, source_x, source_y)) / f32(params.source_masks.w);
         }
         var offset = params.plane01.x + y * params.plane01.y + (x * params.output.w + position) * 4u;
         if params.output.x == 6u { offset = offsets[position] + y * strides[position] + x * 4u; }

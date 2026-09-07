@@ -32,6 +32,8 @@ use jxl_wgpu_encode::{
 use wgpu::util::DeviceExt;
 
 mod common;
+#[path = "wgpu_gray8/extra_channels.rs"]
+mod extra_channels;
 #[path = "wgpu_gray8/frame_sequence.rs"]
 mod frame_sequence;
 #[path = "wgpu_gray8/orientation.rs"]
@@ -1149,7 +1151,7 @@ fn cjxl_palette_transform_is_exact_through_resident_inverse_and_finalize() {
     assert!(stats.inverse_transform_count >= 1);
     assert!(stats.palette_dispatch_count >= 1);
     assert!(stats.inverse_transform_uniform_bytes >= 128);
-    assert_eq!(stats.final_output_uniform_bytes, 160);
+    assert_eq!(stats.final_output_uniform_bytes, 176);
     assert_eq!(
         stats.reconstruction_specialization,
         ModularReconstructionSpecialization::DescriptorMetaAdaptive
@@ -1251,7 +1253,7 @@ fn cjxl_multigroup_global_palette_is_exact_through_frame_resident_inverse() {
     assert!(stats.global_reconstruction_sample_words > 0);
     assert!(stats.frame_modular_arena_bytes > 0);
     assert_eq!(stats.palette_dispatch_count, 1);
-    assert_eq!(stats.final_output_uniform_bytes, 160);
+    assert_eq!(stats.final_output_uniform_bytes, 176);
     let frame = session
         .next_frame()
         .expect("cjxl global Palette GPU decode succeeds")
@@ -1457,7 +1459,7 @@ fn cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly() {
     );
     assert!(stats.inverse_transform_count >= group_count);
     assert!(stats.palette_dispatch_count >= 1);
-    assert_eq!(stats.final_output_uniform_bytes, group_count as u64 * 160);
+    assert_eq!(stats.final_output_uniform_bytes, group_count as u64 * 176);
     assert_eq!(stats.frame_modular_arena_bytes, 0);
     assert_eq!(stats.stream_batch_count, 2);
     assert_eq!(stats.submissions_per_frame, 2);
@@ -1532,7 +1534,7 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
                 channels: actual_channels,
                 grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
                 ..
-            } if actual_bits == bits_per_sample && actual_channels == expected_channels
+            } if actual_bits == bits_per_sample && actual_channels == expected_channels.into()
         ));
         let bytes_per_sample = if bits_per_sample <= 8 { 1u64 } else { 2 };
         let row_bytes = u64::from(width) * u64::from(format.channel_count()) * bytes_per_sample;

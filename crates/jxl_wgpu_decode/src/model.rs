@@ -22,7 +22,7 @@ pub enum DecodeProfile {
     /// Lossless Modular data reconstructed by a GPU entropy/MA pipeline.
     ModularLossless {
         bits_per_sample: u8,
-        channels: ModularChannels,
+        channels: ModularChannelCounts,
         prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
         /// Progressive pass count declared by the frame (`1..=3` for the negotiated profile).
@@ -33,7 +33,7 @@ pub enum DecodeProfile {
     VarDct { bits_per_sample: u8 },
 }
 
-/// Logical channels reconstructed by a lossless Modular profile.
+/// Channel arrangement of a native unsigned Modular output pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModularChannels {
     Gray,
@@ -48,6 +48,64 @@ impl ModularChannels {
             Self::Gray => 1,
             Self::Rgb => 3,
             Self::Rgba => 4,
+        }
+    }
+}
+
+/// Codestream channel topology, independent of the requested output pixel format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModularChannelCounts {
+    color: u32,
+    total: NonZeroU32,
+}
+
+impl ModularChannelCounts {
+    /// Creates a Gray or RGB source topology with a checked number of extra channels.
+    pub fn new(grayscale: bool, extra: u32) -> Result<Self> {
+        let color: u32 = if grayscale { 1 } else { 3 };
+        let total = color.checked_add(extra).and_then(NonZeroU32::new).ok_or(
+            Error::ModularChannelCountOverflow {
+                color_channels: color,
+                extra_channels: extra,
+            },
+        )?;
+        Ok(Self { color, total })
+    }
+
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.total.get()
+    }
+
+    #[must_use]
+    pub const fn color_count(self) -> u32 {
+        self.color
+    }
+
+    #[must_use]
+    pub const fn extra_count(self) -> u32 {
+        self.count() - self.color
+    }
+
+    pub(crate) const fn conventional(self) -> Option<ModularChannels> {
+        match (self.color, self.extra_count()) {
+            (1, 0) => Some(ModularChannels::Gray),
+            (3, 0) => Some(ModularChannels::Rgb),
+            (3, 1) => Some(ModularChannels::Rgba),
+            _ => None,
+        }
+    }
+}
+
+impl From<ModularChannels> for ModularChannelCounts {
+    fn from(channels: ModularChannels) -> Self {
+        Self {
+            color: if channels == ModularChannels::Gray {
+                1
+            } else {
+                3
+            },
+            total: NonZeroU32::new(channels.count()).expect("native channels are nonempty"),
         }
     }
 }
@@ -183,6 +241,8 @@ pub struct AnimationMetadata {
     pub loop_count: Option<u32>,
     pub has_timecodes: Option<bool>,
     pub frame_count_hint: Option<usize>,
+    /// Extra-channel declarations in codestream order, including exact names and sample metadata.
+    pub extra_channels: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
 }
 
 impl AnimationMetadata {
@@ -194,6 +254,7 @@ impl AnimationMetadata {
             loop_count: None,
             has_timecodes: None,
             frame_count_hint: Some(1),
+            extra_channels: Vec::new(),
         }
     }
 
@@ -211,6 +272,7 @@ impl AnimationMetadata {
             loop_count: Some(loop_count),
             has_timecodes: Some(has_timecodes),
             frame_count_hint,
+            extra_channels: Vec::new(),
         }
     }
 
@@ -230,6 +292,9 @@ pub enum NumericSampleMapping {
     /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
     /// codestream depth must match.
     NativeUnsigned,
+    /// Divide a 1–16-bit unsigned source by its own maximum code into scalar F32 storage.
+    /// No transfer function or color conversion is applied, including for extra channels.
+    NormalizedUnsigned,
     /// Maps the decoded integer code `gray` in `[0, 255]` across the destination's nonnegative
     /// range. Unsigned integers use `[0, MAX]`; signed integers use `[0, MAX]` (never negative);
     /// floating-point values use the normalized `f32` value `gray / 255`. Two-component formats
@@ -277,6 +342,17 @@ pub struct GpuOutputRequest {
     mapping: GpuOutputMapping,
     max_frame_slots: NonZeroUsize,
     orientation: OrientationPolicy,
+    extra_channel: Option<u32>,
+    spot_colors: SpotColorPolicy,
+}
+
+/// Whether spot inks are rendered into color output or preserved as independent channels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpotColorPolicy {
+    #[default]
+    Render,
+    /// Return the base color and keep spot declarations available in stream metadata.
+    Preserve,
 }
 
 /// Whether image orientation is applied to the returned pixels and extent.
@@ -367,6 +443,8 @@ impl GpuOutputRequest {
             mapping,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
             orientation: OrientationPolicy::Apply,
+            extra_channel: None,
+            spot_colors: SpotColorPolicy::Render,
         }
     }
 
@@ -378,6 +456,48 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn mapping(&self) -> GpuOutputMapping {
         self.mapping
+    }
+
+    /// Selects one extra channel by its index in the stream metadata. The result is a scalar
+    /// numeric image; its values never pass through a color transfer function.
+    pub fn with_extra_channel(mut self, index: u32) -> Result<Self> {
+        let scalar = self.format.planes.len() == 1
+            && match classify_pixel_format(&self.format) {
+                Ok(PixelFormatClass::Numeric(numeric)) => numeric.components == 1,
+                _ => native_modular_format(&self.format)
+                    .is_some_and(|native| native.channels == ModularChannels::Gray),
+            };
+        if !scalar
+            || !matches!(
+                self.mapping,
+                GpuOutputMapping::Numeric(
+                    NumericSampleMapping::NativeUnsigned | NumericSampleMapping::NormalizedUnsigned
+                )
+            )
+        {
+            return Err(Error::UnsupportedOutputFormat(
+                "extra-channel output requires scalar native unsigned or normalized F32 samples"
+                    .into(),
+            ));
+        }
+        self.extra_channel = Some(index);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn extra_channel(&self) -> Option<u32> {
+        self.extra_channel
+    }
+
+    #[must_use]
+    pub const fn with_spot_color_policy(mut self, policy: SpotColorPolicy) -> Self {
+        self.spot_colors = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn spot_color_policy(&self) -> SpotColorPolicy {
+        self.spot_colors
     }
 
     #[must_use]

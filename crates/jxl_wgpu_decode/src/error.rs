@@ -284,6 +284,15 @@ pub enum Error {
     Backpressure { limit: usize },
     #[error("presentation {index} must finish before its dependent frame can be submitted")]
     FrameDependencyBackpressure { index: usize },
+    #[error("extra-channel index {index} is outside the {count} declared channels")]
+    ExtraChannelIndex { index: u32, count: u32 },
+    #[error(
+        "{color_channels} color channels plus {extra_channels} extra channels exceed u32 addressing"
+    )]
+    ModularChannelCountOverflow {
+        color_channels: u32,
+        extra_channels: u32,
+    },
     #[error("the final output commands have not yet been submitted")]
     UnvalidatedOutputNotSubmitted,
     #[error("frame composition {resource} requires {requested}, exceeding the limit {limit}")]

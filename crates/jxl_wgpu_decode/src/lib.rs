@@ -84,8 +84,9 @@ pub use jxl_gpu_formats::{ImageLayout, PixelFormat};
 pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
     AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration, FrameMetadata, FrameTimebase,
-    GpuOutputMapping, GpuOutputRequest, ModularChannels, ModularGrouping, ModularPredictionProfile,
-    ModularPredictor, NumericSampleMapping, OrientationPolicy,
+    GpuOutputMapping, GpuOutputRequest, ModularChannelCounts, ModularChannels, ModularGrouping,
+    ModularPredictionProfile, ModularPredictor, NumericSampleMapping, OrientationPolicy,
+    SpotColorPolicy,
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;

@@ -26,15 +26,19 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   JxlBasicInfo info;
   JxlEncoderInitBasicInfo(&info);
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
-  info.num_color_channels = channels == 1 ? 1 : 3;
-  info.num_extra_channels = channels == 4; info.alpha_bits = channels == 4 ? bits : 0;
+  int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0;
+  uint32_t color_channels = channels <= 2 ? 1 : 3;
+  int has_alpha = channels != color_channels;
+  uint32_t alpha_bits = has_alpha ? (different_alpha ? 5 : bits) : 0;
+  info.num_color_channels = color_channels;
+  info.num_extra_channels = has_alpha; info.alpha_bits = alpha_bits;
   info.uses_original_profile = vardct <= 0; info.orientation = (JxlOrientation)orientation;
   info.have_animation = !still;
   info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
   info.animation.num_loops = 2; info.animation.have_timecodes = !still;
   check(JxlEncoderSetBasicInfo(enc, &info));
   JxlColorEncoding color;
-  JxlColorEncodingSetToSRGB(&color, channels == 1);
+  JxlColorEncodingSetToSRGB(&color, color_channels == 1);
   check(JxlEncoderSetColorEncoding(enc, &color));
   const Layer layers[] = {
     {0, 0, width, height, 1, 1, 0, 0, JXL_BLEND_REPLACE, JXL_BLEND_REPLACE, 0},
@@ -49,19 +53,22 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   };
   for (uint32_t frame = 0; frame < sizeof(layers)/sizeof(*layers); ++frame) {
     const Layer* layer = &layers[frame];
-    size_t bytes = (size_t)layer->width * layer->height * channels * (bits > 8 ? 2 : 1);
+    size_t bytes = (size_t)layer->width * layer->height * channels * (different_alpha ? 4 : bits > 8 ? 2 : 1);
     void* pixels = malloc(bytes);
     uint32_t mask = (1u << bits) - 1;
+    uint32_t alpha_mask = has_alpha ? (1u << alpha_bits) - 1 : mask;
     for (uint32_t y = 0; y < layer->height; ++y) for (uint32_t x = 0; x < layer->width; ++x) {
       const uint32_t values[4] = {
         (613*x + 107*y + 43*(x^y) + 193*frame) & mask,
         ((153*x) ^ (271*y) ^ (79*frame)) & mask,
         (259*x + 307*y + 31*(x^y) + 131*frame) & mask,
-        x % 5 == 0 ? 0 : x % 5 == 1 ? mask : (181*x + 97*y + 193*frame) & mask,
+        x % 5 == 0 ? 0 : x % 5 == 1 ? alpha_mask : (181*x + 97*y + 193*frame) & alpha_mask,
       };
       for (uint32_t c = 0; c < channels; ++c) {
         size_t pos = ((size_t)y*layer->width + x)*channels + c;
-        if (bits > 8) ((uint16_t*)pixels)[pos] = values[c];
+        uint32_t canonical = channels == 2 && c == 1 ? 3 : c;
+        if (different_alpha) ((float*)pixels)[pos] = (float)values[canonical] / (float)(canonical == 3 ? alpha_mask : mask);
+        else if (bits > 8) ((uint16_t*)pixels)[pos] = values[c];
         else ((uint8_t*)pixels)[pos] = values[c];
       }
     }
@@ -78,8 +85,10 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
       check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_DC, layer_dc));
     } else if (!jpeg_frame) {
       check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
-      JxlBitDepth depth = {JXL_BIT_DEPTH_FROM_CODESTREAM, bits, 0};
-      check(JxlEncoderSetFrameBitDepth(settings, &depth));
+      if (!different_alpha) {
+        JxlBitDepth depth = {JXL_BIT_DEPTH_FROM_CODESTREAM, bits, 0};
+        check(JxlEncoderSetFrameBitDepth(settings, &depth));
+      }
     }
     JxlFrameHeader header;
     JxlEncoderInitFrameHeader(&header);
@@ -94,7 +103,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     header.layer_info.blend_info.alpha = 0; header.layer_info.blend_info.clamp = layer->clamp;
     if (frame == 3 && strcmp(name, "gray_clamp") == 0) header.layer_info.blend_info.clamp = JXL_TRUE;
     check(JxlEncoderSetFrameHeader(settings, &header));
-    if (channels == 4) {
+    if (has_alpha) {
       JxlBlendInfo alpha = header.layer_info.blend_info;
       alpha.blendmode = layer->alpha; alpha.source = layer->alpha_source;
       check(JxlEncoderSetExtraChannelBlendInfo(settings, 0, &alpha));
@@ -102,7 +111,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     char frame_name[64];
     snprintf(frame_name, sizeof(frame_name), "composed-%u", frame);
     check(JxlEncoderSetFrameName(settings, frame_name));
-    JxlPixelFormat format = {channels, bits > 8 ? JXL_TYPE_UINT16 : JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    JxlPixelFormat format = {channels, different_alpha ? JXL_TYPE_FLOAT : bits > 8 ? JXL_TYPE_UINT16 : JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
     if (jpeg_frame) check(JxlEncoderAddJPEGFrame(settings, jpeg, jpeg_size));
     else check(JxlEncoderAddImageFrame(settings, &format, pixels, bytes));
     free(pixels);
@@ -128,6 +137,8 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 
 int main(int argc, char** argv) {
   if (argc != 2 && argc != 3) return 2;
+  generate(argv[1], "gray_alpha", 259, 17, 2, 16, 8, 0, 0, 0);
+  generate(argv[1], "rgba_mixed_depth", 33, 7, 4, 12, 6, 0, 0, 0);
   generate(argv[1], "gray", 259, 17, 1, 8, 6, 0, 0, 0);
   generate(argv[1], "gray_clamp", 259, 17, 1, 8, 6, 0, 0, 0);
   generate(argv[1], "rgb12", 257, 9, 3, 12, 8, 0, 0, 0);

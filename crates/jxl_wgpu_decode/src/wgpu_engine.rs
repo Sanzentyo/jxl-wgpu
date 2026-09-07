@@ -1,3 +1,4 @@
+mod channels;
 mod execution;
 mod lifetime;
 mod pipeline;
