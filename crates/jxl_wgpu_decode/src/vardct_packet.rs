@@ -911,32 +911,30 @@ impl BoundedVarDctPacketPlan {
         .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
         let mut reader = source_reader_at(source, descriptor_end)?;
         let mut reader = BoundedBitInput::new(&mut reader, lf_global_end);
-        let image = crate::modular_side_image::ModularSideImagePlan::parse(
-            &mut reader,
-            topology,
-            profile.bits_per_sample,
-            0,
-            prefix.global_ma_config.as_ref(),
-        )
-        .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        let header =
+            crate::modular_side_image::ModularSideImageHeader::parse(&mut reader, topology)
+                .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+        if crate::modular_grouping::global_subimage_channel_count(
+            &header.transforms.topology,
+            profile.group_dimension,
+        ) != header.transforms.topology.channels().len()
+        {
+            return Err(BoundedVarDctPacketError::DistributedModularExtras);
+        }
+        let image = header
+            .finish(
+                &mut reader,
+                profile.bits_per_sample,
+                0,
+                prefix.global_ma_config.as_ref(),
+            )
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
         if u64::from(image.token_bit_offset) > lf_global_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: u64::from(image.token_bit_offset),
                 packet_end: lf_global_end,
             }
             .into());
-        }
-        if image
-            .channel_metadata
-            .channels
-            .iter()
-            .enumerate()
-            .any(|(index, c)| {
-                index >= image.meta_channel_count
-                    && (c.width > profile.group_dimension || c.height > profile.group_dimension)
-            })
-        {
-            return Err(BoundedVarDctPacketError::DistributedModularExtras);
         }
         Ok(VarDctPacketPreparation::GlobalModular(Box::new(
             PendingGlobalModular { prefix, image },
@@ -3009,6 +3007,165 @@ mod tests {
     use jxl_gpu_bitstream::{BitWriter, StreamSlice};
 
     use super::*;
+
+    #[test]
+    fn distributed_extra_channels_partition_before_reading_global_entropy() {
+        use crate::modular_grouping::{
+            ModularSubimageKind, ModularSubimageRegion, build_modular_pass_shift_ranges,
+            global_subimage_channel_count, grouped_subimage_topology,
+        };
+        let fixtures = [
+            (
+                "alpha",
+                include_str!("../test-data/vardct_extras_distributed_alpha.jxl.hex"),
+                0,
+                1,
+            ),
+            (
+                "data",
+                include_str!("../test-data/vardct_extras_distributed_data.jxl.hex"),
+                2,
+                11,
+            ),
+            (
+                "progressive",
+                include_str!("../test-data/vardct_extras_distributed_progressive.jxl.hex"),
+                12,
+                13,
+            ),
+            (
+                "wide",
+                include_str!("../test-data/vardct_extras_distributed_wide.jxl.hex"),
+                0,
+                1,
+            ),
+            (
+                "squeeze",
+                include_str!("../test-data/vardct_extras_distributed_squeeze.jxl.hex"),
+                10,
+                16,
+            ),
+        ];
+        for (name, hex, expected_global, expected_channels) in fixtures {
+            let data = decode_hex(hex);
+            let parsed = jxl_gpu_bitstream::parse(&data, Default::default()).unwrap();
+            let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+            let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+            let VarDctSectionLayout::Sections { lf_global, .. } = profile.sections else {
+                panic!("section layout");
+            };
+            let mut reader = BitReader::new(parsed.codestream());
+            reader.skip_bits(lf_global.offset).unwrap();
+            let prefix =
+                LfGlobalPrefix::parse_reader(&mut reader, lf_global.end().unwrap()).unwrap();
+            if let Some(offset) = prefix.global_ma_tree_bit_offset {
+                reader.skip_bits(offset - reader.bit_offset()).unwrap();
+                parse_ma_config_at_reader(&mut reader, lf_global.end().unwrap()).unwrap();
+            }
+            let topology = crate::modular_transform::ModularChannelTopology::full_resolution(
+                profile.output_width,
+                profile.output_height,
+                profile.bits_per_sample,
+                inventory.image_header.extra_channel_count,
+                Default::default(),
+            )
+            .unwrap();
+            let header =
+                crate::modular_side_image::ModularSideImageHeader::parse(&mut reader, topology)
+                    .unwrap();
+            let topology = &header.transforms.topology;
+            let global = global_subimage_channel_count(topology, profile.group_dimension);
+            assert_eq!(global, expected_global, "{name}");
+            assert_eq!(topology.channels().len(), expected_channels, "{name}");
+            let layout = topology.gpu_layout().unwrap();
+            let mut ownership = vec![0_u8; topology.sample_count().unwrap() as usize];
+            let mut cover = |planes: &[crate::modular_transform::GpuModularChannelLayout]| {
+                for plane in planes {
+                    for row in 0..plane.height {
+                        let offset = (plane.word_offset + row * plane.row_stride_words) as usize;
+                        for value in &mut ownership[offset..offset + plane.width as usize] {
+                            *value += 1;
+                        }
+                    }
+                }
+            };
+            cover(&layout[..global]);
+            let frame = &inventory.frames[0];
+            let ranges = build_modular_pass_shift_ranges(
+                frame.num_passes,
+                &frame.progressive_passes.downsampling,
+                &frame.progressive_passes.last_pass,
+            )
+            .unwrap();
+            let mut lf_samples = 0;
+            for (kind, range) in std::iter::once((ModularSubimageKind::LowFrequencyGroup, None))
+                .chain(
+                    ranges
+                        .iter()
+                        .copied()
+                        .map(|range| (ModularSubimageKind::PassGroup, range)),
+                )
+            {
+                let region_dimension = if kind == ModularSubimageKind::LowFrequencyGroup {
+                    profile.group_dimension * 8
+                } else {
+                    profile.group_dimension
+                };
+                for row in 0..profile.output_height.div_ceil(region_dimension) {
+                    for column in 0..profile.output_width.div_ceil(region_dimension) {
+                        let (subimage, targets) = grouped_subimage_topology(
+                            topology,
+                            &layout,
+                            global,
+                            ModularSubimageRegion {
+                                kind,
+                                column,
+                                row,
+                                group_dimension: profile.group_dimension,
+                            },
+                            range,
+                            Default::default(),
+                        )
+                        .unwrap();
+                        assert_eq!(subimage.channels().len(), targets.len());
+                        assert!(
+                            subimage
+                                .channels()
+                                .iter()
+                                .all(|channel| channel.width > 0 && channel.height > 0)
+                        );
+                        if kind == ModularSubimageKind::LowFrequencyGroup {
+                            lf_samples += subimage.sample_count().unwrap();
+                        }
+                        cover(&targets);
+                    }
+                }
+            }
+            assert!(
+                ownership.iter().all(|&count| count == 1),
+                "{name}: every coded sample has exactly one owner"
+            );
+            assert_eq!(lf_samples != 0, name == "squeeze");
+            assert_eq!(
+                profile.low_frequency_group_count > 1,
+                matches!(name, "wide" | "squeeze")
+            );
+            assert!(matches!(
+                BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory),
+                Err(BoundedVarDctPacketError::DistributedModularExtras)
+            ));
+            // Admission is based on channel ownership. A global subimage with no samples has
+            // no MA/entropy descriptor to parse, even when its use_global_tree bit is false.
+            let mut corrupt = parsed.codestream().to_vec();
+            for bit in reader.bit_offset()..lf_global.end().unwrap() {
+                corrupt[bit as usize / 8] |= 1 << (bit % 8);
+            }
+            assert!(matches!(
+                BoundedVarDctPacketPlan::parse(&corrupt, &inventory),
+                Err(BoundedVarDctPacketError::DistributedModularExtras)
+            ));
+        }
+    }
 
     fn decode_hex(source: &str) -> Vec<u8> {
         let digits = source

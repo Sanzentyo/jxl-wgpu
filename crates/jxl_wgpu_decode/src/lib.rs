@@ -35,6 +35,7 @@ mod inflight;
 mod input_budget;
 mod model;
 mod modular_finalize;
+mod modular_grouping;
 mod modular_inverse;
 mod modular_palette;
 pub mod modular_rct;

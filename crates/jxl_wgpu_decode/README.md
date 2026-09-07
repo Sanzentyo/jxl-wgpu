@@ -464,6 +464,23 @@ corrupting a later AC section still fails the scalar request after the global st
 Public LF/AC-group-distributed extras, associated alpha, and
 shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
 
+For LF/AC integration, Modular headers and transform topology now parse separately from MA and
+image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
+MA/entropy descriptor. The shared group planner clips transformed channels into LF/pass regions
+and validates progressive brackets, including boundaries on the final pass that must preserve all remaining resolutions. Five distributed libjxl fixtures assert that every coded
+sample belongs to exactly one global, LF or pass subimage. Public admission still reports
+`DistributedModularExtras`, before attempting to parse nonexistent global entropy.
+
+The low-level `HfCoefficientExecutionPlan::set_stream_end` selects `Packet` or `Continuation` per
+logical pass group and updates every bounded-window parameter. Packet mode retains exact
+zero-padding validation. Continuation mode validates ANS terminal state and returns the next bit
+without consuming the suffix, even before the final upload window. `GpuHfCoefficientStatus::validate_cursor`
+checks the result against host-owned group identity and packet bounds. Callers must consume and
+validate the following stream before delivering a frame. Actual-GPU tests hand all eight bit
+alignments from zero-bit Prefix, nontrivial Prefix and ANS AC into a following Modular image,
+check its resident samples and cursor, and reject truncated/corrupt ANS endings. This boundary
+API does not yet connect distributed extras to the public VarDCT frame scheduler.
+
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
 payload can be reassembled; this is an engine limit, not a late profile check after the generic

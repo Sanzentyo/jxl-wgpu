@@ -28,7 +28,7 @@ struct Params {
     metadata_base_words: u32,
     order_base_words: u32,
     spatial_group_index: u32,
-    _reserved: u32,
+    stream_end: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
@@ -477,7 +477,10 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
 
     var status_code = decode_error;
     if decode_error == 0u && phase == PHASE_DONE {
-        if window_is_final() {
+        if params.stream_end == 1u {
+            entropy_finalize();
+            status_code = decode_error;
+        } else if window_is_final() {
             entropy_finish_exact();
             status_code = decode_error;
         } else {

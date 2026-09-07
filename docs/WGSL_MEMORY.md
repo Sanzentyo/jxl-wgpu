@@ -425,6 +425,15 @@ restoration run only after all AC work. The final aggregate map validates every 
 HF-global admission multiplies status, parameter, and worst-case history/state capacity by the
 declared pass count. Intermediate pass output is not published.
 
+The final word (byte offset 156) of each 160-byte AC parameter record is `stream_end`: zero
+requires the packet's exact padded end, one selects an entropy cursor continuation. The latter
+validates the terminal ANS state and leaves the cursor unaligned for the next consumer; a stream
+that finishes in a nonfinal input window can return success immediately. The 32-byte status and
+464-byte resume ABI remain unchanged. Host continuation validation checks group identity and
+both bounds against its packet plan, including the reported token end. Changing a logical pass
+group's mode updates both whole-range and window-resume parameter records. Standard public
+frame execution continues to use exact packet mode until distributed extra scheduling is connected.
+
 A Modular frame containing only DC-global image samples uses its admitted frame arena and zero
 subimage lanes. The otherwise-unused reconstruction binding retains a counted four-byte placeholder.
 The final global batch shares the same inverse, progressive-DC conversion/output, and aggregate

@@ -2,11 +2,67 @@
 
 use crate::modular_inverse::{ModularInversePlan, plan_modular_inverse};
 use crate::modular_transform::{
-    GpuModularChannelLayout, ModularChannelTopology, ModularTransformLimits,
+    GpuModularChannelLayout, ModularChannelTopology, ModularTransformLimits, ModularTransformPlan,
     PackedModularChannelMetadata, parse_modular_transforms,
 };
 use crate::modular_tree::{BitInput, MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config};
 use crate::{Error, Result};
+
+/// Parsed before deciding which transformed channels belong to this substream. In particular,
+/// a global header exists even when every image channel belongs to an LF or AC group; such an
+/// empty global subimage has no local MA tree or entropy stream following its header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModularSideImageHeader {
+    pub(crate) use_global_tree: bool,
+    pub(crate) wp_header: WpHeaderIr,
+    pub(crate) transforms: ModularTransformPlan,
+}
+
+impl ModularSideImageHeader {
+    pub(crate) fn parse(
+        reader: &mut impl BitInput,
+        topology: ModularChannelTopology,
+    ) -> Result<Self> {
+        Ok(Self {
+            use_global_tree: reader.read_bits(1)? != 0,
+            wp_header: WpHeaderIr::parse(reader)?,
+            transforms: parse_modular_transforms(
+                reader,
+                topology,
+                ModularTransformLimits::default(),
+            )?,
+        })
+    }
+
+    pub(crate) fn finish(
+        self,
+        reader: &mut impl BitInput,
+        bit_depth: u32,
+        stream_index: u32,
+        global_ma_config: Option<&MaConfigIr>,
+    ) -> Result<ModularSideImagePlan> {
+        let Self {
+            use_global_tree,
+            wp_header,
+            transforms,
+        } = self;
+        let ma_config = if use_global_tree {
+            global_ma_config
+                .ok_or(Error::MissingGlobalMaTree { stream_index })?
+                .clone()
+        } else {
+            parse_ma_config(reader, MaTreeLimits::default())?
+        };
+        ModularSideImagePlan::from_descriptor(
+            reader,
+            transforms,
+            bit_depth,
+            stream_index,
+            wp_header,
+            ma_config,
+        )
+    }
+}
 
 /// All image samples and inverse transforms execute on the GPU. Only the descriptor is host data.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,17 +95,22 @@ impl ModularSideImagePlan {
                 "invalid Modular side-image source topology",
             ));
         }
-        let use_global_tree = reader.read_bits(1)? != 0;
-        let wp_header = WpHeaderIr::parse(reader)?;
-        let transforms =
-            parse_modular_transforms(reader, topology, ModularTransformLimits::default())?;
-        let ma_config = if use_global_tree {
-            global_ma_config
-                .ok_or(Error::MissingGlobalMaTree { stream_index })?
-                .clone()
-        } else {
-            parse_ma_config(reader, MaTreeLimits::default())?
-        };
+        ModularSideImageHeader::parse(reader, topology)?.finish(
+            reader,
+            bit_depth,
+            stream_index,
+            global_ma_config,
+        )
+    }
+
+    fn from_descriptor(
+        reader: &impl BitInput,
+        transforms: ModularTransformPlan,
+        bit_depth: u32,
+        stream_index: u32,
+        wp_header: WpHeaderIr,
+        ma_config: MaConfigIr,
+    ) -> Result<Self> {
         let token_bit_offset = u32::try_from(reader.bit_offset())
             .map_err(|_| Error::backend("Modular side-image entropy offset exceeds WGSL u32"))?;
         let channel_metadata = transforms

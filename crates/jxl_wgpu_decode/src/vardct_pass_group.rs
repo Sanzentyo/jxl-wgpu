@@ -27,6 +27,17 @@ pub const HF_COEFFICIENT_EXECUTION_STATE_WORDS: u32 = 116;
 pub const HF_COEFFICIENT_EXECUTION_STATE_BYTES: u64 =
     HF_COEFFICIENT_EXECUTION_STATE_WORDS as u64 * 4;
 
+/// Whether the coefficient stream ends its packet or precedes another entropy consumer.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HfCoefficientStreamEnd {
+    /// Validate at most seven zero padding bits and consume the complete packet.
+    #[default]
+    Packet = 0,
+    /// Validate the entropy coder's terminal state and return the unaligned next bit cursor.
+    Continuation = 1,
+}
+
 /// Exact 48-byte storage ABI locating the variable-length HF block-context tables.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -74,7 +85,7 @@ pub struct HfCoefficientPassParams {
     metadata_base_words: u32,
     order_base_words: u32,
     spatial_group_index: u32,
-    _reserved: u32,
+    stream_end: u32,
 }
 
 /// Exact 464-byte resume record for one serial HF coefficient consumer.
@@ -151,6 +162,28 @@ fn append_block_context_tables(
 }
 
 impl HfCoefficientExecutionPlan {
+    /// Changes one logical pass group's termination rule, including every bounded-window resume.
+    /// The caller must consume and validate the suffix before publishing a decoded frame.
+    pub fn set_stream_end(
+        &mut self,
+        pass_group: u32,
+        end: HfCoefficientStreamEnd,
+    ) -> Result<(), HfCoefficientPlanError> {
+        let mut found = false;
+        for group in &mut self.groups {
+            for params in group.params.iter_mut().chain(&mut group.segment_params) {
+                if params.global_group_index == pass_group {
+                    params.stream_end = end as u32;
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return Err(HfCoefficientPlanError::MissingPassGroup { group: pass_group });
+        }
+        Ok(())
+    }
+
     pub fn new(
         packet: &BoundedVarDctPacketPlan,
         entropy: &HfCoefficientEntropyPlan,
@@ -321,7 +354,7 @@ impl HfCoefficientExecutionPlan {
                         spatial_group_index: (local_y / packet.profile.group_dimension)
                             * blocks_per_row.div_ceil(packet.profile.group_dimension / 8)
                             + local_x / packet.profile.group_dimension,
-                        _reserved: 0,
+                        stream_end: HfCoefficientStreamEnd::Packet as u32,
                         channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
                             0u32,
                             |packed, (channel, shift)| {
@@ -495,6 +528,8 @@ impl HfCoefficientGroupExecutionPlan {
 
 #[derive(Debug, Error)]
 pub enum HfCoefficientPlanError {
+    #[error("HF coefficient plan has no logical pass group {group}")]
+    MissingPassGroup { group: u32 },
     #[error(transparent)]
     Frontend(#[from] crate::vardct_frontend::VarDctFrontendError),
     #[error(transparent)]
@@ -528,8 +563,32 @@ pub struct GpuHfCoefficientStatus {
 
 impl GpuHfCoefficientStatus {
     pub fn validate(self, expected_group: u32) -> Result<(), GpuHfCoefficientError> {
+        self.validate_end(expected_group, self.bit_cursor == self.token_end)
+    }
+
+    /// Validates a continuation against host-owned packet bounds and returns its next bit.
+    pub fn validate_cursor(
+        self,
+        expected_group: u32,
+        token_start: u32,
+        token_end: u32,
+    ) -> Result<u32, GpuHfCoefficientError> {
+        self.validate_end(
+            expected_group,
+            token_start <= self.bit_cursor
+                && self.bit_cursor <= token_end
+                && self.token_end == token_end,
+        )?;
+        Ok(self.bit_cursor)
+    }
+
+    fn validate_end(
+        self,
+        expected_group: u32,
+        cursor_valid: bool,
+    ) -> Result<(), GpuHfCoefficientError> {
         let error = match self.error_code {
-            1 if self.group_index == expected_group && self.bit_cursor == self.token_end => {
+            1 if self.group_index == expected_group && cursor_valid => {
                 return Ok(());
             }
             1 => GpuHfCoefficientError::StatusContract {
@@ -726,6 +785,7 @@ const _: () = {
     assert!(std::mem::offset_of!(HfCoefficientPassParams, metadata_base_words) == 144);
     assert!(std::mem::offset_of!(HfCoefficientPassParams, order_base_words) == 148);
     assert!(std::mem::offset_of!(HfCoefficientPassParams, spatial_group_index) == 152);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, stream_end) == 156);
     assert!(std::mem::size_of::<HfCoefficientExecutionState>() == 464);
     assert!(std::mem::align_of::<HfCoefficientExecutionState>() == 16);
     assert!(std::mem::offset_of!(HfCoefficientExecutionState, nonzero_grid) == 72);
@@ -784,3 +844,7 @@ mod tests {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod gpu_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "vardct_pass_group/tests.rs"]
+mod continuation_tests;

@@ -144,6 +144,12 @@ inverse transforms, restoration and color image buffers. Native output requires 
 codes; F32 preserves signed normalization without clipping. LF/AC-group-distributed extras and
 shifted/resampled or associated alpha remain pending.
 
+The low-level AC executor can now validate an entropy stream and return its exact unaligned
+cursor for a following Modular substream. Prefix/ANS GPU tests cover continuation, bounded
+resume and malformed endings. Modular group ownership is shared between the coding modes;
+five distributed VarDCT fixtures cover empty globals, Palette, Squeeze, multiple LF groups and
+progressive pass assignment. Their complete public frame scheduling remains pending.
+
 Modular also normalizes orientations 1–8 on the GPU, including exact native RGB/RGBA and 12/16-bit
 samples, all 30 Gray8 VPI color/numeric outputs, Palette/Squeeze, and one-pixel axes. Its frontend
 now admits parsed header semantics instead of requiring one fixed wire representation. Unsupported

@@ -1,3 +1,8 @@
+use crate::modular_grouping::{
+    ModularSubimageKind, ModularSubimageRegion, build_modular_pass_shift_ranges,
+    global_subimage_channel_count, grouped_subimage_topology, modular_pass_for_channel,
+};
+
 use jxl_gpu_bitstream::{
     CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
     EdgePreservingFilterInventory, ExtraChannelTypeInventory, FiniteF16, FrameBlendInfo,
@@ -9,8 +14,8 @@ use jxl_gpu_protocol::OutputOrientation;
 
 use crate::modular_inverse::{ModularInversePlan, plan_modular_inverse};
 use crate::modular_transform::{
-    GpuModularChannelLayout, ModularChannelGeometry, ModularChannelTopology, ModularRct,
-    ModularTransformIr, ModularTransformLimits, ModularTransformPlan, PackedModularChannelMetadata,
+    GpuModularChannelLayout, ModularChannelTopology, ModularRct, ModularTransformIr,
+    ModularTransformLimits, ModularTransformPlan, PackedModularChannelMetadata,
     parse_modular_transforms,
 };
 use crate::modular_tree::BitInput;
@@ -1024,203 +1029,6 @@ pub(crate) fn uses_generalized_channel_layout(
     )
 }
 
-fn global_subimage_channel_count(topology: &ModularChannelTopology, group_dimension: u32) -> usize {
-    topology
-        .channels()
-        .iter()
-        .enumerate()
-        .take_while(|(index, channel)| {
-            *index < topology.meta_channel_count()
-                || (channel.width <= group_dimension && channel.height <= group_dimension)
-        })
-        .count()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModularSubimageKind {
-    LowFrequencyGroup,
-    PassGroup,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ModularSubimageRegion {
-    kind: ModularSubimageKind,
-    column: u32,
-    row: u32,
-    group_dimension: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ModularPassShiftRange {
-    min_shift: u32,
-    max_shift: u32,
-}
-
-impl ModularPassShiftRange {
-    fn contains(self, shift: u32) -> bool {
-        (self.min_shift..self.max_shift).contains(&shift)
-    }
-}
-
-/// Builds the shift brackets used by `jxl-modular`'s `prepare_groups`.
-///
-/// A missing entry denotes a pass with no shift bracket. Such a pass still has a physical
-/// PassGroup section, but the section must be empty. The final pass is always assigned the
-/// remaining `[0, max_shift)` bracket, including when that bracket is empty.
-fn build_modular_pass_shift_ranges(
-    pass_count: u32,
-    downsampling: &[u32],
-    last_pass: &[u32],
-) -> Result<Vec<Option<ModularPassShiftRange>>> {
-    if pass_count == 0 {
-        return unsupported("the Modular frame declares zero progressive passes");
-    }
-    if downsampling.len() != last_pass.len()
-        || downsampling.len() >= usize::try_from(pass_count).unwrap_or(usize::MAX)
-    {
-        return unsupported("the Modular frame has inconsistent progressive-pass metadata");
-    }
-
-    let pass_count = usize::try_from(pass_count)
-        .map_err(|_| unsupported_error("Modular pass count exceeds host address space"))?;
-    let mut ranges = vec![None; pass_count];
-    let mut max_shift = 3;
-    for (&downsample, &pass) in downsampling.iter().zip(last_pass) {
-        if downsample == 0 {
-            return unsupported("the Modular frame has a zero progressive downsampling factor");
-        }
-        let pass = usize::try_from(pass).map_err(|_| {
-            unsupported_error("Modular progressive-pass index exceeds host address space")
-        })?;
-        let range = ranges.get_mut(pass).ok_or_else(|| {
-            unsupported_error("Modular progressive-pass index exceeds the pass count")
-        })?;
-        if range.is_some() {
-            return unsupported("the Modular frame has duplicate progressive-pass boundaries");
-        }
-        let min_shift = downsample.trailing_zeros();
-        if min_shift > max_shift {
-            return unsupported("the Modular frame has non-monotonic progressive downsampling");
-        }
-        *range = Some(ModularPassShiftRange {
-            min_shift,
-            max_shift,
-        });
-        max_shift = min_shift;
-    }
-    ranges[pass_count - 1] = Some(ModularPassShiftRange {
-        min_shift: 0,
-        max_shift,
-    });
-    Ok(ranges)
-}
-
-fn modular_pass_for_channel(
-    hshift: u32,
-    vshift: u32,
-    pass_ranges: &[Option<ModularPassShiftRange>],
-) -> Option<usize> {
-    if hshift >= 3 && vshift >= 3 {
-        return None;
-    }
-    let shift = hshift.min(vshift);
-    pass_ranges
-        .iter()
-        .position(|range| range.is_some_and(|range| range.contains(shift)))
-}
-
-fn grouped_subimage_topology(
-    frame_topology: &ModularChannelTopology,
-    frame_layout: &[GpuModularChannelLayout],
-    global_channel_count: usize,
-    region: ModularSubimageRegion,
-    pass_range: Option<ModularPassShiftRange>,
-    limits: ModularTransformLimits,
-) -> Result<(ModularChannelTopology, Vec<GpuModularChannelLayout>)> {
-    if frame_topology.channels().len() != frame_layout.len()
-        || global_channel_count > frame_layout.len()
-    {
-        return Err(Error::EngineContract(
-            "frame Modular topology and packed layout disagree",
-        ));
-    }
-
-    let mut channels = Vec::new();
-    let mut targets = Vec::new();
-    for (&channel, &layout) in frame_topology.channels()[global_channel_count..]
-        .iter()
-        .zip(&frame_layout[global_channel_count..])
-    {
-        let (Ok(hshift), Ok(vshift)) =
-            (u32::try_from(channel.hshift), u32::try_from(channel.vshift))
-        else {
-            return unsupported(
-                "a DC-global meta channel was not retained in the global Modular subimage",
-            );
-        };
-        let low_frequency = hshift >= 3 && vshift >= 3;
-        if low_frequency != (region.kind == ModularSubimageKind::LowFrequencyGroup) {
-            continue;
-        }
-        if region.kind == ModularSubimageKind::PassGroup
-            && !pass_range.is_some_and(|range| range.contains(hshift.min(vshift)))
-        {
-            continue;
-        }
-        let (tile_hshift, tile_vshift) = if low_frequency {
-            (hshift - 3, vshift - 3)
-        } else {
-            (hshift, vshift)
-        };
-        let tile_width = region
-            .group_dimension
-            .checked_shr(tile_hshift)
-            .filter(|value| *value != 0)
-            .ok_or_else(|| unsupported_error("Modular horizontal channel shift is too large"))?;
-        let tile_height = region
-            .group_dimension
-            .checked_shr(tile_vshift)
-            .filter(|value| *value != 0)
-            .ok_or_else(|| unsupported_error("Modular vertical channel shift is too large"))?;
-        let origin_x = region
-            .column
-            .checked_mul(tile_width)
-            .ok_or_else(|| unsupported_error("Modular transformed group x origin overflow"))?;
-        let origin_y = region
-            .row
-            .checked_mul(tile_height)
-            .ok_or_else(|| unsupported_error("Modular transformed group y origin overflow"))?;
-        let width = channel.width.saturating_sub(origin_x).min(tile_width);
-        let height = channel.height.saturating_sub(origin_y).min(tile_height);
-        if width == 0 || height == 0 {
-            continue;
-        }
-        channels.push(ModularChannelGeometry::new(
-            width,
-            height,
-            channel.hshift,
-            channel.vshift,
-            channel.bit_depth,
-        ));
-        let word_offset = origin_y
-            .checked_mul(layout.row_stride_words)
-            .and_then(|offset| offset.checked_add(origin_x))
-            .and_then(|offset| offset.checked_add(layout.word_offset))
-            .ok_or_else(|| unsupported_error("Modular frame-arena plane offset overflow"))?;
-        targets.push(GpuModularChannelLayout {
-            word_offset,
-            row_stride_words: layout.row_stride_words,
-            width,
-            height,
-            hshift: channel.hshift,
-            vshift: channel.vshift,
-            bit_depth: channel.bit_depth,
-            reserved: 0,
-        });
-    }
-    Ok((ModularChannelTopology::new(channels, 0, limits)?, targets))
-}
-
 /// Parses `LfChannelDequantization`, which precedes `GlobalModular` in LF-global.
 fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<[FiniteF16; 3]> {
     let all_default = reader.read_bits(1)? != 0;
@@ -1478,6 +1286,8 @@ fn unsupported_error(detail: impl Into<String>) -> UnsupportedProfile {
 
 #[cfg(test)]
 mod tests {
+    use crate::modular_grouping::ModularPassShiftRange;
+    use crate::modular_transform::ModularChannelGeometry;
     use std::sync::Arc;
 
     use jxl_gpu_bitstream::{

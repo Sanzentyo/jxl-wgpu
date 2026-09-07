@@ -1224,3 +1224,56 @@ six-crate WASM, both 18-case reference/Metal harnesses and indexed codec/readbac
 | `vardct_extras_rgba.jxl.hex` | 1607 | `d0e532f5d2eec3aa2a9465332a0743b927f2c72d0bdabbfd42a6c93685353c3f` |
 | `vardct_extras_transformed.jxl.hex` | 81790 | `c5af1524af32e6ec9d87bc66118d37551a51615a6c22c902c41a05f61742359f` |
 | `vardct_extras_rgba_progressive.jxl.hex` | 1531 | `5151de6b5f7826080cc0f520b3e9ef6d469043463db26d1bf2ae91b73d7bcf81` |
+
+### VarDCT distributed extra-channel boundaries (2026-09-08)
+
+`generate_extra_channels.c OUTPUT_DIRECTORY --vardct-distributed`, built against libjxl 0.12.0,
+adds five descriptor/partition fixtures. Their color/extra sample formula is the same as the
+preceding global-extra fixtures; every extra channel is encoded at distance zero.
+
+| Fixture suffix | Source | Extra declarations | Global/coded channel count | Group coverage |
+|---|---|---|---:|---|
+| `alpha` | RGB8, 257×17, orientation 6, effort 1 | Alpha5 | 0/1 | two AC groups; empty global prefix |
+| `data` | Gray12, 517×9, orientation 8, effort 1 | nine independently sized types/depths | 2/11 | global Palette metadata; three AC groups |
+| `progressive` | RGB8, 259×257, orientation 2, effort 7 | Alpha5 | 12/13 | global Squeeze channels; three passes and four spatial groups |
+| `wide` | Gray16, 2049×9, orientation 5, effort 1 | Alpha5 | 0/1 | two LF groups, nine AC groups; empty global with local-tree flag |
+| `squeeze` | RGB12, 2051×259, orientation 7, effort 7, responsive | Alpha5 | 10/16 | global and LF Squeeze channels, three passes, clipped AC edges |
+
+The partition test marks the full transformed arena and requires exactly one owner for every
+coded sample. It covers global-prefix ordering, LF versus asymmetric pass shifts, progressive
+brackets and clipped zero-size channels. Additional regression cases cover a downsampling boundary on the final pass: it must retain the preceding maximum shift and force its minimum to zero, rather than dropping unassigned resolutions. These fixtures still receive the explicit public
+`DistributedModularExtras` rejection; this checkpoint does not claim public distributed pixel
+output. Corrupting the bytes following the global header preserves that admission result, proving
+that empty or distributed global subimages are identified before parsing image entropy.
+The header/entropy split follows [libjxl ModularDecode](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/modular/encoding/encoding.cc),
+and omission of clipped empty frame channels before local transforms follows
+[libjxl DecodeGroup](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_modular.cc).
+
+The low-level AC continuation test uses the actual coefficient shader and shared Modular GPU
+executor for 24 combinations of three entropy descriptors and eight starting bit alignments.
+Each AC stream selects a nonzero HF preset, decodes the three zero nonzero-counts of one DCT8
+block, and hands the next exact bit to a Modular header. That substream reconstructs six resident
+integer samples and returns another exact cursor before an unrelated nonzero suffix. Descriptors
+cover zero-bit single-symbol Prefix, a two-symbol one-bit Prefix code and terminal-state ANS.
+Exact-packet mode rejects the same non-padding suffix; continuation finishes in a nonfinal window,
+resumes after a forced Prefix yield, and rejects a corrupted ANS terminal state or truncated initial
+state. Host checks reject changed packet bounds, wrong group identity and every failure status.
+A real progressive multi-LF plan with 128-byte windows verifies that selecting one pass group's
+termination updates every resume record while preserving the other groups' exact termination.
+Naga verifies the unchanged 160-byte parameter ABI and the new final word at byte offset 156.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `vardct_extras_distributed_alpha.jxl.hex` | 8912 | `07e454cdf6d14c92f8227ef1656dff9546ddeab2ca2cc82ad4a86e5dd230263a` |
+| `vardct_extras_distributed_data.jxl.hex` | 38109 | `8906ec29ed1e8d10f80c3e9fab95a0e768134d583079348f7b5c845f714eb5fa` |
+| `vardct_extras_distributed_progressive.jxl.hex` | 95654 | `8b04d3e56120101708a98242cebbb3616586a999f9e600254e36be2722369cc5` |
+| `vardct_extras_distributed_squeeze.jxl.hex` | 598421 | `692211f95f0e7f35228f035232a52c90af854eb950cdbaa85b76bb9cc16f98c8` |
+| `vardct_extras_distributed_wide.jxl.hex` | 15992 | `8cc1e8c0f0a43b7d3e6f94f30ab1c68028c400434fd8723075673756967e12fe` |
+
+Validation on Apple M5/Metal: the serial full-workspace run passes 670 tests with one manual
+allocation benchmark ignored. After the final-pass correction, all 156 decoder library tests and
+the public 2051×259 progressive Squeeze GPU regression pass, covering 671 distinct workspace tests
+in total (281 decoder tests and 390 elsewhere). Final formatting, workspace check, warning-free
+Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal harnesses each pass
+18 cases; indexed GPU decode with CPU readback also passes. Public distributed-extra frame output
+is still outside this checkpoint.

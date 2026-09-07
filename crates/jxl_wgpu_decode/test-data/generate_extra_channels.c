@@ -1,6 +1,6 @@
 /* Offline libjxl 0.12 fixture generator; production never links this CPU codec.
  * cc generate_extra_channels.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-extras
- * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct]
+ * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
@@ -10,6 +10,7 @@
 #include <string.h>
 
 static int vardct;
+static int responsive;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static const JxlExtraChannelType types[] = {
@@ -50,6 +51,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
   if (progressive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
+  if (responsive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, 1));
   if (vardct) {
     check(JxlEncoderSetFrameDistance(settings, 1.0f));
     for (uint32_t c=0; c<extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0.0f));
@@ -87,8 +89,17 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2 && (argc != 3 || strcmp(argv[2], "--vardct"))) return 2;
+  if (argc != 2 && (argc != 3 || (strcmp(argv[2], "--vardct") && strcmp(argv[2], "--vardct-distributed")))) return 2;
   vardct = argc == 3;
+  if (vardct && !strcmp(argv[2], "--vardct-distributed")) {
+    generate(argv[1], "distributed_alpha", 257, 17, 3, 8, 1, 6, 1, 1, 0);
+    generate(argv[1], "distributed_data", 517, 9, 1, 12, 9, 8, 1, 0, 0);
+    generate(argv[1], "distributed_progressive", 259, 257, 3, 8, 1, 2, 7, 1, 1);
+    generate(argv[1], "distributed_wide", 2049, 9, 1, 16, 1, 5, 1, 1, 0);
+    responsive = 1;
+    generate(argv[1], "distributed_squeeze", 2051, 259, 3, 12, 1, 7, 7, 1, 1);
+    return 0;
+  }
   if (vardct) {
     generate(argv[1], "data_only", 17, 1, 3, 8, 2, 6, 1, 0, 0);
     generate(argv[1], "rgb12", 33, 7, 3, 12, 9, 6, 1, 0, 0);
