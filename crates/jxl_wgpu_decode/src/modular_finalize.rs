@@ -1,7 +1,7 @@
 //! Final packing from GPU-resident inverse-Modular source planes.
 
 use bytemuck::{Pod, Zeroable};
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -53,7 +53,9 @@ pub(crate) struct ModularFinalizeOutput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularFinalizeRegion {
     pub source_extent: Extent2d,
+    /// Complete image extent in codestream coordinates, before orientation.
     pub canvas_extent: Extent2d,
+    pub orientation: OutputOrientation,
     pub origin_x: u32,
     pub origin_y: u32,
     pub status_index: u32,
@@ -64,6 +66,7 @@ impl ModularFinalizeRegion {
         Self {
             source_extent: extent,
             canvas_extent: extent,
+            orientation: OutputOrientation::Identity,
             origin_x: 0,
             origin_y: 0,
             status_index: 0,
@@ -90,10 +93,11 @@ pub(crate) struct ModularFinalizeParams {
     plane01: [u32; 4],
     plane23: [u32; 4],
     bounds: [u32; 4],
+    canvas: [u32; 4],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ModularFinalizeParams>() == 144);
+    assert!(std::mem::size_of::<ModularFinalizeParams>() == 160);
     assert!(std::mem::align_of::<ModularFinalizeParams>() == 16);
 };
 
@@ -123,15 +127,6 @@ impl ModularFinalizeParams {
         {
             return Err(ModularFinalizeError::InvalidParams {
                 reason: "source region exceeds the output canvas",
-            });
-        }
-        if output.kind == 4
-            && (!region.origin_x.is_multiple_of(2)
-                || region_end_x
-                    .is_some_and(|end| end != region.canvas_extent.width && !end.is_multiple_of(2)))
-        {
-            return Err(ModularFinalizeError::InvalidParams {
-                reason: "packed 4:2:2 regions must own complete output pairs",
             });
         }
         let source_channels = u32::try_from(source_planes.len()).map_err(|_| {
@@ -176,7 +171,8 @@ impl ModularFinalizeParams {
             source_offsets[index] = plane.word_offset;
             source_strides[index] = plane.row_stride_words;
         }
-        validate_output(region.canvas_extent, source_channels, source_bits, output)?;
+        let output_extent = region.orientation.map_extent(region.canvas_extent);
+        validate_output(output_extent, source_channels, source_bits, output)?;
         extent
             .width
             .checked_mul(extent.height)
@@ -222,6 +218,12 @@ impl ModularFinalizeParams {
                 output.chroma_extent.width,
                 output.chroma_extent.height,
                 0,
+            ],
+            canvas: [
+                region.canvas_extent.width,
+                region.canvas_extent.height,
+                output_extent.width,
+                region.orientation.to_exif_value() - 1,
             ],
         })
     }
@@ -568,9 +570,10 @@ fn shader_source(path: ModularFinalizeF64Path) -> String {
         ModularFinalizeF64Path::ExactF32Widening => ("", F64_EXACT_OUTPUT),
         ModularFinalizeF64Path::NativeArithmetic => (F64_NATIVE_BINDING, F64_NATIVE_OUTPUT),
     };
-    SHADER
+    let source = SHADER
         .replace(F64_BINDING_MARKER, binding)
-        .replace(F64_OUTPUT_MARKER, output)
+        .replace(F64_OUTPUT_MARKER, output);
+    format!("{}\n{source}", jxl_wgpu::IMAGE_ORIENTATION_SHADER)
 }
 
 fn validate_variant(
@@ -773,7 +776,7 @@ mod tests {
 
     #[test]
     fn uniform_and_wgsl_abis_validate_semantically() {
-        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 144);
+        assert_eq!(std::mem::size_of::<ModularFinalizeParams>(), 160);
         assert_eq!(std::mem::align_of::<ModularFinalizeParams>(), 16);
         fn assert_pod<T: Pod>() {}
         assert_pod::<ModularFinalizeParams>();
@@ -810,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_regions_must_own_complete_output_pairs() {
+    fn packed_regions_can_share_output_pairs_through_atomic_bytes() {
         let output = ModularFinalizeOutput {
             kind: 4,
             transfer: 0,
@@ -835,11 +838,12 @@ mod tests {
             bit_depth: 8,
             reserved: 0,
         };
-        assert!(matches!(
+        assert!(
             ModularFinalizeParams::new(
                 ModularFinalizeRegion {
                     source_extent: Extent2d::new(3, 1),
                     canvas_extent: Extent2d::new(5, 1),
+                    orientation: OutputOrientation::Identity,
                     origin_x: 1,
                     origin_y: 0,
                     status_index: 0,
@@ -848,11 +852,9 @@ mod tests {
                 &[plane],
                 3,
                 output,
-            ),
-            Err(ModularFinalizeError::InvalidParams {
-                reason: "packed 4:2:2 regions must own complete output pairs"
-            })
-        ));
+            )
+            .is_ok()
+        );
     }
 
     #[test]

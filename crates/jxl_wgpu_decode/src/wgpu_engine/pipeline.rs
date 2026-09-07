@@ -408,6 +408,7 @@ impl WgpuSubmissionEngine {
         let extent = Extent2d::new(profile.width, profile.height);
         let output = OutputPlan::new(
             extent,
+            profile.orientation,
             request,
             profile.channels,
             profile.bits_per_sample,
@@ -840,7 +841,7 @@ pub(super) fn shader_source(
         | ModularReconstructionSpecialization::DescriptorMetaAdaptive => MODULAR_RESUME_SHADER,
         ModularReconstructionSpecialization::ChannelFixed { .. } => "",
     };
-    SHADER_TEMPLATE
+    let source = SHADER_TEMPLATE
         .replace(MODULAR_ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI_SHADER)
         .replace(MODULAR_ENTROPY_MARKER, MODULAR_ENTROPY_SHADER)
         .replace(MODULAR_RESUME_MARKER, resume_shader)
@@ -849,7 +850,8 @@ pub(super) fn shader_source(
         .replace(F64_BINDING_MARKER, binding)
         .replace(OUTPUT_WORDS_TYPE_MARKER, output_words_type)
         .replace(WRITE_BYTE_WORD_MARKER, write_byte_word)
-        .replace(WRITE_FULL_WORD_MARKER, write_full_word)
+        .replace(WRITE_FULL_WORD_MARKER, write_full_word);
+    format!("{}\n{source}", jxl_wgpu::IMAGE_ORIENTATION_SHADER)
 }
 
 pub(super) fn create_decode_pipeline(

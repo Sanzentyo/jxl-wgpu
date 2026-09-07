@@ -19,6 +19,8 @@ struct Params {
     plane23: vec4<u32>,
     // logical output bytes, chroma width, chroma height, reserved
     bounds: vec4<u32>,
+    // codestream canvas width/height, oriented output width, zero-based orientation
+    canvas: vec4<u32>,
 };
 
 @group(0) @binding(0) var<storage, read> arena: array<u32>;
@@ -292,19 +294,19 @@ fn write_chroma(x: u32, y: u32) {
     }
 }
 
-fn write_packed_422(source_x: u32, source_y: u32, x: u32, y: u32) {
-    if (x & 1u) != 0u {
-        return;
+fn write_packed_422(x: u32, y: u32, sample: u32) {
+    // Each source pixel owns its luma byte and one neutral chroma byte. A rotated group boundary
+    // can split a packed pair, so neither invocation may overwrite the complete word.
+    let pair = params.plane01.x + y * params.plane01.y + (x / 2u) * 4u;
+    let luma_offset = params.format.x + (x & 1u) * 2u;
+    let chroma_offset = 1u - params.format.x + (x & 1u) * 2u;
+    let luma = color_code(sample);
+    write_byte(pair + luma_offset, luma);
+    write_byte(pair + chroma_offset, neutral_chroma_code());
+    if (x & 1u) == 0u && x + 1u == params.canvas.z {
+        write_byte(pair + luma_offset + 2u, luma);
+        write_byte(pair + chroma_offset + 2u, neutral_chroma_code());
     }
-    let source_x1 = min(source_x + 1u, params.extent.x - 1u);
-    let y0 = color_code(source_sample(0u, source_x, source_y));
-    let y1 = color_code(source_sample(0u, source_x1, source_y));
-    let neutral = neutral_chroma_code();
-    var packed = y0 | (neutral << 8u) | (y1 << 16u) | (neutral << 24u);
-    if params.format.x == 1u {
-        packed = neutral | (y0 << 8u) | (neutral << 16u) | (y1 << 24u);
-    }
-    write_word(params.plane01.x + y * params.plane01.y + (x >> 1u) * 4u, packed);
 }
 
 @compute @workgroup_size(wg_x, 1, 1)
@@ -317,14 +319,15 @@ fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let source_x = id.x;
     let source_y = id.y;
-    let x = params.region.x + source_x;
-    let y = params.region.y + source_y;
+    let destination = image_output_coordinate(params.region.xy + id.xy, params.canvas.xy, params.canvas.w);
+    let x = destination.x;
+    let y = destination.y;
     if params.output.x == 9u {
         write_native_pixel(source_x, source_y, x, y);
         return;
     }
     if params.output.x == 4u {
-        write_packed_422(source_x, source_y, x, y);
+        write_packed_422(x, y, source_sample(0u, source_x, source_y));
         return;
     }
     let sample = source_sample(0u, source_x, source_y);

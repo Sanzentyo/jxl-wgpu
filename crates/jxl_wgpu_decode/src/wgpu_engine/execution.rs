@@ -7,7 +7,7 @@ use jxl_gpu_formats::{
     PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
     classify_pixel_format,
 };
-use jxl_gpu_protocol::{Extent2d, SubmissionToken};
+use jxl_gpu_protocol::{Extent2d, OutputOrientation, SubmissionToken};
 use jxl_wgpu::{
     GpuBufferLease, KernelVariant, ResidentStorageBinding, SubmissionPollPermit, WgpuBackend,
 };
@@ -861,7 +861,8 @@ pub(super) fn modular_finalize_params(
     ModularFinalizeParams::new(
         ModularFinalizeRegion {
             source_extent: Extent2d::new(group.width, group.height),
-            canvas_extent: output.layout.extent,
+            canvas_extent: output.source_extent,
+            orientation: output.orientation,
             origin_x: group.x,
             origin_y: group.y,
             status_index: u32::try_from(group_index)
@@ -889,7 +890,8 @@ pub(super) fn modular_frame_finalize_params(
     ModularFinalizeParams::new(
         ModularFinalizeRegion {
             source_extent: Extent2d::new(profile.width, profile.height),
-            canvas_extent: output.layout.extent,
+            canvas_extent: output.source_extent,
+            orientation: output.orientation,
             origin_x: 0,
             origin_y: 0,
             status_index,
@@ -953,6 +955,8 @@ pub(super) enum OutputKind {
 
 pub(super) struct OutputPlan {
     pub(super) layout: ImageLayout,
+    pub(super) source_extent: Extent2d,
+    pub(super) orientation: OutputOrientation,
     pub(super) kind: OutputKind,
     pub(super) transfer: u32,
     pub(super) limited_range: bool,
@@ -966,12 +970,14 @@ pub(super) struct OutputPlan {
 
 impl OutputPlan {
     pub(super) fn new(
-        extent: Extent2d,
+        source_extent: Extent2d,
+        orientation: OutputOrientation,
         request: &GpuOutputRequest,
         source_channels: crate::ModularChannels,
         source_bits: u8,
         capabilities: WgpuDecodeCapabilities,
     ) -> Result<Self> {
+        let extent = orientation.map_extent(source_extent);
         let format = request.format().clone();
         if let Some(native) = native_modular_format(&format) {
             let native_mapping = matches!(
@@ -993,6 +999,8 @@ impl OutputPlan {
                 }
                 let output = Self {
                     layout: ImageLayout::packed(extent, format)?,
+                    source_extent,
+                    orientation,
                     kind: OutputKind::NativeModular,
                     transfer: 0,
                     limited_range: false,
@@ -1169,6 +1177,8 @@ impl OutputPlan {
         };
         let output = Self {
             layout: ImageLayout::packed(extent, format)?,
+            source_extent,
+            orientation,
             kind,
             transfer,
             limited_range,
@@ -1257,6 +1267,10 @@ impl OutputPlan {
     pub(super) fn write_path_for_groups(&self, groups: &[ModularGroup]) -> Result<OutputWritePath> {
         if groups.is_empty() {
             return Err(Error::backend("Modular output has no pass groups"));
+        }
+        // Rotated/mirrored group edges may share words even when the original grid was aligned.
+        if self.orientation != OutputOrientation::Identity {
+            return Ok(OutputWritePath::AtomicBytes);
         }
         if self
             .layout
@@ -2783,6 +2797,9 @@ pub(super) fn build_params(
         wp_w1: wp_header.w1,
         wp_w2: wp_header.w2,
         wp_w3: wp_header.w3,
+        canvas_width: source.output.source_extent.width,
+        canvas_height: source.output.source_extent.height,
+        orientation: source.output.orientation.to_exif_value() - 1,
     })
 }
 

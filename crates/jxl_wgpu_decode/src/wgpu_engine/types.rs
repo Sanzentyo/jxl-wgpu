@@ -296,6 +296,9 @@ pub(super) struct ShaderParams {
     pub(super) wp_w1: u32,
     pub(super) wp_w2: u32,
     pub(super) wp_w3: u32,
+    pub(super) canvas_width: u32,
+    pub(super) canvas_height: u32,
+    pub(super) orientation: u32,
 }
 
 /// CPU/WGSL ABI selecting one bounded parallel group wave.
@@ -360,7 +363,7 @@ pub(super) struct DecodeStatus {
 pub(super) const STATUS_BYTES: u64 = std::mem::size_of::<DecodeStatus>() as u64;
 
 const _: () = {
-    assert!(std::mem::size_of::<ShaderParams>() == 244);
+    assert!(std::mem::size_of::<ShaderParams>() == 256);
     assert!(std::mem::align_of::<ShaderParams>() == 4);
     assert!(std::mem::size_of::<EntropyExecutionState>() == 32);
     assert!(std::mem::align_of::<EntropyExecutionState>() == 16);

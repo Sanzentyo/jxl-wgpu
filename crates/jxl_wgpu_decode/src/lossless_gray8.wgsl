@@ -63,6 +63,9 @@ struct Params {
     wp_w1: u32,
     wp_w2: u32,
     wp_w3: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+    orientation: u32,
 };
 
 struct DispatchControl {
@@ -512,6 +515,27 @@ fn write_output_sample(x: u32, y: u32, sample: u32) {
     }
 }
 
+fn output_coordinate(x: u32, y: u32) -> vec2<u32> {
+    return image_output_coordinate(
+        vec2<u32>(params.origin_x + x, params.origin_y + y),
+        vec2<u32>(params.canvas_width, params.canvas_height), params.orientation,
+    );
+}
+
+fn write_packed_422_pixel(x: u32, y: u32, sample: u32) {
+    let pair = params.plane0_offset + y * params.plane0_stride + (x / 2u) * 4u;
+    let luma_offset = params.order + (x & 1u) * 2u;
+    let chroma_offset = 1u - params.order + (x & 1u) * 2u;
+    let luma = color_code(sample);
+    write_byte(pair + luma_offset, luma);
+    write_byte(pair + chroma_offset, neutral_chroma_code());
+    let output_width = select(params.canvas_width, params.canvas_height, params.orientation >= 4u);
+    if (x & 1u) == 0u && x + 1u == output_width {
+        write_byte(pair + luma_offset + 2u, luma);
+        write_byte(pair + chroma_offset + 2u, neutral_chroma_code());
+    }
+}
+
 fn finalize_output() {
     if params.source_channels != 1u || params.output_kind == 9u {
         if params.output_kind != 9u {
@@ -519,18 +543,18 @@ fn finalize_output() {
             return;
         }
         for (var index = 0u; index < params.sample_count; index += 1u) {
-            let x = params.origin_x + index % params.width;
-            let y = params.origin_y + index / params.width;
-            write_native_pixel(x, y, index);
+            let destination = output_coordinate(index % params.width, index / params.width);
+            write_native_pixel(destination.x, destination.y, index);
         }
         return;
     }
 
-    if params.output_kind != 4u {
-        for (var index = 0u; index < params.sample_count; index += 1u) {
-            let x = params.origin_x + index % params.width;
-            let y = params.origin_y + index / params.width;
-            write_output_sample(x, y, reconstruction_load(index));
+    for (var index = 0u; index < params.sample_count; index += 1u) {
+        let destination = output_coordinate(index % params.width, index / params.width);
+        if params.output_kind == 4u {
+            write_packed_422_pixel(destination.x, destination.y, reconstruction_load(index));
+        } else {
+            write_output_sample(destination.x, destination.y, reconstruction_load(index));
         }
     }
     if params.output_kind == 2u && params.initialize_chroma != 0u {
@@ -555,27 +579,6 @@ fn finalize_output() {
                 write_stored_code(
                     params.plane2_offset + y * params.plane2_stride + x * bytes_per_sample,
                     neutral,
-                );
-            }
-        }
-    } else if params.output_kind == 4u {
-        let neutral = neutral_chroma_code();
-        let pair_count = (params.width + 1u) / 2u;
-        for (var y = 0u; y < params.height; y += 1u) {
-            for (var pair = 0u; pair < pair_count; pair += 1u) {
-                let x0 = pair * 2u;
-                let x1 = min(x0 + 1u, params.width - 1u);
-                let y0 = color_code(reconstruction_load(y * params.width + x0));
-                let y1 = color_code(reconstruction_load(y * params.width + x1));
-                var packed = y0 | (neutral << 8u) | (y1 << 16u) | (neutral << 24u);
-                if params.order == 1u {
-                    packed = neutral | (y0 << 8u) | (neutral << 16u) | (y1 << 24u);
-                }
-                let output_y = params.origin_y + y;
-                let output_pair = params.origin_x / 2u + pair;
-                write_word(
-                    params.plane0_offset + output_y * params.plane0_stride + output_pair * 4u,
-                    packed,
                 );
             }
         }

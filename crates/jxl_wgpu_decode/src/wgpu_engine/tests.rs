@@ -4,7 +4,7 @@ use std::task::{Context, Waker};
 use jxl_gpu_formats::{
     ColorSpecification, PixelFormat, PixelFormatClass, SampleKind, classify_pixel_format,
 };
-use jxl_gpu_protocol::Extent2d;
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::MemoryBudget;
 
 use crate::entropy::EntropyStreamParams;
@@ -321,8 +321,15 @@ fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
         ),
     ]);
     for (name, request, source_channels) in cases {
-        let output = OutputPlan::new(extent, &request, source_channels, 8, PORTABLE_CAPABILITIES)
-            .unwrap_or_else(|error| panic!("{name} output plan failed: {error}"));
+        let output = OutputPlan::new(
+            extent,
+            OutputOrientation::Identity,
+            &request,
+            source_channels,
+            8,
+            PORTABLE_CAPABILITIES,
+        )
+        .unwrap_or_else(|error| panic!("{name} output plan failed: {error}"));
         assert_eq!(
             output.write_path_for_groups(&groups).unwrap(),
             OutputWritePath::WordAligned,
@@ -333,6 +340,7 @@ fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
     let rgb_request = GpuOutputRequest::color(Vpi::Rgb8.pixel_format()).unwrap();
     let mut rgb = OutputPlan::new(
         extent,
+        OutputOrientation::Identity,
         &rgb_request,
         crate::ModularChannels::Gray,
         8,
@@ -459,6 +467,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
     .unwrap();
     let normalized_u8 = OutputPlan::new(
         Extent2d::new(17, 13),
+        OutputOrientation::Identity,
         &request,
         crate::ModularChannels::Gray,
         8,
@@ -509,6 +518,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
     .unwrap();
     let native = OutputPlan::new(
         Extent2d::new(17, 13),
+        OutputOrientation::Identity,
         &native_request,
         crate::ModularChannels::Gray,
         8,
@@ -527,6 +537,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
     .unwrap();
     let signed = OutputPlan::new(
         Extent2d::new(17, 13),
+        OutputOrientation::Identity,
         &signed_request,
         crate::ModularChannels::Gray,
         8,
@@ -576,6 +587,7 @@ fn output_negotiation_rejects_rgb_without_explicit_transfer_and_range() {
     assert!(matches!(
         OutputPlan::new(
             Extent2d::new(2, 2),
+            OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
             8,
@@ -591,6 +603,7 @@ fn output_negotiation_rejects_shader_address_overflow() {
     assert!(matches!(
         OutputPlan::new(
             Extent2d::new(u32::MAX, 1),
+            OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
             8,
@@ -652,6 +665,7 @@ fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
         let request = GpuOutputRequest::color(pixel_format).unwrap();
         let output = OutputPlan::new(
             Extent2d::new(5, 3),
+            OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
             8,
@@ -696,6 +710,7 @@ fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
         let request = GpuOutputRequest::numeric(format.pixel_format(), mapping).unwrap();
         let output = OutputPlan::new(
             Extent2d::new(5, 3),
+            OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
             8,
@@ -815,7 +830,7 @@ fn shader_abi_and_stream_sentinel_are_explicit() {
     assert_eq!(MIN_STREAM_WINDOW_BYTES, 40);
     assert_eq!(align16(1).unwrap(), 16);
     assert_eq!(align16(16).unwrap(), 16);
-    assert_eq!(std::mem::size_of::<ShaderParams>(), 244);
+    assert_eq!(std::mem::size_of::<ShaderParams>(), 256);
     assert_eq!(std::mem::align_of::<ShaderParams>(), 4);
     let params = ShaderParams {
         entropy: EntropyStreamParams {
@@ -881,13 +896,16 @@ fn shader_abi_and_stream_sentinel_are_explicit() {
         wp_w1: 59,
         wp_w2: 60,
         wp_w3: 61,
+        canvas_width: 62,
+        canvas_height: 63,
+        orientation: 64,
     };
     assert_eq!(
-        bytemuck::cast::<ShaderParams, [u32; 61]>(params),
+        bytemuck::cast::<ShaderParams, [u32; 64]>(params),
         [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64,
         ]
     );
     assert_eq!(std::mem::size_of::<EntropyExecutionState>(), 32);

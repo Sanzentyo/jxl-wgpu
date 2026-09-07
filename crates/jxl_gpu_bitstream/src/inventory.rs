@@ -18,6 +18,8 @@ use thiserror::Error;
 
 use crate::{BitReader, Error as BitReaderError};
 
+mod image_extensions;
+
 const FLAG_USE_LF_FRAME: u64 = 0x20;
 const GROUP_DIM_LOG2_MINUS_ONE: u32 = 7;
 const MAX_EXTRA_CHANNELS: u32 = 256;
@@ -613,6 +615,8 @@ pub struct CodestreamInventory {
 /// Failure while constructing a bounded standard codestream inventory.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum InventoryError {
+    #[error("unsupported JPEG XL {scope} extensions: selector {selector:#x}")]
+    UnsupportedExtensions { scope: &'static str, selector: u64 },
     #[error("JPEG XL image header is invalid: {0}")]
     ImageHeader(String),
     #[error("unexpected end of codestream at bit {bit_offset}")]
@@ -1045,6 +1049,16 @@ pub(crate) fn parse_image_header(
     };
     let header_bits =
         u64::try_from(bitstream.num_read_bits()).map_err(|_| InventoryError::SizeOverflow)?;
+    // jxl-image deliberately skips unknown extension payloads. Authoritative decode must reject
+    // them instead of assuming that an unknown rendering extension leaves pixels unchanged.
+    if let Some((_, selector)) = image_extensions::read_selector(&codestream[..visible_bytes])?
+        && selector != 0
+    {
+        return Err(InventoryError::UnsupportedExtensions {
+            scope: "image",
+            selector,
+        });
+    }
 
     let metadata = &image.metadata;
     let extra_channel_count = u32::try_from(metadata.ec_info.len())
@@ -1651,7 +1665,7 @@ fn parse_frame_header(
     }
     let name_bytes = read_name(reader, limits.max_frame_name_bytes)?;
     let restoration_filter = parse_restoration_filter(reader, encoding, limits.max_extension_bits)?;
-    parse_extensions(reader, limits.max_extension_bits)?;
+    parse_extensions(reader, limits.max_extension_bits, "frame")?;
 
     const H_SHIFT: [u32; 4] = [0, 1, 1, 0];
     const V_SHIFT: [u32; 4] = [0, 1, 0, 1];
@@ -1873,13 +1887,14 @@ fn parse_restoration_filter(
             sigma_for_modular,
         }
     };
-    parse_extensions(reader, max_extension_bits)?;
+    parse_extensions(reader, max_extension_bits, "restoration")?;
     Ok(RestorationFilterInventory::Custom { gaborish, epf })
 }
 
 fn parse_extensions(
     reader: &mut BitReader<'_>,
     max_extension_bits: u64,
+    scope: &'static str,
 ) -> Result<(), InventoryError> {
     let selector = read_u64(reader)?;
     let mut total_bits = 0u64;
@@ -1895,7 +1910,11 @@ fn parse_extensions(
     }
     reader
         .skip_bits(total_bits)
-        .map_err(|error| map_reader_error(error, reader.bit_offset()))
+        .map_err(|error| map_reader_error(error, reader.bit_offset()))?;
+    if selector != 0 {
+        return Err(InventoryError::UnsupportedExtensions { scope, selector });
+    }
+    Ok(())
 }
 
 struct ParsedToc {

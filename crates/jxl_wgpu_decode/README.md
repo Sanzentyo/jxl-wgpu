@@ -19,6 +19,27 @@ The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular pr
   nonempty DC-global sample channels, group-edge geometry, and one full-resolution unassociated
   alpha channel for RGBA; no restoration filters, other extra channels, or references.
 
+Presentation normalizes all eight image orientations in the GPU writer. The source canvas and
+group origins remain in codestream coordinates; output layout and changed regions use the oriented
+extent. The same forward/inverse WGSL coordinate helpers serve Modular and VarDCT. Fixed-Gradient
+direct Gray8 output, ordinary reconstruction, group-local inverse stacks, and the frame-wide
+Palette/Squeeze finalizer all apply the mapping without an intermediate image or extra submission.
+Rotated or mirrored groups use atomic byte writes because transformed group boundaries may share
+a storage word. Packed 4:2:2 writes each pixel's luma and neutral-chroma bytes independently and
+replicates the final odd pixel; a group no longer has to own an entire packed pair.
+
+Image admission uses the validated inventory's color, depth, and alpha semantics rather than
+reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, unassociated matching-depth
+full-resolution alpha, all orientations, intrinsic-size hints, and named alpha declarations can
+use the supported reconstruction path. Unsupported ICC/color, associated/dimension-shifted or
+mismatched-depth alpha, extra-channel resampling, and restoration remain rejected. Unknown image,
+frame, and restoration extension selectors are typed inventory errors before any GPU work.
+Twenty-three checked-in libjxl fixtures compare exact native samples with their deterministic
+source and Rust jxl, plus exact Gray/RGB samples from djxl. Twelve gray fixtures cover all 30 VPI formats under both whole blocking
+and 4 KiB bounded, fragmented async input. Numeric/native results are exact; transformed color
+codes differ from the scalar reference by at most one. Both scheduling paths return identical
+bytes and release all reservations.
+
 Before submission the decoder inventories the standard image header, frame header, and TOC with
 explicit limits. It parses only the bounded DC-global and selected LF-group/pass-group-local MA trees,
 histogram descriptors, hybrid integer configuration, context maps, ordered Modular transform
@@ -38,7 +59,7 @@ channels whose dimensions and horizontal/vertical shifts match, newest first, as
 require. A geometry-keyed map bounds construction by channel count times the at-most-60 references
 addressable by the 8-bit MA property space. Each self-contained MA/entropy descriptor has its
 internal config/tree/table offsets rebased into one immutable GPU word buffer; equal local
-descriptors are deduplicated. The 244-byte per-group parameter record exposes independent MA and
+descriptors are deduplicated. The 256-byte per-group parameter record exposes independent MA and
 channel-descriptor bases. Identical transform plans share one descriptor table even when their MA
 or weighted-predictor configuration differs; edge groups retain distinct checked geometry. The
 resident arena stride is aligned for dynamic storage offsets.
@@ -71,7 +92,7 @@ its first retired range for the restored output. The real progressive-DC LF2 fix
 parameters to 37 jobs and three final full-resolution planes within twice its entropy sample count.
 An RCT/Squeeze/RCT test emits five ordered jobs and executes them in one command encoder, copying all
 three noncontiguous final planes into one staging map. Production scheduling applies a concrete
-group-local inverse plan and a 144-byte region-aware finalizer as soon as each group's final entropy
+group-local inverse plan and a 160-byte region-aware finalizer as soon as each group's final entropy
 segment finishes when no cross-group transform is present. For DC-global Palette/Squeeze, channels
 with both transformed shifts at least three are decoded by LF-group subimages first; channels with
 either shift below three are decoded by pass-group subimages. Each subimage finishes its local
@@ -559,7 +580,7 @@ bitstream `timecode` when declared. The session rejects timebase, accumulated pr
 or timecode-presence mismatches as typed errors. A cancelled async wait can be resumed through the
 same session synchronously or by a later future.
 
-The CPU/WGSL per-group Modular parameter ABI is a checked 244-byte `repr(C)` POD. Its first 12 bytes are the
+The CPU/WGSL per-group Modular parameter ABI is a checked 256-byte `repr(C)` POD. Its first 12 bytes are the
 shared `EntropyStreamParams`: token start/end bounds and the descriptor-derived LZ ring mask. The
 same typed prefix starts the 240-byte, 16-byte-aligned VarDCT packet entropy record. Each consumer supplies its own
 storage access and LZ scratch-base functions; geometry, prediction, output, and coefficient state
@@ -580,7 +601,7 @@ full stream end, yield boundary, first/final flags, and the aligned entropy-stat
 carries four plane offset/stride pairs, exact output
 channel/order/depth/range/transfer codes, the resolved numeric mapping, global status index, MA
 stream index, the proven fixed-leaf predictor/offset/multiplier and four channel cluster ids, the
-output traversal mode, weighted-predictor header, and shader-visible logical size. Records are a
+output traversal mode, weighted-predictor header, and shader-visible logical size. The final three words are the unrotated canvas width/height and zero-based orientation. Records are a
 tightly packed read-only storage array; a separate 16-byte uniform selects the global group range and local
 scratch-lane stride for each wave.
 Codestream segments are rounded to four bytes and include a zero sentinel word for bounded
@@ -630,7 +651,7 @@ reconstruction, status, status-staging, and POD parameter buffers (plus the nati
 needed). A cache hit requires the exact allocation size, usage flags, and ABI alignment. The raw
 JPEG XL codestream and caller-owned output are never admitted to this pool. Codestream upload reads
 only each planned bounded range from a checked table of shared input spans, even when the range
-crosses physical chunks, while metadata and packed 244-byte `ShaderParams` records (including the
+crosses physical chunks, while metadata and packed 256-byte `ShaderParams` records (including the
 12-byte shared entropy prefix) use `Queue::write_buffer`; no second full-codestream host `Vec` is
 created.
 

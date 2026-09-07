@@ -106,6 +106,14 @@ RGB image or host pixel conversion is added. Tests cover 30 layout/transfer choi
 JPEG upsampling, recursive DC, and Display-P3/BT.2020 conversion. Numeric/float RGB output and the
 luminance mapping needed for PQ/HLG output remain unsupported in this decoder path.
 
+Modular also normalizes orientations 1–8 on the GPU, including exact native RGB/RGBA and 12/16-bit
+samples, all 30 Gray8 VPI color/numeric outputs, Palette/Squeeze, and one-pixel axes. Its frontend
+now admits parsed header semantics instead of requiring one fixed wire representation. Unsupported
+color/alpha/restoration contracts remain checked; unknown image/frame/restoration extensions fail
+with their scope and selector before output. The 23-fixture corpus matches source/Rust jxl samples
+and djxl color samples; color conversion differs by at most one code, and whole versus
+fragmented async output is byte-identical.
+
 Concurrent encode, decode, and explicit readback work uses byte-weighted, non-blocking memory
 admission. The same completion values work with native blocking calls or any async executor.
 Decoder output buffers carry cloneable memory leases, so dropping a session cannot free its budget

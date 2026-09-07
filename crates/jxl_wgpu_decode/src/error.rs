@@ -8,6 +8,7 @@ pub enum UnsupportedCodestreamFeature {
     AdaptiveModularPredictor,
     MultiplePasses,
     ExtraChannels,
+    ColorEncoding,
     Patches,
     Splines,
     Noise,
@@ -201,6 +202,8 @@ impl FrontendIncomplete {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("JPEG XL image orientation must be in 1..=8, got {value}")]
+    InvalidImageOrientation { value: u32 },
     #[error("JPEG XL container/codestream validation failed: {0}")]
     Bitstream(#[from] jxl_gpu_bitstream::Error),
     #[error("JPEG XL standard codestream inventory failed: {0}")]

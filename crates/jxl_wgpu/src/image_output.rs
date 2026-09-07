@@ -19,14 +19,22 @@ use jxl_gpu_protocol::{
 
 /// Shared WGSL declarations, color conversion, and word-owned output entry point `main`.
 /// Append a source fragment defining `source_rgb_at(x: u32, y: u32) -> vec3<f32>`.
-pub const IMAGE_OUTPUT_SHADER: &str = include_str!("../shaders/image_output.wgsl");
+pub const IMAGE_OUTPUT_SHADER: &str = concat!(
+    include_str!("../shaders/image_orientation.wgsl"),
+    include_str!("../shaders/image_output.wgsl"),
+);
+
+/// WGSL forward/inverse image-coordinate helpers using zero-based Exif orientation codes.
+/// Callers validate nonempty extents and coordinate bounds before invoking either helper.
+pub const IMAGE_ORIENTATION_SHADER: &str = include_str!("../shaders/image_orientation.wgsl");
 
 pub(crate) const RGB_TO_IMAGE_SHADER: &str = concat!(
+    include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
     include_str!("../shaders/rgb_to_image.wgsl"),
 );
 
-/// Validated source coordinates and color encoding for the shared output shader.
+/// Source coordinates and color encoding for the shared output shader.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageOutputSource {
     pub extent: Extent2d,

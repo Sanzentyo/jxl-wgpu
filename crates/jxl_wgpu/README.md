@@ -5,6 +5,11 @@ implements `jxl_gpu_protocol::RenderBackend` with `wgpu` 30 and exposes its conc
 `WgpuBackend`/`WgpuFrameSession` APIs for GPU-resident image output, same-queue presentation, and
 explicit mapped readback.
 
+Modular and VarDCT presentation use the same `IMAGE_ORIENTATION_SHADER` coordinate helpers.
+The fragment defines forward and inverse mappings for zero-based Exif orientation codes; producers
+validate the complete unrotated canvas and coordinate bounds before calling it. The color-output
+fragment includes this helper automatically.
+
 Host code validates plans and packets, records command buffers, and resolves completion. Supported
 pixel, coefficient, restoration, color, packing, and display work executes in WGSL. Unsupported
 operations, layouts, precision contracts, and device limits return typed errors before an output

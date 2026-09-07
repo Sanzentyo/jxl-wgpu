@@ -92,11 +92,11 @@ fn decode_adaptive_channel(start: u32, may_pause: bool, pause_cursor: u32) -> u3
         }
         reconstruction_store(channel_base + reconstruction_index, bitcast<u32>(sample));
         if params.fixed_output_mode != 0u {
+            let destination = output_coordinate(x, y);
             write_byte(
                 params.plane0_offset
-                    + (params.origin_y + y) * params.plane0_stride
-                    + params.origin_x
-                    + x,
+                    + destination.y * params.plane0_stride
+                    + destination.x,
                 bitcast<u32>(sample),
             );
         }

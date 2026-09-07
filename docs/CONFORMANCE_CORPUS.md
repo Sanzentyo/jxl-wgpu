@@ -416,6 +416,79 @@ window without touching its host-parsed descriptor and must return typed
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
 
+## Modular orientation and semantic header admission
+
+`testsrc_modular_orientation_*.jxl.hex` contains 23 synthetic lossless images generated with
+libjxl `cjxl` 0.12.0 on 2026-09-07. There is no external image or private transport dependency.
+PGM/PPM source maxval is `(1 << bits) - 1`; samples above eight bits are big-endian u16.
+RGBA sources are generated PNGs with color type 6, 8/16-bit samples, filter 0, sRGB rendering
+intent 1, and zlib-compressed rows. Each source gets a minimal little-endian TIFF Exif orientation
+IFD through `-x exif=orientation.exif`. The PNG-derived RGBA outputs retain the container emitted
+by cjxl; the other fixtures are raw codestreams.
+
+For coordinates `x,y` and `M=(1<<bits)-1`, source samples are:
+
+- R/gray: `(613*x + 107*y + 43*(x XOR y)) & M`.
+- G: `((153*x) XOR (271*y)) & M`.
+- B: `(259*x + 307*y + 31*(x XOR y)) & M`.
+- A: `M - ((181*x + 97*y) & (M-1))`; alpha remains nonzero, so invisible-color removal is irrelevant.
+- Palette cases replace gray with `[2,29,113,241][(x/11 + y/7 + (x*y)%5)%4]` using integer division.
+
+Ordinary cases use `cjxl input output -d 0 -e 1 -m 1 --container=0` with explicit
+`-x color_space=Gra_D65_Rel_SRG` or `-x color_space=RGB_D65_SRG_Rel_SRG` and the Exif hint.
+Palette cases use effort 9. The 2051×259 Squeeze case uses effort 9 plus `-p -R 1` and supplies
+multiple LF groups and progressive passes. Hex files contain only the resulting bytes.
+
+`native_modular_orientation_matches_sources_and_both_decoders` compares all samples, including
+alpha, exactly with the generated source and Rust jxl 0.6.0. It also compares Gray/RGB color samples
+with djxl's explicit-sRGB PGM/PPM output at the original sample depth; that PNM comparison excludes
+RGBA alpha. The source oracle transposes row/column collections and reverses traversal independently
+of the WGSL coordinate formulas. Assertions require fused output, group-local inverse/finalizer,
+frame-wide inverse/finalizer, Palette, and multi-pass LF Squeeze paths to execute.
+
+`oriented_gray_modular_preserves_all_vpi_color_and_numeric_layouts` covers all 30 VPI formats
+across all twelve gray fixtures: eight orientations, two Palette extents, progressive Squeeze,
+and a one-pixel output axis. Each case runs with whole blocking input and with 4 KiB GPU entropy
+windows, 137-byte transport chunks, and runtime-neutral async completion. Output bytes match
+between the two execution paths. Native/numeric output is exact; transformed color output differs
+from the independent scalar packing oracle by at most one stored code at 8/16 bits on Apple M5.
+Exact output lease sizes and full budget release are checked after each frame.
+
+Negative metadata tests cover invalid orientations, unsupported color, associated alpha,
+dimension shifts, mismatched alpha depths, extra-channel resampling, and restoration. The frontend
+accepts supported metadata semantics instead of comparing a fixed image-header bit representation.
+Separate bitstream tests cover small/default header forms and typed unknown image/frame/restoration
+extension rejection, including empty unknown payloads and bounded extension lengths.
+
+| Fixture suffix | Encoded extent | Depth / channels | Orientation | Binary bytes | SHA-256 |
+|---|---|---|---|---|---|
+| `gray_1` | 259×257 | 8 / 1 | 1 | 63726 | `70fb523dfef3933f3da7387094db515a9ef51293326d37884fa9d0d9f72c562e` |
+| `rgb_1` | 259×17 | 8 / 3 | 1 | 19270 | `6c0160b2c3b321bf3cffbd9100d29ba0c09feb28958dfd090125b20c1eaed4c7` |
+| `gray_2` | 259×257 | 8 / 1 | 2 | 63727 | `eca45d5c22bca2104ecd553c5d5055ad99a3a37b214f3ee147e67c3c094956d8` |
+| `rgb_2` | 259×17 | 8 / 3 | 2 | 19271 | `f8b8d924696ae673e4fa40168562d20e20054ce4bd25b9700baa64e591b25c62` |
+| `gray_3` | 259×257 | 8 / 1 | 3 | 63727 | `67924e83cd2ebc9642c2dba72694dee72151fc9b1708ac4fffef1d1b85228257` |
+| `rgb_3` | 259×17 | 8 / 3 | 3 | 19271 | `eeab712786147d6004b084a8fed26786d083d67baf4764a420fb3242023a6ba8` |
+| `gray_4` | 259×257 | 8 / 1 | 4 | 63727 | `cf1f86ec6c86e68913b2e8865b5b8c735e29a358fb9352a60c5bd6bf06412111` |
+| `rgb_4` | 259×17 | 8 / 3 | 4 | 19271 | `a04851e7b5ac7ab40d94a269f5486dc908c9dd6ef1124eb4d484ac461eabed4b` |
+| `gray_5` | 259×257 | 8 / 1 | 5 | 63727 | `7e19365b0ffd76c732c14cb97470165e432a79623c9d5685ea77817393ac3f11` |
+| `rgb_5` | 259×17 | 8 / 3 | 5 | 19271 | `c56d972cacddeeda918f73404dbba2d88c5f9114d418a0801c592039374d5a50` |
+| `gray_6` | 259×257 | 8 / 1 | 6 | 63727 | `527de4d203f1e2efc39bdc45399feca24a6bf78b1e4f463cf7c0a1b038100daf` |
+| `rgb_6` | 259×17 | 8 / 3 | 6 | 19271 | `e3013d71cd2790c3cd7f0fbcb7bf4708083849caee1e1c55ef31bdbbb7acf0f7` |
+| `gray_7` | 259×257 | 8 / 1 | 7 | 63727 | `805b6b25b448cf13cb4d4c758573dd44c78ad575051cb37e2c14910e4a116af8` |
+| `rgb_7` | 259×17 | 8 / 3 | 7 | 19271 | `919cab8bf0ab63ce968f83d39c8c5f4e6fffa77ed0eb8bddc4cf5e202cafd0ff` |
+| `gray_8` | 259×257 | 8 / 1 | 8 | 63727 | `c840399a82f60a26dfa881ca95b75fd73f772399be33670856af06420f333fb1` |
+| `rgb_8` | 259×17 | 8 / 3 | 8 | 19271 | `7fd413f9b45b6590df81459f638b38bdc63abfb80bce1e445b24eb09f155a12c` |
+| `gray_palette` | 515×259 | 8 / 1 | 6 | 2316 | `9136aba5d5da026ac1099ff6f2f03fae4f1bd4d66a369256f2b63b44d523acf2` |
+| `gray_squeeze` | 2051×259 | 8 / 1 | 8 | 42063 | `c9d154ed2a8f7e24c1fd6c7bdd2f51867c773a91e7cb79a952172596e0066296` |
+| `gray_single_palette` | 37×23 | 8 / 1 | 7 | 232 | `c91379dd6f2f4755f333ab22cdf43b1e0383696effd97b63b57f3e6371212893` |
+| `rgba_16` | 259×7 | 16 / 4 | 5 | 12009 | `f2b4372158726c2887dcaf6342e01bcc53dcef9fbcb5bb7d88b5a42190f7351e` |
+| `rgb_12_column` | 1×257 | 12 / 3 | 6 | 1604 | `1abacf220e0841808db21a3986de761bd7f48dd46759ebb0f7eb3e21c8e352fa` |
+| `gray_row` | 257×1 | 8 / 1 | 8 | 367 | `5cdd1252953adfdd9fa7f2e7d9908919fe4abd203a80fe3c405dbc948f0f1337` |
+| `rgba_8` | 17×9 | 8 / 4 | 2 | 1238 | `54fc40d367b42351c6770868195d3abd584df7e1b4ea9d8bea25e7afb297fe6d` |
+
+This coverage does not add Modular HDR/ICC conversion, arbitrary extra channels, frame resampling,
+animation/composition, or keep-orientation output controls.
+
 ## Shared VarDCT color output
 
 The decoder and render graph use one shared GPU color/layout lowering and word-owned packing

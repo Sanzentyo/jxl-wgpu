@@ -46,18 +46,9 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 fn source_coordinate(destination: vec2<u32>) -> vec2<u32> {
-    let x = destination.x;
-    let y = destination.y;
-    switch params.orientation {
-        case 1u: { return vec2<u32>(params.source_width - 1u - x, y); }
-        case 2u: { return vec2<u32>(params.source_width - 1u - x, params.source_height - 1u - y); }
-        case 3u: { return vec2<u32>(x, params.source_height - 1u - y); }
-        case 4u: { return vec2<u32>(y, x); }
-        case 5u: { return vec2<u32>(y, params.source_height - 1u - x); }
-        case 6u: { return vec2<u32>(params.source_width - 1u - y, params.source_height - 1u - x); }
-        case 7u: { return vec2<u32>(params.source_width - 1u - y, x); }
-        default: { return destination; }
-    }
+    return image_source_coordinate(
+        destination, vec2<u32>(params.source_width, params.source_height), params.orientation,
+    );
 }
 
 fn transfer_to_linear(value: f32, transfer: u32) -> f32 {

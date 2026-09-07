@@ -1,7 +1,11 @@
 use jxl_gpu_bitstream::{
-    CodestreamInventory, FiniteF16, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType,
-    ImageHeaderInventory, SampleBitDepth,
+    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
+    EdgePreservingFilterInventory, ExtraChannelTypeInventory, FiniteF16, FrameBlendInfo,
+    FrameEncoding, FrameSectionKind, FrameType, GaborishInventory, ImageHeaderInventory,
+    PrimariesInventory, RestorationFilterInventory, SampleBitDepth, TransferFunctionInventory,
+    WhitePointInventory,
 };
+use jxl_gpu_protocol::OutputOrientation;
 
 use crate::modular_inverse::{ModularInversePlan, plan_modular_inverse};
 use crate::modular_transform::{
@@ -50,6 +54,7 @@ impl ModularGroup {
 pub(crate) struct StandardModularProfile {
     pub width: u32,
     pub height: u32,
+    pub orientation: OutputOrientation,
     pub bits_per_sample: u8,
     pub channels: ModularChannels,
     pub pass_count: u32,
@@ -126,128 +131,62 @@ impl ModularMaConfig {
     }
 }
 
+// The inventory already validates the header grammar and resolves its default/explicit forms.
+// Admission depends on pixel semantics, never on one encoder's choice of bit representation.
 fn validate_image_header(
-    codestream: &GpuCodestream,
     image: &ImageHeaderInventory,
     channels: ModularChannels,
     bits_per_sample: u8,
-) -> Result<()> {
-    if image.orientation != 1
-        || image.intrinsic_size.is_some()
-        || image.preview_size.is_some()
-        || image.embedded_icc.is_some()
-        || image.animation.is_some()
-        || image.modular_16bit_buffers != (bits_per_sample <= 14)
-    {
-        return unsupported(
-            "the lossless Modular GPU profile requires canonical still-image metadata",
-        );
-    }
-
-    let mut reader = codestream.reader();
-    expect(&mut reader, 16, 0x0aff, "JPEG XL codestream signature")?;
-    expect(&mut reader, 1, 0, "non-small image header")?;
-    let height = read_size(&mut reader, true)?;
-    let width = read_size(&mut reader, false)?;
-    if width != image.width || height != image.height {
-        return unsupported("standard image-header extent does not match its inventory");
-    }
-    expect(&mut reader, 1, 0, "non-default image metadata")?;
-    expect(&mut reader, 1, 0, "no extra metadata fields")?;
-    read_integer_bit_depth(&mut reader, bits_per_sample, "main image bit depth")?;
-    expect(
-        &mut reader,
-        1,
-        u64::from(bits_per_sample <= 14),
-        "canonical Modular buffer depth",
+) -> Result<OutputOrientation> {
+    let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
+        Error::InvalidImageOrientation {
+            value: image.orientation,
+        },
     )?;
-
-    let has_alpha = channels == ModularChannels::Rgba;
-    expect(
-        &mut reader,
-        2,
-        u64::from(has_alpha),
-        "canonical extra-channel count",
-    )?;
-    if has_alpha {
-        if bits_per_sample == 8 {
-            expect(&mut reader, 1, 1, "default unassociated alpha metadata")?;
-        } else {
-            expect(&mut reader, 1, 0, "explicit alpha metadata")?;
-            expect(&mut reader, 2, 0, "alpha extra-channel type")?;
-            read_integer_bit_depth(&mut reader, bits_per_sample, "alpha bit depth")?;
-            expect(&mut reader, 2, 0, "full-resolution alpha")?;
-            expect(&mut reader, 2, 0, "empty alpha name")?;
-            expect(&mut reader, 1, 0, "unassociated alpha")?;
-        }
+    if image.preview_size.is_some() || image.animation.is_some() {
+        return unsupported("the Modular presentation profile requires a still without a preview");
     }
-
-    expect(&mut reader, 1, 0, "non-XYB image")?;
-    if channels == ModularChannels::Gray {
-        for (count, value, name) in [
-            (1, 0, "non-default grayscale color encoding"),
-            (1, 0, "no ICC profile"),
-            (2, 1, "grayscale color space"),
-            (2, 1, "D65 white point"),
-            (1, 0, "enumerated transfer function"),
-            (2, 0b10, "transfer-function selector"),
-            (4, 11, "sRGB transfer function"),
-            (2, 1, "relative rendering intent"),
-        ] {
-            expect(&mut reader, count, value, name)?;
-        }
+    let colour_space = if channels == ModularChannels::Gray {
+        ColourSpaceInventory::Grey
     } else {
-        expect(&mut reader, 1, 1, "default sRGB color encoding")?;
-    }
-    expect(&mut reader, 2, 0, "no image extensions")?;
-    expect(&mut reader, 1, 1, "default transform data")?;
-    let grammar_end = reader.bit_offset();
-    if image.bit_range.offset != 0 || image.bit_range.end() != Some(grammar_end) {
-        return unsupported(format!(
-            "canonical image-header length {} does not match inventory {:?}",
-            grammar_end,
-            image.bit_range.end()
-        ));
-    }
-    reader.align_to_byte()?;
-    Ok(())
-}
-
-fn read_integer_bit_depth(reader: &mut impl BitInput, expected: u8, field: &str) -> Result<()> {
-    expect(reader, 1, 0, field)?;
-    let actual = match reader.read_bits(2)? {
-        0 => 8,
-        1 => 10,
-        2 => 12,
-        3 => u8::try_from(reader.read_bits(6)?)
-            .map_err(|_| unsupported_error("integer bit depth exceeds u8"))?
-            .checked_add(1)
-            .ok_or_else(|| unsupported_error("integer bit depth overflow"))?,
-        _ => unreachable!(),
+        ColourSpaceInventory::Rgb
     };
-    if actual != expected {
-        return unsupported(format!(
-            "the lossless Modular GPU profile requires {field} {expected}, received {actual}"
-        ));
+    if image.embedded_icc.is_some()
+        || !matches!(image.colour_encoding, ColourEncodingInventory::Enumerated {
+            colour_space: actual,
+            white_point: WhitePointInventory::D65,
+            primaries: PrimariesInventory::Srgb,
+            transfer_function: TransferFunctionInventory::Srgb,
+            rendering_intent: _,
+        } if actual == colour_space)
+    {
+        return Err(UnsupportedProfile::new(
+            UnsupportedCodestreamFeature::ColorEncoding,
+            "the Modular presentation profile requires enumerated D65 sRGB color",
+        )
+        .into());
     }
-    Ok(())
+    let alpha_count = usize::from(channels == ModularChannels::Rgba);
+    if image.extra_channels.len() != alpha_count
+        || image.extra_channel_count as usize != alpha_count
+        || image.extra_channels.iter().any(|extra| {
+            extra.channel_type != (ExtraChannelTypeInventory::Alpha { associated: false })
+                || extra.bit_depth
+                    != (SampleBitDepth::Integer {
+                        bits_per_sample: u32::from(bits_per_sample),
+                    })
+                || extra.dimension_shift != 0
+        })
+    {
+        return Err(UnsupportedProfile::new(
+            UnsupportedCodestreamFeature::ExtraChannels,
+            "native RGBA requires one unassociated full-resolution alpha channel with matching depth",
+        ).into());
+    }
+    Ok(orientation)
 }
 
-fn read_size(reader: &mut impl BitInput, has_ratio: bool) -> Result<u32> {
-    let selector = usize::try_from(reader.read_bits(2)?)
-        .map_err(|_| unsupported_error("image extent selector overflow"))?;
-    let widths = [9, 13, 18, 30];
-    let value = u32::try_from(reader.read_bits(widths[selector])?)
-        .map_err(|_| unsupported_error("image extent overflows u32"))?
-        .checked_add(1)
-        .ok_or_else(|| unsupported_error("image extent overflows u32"))?;
-    if has_ratio {
-        expect(reader, 3, 0, "explicit width follows height")?;
-    }
-    Ok(value)
-}
-
-/// Recognizes the standards-compliant lossless Modular grammar emitted by `jxl_wgpu_encode`.
+/// Lowers validated still-image metadata and bounded Modular entropy/transform descriptors.
 ///
 /// Only bounded image/frame metadata, the Modular DC-global prefix description, and fixed group
 /// headers are inspected here. Entropy symbols, residuals, predictors, and pixels are deliberately
@@ -312,12 +251,12 @@ fn parse_modular_profile(
     if image.animation.is_some() || image.preview_size.is_some() || inventory.frames.len() != 1 {
         return unsupported("the Modular GPU profile requires exactly one still-image frame");
     }
-    match purpose {
+    let orientation = match purpose {
         ModularProfilePurpose::Presentation => {
             if image.xyb_encoded {
                 return unsupported("the lossless Modular GPU profile does not use XYB metadata");
             }
-            validate_image_header(codestream, image, channels, bits_per_sample)?;
+            validate_image_header(image, channels, bits_per_sample)?
         }
         ModularProfilePurpose::ProgressiveDc => {
             if !image.xyb_encoded || channels != ModularChannels::Rgb {
@@ -325,8 +264,9 @@ fn parse_modular_profile(
                     "a progressive-DC Modular producer requires three XYB color channels",
                 );
             }
+            OutputOrientation::Identity
         }
-    }
+    };
 
     let frame = &inventory.frames[0];
     let shared_frame_is_invalid = frame.is_preview
@@ -335,6 +275,14 @@ fn parse_modular_profile(
         || frame.do_ycbcr
         || frame.jpeg_upsampling != [0; 3]
         || frame.upsampling != 1
+        || frame.extra_channel_upsampling != vec![1; image.extra_channels.len()]
+        || !matches!(
+            frame.restoration_filter,
+            RestorationFilterInventory::Custom {
+                gaborish: GaborishInventory::Disabled,
+                epf: EdgePreservingFilterInventory::Disabled,
+            }
+        )
         || frame.group_size_shift > 3
         || frame.have_crop
         || frame.x0 != 0
@@ -944,6 +892,7 @@ fn parse_modular_profile(
     Ok(StandardModularProfile {
         width: frame_width,
         height: frame_height,
+        orientation,
         bits_per_sample,
         channels,
         pass_count: frame.num_passes,
@@ -1483,16 +1432,6 @@ fn validate_empty_lf_group_sections(
     Ok(())
 }
 
-fn expect(reader: &mut impl BitInput, count: u8, expected: u64, field: &str) -> Result<()> {
-    let actual = reader.read_bits(count)?;
-    if actual != expected {
-        return unsupported(format!(
-            "the lossless Modular GPU profile requires {field} (expected {expected}, received {actual})"
-        ));
-    }
-    Ok(())
-}
-
 fn unsupported<T>(detail: impl Into<String>) -> Result<T> {
     Err(unsupported_error(detail).into())
 }
@@ -1514,6 +1453,81 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn modular_header_admission_uses_color_and_alpha_semantics() {
+        let encoded = fixture(include_str!(
+            "../test-data/testsrc_modular_orientation_rgba_16.jxl.hex"
+        ));
+        let parsed = parse(&encoded, ParseLimits::default()).unwrap();
+        let mut inventory = parsed
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let image = &mut inventory.image_header;
+        image.intrinsic_size = Some((33, 21));
+        image.modular_16bit_buffers = false;
+        image.extra_channels[0].name_bytes = b"opacity".to_vec();
+        for value in 1..=8 {
+            image.orientation = value;
+            assert_eq!(
+                validate_image_header(image, ModularChannels::Rgba, 16)
+                    .unwrap()
+                    .to_exif_value(),
+                value
+            );
+        }
+        image.orientation = 9;
+        assert!(matches!(
+            validate_image_header(image, ModularChannels::Rgba, 16),
+            Err(Error::InvalidImageOrientation { value: 9 })
+        ));
+        image.orientation = 1;
+        let encoding = image.colour_encoding;
+        image.colour_encoding = ColourEncodingInventory::IccProfile {
+            colour_space: ColourSpaceInventory::Rgb,
+        };
+        assert!(
+            matches!(validate_image_header(image, ModularChannels::Rgba, 16),
+            Err(Error::UnsupportedProfile(ref error)) if error.feature == UnsupportedCodestreamFeature::ColorEncoding)
+        );
+        image.colour_encoding = encoding;
+        let alpha = image.extra_channels[0].clone();
+        for invalid in [
+            jxl_gpu_bitstream::ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::Alpha { associated: true },
+                ..alpha.clone()
+            },
+            jxl_gpu_bitstream::ExtraChannelInventory {
+                channel_type: ExtraChannelTypeInventory::Depth,
+                ..alpha.clone()
+            },
+            jxl_gpu_bitstream::ExtraChannelInventory {
+                dimension_shift: 1,
+                ..alpha.clone()
+            },
+            jxl_gpu_bitstream::ExtraChannelInventory {
+                bit_depth: SampleBitDepth::Integer {
+                    bits_per_sample: 12,
+                },
+                ..alpha.clone()
+            },
+        ] {
+            image.extra_channels[0] = invalid;
+            assert!(
+                matches!(validate_image_header(image, ModularChannels::Rgba, 16),
+                Err(Error::UnsupportedProfile(ref error)) if error.feature == UnsupportedCodestreamFeature::ExtraChannels)
+            );
+        }
+        image.extra_channels[0] = alpha;
+        let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
+        let source = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
+        parse_standard_modular_profile(&source, &inventory).unwrap();
+        inventory.frames[0].extra_channel_upsampling = vec![2];
+        assert!(parse_standard_modular_profile(&source, &inventory).is_err());
+        inventory.frames[0].extra_channel_upsampling = vec![1];
+        inventory.frames[0].restoration_filter = RestorationFilterInventory::Default;
+        assert!(parse_standard_modular_profile(&source, &inventory).is_err());
+    }
 
     #[test]
     fn nonempty_zero_bit_global_prefix_stream_is_still_scheduled() {

@@ -53,3 +53,10 @@ development. They feed it float RGB reconstructed by Rust `jxl` or libjxl `djxl`
 stored codes and padding against the production GPU pipeline. Display-P3 and BT.2020 cases request
 those exact output profiles from `djxl`. Common shader color/packing code is shared with
 `jxl_wgpu`, rather than duplicated in the decoder.
+
+`testsrc_modular_orientation_*.jxl.hex` are 23 deterministic Gray/RGB/RGBA patterns encoded by
+libjxl 0.12.0, with synthetic Exif orientation and no external imagery. PGM/PPM and generated
+8/16-bit RGBA PNG sources, exact options, hashes, and source/oracle evidence are recorded in
+`docs/CONFORMANCE_CORPUS.md`. The orientation helpers are shared original WGSL coordinate mappings;
+the metadata extension probe reuses the MIT OR Apache-2.0 `jxl-image` 0.13.0 public field parsers.
+CPU pixel generation, PNM oracle parsing, and scalar color conversion are test-only.

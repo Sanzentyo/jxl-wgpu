@@ -60,7 +60,9 @@ pub use display::{
     NumericDisplaySource, NumericDisplayTransfer, NumericNonFinitePolicy,
 };
 pub use error::{Error, Result};
-pub use image_output::{IMAGE_OUTPUT_SHADER, ImageOutputParams, ImageOutputSource};
+pub use image_output::{
+    IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER, ImageOutputParams, ImageOutputSource,
+};
 pub use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaLocation, ChromaLocation2d, ChromaOrder, ChromaSubsampling,
     ColorModel, ColorRange, ColorSpace, ColorSpec, ColorSpecification, ImageLayout, Packed422Order,

@@ -47,3 +47,10 @@ Embedded ICC streams are reconstructed with bounded `jxl-color` primitives and r
 their exact compressed bit range. Neither path decodes Modular, VarDCT, or pixel data. Returned
 section ranges are relative to the contiguous standard codestream, so the same inventory applies
 to raw, `jxlc`, and reconstructed `jxlp` input.
+
+Unknown image, frame, and restoration extension selectors return the typed
+`InventoryError::UnsupportedExtensions { scope, selector }` before an authoritative decode can
+use the inventory. A bounded walk through the public `jxl-image` field parsers observes the image
+selector that its opaque extension bundle otherwise skips. Empty unknown payloads are also
+rejected; frame/restoration payload lengths still obey the explicit extension-bit limit. Safe
+auxiliary container boxes continue through the transport event path independently.

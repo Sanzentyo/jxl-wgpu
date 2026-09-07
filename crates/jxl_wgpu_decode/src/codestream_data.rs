@@ -335,15 +335,6 @@ impl<'source> CodestreamBitReader<'source> {
         }
         Ok(())
     }
-
-    pub(crate) fn align_to_byte(&mut self) -> Result<()> {
-        let aligned = self
-            .bit_offset
-            .checked_add(7)
-            .ok_or_else(|| Error::backend("codestream byte alignment overflow"))?
-            & !7;
-        self.skip_bits(aligned - self.bit_offset)
-    }
 }
 
 impl BitInput for CodestreamBitReader<'_> {
