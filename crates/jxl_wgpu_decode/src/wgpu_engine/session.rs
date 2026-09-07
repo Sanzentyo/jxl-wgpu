@@ -115,6 +115,7 @@ impl WgpuDecodeSession {
 /// One submitted stock Modular frame. Queue submission has completed, while mapped validation may
 /// still be pending.
 pub struct WgpuPendingFrame {
+    pub(super) frame_name: String,
     pub(super) device: wgpu::Device,
     pub(super) lifetime: Option<Arc<DecodeJobLifetime>>,
     pub(super) token: SubmissionToken,
@@ -245,7 +246,7 @@ impl WgpuPendingFrame {
                 timecode: None,
                 is_last: true,
                 is_keyframe: true,
-                name: String::new(),
+                name: self.frame_name.clone(),
             },
             GpuImageFrame {
                 token: self.token,

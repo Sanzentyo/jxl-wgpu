@@ -143,7 +143,11 @@ cover 16K×1 and 1×16K tiled panoramas.
 The public decode session traits separate queue submission from completion, prefetch an ordered
 bounded frame window, and expose native blocking plus runtime-neutral asynchronous completion.
 Frame leases, timing, timecodes, loop metadata, and reference slots remain explicit. The encoder
-implements standard Modular animation. Decoder animation, intermediate progressive presentation,
+implements standard Modular animation. The decoder now executes full-canvas Replace frame sequences
+through one mode-neutral frame plan, including mixed JPEG-VarDCT/Modular presentations, exact timing
+and names, overwritten zero-duration layers, and recursive progressive-DC dependencies. Nine libjxl
+fixtures match Rust `jxl` and `djxl` exactly for Modular and within one RGB8 code for VarDCT under
+whole and bounded fragmented async input. Canvas/reference composition, intermediate progressive presentation,
 non-alpha extra channels, complete VarDCT reconstruction,
 arbitrary ICC transforms, patches, splines, and noise
 remain typed rejections until their GPU paths and conformance coverage land.
@@ -177,8 +181,10 @@ the checked `ImageLayout`.
 The animation session contracts expose frame timing and loop metadata through both blocking and
 runtime-neutral `Future`/poll APIs. Prefetch submits multiple frames without a host wait; the
 ordered pending queue then completes its front through a native wait or a task waker, without
-depending on Tokio, async-std, or a particular reactor. The stock codec slice is still-only and
-returns a typed unsupported error for animation codestreams.
+depending on Tokio, async-std, or a particular reactor. The stock mode-neutral engine supports
+independent full-canvas Replace animations and layered stills. It prepares only the next presentation,
+retains source spans until the last source-dependent submission, and preserves pending/output leases
+through cancellation. Cropped or blended canvases and reference-only frames remain typed errors.
 
 ## Build and validate
 

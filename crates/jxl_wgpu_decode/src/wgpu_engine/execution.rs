@@ -2065,6 +2065,7 @@ pub(super) fn submit_decode(
     }
 
     Ok(WgpuPendingFrame {
+        frame_name: source.profile.frame_name.clone(),
         device: backend.device().clone(),
         lifetime: Some(lifetime),
         token: SubmissionToken(1),

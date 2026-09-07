@@ -1,6 +1,6 @@
 //! Coding-mode-neutral GPU decode selection.
 //!
-//! This layer owns the one public mode decision. Modular and VarDCT keep independent pipeline
+//! This layer selects a producer for each physical frame in the common execution plan. Modular and VarDCT keep independent pipeline
 //! caches and submission state because their storage bindings and render phases are intentionally
 //! different. Both paths share the backend-wide byte budget and return the same GPU frame type.
 
@@ -25,6 +25,9 @@ use crate::{
     WgpuPendingFrame, WgpuSubmissionEngine,
 };
 
+mod sequence;
+pub use sequence::{FrameSequencePending, FrameSequenceSession};
+
 /// One physical frame in a progressive-DC dependency chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProgressiveDcStage {
@@ -37,7 +40,7 @@ pub struct ProgressiveDcStage {
     pub is_final: bool,
 }
 
-/// Coarse-to-fine execution order for one final still image.
+/// Coarse-to-fine execution order for one presentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgressiveDcPlan {
     pub stages: Vec<ProgressiveDcStage>,
@@ -50,29 +53,56 @@ impl ProgressiveDcPlan {
     ) -> std::result::Result<Option<Self>, ProgressiveDcError> {
         negotiate_progressive_dc(&inventory.frames)
     }
+
+    pub(crate) fn for_frame(
+        inventory: &CodestreamInventory,
+        frame_index: u32,
+    ) -> Result<Option<Self>> {
+        let mut chain = Vec::new();
+        let mut cursor = frame_index;
+        loop {
+            let frame = inventory
+                .frames
+                .get(cursor as usize)
+                .filter(|frame| frame.frame_index == cursor)
+                .ok_or(ProgressiveDcError::InvalidSource {
+                    frame_index,
+                    source_frame: cursor,
+                })?;
+            chain.push(frame.clone());
+            let Some(source) = frame.lf_source_frame else {
+                break;
+            };
+            if source >= cursor {
+                return Err(ProgressiveDcError::InvalidSource {
+                    frame_index: cursor,
+                    source_frame: source,
+                }
+                .into());
+            }
+            cursor = source;
+        }
+        chain.reverse();
+        Ok(negotiate_progressive_dc(&chain)?)
+    }
 }
 
 fn negotiate_progressive_dc(
     frames: &[FrameInventory],
 ) -> std::result::Result<Option<ProgressiveDcPlan>, ProgressiveDcError> {
     if frames.len() == 1
-        && frames[0].frame_type == FrameType::Regular
+        && matches!(
+            frames[0].frame_type,
+            FrameType::Regular | FrameType::SkipProgressive
+        )
         && frames[0].lf_source_frame.is_none()
     {
         return Ok(None);
     }
-    let final_indices = frames
-        .iter()
-        .enumerate()
-        .filter_map(|(index, frame)| frame.is_last.then_some(index))
-        .collect::<Vec<_>>();
-    let [final_index] = final_indices.as_slice() else {
+    let Some(final_index) = frames.len().checked_sub(1) else {
         return Err(ProgressiveDcError::MissingFinalFrame);
     };
-    if *final_index + 1 != frames.len() {
-        return Err(ProgressiveDcError::MissingFinalFrame);
-    }
-    let final_frame = &frames[*final_index];
+    let final_frame = &frames[final_index];
     if final_frame.frame_type != FrameType::Regular
         || final_frame.encoding != FrameEncoding::VarDct
         || final_frame.lf_level != 0
@@ -85,7 +115,7 @@ fn negotiate_progressive_dc(
 
     let mut visited = vec![false; frames.len()];
     let mut reverse = Vec::with_capacity(frames.len());
-    let mut cursor = *final_index;
+    let mut cursor = final_index;
     loop {
         let frame = &frames[cursor];
         if visited[cursor] {
@@ -107,14 +137,16 @@ fn negotiate_progressive_dc(
             lf_level: frame.lf_level,
             width,
             height,
-            is_final: cursor == *final_index,
+            is_final: cursor == final_index,
         });
 
         let Some(source_index) = frame.lf_source_frame else {
             break;
         };
-        let source_index_usize =
-            usize::try_from(source_index).map_err(|_| ProgressiveDcError::InvalidSource {
+        let source_index_usize = frames
+            .iter()
+            .position(|frame| frame.frame_index == source_index)
+            .ok_or(ProgressiveDcError::InvalidSource {
                 frame_index: frame.frame_index,
                 source_frame: source_index,
             })?;
@@ -234,6 +266,18 @@ impl WgpuDecodeEngine {
         request: &GpuOutputRequest,
         inventory: &jxl_gpu_bitstream::CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        let plan = crate::FrameExecutionPlan::negotiate(inventory)?;
+        if inventory.image_header.animation.is_some()
+            || plan.presentations.len() != 1
+            || inventory.frames.iter().any(|frame| {
+                matches!(
+                    frame.frame_type,
+                    FrameType::ReferenceOnly | FrameType::SkipProgressive
+                ) || (frame.frame_type == FrameType::Regular && !frame.is_last)
+            })
+        {
+            return self.open_sequence(codestream, request, inventory, plan);
+        }
         if let Some(plan) = ProgressiveDcPlan::negotiate(inventory)? {
             return self.open_progressive_dc(codestream, request, inventory, plan);
         }
@@ -354,8 +398,6 @@ impl GpuSubmissionEngine for WgpuDecodeEngine {
 
     fn inventory_limits(&self) -> InventoryLimits {
         InventoryLimits {
-            // Four LF slots plus one final frame are representable by the JPEG XL frame header.
-            max_frames: 5,
             max_total_section_bytes: self.parse_limits().max_codestream_bytes,
             ..InventoryLimits::default()
         }
@@ -384,9 +426,11 @@ fn project_frame_inventory(
         .ok_or(Error::EngineContract(
             "progressive-DC plan references a missing physical frame",
         ))?;
-    let mut projected = inventory.clone();
-    projected.frames = vec![frame];
-    Ok(projected)
+    Ok(CodestreamInventory {
+        codestream_bytes: inventory.codestream_bytes,
+        image_header: inventory.image_header.clone(),
+        frames: vec![frame],
+    })
 }
 
 fn maximum_limits(left: ParseLimits, right: ParseLimits) -> ParseLimits {
@@ -435,8 +479,9 @@ fn map_vardct(
     Ok(mapped)
 }
 
-/// Per-codestream state selected once from the standard frame coding mode.
+/// Per-codestream execution state selected from the common frame plan.
 pub enum WgpuDecodeSubmissionSession {
+    Sequence(Box<FrameSequenceSession>),
     Modular(Box<WgpuDecodeSession>),
     VarDct(Box<VarDctDecodeSession>),
     ProgressiveDc(Box<ProgressiveDcSubmissionSession>),
@@ -457,14 +502,14 @@ impl WgpuDecodeSubmissionSession {
     pub const fn modular(&self) -> Option<&WgpuDecodeSession> {
         match self {
             Self::Modular(session) => Some(session),
-            Self::VarDct(_) | Self::ProgressiveDc(_) => None,
+            Self::VarDct(_) | Self::ProgressiveDc(_) | Self::Sequence(_) => None,
         }
     }
 
     #[must_use]
     pub const fn vardct(&self) -> Option<&VarDctDecodeSession> {
         match self {
-            Self::Modular(_) | Self::ProgressiveDc(_) => None,
+            Self::Modular(_) | Self::ProgressiveDc(_) | Self::Sequence(_) => None,
             Self::VarDct(session) => Some(session),
         }
     }
@@ -475,6 +520,7 @@ impl WgpuDecodeSubmissionSession {
     #[must_use]
     pub fn submissions_per_frame(&self) -> usize {
         match self {
+            Self::Sequence(session) => session.submissions_per_frame(),
             Self::Modular(session) => session.memory_stats().submissions_per_frame,
             Self::VarDct(session) => session.submissions_per_frame(),
             Self::ProgressiveDc(session) => session.submissions_per_frame.load(Ordering::Acquire),
@@ -485,6 +531,7 @@ impl WgpuDecodeSubmissionSession {
 impl std::fmt::Debug for WgpuDecodeSubmissionSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Sequence(session) => formatter.debug_tuple("Sequence").field(session).finish(),
             Self::Modular(session) => formatter.debug_tuple("Modular").field(session).finish(),
             Self::VarDct(session) => formatter.debug_tuple("VarDct").field(session).finish(),
             Self::ProgressiveDc(session) => formatter
@@ -505,6 +552,7 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
 
     fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
         match self {
+            Self::Sequence(session) => session.submit_next(),
             Self::Modular(session) => session
                 .submit_next()
                 .map(|pending| pending.map(WgpuDecodePendingFrame::Modular)),
@@ -518,15 +566,13 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
 
 impl ProgressiveDcSubmissionSession {
     fn submit_next(&mut self) -> Result<Option<WgpuDecodePendingFrame>> {
-        let Some(stages) = self.stages.take() else {
+        let Some(stages) = self.stages.as_mut() else {
             return Ok(None);
         };
-        let stage_count = stages.len();
-        let mut remaining = VecDeque::from(stages);
-        let root = remaining
-            .pop_front()
+        let root = stages
+            .first_mut()
             .ok_or(Error::EngineContract("progressive-DC plan has no stages"))?;
-        let ProgressiveDcStageSession::Modular(mut root) = root else {
+        let ProgressiveDcStageSession::Modular(root) = root else {
             return Err(Error::EngineContract(
                 "a progressive-DC plan must start with a Modular LF producer",
             ));
@@ -534,6 +580,14 @@ impl ProgressiveDcSubmissionSession {
         let root_pending = root.submit_next()?.ok_or(Error::EngineContract(
             "progressive-DC Modular stage produced no submission",
         ))?;
+        // A failed root admission leaves the complete graph available for retry.
+        let stages = self
+            .stages
+            .take()
+            .expect("root admission retained the stage graph");
+        let stage_count = stages.len();
+        let mut remaining = VecDeque::from(stages);
+        remaining.pop_front();
         let dependency = root_pending.progressive_dc_planes()?;
         let mut pending = ProgressiveDcPendingFrame {
             hidden: VecDeque::with_capacity(stage_count.saturating_sub(1)),
@@ -556,6 +610,7 @@ impl ProgressiveDcSubmissionSession {
 
 /// One submitted frame from either stock GPU coding-mode pipeline.
 pub enum WgpuDecodePendingFrame {
+    Sequence(Box<FrameSequencePending>),
     Modular(WgpuPendingFrame),
     VarDct(Box<VarDctPendingFrame>),
     ProgressiveDc(Box<ProgressiveDcPendingFrame>),
@@ -694,6 +749,7 @@ impl WgpuDecodePendingFrame {
     /// Same-queue, budget-tracked output access before validation completes.
     pub fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
         match self {
+            Self::Sequence(pending) => pending.unvalidated_gpu_frame(),
             Self::Modular(pending) => pending.unvalidated_gpu_frame(),
             Self::VarDct(pending) => pending.unvalidated_gpu_frame(),
             Self::ProgressiveDc(pending) => pending
@@ -708,6 +764,7 @@ impl WgpuDecodePendingFrame {
 impl std::fmt::Debug for WgpuDecodePendingFrame {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Sequence(pending) => formatter.debug_tuple("Sequence").field(pending).finish(),
             Self::Modular(pending) => formatter.debug_tuple("Modular").field(pending).finish(),
             Self::VarDct(pending) => formatter.debug_tuple("VarDct").field(pending).finish(),
             Self::ProgressiveDc(pending) => formatter
@@ -730,6 +787,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
 
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         match self {
+            Self::Sequence(pending) => pending.wait(),
             Self::Modular(pending) => pending.wait(),
             Self::VarDct(pending) => (*pending).wait(),
             Self::ProgressiveDc(pending) => pending.wait(),
@@ -741,6 +799,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
+            Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::Modular(pending) => Pin::new(pending).poll_complete(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::ProgressiveDc(pending) => Pin::new(pending.as_mut()).poll_complete(context),
@@ -757,6 +816,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
+            Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::Modular(pending) => Pin::new(pending).poll_complete(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::ProgressiveDc(pending) => Pin::new(pending.as_mut()).poll_complete(context),

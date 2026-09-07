@@ -979,25 +979,11 @@ impl StandardVarDctProfile {
         Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
     }
 
-    pub(crate) fn negotiate_progressive_dc(
-        inventory: &CodestreamInventory,
-        is_final: bool,
-    ) -> Result<Self, VarDctFrontendError> {
-        Self::negotiate_for_role(
-            inventory,
-            if is_final {
-                VarDctFrameRole::ProgressiveDcFinal
-            } else {
-                VarDctFrameRole::ProgressiveDcRefinement
-            },
-        )
-    }
-
-    fn negotiate_for_role(
+    pub(crate) fn negotiate_for_role(
         inventory: &CodestreamInventory,
         role: VarDctFrameRole,
     ) -> Result<Self, VarDctFrontendError> {
-        validate_image(inventory)?;
+        validate_image(inventory, role)?;
         let frame = validate_frame(inventory, role)?;
         let sections = collect_sections(inventory, frame)?;
         let frame_name = String::from_utf8(frame.name_bytes.clone())
@@ -1196,8 +1182,9 @@ fn jpeg_channel_shifts(jpeg_upsampling: [u32; 3]) -> [VarDctChannelShift; 3] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VarDctFrameRole {
+pub(crate) enum VarDctFrameRole {
     Presentation,
+    Frame,
     ProgressiveDcRefinement,
     ProgressiveDcFinal,
 }
@@ -1256,7 +1243,10 @@ fn checked_stream_index(
     })
 }
 
-fn validate_image(inventory: &CodestreamInventory) -> Result<(), VarDctFrontendError> {
+fn validate_image(
+    inventory: &CodestreamInventory,
+    role: VarDctFrameRole,
+) -> Result<(), VarDctFrontendError> {
     let image = &inventory.image_header;
     if inventory.codestream_bytes > MAX_CODESTREAM_BYTES {
         return unsupported(UnsupportedVarDctFeature::CodestreamSize);
@@ -1292,7 +1282,7 @@ fn validate_image(inventory: &CodestreamInventory) -> Result<(), VarDctFrontendE
     if image.preview_size.is_some() {
         return unsupported(UnsupportedVarDctFeature::Preview);
     }
-    if image.animation.is_some() {
+    if image.animation.is_some() && role == VarDctFrameRole::Presentation {
         return unsupported(UnsupportedVarDctFeature::Animation);
     }
     if inventory.frames.len() != 1 {
@@ -1313,6 +1303,12 @@ fn validate_frame(
                 || frame.uses_lf_frame()
                 || frame.lf_level != 0
         }
+        VarDctFrameRole::Frame => {
+            !matches!(
+                frame.frame_type,
+                FrameType::Regular | FrameType::SkipProgressive
+            ) || frame.lf_level != 0
+        }
         VarDctFrameRole::ProgressiveDcRefinement => {
             frame.frame_type != FrameType::LowFrequency
                 || frame.is_last
@@ -1321,10 +1317,7 @@ fn validate_frame(
                 || !frame.save_before_color_transform
         }
         VarDctFrameRole::ProgressiveDcFinal => {
-            frame.frame_type != FrameType::Regular
-                || !frame.is_last
-                || !frame.uses_lf_frame()
-                || frame.lf_level != 0
+            frame.frame_type != FrameType::Regular || !frame.uses_lf_frame() || frame.lf_level != 0
         }
     };
     if role_is_invalid || frame.is_preview {
@@ -1379,8 +1372,8 @@ fn validate_frame(
     {
         return unsupported(UnsupportedVarDctFeature::Blending);
     }
-    if frame.save_as_reference != 0
-        || (role != VarDctFrameRole::ProgressiveDcRefinement && frame.save_before_color_transform)
+    if role == VarDctFrameRole::Presentation
+        && (frame.save_as_reference != 0 || frame.save_before_color_transform)
     {
         return unsupported(UnsupportedVarDctFeature::FrameReferences);
     }

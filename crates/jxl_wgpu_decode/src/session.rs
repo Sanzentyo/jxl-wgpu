@@ -1161,6 +1161,13 @@ fn validate_stream_metadata(metadata: &AnimationMetadata) -> Result<()> {
 
 fn validate_profile(profile: DecodeProfile) -> Result<()> {
     match profile {
+        DecodeProfile::FrameSequence {
+            physical_frames,
+            presentation_frames,
+        } if presentation_frames != 0 && physical_frames >= presentation_frames => Ok(()),
+        DecodeProfile::FrameSequence { .. } => {
+            Err(Error::EngineContract("invalid frame sequence counts"))
+        }
         DecodeProfile::ModularLossless {
             bits_per_sample: 1..=16,
             passes: 1..=3,

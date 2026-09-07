@@ -6,7 +6,11 @@ tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 
 ## Executable profile
 
-The stock `WgpuSubmissionEngine` implements a standards-only lossless Modular profile:
+`GpuDecoder::wgpu` supports independent full-canvas Replace animations and layered stills, including
+mixed Modular/VarDCT presentations and recursive progressive DC. It uses the shared frame executor
+described below.
+
+The low-level `WgpuSubmissionEngine` implements a standards-only lossless Modular still profile:
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
@@ -160,11 +164,46 @@ one global inverse/finalizer runs after assembly. One through three passes produ
 image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular, non-alpha extra channels,
 patches, splines, noise, and
 reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
-the standard frame once, and selects this engine or the bounded VarDCT engine from
+the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.
 
+### Frame execution and animation
+
+`FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
+exact earlier LF producers, the four reference-slot versions before each frame, save-before/after
+color-transform metadata, and whether the frame needs canvas composition. Presentation metadata
+retains orientation-normalized extent, rational timebase, loop count (including zero for infinite
+looping), accumulated ticks, exact timecode, finality, and UTF-8 name. The plan is backend-neutral;
+it does not reconstruct pixels or entropy on the CPU.
+
+`WgpuDecodeEngine` executes full-canvas Replace sequences using Modular, VarDCT, or a mixture of
+JPEG-transcode VarDCT and non-XYB Modular. Recursive progressive-DC chains may precede each
+presentation. A Replace presentation completely supersedes earlier zero-duration Replace layers,
+so only its producer and LF dependency closure need image decoding. Headers, TOCs, section bounds,
+and reference versions are still inventoried for every physical frame; discarded entropy is not
+advertised as validated. Layered stills and a final zero-duration animation frame are covered.
+
+`DecodeProfile::FrameSequence` reports physical/presentation counts. `FrameSequenceSession` exposes
+the execution plan and prepares only one upcoming presentation's entropy/scratch descriptors.
+Blocking, polling, and futures wrap the same producer pending handle. Prefetch preserves ordering,
+byte-budget pressure leaves the next producer available for retry, and progressive-DC root admission
+no longer consumes the dependency chain on failure. Source spans remain under the shared input
+budget until their last dependent submission; cancellation and output clones retain the existing
+callback/lease ownership contract. Late VarDCT submission counts remain observable through the
+underlying shared counter. Later frame-specific syntax/output errors surface when that presentation
+is prepared, while unsupported crop/blend/reference-only topology is rejected before submission.
+
+Nine positive libjxl fixtures cover 8/12/16-bit Gray/RGB/RGBA, mixed coding modes, all relevant timing
+fields, 17 physical frames, six orientations, a transposed one-pixel axis, and recursive
+DC2. Actual GPU output is exact for Modular and within one RGB8 code for VarDCT against both Rust
+`jxl` and `djxl`, with byte-identical whole and 4 KiB-window/137-byte-fragment async output. Two valid
+crop/Add fixtures prove typed rejection. References are planned but not retained or composited on
+GPU yet; arbitrary crops, blends, reference-only frames, and non-coalesced/progressive delivery
+remain required for full JPEG XL.
+
 ### Bounded standard VarDCT engine
+
 
 The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine for two bounded
 standard packet topologies. A one-entry TOC stages LF and HF metadata before parsing its general
@@ -215,7 +254,8 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 RGB or grayscale presentation encoding, no ICC profile or extra channel, and no crop, blend,
-reference, preview, animation, or other unsupported frame feature.
+reference composition, preview, or other unsupported frame feature. Full-canvas animations enter
+through the frame executor above; the low-level standalone VarDCT entry point remains a still API.
 
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `VarDctOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
@@ -467,8 +507,9 @@ operation.
 This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
-extra channels, intermediate progressive presentation, animation, and reference frames return typed unsupported
+numeric/float RGB output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata, crop/blend,
+extra channels, intermediate progressive presentation, and reference composition remain typed or unproven
+gaps. Independent Replace animation is supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 
 ### Measured lossless Modular checkpoint
@@ -643,8 +684,9 @@ bytes are carried by `GpuBufferLease`, so explicitly cloning that lease extends
 the same reservation and dropping the decode session cannot release it prematurely. GPU frame and
 output containers are intentionally not cloneable. A raw `wgpu::Buffer` cloned through
 `GpuBufferLease::as_wgpu_buffer()` remains valid wgpu ownership but is outside the byte budget; the
-reservation returns after the final tracked lease is dropped. The current stock profile has
-exactly one visible frame; the same ownership contract applies to future animation frames.
+reservation returns after the final tracked lease is dropped. The same ownership contract applies
+to every pending and presented frame of a stock Replace animation, including cancellation while
+several Modular presentations are prefetched or a VarDCT LF cursor map is pending.
 
 Repeated small and sequential decodes reuse a decoder-local, bounded cache for entropy metadata,
 reconstruction, status, status-staging, and POD parameter buffers (plus the native-F64 dummy when

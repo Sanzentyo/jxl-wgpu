@@ -52,6 +52,7 @@ impl ModularGroup {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StandardModularProfile {
+    pub frame_name: String,
     pub width: u32,
     pub height: u32,
     pub orientation: OutputOrientation,
@@ -89,6 +90,7 @@ impl ProgressiveDcModularProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModularProfilePurpose {
     Presentation,
+    Frame,
     ProgressiveDc,
 }
 
@@ -143,9 +145,6 @@ fn validate_image_header(
             value: image.orientation,
         },
     )?;
-    if image.preview_size.is_some() || image.animation.is_some() {
-        return unsupported("the Modular presentation profile requires a still without a preview");
-    }
     let colour_space = if channels == ModularChannels::Gray {
         ColourSpaceInventory::Grey
     } else {
@@ -205,6 +204,13 @@ pub(crate) fn parse_progressive_dc_modular_profile(
     parse_modular_profile(codestream, inventory, ModularProfilePurpose::ProgressiveDc)
 }
 
+pub(crate) fn parse_modular_frame_profile(
+    codestream: &GpuCodestream,
+    inventory: &CodestreamInventory,
+) -> Result<StandardModularProfile> {
+    parse_modular_profile(codestream, inventory, ModularProfilePurpose::Frame)
+}
+
 fn parse_modular_profile(
     codestream: &GpuCodestream,
     inventory: &CodestreamInventory,
@@ -248,11 +254,14 @@ fn parse_modular_profile(
             .into());
         }
     };
-    if image.animation.is_some() || image.preview_size.is_some() || inventory.frames.len() != 1 {
+    if (image.animation.is_some() && purpose == ModularProfilePurpose::Presentation)
+        || image.preview_size.is_some()
+        || inventory.frames.len() != 1
+    {
         return unsupported("the Modular GPU profile requires exactly one still-image frame");
     }
     let orientation = match purpose {
-        ModularProfilePurpose::Presentation => {
+        ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
             if image.xyb_encoded {
                 return unsupported("the lossless Modular GPU profile does not use XYB metadata");
             }
@@ -289,9 +298,8 @@ fn parse_modular_profile(
         || frame.y0 != 0
         || frame.width != image.width
         || frame.height != image.height
-        || frame.duration_ticks != 0
-        || frame.save_as_reference != 0
-        || !frame.name_bytes.is_empty()
+        || (purpose == ModularProfilePurpose::Presentation
+            && (frame.duration_ticks != 0 || frame.save_as_reference != 0))
         || frame.color_blend != FrameBlendInfo::default()
         || frame.extra_channel_blends
             != vec![FrameBlendInfo::default(); usize::from(channels == ModularChannels::Rgba)];
@@ -303,6 +311,13 @@ fn parse_modular_profile(
                 || !frame.is_last
                 || frame.save_before_color_transform
         }
+        ModularProfilePurpose::Frame => {
+            !matches!(
+                frame.frame_type,
+                FrameType::Regular | FrameType::SkipProgressive
+            ) || frame.lf_level != 0
+                || frame.lf_source_frame.is_some()
+        }
         ModularProfilePurpose::ProgressiveDc => {
             frame.frame_type != FrameType::LowFrequency
                 || frame.lf_level == 0
@@ -313,7 +328,7 @@ fn parse_modular_profile(
     };
     if shared_frame_is_invalid || role_is_invalid {
         return unsupported(match purpose {
-            ModularProfilePurpose::Presentation => {
+            ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
                 "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references"
             }
             ModularProfilePurpose::ProgressiveDc => {
@@ -332,7 +347,9 @@ fn parse_modular_profile(
     }
 
     let (frame_width, frame_height) = match purpose {
-        ModularProfilePurpose::Presentation => (image.width, image.height),
+        ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
+            (image.width, image.height)
+        }
         ModularProfilePurpose::ProgressiveDc => frame
             .color_sample_extent()
             .ok_or_else(|| unsupported_error("progressive-DC frame extent is invalid"))?,
@@ -890,6 +907,12 @@ fn parse_modular_profile(
     });
 
     Ok(StandardModularProfile {
+        frame_name: String::from_utf8(frame.name_bytes.clone()).map_err(|_| {
+            Error::FramePlan(crate::FramePlanError::InvalidFrame {
+                frame_index: frame.frame_index,
+                reason: "frame name is not UTF-8",
+            })
+        })?,
         width: frame_width,
         height: frame_height,
         orientation,
@@ -1840,13 +1863,16 @@ mod tests {
         {
             let mut projected = inventory.clone();
             projected.frames = vec![inventory.frames[frame_index].clone()];
-            let packet =
-                crate::vardct_packet::BoundedVarDctPacketPlan::parse_progressive_dc_source(
-                    &codestream,
-                    &projected,
-                    is_final,
-                )
-                .unwrap();
+            let packet = crate::vardct_packet::BoundedVarDctPacketPlan::parse_frame_source(
+                &codestream,
+                &projected,
+                if is_final {
+                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
+                } else {
+                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
+                },
+            )
+            .unwrap();
             assert_eq!(
                 (packet.profile.width, packet.profile.height),
                 expected_extent

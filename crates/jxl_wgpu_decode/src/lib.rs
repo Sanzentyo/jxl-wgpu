@@ -30,6 +30,7 @@ mod codestream_data;
 mod entropy;
 mod entropy_window;
 mod error;
+mod frame_plan;
 mod inflight;
 mod input_budget;
 mod model;
@@ -62,14 +63,17 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
 pub use codec_engine::{
-    ProgressiveDcPlan, ProgressiveDcStage, WgpuDecodeEngine, WgpuDecodePendingFrame,
-    WgpuDecodeSubmissionSession,
+    FrameSequencePending, FrameSequenceSession, ProgressiveDcPlan, ProgressiveDcStage,
+    WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession,
 };
 pub use codestream_data::GpuCodestream;
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularInversePlanError, ModularTransformError,
     ModularTransformFeature, ModularTreeError, ProgressiveDcError, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,
+};
+pub use frame_plan::{
+    FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,
 };
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{

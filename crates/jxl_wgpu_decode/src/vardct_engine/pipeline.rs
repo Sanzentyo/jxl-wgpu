@@ -194,7 +194,7 @@ impl VarDctSubmissionEngine {
                 output_variant: self.pipelines.output_variant,
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
-                progressive_dc_final: None,
+                role: crate::vardct_frontend::VarDctFrameRole::Presentation,
             },
         )?;
         self.open_source(source)
@@ -216,7 +216,32 @@ impl VarDctSubmissionEngine {
                 output_variant: self.pipelines.output_variant,
                 stream_window_limit: self.stream_window_limit,
                 memory_limit_bytes: self.memory.snapshot().limit_bytes,
-                progressive_dc_final: Some(is_final),
+                role: if is_final {
+                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
+                } else {
+                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
+                },
+            },
+        )?;
+        self.open_source(source)
+    }
+
+    pub(crate) fn open_frame_with_inventory_data(
+        &self,
+        codestream: GpuCodestream,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        let source = prepare_source(
+            &self.backend,
+            codestream,
+            request,
+            inventory,
+            VarDctPrepareOptions {
+                output_variant: self.pipelines.output_variant,
+                stream_window_limit: self.stream_window_limit,
+                memory_limit_bytes: self.memory.snapshot().limit_bytes,
+                role: crate::vardct_frontend::VarDctFrameRole::Frame,
             },
         )?;
         self.open_source(source)

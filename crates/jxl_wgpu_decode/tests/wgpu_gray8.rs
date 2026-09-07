@@ -32,6 +32,8 @@ use jxl_wgpu_encode::{
 use wgpu::util::DeviceExt;
 
 mod common;
+#[path = "wgpu_gray8/frame_sequence.rs"]
+mod frame_sequence;
 #[path = "wgpu_gray8/orientation.rs"]
 mod orientation;
 

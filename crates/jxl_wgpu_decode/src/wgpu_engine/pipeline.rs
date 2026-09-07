@@ -19,7 +19,8 @@ use crate::modular_rct::{DEFAULT_MODULAR_RCT_VARIANT, MODULAR_RCT_KERNEL_KEY, Mo
 use crate::modular_squeeze::ModularSqueezePipeline;
 use crate::modular_tree::MaTreeNodeIr;
 use crate::profile::{
-    StandardModularProfile, parse_progressive_dc_modular_profile, parse_standard_modular_profile,
+    StandardModularProfile, parse_modular_frame_profile, parse_progressive_dc_modular_profile,
+    parse_standard_modular_profile,
 };
 use crate::progressive_dc::ProgressiveDcPipeline;
 use crate::{
@@ -291,6 +292,16 @@ impl WgpuSubmissionEngine {
         )?)?
         .with_max_frame_slots(request.max_frame_slots());
         self.open_profile(codestream, &internal_request, profile)
+    }
+
+    pub(crate) fn open_frame_with_inventory_data(
+        &self,
+        codestream: Arc<GpuCodestream>,
+        request: &GpuOutputRequest,
+        inventory: &CodestreamInventory,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        let profile = parse_modular_frame_profile(&codestream, inventory)?;
+        self.open_profile(codestream, request, profile)
     }
 
     fn open_profile(
@@ -608,7 +619,7 @@ impl WgpuSubmissionEngine {
                 },
                 passes: profile.pass_count,
             },
-            AnimationMetadata::still(extent),
+            AnimationMetadata::still(output.layout.extent),
             WgpuDecodeSession {
                 backend: self.backend.clone(),
                 pipeline,

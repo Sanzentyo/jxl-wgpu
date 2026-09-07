@@ -202,6 +202,8 @@ impl FrontendIncomplete {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error(transparent)]
+    FramePlan(#[from] crate::FramePlanError),
     #[error("JPEG XL image orientation must be in 1..=8, got {value}")]
     InvalidImageOrientation { value: u32 },
     #[error("JPEG XL container/codestream validation failed: {0}")]

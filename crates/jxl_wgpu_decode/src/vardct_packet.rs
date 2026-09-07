@@ -424,7 +424,11 @@ impl BoundedVarDctPacketPlan {
         codestream: &[u8],
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Slice(codestream), inventory, None)
+        Self::parse_inner(
+            PacketSource::Slice(codestream),
+            inventory,
+            crate::vardct_frontend::VarDctFrameRole::Presentation,
+        )
     }
 
     /// Parses bounded metadata from a logically contiguous, potentially multi-span codestream.
@@ -432,26 +436,27 @@ impl BoundedVarDctPacketPlan {
         source: &GpuCodestream,
         inventory: &CodestreamInventory,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, None)
+        Self::parse_inner(
+            PacketSource::Spans(source),
+            inventory,
+            crate::vardct_frontend::VarDctFrameRole::Presentation,
+        )
     }
 
-    pub(crate) fn parse_progressive_dc_source(
+    pub(crate) fn parse_frame_source(
         source: &GpuCodestream,
         inventory: &CodestreamInventory,
-        is_final: bool,
+        role: crate::vardct_frontend::VarDctFrameRole,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        Self::parse_inner(PacketSource::Spans(source), inventory, Some(is_final))
+        Self::parse_inner(PacketSource::Spans(source), inventory, role)
     }
 
     fn parse_inner(
         source: PacketSource<'_>,
         inventory: &CodestreamInventory,
-        progressive_dc_final: Option<bool>,
+        role: crate::vardct_frontend::VarDctFrameRole,
     ) -> Result<Self, BoundedVarDctPacketError> {
-        let profile = progressive_dc_final.map_or_else(
-            || StandardVarDctProfile::negotiate(inventory),
-            |is_final| StandardVarDctProfile::negotiate_progressive_dc(inventory, is_final),
-        )?;
+        let profile = StandardVarDctProfile::negotiate_for_role(inventory, role)?;
         if !(1..=16).contains(&profile.bits_per_sample)
             || (profile.color_transform == VarDctColorTransform::Ycbcr
                 && profile.bits_per_sample != 8)

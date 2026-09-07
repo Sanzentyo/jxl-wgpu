@@ -13,6 +13,12 @@ use crate::{Error, Result};
 /// A GPU decode profile negotiated before any frame is submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodeProfile {
+    /// A sequence of independently negotiated physical frames. Per-frame coding modes and
+    /// dependencies are represented by the common frame execution plan.
+    FrameSequence {
+        physical_frames: usize,
+        presentation_frames: usize,
+    },
     /// Lossless Modular data reconstructed by a GPU entropy/MA pipeline.
     ModularLossless {
         bits_per_sample: u8,
@@ -439,20 +445,20 @@ pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModula
     {
         return None;
     }
+    let native_rgb_color = matches!(
+        format.color_spec,
+        ColorSpecification::Default | ColorSpecification::Undefined
+    ) || matches!(format.color_spec, ColorSpecification::Defined(spec)
+            if spec.space == jxl_gpu_formats::ColorSpace::Bt709
+                && spec.encoding == jxl_gpu_formats::YcbcrEncoding::Undefined
+                && spec.transfer == jxl_gpu_formats::TransferFunction::Srgb
+                && spec.range == jxl_gpu_formats::ColorRange::Full);
     let channels = match (format.model, format.swizzle, format.color_spec) {
         (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
             ModularChannels::Gray
         }
-        (
-            ColorModel::Rgb,
-            Swizzle::XYZ1,
-            ColorSpecification::Default | ColorSpecification::Undefined,
-        ) => ModularChannels::Rgb,
-        (
-            ColorModel::Rgb,
-            Swizzle::XYZW,
-            ColorSpecification::Default | ColorSpecification::Undefined,
-        ) => ModularChannels::Rgba,
+        (ColorModel::Rgb, Swizzle::XYZ1, _) if native_rgb_color => ModularChannels::Rgb,
+        (ColorModel::Rgb, Swizzle::XYZW, _) if native_rgb_color => ModularChannels::Rgba,
         _ => return None,
     };
     let plane = &format.planes[0];

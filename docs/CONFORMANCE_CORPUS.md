@@ -788,6 +788,62 @@ channel, and distinct coefficient order IDs. GPU-selected map entries must equal
 Rust implementation of the normative X/B/Y LF folding order. Naga parses and semantically
 validates the same fragment before adapter discovery; the test does not inspect shader text.
 
+## Frame sequences, mixed modes, and coalescing
+
+`tests/wgpu_gray8/frame_sequence.rs` executes nine positive fixtures on the stock mode-neutral
+GPU engine. `test-data/generate_frame_sequences.c` is the offline libjxl 0.12.0 generator and is
+never linked to production. Its integer source formulas, encoder options, exact names and timecodes
+are checked in. All animations use 30000/1001 ticks per second; loops are three except `modular_many`
+(infinite). Odd-indexed source frames have `3*i+1` ticks; even frames have zero, including the final
+frame. `layered_still` omits the animation header and presents only the fifth Replace layer.
+
+| Fixture suffix | Encoded extent | Color/depth/orientation | Physical source frames |
+|---|---|---|---:|
+| `modular_gray` | 259×17 | Gray8, 6 | 5 |
+| `modular_rgb12` | 257×9 | RGB12, 8 | 5 |
+| `modular_rgba16` | 33×7 | RGBA16, 2 | 5 |
+| `modular_many` | 1×9 | Gray8, 5 | 17 |
+| `layered_still` | 37×13 | Gray8, 7 | 5 |
+| `vardct_rgb` | 257×33 | XYB/RGB8, 6 | 5 |
+| `vardct_gray` | 259×17 | XYB/Gray8 presented as RGB8, 8 | 5 |
+| `mixed_jpeg_modular` | 259×17 | YCbCr 4:2:0 VarDCT and RGB8 Modular, 1 | 5 |
+| `vardct_dc` | 1024×128 | XYB/RGB8, 6; each source adds DC2 dependencies | 3 |
+
+The mixed input JPEG is generated from the generator's RGB8 formula at source index 1 with
+libjpeg-turbo 3.2.0 `cjpeg -quality 85 -sample 2x2`; pass it as the generator's optional second argument
+(after the output directory). Physical source indices 1 and 4 use `JxlEncoderAddJPEGFrame`; the
+others use lossless Modular image frames. No JPEG reconstruction metadata is requested.
+
+Rust `jxl` and `djxl --output_frames` independently decode every presentation. Modular samples
+match exactly, including alpha and 12/16-bit valid codes; VarDCT differs by at most one RGB8 code
+on Apple M5/Metal. Whole blocking and 4096-byte entropy-window/137-byte fragmented async output
+are byte-identical. The tests check orientation-normalized session/output extent, source-indexed
+UTF-8 name and timecode, exact tick accumulation, output count/finality, shared input release,
+multiple prefetched Modular frames, retryable memory pressure (including DC roots), cancellation
+during staged submission, and output clones surviving session drop. Native RGB packing accepts
+an explicitly matching sRGB/BT.709/full-range descriptor so both coding modes share one output
+contract; it does not accept a different transfer or relabel converted pixels.
+
+`rejected_crop` and `rejected_add` are valid libjxl animations with an off-canvas or Add second
+source frame. Rust `jxl` renders both, while the GPU engine returns
+`FramePlanError::CompositionRequired { frame_index: 1 }` before GPU admission. Reference-version
+and malformed-timecode tests exercise the common plan. These fixtures do not prove GPU reference
+retention, arbitrary blends, non-coalesced output, or full JPEG XL decoder conformance.
+
+| File | Decoded hex bytes | SHA-256 of binary codestream |
+|---|---:|---|
+| `sequence_layered_still.jxl.hex` | 2650 | `87d13a10326aa0c093862dc2d425543e79b95117b6206c8baad76a6c6e3eea88` |
+| `sequence_mixed_jpeg_modular.jxl.hex` | 46458 | `eb85c7eeae62b9d2bc7373e40d988bc8e92661c9a34d53f7fc7f476d8028d6ef` |
+| `sequence_modular_gray.jxl.hex` | 16368 | `2e6da5ba1e93f4e7769bf0ba4fc82fa70479ad878e91dd5d8a7079fe5be03680` |
+| `sequence_modular_many.jxl.hex` | 772 | `abb7e6e8786bc944a0dd98e94dd6d6d6d3b026204df650d9776577c013c002a9` |
+| `sequence_modular_rgb12.jxl.hex` | 45715 | `1363ec500429175e16530362d735e8f87eff17ffc4a040039f2d02f26ba19b67` |
+| `sequence_modular_rgba16.jxl.hex` | 5808 | `16f5ca14c7576b1347f232b1c0d97d7cea80686a5c939dbdeead9b18ed5605aa` |
+| `sequence_rejected_add.jxl.hex` | 676 | `cb24f1b73c3995f382fcb0836f8607063f705e7cd7490d51aa597fda591fd243` |
+| `sequence_rejected_crop.jxl.hex` | 681 | `c18e071a2fd7890006343025b3d1128e86a5007f17e2177feb205c08b0360aee` |
+| `sequence_vardct_dc.jxl.hex` | 309711 | `4174e65e2235424b31e880d579a5a57e8286972cf388fb191b9caf9de81bb348` |
+| `sequence_vardct_gray.jxl.hex` | 12783 | `bec8483bd664976e9b4d0acf85ab59388e522a7b5a58ea9ffbb5a1a703116eba` |
+| `sequence_vardct_rgb.jxl.hex` | 41837 | `547b047f5241080f69d9ec2821291ed528deddd16049f319329cf2ea2138f6da` |
+
 ## Deterministic source contract
 
 Every case describes:

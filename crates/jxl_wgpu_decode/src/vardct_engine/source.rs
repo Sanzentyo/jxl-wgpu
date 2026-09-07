@@ -132,7 +132,7 @@ pub(super) struct VarDctPrepareOptions {
     pub(super) output_variant: KernelVariant,
     pub(super) stream_window_limit: Option<NonZeroU64>,
     pub(super) memory_limit_bytes: u64,
-    pub(super) progressive_dc_final: Option<bool>,
+    pub(super) role: crate::vardct_frontend::VarDctFrameRole,
 }
 
 pub(super) fn prepare_source(
@@ -171,12 +171,12 @@ pub(super) fn prepare_source(
         1.0,
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
-    let packet = options.progressive_dc_final.map_or_else(
-        || BoundedVarDctPacketPlan::parse_source(&codestream, inventory),
-        |is_final| {
-            BoundedVarDctPacketPlan::parse_progressive_dc_source(&codestream, inventory, is_final)
-        },
-    )?;
+    let packet = match options.role {
+        crate::vardct_frontend::VarDctFrameRole::Presentation => {
+            BoundedVarDctPacketPlan::parse_source(&codestream, inventory)?
+        }
+        role => BoundedVarDctPacketPlan::parse_frame_source(&codestream, inventory, role)?,
+    };
     let has_subsampled_channels = packet
         .profile
         .channel_shifts
