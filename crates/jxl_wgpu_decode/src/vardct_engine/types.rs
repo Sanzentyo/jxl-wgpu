@@ -5,7 +5,8 @@ use jxl_gpu_formats::{
 use jxl_wgpu::{
     MemoryBudgetError, ResidentChromaUpsampleError, ResidentChromaUpsampleMemoryPlan,
     ResidentEpfError, ResidentEpfMemoryPlan, ResidentGaborishError, ResidentGaborishMemoryPlan,
-    ResidentVarDctError, ResidentVarDctMemoryPlan, SubmissionPollerError,
+    ResidentUpsampleError, ResidentUpsamplePipeline, ResidentVarDctError, ResidentVarDctMemoryPlan,
+    SubmissionPollerError,
 };
 use thiserror::Error;
 
@@ -81,6 +82,8 @@ pub enum VarDctDecodeError {
     Resident(#[from] ResidentVarDctError),
     #[error(transparent)]
     ChromaUpsample(#[from] ResidentChromaUpsampleError),
+    #[error(transparent)]
+    FrameUpsample(#[from] ResidentUpsampleError),
     #[error(transparent)]
     Gaborish(#[from] ResidentGaborishError),
     #[error(transparent)]
@@ -188,7 +191,7 @@ pub enum VarDctDecodeError {
     },
 }
 
-/// Exact canonical output supported by [`VarDctSubmissionEngine`].
+/// Exact canonical output supported by [`crate::VarDctSubmissionEngine`].
 #[must_use]
 pub fn vardct_rgb8_format() -> PixelFormat {
     PixelFormat::rgb8(
@@ -261,6 +264,12 @@ pub struct VarDctDecodeMemoryStats {
     pub pre_restoration_upsample_bytes: u64,
     /// One 32-byte interpolation uniform for each shifted component.
     pub pre_restoration_upsample_uniform_bytes: u64,
+    /// Three full output-size F32 planes, after restoration and frame resampling.
+    pub frame_upsample_bytes: u64,
+    /// One phase-major weight buffer shared by the three frame-resampling dispatches.
+    pub frame_upsample_weight_bytes: u64,
+    /// Three 32-byte uniforms retained until aggregate validation completes.
+    pub frame_upsample_uniform_bytes: u64,
     /// Three full-resolution ping-pong destinations shared by Gaborish and EPF.
     pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
@@ -269,7 +278,7 @@ pub struct VarDctDecodeMemoryStats {
     pub epf_filter_uniform_bytes: u64,
     pub resident_transient_bytes: u64,
     pub output_uniform_bytes: u64,
-    /// Packed RGB8 storage retained until the final [`GpuBufferLease`] clone is dropped.
+    /// Packed RGB8 storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// All non-output GPU buffers retained through status validation.
     pub transient_bytes: u64,
@@ -316,31 +325,30 @@ impl VarDctDecodeMemoryStats {
                 field: "codestream upload length",
             }
         })?)?;
-        let modular_metadata_words =
-            if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
-                packet.groups.iter().try_fold(0_u64, |total, group| {
-                    let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
-                        VarDctDecodeError::ArithmeticOverflow {
-                            field: "LF-local Modular metadata length",
-                        }
-                    })?;
-                    total
-                        .checked_add(words)
-                        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                            field: "LF-local Modular metadata words",
-                        })
-                })?
-            } else {
-                u64::try_from(packet.modular_metadata.len()).map_err(|_| {
+        let modular_metadata_words = if packet.requires_lf_staging() || packet.profile.uses_lf_frame
+        {
+            packet.groups.iter().try_fold(0_u64, |total, group| {
+                let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
                     VarDctDecodeError::ArithmeticOverflow {
-                        field: "Modular metadata length",
+                        field: "LF-local Modular metadata length",
                     }
-                })?
-            };
+                })?;
+                total
+                    .checked_add(words)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "LF-local Modular metadata words",
+                    })
+            })?
+        } else {
+            u64::try_from(packet.modular_metadata.len()).map_err(|_| {
+                VarDctDecodeError::ArithmeticOverflow {
+                    field: "Modular metadata length",
+                }
+            })?
+        };
         let modular_metadata_bytes =
             checked_words(modular_metadata_words, "Modular metadata bytes")?;
-        let predictor_capacity =
-            packet.needs_self_correcting || packet.requires_local_tree_staging();
+        let predictor_capacity = packet.needs_self_correcting || packet.requires_lf_staging();
         let mut reconstructed_words = Vec::with_capacity(packet.groups.len());
         for group in &packet.groups {
             reconstructed_words.push(u64::from(group.reconstructed_words(predictor_capacity)?));
@@ -475,7 +483,7 @@ impl VarDctDecodeMemoryStats {
             .iter()
             .try_fold(0_u64, |total, _| {
                 total.checked_add(packet_execution_state_bytes(
-                    packet.needs_self_correcting || packet.requires_local_tree_staging(),
+                    packet.needs_self_correcting || packet.requires_lf_staging(),
                 ))
             })
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -563,7 +571,8 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let pre_restoration_upsample_bytes = if restoration_scratch {
+        let expand_components = restoration_scratch || packet.profile.upsampling != 1;
+        let pre_restoration_upsample_bytes = if expand_components {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
                     field: "pre-restoration upsample bytes",
@@ -572,7 +581,7 @@ impl VarDctDecodeMemoryStats {
         } else {
             0
         };
-        let pre_restoration_upsample_uniform_bytes = if restoration_scratch {
+        let pre_restoration_upsample_uniform_bytes = if expand_components {
             ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
                 .checked_mul(shifted_channel_count)
                 .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -615,6 +624,23 @@ impl VarDctDecodeMemoryStats {
             resident.iter().map(|plan| plan.total_bytes),
             "resident VarDCT transient bytes",
         )?;
+        let (frame_upsample_bytes, frame_upsample_weight_bytes, frame_upsample_uniform_bytes) =
+            if packet.profile.upsampling == 1 {
+                (0, 0, 0)
+            } else {
+                let bytes = u64::from(packet.profile.output_width)
+                    .checked_mul(u64::from(packet.profile.output_height))
+                    .and_then(|pixels| pixels.checked_mul(3 * 4))
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "frame upsampling planes",
+                    })?;
+                let factor = u64::from(packet.profile.upsampling);
+                (
+                    bytes,
+                    factor * factor * 25 * 4,
+                    3 * ResidentUpsamplePipeline::UNIFORM_BYTES,
+                )
+            };
         let output_uniform_bytes = output.memory.uniform_bytes;
         let output_lease_bytes = output.memory.output_storage_bytes;
         let transient_bytes = [
@@ -647,6 +673,9 @@ impl VarDctDecodeMemoryStats {
             resident_image_bytes,
             pre_restoration_upsample_bytes,
             pre_restoration_upsample_uniform_bytes,
+            frame_upsample_bytes,
+            frame_upsample_weight_bytes,
+            frame_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
@@ -672,7 +701,7 @@ impl VarDctDecodeMemoryStats {
             resolved_stream_window_limit_bytes: stream_limit,
             codestream_bytes,
             modular_metadata_bytes,
-            deferred_hf_modular_metadata: packet.requires_local_tree_staging(),
+            deferred_hf_modular_metadata: packet.requires_lf_staging(),
             deferred_hf_coefficients: deferred_hf.is_some(),
             reconstructed_bytes,
             raw_metadata_bytes,
@@ -705,6 +734,9 @@ impl VarDctDecodeMemoryStats {
             resident_image_bytes,
             pre_restoration_upsample_bytes,
             pre_restoration_upsample_uniform_bytes,
+            frame_upsample_bytes,
+            frame_upsample_weight_bytes,
+            frame_upsample_uniform_bytes,
             restoration_scratch_bytes,
             gaborish_uniform_bytes,
             epf_sigma_bytes,
@@ -761,11 +793,12 @@ impl DeferredHfCoefficientLayout {
         if !packet.requires_deferred_hf_coefficients() {
             return Ok(None);
         }
-        let pass_group_count = usize::try_from(packet.profile.group_count).map_err(|_| {
+        let pass_count = packet.profile.coefficient_shifts.len() as u64;
+        let pass_group_count = packet.profile.group_count.checked_mul(pass_count).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
                 field: "deferred HF pass-group count",
-            }
-        })?;
+            },
+        )?;
         let mut local_counts = vec![0_u64; packet.groups.len()];
         for global_group_index in 0..packet.profile.group_count {
             let lf_group = packet
@@ -784,11 +817,12 @@ impl DeferredHfCoefficientLayout {
                         expected: packet.groups.len(),
                         actual: lf_group.saturating_add(1),
                     })?;
-            *count = count
-                .checked_add(1)
-                .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "deferred HF local pass-group count",
-                })?;
+            *count =
+                count
+                    .checked_add(pass_count)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "deferred HF local pass-group count",
+                    })?;
         }
         let max_group_blocks = packet
             .profile
@@ -834,10 +868,6 @@ impl DeferredHfCoefficientLayout {
                 execution_state_bytes: execution,
             });
         }
-        let pass_group_count =
-            u64::try_from(pass_group_count).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
-                field: "deferred HF pass-group byte count",
-            })?;
         Ok(Some(Self {
             groups,
             lz77_scratch_bytes,

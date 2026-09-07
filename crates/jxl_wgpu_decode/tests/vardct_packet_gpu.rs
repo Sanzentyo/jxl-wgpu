@@ -211,7 +211,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
     let block_count = control.geometry[2] * control.geometry[3];
     status
         .validate(VarDctPacketValidation {
-            expected_strategy: plan.uniform_transform,
+            expected_strategy: None,
             expected_lf_samples: block_count * 3,
             block_count,
             correlation_samples: plan.profile.width.div_ceil(64) * plan.profile.height.div_ceil(64),
@@ -242,7 +242,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
         })
         .unwrap();
     let plan = BoundedVarDctPacketPlan::parse(&codestream, &inventory).unwrap();
-    assert!(plan.requires_local_tree_staging());
+    assert!(plan.requires_lf_staging());
     assert!(plan.groups.len() > 1);
 
     let mut stream_bytes = codestream;
@@ -420,7 +420,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
         let [blocks_x, blocks_y] = group.block_extent();
         status
             .validate(VarDctPacketValidation {
-                expected_strategy: plan.uniform_transform,
+                expected_strategy: None,
                 expected_lf_samples: blocks_x * blocks_y * 3,
                 block_count: blocks_x * blocks_y,
                 correlation_samples: group.rect.width.div_ceil(64) * group.rect.height.div_ceil(64),

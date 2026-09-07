@@ -314,7 +314,10 @@ The current planner and scheduler execute these protocol stages:
 - horizontal/vertical chroma reconstruction and fused 2-D chroma reconstruction;
 - per-plane and fused three-plane Gaborish;
 - EPF passes 0, 1, and 2 with constant or supplied sigma;
-- 2x, 4x, and 8x image upsampling with validated weights;
+- 2x, 4x, and 8x image upsampling with validated weights; `ResidentUpsamplePipeline` exposes the
+  same filter for resident planes, and `ResidentUpsampleKernel::from_compact` resolves the image
+  header's 15/55/210-weight triangle into all reflected phases. One uploaded kernel is reusable
+  across channels; each dispatch retains a checked 32-byte uniform;
 - all 27 JPEG XL VarDCT strategies: square and rectangular DCTs through 256x256, Hornuss,
   hierarchical DCT2, DCT4 variants, and all four AFV orientations, with GPU dequantization, color
   correlation, LF-grid reinterpretation, and inverse transform;

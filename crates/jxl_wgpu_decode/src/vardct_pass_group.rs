@@ -1,4 +1,4 @@
-//! GPU entropy decode for single-pass regular DCT8 pass groups.
+//! Bounded GPU entropy decode and accumulation for VarDCT coefficient passes.
 
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
@@ -43,8 +43,8 @@ pub struct HfBlockContextTables {
     pub _reserved: [u32; 3],
 }
 
-/// One pass-group entropy invocation. The first 96 bytes carry stream-window, progress-storage,
-/// geometry, and entropy-table bounds; the trailing 48 bytes carry the block-context table ABI.
+/// One 160-byte pass-group entropy invocation. A 92-byte stream/geometry prefix is followed by
+/// 48-byte block-context locations, component shifts, per-pass table bases, and a spatial group ID.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct HfCoefficientPassParams {
@@ -71,6 +71,10 @@ pub struct HfCoefficientPassParams {
     global_group_index: u32,
     block_context: HfBlockContextTables,
     channel_shifts: u32,
+    metadata_base_words: u32,
+    order_base_words: u32,
+    spatial_group_index: u32,
+    _reserved: u32,
 }
 
 /// Exact 464-byte resume record for one serial HF coefficient consumer.
@@ -154,28 +158,12 @@ impl HfCoefficientExecutionPlan {
         codestream_bytes: u64,
         stream_limit: u64,
     ) -> Result<Self, HfCoefficientPlanError> {
-        let metadata_words = u32::try_from(entropy.metadata.len()).map_err(|_| {
-            HfCoefficientPlanError::ArithmeticOverflow {
-                field: "metadata words",
-            }
-        })?;
-        let context_map_offset_words = metadata_words;
-        let mut entropy_words = Vec::with_capacity(
-            entropy
-                .metadata
-                .len()
-                .checked_add(entropy.context_map.len())
-                .and_then(|words| words.checked_add(entropy.block_context_map.len()))
-                .and_then(|words| words.checked_add(entropy.qf_thresholds.len()))
-                .and_then(|words| words.checked_add(entropy.lf_thresholds[0].len()))
-                .and_then(|words| words.checked_add(entropy.lf_thresholds[1].len()))
-                .and_then(|words| words.checked_add(entropy.lf_thresholds[2].len()))
-                .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "entropy bundle words",
-                })?,
-        );
-        entropy_words.extend_from_slice(&entropy.metadata);
-        entropy_words.extend_from_slice(&entropy.context_map);
+        let offset = |words: &[u32], field| {
+            u32::try_from(words.len())
+                .map_err(|_| HfCoefficientPlanError::ArithmeticOverflow { field })
+        };
+        let mut entropy_words = Vec::new();
+        let mut order_words = Vec::new();
         let block_context = append_block_context_tables(
             &mut entropy_words,
             &entropy.block_context_map,
@@ -183,18 +171,44 @@ impl HfCoefficientExecutionPlan {
             &entropy.lf_thresholds,
         )?;
 
-        let group_count = u32::try_from(entropy.pass_groups.len()).map_err(|_| {
-            HfCoefficientPlanError::ArithmeticOverflow {
-                field: "pass-group count",
-            }
-        })?;
-        if u64::from(group_count) != packet.profile.group_count {
-            return Err(HfCoefficientPlanError::PassGroupCount {
-                expected: packet.profile.group_count,
-                actual: u64::from(group_count),
+        if entropy.passes.len() != packet.profile.coefficient_shifts.len() {
+            return Err(HfCoefficientPlanError::PassCount {
+                expected: packet.profile.coefficient_shifts.len(),
+                actual: entropy.passes.len(),
             });
         }
-        let lz77_window_mask = entropy.lz77_window_words.saturating_sub(1);
+        let mut pass_tables = Vec::with_capacity(entropy.passes.len());
+        for (pass, &shift) in entropy
+            .passes
+            .iter()
+            .zip(&packet.profile.coefficient_shifts)
+        {
+            if pass.coefficient_shift != shift {
+                return Err(
+                    crate::vardct_frontend::VarDctFrontendError::InvalidPassSchedule.into(),
+                );
+            }
+            if pass.pass_groups.len() as u64 != packet.profile.group_count {
+                return Err(HfCoefficientPlanError::PassGroupCount {
+                    expected: packet.profile.group_count,
+                    actual: pass.pass_groups.len() as u64,
+                });
+            }
+            let metadata_base = crate::modular_tree::PackedModularMetadata {
+                words: pass.metadata.clone(),
+            }
+            .append_to(&mut entropy_words)
+            .map_err(|error| {
+                crate::vardct_packet::BoundedVarDctPacketError::ModularTree(error.to_string())
+            })?;
+            let context_map_offset = offset(&entropy_words, "pass context-map offset")?;
+            entropy_words.extend_from_slice(&pass.context_map);
+            let order_base = offset(&order_words, "pass order base")?;
+            order_words.extend_from_slice(&pass.order_words);
+            pass_tables.push((metadata_base, context_map_offset, order_base));
+        }
+        offset(&entropy_words, "entropy bundle words")?;
+        offset(&order_words, "order bundle words")?;
         let num_block_clusters = entropy.num_block_clusters;
         if artifacts.len() != packet.groups.len() {
             return Err(HfCoefficientPlanError::LfGroupCount {
@@ -214,108 +228,122 @@ impl HfCoefficientExecutionPlan {
                 lf_group.reconstructed_words(packet.needs_self_correcting)?;
             let mut params = Vec::new();
             let mut stream_ranges = Vec::new();
-            for (global_group_index, range) in entropy.pass_groups.iter().copied().enumerate() {
-                let global_group_index = u32::try_from(global_group_index).map_err(|_| {
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "pass-group index",
-                    }
-                })?;
-                if packet
-                    .profile
-                    .low_frequency_group_index_for_pass_group(u64::from(global_group_index))?
-                    != lf_group.index
-                {
-                    continue;
-                }
-                let rect = packet
-                    .profile
-                    .pass_group_rect(u64::from(global_group_index))?;
-                let local_x = rect.x.checked_sub(lf_group.rect.x).ok_or(
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "local pass-group x origin",
-                    },
-                )?;
-                let local_y = rect.y.checked_sub(lf_group.rect.y).ok_or(
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "local pass-group y origin",
-                    },
-                )?;
-                let token_start = u32::try_from(range.offset).map_err(|_| {
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "pass-group bit start",
-                    }
-                })?;
-                let token_end = range.end().and_then(|end| u32::try_from(end).ok()).ok_or(
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "pass-group bit end",
-                    },
-                )?;
-                let local_group_index = u32::try_from(params.len()).map_err(|_| {
-                    HfCoefficientPlanError::ArithmeticOverflow {
-                        field: "local pass-group index",
-                    }
-                })?;
-                params.push(HfCoefficientPassParams {
-                    entropy: EntropyStreamParams {
-                        token_start,
-                        token_end,
-                        lz77_window_mask,
-                    },
-                    window_logical_start: 0,
-                    window_upload_start: 0,
-                    stream_token_end: token_end,
-                    window_yield_end: token_end,
-                    window_flags: 3,
-                    execution_state_base_words: 0,
-                    status_index: local_group_index,
-                    block_origin_x: local_x / 8,
-                    block_origin_y: local_y / 8,
-                    block_width: rect.width.div_ceil(8),
-                    block_height: rect.height.div_ceil(8),
-                    blocks_per_row,
-                    block_task_map_offset_words: artifact.block_task_map_offset_words,
-                    num_hf_presets: entropy.num_hf_presets,
-                    num_block_clusters,
-                    context_map_offset_words,
-                    lf_plane_stride_words,
-                    lz77_window_base_words: local_group_index
-                        .checked_mul(entropy.lz77_window_words)
-                        .and_then(|offset| lz77_scratch_base_words.checked_add(offset))
-                        .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
-                            field: "pass-group LZ77 scratch offset",
-                        })?,
-                    coeff_shift: 0,
-                    global_group_index,
-                    block_context,
-                    channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
-                        0u32,
-                        |packed, (channel, shift)| {
-                            packed
-                                | shift.horizontal << (channel as u32 * 2)
-                                | shift.vertical << (channel as u32 * 2 + 1)
-                        },
-                    ),
-                });
-                stream_ranges.push(GroupEntropyRange {
-                    token_bit_offset: range.offset,
-                    token_bit_end: range.end().ok_or(
+            let mut lz77_scratch_words = 0u32;
+            for (
+                pass_index,
+                (pass, &(metadata_base_words, context_map_offset_words, order_base_words)),
+            ) in entropy.passes.iter().zip(&pass_tables).enumerate()
+            {
+                for (global_group_index, range) in pass.pass_groups.iter().copied().enumerate() {
+                    let global_group_index = u32::try_from(global_group_index).map_err(|_| {
                         HfCoefficientPlanError::ArithmeticOverflow {
-                            field: "pass-group stream end",
+                            field: "pass-group index",
+                        }
+                    })?;
+                    if packet
+                        .profile
+                        .low_frequency_group_index_for_pass_group(u64::from(global_group_index))?
+                        != lf_group.index
+                    {
+                        continue;
+                    }
+                    let rect = packet
+                        .profile
+                        .pass_group_rect(u64::from(global_group_index))?;
+                    let local_x = rect.x.checked_sub(lf_group.rect.x).ok_or(
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "local pass-group x origin",
                         },
-                    )?,
-                });
-            }
-            let local_group_count = u32::try_from(params.len()).map_err(|_| {
-                HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "LF-group pass-group count",
+                    )?;
+                    let local_y = rect.y.checked_sub(lf_group.rect.y).ok_or(
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "local pass-group y origin",
+                        },
+                    )?;
+                    let token_start = u32::try_from(range.offset).map_err(|_| {
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "pass-group bit start",
+                        }
+                    })?;
+                    let token_end = range.end().and_then(|end| u32::try_from(end).ok()).ok_or(
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "pass-group bit end",
+                        },
+                    )?;
+                    let local_group_index = u32::try_from(params.len()).map_err(|_| {
+                        HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "local pass-group index",
+                        }
+                    })?;
+                    params.push(HfCoefficientPassParams {
+                        entropy: EntropyStreamParams {
+                            token_start,
+                            token_end,
+                            lz77_window_mask: pass.lz77_window_words.saturating_sub(1),
+                        },
+                        window_logical_start: 0,
+                        window_upload_start: 0,
+                        stream_token_end: token_end,
+                        window_yield_end: token_end,
+                        window_flags: 3,
+                        execution_state_base_words: 0,
+                        status_index: local_group_index,
+                        block_origin_x: local_x / 8,
+                        block_origin_y: local_y / 8,
+                        block_width: rect.width.div_ceil(8),
+                        block_height: rect.height.div_ceil(8),
+                        blocks_per_row,
+                        block_task_map_offset_words: artifact.block_task_map_offset_words,
+                        num_hf_presets: entropy.num_hf_presets,
+                        num_block_clusters,
+                        context_map_offset_words,
+                        lf_plane_stride_words,
+                        lz77_window_base_words: lz77_scratch_base_words
+                            .checked_add(lz77_scratch_words)
+                            .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                                field: "pass-group LZ77 scratch offset",
+                            })?,
+                        coeff_shift: pass.coefficient_shift,
+                        global_group_index: u32::try_from(
+                            pass_index as u64 * packet.profile.group_count
+                                + u64::from(global_group_index),
+                        )
+                        .map_err(|_| {
+                            HfCoefficientPlanError::ArithmeticOverflow {
+                                field: "logical pass-group index",
+                            }
+                        })?,
+                        block_context,
+                        metadata_base_words,
+                        order_base_words,
+                        spatial_group_index: (local_y / packet.profile.group_dimension)
+                            * blocks_per_row.div_ceil(packet.profile.group_dimension / 8)
+                            + local_x / packet.profile.group_dimension,
+                        _reserved: 0,
+                        channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
+                            0u32,
+                            |packed, (channel, shift)| {
+                                packed
+                                    | shift.horizontal << (channel as u32 * 2)
+                                    | shift.vertical << (channel as u32 * 2 + 1)
+                            },
+                        ),
+                    });
+                    lz77_scratch_words = lz77_scratch_words
+                        .checked_add(pass.lz77_window_words)
+                        .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
+                            field: "pass-group LZ77 scratch words",
+                        })?;
+                    stream_ranges.push(GroupEntropyRange {
+                        token_bit_offset: range.offset,
+                        token_bit_end: range.end().ok_or(
+                            HfCoefficientPlanError::ArithmeticOverflow {
+                                field: "pass-group stream end",
+                            },
+                        )?,
+                    });
                 }
-            })?;
-            let lz77_scratch_words = entropy
-                .lz77_window_words
-                .checked_mul(local_group_count)
-                .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
-                    field: "LF-group pass-group LZ77 scratch words",
-                })?;
+            }
             let execution_state_base_words = lz77_scratch_base_words
                 .checked_add(lz77_scratch_words)
                 .ok_or(HfCoefficientPlanError::ArithmeticOverflow {
@@ -361,7 +389,7 @@ impl HfCoefficientExecutionPlan {
                     task_count: lf_group.task_capacity,
                     coefficient_words: lf_group.coefficient_words(),
                     order_descriptor_count: (HF_ORDER_COUNT * HF_ORDER_CHANNELS) as u32,
-                    order_coordinate_offset_words: entropy.order_coordinate_offset_words,
+                    order_coordinate_offset_words: (HF_ORDER_COUNT * HF_ORDER_CHANNELS * 4) as u32,
                     _reserved: [0; 3],
                 },
                 lz77_scratch_words,
@@ -372,7 +400,6 @@ impl HfCoefficientExecutionPlan {
             });
         }
 
-        let order_words = entropy.order_words.clone();
         Ok(Self {
             entropy_words,
             order_words,
@@ -472,6 +499,8 @@ pub enum HfCoefficientPlanError {
     Packet(#[from] crate::vardct_packet::BoundedVarDctPacketError),
     #[error("HF coefficient plan has {actual} pass groups; expected {expected}")]
     PassGroupCount { expected: u64, actual: u64 },
+    #[error("HF coefficient plan has {actual} passes; expected {expected}")]
+    PassCount { expected: usize, actual: usize },
     #[error("HF coefficient plan has {actual} LF groups; expected {expected}")]
     LfGroupCount { expected: usize, actual: usize },
     #[error("HF coefficient plan arithmetic overflowed while computing {field}")]
@@ -489,6 +518,7 @@ pub struct GpuHfCoefficientStatus {
     pub token_end: u32,
     pub decoded_symbols: u32,
     pub selected_preset: u32,
+    /// Logical pass-group index: `pass_index * spatial_group_count + spatial_group_index`.
     pub group_index: u32,
     pub nonzero_coefficients: u32,
     pub sink_error: u32,
@@ -686,11 +716,14 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 144);
+    assert!(std::mem::size_of::<HfCoefficientPassParams>() == 160);
     assert!(std::mem::align_of::<HfCoefficientPassParams>() == 16);
     assert!(std::mem::size_of::<HfBlockContextTables>() == 48);
     assert!(std::mem::align_of::<HfBlockContextTables>() == 4);
     assert!(std::mem::offset_of!(HfCoefficientPassParams, block_context) == 92);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, metadata_base_words) == 144);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, order_base_words) == 148);
+    assert!(std::mem::offset_of!(HfCoefficientPassParams, spatial_group_index) == 152);
     assert!(std::mem::size_of::<HfCoefficientExecutionState>() == 464);
     assert!(std::mem::align_of::<HfCoefficientExecutionState>() == 16);
     assert!(std::mem::offset_of!(HfCoefficientExecutionState, nonzero_grid) == 72);

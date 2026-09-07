@@ -149,7 +149,7 @@ The coding-mode-neutral `GpuDecoder::wgpu` selects the VarDCT production engine 
 standard packet topologies. A one-entry zero-AC TOC retains the original single regular 8x8,
 16x16, 32x32, 16x8, 8x16, 32x8, 8x32, 32x16, or 16x32 transform. A sectioned TOC covers one or
 more independently bounded LF groups with GPU-decoded mixed maps of any of JPEG XL's 27 regular
-and special strategies across one or more 256-pixel pass groups. Those pass groups may carry real single-pass HF coefficients
+and special strategies across one or more 256-pixel pass groups. Those pass groups may carry real HF coefficients across one through eleven spectral/refinement passes
 using any of the 13 natural or entropy-coded custom coefficient-order families. Scanline and
 entropy-coded center-first TOC order are both accepted: inventory retains physical section ranges
 and the frontend normalizes them to logical group order before assigning pixel rectangles and
@@ -157,18 +157,27 @@ per-group scratch. The explicit section topology removes the ambiguity with a on
 single-transform packet. The sectioned form supports odd and asymmetric pixel extents across LF
 group boundaries while keeping edge padding internal to GPU storage; 2056x256 is the checked
 two-LF-group boundary case.
-Both forms accept exactly one final 8-bit still frame and one pass. The main profile is XYB; a
+HF-global metadata is represented as shared block contexts/matrices plus `HfCoefficientPass`
+records. Each pass owns its entropy descriptor, context map, order tables, coefficient shift, and
+spatial packet ranges. The 160-byte pass invocation selects rebased table locations and keeps its
+spatial task identity separate from its logical pass-group validation index. Each pass/group has
+independent LZ77 and 464-byte resume storage, while atomic integer addition accumulates coefficients
+before the single inverse-transform/restoration/output sequence. Every status must validate before
+the final image becomes authoritative. Three checked-in spectral/quantized fixtures cover ordinary
+and 256-byte windowed execution, 37-byte transport chunks, odd extents, center-first order, and two
+LF groups; both CPU oracles agree within one RGB8 code on Apple M5.
+Both forms return one final 8-bit still frame; a one-entry TOC has one pass, while sectioned TOCs retain every declared pass. The main profile is XYB; a
 non-XYB JPEG-reconstruction profile accepts encoded YCbCr and the codestream's component sampling
 selectors. The packet contract
 accepts either adaptive LF smoothing or its standard skip flag, every 3-bit X/B frame
 quant-matrix scale, every normative default or parametric custom dequantization matrix encoding,
 disabled/default/custom Gaborish, disabled/default/custom
-one-to-three-iteration EPF, arbitrary valid HF block-context maps, and one spectral pass.
+one-to-three-iteration EPF, arbitrary valid HF block-context maps, and per-pass coefficient orders, entropy descriptors, and quantized refinement shifts.
 `global_scale`, `quant_lf`, LF extra precision, the quant field, per-block `hf_mul`, sharpness,
 per-frequency-cell HF chroma correlation, MA
 properties 0 through 15, and weighted self-correcting prediction are read from the stream. The
-combined single-entry and shared-global-tree packet forms resume across the shared bounded-window
-planner without an intermediate map. Their 64/128-byte `Pod` state records the active LF/HF phase,
+sectioned shared-global-tree packet form resumes across the shared bounded-window
+planner without an intermediate map. Its 64/128-byte `Pod` state records the active LF/HF phase,
 both decoded counts, first-block count, extra precision, ANS/LZ state, and predictor state. The
 packet frontend also represents an absent LF-global tree, packs each LF-local tree independently,
 executes LF image entropy on GPU, maps the aggregate end cursors, then parses and packs the following
@@ -184,7 +193,25 @@ admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-g
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
 presentation encoding, no ICC profile or extra channel, orientation 1, and no crop, blend,
-reference, preview, animation, frame upsampling, spectral progressive pass, or other frame feature.
+reference, preview, animation, or other unsupported frame feature.
+
+Ordinary frame upsampling uses the image header's standard or custom 2×/4×/8× weights. The
+profile separates encoded `width`/`height` from presented `output_width`/`output_height`; LF/HF,
+coefficient and restoration work use the encoded grid. Three resident 5×5 filter dispatches then
+expand that grid before XYB conversion, with mirrored boundaries, normative range clamping, and
+right/bottom cropping to the exact output extent. One expanded weight buffer is shared by all
+channels. Output-sized F32 planes, weights, and three 32-byte uniforms are explicitly budgeted and
+retained through final validation. Checked-in libjxl fixtures cover all factors, custom nearest
+neighbor weights, spectral passes with 4× resampling, odd dimensions, single-sample axes, and a
+4111×17 output spanning two LF groups. Blocking and bounded-window async output matches Rust
+`jxl` and `djxl` within one RGB8 code.
+
+Every single-entry TOC now uses the staged LF, HF-metadata, and general HF-global/AC continuation,
+including ordinary frames with a global tree. There is no dimension-derived transform assumption:
+the GPU reads and validates the actual strategy map. This intentionally trades the old single-entry
+shortcut for complete metadata handling. Each entropy stage retains bounded windows and shares one
+logical pending frame and byte budget.
+
 Subsampled YCbCr still rejects adaptive LF smoothing because that LF-domain step needs
 component-aware scheduling. Gaborish and EPF are connected: shifted components use a fused
 horizontal/vertical quarter/three-quarter resident upsample before the full-resolution restoration
@@ -196,8 +223,11 @@ progressive-DC dependencies. It keeps three F32
 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
 hidden and visible status, and publishes only the final frame. A single-entry intermediate frame
 first executes HF metadata on GPU, maps its bounded HF-global cursor, host-parses only scalar
-HF-global tables, and resumes general AC plus downstream reconstruction on the same queue. Fixed
-scratch/status capacity is admitted before submission; descriptor/order/window bytes discovered at
+HF-global tables, and resumes general AC plus downstream reconstruction on the same queue.
+Global-only Modular roots run their inverse/conversion and final status map in the last DC-global
+submission, with zero subimage lanes. A checked three-frame DC-plus-quantized-AC fixture covers
+this combination with both whole-range and 256-byte-window async execution.
+Fixed scratch/status capacity is admitted before submission; descriptor/order/window bytes discovered at
 the cursor are admitted through the same shared budget. `cjxl --progressive_dc=1` and
 `--progressive_dc=2` actual-GPU outputs are checked through blocking and runtime-neutral async
 completion against Rust `jxl` within one RGB8 code. Parametric matrix modes 0 through 6 populate the
@@ -257,10 +287,10 @@ special coefficient layout, optionally applies the signaled Gaborish weights, co
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
 contract through a shared resident ping-pong plane set, then either applies inverse opsin plus sRGB
 transfer or fuses JPEG component upsampling and encoded YCbCr conversion. It writes tightly packed
-RGB8 without an intermediate image readback. Combined/global packet and
+RGB8 without an intermediate image readback. Sectioned global-tree packet and
 AC pass-group ranges that fit the resolved entropy cap retain the one-submission path. Either
 oversized consumer instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/
-parameter pair, and ordered queue submissions. The final combined/global packet command shares the
+parameter pair, and ordered queue submissions. The final sectioned global-tree packet command shares the
 first downstream submission. A 464-byte aligned `Pod` tail per pass group preserves bit/ANS/LZ
 state, nested block/channel/order progress, coefficient-sink error, and the 96-word nonzero context
 grid; only the final window validates exact ANS/padding termination. Local-tree frames first run one
@@ -292,12 +322,12 @@ WebGPU without a Tokio or async-std dependency.
 
 `VarDctDecodeMemoryStats` separately reports the shared packet stream peak, initial packet batch
 count, reusable AC stream peak and batch count, reusable parameter bytes, LZ scratch, and
-execution-state total. For combined/global packets the initial count covers the complete packet;
+execution-state total. For sectioned global-tree packets the initial count covers the complete packet;
 for local trees it covers LF. HF packet descriptors are host-discovered after the LF map, so
 `hf_packet_stream_batch_count()` and `submissions_per_frame()` become exact when that dynamic plan is
 installed; performance harnesses sample them after frame completion. Applying
 `WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines and governs
-combined/global packets, local-tree LF/HF packets, and AC pass groups. It is a caller upper bound:
+sectioned global-tree packets, staged LF/HF packets, and AC pass groups. It is a caller upper bound:
 device limits and deterministic planning against the shared budget's total capacity may select a
 smaller four-byte-aligned value, exposed as
 `VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`. Planning does not sample live
@@ -305,7 +335,7 @@ headroom, so concurrent opens are reproducible; live jobs still receive typed no
 backpressure at submission. If even the 40-byte overlap/sentinel layout exceeds the budget,
 `MemoryBudgetTooSmall` reports both exact planned bytes and the configured limit before GPU work.
 Cursor-dependent local-HF metadata remains the one dynamic addition and admits only its exact
-positive difference from the same budget. Actual-adapter runs force a 40-byte 32x32 combined packet,
+positive difference from the same budget. Actual-adapter runs force a 40-byte staged 32x32 single-entry packet,
 256-byte shared-global/local-tree/nonzero-AC paths, and an intermediate budget-resolved cap through
 blocking or runtime-neutral async decode, typed corruption/backpressure, and cancellation-driven
 reservation release.
@@ -365,11 +395,11 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Multiple spectral/refinement passes, explicitly published
+This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 alternate RGB/gray/YUV/NV12/VPI outputs, ICC/HDR and other bit depths, crop/blend,
-extra channels, other progressive passes, animation, and reference frames return typed unsupported
+extra channels, intermediate progressive presentation, animation, and reference frames return typed unsupported
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 
 ### Measured lossless Modular checkpoint
@@ -488,9 +518,10 @@ storage access and LZ scratch-base functions; geometry, prediction, output, and 
 remain consumer-specific. Consumers whose entropy owns the complete token range also call one
 shared terminator for the ANS final-state and at most seven zero-padding bits; VarDCT packet streams
 followed by fixed metadata finalize ANS first and validate the enclosing section after that tail.
-The VarDCT AC parameter record is a separate 144-byte aligned `Pod`. Its window suffix carries
+The VarDCT AC parameter record is a separate 160-byte aligned `Pod`. Its window suffix carries
 logical/upload starts, available/full ends, the yield boundary, first/final flags, a 464-byte
-execution-state offset, and the canonical status index. The VarDCT packet record has its own seven
+execution-state offset, and the canonical status index. Its final four words select the pass's
+entropy/order bases and spatial group index, with one padding word. The VarDCT packet record has its own seven
 window fields, including a bounded-mode bit independent of FIRST/FINAL and a stream-base bit offset.
 Combined/global-tree packets use those fields with 64-byte generic or 128-byte SelfCorrecting state;
 five explicit words retain phase, LF/HF counts, first blocks, and extra precision. Staged local-tree

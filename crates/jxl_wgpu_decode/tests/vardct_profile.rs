@@ -32,6 +32,35 @@ fn inventory(bytes: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
         .unwrap()
 }
 
+#[test]
+fn frame_upsampling_routes_sections_in_encoded_coordinates() {
+    let bytes = decode_hex(include_str!(
+        "../test-data/testsrc_vardct_upsample_2_multilf.jxl.hex"
+    ));
+    let mut inventory = inventory(&bytes);
+    let profile = StandardVarDctProfile::negotiate(&inventory).unwrap();
+    assert_eq!((profile.width, profile.height), (2056, 9));
+    assert_eq!((profile.output_width, profile.output_height), (4111, 17));
+    assert_eq!(profile.group_count, 9);
+    assert_eq!(profile.low_frequency_group_count, 2);
+    let tail = profile.pass_group_rect(8).unwrap();
+    assert_eq!((tail.x, tail.y, tail.width, tail.height), (2048, 0, 8, 9));
+    assert_eq!(profile.low_frequency_group_rect(1).unwrap(), tail);
+    assert_eq!(
+        profile.low_frequency_group_index_for_pass_group(8).unwrap(),
+        1
+    );
+    for factor in [0, 3, 16, u32::MAX] {
+        inventory.frames[0].upsampling = factor;
+        assert!(matches!(
+            StandardVarDctProfile::negotiate(&inventory),
+            Err(VarDctFrontendError::Unsupported {
+                feature: UnsupportedVarDctFeature::Upsampling,
+            })
+        ));
+    }
+}
+
 fn custom_lf_global(
     dequant_bits: [u16; 3],
     colour_factor: (u8, u16),
@@ -284,7 +313,7 @@ fn permuted_toc_is_normalized_to_logical_pass_group_order() {
 
     let packet = BoundedVarDctPacketPlan::parse(&bytes, &inventory).unwrap();
     assert_eq!(
-        packet.hf_coefficients.unwrap().pass_groups,
+        packet.hf_coefficients.unwrap().passes[0].pass_groups,
         pass_groups.as_slice()
     );
 }
@@ -323,15 +352,88 @@ fn rejects_packets_and_geometries_outside_gpu_bounds() {
 }
 
 #[test]
+fn progressive_sections_preserve_pass_identity_and_reject_invalid_indices() {
+    let bytes = decode_hex(include_str!(
+        "../test-data/testsrc_vardct_progressive_quantized.jxl.hex"
+    ));
+    let original = inventory(&bytes);
+    let profile = StandardVarDctProfile::negotiate(&original).unwrap();
+    assert_eq!(profile.coefficient_shifts, [1, 0]);
+    let VarDctSectionLayout::Sections { pass_groups, .. } = profile.sections else {
+        panic!("multiple passes require physical sections");
+    };
+    assert_eq!(pass_groups.len(), 12);
+    for section in &original.frames[0].sections {
+        if let FrameSectionKind::PassGroup {
+            pass_index,
+            group_index,
+        } = section.kind
+        {
+            assert_eq!(
+                pass_groups[pass_index as usize * 6 + group_index as usize],
+                section.bits
+            );
+        }
+    }
+    let selected = original.frames[0]
+        .sections
+        .iter()
+        .position(|section| {
+            section.kind
+                == FrameSectionKind::PassGroup {
+                    pass_index: 1,
+                    group_index: 0,
+                }
+        })
+        .unwrap();
+    let mut invalid = original.clone();
+    invalid.frames[0].sections[selected].kind = FrameSectionKind::PassGroup {
+        pass_index: 2,
+        group_index: 0,
+    };
+    assert_eq!(
+        StandardVarDctProfile::negotiate(&invalid).unwrap_err(),
+        VarDctFrontendError::UnexpectedPass {
+            pass_index: 2,
+            pass_count: 2
+        }
+    );
+    invalid.frames[0].sections[selected].kind = FrameSectionKind::PassGroup {
+        pass_index: 1,
+        group_index: 6,
+    };
+    assert_eq!(
+        StandardVarDctProfile::negotiate(&invalid).unwrap_err(),
+        VarDctFrontendError::GroupIndexOutOfRange {
+            index: 6,
+            group_count: 6
+        }
+    );
+    invalid = original.clone();
+    invalid.frames[0].sections.remove(selected);
+    assert_eq!(
+        StandardVarDctProfile::negotiate(&invalid).unwrap_err(),
+        VarDctFrontendError::MissingSection {
+            kind: "pass-group",
+            index: 6
+        }
+    );
+    invalid = original;
+    invalid.frames[0].progressive_passes.shifts[0] = 4;
+    assert_eq!(
+        StandardVarDctProfile::negotiate(&invalid).unwrap_err(),
+        VarDctFrontendError::InvalidPassSchedule
+    );
+}
+
+#[test]
 fn preserves_typed_profile_and_metadata_error_causes() {
     let bytes = decode_hex(include_str!("../test-data/basic.jxl.hex"));
     let mut progressive = inventory(&bytes);
     progressive.frames[0].num_passes = 2;
     assert_eq!(
         StandardVarDctProfile::negotiate(&progressive).unwrap_err(),
-        VarDctFrontendError::Unsupported {
-            feature: UnsupportedVarDctFeature::ProgressivePasses,
-        }
+        VarDctFrontendError::InvalidPassSchedule
     );
 
     let error = LfGlobalPrefix::parse(

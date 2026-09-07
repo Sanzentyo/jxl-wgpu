@@ -8,7 +8,8 @@ use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     KernelVariant, ResidentChromaUpsampleMemoryPlan, ResidentEpfMemoryPlan,
-    ResidentGaborishWeights, ResidentVarDctMemoryPlan, WgpuBackend,
+    ResidentGaborishWeights, ResidentUpsampleKernel, ResidentUpsamplePipeline,
+    ResidentVarDctMemoryPlan, WgpuBackend,
 };
 
 use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
@@ -46,6 +47,7 @@ pub(super) struct VarDctSource {
     pub(super) deferred_hf: Option<DeferredHfCoefficientLayout>,
     pub(super) gaborish: Option<ResidentGaborishWeights>,
     pub(super) epf: Option<VarDctEpfPlan>,
+    pub(super) frame_upsample: Option<ResidentUpsampleKernel>,
     pub(super) output_plan: VarDctOutputPlan,
     pub(super) layout: ImageLayout,
     pub(super) output_transform: VarDctOutputTransform,
@@ -69,7 +71,7 @@ impl VarDctSource {
     pub(super) fn submissions_per_frame(&self) -> usize {
         if self.deferred_hf.is_some() {
             if self.packet.pending_raw_hf_dequant_side_image().is_some()
-                && !self.packet.requires_local_tree_staging()
+                && !self.packet.requires_lf_staging()
             {
                 // The final AC/render submission is known up front. Each raw side image adds its
                 // own submission as the resumable HF-global parser discovers it.
@@ -90,7 +92,7 @@ impl VarDctSource {
                 .saturating_add(coefficient_batches)
                 .saturating_add(2);
         }
-        let local_lf = if self.packet.requires_local_tree_staging() {
+        let local_lf = if self.packet.requires_lf_staging() {
             self.lf_packet_windows
                 .as_ref()
                 .map_or(1, LfPacketWindowExecutionPlan::batch_count)
@@ -189,7 +191,7 @@ pub(super) fn prepare_source(
         usize::try_from(codestream_bytes).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
             field: "codestream source length",
         })?;
-    let staged_local_trees = packet.requires_local_tree_staging();
+    let staged_lf = packet.requires_lf_staging();
     let limits = backend.device().limits();
     let configured_stream_limit = options
         .stream_window_limit
@@ -220,7 +222,7 @@ pub(super) fn prepare_source(
     for packet_group in &packet.groups {
         let control = if let Some(continuation) = &packet_group.external_lf_hf {
             packet_group.hf_stage_control(&packet, continuation)?
-        } else if staged_local_trees {
+        } else if staged_lf {
             packet_group.lf_stage_control(&packet)?
         } else {
             packet_group.packet_control(&packet)?
@@ -313,14 +315,41 @@ pub(super) fn prepare_source(
         .iter()
         .map(|group| group.artifact_layout)
         .collect::<Vec<_>>();
+    let frame_upsample = if packet.profile.upsampling == 1 {
+        None
+    } else {
+        let weights = &inventory.image_header.upsampling_weights;
+        let compact = match packet.profile.upsampling {
+            2 => weights
+                .up2
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            4 => weights
+                .up4
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            8 => weights
+                .up8
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            _ => unreachable!("frame profile validates upsampling factors"),
+        };
+        Some(ResidentUpsampleKernel::from_compact(
+            packet.profile.upsampling,
+            &compact,
+        )?)
+    };
     let output_plan = VarDctOutputPlan::for_limits_with_variant(
-        packet.profile.width,
-        packet.profile.height,
+        packet.profile.output_width,
+        packet.profile.output_height,
         &backend.device().limits(),
         options.output_variant,
     )?;
     let layout = ImageLayout::packed(
-        Extent2d::new(packet.profile.width, packet.profile.height),
+        Extent2d::new(packet.profile.output_width, packet.profile.output_height),
         vardct_rgb8_format(),
     )?;
     let (output_transform, quant_biases) = match packet.profile.color_transform {
@@ -351,7 +380,11 @@ pub(super) fn prepare_source(
         }
         VarDctColorTransform::Ycbcr => (
             VarDctOutputTransform::Ycbcr {
-                channel_shifts: packet.profile.channel_shifts,
+                channel_shifts: if gaborish.is_some() || epf.is_some() || frame_upsample.is_some() {
+                    [Default::default(); 3]
+                } else {
+                    packet.profile.channel_shifts
+                },
             },
             // Non-XYB image metadata omits the optional opsin object that otherwise carries these
             // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32
@@ -371,11 +404,11 @@ pub(super) fn prepare_source(
         .collect::<Result<Vec<_>, _>>()?;
     let plan_at_limit =
         |stream_limit: u64| -> Result<VarDctEntropyPlanSelection, VarDctDecodeError> {
-            let lf_packet_windows = staged_local_trees
+            let lf_packet_windows = staged_lf
                 .then(|| LfPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit))
                 .transpose()?
                 .flatten();
-            let combined_packet_windows = (!staged_local_trees
+            let combined_packet_windows = (!staged_lf
                 && !packet.profile.uses_lf_frame
                 && packet.pending_raw_hf_dequant_side_image().is_none())
             .then(|| {
@@ -481,6 +514,7 @@ pub(super) fn prepare_source(
         deferred_hf,
         gaborish,
         epf,
+        frame_upsample,
         output_plan,
         layout,
         output_transform,
@@ -510,7 +544,7 @@ fn validate_device_limits(
             actual: 0,
         });
     }
-    let predictor_capacity = packet.needs_self_correcting || packet.requires_local_tree_staging();
+    let predictor_capacity = packet.needs_self_correcting || packet.requires_lf_staging();
     let mut reconstruction_storage_bytes = 0_u64;
     for (index, group) in packet.groups.iter().enumerate() {
         let reconstruction = u64::from(group.reconstructed_words(predictor_capacity)?)
@@ -565,7 +599,7 @@ fn validate_device_limits(
         })
         .unwrap_or(0);
     let modular_metadata_binding_bytes =
-        if packet.requires_local_tree_staging() || packet.profile.uses_lf_frame {
+        if packet.requires_lf_staging() || packet.profile.uses_lf_frame {
             packet
                 .groups
                 .iter()
@@ -624,7 +658,13 @@ fn validate_device_limits(
             if memory.pre_restoration_upsample_bytes == 0 {
                 0
             } else {
-                memory.restoration_scratch_bytes / 3
+                memory.pre_restoration_upsample_bytes
+                    / packet
+                        .profile
+                        .channel_shifts
+                        .into_iter()
+                        .filter(|shift| shift.is_subsampled())
+                        .count() as u64
             },
             true,
         ),
@@ -634,6 +674,16 @@ fn validate_device_limits(
             true,
         ),
         ("EPF sigma plane", memory.epf_sigma_bytes, true),
+        (
+            "frame upsample plane",
+            memory.frame_upsample_bytes / 3,
+            true,
+        ),
+        (
+            "frame upsample weights",
+            memory.frame_upsample_weight_bytes,
+            true,
+        ),
         ("packed RGB8 output", memory.output_lease_bytes, true),
     ] {
         check_limit(resource, required, limits.max_buffer_size)?;
@@ -687,6 +737,14 @@ fn validate_device_limits(
             },
         ),
         ("output uniform", memory.output_uniform_bytes),
+        (
+            "frame upsample uniform",
+            if memory.frame_upsample_uniform_bytes == 0 {
+                0
+            } else {
+                ResidentUpsamplePipeline::UNIFORM_BYTES
+            },
+        ),
     ] {
         check_limit(resource, required, limits.max_uniform_buffer_binding_size)?;
     }

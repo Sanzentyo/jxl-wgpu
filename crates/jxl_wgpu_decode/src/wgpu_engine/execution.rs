@@ -336,7 +336,10 @@ impl GroupDispatchLayout {
                 "reconstruction lane",
             )?);
         }
-        if reconstruction_lane_stride == 0 {
+        let global_only = profile.entropy_groups.is_empty()
+            && profile.global_stream.is_some()
+            && frame_workspace.is_some();
+        if reconstruction_lane_stride == 0 && !global_only {
             return Err(Error::backend("Modular reconstruction lane is empty"));
         }
         let device_stream_limit = limits
@@ -403,7 +406,7 @@ impl GroupDispatchLayout {
         let device_lane_cap = limits
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size)
-            / reconstruction_lane_stride;
+            / reconstruction_lane_stride.max(4);
         let device_lane_cap = usize::try_from(device_lane_cap).unwrap_or(usize::MAX);
         let workgroup_cap = u64::from(limits.max_compute_workgroups_per_dimension)
             .checked_mul(u64::from(group_workgroup_size))
@@ -413,7 +416,7 @@ impl GroupDispatchLayout {
             .min(profile.entropy_groups.len())
             .min(device_lane_cap)
             .min(workgroup_cap);
-        if lane_cap == 0 {
+        if lane_cap == 0 && !global_only {
             return Err(Error::backend(
                 "device limits cannot bind one Modular reconstruction lane",
             ));
@@ -421,19 +424,12 @@ impl GroupDispatchLayout {
         let requested_slots = u64::try_from(options.requested_frame_slots.max(1))
             .map_err(|_| Error::backend("requested frame-slot count exceeds u64"))?;
         let requested_target = options.memory_limit_bytes / requested_slots;
-        let selected = match select_parallel_group_layout(
-            codestream_bytes,
-            &profile.entropy_groups,
-            ParallelGroupLimits {
-                stream_limit,
-                lane_cap,
-                lane_stride: reconstruction_lane_stride,
-                fixed_bytes,
-                per_frame_target: requested_target,
-            },
-        ) {
-            Ok(Some(selected)) => Some(selected),
-            Ok(None) => select_parallel_group_layout(
+        let selected = if global_only {
+            // All channels are reconstructed in the frame arena by DC-global. There are no
+            // subimage lanes or pass-group dispatches; only the common binding placeholder lives.
+            Some((0, Vec::new(), Vec::new(), 0))
+        } else {
+            match select_parallel_group_layout(
                 codestream_bytes,
                 &profile.entropy_groups,
                 ParallelGroupLimits {
@@ -441,10 +437,23 @@ impl GroupDispatchLayout {
                     lane_cap,
                     lane_stride: reconstruction_lane_stride,
                     fixed_bytes,
-                    per_frame_target: options.memory_limit_bytes,
+                    per_frame_target: requested_target,
                 },
-            )?,
-            Err(error) => return Err(error),
+            ) {
+                Ok(Some(selected)) => Some(selected),
+                Ok(None) => select_parallel_group_layout(
+                    codestream_bytes,
+                    &profile.entropy_groups,
+                    ParallelGroupLimits {
+                        stream_limit,
+                        lane_cap,
+                        lane_stride: reconstruction_lane_stride,
+                        fixed_bytes,
+                        per_frame_target: options.memory_limit_bytes,
+                    },
+                )?,
+                Err(error) => return Err(error),
+            }
         }
         .ok_or_else(|| {
             Error::backend(format!(
@@ -456,7 +465,8 @@ impl GroupDispatchLayout {
         let stream_bytes = group_stream_bytes.max(global_stream_bytes);
         let reconstructed_bytes = reconstruction_lane_stride
             .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
-            .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?;
+            .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?
+            .max(4);
         Ok(Self {
             group_workgroup_size,
             reconstruction_lane_stride,
@@ -1843,7 +1853,25 @@ pub(super) fn submit_decode(
                 pass.set_bind_group(0, global_binding.as_ref().unwrap_or(&binding), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            backend.queue().submit([commands.finish()]);
+            let final_batch = source.dispatch_layout.stream_batches.is_empty()
+                && batch_index + 1 == source.dispatch_layout.global_stream_batches.len();
+            let uniforms = if final_batch {
+                encode_frame_completion(
+                    device,
+                    source,
+                    pipelines,
+                    &lifetime,
+                    &completion,
+                    &mut commands,
+                )?
+            } else {
+                Vec::new()
+            };
+            let submission = backend.queue().submit([commands.finish()]);
+            drop(uniforms);
+            if final_batch {
+                final_submission = Some(submission);
+            }
         }
     }
     for (batch_index, batch) in source.dispatch_layout.stream_batches.iter().enumerate() {
@@ -1998,124 +2026,14 @@ pub(super) fn submit_decode(
             }
         }
         if final_batch {
-            if let Some(frame_plan) = &source.profile.resident_frame_plan {
-                let inverse = pipelines.inverse.ok_or(Error::EngineContract(
-                    "frame Modular reconstruction is missing resident inverse pipelines",
-                ))?;
-                let frame_arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
-                    "frame-wide Modular inverse is missing its resident arena",
-                ))?;
-                let arena_size = NonZeroU64::new(frame_plan.inverse_plan.arena_bytes()).ok_or(
-                    Error::EngineContract(
-                        "frame Modular reconstruction produced an empty inverse arena",
-                    ),
-                )?;
-                inverse_uniforms.extend(encode_modular_inverse_jobs(
-                    device,
-                    &mut commands,
-                    ResidentStorageBinding {
-                        buffer: frame_arena.buffer(),
-                        offset: 0,
-                        size: arena_size,
-                    },
-                    &frame_plan.inverse_plan,
-                    frame_plan.wp_header,
-                    inverse,
-                )?);
-                if source.profile.progressive_dc.is_none() {
-                    inverse_uniforms.push(encode_frame_modular_finalize(
-                        device,
-                        &mut commands,
-                        source,
-                        &lifetime,
-                        inverse,
-                    )?);
-                }
-            }
-            if let Some(progressive) = source.profile.progressive_dc {
-                let pipeline = pipelines.progressive_dc.ok_or(Error::EngineContract(
-                    "progressive-DC Modular conversion pipeline is missing",
-                ))?;
-                let planes =
-                    lifetime
-                        .progressive_dc_planes
-                        .as_ref()
-                        .ok_or(Error::EngineContract(
-                            "progressive-DC Modular conversion planes are missing",
-                        ))?;
-                let (arena, final_planes) =
-                    if let Some(frame_plan) = &source.profile.resident_frame_plan {
-                        let arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
-                            "progressive-DC frame inverse arena is missing",
-                        ))?;
-                        (arena.buffer(), frame_plan.inverse_plan.final_gpu_layouts())
-                    } else {
-                        let [group_plan] = source.profile.resident_entropy_plans.as_slice() else {
-                            return Err(Error::EngineContract(
-                                "progressive-DC Modular root requires one resident frame topology",
-                            ));
-                        };
-                        (
-                            lifetime._reconstructed.buffer(),
-                            group_plan.inverse_plan.final_gpu_layouts(),
-                        )
-                    };
-                let source_planes = final_planes.try_into().map_err(|_| {
-                    Error::EngineContract(
-                        "progressive-DC Modular root must reconstruct exactly three XYB planes",
-                    )
-                })?;
-                let arena_size = NonZeroU64::new(arena.size()).ok_or(Error::EngineContract(
-                    "progressive-DC Modular arena is empty",
-                ))?;
-                let uniform = pipeline.encode_convert(
-                    device,
-                    &mut commands,
-                    ProgressiveDcConvertInputs {
-                        arena: ResidentStorageBinding {
-                            buffer: arena,
-                            offset: 0,
-                            size: arena_size,
-                        },
-                        source_planes,
-                        outputs: planes,
-                        multipliers: progressive.lf_dequantization(),
-                    },
-                )?;
-                *lifetime
-                    ._progressive_dc_uniform
-                    .lock()
-                    .map_err(|_| Error::backend("progressive-DC uniform lock was poisoned"))? =
-                    Some(uniform);
-            }
-            commands.copy_buffer_to_buffer(
-                lifetime._status.buffer(),
-                0,
-                lifetime.status_staging.buffer(),
-                0,
-                source.dispatch_layout.status_bytes,
-            );
-            let callback_lifetime = Arc::clone(&lifetime);
-            let callback_completion = Arc::clone(&completion);
-            commands.map_buffer_on_submit(
-                lifetime.status_staging.buffer(),
-                wgpu::MapMode::Read,
-                ..,
-                move |result| {
-                    // Release the callback's ownership before waking a waiter. The pending frame
-                    // keeps the job alive through validation; an abandoned pending frame instead
-                    // makes this the final Arc and safely unmaps/recycles staging.
-                    if result.is_ok() {
-                        callback_lifetime
-                            .status_mapped
-                            .store(true, Ordering::Release);
-                    }
-                    drop(callback_lifetime);
-                    callback_completion.complete(
-                        result.map_err(|error| format!("GPU status mapping failed: {error}")),
-                    );
-                },
-            );
+            inverse_uniforms.extend(encode_frame_completion(
+                device,
+                source,
+                pipelines,
+                &lifetime,
+                &completion,
+                &mut commands,
+            )?);
         }
         let submission = backend.queue().submit([commands.finish()]);
         drop(inverse_uniforms);
@@ -2163,6 +2081,127 @@ pub(super) fn submit_decode(
         },
         status_stride: source.dispatch_layout.status_stride,
     })
+}
+
+fn encode_frame_completion(
+    device: &wgpu::Device,
+    source: &DecodeSource,
+    pipelines: SubmitPipelines<'_>,
+    lifetime: &Arc<DecodeJobLifetime>,
+    completion: &Arc<MapCompletion>,
+    commands: &mut wgpu::CommandEncoder,
+) -> Result<Vec<wgpu::Buffer>> {
+    let mut inverse_uniforms = Vec::new();
+    if let Some(frame_plan) = &source.profile.resident_frame_plan {
+        let inverse = pipelines.inverse.ok_or(Error::EngineContract(
+            "frame Modular reconstruction is missing resident inverse pipelines",
+        ))?;
+        let frame_arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
+            "frame-wide Modular inverse is missing its resident arena",
+        ))?;
+        let arena_size = NonZeroU64::new(frame_plan.inverse_plan.arena_bytes()).ok_or(
+            Error::EngineContract("frame Modular reconstruction produced an empty inverse arena"),
+        )?;
+        inverse_uniforms.extend(encode_modular_inverse_jobs(
+            device,
+            commands,
+            ResidentStorageBinding {
+                buffer: frame_arena.buffer(),
+                offset: 0,
+                size: arena_size,
+            },
+            &frame_plan.inverse_plan,
+            frame_plan.wp_header,
+            inverse,
+        )?);
+        if source.profile.progressive_dc.is_none() {
+            inverse_uniforms.push(encode_frame_modular_finalize(
+                device, commands, source, lifetime, inverse,
+            )?);
+        }
+    }
+    if let Some(progressive) = source.profile.progressive_dc {
+        let pipeline = pipelines.progressive_dc.ok_or(Error::EngineContract(
+            "progressive-DC Modular conversion pipeline is missing",
+        ))?;
+        let planes = lifetime
+            .progressive_dc_planes
+            .as_ref()
+            .ok_or(Error::EngineContract(
+                "progressive-DC Modular conversion planes are missing",
+            ))?;
+        let (arena, final_planes) = if let Some(frame_plan) = &source.profile.resident_frame_plan {
+            let arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
+                "progressive-DC frame inverse arena is missing",
+            ))?;
+            (arena.buffer(), frame_plan.inverse_plan.final_gpu_layouts())
+        } else {
+            let [group_plan] = source.profile.resident_entropy_plans.as_slice() else {
+                return Err(Error::EngineContract(
+                    "progressive-DC Modular root requires one resident frame topology",
+                ));
+            };
+            (
+                lifetime._reconstructed.buffer(),
+                group_plan.inverse_plan.final_gpu_layouts(),
+            )
+        };
+        let source_planes = final_planes.try_into().map_err(|_| {
+            Error::EngineContract(
+                "progressive-DC Modular root must reconstruct exactly three XYB planes",
+            )
+        })?;
+        let arena_size = NonZeroU64::new(arena.size()).ok_or(Error::EngineContract(
+            "progressive-DC Modular arena is empty",
+        ))?;
+        let uniform = pipeline.encode_convert(
+            device,
+            commands,
+            ProgressiveDcConvertInputs {
+                arena: ResidentStorageBinding {
+                    buffer: arena,
+                    offset: 0,
+                    size: arena_size,
+                },
+                source_planes,
+                outputs: planes,
+                multipliers: progressive.lf_dequantization(),
+            },
+        )?;
+        *lifetime
+            ._progressive_dc_uniform
+            .lock()
+            .map_err(|_| Error::backend("progressive-DC uniform lock was poisoned"))? =
+            Some(uniform);
+    }
+    commands.copy_buffer_to_buffer(
+        lifetime._status.buffer(),
+        0,
+        lifetime.status_staging.buffer(),
+        0,
+        source.dispatch_layout.status_bytes,
+    );
+    let callback_lifetime = Arc::clone(lifetime);
+    let callback_completion = Arc::clone(completion);
+    commands.map_buffer_on_submit(
+        lifetime.status_staging.buffer(),
+        wgpu::MapMode::Read,
+        ..,
+        move |result| {
+            // Release the callback's ownership before waking a waiter. The pending frame
+            // keeps the job alive through validation; an abandoned pending frame instead
+            // makes this the final Arc and safely unmaps/recycles staging.
+            if result.is_ok() {
+                callback_lifetime
+                    .status_mapped
+                    .store(true, Ordering::Release);
+            }
+            drop(callback_lifetime);
+            callback_completion
+                .complete(result.map_err(|error| format!("GPU status mapping failed: {error}")));
+        },
+    );
+    Ok(inverse_uniforms)
 }
 
 pub(super) fn copy_stream_segment(

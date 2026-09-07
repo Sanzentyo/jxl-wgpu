@@ -12,7 +12,7 @@ use jxl_gpu_bitstream::{
     ParseLimits, RestorationFilterInventory,
 };
 use jxl_gpu_formats::{Channel, ImageLayout, PitchLinearPlaneLayout, PixelFormat, SampleKind};
-use jxl_gpu_protocol::{Extent2d, TransformKind};
+use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     DisplayColorEncoding, DisplayPipeline, DisplayTexture, DisplayTextureDescriptor,
     ImageReadbackPipeline, MemoryBudget, MemoryBudgetError, ResidentVarDctMemoryPlan, WgpuBackend,
@@ -190,6 +190,428 @@ fn maximum_error(left: &[u8], right: &[u8]) -> u8 {
         .map(|(&left, &right)| left.abs_diff(right))
         .max()
         .unwrap_or(0)
+}
+
+#[test]
+fn frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    eprintln!("frame upsampling adapter: {info:?}");
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let cases = [
+        ("2", Extent2d::new(515, 259), 2),
+        ("4", Extent2d::new(1027, 133), 4),
+        ("8", Extent2d::new(2053, 67), 8),
+        ("8_custom", Extent2d::new(584, 456), 8),
+        ("2_multilf", Extent2d::new(4111, 17), 2),
+        ("4_thin", Extent2d::new(17, 1), 4),
+        ("8_single", Extent2d::new(7, 5), 8),
+    ];
+    let mut default_up8_weights = None;
+    for (name, extent, factor) in cases {
+        let encoded = common::vardct_upsampling(name);
+        let inventory = jxl_gpu_bitstream::parse(&encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
+        assert_eq!(packet.profile.upsampling, factor);
+        assert_eq!(
+            (packet.profile.width, packet.profile.height),
+            (
+                extent.width.div_ceil(factor),
+                extent.height.div_ceil(factor)
+            )
+        );
+        assert_eq!(
+            (packet.profile.output_width, packet.profile.output_height),
+            (extent.width, extent.height)
+        );
+        if name == "2_multilf" {
+            assert_eq!(packet.profile.low_frequency_group_count, 2);
+        }
+        if name == "4" {
+            assert_eq!(packet.profile.coefficient_shifts.len(), 3);
+        }
+        if name == "8" {
+            default_up8_weights = Some(inventory.image_header.upsampling_weights.up8);
+        }
+        if name == "8_custom" {
+            assert!(
+                Some(inventory.image_header.upsampling_weights.up8) != default_up8_weights,
+                "the custom fixture must carry nondefault weights"
+            );
+        }
+        let expected = rust_jxl_rgb8(&encoded, extent);
+        let djxl = djxl_ppm(&encoded, extent);
+        let mut whole_output = None;
+        for cap in [u64::MAX, 256] {
+            let decoder = GpuDecoder::new(
+                WgpuDecodeEngine::new(backend.clone())
+                    .unwrap()
+                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+            );
+            let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+            let mut session = if cap == 256 {
+                open_incremental(&decoder, &encoded, request)
+            } else {
+                decoder.open(&encoded, request).unwrap()
+            };
+            let memory = session
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .memory_stats();
+            assert_eq!(
+                memory.frame_upsample_bytes,
+                u64::from(extent.width) * u64::from(extent.height) * 12
+            );
+            assert_eq!(
+                memory.frame_upsample_weight_bytes,
+                u64::from(factor * factor) * 25 * 4
+            );
+            assert_eq!(memory.frame_upsample_uniform_bytes, 96);
+            if name == "2" && cap == 256 {
+                let budget =
+                    MemoryBudget::new(NonZeroU64::new(memory.frame_upsample_bytes).unwrap());
+                let limited = GpuDecoder::new(
+                    VarDctSubmissionEngine::with_memory_budget(backend.clone(), budget.clone())
+                        .unwrap(),
+                );
+                assert!(matches!(
+                    limited.open(
+                        &encoded,
+                        GpuOutputRequest::color(vardct_rgb8_format()).unwrap()
+                    ),
+                    Err(DecodeError::VarDct(
+                        VarDctDecodeError::MemoryBudgetTooSmall { .. }
+                    ))
+                ));
+                assert_eq!(budget.snapshot().reserved_bytes, 0);
+            }
+            let frame = if cap == 256 {
+                pollster::block_on(session.next_frame_async())
+                    .unwrap()
+                    .unwrap()
+            } else {
+                session.next_frame().unwrap().unwrap()
+            };
+            assert!(session.next_frame().unwrap().is_none());
+            let readback = ImageReadbackPipeline::new(&backend)
+                .submit(frame.output())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(readback.frame.outputs[0].layout.extent, extent);
+            let actual = &readback.frame.outputs[0].bytes;
+            let error = maximum_error(actual, &expected);
+            assert!(
+                error <= 1,
+                "upsample {name}, cap {cap}: Rust jxl error {error}"
+            );
+            if let Some(djxl) = &djxl {
+                let error = maximum_error(actual, djxl);
+                assert!(error <= 1, "upsample {name}, cap {cap}: djxl error {error}");
+            }
+            if let Some(whole) = &whole_output {
+                assert_eq!(actual, whole);
+            } else {
+                whole_output = Some(actual.clone());
+            }
+            eprintln!("upsample {name}, cap {cap}: max error {error}");
+            drop(readback);
+            drop(frame);
+            drop(session);
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn progressive_ac_passes_accumulate_with_independent_tables_on_gpu() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    eprintln!("progressive AC adapter: {info:?}");
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let cases = [
+        (
+            "spectral",
+            common::vardct_progressive_spectral(),
+            Extent2d::new(257, 129),
+            false,
+        ),
+        (
+            "quantized",
+            common::vardct_progressive_quantized(),
+            Extent2d::new(515, 259),
+            true,
+        ),
+        (
+            "multilf",
+            common::vardct_progressive_multilf(),
+            Extent2d::new(2056, 17),
+            false,
+        ),
+    ];
+    let mut distinct_pass_orders = false;
+    for (name, encoded, extent, shifted) in cases {
+        let inventory = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let packet = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+        let entropy = packet.hf_coefficients.as_ref().unwrap();
+        eprintln!(
+            "{name}: shifts {:?}, groups {}, LF groups {}",
+            packet.profile.coefficient_shifts,
+            packet.profile.group_count,
+            packet.profile.low_frequency_group_count
+        );
+        assert_eq!(entropy.passes.len(), if shifted { 2 } else { 3 });
+        assert_eq!(
+            entropy.passes.len(),
+            inventory.frames[0].num_passes as usize
+        );
+        assert_eq!(
+            packet
+                .profile
+                .coefficient_shifts
+                .iter()
+                .any(|&shift| shift != 0),
+            shifted
+        );
+        assert!(
+            entropy
+                .passes
+                .windows(2)
+                .any(|pair| pair[0].metadata != pair[1].metadata)
+        );
+        distinct_pass_orders |= entropy
+            .passes
+            .windows(2)
+            .any(|pair| pair[0].order_words != pair[1].order_words);
+        if name == "quantized" {
+            assert!(
+                inventory.frames[0]
+                    .sections
+                    .iter()
+                    .any(|section| section.bitstream_index != section.toc_index)
+            );
+        }
+        let expected = rust_jxl_rgb8(encoded, extent);
+        let djxl = djxl_ppm(encoded, extent);
+        let mut whole_output = None;
+        for cap in [u64::MAX, 256] {
+            let decoder = GpuDecoder::new(
+                WgpuDecodeEngine::new(backend.clone())
+                    .unwrap()
+                    .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+            );
+            let request = GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+            let mut session = if cap == 256 {
+                let mut input = decoder.stream(request).unwrap();
+                let mut transport = ContainerStreamScanner::new(decoder.container_stream_limits());
+                for chunk in encoded.chunks(37) {
+                    for event in transport.push_chunk(Arc::from(chunk)).unwrap() {
+                        input.push_transport_event(&event).unwrap();
+                    }
+                }
+                for event in transport.finish_input().unwrap() {
+                    input.push_transport_event(&event).unwrap();
+                }
+                input.finish().unwrap()
+            } else {
+                decoder.open(encoded, request).unwrap()
+            };
+            let memory = session
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .memory_stats();
+            assert_eq!(
+                memory.hf_status_bytes,
+                packet.profile.group_count * entropy.passes.len() as u64 * 32
+            );
+            assert_eq!(
+                memory.hf_execution_state_bytes,
+                packet.profile.group_count * entropy.passes.len() as u64 * 464
+            );
+            if cap == 256 {
+                assert!(memory.hf_stream_window_bytes <= 256);
+                assert!(
+                    memory.hf_stream_batch_count
+                        > packet.profile.group_count as usize * entropy.passes.len()
+                );
+            }
+            let frame = if cap == 256 {
+                pollster::block_on(session.next_frame_async())
+                    .unwrap()
+                    .unwrap()
+            } else {
+                session.next_frame().unwrap().unwrap()
+            };
+            assert!(session.next_frame().unwrap().is_none());
+            let readback = ImageReadbackPipeline::new(&backend)
+                .submit(frame.output())
+                .unwrap()
+                .wait()
+                .unwrap();
+            let actual = &readback.frame.outputs[0].bytes;
+            let error = maximum_error(actual, &expected);
+            assert!(error <= 1, "{name}, cap {cap}: Rust jxl error {error}");
+            if let Some(djxl) = &djxl {
+                let error = maximum_error(actual, djxl);
+                assert!(error <= 1, "{name}, cap {cap}: djxl error {error}");
+            }
+            if let Some(whole_output) = &whole_output {
+                assert_eq!(actual, whole_output);
+            } else {
+                whole_output = Some(actual.clone());
+            }
+            drop(readback);
+            drop(frame);
+            drop(session);
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
+    assert!(
+        distinct_pass_orders,
+        "the corpus must exercise different coefficient orders between passes"
+    );
+}
+
+#[test]
+fn progressive_ac_combines_with_recursive_gpu_resident_dc() {
+    let encoded = common::vardct_progressive_dc_ac();
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let inventory = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
+        .unwrap()
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    assert_eq!(inventory.frames.len(), 3);
+    assert_eq!(
+        inventory.frames.last().unwrap().progressive_passes.shifts,
+        [1]
+    );
+    let extent = Extent2d::new(1024, 128);
+    let expected = rust_jxl_rgb8(encoded, extent);
+    let djxl = djxl_ppm(encoded, extent);
+    for cap in [u64::MAX, 256] {
+        let decoder = GpuDecoder::new(
+            WgpuDecodeEngine::new(backend.clone())
+                .unwrap()
+                .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+        );
+        let mut session = decoder
+            .open(
+                encoded,
+                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            session.submission_session(),
+            WgpuDecodeSubmissionSession::ProgressiveDc(_)
+        ));
+        let frame = pollster::block_on(session.next_frame_async())
+            .unwrap()
+            .unwrap();
+        assert!(session.next_frame().unwrap().is_none());
+        let readback = ImageReadbackPipeline::new(&backend)
+            .submit(frame.output())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let actual = &readback.frame.outputs[0].bytes;
+        let error = maximum_error(actual, &expected);
+        assert!(
+            error <= 1,
+            "progressive DC+AC cap {cap}: Rust jxl error {error}"
+        );
+        if let Some(djxl) = &djxl {
+            let error = maximum_error(actual, djxl);
+            assert!(
+                error <= 1,
+                "progressive DC+AC cap {cap}: djxl error {error}"
+            );
+        }
+        drop(readback);
+        drop(frame);
+        drop(session);
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+}
+
+#[test]
+fn progressive_ac_late_corruption_and_cancellation_release_all_pass_storage() {
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let decoder = GpuDecoder::new(
+        WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+    );
+    let encoded = common::vardct_progressive_quantized();
+    let inventory = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
+        .unwrap()
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap();
+    let packet = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
+    let last_pass = packet
+        .hf_coefficients
+        .as_ref()
+        .unwrap()
+        .passes
+        .last()
+        .unwrap();
+    let range = last_pass
+        .pass_groups
+        .iter()
+        .max_by_key(|range| range.length)
+        .unwrap();
+    let mut damaged = encoded.to_vec();
+    let end = (range.end().unwrap() / 8) as usize;
+    assert!(range.length > 256);
+    damaged[end - 32..end].fill(0xff);
+    let request = || GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+    let mut damaged_session = decoder.open(&damaged, request()).unwrap();
+    assert!(matches!(
+        damaged_session.next_frame(),
+        Err(DecodeError::VarDct(VarDctDecodeError::HfCoefficientGpu(_)))
+    ));
+    drop(damaged_session);
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+
+    let mut abandoned = decoder.open(encoded, request()).unwrap();
+    abandoned.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+    assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+    drop(abandoned);
+    let fence = backend.queue().submit(std::iter::empty());
+    backend
+        .device()
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(fence),
+            timeout: None,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+        && std::time::Instant::now() < deadline
+    {
+        backend.device().poll(wgpu::PollType::Poll).unwrap();
+        std::thread::yield_now();
+    }
+    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
 #[test]
@@ -690,9 +1112,8 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let plan = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
-    assert_eq!(plan.uniform_transform, Some(TransformKind::Dct32x32));
     assert!(plan.hf_global.is_none());
-    assert!(!plan.requires_local_tree_staging());
+    assert!(plan.requires_lf_staging());
 
     let backend = WgpuBackend::from_device(
         device,
@@ -724,13 +1145,13 @@ fn combined_single_packet_resumes_across_bounded_gpu_windows() {
     );
     let vardct = session.submission_session().vardct().unwrap();
     let memory = vardct.memory_stats();
-    assert!(!memory.deferred_hf_modular_metadata);
+    assert!(memory.deferred_hf_modular_metadata);
     assert!(memory.packet_stream_window_bytes > 0);
     assert!(memory.packet_stream_window_bytes <= 40);
     assert!(memory.packet_stream_batch_count > 2);
     assert_eq!(
         vardct.submissions_per_frame(),
-        memory.packet_stream_batch_count
+        memory.packet_stream_batch_count + 2
     );
 
     let frame = pollster::block_on(session.next_frame_async())
@@ -848,7 +1269,6 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .unwrap();
         let plan = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
         let blocks = extent.width.div_ceil(8) * extent.height.div_ceil(8);
-        assert_eq!(plan.uniform_transform, None);
         assert_eq!(plan.groups.len(), 1);
         let group = &plan.groups[0];
         assert_eq!(group.task_capacity, blocks);
@@ -859,14 +1279,14 @@ fn tiled_dct8_spans_empty_pass_groups_and_odd_padded_edges_on_gpu() {
             .as_ref()
             .expect("multi-entry VarDCT parses the descriptor-only HF coefficient plan");
         assert_eq!(hf_coefficients.num_hf_presets, 1);
-        assert_eq!(hf_coefficients.context_map.len(), 495 * 15);
+        assert_eq!(hf_coefficients.passes[0].context_map.len(), 495 * 15);
         assert_eq!(hf_coefficients.block_context_map.len(), 39);
         assert_eq!(
-            hf_coefficients.pass_groups.len() as u64,
+            hf_coefficients.passes[0].pass_groups.len() as u64,
             plan.profile.group_count
         );
-        assert!(hf_coefficients.metadata.len() >= 28);
-        assert_eq!(hf_coefficients.lz77_window_words, 0);
+        assert!(hf_coefficients.passes[0].metadata.len() >= 28);
+        assert_eq!(hf_coefficients.passes[0].lz77_window_words, 0);
         let control = group.packet_control(&plan).unwrap();
         let correlations = extent.width.div_ceil(64) * extent.height.div_ceil(64);
         assert_eq!(control.offsets[0], 0);
@@ -965,12 +1385,12 @@ fn libjxl_nonzero_ac_custom_order_matches_reference_on_gpu() {
     let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
     assert!(plan.needs_self_correcting);
     let hf = plan.hf_coefficients.as_ref().unwrap();
-    assert_eq!(hf.pass_groups.len(), 6);
-    assert_eq!(hf.order_coordinate_offset_words, 13 * 3 * 4);
-    let descriptors = bytemuck::cast_slice::<
-        u32,
-        jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor,
-    >(&hf.order_words[..hf.order_coordinate_offset_words as usize]);
+    assert_eq!(hf.passes[0].pass_groups.len(), 6);
+    assert_eq!(hf.passes[0].order_coordinate_offset_words, 13 * 3 * 4);
+    let descriptors =
+        bytemuck::cast_slice::<u32, jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor>(
+            &hf.passes[0].order_words[..hf.passes[0].order_coordinate_offset_words as usize],
+        );
     assert_eq!(descriptors.len(), 13 * 3);
     assert_eq!([descriptors[0].width, descriptors[0].height], [8, 8]);
     assert_ne!(descriptors[0].offset, descriptors[1].offset);
@@ -1080,10 +1500,7 @@ fn global_packet_and_nonzero_ac_resume_across_bounded_gpu_stream_windows() {
         .codestream_inventory(InventoryLimits::default())
         .unwrap();
     let packet = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
-    let damaged_range = packet
-        .hf_coefficients
-        .as_ref()
-        .unwrap()
+    let damaged_range = packet.hf_coefficients.as_ref().unwrap().passes[0]
         .pass_groups
         .iter()
         .max_by_key(|range| range.length)
@@ -1355,16 +1772,15 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
     let plan = BoundedVarDctPacketPlan::parse(encoded, &inventory).unwrap();
     let extent = Extent2d::new(plan.profile.width, plan.profile.height);
     assert_eq!(extent, Extent2d::new(257, 257));
-    assert_eq!(plan.uniform_transform, None);
     assert_eq!(plan.groups.len(), 1);
     assert_eq!(plan.groups[0].extra_precision, 1);
     assert_eq!(plan.groups[0].task_capacity, 33 * 33);
     let hf = plan.hf_coefficients.as_ref().unwrap();
     assert_eq!(hf.num_block_clusters, 3);
-    let descriptors = bytemuck::cast_slice::<
-        u32,
-        jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor,
-    >(&hf.order_words[..hf.order_coordinate_offset_words as usize]);
+    let descriptors =
+        bytemuck::cast_slice::<u32, jxl_wgpu_decode::vardct::artifact::GpuHfOrderDescriptor>(
+            &hf.passes[0].order_words[..hf.passes[0].order_coordinate_offset_words as usize],
+        );
     let custom_orders = (0..13)
         .filter(|&order| descriptors[order * 3].offset != descriptors[order * 3 + 1].offset)
         .collect::<Vec<_>>();

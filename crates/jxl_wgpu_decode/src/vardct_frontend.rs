@@ -25,7 +25,7 @@ const MAX_GROUPS: u64 = 1 << 16;
 /// conversion, restoration, and output packing have separate capability checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VarDctFrontendCapability {
-    SinglePassEntropyPackets,
+    EntropyPackets,
 }
 
 /// Effective horizontal and vertical JPEG component subsampling relative to the largest
@@ -78,7 +78,6 @@ pub enum UnsupportedVarDctFeature {
     Cropping,
     Blending,
     FrameReferences,
-    ProgressivePasses,
     SectionLayout,
 }
 
@@ -100,8 +99,10 @@ pub enum VarDctFrontendError {
     DuplicateSection { kind: &'static str, index: u64 },
     #[error("missing {kind} section for logical index {index}")]
     MissingSection { kind: &'static str, index: u64 },
-    #[error("pass-group section uses pass {pass_index}; the negotiated profile requires pass 0")]
-    UnexpectedPass { pass_index: u32 },
+    #[error("pass-group section uses pass {pass_index}, outside {pass_count} declared passes")]
+    UnexpectedPass { pass_index: u32, pass_count: u32 },
+    #[error("invalid VarDCT progressive pass schedule")]
+    InvalidPassSchedule,
     #[error("section group index {index} exceeds the declared {group_count} groups")]
     GroupIndexOutOfRange { index: u64, group_count: u64 },
 }
@@ -323,6 +324,15 @@ impl HfGlobalPrefix {
                 group_count,
             });
         }
+        Self::parse_pass_reader(&mut reader, packet_end, num_hf_presets)
+    }
+
+    pub(crate) fn parse_pass_reader(
+        reader: &mut impl BitInput,
+        packet_end: u64,
+        num_hf_presets: u32,
+    ) -> Result<Self, VarDctPacketError> {
+        let mut reader = BoundedBitInput::new(reader, packet_end);
         let used_orders = metadata_u32(
             &mut reader,
             "HF coefficient-order mask",
@@ -911,8 +921,8 @@ pub enum VarDctSectionLayout {
     /// carried forward as checked bit cursors; the host does not entropy-decode the entry.
     Single { packet: BitRange },
     /// Independently addressable LF-global, LF-group, HF-global, and pass-group packets.
-    /// Group vectors are normalized to logical group order; each range still addresses the
-    /// section's original physical location in the codestream.
+    /// LF groups are normalized to spatial order; pass groups are normalized to pass-major,
+    /// spatial-group-minor order. Each range addresses its original physical section.
     Sections {
         lf_global: BitRange,
         lf_groups: Vec<BitRange>,
@@ -925,8 +935,13 @@ pub enum VarDctSectionLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardVarDctProfile {
     pub capability: VarDctFrontendCapability,
+    /// Encoded color-sample extent before frame upsampling.
     pub width: u32,
     pub height: u32,
+    /// Presented extent at this progressive-DC level, after frame upsampling.
+    pub output_width: u32,
+    pub output_height: u32,
+    pub upsampling: u32,
     pub bits_per_sample: u32,
     pub color_transform: VarDctColorTransform,
     /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
@@ -938,6 +953,8 @@ pub struct StandardVarDctProfile {
     pub group_dimension: u32,
     pub group_count: u64,
     pub low_frequency_group_count: u64,
+    /// Quantized coefficient left shift for each AC pass, including the final zero shift.
+    pub coefficient_shifts: Vec<u32>,
     /// Whether section F.2's adaptive smoothing pass is required after LF dequantization and
     /// chroma-from-luma reconstruction.
     pub adaptive_lf_smoothing: bool,
@@ -960,7 +977,7 @@ pub struct VarDctGroupRect {
 }
 
 impl StandardVarDctProfile {
-    /// Negotiate the strict single-frame/single-pass XYB or JPEG-reconstruction VarDCT profile.
+    /// Negotiate the single-frame XYB or JPEG-reconstruction VarDCT profile.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, VarDctFrontendError> {
         Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
     }
@@ -994,19 +1011,22 @@ impl StandardVarDctProfile {
                 return unsupported(UnsupportedVarDctFeature::FloatingPointSamples);
             }
         };
-        let (width, height) = if role == VarDctFrameRole::Presentation {
-            (frame.width, frame.height)
-        } else {
-            frame
-                .color_sample_extent()
-                .ok_or(VarDctFrontendError::Unsupported {
-                    feature: UnsupportedVarDctFeature::ImageDimensions,
-                })?
+        let invalid_extent = || VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::ImageDimensions,
         };
+        let (width, height) = frame.color_sample_extent().ok_or_else(invalid_extent)?;
+        let lf_divisor = frame
+            .lf_level
+            .checked_mul(3)
+            .and_then(|shift| 1_u32.checked_shl(shift))
+            .ok_or_else(invalid_extent)?;
         Ok(Self {
-            capability: VarDctFrontendCapability::SinglePassEntropyPackets,
+            capability: VarDctFrontendCapability::EntropyPackets,
             width,
             height,
+            output_width: frame.width.div_ceil(lf_divisor),
+            output_height: frame.height.div_ceil(lf_divisor),
+            upsampling: frame.upsampling,
             bits_per_sample,
             color_transform: if frame.do_ycbcr {
                 VarDctColorTransform::Ycbcr
@@ -1019,6 +1039,13 @@ impl StandardVarDctProfile {
             group_dimension: 128u32 << frame.group_size_shift,
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
+            coefficient_shifts: frame
+                .progressive_passes
+                .shifts
+                .iter()
+                .copied()
+                .chain([0])
+                .collect(),
             adaptive_lf_smoothing: frame.flags & 0x80 == 0,
             uses_lf_frame: frame.uses_lf_frame(),
             lf_level: frame.lf_level,
@@ -1334,7 +1361,7 @@ fn validate_frame(
     if !frame.do_ycbcr && frame.jpeg_upsampling != [0; 3] {
         return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
     }
-    if frame.upsampling != 1
+    if !matches!(frame.upsampling, 1 | 2 | 4 | 8)
         || frame
             .extra_channel_upsampling
             .iter()
@@ -1363,12 +1390,37 @@ fn validate_frame(
     {
         return unsupported(UnsupportedVarDctFeature::FrameReferences);
     }
-    if frame.num_passes != 1
-        || !frame.progressive_passes.shifts.is_empty()
-        || !frame.progressive_passes.downsampling.is_empty()
-        || !frame.progressive_passes.last_pass.is_empty()
+    if !(1..=11).contains(&frame.num_passes)
+        || frame.progressive_passes.shifts.len() != frame.num_passes as usize - 1
+        || frame
+            .progressive_passes
+            .shifts
+            .iter()
+            .any(|&shift| shift > 3)
+        || frame.progressive_passes.downsampling.len() != frame.progressive_passes.last_pass.len()
+        || frame.progressive_passes.downsampling.len() >= frame.num_passes as usize
+        || frame
+            .progressive_passes
+            .downsampling
+            .iter()
+            .any(|&factor| !matches!(factor, 1 | 2 | 4 | 8))
+        || frame
+            .progressive_passes
+            .last_pass
+            .iter()
+            .any(|&pass| pass >= frame.num_passes)
+        || frame
+            .progressive_passes
+            .downsampling
+            .windows(2)
+            .any(|pair| pair[1] >= pair[0])
+        || frame
+            .progressive_passes
+            .last_pass
+            .windows(2)
+            .any(|pair| pair[1] <= pair[0])
     {
-        return unsupported(UnsupportedVarDctFeature::ProgressivePasses);
+        return Err(VarDctFrontendError::InvalidPassSchedule);
     }
     if frame.group_count == 0
         || frame.low_frequency_group_count == 0
@@ -1392,7 +1444,10 @@ fn collect_sections(
         validate_range(section.bits, codestream_bits)?;
     }
     if let [section] = frame.sections.as_slice() {
-        if section.kind != FrameSectionKind::Single {
+        if section.kind != FrameSectionKind::Single
+            || frame.num_passes != 1
+            || frame.group_count != 1
+        {
             return unsupported(UnsupportedVarDctFeature::SectionLayout);
         }
         return Ok(VarDctSectionLayout::Single {
@@ -1410,7 +1465,11 @@ fn collect_sections(
     let mut lf_global = None;
     let mut hf_global = None;
     let mut lf_groups = vec![None; host_count(frame.low_frequency_group_count)?];
-    let mut pass_groups = vec![None; host_count(frame.group_count)?];
+    let pass_group_count = frame
+        .group_count
+        .checked_mul(u64::from(frame.num_passes))
+        .ok_or(VarDctFrontendError::SectionRangeOverflow)?;
+    let mut pass_groups = vec![None; host_count(pass_group_count)?];
     for section in &frame.sections {
         match section.kind {
             FrameSectionKind::LowFrequencyGlobal => {
@@ -1428,11 +1487,21 @@ fn collect_sections(
                 pass_index,
                 group_index,
             } => {
-                if pass_index != 0 {
-                    return Err(VarDctFrontendError::UnexpectedPass { pass_index });
+                if pass_index >= frame.num_passes {
+                    return Err(VarDctFrontendError::UnexpectedPass {
+                        pass_index,
+                        pass_count: frame.num_passes,
+                    });
                 }
-                let slot = group_slot(&mut pass_groups, group_index, frame.group_count)?;
-                assign_once(slot, section.bits, "pass-group", group_index)?;
+                if group_index >= frame.group_count {
+                    return Err(VarDctFrontendError::GroupIndexOutOfRange {
+                        index: group_index,
+                        group_count: frame.group_count,
+                    });
+                }
+                let index = u64::from(pass_index) * frame.group_count + group_index;
+                let slot = group_slot(&mut pass_groups, index, pass_group_count)?;
+                assign_once(slot, section.bits, "pass-group", index)?;
             }
             FrameSectionKind::Single => unreachable!("single entries rejected above"),
         }

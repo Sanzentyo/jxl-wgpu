@@ -249,3 +249,52 @@ pub fn jpeg_transcode_440() -> &'static [u8] {
         LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_440.jxl.hex")));
     BYTES.as_slice()
 }
+
+pub fn vardct_progressive_spectral() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_progressive_spectral.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn vardct_progressive_quantized() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_progressive_quantized.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn vardct_progressive_multilf() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_progressive_multilf.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn vardct_progressive_dc_ac() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_progressive_dc_ac.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn vardct_upsampling(name: &str) -> Vec<u8> {
+    decode_hex(match name {
+        "2" => include_str!("../../test-data/testsrc_vardct_upsample_2.jxl.hex"),
+        "4" => include_str!("../../test-data/testsrc_vardct_upsample_4.jxl.hex"),
+        "8" => include_str!("../../test-data/testsrc_vardct_upsample_8.jxl.hex"),
+        "8_custom" => include_str!("../../test-data/testsrc_vardct_upsample_8_custom.jxl.hex"),
+        "2_multilf" => include_str!("../../test-data/testsrc_vardct_upsample_2_multilf.jxl.hex"),
+        "4_thin" => include_str!("../../test-data/testsrc_vardct_upsample_4_thin.jxl.hex"),
+        "8_single" => include_str!("../../test-data/testsrc_vardct_upsample_8_single.jxl.hex"),
+        _ => panic!("unknown upsampling fixture: {name}"),
+    })
+}

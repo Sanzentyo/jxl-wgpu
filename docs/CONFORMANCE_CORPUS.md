@@ -274,9 +274,9 @@ pixels. A budget one byte below the exact 40-byte layout must fail at open with 
 
 `vardct_engine_gpu::combined_single_packet_resumes_across_bounded_gpu_windows` generates a patterned
 32×32 DCT32x32 stream through the GPU encoder and forces its single combined LF/HF packet through a
-40-byte cap. More than two windows share the same 64/128-byte state across the LF-to-HF transition;
-there is no intermediate status map and the final packet command shares the first downstream
-submission. Runtime-neutral async decode/readback must agree with Rust `jxl` and optional `djxl`
+40-byte cap. More than two LF windows retain the same state before a mapped cursor selects the HF
+descriptor. HF metadata then reports the general HF-global/AC cursor, so the test exercises the
+same staged path as arbitrary single-entry streams. Runtime-neutral async decode/readback agrees with Rust `jxl` and optional `djxl`
 within one RGB8 code, abandoning a prefetched decode must drain the byte budget, and late-window
 damage must return typed `PacketGpu(Entropy { .. })` from the final aggregate map.
 
@@ -415,6 +415,79 @@ window without touching its host-parsed descriptor and must return typed
 `PacketGpu(Entropy { .. })` from the final aggregate map before releasing the reservation. The effort-7 stream also exercises X=5/B=5
 quant-matrix scales; a lower-level actual-GPU artifact test observes non-default scale multipliers
 for all three channels directly in the resident resource vectors.
+
+## VarDCT frame upsampling
+
+Seven libjxl 0.12.0 codestreams live under `crates/jxl_wgpu_decode/test-data/`. They use the same
+P6 header and deterministic RGB formula documented in the spectral-pass section below. Each
+command is `cjxl source.ppm output.jxl -d 2 -e 7 -m 0 --container=0 --progressive_dc=0
+--resampling=FACTOR`. The 4× case additionally uses `--progressive_ac`. The custom 8× case uses
+`--upsampling_mode=0 --already_downsampled`; its 73×57 PPM is already at the encoded resolution,
+so the presented extent is 584×456. Other PPM dimensions equal their presented dimensions.
+
+| Suffix after `testsrc_vardct_upsample_` | Presented extent | Evidence | Binary SHA-256 |
+|---|---|---|---|
+| `2.jxl.hex` | 515×259 | 2×, two spatial groups, odd edges | `e59711816d091783e1e625938f16d883a3b60bf8330bfc55f849a545f3d526ed` |
+| `4.jxl.hex` | 1027×133 | 4×, three spectral passes, two groups | `94133d7f1a59718834de6fbb2363568f8114107008cb41dd9030b37253e44028` |
+| `8.jxl.hex` | 2053×67 | 8×, odd edges and two groups | `3105bb30f464f80f0dfe50c26d5f18a8a27587cd1a4489f7981671a4dc3893cd` |
+| `8_custom.jxl.hex` | 584×456 | Custom nearest-neighbor weights, single-entry 73×57 encoded grid | `ce9b47e9e3070207f59f21fb8c6a2de8e263bf190fc380a1a70eadcb23143c87` |
+| `2_multilf.jxl.hex` | 4111×17 | Two LF groups and nine pass groups | `c1d7d5cd7538cb5ba8ae3daba3784672216ecd1e2f331d248310a50209348896` |
+| `4_thin.jxl.hex` | 17×1 | Mirrored one-sample vertical axis | `86fb6036f6a357ca31bd9386e0deb95704897d85e41329591b9c8ecc6130866e` |
+| `8_single.jxl.hex` | 7×5 | One encoded sample on each axis | `3b43087728f340f29829cf286778d2916d5edaff8d6eb8718d38e005d9a0514d` |
+
+`frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu` validates factors, coded
+and presented extents, nondefault custom weights, and exact plane/weight/uniform memory costs.
+It checks whole-input blocking output and fragmented-input async output with a 256-byte GPU cap
+against both Rust `jxl` and optional `djxl`, allowing at most one RGB8 code of error. Both upload
+policies must produce identical bytes and release all reservations. A budget that could hold only
+the three upsampled planes must be refused before submission. The tests ran on Apple M5/Metal on
+2026-09-07. The compact-kernel unit test compares every reflected phase against an independently
+constructed symmetric matrix and rejects invalid factors, truncated weights, and non-finite
+weights; Naga validates the reused WGSL. Profile tests fix the exact LF/pass-group boundary in
+encoded coordinates and reject invalid factors.
+
+Single-entry streams now use bounded LF/HF-metadata staging and the general HF-global/AC parser.
+Their image dimensions impose no uniform-transform assumption. These fixtures establish ordinary
+VarDCT color resampling coverage; Modular and extra-channel resampling remain separate gaps.
+
+## Spectral and quantized VarDCT passes
+
+The following synthetic fixtures are checked in under `crates/jxl_wgpu_decode/test-data/` as
+hex-encoded raw codestreams. They were generated with libjxl `cjxl` 0.12.0. Each P6 PPM has header
+`P6\n{width} {height}\n255\n` followed by row-major RGB8 samples, with zero-based coordinates:
+`R = (13*x + 7*y) & 255`, `G = ((3*x) ^ (11*y)) & 255`, and
+`B = (5*x + 17*y + (x ^ y)) & 255`.
+
+| Fixture suffix after `testsrc_vardct_progressive_` | Extent | Pass/topology evidence | Binary SHA-256 |
+|---|---|---|---|
+| `spectral.jxl.hex` | 257×129 | Three unshifted AC passes, two spatial groups | `b5246f6478e45c034805eb7fea968e08e65e0406cb98f75d9e443c431eebafe4` |
+| `quantized.jxl.hex` | 515×259 | Two AC passes with shifts `[1, 0]`, six spatial groups, center-first TOC | `25558bce86d71acd96ba17a41d365c2059f5ae86020c0abe5637d1b51edd0cba` |
+| `multilf.jxl.hex` | 2056×17 | Three unshifted AC passes, nine spatial groups across two LF groups | `4edf4d9627d0ee7909116007822ab37feece908af9b95a064d32dc2f6a814ed6` |
+| `dc_ac.jxl.hex` | 1024×128 | Recursive DC levels 2→1→0, global-only Modular root, two final AC passes | `8ab79d20f86bfc8b1349361927f13415d5669d1e98125df2b8b3673fdca04c7b` |
+
+```console
+cjxl spectral.ppm spectral.jxl -d 2 -e 7 -m 0 --container=0 --progressive_ac --progressive_dc=0
+cjxl quantized.ppm quantized.jxl -d 2 -e 7 -m 0 --container=0 --qprogressive_ac --progressive_dc=0 --group_order=1 --center_x=400 --center_y=200
+cjxl multilf.ppm multilf.jxl -d 2 -e 7 -m 0 --container=0 --progressive_ac --progressive_dc=0
+cjxl dc_ac.ppm dc_ac.jxl -d 2 -e 7 -m 0 --container=0 --qprogressive_ac --progressive_dc=2
+```
+
+`progressive_ac_passes_accumulate_with_independent_tables_on_gpu` checks that distinct per-pass
+entropy tables are retained, that every pass receives separate status/resume storage, and that
+whole-range blocking and 256-byte-window async execution produce identical RGB8. The latter feeds
+37-byte transport chunks through the public streaming decoder, crossing HF-global descriptors and
+coefficient packets. `progressive_ac_combines_with_recursive_gpu_resident_dc` checks the fourth
+fixture with both window policies and only one visible final frame. Both tests compare every output
+sample with Rust `jxl` and installed `djxl`, accepting at most one code of difference; all cases ran
+on Apple M5/Metal on 2026-09-07. These are decoder correctness results, not encoder quality or speed
+measurements.
+
+`progressive_ac_late_corruption_and_cancellation_release_all_pass_storage` corrupts the last AC
+pass's largest packet and requires typed `HfCoefficientGpu` failure without an authoritative frame.
+Dropping either failed or prefetched work must release the complete shared reservation. The parser
+unit suite additionally repeats a real HF pass descriptor eleven times, preserves shifts 0–3, and
+rejects truncation inside the final descriptor. That is parser boundary evidence; eleven-pass image
+conformance and intermediate progressive presentation remain separate gaps.
 
 ## Bounded Modular stream-window matrix
 

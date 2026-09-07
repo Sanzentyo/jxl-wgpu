@@ -5,15 +5,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{
-    ChangedRegions, Extent2d, OutputId, Region, SubmissionToken, TransformKind,
-};
+use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot,
     MemoryPermit, ResidentChromaShift, ResidentChromaUpsampleInputs, ResidentEpfInputs,
-    ResidentF32Plane, ResidentGaborishInputs, ResidentStorageBinding, ResidentVarDctInputs,
-    ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
-    UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
+    ResidentF32Plane, ResidentGaborishInputs, ResidentStorageBinding, ResidentUpsampleInputs,
+    ResidentUpsampleWeights, ResidentVarDctInputs, ResidentVarDctRenderConfig,
+    ResidentVarDctScratch, SubmissionPollPermit, UnvalidatedGpuImageFrame,
+    UnvalidatedGpuImageOutput, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
@@ -53,7 +52,7 @@ use super::window_plan::{
     HfPacketWindowExecutionPlan, copy_stream_segment, map_codestream_source_error,
 };
 
-/// One-frame submission state for [`VarDctSubmissionEngine`].
+/// One-frame submission state for [`crate::VarDctSubmissionEngine`].
 pub struct VarDctDecodeSession {
     pub(super) backend: WgpuBackend,
     pub(super) pipelines: Arc<VarDctPipelines>,
@@ -530,14 +529,17 @@ struct VarDctGroupJobBuffers {
     artifact_uniform: wgpu::Buffer,
 }
 
-struct RestorationJobBuffers {
-    _planes: [wgpu::Buffer; 3],
+struct PostTransformJobBuffers {
+    _restoration_planes: Option<[wgpu::Buffer; 3]>,
     _pre_restoration_planes: Option<[wgpu::Buffer; 3]>,
     _pre_restoration_uniforms: Vec<wgpu::Buffer>,
     _gaborish_uniform: Option<wgpu::Buffer>,
     _epf_sigma: Option<wgpu::Buffer>,
     _epf_sigma_uniforms: Vec<wgpu::Buffer>,
     _epf_uniforms: Vec<wgpu::Buffer>,
+    _frame_upsample_planes: Option<[wgpu::Buffer; 3]>,
+    _frame_upsample_weights: Option<ResidentUpsampleWeights>,
+    _frame_upsample_uniforms: Vec<wgpu::Buffer>,
 }
 
 struct VarDctJobLifetime {
@@ -557,7 +559,7 @@ struct VarDctJobLifetime {
     _external_lf: Option<ProgressiveDcXybPlanes>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: [wgpu::Buffer; 3],
-    _restoration: Option<RestorationJobBuffers>,
+    _post_transform: PostTransformJobBuffers,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: VarDctOutputScratch,
 }
@@ -572,7 +574,6 @@ impl Drop for VarDctJobLifetime {
 
 #[derive(Clone, Debug)]
 struct VarDctGroupValidation {
-    uniform_transform: Option<TransformKind>,
     expected_lf_samples: u32,
     expected_coefficients: u32,
     expected_blocks: u32,
@@ -1385,7 +1386,7 @@ impl VarDctPendingFrame {
             cursors.push(
                 status
                     .validate_hf_metadata_stage(VarDctPacketValidation {
-                        expected_strategy: expected.uniform_transform,
+                        expected_strategy: None,
                         expected_lf_samples: expected.expected_lf_samples,
                         block_count: expected.expected_blocks,
                         correlation_samples: expected.correlation_samples,
@@ -1873,7 +1874,7 @@ impl VarDctPendingFrame {
                 .and_then(|bytes| bytemuck::try_pod_read_unaligned(bytes).ok())
                 .ok_or(VarDctDecodeError::StatusAbi { status: "artifact" })?;
             let validation = VarDctPacketValidation {
-                expected_strategy: expected.uniform_transform,
+                expected_strategy: None,
                 expected_lf_samples: expected.expected_lf_samples,
                 block_count: expected.expected_blocks,
                 correlation_samples: expected.correlation_samples,
@@ -2230,10 +2231,10 @@ fn submit_vardct(
         &codestream_buffer,
         source.memory.codestream_bytes,
     )?;
-    let staged_local_trees = source.packet.requires_local_tree_staging();
+    let staged_lf = source.packet.requires_lf_staging();
     let staged_hf_global =
         source.packet.requires_hf_global_staging() && source.combined_packet_windows.is_none();
-    let group_specific_metadata = staged_local_trees || source.packet.profile.uses_lf_frame;
+    let group_specific_metadata = staged_lf || source.packet.profile.uses_lf_frame;
     let modular_metadata = if group_specific_metadata {
         source
             .packet
@@ -2454,7 +2455,14 @@ fn submit_vardct(
             "jxl-wgpu VarDCT pre-restoration Y plane",
             "jxl-wgpu VarDCT pre-restoration B plane",
         ];
-        let full_plane_bytes = source.memory.restoration_scratch_bytes / 3;
+        let shifted_channels = source
+            .packet
+            .profile
+            .channel_shifts
+            .into_iter()
+            .filter(|shift| shift.is_subsampled())
+            .count() as u64;
+        let full_plane_bytes = source.memory.pre_restoration_upsample_bytes / shifted_channels;
         std::array::from_fn(|channel| {
             if source.packet.profile.channel_shifts[channel].is_subsampled() {
                 storage(
@@ -2481,6 +2489,20 @@ fn submit_vardct(
             )
         })
     });
+    let frame_upsample_planes = source.frame_upsample.as_ref().map(|_| {
+        std::array::from_fn(|_| {
+            storage(
+                "jxl-wgpu VarDCT upsampled frame plane",
+                source.memory.frame_upsample_bytes / 3,
+                wgpu::BufferUsages::empty(),
+            )
+        })
+    });
+    let frame_upsample_weights = source
+        .frame_upsample
+        .as_ref()
+        .map(|kernel| kernel.upload(device))
+        .transpose()?;
     let epf_sigma = source.epf.as_ref().map(|_| {
         storage(
             "jxl-wgpu VarDCT EPF inverse-sigma plane",
@@ -2543,7 +2565,7 @@ fn submit_vardct(
     let (packet_stage_commands, combined_packet_batches, mut commands) = if let Some(plan) =
         &source.lf_packet_windows
     {
-        if !staged_local_trees {
+        if !staged_lf {
             return Err(VarDctDecodeError::EntropyWindowContract {
                 detail: "LF packet windows require staged local trees",
             });
@@ -2656,7 +2678,7 @@ fn submit_vardct(
             }),
         )
     } else if let Some(plan) = &source.combined_packet_windows {
-        if staged_local_trees {
+        if staged_lf {
             return Err(VarDctDecodeError::EntropyWindowContract {
                 detail: "combined packet windows cannot stage local trees",
             });
@@ -2797,7 +2819,7 @@ fn submit_vardct(
                         .packet
                         .encode_hf(device, &mut packet_commands, buffers);
                 }
-            } else if staged_local_trees || staged_hf_global {
+            } else if staged_lf || staged_hf_global {
                 pipelines
                     .packet
                     .encode_lf(device, &mut packet_commands, buffers);
@@ -2807,7 +2829,7 @@ fn submit_vardct(
                     .encode(device, &mut packet_commands, buffers);
             }
         }
-        if staged_local_trees || staged_hf_global {
+        if staged_lf || staged_hf_global {
             for (index, buffers) in group_buffers.iter().enumerate() {
                 packet_commands.copy_buffer_to_buffer(
                     &buffers.packet_status,
@@ -2820,7 +2842,7 @@ fn submit_vardct(
                 );
             }
         }
-        if staged_local_trees || staged_hf_global {
+        if staged_lf || staged_hf_global {
             (
                 Some(LfPacketCommands::Whole(packet_commands.finish())),
                 None,
@@ -3223,14 +3245,48 @@ fn submit_vardct(
     }
     let presentation_planes = restoration
         .as_ref()
-        .map_or(&resident_planes, RestorationCursor::current);
-    let presentation_shifts = if restoration.is_some() {
+        .map_or(restoration_source, RestorationCursor::current);
+    let mut frame_upsample_uniforms = Vec::new();
+    if let (Some(upsampled), Some(weights)) = (&frame_upsample_planes, &frame_upsample_weights) {
+        for channel in 0..3 {
+            frame_upsample_uniforms.push(pipelines.frame_upsample.encode(
+                device,
+                &mut commands,
+                ResidentUpsampleInputs {
+                    input: ResidentF32Plane {
+                        storage: resident_binding(&presentation_planes[channel])?,
+                        width: image_width,
+                        height: image_height,
+                        stride: padded_width,
+                    },
+                    output: ResidentF32Plane {
+                        storage: resident_binding(&upsampled[channel])?,
+                        width: source.packet.profile.output_width,
+                        height: source.packet.profile.output_height,
+                        stride: source.packet.profile.output_width,
+                    },
+                    weights,
+                },
+            )?);
+        }
+    }
+    let presentation_planes = frame_upsample_planes
+        .as_ref()
+        .unwrap_or(presentation_planes);
+    let presentation_shifts = if restoration.is_some() || frame_upsample_planes.is_some() {
         [crate::vardct_frontend::VarDctChannelShift::default(); 3]
     } else {
         source.packet.profile.channel_shifts
     };
+    let output_width = source.packet.profile.output_width;
+    let output_height = source.packet.profile.output_height;
+    let presentation_stride = if frame_upsample_planes.is_some() {
+        output_width
+    } else {
+        padded_width
+    };
     let presentation_geometry = presentation_shifts.map(|shift| {
-        shift.shifted_extent(image_width, image_height).ok_or(
+        shift.shifted_extent(output_width, output_height).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
                 field: "presentation channel extent",
             },
@@ -3239,11 +3295,11 @@ fn submit_vardct(
     let [geometry_x, geometry_y, geometry_b] = presentation_geometry;
     let presentation_geometry = [geometry_x?, geometry_y?, geometry_b?];
     let presentation_strides = presentation_shifts.map(|shift| {
-        padded_width
-            .checked_shr(shift.horizontal)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
+        presentation_stride.checked_shr(shift.horizontal).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
                 field: "presentation channel stride",
-            })
+            },
+        )
     });
     let [stride_x, stride_y, stride_b] = presentation_strides;
     let presentation_strides = [stride_x?, stride_y?, stride_b?];
@@ -3273,22 +3329,25 @@ fn submit_vardct(
             ],
             output: resident_binding(&output)?,
             config: VarDctOutputConfig {
-                width: source.packet.profile.width,
-                height: source.packet.profile.height,
+                width: output_width,
+                height: output_height,
                 transform: source.output_transform,
             },
         },
     )?;
     debug_assert_eq!(output_scratch.plan, source.output_plan);
-    let restoration_buffers = restoration_planes.map(|planes| RestorationJobBuffers {
-        _planes: planes,
+    let post_transform_buffers = PostTransformJobBuffers {
+        _restoration_planes: restoration_planes,
         _pre_restoration_planes: pre_restoration_planes,
         _pre_restoration_uniforms: pre_restoration_uniforms,
         _gaborish_uniform: gaborish_uniform,
         _epf_sigma: epf_sigma,
         _epf_sigma_uniforms: epf_sigma_uniforms,
         _epf_uniforms: epf_uniforms,
-    });
+        _frame_upsample_planes: frame_upsample_planes,
+        _frame_upsample_weights: frame_upsample_weights,
+        _frame_upsample_uniforms: frame_upsample_uniforms,
+    };
     let packet_status_end = source.memory.packet_status_bytes;
     let artifact_status_end = packet_status_end
         .checked_add(
@@ -3379,7 +3438,7 @@ fn submit_vardct(
         _external_lf: external_lf,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
-        _restoration: restoration_buffers,
+        _post_transform: post_transform_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
     });
@@ -3400,7 +3459,6 @@ fn submit_vardct(
                 field: "LF-group validation correlation samples",
             })?;
         expected_groups.push(VarDctGroupValidation {
-            uniform_transform: source.packet.uniform_transform,
             expected_lf_samples: if source.packet.profile.uses_lf_frame {
                 0
             } else {
@@ -3524,7 +3582,7 @@ fn submit_vardct(
     arm_status_map(
         &lifetime,
         &completion,
-        if staged_local_trees {
+        if staged_lf {
             "VarDCT LF cursor mapping"
         } else if staged_hf_global {
             "VarDCT HF-global cursor mapping"

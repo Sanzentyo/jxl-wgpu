@@ -4,7 +4,8 @@ use std::sync::{Arc, atomic::AtomicUsize};
 use jxl_gpu_bitstream::{CodestreamInventory, InventoryLimits, ParseLimits};
 use jxl_wgpu::{
     KernelVariant, MemoryBudget, MemoryBudgetSnapshot, ResidentChromaUpsamplePipeline,
-    ResidentEpfPipeline, ResidentGaborishPipeline, ResidentVarDctRenderer, WgpuBackend,
+    ResidentEpfPipeline, ResidentGaborishPipeline, ResidentUpsamplePipeline,
+    ResidentVarDctRenderer, WgpuBackend,
 };
 
 use crate::progressive_dc::ProgressiveDcPipeline;
@@ -33,6 +34,7 @@ pub(super) struct VarDctPipelines {
     pub(super) hf_coefficients: HfCoefficientPipeline,
     pub(super) renderer: ResidentVarDctRenderer,
     pub(super) chroma_upsample: ResidentChromaUpsamplePipeline,
+    pub(super) frame_upsample: ResidentUpsamplePipeline,
     pub(super) gaborish: ResidentGaborishPipeline,
     pub(super) epf_sigma: EpfSigmaPipeline,
     pub(super) epf: ResidentEpfPipeline,
@@ -52,6 +54,8 @@ impl VarDctPipelines {
             resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
         let chroma_upsample_variant =
             resolve_kernel_variant(backend, "vardct_chroma_upsample", KernelVariant::Tile16x16)?;
+        let frame_upsample_variant =
+            resolve_kernel_variant(backend, "vardct_frame_upsample", KernelVariant::Tile16x16)?;
         let epf_sigma_variant =
             resolve_kernel_variant(backend, "vardct_epf_sigma", KernelVariant::Lanes64)?;
         let epf_variant = resolve_kernel_variant(backend, "vardct_epf", KernelVariant::Tile16x16)?;
@@ -75,6 +79,7 @@ impl VarDctPipelines {
                 device,
                 chroma_upsample_variant,
             )?,
+            frame_upsample: ResidentUpsamplePipeline::with_variant(device, frame_upsample_variant)?,
             gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
@@ -149,7 +154,7 @@ impl VarDctSubmissionEngine {
     }
 
     /// Returns the caller-supplied upper bound, not a session's budget-resolved cap. The latter is
-    /// reported by [`VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`].
+    /// reported by [`crate::VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`].
     #[must_use]
     pub const fn stream_window_limit(&self) -> Option<NonZeroU64> {
         self.stream_window_limit

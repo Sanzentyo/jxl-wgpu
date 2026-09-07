@@ -42,7 +42,7 @@ impl<'a> ResidentStorageBinding<'a> {
         })
     }
 
-    fn resource(self) -> wgpu::BindingResource<'a> {
+    pub(crate) fn resource(self) -> wgpu::BindingResource<'a> {
         wgpu::BindingResource::Buffer(wgpu::BufferBinding {
             buffer: self.buffer,
             offset: self.offset,

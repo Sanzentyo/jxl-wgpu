@@ -26,6 +26,8 @@ struct HfCoefficientSinkParams {
 @group(1) @binding(3) var<uniform> hf_sink_params: HfCoefficientSinkParams;
 
 var<private> hf_coefficient_error: u32;
+// Zero for standalone sinks. The pass consumer selects a complete descriptor/coordinate table.
+var<private> hf_order_table_base: u32;
 
 const HF_SINK_ERROR_TASK: u32 = 1u;
 const HF_SINK_ERROR_CHANNEL: u32 = 2u;
@@ -39,7 +41,7 @@ fn hf_sink_fail(code: u32) {
 }
 
 fn hf_order_descriptor(index: u32) -> HfOrderDescriptor {
-    let base = index * 4u;
+    let base = hf_order_table_base + index * 4u;
     return HfOrderDescriptor(
         hf_order_table[base],
         hf_order_table[base + 1u],
@@ -85,7 +87,7 @@ fn hf_store_quantized_coefficient(
         return false;
     }
     let packed_coordinate = hf_order_table[
-        hf_sink_params.order_coordinate_offset_words + descriptor.offset + order_index
+        hf_order_table_base + hf_sink_params.order_coordinate_offset_words + descriptor.offset + order_index
     ];
     var frequency_x = packed_coordinate & 0xffffu;
     var frequency_y = packed_coordinate >> 16u;

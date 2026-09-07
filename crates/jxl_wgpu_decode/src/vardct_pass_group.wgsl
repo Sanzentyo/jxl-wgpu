@@ -25,11 +25,14 @@ struct Params {
     global_group_index: u32,
     block_context: HfBlockContextTables,
     channel_shifts: u32,
+    metadata_base_words: u32,
+    order_base_words: u32,
+    spatial_group_index: u32,
+    _reserved: u32,
 };
 
 @group(0) @binding(0) var<storage, read> codestream: array<u32>;
-// The packed common entropy descriptor starts at word zero. HF coefficient-context and block-
-// context maps follow at the offsets carried by Params, avoiding two additional storage bindings.
+// All passes share one table buffer; each invocation selects its own descriptor and context map.
 @group(0) @binding(1) var<storage, read> modular_metadata: array<u32>;
 @group(0) @binding(2) var<storage, read_write> reconstruction: array<u32>;
 @group(0) @binding(3) var<storage, read> params_input: array<Params>;
@@ -114,7 +117,7 @@ fn read_bits(count: u32) -> u32 {
 }
 
 fn modular_metadata_base() -> u32 {
-    return 0u;
+    return params.metadata_base_words;
 }
 
 /*__JXL_MODULAR_ENTROPY__*/
@@ -277,6 +280,7 @@ fn save_execution_state(
 fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
     let lane = workgroup.x;
     params = params_input[lane];
+    hf_order_table_base = params.order_base_words;
     decode_error = 0u;
     hf_coefficient_error = 0u;
     var selected_preset = 0u;
@@ -352,7 +356,7 @@ fn decode_hf_coefficients(@builtin(workgroup_id) workgroup: vec3<u32>) {
             || hf_artifact[task_metadata + 3u] != params.block_origin_y + y
             || hf_artifact[task_metadata + 4u] == 0u
             || hf_artifact[task_metadata + 5u] == 0u
-            || hf_artifact[task_metadata + 7u] != params.status_index {
+            || hf_artifact[task_metadata + 7u] != params.spatial_group_index {
             fail(ERROR_TASK_SHAPE);
             continue;
         }
