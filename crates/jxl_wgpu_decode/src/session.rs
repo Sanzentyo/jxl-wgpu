@@ -122,6 +122,9 @@ pub trait GpuSubmissionSession: 'static {
 /// Exact reason a prefetch attempt stopped below its requested queue depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefetchBackpressure {
+    /// A preceding presentation must complete before the next reference-dependent frame starts.
+    /// Consume the oldest pending frame, then retry prefetch. Caller-held output leases may remain.
+    FrameDependency { index: usize },
     /// Pending frames plus caller-owned frame leases exhausted the configured frame slots.
     FrameSlots { limit: usize },
     /// The shared byte-weighted GPU memory budget rejected the next submission.
@@ -813,8 +816,10 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
     }
 
     /// Nonblocking prefetch counterpart. `Pending` is returned only while waiting for a retained
-    /// frame lease to release a slot; memory and poll-worker admission failures are returned as a
-    /// ready [`PrefetchProgress`] because those external budgets do not own task wakers.
+    /// frame lease to release a slot. Memory and poll-worker pressure return a ready
+    /// [`PrefetchProgress`] because those external budgets do not own task wakers. A frame
+    /// dependency also returns ready progress: consume the oldest pending presentation before
+    /// retrying prefetch, rather than waiting for a dependency that this call does not drive.
     pub fn poll_prefetch(
         &mut self,
         target_depth: NonZeroUsize,
@@ -970,6 +975,12 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
                     PrefetchBackpressure::Memory(error),
                 ))))
             }
+            Err(Error::FrameDependencyBackpressure { index }) => {
+                drop(permit);
+                Ok(Some(self.prefetch_progress(Some(
+                    PrefetchBackpressure::FrameDependency { index },
+                ))))
+            }
             Err(Error::PollBackpressure(error @ jxl_wgpu::SubmissionPollerError::Full { .. })) => {
                 drop(permit);
                 Ok(Some(self.prefetch_progress(Some(
@@ -1102,6 +1113,9 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
 
 fn prefetch_backpressure_error(backpressure: PrefetchBackpressure) -> Error {
     match backpressure {
+        PrefetchBackpressure::FrameDependency { index } => {
+            Error::FrameDependencyBackpressure { index }
+        }
         PrefetchBackpressure::FrameSlots { limit } => Error::Backpressure { limit },
         PrefetchBackpressure::Memory(error) => Error::MemoryBackpressure(error),
         PrefetchBackpressure::SubmissionPoller(error) => Error::PollBackpressure(error),

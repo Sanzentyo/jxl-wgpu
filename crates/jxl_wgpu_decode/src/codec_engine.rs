@@ -25,6 +25,7 @@ use crate::{
     WgpuPendingFrame, WgpuSubmissionEngine,
 };
 
+mod composition;
 mod sequence;
 pub use sequence::{FrameSequencePending, FrameSequenceSession};
 
@@ -93,7 +94,7 @@ fn negotiate_progressive_dc(
     if frames.len() == 1
         && matches!(
             frames[0].frame_type,
-            FrameType::Regular | FrameType::SkipProgressive
+            FrameType::Regular | FrameType::SkipProgressive | FrameType::ReferenceOnly
         )
         && frames[0].lf_source_frame.is_none()
     {
@@ -272,6 +273,7 @@ impl WgpuDecodeEngine {
         )?;
         if inventory.image_header.animation.is_some()
             || plan.presentations.len() != 1
+            || plan.nodes.iter().any(|node| node.needs_composition)
             || inventory.frames.iter().any(|frame| {
                 matches!(
                     frame.frame_type,

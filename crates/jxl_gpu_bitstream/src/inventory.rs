@@ -1599,7 +1599,7 @@ fn parse_frame_header(
 
     let normal_frame = matches!(frame_type, FrameType::Regular | FrameType::SkipProgressive);
     let color_blend = if normal_frame {
-        parse_blending_info(reader, context.num_extra_channels, full_frame, None)?
+        parse_blending_info(reader, context.num_extra_channels, full_frame)?
     } else {
         FrameBlendInfo::default()
     };
@@ -1610,12 +1610,7 @@ fn parse_frame_header(
         .map_err(|_| InventoryError::AllocationFailed("extra-channel blending"))?;
     if normal_frame {
         for _ in 0..context.num_extra_channels {
-            let blend = parse_blending_info(
-                reader,
-                context.num_extra_channels,
-                full_frame,
-                Some(color_blend.mode),
-            )?;
+            let blend = parse_blending_info(reader, context.num_extra_channels, full_frame)?;
             replace_all &= blend.mode == FrameBlendMode::Replace;
             extra_channel_blends.push(blend);
         }
@@ -1760,7 +1755,6 @@ fn parse_blending_info(
     reader: &mut BitReader<'_>,
     num_extra_channels: u32,
     full_frame: bool,
-    canvas_mode: Option<FrameBlendMode>,
 ) -> Result<FrameBlendInfo, InventoryError> {
     let mode = read_u32(reader, [c(0), c(1), c(2), b(3, 2)])?;
     let mode = match mode {
@@ -1793,8 +1787,7 @@ fn parse_blending_info(
     } else {
         false
     };
-    let reset_mode = canvas_mode.unwrap_or(mode);
-    let source = if full_frame && reset_mode == FrameBlendMode::Replace {
+    let source = if full_frame && mode == FrameBlendMode::Replace {
         0
     } else {
         read_u32(reader, [c(0), c(1), c(2), c(3)])?
@@ -2566,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn blending_inventory_preserves_alpha_clamp_and_main_canvas_source_rule() {
+    fn blending_inventory_preserves_alpha_clamp_and_per_channel_source_rule() {
         let mut color_bits = BitWriter::new();
         color_bits.write_bits(2, 2).unwrap(); // Blend mode.
         color_bits.write_bits(2, 2).unwrap(); // Alpha extra channel 2.
@@ -2574,7 +2567,7 @@ mod tests {
         color_bits.write_bits(3, 2).unwrap(); // Reference source 3.
         let mut color_reader = BitReader::new(color_bits.as_bytes());
         assert_eq!(
-            parse_blending_info(&mut color_reader, 3, false, None).unwrap(),
+            parse_blending_info(&mut color_reader, 3, false).unwrap(),
             FrameBlendInfo {
                 mode: FrameBlendMode::Blend,
                 alpha_channel: Some(2),
@@ -2584,46 +2577,36 @@ mod tests {
         );
         assert_eq!(color_reader.bit_offset(), 7);
 
-        // An extra channel inherits the color blend mode for the source-field condition. A full
-        // Replace color frame resets the canvas, so the Add extra channel has no source bits.
+        // Each channel's own mode determines whether its source is present. A full-frame Add
+        // extra channel reads its source even if the color operation is Replace.
         let mut reset_extra_bits = BitWriter::new();
         reset_extra_bits.write_bits(1, 2).unwrap(); // Add mode.
+        reset_extra_bits.write_bits(2, 2).unwrap(); // Reference source 2.
         let mut reset_extra_reader = BitReader::new(reset_extra_bits.as_bytes());
         assert_eq!(
-            parse_blending_info(
-                &mut reset_extra_reader,
-                1,
-                true,
-                Some(FrameBlendMode::Replace),
-            )
-            .unwrap(),
+            parse_blending_info(&mut reset_extra_reader, 1, true).unwrap(),
             FrameBlendInfo {
                 mode: FrameBlendMode::Add,
                 alpha_channel: None,
                 clamp: false,
-                source: 0,
+                source: 2,
             }
         );
-        assert_eq!(reset_extra_reader.bit_offset(), 2);
+        assert_eq!(reset_extra_reader.bit_offset(), 4);
 
-        // Conversely, a non-resetting color frame requires the source even when this extra
-        // channel's own operation is Replace.
+        // A full-frame Replace extra channel resets its source even if the color operation
+        // uses a reference. Its following bits belong to the rest of the header.
         let mut sourced_extra_bits = BitWriter::new();
         sourced_extra_bits.write_bits(0, 2).unwrap(); // Replace mode.
-        sourced_extra_bits.write_bits(2, 2).unwrap(); // Reference source 2.
+        sourced_extra_bits.write_bits(2, 2).unwrap(); // Following header bits, not a source.
         let mut sourced_extra_reader = BitReader::new(sourced_extra_bits.as_bytes());
         assert_eq!(
-            parse_blending_info(
-                &mut sourced_extra_reader,
-                1,
-                true,
-                Some(FrameBlendMode::Add),
-            )
-            .unwrap()
-            .source,
-            2
+            parse_blending_info(&mut sourced_extra_reader, 1, true)
+                .unwrap()
+                .source,
+            0
         );
-        assert_eq!(sourced_extra_reader.bit_offset(), 4);
+        assert_eq!(sourced_extra_reader.bit_offset(), 2);
     }
 
     #[test]

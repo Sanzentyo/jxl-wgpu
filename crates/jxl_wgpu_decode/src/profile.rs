@@ -293,16 +293,21 @@ fn parse_modular_profile(
             }
         )
         || frame.group_size_shift > 3
-        || frame.have_crop
-        || frame.x0 != 0
-        || frame.y0 != 0
-        || frame.width != image.width
-        || frame.height != image.height
+        || (purpose == ModularProfilePurpose::Presentation
+            && (frame.have_crop
+                || frame.x0 != 0
+                || frame.y0 != 0
+                || frame.width != image.width
+                || frame.height != image.height))
         || (purpose == ModularProfilePurpose::Presentation
             && (frame.duration_ticks != 0 || frame.save_as_reference != 0))
-        || frame.color_blend != FrameBlendInfo::default()
-        || frame.extra_channel_blends
-            != vec![FrameBlendInfo::default(); usize::from(channels == ModularChannels::Rgba)];
+        || (purpose != ModularProfilePurpose::Frame
+            && (frame.color_blend != FrameBlendInfo::default()
+                || frame.extra_channel_blends
+                    != vec![
+                        FrameBlendInfo::default();
+                        usize::from(channels == ModularChannels::Rgba)
+                    ]));
     let role_is_invalid = match purpose {
         ModularProfilePurpose::Presentation => {
             frame.frame_type != FrameType::Regular
@@ -314,7 +319,7 @@ fn parse_modular_profile(
         ModularProfilePurpose::Frame => {
             !matches!(
                 frame.frame_type,
-                FrameType::Regular | FrameType::SkipProgressive
+                FrameType::Regular | FrameType::SkipProgressive | FrameType::ReferenceOnly
             ) || frame.lf_level != 0
                 || frame.lf_source_frame.is_some()
         }
@@ -328,8 +333,11 @@ fn parse_modular_profile(
     };
     if shared_frame_is_invalid || role_is_invalid {
         return unsupported(match purpose {
-            ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
+            ModularProfilePurpose::Presentation => {
                 "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references"
+            }
+            ModularProfilePurpose::Frame => {
+                "the Modular frame producer requires one regular, skip-progressive, or reference-only frame with canonical grouping and no restoration or frame features"
             }
             ModularProfilePurpose::ProgressiveDc => {
                 "the progressive-DC Modular GPU profile requires one uncropped root LF frame with canonical grouping and XYB reference retention"
@@ -347,9 +355,8 @@ fn parse_modular_profile(
     }
 
     let (frame_width, frame_height) = match purpose {
-        ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
-            (image.width, image.height)
-        }
+        ModularProfilePurpose::Presentation => (image.width, image.height),
+        ModularProfilePurpose::Frame => (frame.width, frame.height),
         ModularProfilePurpose::ProgressiveDc => frame
             .color_sample_extent()
             .ok_or_else(|| unsupported_error("progressive-DC frame extent is invalid"))?,

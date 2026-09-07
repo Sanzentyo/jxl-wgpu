@@ -177,8 +177,7 @@ the remaining channels, including asymmetric shifts. LF streams execute before n
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through three passes produce an exact final
 image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular, non-alpha extra channels,
-patches, splines, noise, and
-reference-frame animation remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+patches, splines, and noise remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.
@@ -207,15 +206,44 @@ no longer consumes the dependency chain on failure. Source spans remain under th
 budget until their last dependent submission; cancellation and output clones retain the existing
 callback/lease ownership contract. Late VarDCT submission counts remain observable through the
 underlying shared counter. Later frame-specific syntax/output errors surface when that presentation
-is prepared, while unsupported crop/blend/reference-only topology is rejected before submission.
+is prepared. Composition sequences use the physical execution path described below.
 
 Nine positive libjxl fixtures cover 8/12/16-bit Gray/RGB/RGBA, mixed coding modes, all relevant timing
 fields, 17 physical frames, six orientations, a transposed one-pixel axis, and recursive
 DC2. Actual GPU output is exact for Modular and within one RGB8 code for VarDCT against both Rust
-`jxl` and `djxl`, with byte-identical whole and 4 KiB-window/137-byte-fragment async output. Two valid
-crop/Add fixtures prove typed rejection. References are planned but not retained or composited on
-GPU yet; arbitrary crops, blends, reference-only frames, and non-coalesced/progressive delivery
-remain required for full JPEG XL.
+`jxl` and `djxl`, with byte-identical whole and 4 KiB-window/137-byte-fragment async output. The two
+formerly rejected crop/Add fixtures now execute and match both decoders.
+
+Sequences containing crops, blends, or reference-only frames decode every physical color producer
+and its LF dependency closure, including hidden zero-duration layers. The working surface is
+unrounded, unrotated F32 RGBA in the original enumerated D65 sRGB encoding. Up to four reference
+slots retain accounted buffer leases; an overwritten slot releases its old version after any
+submitted consumer completes. Empty references are zero, with opaque presentation alpha for
+images without an alpha channel. Signed crops are intersected on the host with checked wide
+arithmetic; all pixel copying and Replace/Add/Blend/Mul/MulAdd operations execute on the GPU.
+Color and alpha may read different background slots. Source-over also writes its selected alpha,
+and Multiply clamps the foreground when requested. Native 1–16-bit Gray/RGB/RGBA packing and
+the shared color-output conversion run after the full canvas has been composed; Apply/Keep
+orientation never changes the coordinate system of a retained reference.
+
+The composition executor admits one dependent presentation at a time. `prefetch` reports
+`PrefetchBackpressure::FrameDependency { index }` until the oldest pending presentation completes;
+the caller can retain its returned output while submitting the next. Submission never blocks,
+and native waits and runtime-neutral polling advance the same physical stages. Initial byte/poll
+admission failures preserve the source for retry. As with staged VarDCT, an allocation failure
+after a presentation starts is terminal for that pending frame. References, uniforms, sources,
+and outputs stay budgeted across callbacks and cancellation. No CPU pixels are read for blending.
+
+Ten new libjxl fixtures cover all five blend modes, separate alpha sources, negative and oversized
+crops, fully off-canvas frames, empty slots, reference overwrites, layered stills, mixed JPEG/Modular,
+and recursive DC. Nine match Rust `jxl` and `djxl` within one native output code. F32 comparison
+uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` for Modular and
+`1e-4` for VarDCT-containing sequences. A separate Multiply-clamp case verifies extended reference
+values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.
+Re-serialized reference-only variants independently pass both decoders and exercise slot 3.
+Post-transform composition rejects pre-transform reference domains before submission. Associated
+alpha, additional/shifted extra channels, pre-transform patch execution, non-sRGB/ICC composition,
+and non-coalesced/progressive delivery remain required for full JPEG XL.
 
 ### Bounded standard VarDCT engine
 
@@ -268,9 +296,9 @@ state machine owns every LF submission, both aggregate status maps, and the init
 admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-group `cjxl` output
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
-RGB or grayscale presentation encoding, no ICC profile or extra channel, and no crop, blend,
-reference composition, preview, or other unsupported frame feature. Full-canvas animations enter
-through the frame executor above; the low-level standalone VarDCT entry point remains a still API.
+RGB or grayscale presentation encoding, no ICC profile or extra channel, and no preview or other
+unsupported frame feature. Cropped/blended animations and layered stills enter through the frame
+executor above; the low-level standalone VarDCT entry point remains an uncropped still API.
 
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `VarDctOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
@@ -431,8 +459,8 @@ Nine additional F32 layout/transfer cases preserve unclipped color without integ
 The CPU comparisons measure reconstruction error in linear light and report encoded error as well;
 the thresholds are 0.00002 against Rust `jxl` and 0.0001 against `djxl`. Linear `djxl` PFM output is
 requested directly, avoiding an extra sRGB round trip. Whole and bounded fragmented output remain
-byte-identical. These float outputs support future frame composition without prematurely clipping
-or rounding its inputs; the decoder still rejects crop/blend/reference composition.
+byte-identical. The frame executor uses these float outputs for crop/blend/reference composition
+without prematurely clipping or rounding its inputs.
 
 These color outputs are accepted directly by `DisplayPipeline::submit_image`, which produces a
 GPU-resident linear-BT.709 texture without an intermediate CPU readback; wide-gamut output requires
@@ -529,9 +557,9 @@ operation.
 This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-non-color numeric output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata, crop/blend,
-extra channels, intermediate progressive presentation, and reference composition remain typed or unproven
-gaps. Independent Replace animation is supported through the common frame executor. Unsupported paths return typed
+non-color numeric output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
+extra channels and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 
 ### Measured lossless Modular checkpoint

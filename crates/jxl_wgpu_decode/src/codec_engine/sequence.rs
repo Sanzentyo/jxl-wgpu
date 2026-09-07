@@ -11,6 +11,7 @@ use crate::{
     GpuPendingFrame, GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
+use super::composition::{CompositionPending, CompositionSession};
 use super::{
     ProgressiveDcPlan, WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession,
     map_modular, map_vardct, project_frame_inventory, validate_codestream_limit,
@@ -26,7 +27,31 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        plan.validate_independent_frames(inventory)?;
+        if plan.nodes.iter().any(|node| node.needs_composition)
+            || inventory
+                .frames
+                .iter()
+                .any(|frame| frame.frame_type == jxl_gpu_bitstream::FrameType::ReferenceOnly)
+        {
+            let composition =
+                CompositionSession::new(self.clone(), codestream, inventory, request, &plan)?;
+            return Ok(PreparedGpuSession::new(
+                DecodeProfile::FrameSequence {
+                    physical_frames: plan.nodes.len(),
+                    presentation_frames: plan.presentations.len(),
+                },
+                plan.metadata.clone(),
+                WgpuDecodeSubmissionSession::Sequence(Box::new(FrameSequenceSession {
+                    source: None,
+                    current: None,
+                    next_index: 0,
+                    plan,
+                    last_submissions: Arc::new(AtomicUsize::new(0)),
+                    composition: Some(composition),
+                })),
+            )
+            .with_resolved_frame_slots(request.max_frame_slots()));
+        }
         let source = SequenceSource {
             engine: self.clone(),
             codestream,
@@ -49,6 +74,7 @@ impl WgpuDecodeEngine {
                 next_index: 0,
                 plan,
                 last_submissions: Arc::new(AtomicUsize::new(0)),
+                composition: None,
             })),
         )
         .with_resolved_frame_slots(slots))
@@ -56,11 +82,11 @@ impl WgpuDecodeEngine {
 }
 
 #[derive(Debug)]
-struct SequenceSource {
-    engine: WgpuDecodeEngine,
-    codestream: Arc<GpuCodestream>,
-    inventory: CodestreamInventory,
-    request: GpuOutputRequest,
+pub(super) struct SequenceSource {
+    pub(super) engine: WgpuDecodeEngine,
+    pub(super) codestream: Arc<GpuCodestream>,
+    pub(super) inventory: CodestreamInventory,
+    pub(super) request: GpuOutputRequest,
 }
 
 impl SequenceSource {
@@ -74,14 +100,27 @@ impl SequenceSource {
         // layers; only the visible producer and its LF dependency closure need image decoding.
         let frame_index =
             self.inventory.frames[plan.presentations[index].physical_frames.end - 1].frame_index;
-        let prepared = if let Some(dc) = ProgressiveDcPlan::for_frame(&self.inventory, frame_index)?
-        {
+        let prepared = self.prepare_physical(frame_index as usize)?;
+        if prepared.metadata.extent != plan.metadata.extent {
+            return Err(Error::EngineContract(
+                "frame producer disagrees with the presentation extent",
+            ));
+        }
+        Ok(prepared)
+    }
+
+    pub(super) fn prepare_physical(
+        &self,
+        index: usize,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        let frame_index = self.inventory.frames[index].frame_index;
+        if let Some(dc) = ProgressiveDcPlan::for_frame(&self.inventory, frame_index)? {
             self.engine.open_progressive_dc(
                 Arc::clone(&self.codestream),
                 &self.request,
                 &self.inventory,
                 dc,
-            )?
+            )
         } else {
             let projected = project_frame_inventory(&self.inventory, frame_index)?;
             match projected.frames[0].encoding {
@@ -90,23 +129,17 @@ impl SequenceSource {
                         Arc::clone(&self.codestream),
                         &self.request,
                         &projected,
-                    )?)?
+                    )?)
                 }
                 FrameEncoding::VarDct => {
                     map_vardct(self.engine.vardct.open_frame_with_inventory_data(
                         (*self.codestream).clone(),
                         &self.request,
                         &projected,
-                    )?)?
+                    )?)
                 }
             }
-        };
-        if prepared.metadata.extent != plan.metadata.extent {
-            return Err(Error::EngineContract(
-                "frame producer disagrees with the presentation extent",
-            ));
         }
-        Ok(prepared)
     }
 }
 
@@ -119,6 +152,7 @@ pub struct FrameSequenceSession {
     next_index: usize,
     plan: FrameExecutionPlan,
     last_submissions: Arc<AtomicUsize>,
+    composition: Option<CompositionSession>,
 }
 
 impl FrameSequenceSession {
@@ -128,6 +162,9 @@ impl FrameSequenceSession {
     }
 
     pub(super) fn submissions_per_frame(&self) -> usize {
+        if let Some(composition) = &self.composition {
+            return composition.submissions();
+        }
         self.current.as_ref().map_or_else(
             || self.last_submissions.load(Ordering::Acquire),
             |frame| frame.submissions_per_frame(),
@@ -137,6 +174,15 @@ impl FrameSequenceSession {
     pub(super) fn submit_next(&mut self) -> Result<Option<WgpuDecodePendingFrame>> {
         if self.next_index == self.plan.presentations.len() {
             return Ok(None);
+        }
+        if let Some(composition) = &mut self.composition {
+            let pending = composition.submit(&self.plan, self.next_index)?;
+            self.next_index += 1;
+            return Ok(Some(WgpuDecodePendingFrame::Sequence(Box::new(
+                FrameSequencePending {
+                    inner: SequencePending::Composed(Box::new(pending)),
+                },
+            ))));
         }
         if self.current.is_none() {
             self.current = Some(
@@ -165,19 +211,24 @@ impl FrameSequenceSession {
         }
         Ok(Some(WgpuDecodePendingFrame::Sequence(Box::new(
             FrameSequencePending {
-                pending: Box::new(pending),
-                metadata,
+                inner: SequencePending::Independent {
+                    pending: Box::new(pending),
+                    metadata,
+                },
             },
         ))))
     }
 }
 
-fn submission_counter(pending: &WgpuDecodePendingFrame, planned: usize) -> Arc<AtomicUsize> {
+pub(super) fn submission_counter(
+    pending: &WgpuDecodePendingFrame,
+    planned: usize,
+) -> Arc<AtomicUsize> {
     match pending {
         WgpuDecodePendingFrame::Modular(_) => Arc::new(AtomicUsize::new(planned)),
         WgpuDecodePendingFrame::VarDct(frame) => frame.submissions_per_frame_counter(),
         WgpuDecodePendingFrame::ProgressiveDc(frame) => Arc::clone(&frame.submissions_per_frame),
-        WgpuDecodePendingFrame::Sequence(frame) => submission_counter(&frame.pending, planned),
+        WgpuDecodePendingFrame::Sequence(_) => Arc::new(AtomicUsize::new(planned)),
     }
 }
 
@@ -185,24 +236,38 @@ fn submission_counter(pending: &WgpuDecodePendingFrame, planned: usize) -> Arc<A
 /// is used by blocking and runtime-neutral polling paths.
 #[derive(Debug)]
 pub struct FrameSequencePending {
-    pending: Box<WgpuDecodePendingFrame>,
-    metadata: FrameMetadata,
+    inner: SequencePending,
+}
+
+#[derive(Debug)]
+enum SequencePending {
+    Independent {
+        pending: Box<WgpuDecodePendingFrame>,
+        metadata: FrameMetadata,
+    },
+    Composed(Box<CompositionPending>),
 }
 
 impl FrameSequencePending {
     pub(super) fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
-        self.pending.unvalidated_gpu_frame()
+        match &self.inner {
+            SequencePending::Independent { pending, .. } => pending.unvalidated_gpu_frame(),
+            SequencePending::Composed(pending) => pending.unvalidated(),
+        }
     }
 
     fn poll_frame(
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
-        Pin::new(self.pending.as_mut())
-            .poll_complete(context)
-            .map(|result| {
-                result.map(|frame| SubmittedGpuFrame::new(self.metadata.clone(), frame.output))
-            })
+        match &mut self.inner {
+            SequencePending::Composed(pending) => pending.poll(context),
+            SequencePending::Independent { pending, metadata } => Pin::new(pending.as_mut())
+                .poll_complete(context)
+                .map(|result| {
+                    result.map(|frame| SubmittedGpuFrame::new(metadata.clone(), frame.output))
+                }),
+        }
     }
 }
 
@@ -211,9 +276,12 @@ impl GpuPendingFrame for FrameSequencePending {
     type Frame = GpuImageFrame;
 
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
-        self.pending
-            .wait()
-            .map(|frame| SubmittedGpuFrame::new(self.metadata, frame.output))
+        match self.inner {
+            SequencePending::Composed(pending) => pending.wait(),
+            SequencePending::Independent { pending, metadata } => pending
+                .wait()
+                .map(|frame| SubmittedGpuFrame::new(metadata, frame.output)),
+        }
     }
 
     fn poll_complete(

@@ -1306,7 +1306,7 @@ fn validate_frame(
         VarDctFrameRole::Frame => {
             !matches!(
                 frame.frame_type,
-                FrameType::Regular | FrameType::SkipProgressive
+                FrameType::Regular | FrameType::SkipProgressive | FrameType::ReferenceOnly
             ) || frame.lf_level != 0
         }
         VarDctFrameRole::ProgressiveDcRefinement => {
@@ -1356,19 +1356,21 @@ fn validate_frame(
     {
         return unsupported(UnsupportedVarDctFeature::Upsampling);
     }
-    if frame.have_crop
-        || frame.x0 != 0
-        || frame.y0 != 0
-        || frame.width != inventory.image_header.width
-        || frame.height != inventory.image_header.height
+    if role == VarDctFrameRole::Presentation
+        && (frame.have_crop
+            || frame.x0 != 0
+            || frame.y0 != 0
+            || frame.width != inventory.image_header.width
+            || frame.height != inventory.image_header.height)
     {
         return unsupported(UnsupportedVarDctFeature::Cropping);
     }
-    if frame.color_blend.mode != FrameBlendMode::Replace
-        || frame.color_blend.source != 0
-        || frame.color_blend.alpha_channel.is_some()
-        || frame.color_blend.clamp
-        || !frame.extra_channel_blends.is_empty()
+    if role == VarDctFrameRole::Presentation
+        && (frame.color_blend.mode != FrameBlendMode::Replace
+            || frame.color_blend.source != 0
+            || frame.color_blend.alpha_channel.is_some()
+            || frame.color_blend.clamp
+            || !frame.extra_channel_blends.is_empty())
     {
         return unsupported(UnsupportedVarDctFeature::Blending);
     }

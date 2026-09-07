@@ -40,6 +40,12 @@ slots; a missing producer is a typed error before GPU submission. The same resol
 contiguous and incremental scanners, with a libjxl `--progressive_dc=2` chain checked under
 one-byte delivery. It never decodes image samples or frame-section entropy.
 
+Color and each extra channel independently determine the presence of their blend source field:
+full-frame Replace omits its source, while other modes or partial coverage read it. The channel's
+own mode controls this rule; it does not inherit the color mode. Actual libjxl RGBA animations
+with different color/alpha modes and sources exercise this grammar through contiguous and
+fragmented GPU decode, including the formerly misaligned full-frame MultiplyAdd/Replace header.
+
 The image-header grammar comes from the lightweight `jxl-image` crate. Frame-header and TOC-size
 grammar is parsed locally with explicit limits. Entropy-coded TOC permutations use the published
 `jxl-coding` metadata decoder, producing both physical bitstream indices and logical TOC indices.

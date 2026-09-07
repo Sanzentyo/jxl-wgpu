@@ -59,10 +59,6 @@ pub enum FramePlanError {
     InvalidOrientation { orientation: u32 },
     #[error("preview presentation is not connected to the GPU frame executor")]
     PreviewUnsupported,
-    #[error("physical frame {frame_index} requires GPU canvas composition")]
-    CompositionRequired { frame_index: u32 },
-    #[error("physical frame {frame_index} requires GPU reference retention")]
-    ReferenceRequired { frame_index: u32 },
 }
 
 impl FrameExecutionPlan {
@@ -227,24 +223,5 @@ impl FrameExecutionPlan {
             nodes,
             presentations,
         })
-    }
-
-    pub(crate) fn validate_independent_frames(
-        &self,
-        inventory: &CodestreamInventory,
-    ) -> Result<(), FramePlanError> {
-        for (node, frame) in self.nodes.iter().zip(&inventory.frames) {
-            if node.needs_composition {
-                return Err(FramePlanError::CompositionRequired {
-                    frame_index: node.frame_index,
-                });
-            }
-            if frame.frame_type == FrameType::ReferenceOnly {
-                return Err(FramePlanError::ReferenceRequired {
-                    frame_index: node.frame_index,
-                });
-            }
-        }
-        Ok(())
     }
 }

@@ -3,6 +3,11 @@ use jxl_gpu_bitstream::{ContainerStreamScanner, InventoryLimits, parse};
 use jxl_wgpu_decode::{DecodeProfile, FrameExecutionPlan, FramePlanError, WgpuDecodeEngine};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "frame_sequence/composition.rs"]
+mod composition;
+#[path = "frame_sequence/reference.rs"]
+mod reference;
+
 struct Case {
     name: &'static str,
     hex: &'static str,
@@ -77,6 +82,186 @@ fn cases() -> [Case; 9] {
             vardct: true,
         },
     ]
+}
+
+fn composition_cases() -> [Case; 9] {
+    use LosslessModularFormat::{Gray, Rgb, Rgba};
+    [
+        (
+            "gray",
+            include_str!("../../test-data/composition_gray.jxl.hex"),
+            Gray,
+            8,
+            false,
+        ),
+        (
+            "rgb12",
+            include_str!("../../test-data/composition_rgb12.jxl.hex"),
+            Rgb,
+            12,
+            false,
+        ),
+        (
+            "rgba8",
+            include_str!("../../test-data/composition_rgba8.jxl.hex"),
+            Rgba,
+            8,
+            false,
+        ),
+        (
+            "rgba16",
+            include_str!("../../test-data/composition_rgba16.jxl.hex"),
+            Rgba,
+            16,
+            false,
+        ),
+        (
+            "still",
+            include_str!("../../test-data/composition_still.jxl.hex"),
+            Gray,
+            8,
+            false,
+        ),
+        (
+            "vardct",
+            include_str!("../../test-data/composition_vardct.jxl.hex"),
+            Rgb,
+            8,
+            true,
+        ),
+        (
+            "vardct_gray",
+            include_str!("../../test-data/composition_vardct_gray.jxl.hex"),
+            Rgb,
+            8,
+            true,
+        ),
+        (
+            "vardct_dc",
+            include_str!("../../test-data/composition_vardct_dc.jxl.hex"),
+            Rgb,
+            8,
+            true,
+        ),
+        (
+            "mixed",
+            include_str!("../../test-data/composition_mixed.jxl.hex"),
+            Rgb,
+            8,
+            true,
+        ),
+    ]
+    .map(|(name, hex, format, bits, vardct)| Case {
+        name,
+        hex,
+        format,
+        bits,
+        vardct,
+    })
+}
+
+#[test]
+fn composed_sequences_validate_every_layer_and_match_two_decoders() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    for case in composition_cases() {
+        eprintln!("composition {}", case.name);
+        let bytes = encoded(&case);
+        let inventory = parse(&bytes, Default::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
+        assert!(plan.nodes.iter().any(|node| node.needs_composition));
+        let floats = rust_float_frames(&bytes, case.format);
+        let maximum = ((1u32 << case.bits) - 1) as f32;
+        let expected = floats
+            .iter()
+            .map(|frame| {
+                (
+                    None::<f64>,
+                    frame
+                        .iter()
+                        .map(|value| (value.clamp(0.0, 1.0) * maximum).round() as u16)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let djxl = djxl_frames(&case, &bytes);
+        let mut whole = Vec::new();
+        for bounded in [false, true] {
+            let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+            let decoder = GpuDecoder::new(if bounded {
+                engine.with_stream_window_limit(NonZeroU64::new(4096).unwrap())
+            } else {
+                engine
+            });
+            let mut session = if bounded {
+                incremental(&decoder, &bytes, request(&case))
+            } else {
+                decoder.open(&bytes, request(&case)).unwrap()
+            };
+            for (index, (_, oracle)) in expected.iter().enumerate() {
+                let frame = if bounded {
+                    pollster::block_on(session.next_frame_async())
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    session.next_frame().unwrap().unwrap()
+                };
+                assert_eq!(frame.metadata, plan.presentations[index].metadata);
+                let output = &frame.output().outputs[0];
+                assert_eq!(output.layout.extent, plan.metadata.extent);
+                let pixels = samples(&read_output(&backend, output), case.bits);
+                let error = pixels
+                    .iter()
+                    .zip(oracle)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert_eq!(pixels.len(), oracle.len());
+                assert!(
+                    error <= 1,
+                    "{} presentation {index}: Rust error {error}",
+                    case.name
+                );
+                if let Some(djxl) = &djxl {
+                    assert_eq!(pixels.len(), djxl[index].len());
+                    let error = pixels
+                        .iter()
+                        .zip(&djxl[index])
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        error <= 1,
+                        "{} presentation {index}: djxl error {error}",
+                        case.name
+                    );
+                }
+                if bounded {
+                    assert_eq!(pixels, whole[index]);
+                } else {
+                    whole.push(pixels);
+                }
+            }
+            assert!(session.next_frame().unwrap().is_none());
+            drop(session);
+            assert_eq!(
+                decoder.incremental_input_budget().snapshot().reserved_bytes,
+                0
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+                && std::time::Instant::now() < deadline
+            {
+                backend.device().poll(wgpu::PollType::Poll).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
 }
 
 fn encoded(case: &Case) -> Vec<u8> {
@@ -179,6 +364,60 @@ fn rust_frames(case: &Case, encoded: &[u8]) -> Vec<(Option<f64>, Vec<u16>)> {
         };
         decoder = result;
         frames.push((duration, samples(&bytes, case.bits)));
+        if !decoder.has_more_frames() {
+            break;
+        }
+    }
+    frames
+}
+
+fn rust_float_frames(encoded: &[u8], format: LosslessModularFormat) -> Vec<Vec<f32>> {
+    let mut input = encoded;
+    let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+    let ProcessingResult::Complete {
+        result: mut decoder,
+    } = decoder.process(&mut input, None).unwrap()
+    else {
+        panic!("complete fixture header");
+    };
+    let size = decoder.basic_info().size;
+    let channels = format.channel_count() as usize;
+    decoder.set_pixel_format(JxlPixelFormat {
+        color_type: match format {
+            LosslessModularFormat::Gray => JxlColorType::Grayscale,
+            LosslessModularFormat::Rgb => JxlColorType::Rgb,
+            LosslessModularFormat::Rgba => JxlColorType::Rgba,
+        },
+        color_data_format: Some(JxlDataFormat::F32 {
+            endianness: Endianness::LittleEndian,
+        }),
+        extra_channel_format: vec![None; usize::from(format.has_alpha())],
+    });
+    let mut frames = Vec::new();
+    loop {
+        let ProcessingResult::Complete { result: frame } =
+            decoder.process(&mut input, None).unwrap()
+        else {
+            panic!("complete fixture frame");
+        };
+        let mut bytes = vec![0; size.0 * size.1 * channels * 4];
+        let mut outputs = [JxlOutputBuffer::new(
+            &mut bytes,
+            size.1,
+            size.0 * channels * 4,
+        )];
+        let ProcessingResult::Complete { result } =
+            frame.process(&mut input, &mut outputs, None).unwrap()
+        else {
+            panic!("complete fixture pixels");
+        };
+        decoder = result;
+        frames.push(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect(),
+        );
         if !decoder.has_more_frames() {
             break;
         }
@@ -424,15 +663,15 @@ fn modular_and_vardct_sequences_preserve_pixels_timing_and_bounded_input_lifetim
     }
 }
 
-fn keep_codestream_order(
-    values: &[u16],
+fn keep_codestream_order<T: Clone>(
+    values: &[T],
     extent: Extent2d,
     channels: usize,
     orientation: u32,
-) -> Vec<u16> {
-    let mut rows: Vec<Vec<Vec<u16>>> = values
+) -> Vec<T> {
+    let mut rows: Vec<Vec<Vec<T>>> = values
         .chunks_exact(extent.width as usize * channels)
-        .map(|row| row.chunks_exact(channels).map(<[u16]>::to_vec).collect())
+        .map(|row| row.chunks_exact(channels).map(<[T]>::to_vec).collect())
         .collect();
     if matches!(orientation, 2 | 3 | 6 | 7) {
         for row in &mut rows {
@@ -641,11 +880,11 @@ fn sequence_admission_retries_and_cancellation_preserve_byte_and_frame_ownership
 }
 
 #[test]
-fn frame_sequence_rejects_valid_crop_and_add_before_any_gpu_admission() {
+fn frame_sequence_composes_crop_and_add_against_both_decoders() {
     let Some(backend) = backend() else {
         return;
     };
-    let decoder = GpuDecoder::wgpu(backend).unwrap();
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     for hex in [
         include_str!("../../test-data/sequence_rejected_crop.jxl.hex"),
         include_str!("../../test-data/sequence_rejected_add.jxl.hex"),
@@ -658,14 +897,31 @@ fn frame_sequence_rejects_valid_crop_and_add_before_any_gpu_admission() {
             vardct: false,
         };
         let bytes = encoded(&case);
-        assert_eq!(rust_frames(&case, &bytes).len(), 2);
-        let result = decoder.open(&bytes, request(&case));
-        assert!(matches!(
-            result,
-            Err(jxl_wgpu_decode::Error::FramePlan(
-                FramePlanError::CompositionRequired { frame_index: 1 }
-            ))
-        ));
+        let oracle = rust_frames(&case, &bytes);
+        let djxl = djxl_frames(&case, &bytes);
+        assert_eq!(oracle.len(), 2);
+        let mut session = decoder.open(&bytes, request(&case)).unwrap();
+        let progress = session.prefetch(NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(progress.queued, 1);
+        assert_eq!(
+            progress.backpressure,
+            Some(jxl_wgpu_decode::PrefetchBackpressure::FrameDependency { index: 0 })
+        );
+        for (index, (_, expected)) in oracle.iter().enumerate() {
+            let frame = pollster::block_on(session.next_frame_async())
+                .unwrap()
+                .unwrap();
+            let pixels = samples(
+                &read_output(&backend, &frame.output().outputs[0]),
+                case.bits,
+            );
+            assert_eq!(&pixels, expected);
+            if let Some(djxl) = &djxl {
+                assert_eq!(pixels, djxl[index]);
+            }
+        }
+        assert!(session.next_frame().unwrap().is_none());
+        drop(session);
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
 }

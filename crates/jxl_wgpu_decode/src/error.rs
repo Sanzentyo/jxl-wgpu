@@ -282,6 +282,16 @@ pub enum Error {
     MissingImageFrame,
     #[error("all {limit} bounded GPU frame slots are in flight")]
     Backpressure { limit: usize },
+    #[error("presentation {index} must finish before its dependent frame can be submitted")]
+    FrameDependencyBackpressure { index: usize },
+    #[error("the final output commands have not yet been submitted")]
+    UnvalidatedOutputNotSubmitted,
+    #[error("frame composition {resource} requires {requested}, exceeding the limit {limit}")]
+    CompositionResourceLimit {
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
     #[error("prefetch depth {requested} exceeds the configured frame-slot limit {limit}")]
     PrefetchDepthExceedsLimit { requested: usize, limit: usize },
     #[error("blocking GPU completion waits are unavailable on browser WebGPU")]

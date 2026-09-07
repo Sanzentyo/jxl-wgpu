@@ -856,11 +856,11 @@ during staged submission, and output clones surviving session drop. Native RGB p
 an explicitly matching sRGB/BT.709/full-range descriptor so both coding modes share one output
 contract; it does not accept a different transfer or relabel converted pixels.
 
-`rejected_crop` and `rejected_add` are valid libjxl animations with an off-canvas or Add second
-source frame. Rust `jxl` renders both, while the GPU engine returns
-`FramePlanError::CompositionRequired { frame_index: 1 }` before GPU admission. Reference-version
-and malformed-timecode tests exercise the common plan. These fixtures do not prove GPU reference
-retention, arbitrary blends, non-coalesced output, or full JPEG XL decoder conformance.
+`rejected_crop` and `rejected_add` retain their original historical filenames. They now execute
+through GPU composition and match both Rust `jxl` and `djxl`. Dependency prefetch is checked
+explicitly, and reference-version/malformed-timecode tests continue to exercise the common plan.
+The larger composition corpus below covers real reference retention and additional blend modes;
+neither corpus alone establishes full JPEG XL conformance.
 
 | File | Decoded hex bytes | SHA-256 of binary codestream |
 |---|---:|---|
@@ -951,3 +951,83 @@ The harness streams a PGM or PPM source, calls lossless `cjxl`, decodes with `dj
 binary PNM output row by row, and verifies extent, channels, maximum sample value, and exact pixel
 hash. RGBA entries are kept inventory-only in this external path until a portable alpha-bearing
 fixture transport is selected. Existing outputs are not overwritten unless `--force` is supplied.
+
+## GPU crop/blend composition and resident references
+
+`test-data/generate_frame_composition.c` uses libjxl 0.12.0 only as an offline fixture generator.
+`tests/wgpu_gray8/frame_sequence.rs` and its `composition.rs`/`reference.rs` children exercise the
+production GPU frame executor. The original integer source formulas, crop rectangles, slot
+assignments, blend modes, alpha endpoints, names, timecodes and durations are in the generator.
+All animations use 30000/1001 ticks per second and two loops; the layered still omits animation.
+Nine physical source layers include zero-duration layers and six presentations (one for the
+layered still). Recursive DC adds two hidden LF producers to each of three full-canvas layers.
+
+| Fixture suffix | Canvas | Coding, depth, orientation | Purpose |
+|---|---|---|---|
+| `gray` | 259×17 | Modular Gray8, 6 | Odd multi-group width, all blend modes |
+| `rgb12` | 257×9 | Modular RGB12, 8 | Native valid-bit packing after composition |
+| `rgba8` | 33×7 | Modular RGBA8, 5 | Alpha zero/full/fractional values and independent sources |
+| `rgba16` | 33×7 | Modular RGBA16, 2 | Unassociated high-depth alpha and extended alpha sums |
+| `still` | 37×13 | Modular Gray8, 7 | All nine layers coalesce into one still |
+| `vardct` | 259×17 | XYB VarDCT RGB8, 6 | Progressive AC, crop/restoration/color composition |
+| `vardct_gray` | 37×13 | XYB VarDCT Gray8, 8 | Gray presentation as RGB |
+| `vardct_dc` | 1024×128 | XYB VarDCT RGB8, 6 | Recursive DC references mixed with cropped ordinary layers |
+| `mixed` | 259×17 | JPEG YCbCr 4:2:0 / Modular RGB8, 4 | Cross-mode reference versions |
+| `gray_clamp` | 259×17 | Modular Gray8, 6 | Foreground clamp with an extended-range background |
+
+The JPEG is the same deterministic libjpeg-turbo 3.2.0 input used for `sequence_mixed_jpeg_modular`.
+Pass it as the optional generator argument; only source layer 3 uses that JPEG. Other sources
+are generated integer samples. libjxl's public API disallows save slot 3, and its recursive-DC
+encoder does not accept these tiny crop layers, so DC is requested only for the three full-canvas
+layers. These encoder limitations are not treated as decoder grammar restrictions.
+
+`composed_sequences_validate_every_layer_and_match_two_decoders` checks all nine ordinary cases:
+87 physical producers and 49 presentations, including six LF producers. Whole blocking and
+4096-byte entropy-window / 137-byte fragmented async outputs are identical. Native 8/12/16-bit
+outputs differ by at most one code from each oracle; the Rust oracle is requested in F32 and
+quantized once. `floating_composition_packs_only_after_blending_and_orientation` compares applied
+interleaved sRGB RGBA and kept-coordinate planar linear BGRA for the same cases, including alpha.
+The error is measured in linear light for RGB and directly for alpha, divided by
+`max(1, abs(reference))` to cover extended values: below `3e-6` for Modular and `1e-4` for
+VarDCT-containing sequences. This is a scaled error bound, not a claim of that absolute accuracy
+at arbitrary HDR magnitude or a test of floating-point JPEG XL source metadata.
+
+The separate clamp regression retains `350/255` after Add, then multiplies by `191/255` at original
+coordinate (253,6). It verifies `350*191/(255*255)` before quantization (absolute error below
+`3e-7`), and compares every quantized output against `djxl` within one code. Rust `jxl` 0.6.0
+reverses the operands for this frame Multiply and clamps the background, incorrectly producing
+`191/255`. This oracle disagreement is not hidden by broadening the ordinary test tolerance.
+The primary implementations are [libjxl blending](https://github.com/libjxl/libjxl/blob/main/lib/jxl/blending.cc)
+and [jxl-rs frame blending](https://github.com/libjxl/jxl-rs/blob/main/jxl/src/render/stages/blending.rs);
+the installed pinned Rust source is the version used for the recorded discrepancy.
+
+The conformance-only header writer in `frame_sequence/reference.rs` re-serializes the known
+Modular grammar, preserves libjxl entropy sections unchanged, changes the initial layer to
+post-transform ReferenceOnly and swaps slot identifiers 1/3. Gray8 and RGBA16 variants are
+accepted by both independent decoders and execute on GPU, exercising non-presented references,
+slot 3, subsequent overwrites and the same fragmented async input path. A pre-transform version
+is rejected as an invalid post-transform blend background before GPU admission. The writer also
+extracts a single final cropped layer from the still fixture; both oracles and GPU agree, with
+nonzero crop pixels and zero background. This ensures a one-frame, non-animation crop uses the
+common compositor instead of the standalone full-canvas still path.
+
+Memory tests reserve the entire available budget twice before admission and verify retry without
+consuming the source. Prefetch reports `FrameDependency` while a presentation is pending, permits
+submission of the next after validation while the caller retains the previous output, and releases
+unsubmitted input immediately on cancellation. Submitted references/uniforms/output leases retain
+exact byte reservations through callback completion. Native Apple M5/Metal is the executed adapter;
+WebGPU coverage is compilation only. Associated/shifted/arbitrary extra channels, ICC/non-sRGB
+composition, pre-transform patches, and the official decoder conformance gate remain incomplete.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `composition_gray.jxl.hex` | 15919 | `26967f970494c2ffa969990878050fdc867bcde4642a995bd6b17ea4d3dcf7a5` |
+| `composition_gray_clamp.jxl.hex` | 15919 | `2a6eb8614b9d3ade28d4d52c309f2d4324a1d5883ff4882b84fe19d529223bf6` |
+| `composition_mixed.jxl.hex` | 51326 | `7127a68b3c70d4467a423843b04bea676ec55c9d56eeb691cc9194372f378d3f` |
+| `composition_rgb12.jxl.hex` | 47572 | `352e440c21c5700e50c9484057fde2e36ac76db9869cfc417938a9033d511117` |
+| `composition_rgba16.jxl.hex` | 11227 | `76b3ba2a8fcf9ee805409f0167f774c5c9d41e0c477671c9a551c2ea884cb537` |
+| `composition_rgba8.jxl.hex` | 10045 | `75bc2e24a3fc2db76e823aa859764d4fa4bd5137fa30e8b629765e67b7dad851` |
+| `composition_still.jxl.hex` | 3717 | `29a2ee4309f3a5ba5ac2528344f895e0b9927b0c71e993a82894fed76102f9ea` |
+| `composition_vardct.jxl.hex` | 22274 | `c63af30024305c6cf48a63e6f893456e147610c6eed9a51edc3ace0b8a1a68eb` |
+| `composition_vardct_dc.jxl.hex` | 418651 | `0cecab8c95ab07a947fa3331fbe7d9214d37c83c829599ec684d69880c68b6d8` |
+| `composition_vardct_gray.jxl.hex` | 3883 | `156e04469e6d86705972b03e65f80c942bb557c2de946d5f058cda6ed37462c5` |
