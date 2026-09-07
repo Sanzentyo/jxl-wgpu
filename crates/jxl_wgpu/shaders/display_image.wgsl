@@ -69,16 +69,22 @@ fn stored_rgb_position(canonical: u32) -> u32 {
 fn rgb_sample(pixel: vec2<u32>, canonical: u32) -> f32 {
     if canonical == 3u && params.channels == 3u { return 1.0; }
     let stored = stored_rgb_position(canonical);
+    let sample_bytes = params.storage_bits / 8u;
     var offset: u32;
     if params.kind == 0u {
-        offset = params.plane0_offset + pixel.y * params.plane0_stride + pixel.x * params.channels + stored;
+        offset = params.plane0_offset + pixel.y * params.plane0_stride + (pixel.x * params.channels + stored) * sample_bytes;
     } else {
         var plane_offset = params.plane0_offset;
         var plane_stride = params.plane0_stride;
         if stored == 1u { plane_offset = params.plane1_offset; plane_stride = params.plane1_stride; }
         if stored == 2u { plane_offset = params.plane2_offset; plane_stride = params.plane2_stride; }
         if stored == 3u { plane_offset = params.plane3_offset; plane_stride = params.plane3_stride; }
-        offset = plane_offset + pixel.y * plane_stride + pixel.x;
+        offset = plane_offset + pixel.y * plane_stride + pixel.x * sample_bytes;
+    }
+    if params.bits == 32u {
+        let word = read_byte(offset) | (read_byte(offset + 1u) << 8u)
+            | (read_byte(offset + 2u) << 16u) | (read_byte(offset + 3u) << 24u);
+        return bitcast<f32>(word);
     }
     return f32(read_byte(offset)) / 255.0;
 }

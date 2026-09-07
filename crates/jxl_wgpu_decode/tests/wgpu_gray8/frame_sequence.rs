@@ -424,6 +424,129 @@ fn modular_and_vardct_sequences_preserve_pixels_timing_and_bounded_input_lifetim
     }
 }
 
+fn keep_codestream_order(
+    values: &[u16],
+    extent: Extent2d,
+    channels: usize,
+    orientation: u32,
+) -> Vec<u16> {
+    let mut rows: Vec<Vec<Vec<u16>>> = values
+        .chunks_exact(extent.width as usize * channels)
+        .map(|row| row.chunks_exact(channels).map(<[u16]>::to_vec).collect())
+        .collect();
+    if matches!(orientation, 2 | 3 | 6 | 7) {
+        for row in &mut rows {
+            row.reverse();
+        }
+    }
+    if matches!(orientation, 3 | 4 | 7 | 8) {
+        rows.reverse();
+    }
+    if orientation >= 5 {
+        rows = (0..extent.width as usize)
+            .map(|x| rows.iter().map(|row| row[x].clone()).collect())
+            .collect();
+    }
+    rows.into_iter().flatten().flatten().collect()
+}
+
+#[test]
+fn floating_frame_sequences_can_keep_codestream_coordinates() {
+    use jxl_gpu_formats::RgbChannelOrder;
+    use jxl_wgpu_decode::OrientationPolicy;
+    let Some(backend) = backend() else {
+        return;
+    };
+    for case in cases() {
+        let encoded = encoded(&case);
+        let inventory = parse(&encoded, Default::default())
+            .unwrap()
+            .codestream_inventory(InventoryLimits::default())
+            .unwrap();
+        let plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
+        let kept =
+            FrameExecutionPlan::negotiate_with_orientation(&inventory, OrientationPolicy::Keep)
+                .unwrap();
+        let extent = Extent2d::new(inventory.image_header.width, inventory.image_header.height);
+        assert_eq!(kept.metadata.extent, extent);
+        assert_eq!(kept.nodes, plan.nodes);
+        assert_eq!(kept.presentations, plan.presentations);
+        let oracle = rust_frames(&case, &encoded);
+        let color = jxl_wgpu_decode::vardct_rgb8_format().color_spec;
+        let request =
+            GpuOutputRequest::color(PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color))
+                .unwrap()
+                .with_orientation_policy(OrientationPolicy::Keep);
+        assert_eq!(request.orientation_policy(), OrientationPolicy::Keep);
+        let mut whole = Vec::new();
+        for bounded in [false, true] {
+            let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+            let decoder = GpuDecoder::new(if bounded {
+                engine.with_stream_window_limit(NonZeroU64::new(4096).unwrap())
+            } else {
+                engine
+            });
+            let mut session = if bounded {
+                incremental(&decoder, &encoded, request.clone())
+            } else {
+                decoder.open(&encoded, request.clone()).unwrap()
+            };
+            assert_eq!(session.metadata(), &kept.metadata);
+            let source_channels = case.format.channel_count() as usize;
+            let maximum = ((1u32 << case.bits) - 1) as f32;
+            for (index, (_, expected)) in oracle.iter().enumerate() {
+                let frame = if bounded {
+                    pollster::block_on(session.next_frame_async())
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    session.next_frame().unwrap().unwrap()
+                };
+                assert_eq!(frame.metadata, kept.presentations[index].metadata);
+                let output = &frame.output().outputs[0];
+                assert_eq!(output.layout.extent, extent);
+                let bytes = read_output(&backend, output);
+                let expected = keep_codestream_order(
+                    expected,
+                    plan.metadata.extent,
+                    source_channels,
+                    inventory.image_header.orientation,
+                );
+                for (actual, expected) in bytes
+                    .chunks_exact(16)
+                    .zip(expected.chunks_exact(source_channels))
+                {
+                    for channel in 0..4 {
+                        let value = f32::from_le_bytes(
+                            actual[channel * 4..channel * 4 + 4].try_into().unwrap(),
+                        );
+                        assert!(value.is_finite());
+                        let expected = if channel == 3 && source_channels != 4 {
+                            maximum as u16
+                        } else {
+                            expected[if source_channels == 1 { 0 } else { channel }]
+                        };
+                        let code = (value * maximum).round().clamp(0.0, maximum) as u16;
+                        assert!(
+                            code.abs_diff(expected) <= u16::from(case.vardct),
+                            "{} frame {index} channel {channel}: {value} -> {code} != {expected}",
+                            case.name
+                        );
+                    }
+                }
+                if bounded {
+                    assert_eq!(bytes, whole[index]);
+                } else {
+                    whole.push(bytes);
+                }
+            }
+            assert!(session.next_frame().unwrap().is_none());
+            drop(session);
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
+}
+
 #[test]
 fn sequence_admission_retries_and_cancellation_preserve_byte_and_frame_ownership() {
     let Some(backend) = backend() else {

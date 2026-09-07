@@ -277,19 +277,10 @@ fn write_native_code(offset: u32, code: i32) {
     }
 }
 
-fn write_native_pixel(x: u32, y: u32, index: u32) {
-    if params.output_kind != 9u || params.channels != params.source_channels
-        || params.bits != params.source_bits {
-        decode_error = ERROR_OUTPUT_MAPPING;
-        return;
-    }
-    let bytes_per_component = params.storage_bits / 8u;
-    let pixel_offset = params.plane0_offset
-        + y * params.plane0_stride
-        + x * params.channels * bytes_per_component;
+fn reconstructed_rgba(index: u32) -> vec4<i32> {
     if params.source_channels == 1u {
-        write_native_code(pixel_offset, bitcast<i32>(reconstruction_load(index)));
-        return;
+        let gray = bitcast<i32>(reconstruction_load(index));
+        return vec4<i32>(gray, gray, gray, i32(params.source_mask));
     }
 
     let y_value = bitcast<i32>(reconstruction_load(index));
@@ -299,12 +290,47 @@ fn write_native_pixel(x: u32, y: u32, index: u32) {
     let green = cg + temporary;
     let blue = temporary - (co >> 1u);
     let red = co + blue;
-    write_native_code(pixel_offset, red);
-    write_native_code(pixel_offset + bytes_per_component, green);
-    write_native_code(pixel_offset + 2u * bytes_per_component, blue);
+    var alpha = i32(params.source_mask);
     if params.source_channels == 4u {
-        let alpha = bitcast<i32>(reconstruction_load(3u * params.sample_count + index));
-        write_native_code(pixel_offset + 3u * bytes_per_component, alpha);
+        alpha = bitcast<i32>(reconstruction_load(3u * params.sample_count + index));
+    }
+    return vec4<i32>(red, green, blue, alpha);
+}
+
+fn write_native_pixel(x: u32, y: u32, index: u32) {
+    if params.output_kind != 9u || params.channels != params.source_channels
+        || params.bits != params.source_bits {
+        decode_error = ERROR_OUTPUT_MAPPING;
+        return;
+    }
+    let pixel = reconstructed_rgba(index);
+    let bytes_per_component = params.storage_bits / 8u;
+    let pixel_offset = params.plane0_offset
+        + y * params.plane0_stride
+        + x * params.channels * bytes_per_component;
+    for (var channel = 0u; channel < params.source_channels; channel += 1u) {
+        write_native_code(pixel_offset + channel * bytes_per_component, pixel[channel]);
+    }
+}
+
+fn write_float_rgb_pixel(x: u32, y: u32, index: u32) {
+    let pixel = reconstructed_rgba(index);
+    if any(pixel < vec4<i32>(0i)) || any(pixel > vec4<i32>(i32(params.source_mask))) {
+        decode_error = ERROR_OUTPUT_MAPPING;
+        return;
+    }
+    let rgba = vec4<f32>(
+        target_nonlinear(u32(pixel.r)), target_nonlinear(u32(pixel.g)),
+        target_nonlinear(u32(pixel.b)), f32(pixel.a) / f32(params.source_mask),
+    );
+    let offsets = vec4<u32>(params.plane0_offset, params.plane1_offset, params.plane2_offset, params.plane3_offset);
+    let strides = vec4<u32>(params.plane0_stride, params.plane1_stride, params.plane2_stride, params.plane3_stride);
+    for (var position = 0u; position < params.channels; position += 1u) {
+        var canonical = position;
+        if (params.order == 1u || params.order == 3u) && position < 3u { canonical = 2u - position; }
+        var offset = params.plane0_offset + y * params.plane0_stride + (x * params.channels + position) * 4u;
+        if params.output_kind == 6u { offset = offsets[position] + y * strides[position] + x * 4u; }
+        write_word(offset, bitcast<u32>(rgba[canonical]));
     }
 }
 
@@ -433,13 +459,18 @@ fn srgb_to_linear(value: f32) -> f32 {
 }
 
 fn target_nonlinear(value: u32) -> f32 {
-    let encoded = f32(value) / 255.0;
+    let encoded = f32(value) / f32(params.source_mask);
     if params.transfer == 0u {
         return encoded;
     }
     let linear = srgb_to_linear(encoded);
     if params.transfer == 2u {
         return linear;
+    }
+    if params.transfer == 3u {
+        let alpha = 1.09929682680944;
+        let beta = 0.018053968510807;
+        return select(alpha * pow(linear, 0.45) - (alpha - 1.0), 4.5 * linear, linear < beta);
     }
     if linear < 0.018 {
         return 4.5 * linear;
@@ -537,6 +568,13 @@ fn write_packed_422_pixel(x: u32, y: u32, sample: u32) {
 }
 
 fn finalize_output() {
+    if (params.output_kind == 5u || params.output_kind == 6u) && params.bits == 32u {
+        for (var index = 0u; index < params.sample_count; index += 1u) {
+            let destination = output_coordinate(index % params.width, index / params.width);
+            write_float_rgb_pixel(destination.x, destination.y, index);
+        }
+        return;
+    }
     if params.source_channels != 1u || params.output_kind == 9u {
         if params.output_kind != 9u {
             decode_error = ERROR_OUTPUT_MAPPING;

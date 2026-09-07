@@ -149,6 +149,7 @@ pub(super) fn prepare_source(
         .ok_or(VarDctDecodeError::InvalidOrientation {
             orientation: inventory.image_header.orientation,
         })?;
+    let orientation = request.orientation_policy().resolve(orientation);
     if !matches!(
         inventory.image_header.colour_encoding,
         ColourEncodingInventory::Enumerated {

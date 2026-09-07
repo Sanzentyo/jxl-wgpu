@@ -591,6 +591,23 @@ impl PixelFormat {
 
     #[must_use]
     pub fn rgb8(order: RgbChannelOrder, planar: bool, color_spec: ColorSpecification) -> Self {
+        Self::rgb_format(order, planar, color_spec, SampleKind::Unsigned, 8)
+    }
+
+    /// RGB(A) color with IEEE 754 binary32 components, preserving out-of-range color values.
+    /// The color specification defines the transfer function; alpha is always linear.
+    #[must_use]
+    pub fn rgb_f32(order: RgbChannelOrder, planar: bool, color_spec: ColorSpecification) -> Self {
+        Self::rgb_format(order, planar, color_spec, SampleKind::Float, 32)
+    }
+
+    fn rgb_format(
+        order: RgbChannelOrder,
+        planar: bool,
+        color_spec: ColorSpecification,
+        sample_kind: SampleKind,
+        bits: u8,
+    ) -> Self {
         let (channel_count, swizzle) = match order {
             RgbChannelOrder::Rgb => (3, Swizzle::XYZ1),
             RgbChannelOrder::Bgr => (3, Swizzle::ZYX1),
@@ -602,21 +619,23 @@ impl PixelFormat {
         let planes = if planar {
             channels
                 .iter()
-                .map(|&channel| PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], 8))
+                .map(|&channel| {
+                    PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], bits)
+                })
                 .collect()
         } else {
             vec![PlaneFormat::separate_words(
                 PlaneSampling::FULL,
                 1,
                 channels,
-                8,
+                bits,
             )]
         };
         Self {
             model: ColorModel::Rgb,
             color_spec,
             chroma_subsampling: ChromaSubsampling::None,
-            sample_kind: SampleKind::Unsigned,
+            sample_kind,
             byte_order: ByteOrder::Native,
             swizzle,
             planes,

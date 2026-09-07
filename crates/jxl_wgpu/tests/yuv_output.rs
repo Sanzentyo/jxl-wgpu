@@ -419,6 +419,117 @@ fn canonical_pitch_linear_formats_match_scalar_oracle() {
 }
 
 #[test]
+fn floating_rgb_output_preserves_extended_values_and_color_conversion() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    let extent = Extent2d::new(5, 3);
+    let mut channels = rgb_planes(extent);
+    for (channel, samples) in channels.iter_mut().enumerate() {
+        for (index, sample) in samples.iter_mut().enumerate() {
+            *sample = *sample * 3.0 - 0.75;
+            if index == channel {
+                *sample = -0.0001;
+            }
+        }
+    }
+    channels[0][2] = -0.0;
+    for order in [
+        RgbChannelOrder::Rgb,
+        RgbChannelOrder::Bgr,
+        RgbChannelOrder::Rgba,
+        RgbChannelOrder::Bgra,
+    ] {
+        for planar in [false, true] {
+            for transfer in [TransferFunction::Linear, TransferFunction::Srgb] {
+                let format =
+                    PixelFormat::rgb_f32(order, planar, rgb_color(ColorSpace::Bt709, transfer));
+                let mut session = backend
+                    .create_session(
+                        &frame_desc(extent),
+                        plan(extent, RgbColorEncoding::LINEAR_BT709),
+                    )
+                    .unwrap();
+                enqueue(&mut session, extent, &channels);
+                let token = session
+                    .submit_image(
+                        RenderIntent::Final,
+                        ImageOutputRequest::new(RgbColorEncoding::LINEAR_BT709, format.clone()),
+                    )
+                    .unwrap();
+                let actual = session.wait_image(token).unwrap().outputs.remove(0);
+                let expected_channels: [Vec<_>; 3] = std::array::from_fn(|channel| {
+                    channels[channel]
+                        .iter()
+                        .map(|&value| {
+                            if transfer == TransferFunction::Linear {
+                                value
+                            } else {
+                                signed_map(value, srgb_from_linear)
+                            }
+                        })
+                        .collect()
+                });
+                let expected = convert_rgb_f32(
+                    [
+                        &expected_channels[0],
+                        &expected_channels[1],
+                        &expected_channels[2],
+                    ],
+                    extent,
+                    &format,
+                )
+                .unwrap();
+                assert_eq!(actual.layout, expected.layout);
+                for (actual, expected) in actual
+                    .bytes
+                    .chunks_exact(4)
+                    .zip(expected.bytes.chunks_exact(4))
+                {
+                    let actual = f32::from_le_bytes(actual.try_into().unwrap());
+                    let expected = f32::from_le_bytes(expected.try_into().unwrap());
+                    if transfer == TransferFunction::Linear {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "identity float conversion must preserve samples"
+                        );
+                    } else {
+                        assert!(
+                            (actual - expected).abs() < 2e-6,
+                            "{format:?}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for space in [ColorSpace::DisplayP3, ColorSpace::Bt2020] {
+        let samples = [-0.25, 1.5, 0.018];
+        let expected = scalar_primaries_transform(RgbPrimaries::Bt709, space, samples);
+        let (_, bytes) = submit_format(
+            &backend,
+            RgbColorEncoding::LINEAR_BT709,
+            RgbColorEncoding::LINEAR_BT709,
+            PixelFormat::rgb_f32(
+                RgbChannelOrder::Rgb,
+                false,
+                rgb_color(space, TransferFunction::Linear),
+            ),
+            samples,
+        )
+        .unwrap();
+        for (actual, expected) in bytes.chunks_exact(4).zip(expected) {
+            let actual = f32::from_le_bytes(actual.try_into().unwrap());
+            assert!(
+                (actual - expected).abs() < 2e-6,
+                "float primary transform {space:?}: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
 fn nv12_gpu_output_handles_degenerate_odd_edges_without_readback() {
     let Some(backend) = backend() else {
         return;

@@ -432,6 +432,113 @@ fn wide_gamut_and_hdr_images_become_linear_float_textures() {
 }
 
 #[test]
+fn floating_rgb_display_preserves_alpha_and_extended_values_in_unaligned_planes() {
+    let Some(backend) = test_backend() else {
+        return;
+    };
+    let display = DisplayPipeline::new(&backend);
+    let extent = Extent2d::new(3, 2);
+    let pixels = [[-0.25f32, 1.5, 0.018, 0.23], [0.6, -0.125, 1.1, 0.75]];
+    for order in [
+        RgbChannelOrder::Rgb,
+        RgbChannelOrder::Bgr,
+        RgbChannelOrder::Rgba,
+        RgbChannelOrder::Bgra,
+    ] {
+        for planar in [false, true] {
+            for transfer in [TransferFunction::Linear, TransferFunction::Srgb] {
+                let color = ColorSpecification::Defined(ColorSpec {
+                    space: ColorSpace::Bt709,
+                    encoding: YcbcrEncoding::Undefined,
+                    transfer,
+                    range: ColorRange::Full,
+                    chroma_location: ChromaLocation2d::BOTH,
+                });
+                let mut layout = jxl_wgpu::ImageLayout::packed(
+                    extent,
+                    PixelFormat::rgb_f32(order, planar, color),
+                )
+                .unwrap();
+                let mut offset = 5;
+                for plane in &mut layout.planes {
+                    plane.offset = offset;
+                    plane.row_stride = plane.row_bytes + 1;
+                    offset = plane.end_offset().unwrap();
+                }
+                let layout =
+                    jxl_wgpu::ImageLayout::from_planes(extent, layout.format, layout.planes)
+                        .unwrap();
+                let channels = if matches!(order, RgbChannelOrder::Rgb | RgbChannelOrder::Bgr) {
+                    3
+                } else {
+                    4
+                };
+                let mut bytes = vec![0xa5; layout.logical_size as usize];
+                for y in 0..extent.height {
+                    for x in 0..extent.width {
+                        let pixel = pixels[((x + y) % 2) as usize];
+                        for position in 0..channels {
+                            let canonical =
+                                if matches!(order, RgbChannelOrder::Bgr | RgbChannelOrder::Bgra)
+                                    && position < 3
+                                {
+                                    2 - position
+                                } else {
+                                    position
+                                };
+                            let plane = &layout.planes[if planar { position } else { 0 }];
+                            let sample = if planar {
+                                x as usize
+                            } else {
+                                x as usize * channels + position
+                            };
+                            let offset = (plane.offset + u64::from(y) * plane.row_stride) as usize
+                                + sample * 4;
+                            bytes[offset..offset + 4]
+                                .copy_from_slice(&pixel[canonical].to_le_bytes());
+                        }
+                    }
+                }
+                let mut source = gpu_image(&backend, layout, bytes);
+                assert!(matches!(
+                    display.submit_image(&source, DisplayTextureDescriptor::default()),
+                    Err(jxl_wgpu::Error::Unsupported(_))
+                ));
+                let submitted = display
+                    .submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr())
+                    .unwrap();
+                let bytes = read_texture(&backend, &submitted.texture);
+                for (index, actual) in bytes.chunks_exact(8).enumerate() {
+                    let actual = rgba16f(actual);
+                    let pixel = pixels[(index % 3 + index / 3) % 2];
+                    for channel in 0..4 {
+                        let expected = if channel < 3 {
+                            display_to_linear(pixel[channel], transfer)
+                        } else if channels == 4 {
+                            pixel[3]
+                        } else {
+                            1.0
+                        };
+                        assert!(
+                            (actual[channel] - expected).abs() < 0.002,
+                            "{order:?} planar={planar} {transfer:?} channel {channel}: {} != {expected}",
+                            actual[channel]
+                        );
+                    }
+                }
+                if let ColorSpecification::Defined(color) = &mut source.layout.format.color_spec {
+                    color.range = ColorRange::Limited;
+                }
+                assert!(matches!(
+                    display.submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr()),
+                    Err(jxl_wgpu::Error::Unsupported(_))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn bt2020_constant_luminance_displays_through_its_normative_inverse() {
     let Some(backend) = test_backend() else {
         return;
@@ -598,7 +705,14 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
         PixelFormat::i420(12, 16, color).unwrap(),
         PixelFormat::nv42(color),
         PixelFormat::packed_yuv4228(Packed422Order::Uyvy, color),
-        PixelFormat::rgb8(RgbChannelOrder::Bgra, true, color),
+        PixelFormat::rgb8(
+            RgbChannelOrder::Bgra,
+            true,
+            ColorSpecification::Defined(ColorSpec::bt709(
+                ColorRange::Full,
+                ChromaLocation2d::CENTER,
+            )),
+        ),
     ];
     let format_count = formats.len();
 

@@ -15,9 +15,9 @@ pub struct ConvertedImage {
     pub bytes: Vec<u8>,
 }
 
-/// Converts normalized nonlinear R'G'B' planes into a packed pitch-linear
-/// allocation. It is deliberately scalar and intended as an oracle, not as a
-/// production codec fallback.
+/// Packs RGB planes already in the requested transfer/primary encoding, applying the requested
+/// YCbCr matrix when appropriate. RGB F32 preserves finite values outside `0..=1`; integer outputs
+/// quantize and clamp. This scalar oracle is not a production codec fallback.
 pub fn convert_rgb_f32(
     rgb: [&[f32]; 3],
     extent: Extent2d,
@@ -36,7 +36,8 @@ pub fn convert_rgb_f32(
             return Err(ConversionError::NonFiniteInput { channel, index });
         }
     }
-    if format.sample_kind != SampleKind::Unsigned {
+    let float_rgb = format.model == ColorModel::Rgb && format.sample_kind == SampleKind::Float;
+    if format.sample_kind != SampleKind::Unsigned && !float_rgb {
         return Err(ConversionError::UnsupportedSampleKind(format.sample_kind));
     }
     if !matches!(format.model, ColorModel::Ycbcr | ColorModel::Rgb) {
@@ -115,13 +116,14 @@ pub fn convert_rgb_f32(
                                 luma_occurrence,
                                 color.as_ref(),
                             )?;
-                            let quantized = quantize(
-                                sample,
-                                field.bits,
-                                channel,
-                                format.model,
-                                color.as_ref(),
-                            )?;
+                            let quantized = if float_rgb {
+                                if field.bits != 32 || word.bits() != 32 {
+                                    return Err(ConversionError::UnsupportedBitDepth(field.bits));
+                                }
+                                u64::from(sample.to_bits())
+                            } else {
+                                quantize(sample, field.bits, channel, format.model, color.as_ref())?
+                            };
                             value |= quantized;
                             if channel == Channel::X
                                 && format.model == ColorModel::Ycbcr

@@ -276,6 +276,29 @@ pub struct GpuOutputRequest {
     format: PixelFormat,
     mapping: GpuOutputMapping,
     max_frame_slots: NonZeroUsize,
+    orientation: OrientationPolicy,
+}
+
+/// Whether image orientation is applied to the returned pixels and extent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OrientationPolicy {
+    /// Return presentation coordinates, applying the orientation in the image header.
+    #[default]
+    Apply,
+    /// Keep pixels in codestream coordinates with the unrotated width and height.
+    Keep,
+}
+
+impl OrientationPolicy {
+    pub(crate) const fn resolve(
+        self,
+        orientation: jxl_gpu_protocol::OutputOrientation,
+    ) -> jxl_gpu_protocol::OutputOrientation {
+        match self {
+            Self::Apply => orientation,
+            Self::Keep => jxl_gpu_protocol::OutputOrientation::Identity,
+        }
+    }
 }
 
 impl GpuOutputRequest {
@@ -343,6 +366,7 @@ impl GpuOutputRequest {
             format,
             mapping,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
+            orientation: OrientationPolicy::Apply,
         }
     }
 
@@ -354,6 +378,18 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn mapping(&self) -> GpuOutputMapping {
         self.mapping
+    }
+
+    #[must_use]
+    pub const fn orientation_policy(&self) -> OrientationPolicy {
+        self.orientation
+    }
+
+    /// Selects presentation or codestream coordinates for every output frame.
+    #[must_use]
+    pub const fn with_orientation_policy(mut self, orientation: OrientationPolicy) -> Self {
+        self.orientation = orientation;
+        self
     }
 
     /// Maximum number of slots jointly occupied by queued submissions and caller-held frame

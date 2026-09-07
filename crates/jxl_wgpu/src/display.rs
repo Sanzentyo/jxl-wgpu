@@ -1328,8 +1328,15 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         }
     };
     let (primaries, primary_matrix) = display_primary_matrix(color.space)?;
-    let requires_float_output =
-        primaries != 0 || matches!(color.transfer, TransferFunction::Pq | TransferFunction::Hlg);
+    let requires_float_output = primaries != 0
+        || matches!(color.transfer, TransferFunction::Pq | TransferFunction::Hlg)
+        || matches!(
+            class,
+            ColorFormatClass::Rgb {
+                sample: jxl_gpu_formats::RgbSample::F32,
+                ..
+            }
+        );
     let luminance_encoding = match color.transfer {
         TransferFunction::Pq => DisplayLuminanceEncoding::PqNormalized10000Nits,
         TransferFunction::Hlg => DisplayLuminanceEncoding::HlgScene,
@@ -1346,7 +1353,16 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
     );
     let (kind, channels, order, bits, storage_bits, matrix, range, siting_x, siting_y) = match class
     {
-        ColorFormatClass::Rgb8 { storage, order } => {
+        ColorFormatClass::Rgb {
+            sample,
+            storage,
+            order,
+        } => {
+            if color.range != ColorRange::Full {
+                return Err(Error::Unsupported(
+                    "RGB display input requires full range".into(),
+                ));
+            }
             let kind = match storage {
                 RgbStorage::Interleaved => 0,
                 RgbStorage::Planar => 1,
@@ -1357,7 +1373,17 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                 RgbChannelOrder::Rgba => (4, 2),
                 RgbChannelOrder::Bgra => (4, 3),
             };
-            (kind, channels, order, 8, 8, 1, 0, 1, 1)
+            (
+                kind,
+                channels,
+                order,
+                sample.bits(),
+                sample.bits(),
+                1,
+                0,
+                1,
+                1,
+            )
         }
         color_class => {
             let matrix = match color.encoding {
@@ -1429,7 +1455,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                     siting_x,
                     siting_y,
                 ),
-                ColorFormatClass::Rgb8 { .. } => {
+                ColorFormatClass::Rgb { .. } => {
                     unreachable!("RGB color classes were handled before YCbCr lowering")
                 }
             }
@@ -1654,7 +1680,7 @@ fn validate_image_display_descriptor(
 ) -> Result<()> {
     match descriptor.format {
         wgpu::TextureFormat::Rgba8Unorm if requires_float_output => Err(Error::Unsupported(
-            "wide-gamut or HDR display input requires an Rgba16Float linear BT.709 texture".into(),
+            "floating-point, wide-gamut or HDR display input requires an Rgba16Float linear BT.709 texture".into(),
         )),
         wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba16Float => Ok(()),
         unsupported => Err(Error::Unsupported(format!(

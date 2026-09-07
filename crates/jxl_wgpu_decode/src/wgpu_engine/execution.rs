@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jxl_gpu_formats::{
-    ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout, Packed422Order,
-    PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage, SampleKind, TransferFunction,
-    classify_pixel_format,
+    ChromaOrder, ColorFormatClass, ColorRange, ColorSpace, ColorSpecification, ImageLayout,
+    Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbSample, RgbStorage,
+    SampleKind, TransferFunction, classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputOrientation, SubmissionToken};
 use jxl_wgpu::{
@@ -977,6 +977,7 @@ impl OutputPlan {
         source_bits: u8,
         capabilities: WgpuDecodeCapabilities,
     ) -> Result<Self> {
+        let orientation = request.orientation_policy().resolve(orientation);
         let extent = orientation.map_extent(source_extent);
         let format = request.format().clone();
         if let Some(native) = native_modular_format(&format) {
@@ -1015,14 +1016,28 @@ impl OutputPlan {
                 return Ok(output);
             }
         }
-        if source_channels != crate::ModularChannels::Gray || source_bits != 8 {
+        let class = classify_pixel_format(&format)
+            .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?;
+        let float_rgb = matches!(
+            class,
+            PixelFormatClass::Color(ColorFormatClass::Rgb {
+                sample: RgbSample::F32,
+                ..
+            })
+        );
+        if !float_rgb && (source_channels != crate::ModularChannels::Gray || source_bits != 8) {
             return Err(Error::UnsupportedOutputFormat(
-                "RGB/RGBA and non-8-bit Modular sources currently require their exact canonical native output descriptor"
+                "RGB/RGBA and non-8-bit Modular sources require matching native output or RGB(A) F32"
                     .into(),
             ));
         }
-        let class = classify_pixel_format(&format)
-            .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?;
+        if float_rgb
+            && !matches!(format.color_spec, ColorSpecification::Defined(spec) if spec.space == ColorSpace::Bt709)
+        {
+            return Err(Error::UnsupportedOutputFormat(
+                "Modular RGB F32 conversion currently requires explicit BT.709 primaries".into(),
+            ));
+        }
         let (
             kind,
             transfer,
@@ -1101,7 +1116,11 @@ impl OutputPlan {
             (PixelFormatClass::Color(color), GpuOutputMapping::Color) => {
                 let (transfer, limited_range) = color_conversion(&format)?;
                 let (kind, channels, order, bits, storage_bits) = match color {
-                    ColorFormatClass::Rgb8 { storage, order } => {
+                    ColorFormatClass::Rgb {
+                        sample,
+                        storage,
+                        order,
+                    } => {
                         if limited_range {
                             return Err(Error::UnsupportedOutputFormat(
                                 "RGB output requires an explicit full-range color specification"
@@ -1113,7 +1132,13 @@ impl OutputPlan {
                             RgbStorage::Interleaved => OutputKind::RgbInterleaved,
                             RgbStorage::Planar => OutputKind::RgbPlanar,
                         };
-                        (kind, channels, order, 8, 8)
+                        (
+                            kind,
+                            channels,
+                            order,
+                            u32::from(sample.bits()),
+                            u32::from(sample.bits()),
+                        )
                     }
                     ColorFormatClass::Luma { bits, storage_bits }
                         if matches!((bits, storage_bits), (8, 8) | (16, 16)) =>
@@ -1261,6 +1286,20 @@ impl OutputPlan {
                 ));
             }
         }
+        if matches!(
+            self.kind,
+            OutputKind::RgbInterleaved | OutputKind::RgbPlanar
+        ) && self.bits == 32
+            && self
+                .layout
+                .planes
+                .iter()
+                .any(|plane| !plane.offset.is_multiple_of(4) || !plane.row_stride.is_multiple_of(4))
+        {
+            return Err(Error::backend(
+                "RGB F32 output requires four-byte-aligned rows",
+            ));
+        }
         Ok(())
     }
 
@@ -1315,8 +1354,10 @@ impl OutputPlan {
             OutputKind::Luma | OutputKind::YuvSemiplanar | OutputKind::YuvPlanar => {
                 u64::from(self.storage_bits / 8)
             }
-            OutputKind::RgbInterleaved => u64::from(self.channels),
-            OutputKind::RgbPlanar => 1,
+            OutputKind::RgbInterleaved => {
+                u64::from(self.channels) * u64::from(self.storage_bits / 8)
+            }
+            OutputKind::RgbPlanar => u64::from(self.storage_bits / 8),
             OutputKind::NativeModular => u64::from(self.channels)
                 .checked_mul(u64::from(self.storage_bits / 8))
                 .ok_or_else(|| Error::backend("native Modular output pixel size overflow"))?,
@@ -1367,7 +1408,8 @@ pub(super) fn color_conversion(format: &PixelFormat) -> Result<(u32, bool)> {
     };
     let transfer = match spec.transfer {
         TransferFunction::Srgb | TransferFunction::Sycc => 0,
-        TransferFunction::Bt709 | TransferFunction::Bt2020 => 1,
+        TransferFunction::Bt709 => 1,
+        TransferFunction::Bt2020 => 3,
         TransferFunction::Linear => 2,
         transfer => {
             return Err(Error::UnsupportedOutputFormat(format!(

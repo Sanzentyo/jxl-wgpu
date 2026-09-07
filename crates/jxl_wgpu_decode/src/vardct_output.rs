@@ -1047,7 +1047,7 @@ mod tests {
         );
         let output = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VarDCT color test output"),
-            size: 64,
+            size: 128,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -1055,7 +1055,7 @@ mod tests {
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VarDCT color test staging"),
-            size: 64,
+            size: 128,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1070,17 +1070,22 @@ mod tests {
         for extent in [Extent2d::new(3, 1), Extent2d::new(1, 3)] {
             for value in 1..=8 {
                 let orientation = OutputOrientation::from_exif_value(value).unwrap();
-                for layout_kind in 0..3 {
+                for layout_kind in 0..5 {
                     let oriented = orientation.map_extent(extent);
                     let layout = if layout_kind == 0 {
                         rgb_layout(oriented.width, oriented.height)
                     } else {
-                        let order = if layout_kind == 1 {
+                        let order = if layout_kind == 1 || layout_kind == 3 {
                             jxl_gpu_formats::RgbChannelOrder::Rgb
                         } else {
                             jxl_gpu_formats::RgbChannelOrder::Rgba
                         };
-                        let format = jxl_gpu_formats::PixelFormat::rgb8(
+                        let constructor = if layout_kind >= 3 {
+                            jxl_gpu_formats::PixelFormat::rgb_f32
+                        } else {
+                            jxl_gpu_formats::PixelFormat::rgb8
+                        };
+                        let format = constructor(
                             order,
                             true,
                             crate::vardct_engine::vardct_rgb8_format().color_spec,
@@ -1094,7 +1099,7 @@ mod tests {
                         }
                         ImageLayout::from_planes(oriented, layout.format, layout.planes).unwrap()
                     };
-                    queue.write_buffer(&output, 0, &[0xa5; 64]);
+                    queue.write_buffer(&output, 0, &[0xa5; 128]);
                     let mut encoder =
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("VarDCT color test commands"),
@@ -1144,7 +1149,7 @@ mod tests {
                     );
                     assert_eq!(scratch.uniform.size(), 176);
                     assert_eq!(scratch.source_uniform.size(), 144);
-                    encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 64);
+                    encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);
                     let (sender, receiver) = mpsc::sync_channel(1);
                     staging
@@ -1178,7 +1183,7 @@ mod tests {
                     } else {
                         [255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0]
                     };
-                    let mut stored = vec![0xa5; 64];
+                    let mut stored = vec![0xa5; 128];
                     stored[..scratch.plan.memory.output_storage_bytes as usize].fill(0);
                     if layout_kind == 0 {
                         stored[..9].copy_from_slice(&expected[..9]);
@@ -1187,13 +1192,29 @@ mod tests {
                             for pixel in 0..3 {
                                 let x = pixel % oriented.width as usize;
                                 let y = pixel / oriented.width as usize;
-                                let offset =
-                                    plane.offset as usize + y * plane.row_stride as usize + x;
-                                stored[offset] = if channel == 3 {
+                                let sample_bytes = if layout_kind >= 3 { 4 } else { 1 };
+                                let offset = plane.offset as usize
+                                    + y * plane.row_stride as usize
+                                    + x * sample_bytes;
+                                let expected_code = if channel == 3 {
                                     255
                                 } else {
                                     expected[pixel * 3 + channel]
                                 };
+                                if sample_bytes == 4 {
+                                    let actual = f32::from_le_bytes(
+                                        mapped[offset..offset + 4].try_into().unwrap(),
+                                    );
+                                    let expected = f32::from(expected_code) / 255.0;
+                                    assert!(
+                                        (actual - expected).abs() < 2e-5,
+                                        "float primary sample {actual} != {expected}"
+                                    );
+                                    stored[offset..offset + 4]
+                                        .copy_from_slice(&mapped[offset..offset + 4]);
+                                } else {
+                                    stored[offset] = expected_code;
+                                }
                             }
                         }
                     }

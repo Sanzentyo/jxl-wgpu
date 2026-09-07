@@ -204,7 +204,7 @@ fn srgb_to_linear(value: f32) -> f32 {
 }
 
 fn target_nonlinear(value: u32) -> f32 {
-    let encoded = f32(value) / 255.0;
+    let encoded = f32(value) / f32(source_mask());
     if params.output.y == 0u {
         return encoded;
     }
@@ -212,10 +212,34 @@ fn target_nonlinear(value: u32) -> f32 {
     if params.output.y == 2u {
         return linear;
     }
+    if params.output.y == 3u {
+        let alpha = 1.09929682680944;
+        let beta = 0.018053968510807;
+        return select(alpha * pow(linear, 0.45) - (alpha - 1.0), 4.5 * linear, linear < beta);
+    }
     if linear < 0.018 {
         return 4.5 * linear;
     }
     return 1.099 * pow(linear, 0.45) - 0.099;
+}
+
+fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
+    let offsets = vec4<u32>(params.plane01.x, params.plane01.z, params.plane23.x, params.plane23.z);
+    let strides = vec4<u32>(params.plane01.y, params.plane01.w, params.plane23.y, params.plane23.w);
+    for (var position = 0u; position < params.output.w; position += 1u) {
+        var canonical = position;
+        if (params.format.x == 1u || params.format.x == 3u) && position < 3u { canonical = 2u - position; }
+        var value = 1.0;
+        if canonical < 3u {
+            let channel = select(canonical, 0u, params.extent.z == 1u);
+            value = target_nonlinear(source_sample(channel, source_x, source_y));
+        } else if params.extent.z == 4u {
+            value = f32(source_sample(3u, source_x, source_y)) / f32(source_mask());
+        }
+        var offset = params.plane01.x + y * params.plane01.y + (x * params.output.w + position) * 4u;
+        if params.output.x == 6u { offset = offsets[position] + y * strides[position] + x * 4u; }
+        write_word(offset, bitcast<u32>(value));
+    }
 }
 
 fn color_code(value: u32) -> u32 {
@@ -322,6 +346,10 @@ fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
     let destination = image_output_coordinate(params.region.xy + id.xy, params.canvas.xy, params.canvas.w);
     let x = destination.x;
     let y = destination.y;
+    if (params.output.x == 5u || params.output.x == 6u) && params.format.y == 32u {
+        write_float_rgb_pixel(source_x, source_y, x, y);
+        return;
+    }
     if params.output.x == 9u {
         write_native_pixel(source_x, source_y, x, y);
         return;

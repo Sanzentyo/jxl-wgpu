@@ -6,3 +6,7 @@ fn source_rgb_at(x: u32, y: u32) -> vec3<f32> {
         bitcast<f32>(source_b[coordinate.y * params.b_stride + coordinate.x]),
     );
 }
+
+fn source_alpha_at(x: u32, y: u32) -> f32 {
+    return 1.0;
+}

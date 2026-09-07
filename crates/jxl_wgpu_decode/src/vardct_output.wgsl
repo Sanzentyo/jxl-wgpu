@@ -59,6 +59,10 @@ fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
     return mix(top, bottom, y_weight);
 }
 
+fn source_alpha_at(x: u32, y: u32) -> f32 {
+    return 1.0;
+}
+
 fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
     let coordinate = source_coordinate(vec2<u32>(min(output_x, params.width - 1u), min(output_y, params.height - 1u)));
     let column = coordinate.x;

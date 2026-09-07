@@ -18,7 +18,8 @@ use jxl_gpu_protocol::{
 };
 
 /// Shared WGSL declarations, color conversion, and word-owned output entry point `main`.
-/// Append a source fragment defining `source_rgb_at(x: u32, y: u32) -> vec3<f32>`.
+/// Append a source fragment defining `source_rgb_at(x: u32, y: u32) -> vec3<f32>`
+/// and linear `source_alpha_at(x: u32, y: u32) -> f32`, both in oriented coordinates.
 pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
@@ -80,7 +81,7 @@ pub struct ImageOutputParams {
     pub(crate) orientation: u32,
     pub(crate) source_transfer: u32,
     pub(crate) target_transfer: u32,
-    pub(crate) _padding: u32,
+    pub(crate) identity_color_transform: u32,
     pub(crate) primaries_r: [f32; 4],
     pub(crate) primaries_g: [f32; 4],
     pub(crate) primaries_b: [f32; 4],
@@ -134,7 +135,10 @@ impl ImageOutputParams {
             orientation: source.orientation.to_exif_value() - 1,
             source_transfer: color.source_transfer,
             target_transfer: color.target_transfer,
-            _padding: 0,
+            identity_color_transform: u32::from(
+                color.source_transfer == color.target_transfer
+                    && color.primaries == IDENTITY_3.map(|row| [row[0], row[1], row[2], 0.0]),
+            ),
             primaries_r: color.primaries[0],
             primaries_g: color.primaries[1],
             primaries_b: color.primaries[2],
@@ -183,7 +187,11 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
 
     let class = classify_image_output_format(&layout.format)?;
     match class {
-        ColorFormatClass::Rgb8 { storage, order } => {
+        ColorFormatClass::Rgb {
+            sample,
+            storage,
+            order,
+        } => {
             if matches!(layout.format.color_spec, ColorSpecification::Defined(color) if color.range != ColorRange::Full)
             {
                 return Err(Error::Unsupported(
@@ -210,8 +218,8 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
                 siting_y: 1,
                 subsample_x: 1,
                 subsample_y: 1,
-                bits: 8,
-                storage_bits: 8,
+                bits: u32::from(sample.bits()),
+                storage_bits: u32::from(sample.bits()),
                 plane_offsets,
                 plane_strides,
             })
@@ -245,7 +253,7 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
                 ColorFormatClass::Yuv422Packed { order } => {
                     (6, 3, u32::from(order == Packed422Order::Uyvy), 8, 8)
                 }
-                ColorFormatClass::Rgb8 { .. } => {
+                ColorFormatClass::Rgb { .. } => {
                     unreachable!("RGB color classes were handled before YCbCr lowering")
                 }
             };

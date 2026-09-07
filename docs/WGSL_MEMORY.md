@@ -86,7 +86,7 @@ name shown in parentheses.
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
 | `jxl_wgpu/extend.wgsl` | `ExtendUniform` / `Params` | image/frame dimensions, 3 strides, signed origin, `has_reference`, 2 pads | 48 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
-| `jxl_wgpu/image_output.wgsl` | `ImageOutputParams` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer`, 1 pad, three padded primary-matrix rows | 176 | 4 | uniform |
+| `jxl_wgpu/image_output.wgsl` | `ImageOutputParams` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer, identity_color_transform`, three padded primary-matrix rows | 176 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
 | `jxl_wgpu/display_numeric.wgsl` | `DisplayNumericParams` / `NumericParams` | dimensions/type/depth/components, plane offset/stride, visualization/non-finite/transfer/clamp, reserved word, `scale, bias`, 2 pads | 64 | 4 | uniform |
 | `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer`, three padded source-linear-to-BT.709 matrix rows | 144 | 4 | uniform |
@@ -355,7 +355,9 @@ and retain conservative HF storage; image dimensions no longer imply a transform
 VarDCT and the render graph share `ImageOutputParams` and the `image_output.wgsl` fragment.
 Its 176-byte uniform at binding 4 retains output/input dimensions at offsets 0/8, source strides
 at 16, target layout fields from 28, logical bytes at 104, dispatch width at 108, zero-based
-orientation at 112, source/target transfer at 116/120, and padded primary-matrix rows at 128/144/160.
+orientation at 112, source/target transfer at 116/120, identity-color flag at 124, and padded
+primary-matrix rows at 128/144/160. The identity flag bypasses a redundant EOTF/OETF round trip
+when both transfer and primaries match.
 The codec source fragment adds a 144-byte, 16-byte-aligned `VarDctSourceParams` at binding 5:
 component geometry starts at 0, inverse matrix rows at 48/64/80, cube-root/scaled biases at 96/112,
 intensity scale at 128, and transform mode at 132. The two bindings are individually limit-checked;
@@ -363,7 +365,10 @@ intensity scale at 128, and transform mode at 132. The two bindings are individu
 
 Each output word resolves its samples back to codestream coordinates before XYB/JPEG reconstruction.
 Target chroma subsampling averages only valid oriented pixels, then packing quantizes once into
-8/10/12/16-bit codes. A source fragment supplies unclipped linear BT.709 for XYB or encoded sRGB
+8/10/12/16-bit codes, or writes IEEE 754 F32 RGB components without quantization. RGB storage kinds
+0/1 use `bits = storage_bits = 32` for F32 and 8 for U8. Every invocation still owns one output word;
+byte extraction supports unaligned float plane starts and row pitches. A source fragment supplies
+`source_rgb_at` and linear `source_alpha_at` in output coordinates: unclipped linear BT.709 for XYB or encoded sRGB
 for JPEG; no intermediate RGB allocation or queue submission is added. The requested `ImageLayout`
 defines output lease bytes, plane gaps, row pitches, and four-byte final storage rounding. Range
 checks stop at the last row payload instead of treating unused row-tail capacity as part of a plane,
@@ -372,6 +377,14 @@ both one-pixel axes in all orientations with interleaved and padded RGB/RGBA pla
 plane starts, opaque alpha, zero internal/tail padding, and unchanged guard bytes outside storage.
 Grayscale luminance stays folded into inverse-matrix metadata. Progressive-DC planes retain their
 unoriented three-channel shape even for gray presentation or a non-RGB output request.
+
+Modular's ordinary and inverse-stage writers use output kinds 5/6 with 32-bit samples for F32 RGB.
+They normalize the 1–16-bit integer planes after inverse reconstruction, preserve alpha separately,
+and store complete word-aligned float components. Their 256-byte ordinary records and 160-byte
+finalizer uniforms do not grow. Output planning charges the complete 3/4-component F32 layout,
+validates all four-byte alignments and source/target plane bounds, and includes sample width in
+group-isolation proofs. `OrientationPolicy::Keep` lowers output orientation to identity while
+retaining the checked source extent. It adds no buffer or submission and does not change LF storage.
 
 Staged HF metadata and AC traversal use the checked MCU-padded block grid for subsampled JPEG
 edges. Late host uploads of default/parametric matrices use coalesced vector ranges that exclude

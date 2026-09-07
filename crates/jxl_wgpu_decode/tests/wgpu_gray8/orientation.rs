@@ -133,6 +133,196 @@ impl Case {
     }
 }
 
+#[test]
+fn floating_rgb_preserves_oriented_modular_depth_and_alpha() {
+    use jxl_gpu_formats::{ColorSpace, RgbChannelOrder};
+    let Some(backend) = backend() else {
+        return;
+    };
+    let whole = GpuDecoder::new(WgpuSubmissionEngine::new(backend.clone()));
+    let bounded = GpuDecoder::new(
+        WgpuSubmissionEngine::new(backend.clone())
+            .with_stream_window_limit(NonZeroU64::new(4096).unwrap()),
+    );
+    let orders = [
+        RgbChannelOrder::Rgb,
+        RgbChannelOrder::Bgr,
+        RgbChannelOrder::Rgba,
+        RgbChannelOrder::Bgra,
+    ];
+    for (case_index, case) in CASES.iter().enumerate() {
+        let encoded = case.encoded();
+        let expected = case.expected();
+        let source_channels = case.format.channel_count() as usize;
+        let transfers: &[TransferFunction] = if matches!(
+            case.name,
+            "rgba_16" | "rgb_12_column" | "gray_single_palette"
+        ) {
+            &[
+                TransferFunction::Srgb,
+                TransferFunction::Linear,
+                TransferFunction::Bt709,
+                TransferFunction::Bt2020,
+            ]
+        } else {
+            &[TransferFunction::Srgb]
+        };
+        let maximum = ((1u32 << case.bits) - 1) as f32;
+        for (transfer_index, &transfer) in transfers.iter().enumerate() {
+            let order = orders[(case_index + transfer_index) % orders.len()];
+            let planar = (case_index + transfer_index) % 2 == 0;
+            let channels = if matches!(order, RgbChannelOrder::Rgb | RgbChannelOrder::Bgr) {
+                3
+            } else {
+                4
+            };
+            let format = PixelFormat::rgb_f32(
+                order,
+                planar,
+                ColorSpecification::Defined(ColorSpec {
+                    space: ColorSpace::Bt709,
+                    transfer,
+                    ..ColorSpec::bt709(ColorRange::Full, ChromaLocation2d::CENTER)
+                }),
+            );
+            let mut previous = None;
+            for (decoder, is_bounded) in [(&whole, false), (&bounded, true)] {
+                let (layout, bytes) = decode(
+                    &backend,
+                    decoder,
+                    &encoded,
+                    GpuOutputRequest::color(format.clone()).unwrap(),
+                    is_bounded,
+                );
+                assert_eq!(layout.extent, case.extent());
+                for (pixel_index, pixel) in expected.chunks_exact(source_channels).enumerate() {
+                    let x = pixel_index as u64 % u64::from(layout.extent.width);
+                    let y = pixel_index as u64 / u64::from(layout.extent.width);
+                    for position in 0..channels {
+                        let canonical =
+                            if matches!(order, RgbChannelOrder::Bgr | RgbChannelOrder::Bgra)
+                                && position < 3
+                            {
+                                2 - position
+                            } else {
+                                position
+                            };
+                        let mut value = if canonical == 3 && source_channels != 4 {
+                            1.0
+                        } else {
+                            f32::from(pixel[if source_channels == 1 { 0 } else { canonical }])
+                                / maximum
+                        };
+                        if canonical < 3 && transfer != TransferFunction::Srgb {
+                            let linear = if value <= 0.04045 {
+                                value / 12.92
+                            } else {
+                                ((value + 0.055) / 1.055).powf(2.4)
+                            };
+                            value = match transfer {
+                                TransferFunction::Linear => linear,
+                                TransferFunction::Bt709 => {
+                                    if linear < 0.018 {
+                                        4.5 * linear
+                                    } else {
+                                        1.099 * linear.powf(0.45) - 0.099
+                                    }
+                                }
+                                TransferFunction::Bt2020 => {
+                                    if linear < 0.01805397 {
+                                        4.5 * linear
+                                    } else {
+                                        1.0992968 * linear.powf(0.45) - 0.0992968
+                                    }
+                                }
+                                _ => unreachable!(),
+                            };
+                        }
+                        let plane = &layout.planes[if planar { position } else { 0 }];
+                        let offset = (plane.offset
+                            + y * plane.row_stride
+                            + if planar {
+                                x * 4
+                            } else {
+                                (x * channels as u64 + position as u64) * 4
+                            }) as usize;
+                        let actual =
+                            f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                        assert!(
+                            (actual - value).abs() < 2e-6,
+                            "{} {format:?} pixel {pixel_index} channel {canonical}: {actual} != {value}",
+                            case.name
+                        );
+                    }
+                }
+                if let Some(previous) = &previous {
+                    assert_eq!(&bytes, previous);
+                }
+                previous = Some(bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn floating_rgb_normalizes_every_integer_modular_source_depth() {
+    let Some(backend) = backend() else {
+        return;
+    };
+    let decoder = GpuDecoder::new(
+        WgpuSubmissionEngine::new(backend.clone())
+            .with_stream_window_limit(NonZeroU64::new(4096).unwrap()),
+    );
+    let color = jxl_wgpu_decode::vardct_rgb8_format().color_spec;
+    let request = GpuOutputRequest::color(PixelFormat::rgb_f32(
+        jxl_gpu_formats::RgbChannelOrder::Rgba,
+        false,
+        color,
+    ))
+    .unwrap();
+    for format in [
+        LosslessModularFormat::Gray,
+        LosslessModularFormat::Rgb,
+        LosslessModularFormat::Rgba,
+    ] {
+        for bits in 1..=16 {
+            let samples = patterned_modular_samples(format, bits, 257, 3);
+            let encoded = encode_standard_modular_with_odd_stride(
+                &backend,
+                format,
+                bits,
+                257,
+                3,
+                &samples,
+                bits % 2 == 0,
+            );
+            let (_, oracle) = rust_jxl_decode_integer(&encoded, format, bits).unwrap();
+            assert_eq!(oracle, samples);
+            let (layout, actual) = decode(&backend, &decoder, &encoded, request.clone(), true);
+            assert_eq!(layout.extent, Extent2d::new(257, 3));
+            assert_eq!(actual.len(), 257 * 3 * 16);
+            let maximum = ((1u32 << bits) - 1) as f32;
+            let count = format.channel_count() as usize;
+            for (actual, pixel) in actual.chunks_exact(16).zip(samples.chunks_exact(count)) {
+                for channel in 0..4 {
+                    let actual = f32::from_le_bytes(
+                        actual[channel * 4..channel * 4 + 4].try_into().unwrap(),
+                    );
+                    let expected = if channel == 3 && count != 4 {
+                        1.0
+                    } else {
+                        f32::from(pixel[if count == 1 { 0 } else { channel }]) / maximum
+                    };
+                    assert!(
+                        (actual - expected).abs() < 1e-7,
+                        "{format:?} {bits}-bit channel {channel}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn incremental(
     decoder: &GpuDecoder<WgpuSubmissionEngine>,
     encoded: &[u8],

@@ -33,7 +33,7 @@ struct Params {
     orientation: u32,
     source_transfer: u32,
     target_transfer: u32,
-    _padding: u32,
+    identity_color_transform: u32,
     primaries_r: vec4<f32>,
     primaries_g: vec4<f32>,
     primaries_b: vec4<f32>,
@@ -127,6 +127,7 @@ fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
 }
 
 fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+    if params.identity_color_transform != 0u { return source_rgb_at(x, y); }
     let linear = target_linear_rgb_at(x, y);
     return vec3<f32>(
         transfer_from_linear(linear.r, params.target_transfer),
@@ -261,12 +262,21 @@ fn plane_contains(index: u32, offset: u32, stride: u32, row_bytes: u32, height: 
     return row < height && (row + 1u < height || local % stride < row_bytes);
 }
 
-fn rgb_component(rgb: vec3<f32>, component: u32) -> f32 {
-
+fn rgb_component_at(x: u32, y: u32, component: u32) -> f32 {
+    if component == 3u { return source_alpha_at(x, y); }
+    let rgb = rgb_at(x, y);
     if component == 0u { return rgb.r; }
     if component == 1u { return rgb.g; }
     if component == 2u { return rgb.b; }
     return 1.0;
+}
+
+fn rgb_byte_at(x: u32, y: u32, component: u32, byte: u32) -> u32 {
+    let value = rgb_component_at(x, y, component);
+    if params.bits == 32u {
+        return (bitcast<u32>(value) >> (byte * 8u)) & 0xffu;
+    }
+    return quantize8(value, 0u);
 }
 
 fn stored_rgb_component(position: u32) -> u32 {
@@ -279,32 +289,35 @@ fn stored_rgb_component(position: u32) -> u32 {
 fn byte_at(index: u32) -> u32 {
     if index >= params.logical_size { return 0u; }
 
-    // RGB8 interleaved.
+    let rgb_sample_bytes = params.storage_bits / 8u;
+    // Interleaved RGB8 / RGB F32.
     if params.kind == 0u && index >= params.plane0_offset {
         let local = plane_local(index, params.plane0_offset, params.plane0_stride);
-        if local.y < params.height && local.x < params.width * params.channels {
-            let pixel = local.x / params.channels;
-            let component = stored_rgb_component(local.x % params.channels);
-            return quantize8(rgb_component(rgb_at(pixel, local.y), component), 0u);
+        if local.y < params.height && local.x < params.width * params.channels * rgb_sample_bytes {
+            let sample = local.x / rgb_sample_bytes;
+            let pixel = sample / params.channels;
+            let component = stored_rgb_component(sample % params.channels);
+            return rgb_byte_at(pixel, local.y, component, local.x % rgb_sample_bytes);
         }
         return 0u;
     }
 
-    // RGB8 planar. Plane index is also stored channel position.
+    // Planar RGB8 / RGB F32. Plane index is also stored channel position.
     if params.kind == 1u {
         var plane = 4u;
         var local = vec2<u32>(0u);
-        if plane_contains(index, params.plane0_offset, params.plane0_stride, params.width, params.height) {
+        let row_bytes = params.width * rgb_sample_bytes;
+        if plane_contains(index, params.plane0_offset, params.plane0_stride, row_bytes, params.height) {
             plane = 0u; local = plane_local(index, params.plane0_offset, params.plane0_stride);
-        } else if plane_contains(index, params.plane1_offset, params.plane1_stride, params.width, params.height) {
+        } else if plane_contains(index, params.plane1_offset, params.plane1_stride, row_bytes, params.height) {
             plane = 1u; local = plane_local(index, params.plane1_offset, params.plane1_stride);
-        } else if plane_contains(index, params.plane2_offset, params.plane2_stride, params.width, params.height) {
+        } else if plane_contains(index, params.plane2_offset, params.plane2_stride, row_bytes, params.height) {
             plane = 2u; local = plane_local(index, params.plane2_offset, params.plane2_stride);
-        } else if params.channels == 4u && plane_contains(index, params.plane3_offset, params.plane3_stride, params.width, params.height) {
+        } else if params.channels == 4u && plane_contains(index, params.plane3_offset, params.plane3_stride, row_bytes, params.height) {
             plane = 3u; local = plane_local(index, params.plane3_offset, params.plane3_stride);
         }
-        if plane < params.channels && local.x < params.width && local.y < params.height {
-            return quantize8(rgb_component(rgb_at(local.x, local.y), stored_rgb_component(plane)), 0u);
+        if plane < params.channels && local.x < row_bytes && local.y < params.height {
+            return rgb_byte_at(local.x / rgb_sample_bytes, local.y, stored_rgb_component(plane), local.x % rgb_sample_bytes);
         }
         return 0u;
     }

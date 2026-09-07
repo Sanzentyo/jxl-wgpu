@@ -266,7 +266,10 @@ impl WgpuDecodeEngine {
         request: &GpuOutputRequest,
         inventory: &jxl_gpu_bitstream::CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
-        let plan = crate::FrameExecutionPlan::negotiate(inventory)?;
+        let plan = crate::FrameExecutionPlan::negotiate_with_orientation(
+            inventory,
+            request.orientation_policy(),
+        )?;
         if inventory.image_header.animation.is_some()
             || plan.presentations.len() != 1
             || inventory.frames.iter().any(|frame| {

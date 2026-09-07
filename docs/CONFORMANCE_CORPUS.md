@@ -486,8 +486,8 @@ extension rejection, including empty unknown payloads and bounded extension leng
 | `gray_row` | 257×1 | 8 / 1 | 8 | 367 | `5cdd1252953adfdd9fa7f2e7d9908919fe4abd203a80fe3c405dbc948f0f1337` |
 | `rgba_8` | 17×9 | 8 / 4 | 2 | 1238 | `54fc40d367b42351c6770868195d3abd584df7e1b4ea9d8bea25e7afb297fe6d` |
 
-This coverage does not add Modular HDR/ICC conversion, arbitrary extra channels, frame resampling,
-animation/composition, or keep-orientation output controls.
+This native-orientation coverage does not add Modular HDR/ICC conversion, arbitrary extra channels,
+frame resampling or canvas/reference composition. F32 and Keep controls are covered below.
 
 ## Shared VarDCT color output
 
@@ -495,7 +495,9 @@ The decoder and render graph use one shared GPU color/layout lowering and word-o
 fragment. `vardct_engine_gpu/color_output.rs` reuses the checked-in depth/orientation fixtures below;
 no new image provenance is introduced. `generic_color_outputs_preserve_oriented_high_depth_vardct_precision`
 tests all 20 color VPI pitch-linear forms plus I444/I422/I420, NV21/NV42, P010/P012/P016,
-12-bit planar I420, and linear BGRA: 30 layout/transfer choices. The input is the 16-bit,
+12-bit planar I420, and linear BGRA: 30 integer layout/transfer choices. Nine F32 choices add all
+eight RGB/BGR/RGBA/BGRA packing/planarity combinations in sRGB and interleaved linear BGRA.
+The input is the 16-bit,
 two-LF-group fixture with orientation 5, producing 17×2056 pixels. Source float RGB from Rust `jxl`
 and explicit-sRGB `djxl` PFM is independently converted by the development-only scalar
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
@@ -508,19 +510,49 @@ bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-0
 difference is one code at 8–12 bits; at 16 bits it is one versus Rust `jxl` and three versus `djxl`.
 The regression threshold is one at 8–12 bits and four at 16 bits (less than 0.000062 normalized).
 
+F32 reconstruction comparisons use linear-light values, with separate encoded-error reporting.
+Near black the sRGB slope amplifies reconstruction differences, so a fixed encoded threshold
+would change the permitted reconstruction error with brightness. The independent shared-output
+test verifies the OETF itself within 0.000002 in encoded values. On Apple M5/Metal, the high-depth
+fixture has maximum linear error below 0.000005 against Rust `jxl` and 0.000073 against `djxl`;
+the linear-float references themselves differ by 0.000074. The regression thresholds are 0.00002
+and 0.0001 respectively. Linear `djxl` PFM is requested directly in the target color encoding.
+The sRGB encoded maxima are 0.000046 and 0.000237, also recorded in test diagnostics.
+
 `generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc` repeats I420, P016, and linear
-BGRA for rotated 12-bit gray with 4× resampling, a three-frame 16-bit gray DC chain, and the odd
+BGRA, linear F32 BGRA and planar sRGB F32 RGBA for rotated 12-bit gray with 4× resampling, a three-frame 16-bit gray DC chain, and the odd
 oriented 4:2:0 JPEG transcode. `generic_color_output_converts_d65_primaries_against_djxl` requests
 Display-P3/sRGB and BT.2020/BT.709 output, compares planar BGRA against `djxl` PFM explicitly
 requested as `RGB_D65_DCI_Rel_SRG` and `RGB_D65_202_Rel_709`, and observes at most one code of
 difference. Existing RGB8 dual-oracle cases continue to pass through the shared shader.
 
 The packer GPU test checks 3×1 and 1×3 in every orientation with interleaved RGB and padded planar
-RGB/RGBA. Plane starts can be unaligned and occupy a preceding plane's unused final-row tail;
+U8/F32 RGB/RGBA. Plane starts can be unaligned and occupy a preceding plane's unused final-row tail;
 payload, opaque alpha, zero padding, and untouched output guard bytes are checked independently.
 Typed negative tests reject inconsistent extents/logical sizes, limited-range RGB, and PQ/HLG
-without an explicit luminance mapping. Numeric/float RGB output, arbitrary ICC conversion, HDR
-luminance mapping, Modular orientation, and extra-channel decoding remain separate coverage gaps.
+without an explicit luminance mapping. Non-color numeric output, arbitrary ICC conversion, HDR
+luminance mapping, broader Modular color conversion and extra-channel decoding remain separate coverage gaps.
+
+`floating_rgb_preserves_oriented_modular_depth_and_alpha` reuses all 23 orientation fixtures with
+F32 output, including RCT/Palette/Squeeze, 12/16-bit source normalization, alpha, and the Linear,
+sRGB, BT.709 and BT.2020 transfer functions. Source-formula float error is below 0.000002 and
+whole versus 4 KiB fragmented async output is byte-identical. `floating_frame_sequences_can_keep_codestream_coordinates`
+reuses all nine accepted frame sequences with `OrientationPolicy::Keep` and F32 RGBA: output
+geometry is unrotated, timing/dependency metadata is unchanged, and a row/column traversal inverse
+of the independently decoded Rust frames checks pixels. Requantized Modular samples are exact;
+VarDCT remains within one source code. This includes mixed JPEG/Modular frames and recursive DC.
+
+`floating_rgb_normalizes_every_integer_modular_source_depth` generates 48 tiny GPU-encoded
+257×3 Gray/RGB/RGBA cases: every depth from 1 through 16, alternating raw/container framing,
+nonconstant samples with both range endpoints, and an odd encoder source pitch. Rust `jxl`
+first verifies the integer source exactly. Bounded fragmented GPU decode then checks F32 RGBA
+against source-depth normalization within 0.0000001, including independent alpha.
+
+Render-backend tests cover all eight F32 RGB packing forms, finite negative/greater-than-one
+values, exact identity-color preservation, D65 primary conversion, and float display with
+unaligned rows/planes and independent alpha. F32 display requires `Rgba16Float`; RGB transfers
+do not affect alpha. These tests introduce no new checked-in codestream fixtures and do not satisfy crop,
+reference retention, associated-alpha or floating-point source conformance.
 
 ## VarDCT integer source depths
 
@@ -635,8 +667,8 @@ The JPEG cases also prevent two regressions: staged HF metadata and AC traversal
 MCU-padded block grid (22×14 for the 173×101 4:2:0 image), and later host matrix uploads must preserve
 the nondefault raw DCT8 matrix already decoded on GPU. A resource-range unit test additionally
 checks all transposed/AFV aliases and prevents uploads into LF data or the AFV basis. These tests
-do not claim Modular orientation, keep-orientation controls, arbitrary output formats, or full
-JPEG XL conformance.
+do not by themselves establish arbitrary output-format or full JPEG XL conformance. Modular
+orientation, Keep controls and shared color outputs have separate coverage above.
 
 ## VarDCT frame upsampling
 

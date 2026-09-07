@@ -12,6 +12,13 @@ buffers. The crate separates:
 
 There is no CUDA or NVIDIA dependency.
 
+`PixelFormat::rgb_f32(order, planar, color_spec)` describes RGB/BGR/RGBA/BGRA with IEEE 754
+binary32 components. `ColorFormatClass::Rgb { sample, storage, order }` uses `RgbSample::U8`
+or `RgbSample::F32`; floating-point color remains distinct from non-color numeric F32.
+The color specification defines RGB's transfer function and primaries, while alpha is linear.
+Floating-point output preserves finite negative and greater-than-one values. The scalar oracle
+packs these values without quantization, using the same channel swizzle and checked plane layout.
+
 ## Portable storage boundary
 
 Only directly addressable **pitch-linear** storage is represented. The layout

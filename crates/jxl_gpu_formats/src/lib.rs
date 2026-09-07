@@ -21,7 +21,7 @@ mod convert;
 
 pub use classify::{
     ColorFormatClass, NumericFormatClass, PixelFormatClass, PixelFormatClassificationError,
-    RgbStorage, WgslNumericCapability, classify_pixel_format,
+    RgbSample, RgbStorage, WgslNumericCapability, classify_pixel_format,
 };
 #[cfg(any(feature = "cpu-reference", test))]
 pub use convert::{ConversionError, ConvertedImage, convert_rgb_f32};

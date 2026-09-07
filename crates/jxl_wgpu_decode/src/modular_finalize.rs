@@ -261,6 +261,20 @@ fn validate_output(
             reason: "output layout is empty or not byte-addressable",
         });
     }
+    if matches!(output.kind, 5 | 6) && output.bits == 32 {
+        if output.storage_bits != 32
+            || !matches!(output.channels, 3 | 4)
+            || output.order > 3
+            || output.limited_range
+            || output.numeric_mapping != 0
+            || output.transfer > 3
+        {
+            return Err(ModularFinalizeError::InvalidParams {
+                reason: "invalid floating-point RGB output mapping",
+            });
+        }
+        return validate_output_planes(extent, source_channels, output);
+    }
     if source_channels != 1 {
         if output.kind != 9
             || output.channels != source_channels
@@ -367,12 +381,15 @@ fn validate_output_planes(
         5 => {
             planes[0] = (
                 extent.height,
-                checked_product(&[extent.width, output.channels])?,
+                checked_product(&[extent.width, output.channels, bytes_per_storage])?,
             );
         }
         6 => {
             for plane in planes.iter_mut().take(output.channels as usize) {
-                *plane = (extent.height, extent.width);
+                *plane = (
+                    extent.height,
+                    checked_product(&[extent.width, bytes_per_storage])?,
+                );
             }
         }
         9 => {
@@ -398,6 +415,13 @@ fn validate_output_planes(
             continue;
         }
         let stride = output.plane_strides[index];
+        if output.bits >= 32
+            && (!stride.is_multiple_of(4) || !output.plane_offsets[index].is_multiple_of(4))
+        {
+            return Err(ModularFinalizeError::InvalidParams {
+                reason: "32-bit output components require word-aligned planes",
+            });
+        }
         if stride < row_bytes {
             return Err(ModularFinalizeError::InvalidParams {
                 reason: "output plane stride is shorter than its row",

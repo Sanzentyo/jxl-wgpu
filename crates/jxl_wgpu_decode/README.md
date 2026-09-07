@@ -32,6 +32,21 @@ Rotated or mirrored groups use atomic byte writes because transformed group boun
 a storage word. Packed 4:2:2 writes each pixel's luma and neutral-chroma bytes independently and
 replicates the final odd pixel; a group no longer has to own an entire packed pair.
 
+`GpuOutputRequest::with_orientation_policy(OrientationPolicy::Keep)` retains codestream coordinates
+and unrotated extents. The default is `Apply`. This choice also controls animation metadata and
+presentation buffers across Modular, VarDCT, mixed sequences and recursive DC; physical dependency
+ordering and frame timing remain unchanged. `FrameExecutionPlan::negotiate_with_orientation`
+exposes the matching plan metadata.
+
+All supported 1–16-bit Gray/RGB/RGBA Modular sources can also return F32 color through
+`PixelFormat::rgb_f32`, in planar or interleaved RGB/BGR/RGBA/BGRA order. Integer samples normalize
+by their actual bit depth after inverse transforms; gray expands to RGB, missing alpha is one,
+and decoded alpha normalizes independently of the RGB transfer. This path currently accepts
+explicit full-range BT.709 primaries and sRGB/SYCC, Linear, BT.709 or BT.2020 transfer functions.
+It preserves the existing native integer output contracts and uses the same resident output leases.
+Floating-point JPEG XL source metadata, additional source color domains and other extra channels
+remain unsupported.
+
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, unassociated matching-depth
 full-resolution alpha, all orientations, intrinsic-size hints, and named alpha declarations can
@@ -393,7 +408,7 @@ dispatch records make a rejected packet non-authoritative rather than an uncheck
 is no CPU pixel, coefficient, transform, quantization, residual, entropy, or color fallback.
 
 `vardct_rgb8_format()` remains a convenience descriptor. The engine accepts the shared color output
-families: all 20 color VPI pitch-linear layouts; planar/interleaved RGB/BGR/RGBA/BGRA8; Y8/Y16;
+families: all 20 color VPI pitch-linear layouts; planar/interleaved U8 or F32 RGB/BGR/RGBA/BGRA; Y8/Y16;
 planar or semiplanar 4:4:4/4:2:2/4:2:0 YCbCr at 8/10/12/16 bits; and packed YUYV/UYVY. Primary
 conversion supports D65 BT.709, BT.2020, and Display-P3; transfers are Linear, sRGB/SYCC, BT.709,
 and BT.2020. Output YCbCr selects BT.601/709/2020 NCL or BT.2020 constant luminance, full/limited
@@ -407,10 +422,17 @@ therefore follows orientation and full-precision reconstruction before one final
 byte length and four-byte storage rounding. Separate 176-byte output and 144-byte source uniforms
 cost 320 bytes in total and are checked individually against binding limits. Padded rows, unaligned
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
-Thirty layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
+Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`
-color output within one RGB8 code. Numeric/float RGB output, arbitrary ICC output, and explicit
+color output within one RGB8 code. Non-color numeric output, arbitrary ICC output, and explicit
 luminance mapping for PQ/HLG remain typed gaps; relative SDR is never relabeled as HDR.
+
+Nine additional F32 layout/transfer cases preserve unclipped color without integer quantization.
+The CPU comparisons measure reconstruction error in linear light and report encoded error as well;
+the thresholds are 0.00002 against Rust `jxl` and 0.0001 against `djxl`. Linear `djxl` PFM output is
+requested directly, avoiding an extra sRGB round trip. Whole and bounded fragmented output remain
+byte-identical. These float outputs support future frame composition without prematurely clipping
+or rounding its inputs; the decoder still rejects crop/blend/reference composition.
 
 These color outputs are accepted directly by `DisplayPipeline::submit_image`, which produces a
 GPU-resident linear-BT.709 texture without an intermediate CPU readback; wide-gamut output requires
@@ -507,7 +529,7 @@ operation.
 This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-numeric/float RGB output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata, crop/blend,
+non-color numeric output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata, crop/blend,
 extra channels, intermediate progressive presentation, and reference composition remain typed or unproven
 gaps. Independent Replace animation is supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.

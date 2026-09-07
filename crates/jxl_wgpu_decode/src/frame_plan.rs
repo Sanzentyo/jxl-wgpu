@@ -67,6 +67,14 @@ pub enum FramePlanError {
 
 impl FrameExecutionPlan {
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, FramePlanError> {
+        Self::negotiate_with_orientation(inventory, crate::OrientationPolicy::Apply)
+    }
+
+    /// Builds the same physical dependency graph with the requested presentation coordinates.
+    pub fn negotiate_with_orientation(
+        inventory: &CodestreamInventory,
+        orientation_policy: crate::OrientationPolicy,
+    ) -> Result<Self, FramePlanError> {
         let image = &inventory.image_header;
         if image.preview_size.is_some() || inventory.frames.iter().any(|frame| frame.is_preview) {
             return Err(FramePlanError::PreviewUnsupported);
@@ -79,7 +87,9 @@ impl FrameExecutionPlan {
                 orientation: image.orientation,
             },
         )?;
-        let extent = orientation.map_extent(Extent2d::new(image.width, image.height));
+        let extent = orientation_policy
+            .resolve(orientation)
+            .map_extent(Extent2d::new(image.width, image.height));
         let mut metadata = if let Some(animation) = image.animation {
             let timebase = FrameTimebase {
                 ticks_per_second_numerator: NonZeroU32::new(animation.ticks_per_second_numerator)

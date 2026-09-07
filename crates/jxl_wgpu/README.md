@@ -119,7 +119,12 @@ mapped transport. Supported layout families include:
 - planar and semiplanar YCbCr 4:4:4, 4:2:2, and 4:2:0 at 8/10/12/16 bits, including NV12, NV21,
   NV16, NV61, NV24, NV42, P010, P012, and P016;
 - packed YUYV and UYVY 4:2:2; and
-- planar or interleaved RGB, BGR, RGBA, and BGRA8.
+- planar or interleaved RGB, BGR, RGBA, and BGRA with U8 or F32 components.
+
+`PixelFormat::rgb_f32` keeps extended color values without clipping or integer rounding. Matching
+source and target encodings bypass the transfer round trip. Float, wide-gamut and HDR image display
+requires the `Rgba16Float` descriptor; alpha passes through without an RGB transfer function.
+RGB output and display require full range; unsupported limited-range RGB is rejected explicitly.
 
 ```rust,ignore
 use jxl_gpu_protocol::RenderIntent;
@@ -145,7 +150,8 @@ matrix, range, and siting are never inferred from an ambiguous descriptor.
 
 The render graph and VarDCT decoder share `ImageOutputParams`, `ImageOutputSource`, and
 `IMAGE_OUTPUT_SHADER`. The fixed 176-byte uniform validates target layout, source coordinates,
-color conversion, and WGSL addressing. Producers supply a `source_rgb_at` shader fragment, so
+color conversion, and WGSL addressing. Producers supply `source_rgb_at` and linear `source_alpha_at`
+shader functions in oriented coordinates, so
 VarDCT can fuse XYB/JPEG reconstruction directly into the same word-owned packing entry point.
 Its extra source uniform is separately budgeted; no intermediate RGB image is required. Every
 producer still owns validation of its input bindings and source-specific plane strides.

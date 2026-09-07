@@ -1,8 +1,8 @@
 use super::*;
 use jxl_gpu_formats::{
     ChromaLocation2d, ColorFormatClass, ColorRange, ColorSpace, ColorSpec, ColorSpecification,
-    PixelFormatClass, RgbChannelOrder, TransferFunction, classify_pixel_format, convert_rgb_f32,
-    vpi::VpiPitchLinearFormat,
+    PixelFormatClass, RgbChannelOrder, RgbSample, TransferFunction, classify_pixel_format,
+    convert_rgb_f32, vpi::VpiPitchLinearFormat,
 };
 
 fn source_rgb_for_target(samples: &[f32], format: &PixelFormat) -> [Vec<f32>; 3] {
@@ -44,9 +44,67 @@ fn source_rgb_for_target(samples: &[f32], format: &PixelFormat) -> [Vec<f32>; 3]
     })
 }
 
-fn assert_color_codes(name: &str, actual: &[u8], expected: &[u8], layout: &ImageLayout) {
+fn assert_color_codes(
+    name: &str,
+    actual: &[u8],
+    expected: &[u8],
+    layout: &ImageLayout,
+    float_tolerance: f32,
+) {
     assert_eq!(actual.len(), expected.len());
     let class = classify_pixel_format(&layout.format).unwrap();
+    if matches!(
+        class,
+        PixelFormatClass::Color(ColorFormatClass::Rgb {
+            sample: RgbSample::F32,
+            ..
+        })
+    ) {
+        let ColorSpecification::Defined(color) = layout.format.color_spec else {
+            unreachable!()
+        };
+        // Measure reconstruction error in linear light. Near black, the sRGB OETF amplifies
+        // a small inverse-transform difference by up to 12.92; testing its encoded values at
+        // the same threshold would impose a different reconstruction tolerance by brightness.
+        // The shared output tests separately check the OETF itself in encoded coordinates.
+        let to_linear = |value: f32| {
+            let magnitude = value.abs();
+            let linear = match color.transfer {
+                TransferFunction::Linear => magnitude,
+                TransferFunction::Srgb => {
+                    if magnitude <= 0.04045 {
+                        magnitude / 12.92
+                    } else {
+                        ((magnitude + 0.055) / 1.055).powf(2.4)
+                    }
+                }
+                TransferFunction::Bt709 => {
+                    if magnitude < 0.081 {
+                        magnitude / 4.5
+                    } else {
+                        ((magnitude + 0.099) / 1.099).powf(1.0 / 0.45)
+                    }
+                }
+                other => panic!("unsupported F32 error domain {other:?}"),
+            };
+            linear.copysign(value)
+        };
+        let mut maximum = 0.0f32;
+        let mut maximum_encoded = 0.0f32;
+        for (actual, expected) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+            let actual = f32::from_le_bytes(actual.try_into().unwrap());
+            let expected = f32::from_le_bytes(expected.try_into().unwrap());
+            assert!(actual.is_finite() && expected.is_finite());
+            maximum_encoded = maximum_encoded.max((actual - expected).abs());
+            maximum = maximum.max((to_linear(actual) - to_linear(expected)).abs());
+        }
+        eprintln!("{name}: F32 maximum linear error {maximum}, encoded error {maximum_encoded}");
+        assert!(
+            maximum < float_tolerance,
+            "{name}: F32 maximum error {maximum}"
+        );
+        return;
+    }
     let (bits, storage) = match class {
         PixelFormatClass::Color(
             ColorFormatClass::Luma { bits, storage_bits }
@@ -134,6 +192,27 @@ fn output_cases() -> Vec<(String, PixelFormat)> {
         "linear-BGRA".to_owned(),
         PixelFormat::rgb8(RgbChannelOrder::Bgra, false, linear),
     ));
+    cases.push((
+        "linear-BGRA-F32".to_owned(),
+        PixelFormat::rgb_f32(RgbChannelOrder::Bgra, false, linear),
+    ));
+    let srgb = ColorSpecification::Defined(ColorSpec {
+        transfer: TransferFunction::Srgb,
+        ..ColorSpec::bt709(ColorRange::Full, ChromaLocation2d::CENTER)
+    });
+    for order in [
+        RgbChannelOrder::Rgb,
+        RgbChannelOrder::Bgr,
+        RgbChannelOrder::Rgba,
+        RgbChannelOrder::Bgra,
+    ] {
+        for planar in [false, true] {
+            cases.push((
+                format!("{order:?}-F32-planar{planar}"),
+                PixelFormat::rgb_f32(order, planar, srgb),
+            ));
+        }
+    }
     cases
 }
 
@@ -146,13 +225,57 @@ fn check_formats(
 ) {
     let rust = rust_jxl_rgb_f32(encoded, extent);
     let djxl = djxl_rgb_f32(encoded, extent);
+    let grayscale = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
+        .unwrap()
+        .codestream_inventory(InventoryLimits::default())
+        .unwrap()
+        .image_header
+        .grayscale;
     for (label, format) in formats {
         let reference = |samples: &[f32]| {
             let rgb = source_rgb_for_target(samples, format);
             convert_rgb_f32([&rgb[0], &rgb[1], &rgb[2]], extent, format).unwrap()
         };
         let expected = reference(&rust);
-        let djxl_expected = djxl.as_ref().map(|samples| reference(samples));
+        let float_linear = format.sample_kind == jxl_gpu_formats::SampleKind::Float
+            && matches!(format.color_spec, ColorSpecification::Defined(spec) if spec.transfer == TransferFunction::Linear);
+        let djxl_expected = if float_linear {
+            djxl_rgb_f32_with_color(
+                encoded,
+                extent,
+                Some(if grayscale {
+                    "Gra_D65_Rel_Lin"
+                } else {
+                    "RGB_D65_SRG_Rel_Lin"
+                }),
+            )
+            .map(|samples| {
+                let planes: [Vec<f32>; 3] = std::array::from_fn(|channel| {
+                    samples
+                        .chunks_exact(3)
+                        .map(|pixel| pixel[channel])
+                        .collect()
+                });
+                convert_rgb_f32([&planes[0], &planes[1], &planes[2]], extent, format).unwrap()
+            })
+        } else {
+            djxl.as_ref().map(|samples| reference(samples))
+        };
+        if format.sample_kind == jxl_gpu_formats::SampleKind::Float
+            && let Some(djxl) = &djxl_expected
+        {
+            let maximum = expected
+                .bytes
+                .chunks_exact(4)
+                .zip(djxl.bytes.chunks_exact(4))
+                .map(|(a, b)| {
+                    (f32::from_le_bytes(a.try_into().unwrap())
+                        - f32::from_le_bytes(b.try_into().unwrap()))
+                    .abs()
+                })
+                .fold(0.0f32, f32::max);
+            eprintln!("{name}/{label}: Rust-djxl F32 reference disagreement {maximum}");
+        }
         let mut whole = None;
         for cap in [u64::MAX, 256] {
             let decoder = GpuDecoder::new(
@@ -194,6 +317,7 @@ fn check_formats(
                 &output.bytes,
                 &expected.bytes,
                 &expected.layout,
+                2e-5,
             );
             if let Some(expected) = &djxl_expected {
                 assert_color_codes(
@@ -201,6 +325,7 @@ fn check_formats(
                     &output.bytes,
                     &expected.bytes,
                     &expected.layout,
+                    1e-4,
                 );
             }
             if let Some(whole) = &whole {
@@ -242,7 +367,12 @@ fn generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc() {
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
     let formats = output_cases()
         .into_iter()
-        .filter(|(name, _)| matches!(name.as_str(), "P016" | "I420" | "linear-BGRA"))
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "P016" | "I420" | "linear-BGRA" | "linear-BGRA-F32" | "Rgba-F32-planartrue"
+            )
+        })
         .collect::<Vec<_>>();
     for (name, encoded, extent) in [
         (
@@ -322,7 +452,13 @@ fn generic_color_output_converts_d65_primaries_against_djxl() {
             .unwrap();
         let actual = &readback.frame.outputs[0];
         assert_eq!(actual.layout, expected.layout);
-        assert_color_codes(profile, &actual.bytes, &expected.bytes, &expected.layout);
+        assert_color_codes(
+            profile,
+            &actual.bytes,
+            &expected.bytes,
+            &expected.layout,
+            1e-4,
+        );
         drop(readback);
         drop(frame);
         drop(session);

@@ -636,7 +636,7 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
         orientation: 29,
         source_transfer: 30,
         target_transfer: 31,
-        _padding: 32,
+        identity_color_transform: 32,
         primaries_r: [
             f32::from_bits(33),
             f32::from_bits(34),
@@ -691,7 +691,7 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
             "orientation",
             "source_transfer",
             "target_transfer",
-            "_padding",
+            "identity_color_transform",
             "primaries_r",
             "primaries_g",
             "primaries_b",
