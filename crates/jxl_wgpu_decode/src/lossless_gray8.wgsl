@@ -688,7 +688,9 @@ fn decode(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
             save_entropy_execution_state(0u);
             status_code = STATUS_IN_PROGRESS;
         }
-    } else if !window_is_final() {
+    } else if !window_is_final()
+        && params.fixed_output_mode != FIXED_OUTPUT_CURSOR_CONTINUATION
+    {
         save_entropy_execution_state(0u);
         status_code = STATUS_IN_PROGRESS;
     } else {

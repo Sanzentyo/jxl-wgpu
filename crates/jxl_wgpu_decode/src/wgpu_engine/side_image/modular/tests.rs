@@ -219,6 +219,112 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
                 }
             }
         }
+        let whole_planes = words.to_vec();
+        drop(mapped);
+        staging.unmap();
+        drop(job);
+        drop(permit);
+        let cap = if name == "transformed" { 1024 } else { 40 };
+        let source = crate::GpuCodestream::from_shared(
+            parsed.codestream().into(),
+            0..parsed.codestream().len(),
+            false,
+        )
+        .unwrap();
+        let stream = pipeline.plan_source(&source, &plan, end, cap).unwrap();
+        assert!(stream.stream_bytes <= cap);
+        assert!(stream.segments.len() > 1);
+        let permit = backend
+            .transient_memory_budget()
+            .try_reserve(stream.memory_bytes)
+            .unwrap();
+        let mut job = pipeline
+            .record_source(&backend, &source, &plan, &stream)
+            .unwrap()
+            .finish();
+        assert_eq!(job.memory_bytes(), stream.memory_bytes);
+        let mut commands = job.take_commands().unwrap();
+        let mut next_window = 1;
+        loop {
+            let submission = backend.queue().submit([commands]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            job.mark_status_mapped();
+            job.status_staging()
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    tx.send(r).unwrap();
+                });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            let bounded_status = job.finish_status().unwrap();
+            if bounded_status.is_in_progress() {
+                commands = job
+                    .record_next_window(
+                        &backend,
+                        &source,
+                        stream.segments.get(next_window).unwrap(),
+                    )
+                    .unwrap();
+                next_window += 1;
+                continue;
+            }
+            assert_eq!(
+                bounded_status.code, status.code,
+                "{name}: {bounded_status:?}"
+            );
+            assert_eq!(
+                bounded_status.decoded_samples, status.decoded_samples,
+                "{name}"
+            );
+            assert_eq!(bounded_status.cursor, status.cursor, "{name}");
+            assert_eq!(
+                bounded_status.expected_cursor, status.expected_cursor,
+                "{name}"
+            );
+            if let Some(inverse) = job.take_inverse_commands() {
+                commands = inverse;
+            } else {
+                break;
+            }
+        }
+        // The packet also contains LF/HF/AC data. Stop at the exact GPU cursor without uploading
+        // all of that suffix, even when the entropy stream ends in the middle of a byte.
+        assert!(
+            next_window < stream.segments.len(),
+            "{name}: did not finish early"
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(job.arena(), 0, &staging, 0, staging.size());
+        let submission = backend.queue().submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        let mapped = staging.slice(..).get_mapped_range().unwrap();
+        let bounded = bytemuck::cast_slice::<u8, i32>(&mapped);
+        for plane in &plan.final_planes {
+            for y in 0..plane.height {
+                let start = (plane.word_offset + y * plane.row_stride_words) as usize;
+                let row = start..start + plane.width as usize;
+                assert_eq!(
+                    &bounded[row.clone()],
+                    &whole_planes[row],
+                    "{name}: bounded plane"
+                );
+            }
+        }
         drop(mapped);
         staging.unmap();
         drop(job);
@@ -240,4 +346,112 @@ fn side_image_stream_window_is_word_aligned_and_cursor_rebased() {
     assert_eq!(window.token_end, 68);
     assert!(stream_window_geometry(100, 100).is_err());
     assert!(stream_window_geometry(101, 100).is_err());
+}
+
+#[test]
+fn zero_bit_single_symbol_side_images_preserve_the_exact_cursor() {
+    use crate::modular_tree::{
+        EntropyCoderIr, EntropyDecoderIr, HybridIntegerConfigIr, MaConfigIr, MaTreeNodeIr,
+        PrefixHistogramIr, WpHeaderIr,
+    };
+    let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
+        return;
+    };
+    let device = backend.device();
+    let pipeline = ModularSideImagePipeline::new(&backend, KernelVariant::Lanes64);
+    let limits = ModularTransformLimits::default();
+    let topology = ModularChannelTopology::full_resolution(9, 3, 8, 1, limits).unwrap();
+    let transforms =
+        crate::modular_transform::ModularTransformPlan::from_ir(topology, vec![], limits).unwrap();
+    let inverse_plan = crate::modular_inverse::plan_modular_inverse(&transforms).unwrap();
+    let ma = MaConfigIr {
+        nodes: vec![MaTreeNodeIr::Leaf {
+            cluster: 0,
+            predictor: 0,
+            offset: 17,
+            multiplier: 1,
+        }],
+        max_depth: 0,
+        entropy: EntropyDecoderIr {
+            lz77: None,
+            context_to_cluster: vec![0],
+            configs: vec![HybridIntegerConfigIr {
+                split_exponent: 0,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            }],
+            coder: EntropyCoderIr::Prefix(vec![PrefixHistogramIr {
+                entries: vec![jxl_gpu_bitstream::PrefixCodeEntry::default()],
+                single_symbol: Some(0),
+            }]),
+        },
+    };
+    let mut plan = ModularSideImagePlan {
+        bit_depth: 8,
+        stream_index: 0,
+        token_bit_offset: 0,
+        wp_header: WpHeaderIr::default(),
+        metadata: ma.pack_gpu_metadata().unwrap().words,
+        needs_self_correcting: false,
+        channel_metadata: transforms.topology.gpu_entropy_channels(None).unwrap(),
+        meta_channel_count: 0,
+        final_planes: inverse_plan.final_gpu_layouts(),
+        inverse_plan,
+        decoded_words: 27,
+        maximum_width: 9,
+        lz77_window_words: 0,
+    };
+    let source = crate::GpuCodestream::from_shared(vec![0xff].into(), 0..1, false).unwrap();
+    for cursor in [0, 1, 7, 8] {
+        plan.token_bit_offset = cursor;
+        let stream = pipeline.plan_source(&source, &plan, cursor, 40).unwrap();
+        assert_eq!(stream.segments.len(), 1);
+        assert_eq!(stream.stream_bytes, if cursor % 8 == 0 { 4 } else { 8 });
+        let mut recording = pipeline
+            .record_source(&backend, &source, &plan, &stream)
+            .unwrap();
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("constant side image test readback"),
+            size: 27 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        recording.encoder.copy_buffer_to_buffer(
+            recording.job.arena(),
+            0,
+            &staging,
+            0,
+            staging.size(),
+        );
+        let mut job = recording.finish();
+        let submission = backend.queue().submit([job.take_commands().unwrap()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        job.mark_status_mapped();
+        job.status_staging()
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
+        let (tx, image_rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        image_rx.recv().unwrap().unwrap();
+        let status = job.finish_status().unwrap();
+        assert!(status.is_ok(), "{status:?}");
+        assert_eq!(status.cursor, cursor);
+        assert_eq!(status.expected_cursor, cursor);
+        assert_eq!(status.decoded_samples, 27);
+        let mapped = staging.slice(..).get_mapped_range().unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, i32>(&mapped), &[17; 27]);
+        drop(mapped);
+        staging.unmap();
+    }
 }

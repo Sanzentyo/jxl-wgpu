@@ -70,6 +70,7 @@ pub(super) const WORD_ALIGNED_WRITE_BYTE_WORD: &str = r#"
 pub(super) const ATOMIC_WRITE_FULL_WORD: &str = "atomicStore(&output_words[offset >> 2u], value);";
 pub(super) const WORD_ALIGNED_WRITE_FULL_WORD: &str = "output_words[offset >> 2u] = value;";
 pub(super) const STATUS_OK: u32 = 1;
+pub(super) const STATUS_IN_PROGRESS: u32 = 14;
 pub(super) const ENTROPY_EXECUTION_STATE_WORDS: u64 = 8;
 pub(super) const ENTROPY_EXECUTION_STATE_BYTES: u64 = ENTROPY_EXECUTION_STATE_WORDS * 4;
 // Generic MA reconstruction additionally persists Property-8 gradient history. The weighted

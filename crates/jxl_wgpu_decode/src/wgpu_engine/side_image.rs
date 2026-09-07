@@ -10,7 +10,9 @@ use super::types::STATUS_OK;
 use crate::vardct_resource::{VarDctResourceLayout, hf_matrix_param_index};
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
 use crate::{Error, Result};
-pub(crate) use modular::{ModularSideImageJob, ModularSideImagePipeline};
+pub(crate) use modular::{
+    ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStreamPlan,
+};
 pub(crate) use modular::{
     ModularSideImageJob as RawHfDequantSideImageJob,
     ModularSideImageStatus as RawHfDequantSideImageStatus,

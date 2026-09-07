@@ -135,9 +135,11 @@ header. Only a validated GPU ending cursor advances the color decoder. Its first
 alpha plane remains resident, and the fused output kernel normalizes its independent precision.
 Seven libjxl fixtures cover Gray/RGB at 8/12/16-bit source depths, multiple alpha declarations,
 Palette metadata wider than a pass group, single-entry and progressive multi-entry TOCs,
-orientation Apply/Keep, and fragmented asynchronous input. Scalar extra-plane delivery,
-LF/AC-group-distributed extras, shifted/resampled or associated alpha, and bounded continuation
-inside this global substream remain pending. An entropy-window cap is enforced before submission.
+orientation Apply/Keep, and fragmented asynchronous input. Global entropy reuses an input buffer
+as small as 40 bytes, preserves GPU ANS/LZ77/predictor state across windows, and stops at its exact
+ending cursor. Only consumed windows are planned; total budget capacity can reduce the upload size.
+Scalar extra-plane delivery, LF/AC-group-distributed extras, and shifted/resampled or associated
+alpha remain pending.
 
 Modular also normalizes orientations 1–8 on the GPU, including exact native RGB/RGBA and 12/16-bit
 samples, all 30 Gray8 VPI color/numeric outputs, Palette/Squeeze, and one-pixel axes. Its frontend

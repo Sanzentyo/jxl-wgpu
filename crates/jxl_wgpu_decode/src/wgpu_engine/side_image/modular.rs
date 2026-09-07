@@ -7,6 +7,7 @@ use jxl_wgpu::{KernelVariant, ResidentStorageBinding, WgpuBackend};
 use wgpu::util::DeviceExt;
 
 use crate::entropy::EntropyStreamParams;
+use crate::entropy_window::{EntropyStreamWindows, GroupEntropyRange, GroupStreamSegment};
 use crate::modular_inverse::ModularInverseJob;
 
 use crate::modular_side_image::ModularSideImagePlan;
@@ -37,6 +38,16 @@ impl ModularSideImageStatus {
     pub(crate) fn is_ok(self) -> bool {
         self.code == super::super::types::STATUS_OK
     }
+    pub(crate) fn is_in_progress(self) -> bool {
+        self.code == super::super::types::STATUS_IN_PROGRESS
+    }
+}
+
+/// The end is an upper bound: a cursor-producing substream can finish before the last window.
+pub(crate) struct ModularSideImageStreamPlan {
+    pub(crate) segments: EntropyStreamWindows,
+    pub(crate) stream_bytes: u64,
+    pub(crate) memory_bytes: u64,
 }
 
 pub(crate) struct ModularSideImagePipeline {
@@ -83,14 +94,52 @@ impl ModularSideImagePipeline {
         backend: &WgpuBackend,
         codestream: &crate::GpuCodestream,
         plan: &ModularSideImagePlan,
-        packet_end: u32,
+        stream: &ModularSideImageStreamPlan,
     ) -> Result<ModularSideImageRecording> {
         self.record_inner(
             backend,
-            SideImageInput::Encoded(codestream),
+            SideImageInput::Encoded(codestream, stream),
             plan,
-            packet_end,
+            plan.token_bit_offset
+                .checked_add(
+                    stream
+                        .segments
+                        .get(0)
+                        .expect("initial window")
+                        .stream_token_end,
+                )
+                .ok_or_else(|| Error::backend("Modular side-image packet end overflow"))?,
         )
+    }
+
+    pub(crate) fn plan_source(
+        &self,
+        codestream: &crate::GpuCodestream,
+        plan: &ModularSideImagePlan,
+        packet_end: u32,
+        stream_limit: u64,
+    ) -> Result<ModularSideImageStreamPlan> {
+        if u64::from(packet_end) > codestream.logical_bits()? {
+            return Err(Error::EngineContract(
+                "Modular side-image packet exceeds the encoded source",
+            ));
+        }
+        let segments = EntropyStreamWindows::new(
+            codestream.logical_bytes(),
+            GroupEntropyRange {
+                token_bit_offset: u64::from(plan.token_bit_offset),
+                token_bit_end: u64::from(packet_end),
+            },
+            stream_limit,
+        )?;
+        let stream_bytes = segments.stream_bytes();
+        let (metadata, _) = packed_metadata(plan)?;
+        let memory_bytes = frame_bytes(plan, metadata.len(), workspace(plan)?.bytes, stream_bytes)?;
+        Ok(ModularSideImageStreamPlan {
+            segments,
+            stream_bytes,
+            memory_bytes,
+        })
     }
 
     fn record_inner(
@@ -110,13 +159,23 @@ impl ModularSideImagePipeline {
             SideImageInput::Resident(buffer) => {
                 stream_window(buffer, plan.token_bit_offset, packet_end)?
             }
-            SideImageInput::Encoded(source) => {
+            SideImageInput::Encoded(source, layout) => {
                 if u64::from(packet_end) > source.logical_bits()? {
                     return Err(Error::EngineContract(
                         "Modular side-image packet exceeds the encoded source",
                     ));
                 }
-                stream_window_geometry(plan.token_bit_offset, packet_end)?
+                StreamWindow {
+                    source_offset: 0,
+                    bytes: layout.stream_bytes,
+                    cursor_base_bits: plan.token_bit_offset,
+                    token_start: 0,
+                    token_end: layout
+                        .segments
+                        .get(0)
+                        .expect("initial window")
+                        .stream_token_end,
+                }
             }
         };
         let (metadata, channel_layout_offset) = packed_metadata(plan)?;
@@ -164,6 +223,10 @@ impl ModularSideImagePipeline {
         params.wp_w1 = plan.wp_header.w1;
         params.wp_w2 = plan.wp_header.w2;
         params.wp_w3 = plan.wp_header.w3;
+        if let SideImageInput::Encoded(_, layout) = codestream {
+            configure_window(&mut params, layout.segments.get(0).expect("initial window"));
+        }
+        let params_template = params;
         let control = DispatchControl {
             first_group: 0,
             group_count: 1,
@@ -183,17 +246,13 @@ impl ModularSideImagePipeline {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        if let SideImageInput::Encoded(source) = codestream {
-            let length = usize::try_from(stream.bytes).map_err(|_| {
-                Error::backend("Modular side-image upload exceeds host address space")
-            })?;
-            let mut upload = vec![0; length];
-            let end = (stream.source_offset + stream.bytes).min(source.logical_bytes());
-            source.copy_range(
-                stream.source_offset..end,
-                &mut upload[..(end - stream.source_offset) as usize],
+        if let SideImageInput::Encoded(source, layout) = codestream {
+            upload_window(
+                backend,
+                source,
+                &stream_buffer,
+                layout.segments.get(0).expect("initial window"),
             )?;
-            backend.queue().write_buffer(&stream_buffer, 0, &upload);
         }
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu Modular side image resident arena"),
@@ -226,7 +285,7 @@ impl ModularSideImagePipeline {
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu Modular side image decode parameters"),
             contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu Modular side image dispatch control"),
@@ -292,9 +351,19 @@ impl ModularSideImagePipeline {
             pass.set_bind_group(0, &decode_binding, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
+        // A bounded window may yield with an incomplete image. Keep inverse transforms separate
+        // until the GPU reports a validated cursor; they must never overwrite predictor history.
+        let mut deferred_inverse = (params_template.window_flags & WINDOW_FINAL == 0
+            && !plan.inverse_plan.jobs().is_empty())
+        .then(|| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu Modular side-image deferred inverse"),
+            })
+        });
+        let inverse_encoder = deferred_inverse.as_mut().unwrap_or(&mut encoder);
         let inverse_uniforms = encode_modular_inverse_jobs(
             device,
-            &mut encoder,
+            inverse_encoder,
             ResidentStorageBinding {
                 buffer: &arena,
                 offset: 0,
@@ -306,6 +375,16 @@ impl ModularSideImagePipeline {
             plan.wp_header,
             &inverse,
         )?;
+        let inverse_commands = deferred_inverse.map(|mut encoder| {
+            encoder.copy_buffer_to_buffer(
+                &status,
+                0,
+                &status_staging,
+                0,
+                std::mem::size_of::<DecodeStatus>() as u64,
+            );
+            encoder.finish()
+        });
         Ok(ModularSideImageRecording {
             encoder,
             job: ModularSideImageJob {
@@ -314,12 +393,16 @@ impl ModularSideImagePipeline {
                 status_mapped: AtomicBool::new(false),
                 memory_bytes,
                 cursor_base_bits: stream.cursor_base_bits,
-                _stream: stream_buffer,
+                stream: stream_buffer,
                 _metadata: metadata,
                 arena,
                 _dummy_output: dummy_output,
                 status,
-                _params: params,
+                params,
+                params_template,
+                decode_binding,
+                decode_pipeline: self.decode.clone(),
+                inverse_commands,
                 _control: control,
                 _uniforms: inverse_uniforms,
             },
@@ -336,16 +419,12 @@ impl ModularSideImagePipeline {
     pub(crate) fn arena_bytes(plan: &ModularSideImagePlan) -> Result<u64> {
         Ok(workspace(plan)?.bytes)
     }
-
-    pub(crate) fn stream_bytes(plan: &ModularSideImagePlan, packet_end: u32) -> Result<u64> {
-        Ok(stream_window_geometry(plan.token_bit_offset, packet_end)?.bytes)
-    }
 }
 
 #[derive(Clone, Copy)]
 enum SideImageInput<'a> {
     Resident(&'a wgpu::Buffer),
-    Encoded(&'a crate::GpuCodestream),
+    Encoded(&'a crate::GpuCodestream, &'a ModularSideImageStreamPlan),
 }
 
 pub(crate) struct ModularSideImageJob {
@@ -354,17 +433,67 @@ pub(crate) struct ModularSideImageJob {
     status_mapped: AtomicBool,
     memory_bytes: u64,
     cursor_base_bits: u32,
-    _stream: wgpu::Buffer,
+    stream: wgpu::Buffer,
     _metadata: wgpu::Buffer,
     arena: wgpu::Buffer,
     _dummy_output: wgpu::Buffer,
     status: wgpu::Buffer,
-    _params: wgpu::Buffer,
+    params: wgpu::Buffer,
+    params_template: ShaderParams,
+    decode_binding: wgpu::BindGroup,
+    decode_pipeline: wgpu::ComputePipeline,
+    inverse_commands: Option<wgpu::CommandBuffer>,
     _control: wgpu::Buffer,
     _uniforms: Vec<wgpu::Buffer>,
 }
 
 impl ModularSideImageJob {
+    /// Called only after the preceding status map has completed and been unmapped.
+    pub(crate) fn record_next_window(
+        &self,
+        backend: &WgpuBackend,
+        source: &crate::GpuCodestream,
+        segment: GroupStreamSegment,
+    ) -> Result<wgpu::CommandBuffer> {
+        upload_window(backend, source, &self.stream, segment)?;
+        let mut params = self.params_template;
+        configure_window(&mut params, segment);
+        backend
+            .queue()
+            .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        let mut encoder =
+            backend
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu Modular side-image continuation"),
+                });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("jxl-wgpu Modular side-image continuation"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.decode_pipeline);
+            pass.set_bind_group(0, &self.decode_binding, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.status,
+            0,
+            &self.status_staging,
+            0,
+            std::mem::size_of::<DecodeStatus>() as u64,
+        );
+        Ok(encoder.finish())
+    }
+
+    pub(crate) fn take_inverse_commands(&mut self) -> Option<wgpu::CommandBuffer> {
+        self.inverse_commands.take()
+    }
+
+    pub(crate) fn has_inverse_commands(&self) -> bool {
+        self.inverse_commands.is_some()
+    }
+
     pub(crate) fn arena(&self) -> &wgpu::Buffer {
         &self.arena
     }
@@ -429,6 +558,39 @@ impl Drop for ModularSideImageJob {
             self.status_staging.unmap();
         }
     }
+}
+
+fn configure_window(params: &mut ShaderParams, segment: GroupStreamSegment) {
+    params.entropy.token_start = 0;
+    params.entropy.token_end = segment.available_token_end;
+    params.window_logical_start = segment.window_logical_start;
+    params.window_upload_start = segment.window_upload_start;
+    params.stream_token_end = segment.stream_token_end;
+    params.window_yield_end = segment.window_yield_end;
+    params.window_flags = segment.flags;
+}
+
+fn upload_window(
+    backend: &WgpuBackend,
+    source: &crate::GpuCodestream,
+    buffer: &wgpu::Buffer,
+    segment: GroupStreamSegment,
+) -> Result<()> {
+    let length = usize::try_from(buffer.size())
+        .map_err(|_| Error::backend("Modular side-image upload exceeds host address space"))?;
+    let mut upload = vec![0; length];
+    let end = segment
+        .upload_offset
+        .checked_add(segment.input_end - segment.input_start)
+        .ok_or_else(|| Error::backend("Modular side-image upload offset overflow"))?;
+    let target = upload
+        .get_mut(segment.upload_offset..end)
+        .ok_or(Error::EngineContract(
+            "Modular side-image upload exceeds its window",
+        ))?;
+    source.copy_range(segment.input_start as u64..segment.input_end as u64, target)?;
+    backend.queue().write_buffer(buffer, 0, &upload);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

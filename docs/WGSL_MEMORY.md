@@ -450,9 +450,16 @@ downstream plane delivery. Its contents stay integer words, without sample norma
 conversion. The shared entropy/status and raw-matrix ABIs, workgroup memory and matrix submission counts remain unchanged.
 
 The global VarDCT extra-channel stage uses the common executor directly from encoded host spans,
-copying only the checked word-aligned packet suffix into its budgeted GPU stream buffer. It does
-not first allocate another whole-codestream GPU buffer. The caller's window/device caps apply;
-continuation within that substream is not yet connected, so a smaller cap returns a typed error.
+copying consumed windows into one reusable GPU stream buffer with 16-byte overlap on each side
+and a four-byte zero sentinel. No initial whole-codestream GPU allocation is needed. The shared
+`EntropyStreamWindows` geometry computes each range on demand in constant host space; it also
+drives oversized ordinary group streams. The caller/device cap and total budget capacity resolve
+the actual binding, down to the 40-byte minimum. One 256-byte storage parameter buffer is rewritten
+in queue order; the arena's 48/112-byte MA/predictor/ANS/LZ77 execution tail survives each upload.
+A 16-byte status map either yields to the next window or validates an early ending cursor. Once
+complete, a bounded stream submits its retained inverse command/uniforms and maps the same status
+before advancing to color; a whole stream keeps entropy and inverses in one submission. Zero-bit
+single-symbol Prefix streams use only a four-byte sentinel at byte-aligned endpoints.
 Arena and transient bytes have separate permits, both acquired before allocation. The map
 callback retains the job and both reservations even when the pending frame is abandoned. After
 status/entropy/cursor validation, transient buffers retire and the first-alpha arena lease moves
@@ -465,7 +472,8 @@ cursor validation. It excludes the separately owned global arena; `global_modula
 reports initial-stage buffer bytes and `in_flight_memory_stats()` is authoritative for live bytes.
 Seven public fixtures cover single/multi-entry TOCs, multiple AC passes, independent alpha depths,
 Apply/Keep and fragmented input. Entropy failure never exposes a color frame; cancellation,
-initial admission/retry and explicit window/budget rejection have actual-adapter tests. Internal
+initial admission/retry, middle-window cancellation, budget-driven upload reduction and undersized
+window/budget rejection have actual-adapter tests. Internal
 plane readback remains test-only. LF/AC-distributed and scalar extra output need further integration.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one

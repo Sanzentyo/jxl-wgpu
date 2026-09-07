@@ -1156,14 +1156,31 @@ for alpha. The standalone output test additionally supplies negative/overshoot s
 samples at a nonzero word offset across all eight orientations and both single-pixel axes; F32
 retains signed normalization and U8 clamps during packing rather than wrapping by a depth mask.
 
-Memory tests check exact initial reservation, typed caller-window/budget rejection, backpressure
-without consuming the source, canceled callback ownership, retry and final release. A corruption
+Memory tests check exact initial reservation, budget-driven upload reduction, a 39-byte caller
+cap/minimum-budget rejection, backpressure
+without consuming the source, canceled callback ownership after multiple windows, retry and final release. A corruption
 fixture zeroes only entropy bits 885..3436 of `rgba`, preserving both descriptors and later color
 data; GPU status rejects it before a color plan or frame is exposed. Color planning remains absent
 until global cursor validation; later LF/HF descriptors retain their separately admitted dynamic
-bytes. Public scalar extra delivery, LF/AC-distributed or shifted samples, associated alpha and
-window continuation inside this global substream remain gaps. No production picture data or
-entropy token crosses to a CPU decoder.
+bytes. Public scalar extra delivery, LF/AC-distributed or shifted samples and associated alpha
+remain gaps. No production picture data or entropy token crosses to a CPU decoder.
+
+The six internal fixtures additionally run through a 40-byte stream cap (1024 bytes for the large
+transformed image). Every original plane, decoded sample count and absolute unaligned cursor is
+identical to the whole-range path, and each stops before uploading the rest of its single TOC
+packet. All seven public fixtures also compare complete RGBA bytes against whole input under those
+caps using fragmented asynchronous input; corruption is rejected in both modes. A GPU unit case
+reconstructs 27 constant samples from a zero-bit single-symbol Prefix descriptor at bit positions
+0, 1, 7 and 8, including an empty upload with a four-byte sentinel. Host geometry tests cover
+unaligned starts, empty ranges, boundary lengths and a u32-sized entropy range described lazily
+without allocating its more than 134 million potential window records.
+
+The 2026-09-08 Apple M5/Metal validation covers all 268 decoder tests and 390 tests in the rest
+of the workspace, plus warning-free Clippy/rustdoc, Rust 1.89, the six-crate WASM check, reference
+and Metal harness verification, and indexed codec/readback. GPU suites were validated serially.
+An earlier default-parallel decoder run failed two cancellation assertions and left several Metal
+waits pending; the complete 44-test `wgpu_gray8` target subsequently passed with
+`--test-threads=1`. Concurrent-suite stability remains unverified by this run.
 
 | File | Encoded bytes after hex decoding | SHA-256 of encoded file |
 |---|---:|---|

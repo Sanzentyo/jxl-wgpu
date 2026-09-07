@@ -429,7 +429,7 @@ non-optional channel interpretation return typed errors.
 
 `VarDctDecodeSession::memory_stats()` now returns `Option<VarDctDecodeMemoryStats>`: the color
 plan is absent until the global cursor validates. `global_modular_memory_stats()` reports exact
-initial-stage stream, arena and total buffer bytes. Both stages share the engine budget, while
+initial-stage reusable stream, arena and total buffer bytes. Both stages share the engine budget, while
 `in_flight_memory_stats()` includes every live permit. Submission counts grow as stages become
 known. A pending global stage cannot expose an unvalidated color frame. Dropping it retains GPU
 buffers and permits in the map callback until completion. Color metadata reports the actual
@@ -440,9 +440,19 @@ and Rust `jxl`/libjxl. Seven public fixtures add color and first-alpha compariso
 progressive multi-entry stream, synchronous and fragmented asynchronous input, Apply/Keep,
 entropy corruption, memory backpressure/retry and cancellation. The common executor retains its
 256-byte entropy/16-byte status ABI; fused output uses a 160-byte source uniform and a read-only
-alpha binding. Public LF/AC-group-distributed extras, scalar delivery, associated alpha,
-shifted/resampled/float samples and global-substream window continuation remain gaps. An explicit
-window cap smaller than this stage's binding returns `GlobalModularWindow` before GPU allocation.
+alpha binding. The global stream now uses the common 16-byte overlap/four-byte sentinel layout
+and resumes ANS, LZ77, MA and predictor state over one reusable input/parameter pair. Caps as small
+as 40 bytes match whole-stream output exactly. A validated sample count and entropy terminal state
+finish the stream early, without uploading the remaining LF/HF/AC suffix. Inverse transforms wait
+for that completion and retain their budgeted uniforms across every continuation. Each async poll
+advances at most one window; cancellation retains buffers until its map callback finishes.
+
+Window geometry is generated on demand in constant host space, including empty single-symbol
+Prefix streams. The initial-stage planner reduces the upload against total budget capacity; an
+explicit cap below 40 bytes returns `StreamWindowTooSmall`, and an insufficient minimum allocation
+returns `MemoryBudgetTooSmall`. Live reservations remain retryable submission backpressure.
+Public LF/AC-group-distributed extras, scalar delivery, associated alpha, and
+shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
 
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented

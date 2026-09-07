@@ -193,7 +193,11 @@ fn global_modular_stage_enforces_caps_and_keeps_abandoned_gpu_buffers_budgeted()
         return;
     };
     let data = encoded(include_str!("../../test-data/vardct_extras_rgba.jxl.hex"));
-    let probe = GpuDecoder::new(VarDctSubmissionEngine::new(backend.clone()).unwrap());
+    let probe = GpuDecoder::new(
+        VarDctSubmissionEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
+    );
     let mut session = probe.open(&data, request(false)).unwrap();
     let global = session
         .submission_session()
@@ -208,20 +212,36 @@ fn global_modular_stage_enforces_caps_and_keeps_abandoned_gpu_buffers_budgeted()
     drop(session);
     assert_eq!(probe.engine().in_flight_memory_stats().reserved_bytes, 0);
 
+    // Initial-stage planning adapts the upload to total capacity without allocating GPU buffers.
+    let budget = MemoryBudget::new(NonZeroU64::new(global.total_bytes).unwrap());
+    let adaptive = GpuDecoder::new(
+        VarDctSubmissionEngine::with_memory_budget(backend.clone(), budget.clone()).unwrap(),
+    );
+    let planned = adaptive.open(&data, request(false)).unwrap();
+    assert_eq!(
+        planned.submission_session().global_modular_memory_stats(),
+        Some(global)
+    );
+    assert_eq!(budget.snapshot().reserved_bytes, 0);
+    drop(planned);
+
     let tight = GpuDecoder::new(
         VarDctSubmissionEngine::new(backend.clone())
             .unwrap()
-            .with_stream_window_limit(NonZeroU64::new(global.stream_bytes - 4).unwrap()),
+            .with_stream_window_limit(NonZeroU64::new(39).unwrap()),
     );
     assert!(matches!(
         tight.open(&data, request(false)),
-        Err(DecodeError::VarDct(
-            VarDctDecodeError::GlobalModularWindow { .. }
-        ))
+        Err(DecodeError::StreamWindowTooSmall {
+            limit_bytes: 39,
+            minimum_bytes: 40
+        })
     ));
     let budget = MemoryBudget::new(NonZeroU64::new(global.total_bytes - 1).unwrap());
     let tight = GpuDecoder::new(
-        VarDctSubmissionEngine::with_memory_budget(backend.clone(), budget.clone()).unwrap(),
+        VarDctSubmissionEngine::with_memory_budget(backend.clone(), budget.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
     );
     assert!(matches!(
         tight.open(&data, request(false)),
@@ -256,6 +276,15 @@ fn global_modular_stage_enforces_caps_and_keeps_abandoned_gpu_buffers_budgeted()
         progress.backpressure,
         Some(PrefetchBackpressure::Memory(_))
     ));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while abandoned.submission_session().submissions_per_frame() < 3 {
+        assert!(std::time::Instant::now() < deadline);
+        assert!(abandoned.poll_next_frame(&mut context).is_pending());
+        std::thread::yield_now();
+    }
+    assert!(abandoned.submission_session().memory_stats().is_none());
+    assert_eq!(budget.snapshot().reserved_bytes, limit);
     drop(abandoned);
     drop(held);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -277,6 +306,65 @@ fn global_modular_stage_enforces_caps_and_keeps_abandoned_gpu_buffers_budgeted()
 }
 
 #[test]
+fn bounded_global_windows_resume_early_and_match_whole_stream_outputs() {
+    let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
+        return;
+    };
+    for (name, hex) in fixtures() {
+        let data = encoded(hex);
+        let cap = if name == "transformed" { 1024 } else { 40 };
+        let mut whole = None;
+        for limit in [u64::MAX, cap] {
+            let decoder = GpuDecoder::new(
+                WgpuDecodeEngine::new(backend.clone())
+                    .unwrap()
+                    .with_stream_window_limit(NonZeroU64::new(limit).unwrap()),
+            );
+            let mut session = if limit == cap {
+                open_incremental(&decoder, &data, request(false))
+            } else {
+                decoder.open(&data, request(false)).unwrap()
+            };
+            let global = session
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .global_modular_memory_stats()
+                .unwrap();
+            assert!(global.stream_bytes <= limit);
+            let frame = if limit == cap {
+                pollster::block_on(session.next_frame_async())
+            } else {
+                session.next_frame()
+            }
+            .unwrap_or_else(|e| panic!("{name}/{limit}: {e}"))
+            .unwrap();
+            let readback = ImageReadbackPipeline::new(&backend)
+                .submit(frame.output())
+                .unwrap()
+                .wait()
+                .unwrap();
+            let bytes = &readback.frame.outputs[0].bytes;
+            if let Some(whole) = &whole {
+                assert_eq!(bytes, whole, "{name}: windowed output");
+            } else {
+                whole = Some(bytes.clone());
+            }
+            let producer = session.submission_session().vardct().unwrap();
+            eprintln!(
+                "{name} cap={limit}: {} submissions, global stream={}",
+                producer.submissions_per_frame(),
+                global.stream_bytes
+            );
+            drop(readback);
+            drop(frame);
+            drop(session);
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        }
+    }
+}
+
+#[test]
 fn global_modular_entropy_failure_never_exposes_a_color_frame() {
     let Ok(backend) = pollster::block_on(WgpuBackend::request_default(Default::default())) else {
         return;
@@ -287,32 +375,39 @@ fn global_modular_entropy_failure_never_exposes_a_color_frame() {
     for bit in 885..3436 {
         data[bit / 8] &= !(1 << (bit % 8));
     }
-    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-    let mut session = decoder.open(&data, request(false)).unwrap();
-    session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
-    assert!(
-        session
-            .front_pending_frame()
-            .unwrap()
-            .unvalidated_gpu_frame()
-            .is_err()
-    );
-    let error = pollster::block_on(session.next_frame_async()).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            DecodeError::VarDct(VarDctDecodeError::GlobalModularStatus { .. })
-        ),
-        "{error}"
-    );
-    assert!(
-        session
-            .submission_session()
-            .vardct()
-            .unwrap()
-            .memory_stats()
-            .is_none()
-    );
-    drop(session);
-    assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    for cap in [u64::MAX, 40] {
+        let decoder = GpuDecoder::new(
+            WgpuDecodeEngine::new(backend.clone())
+                .unwrap()
+                .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
+        );
+
+        let mut session = decoder.open(&data, request(false)).unwrap();
+        session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+        assert!(
+            session
+                .front_pending_frame()
+                .unwrap()
+                .unvalidated_gpu_frame()
+                .is_err()
+        );
+        let error = pollster::block_on(session.next_frame_async()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DecodeError::VarDct(VarDctDecodeError::GlobalModularStatus { .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            session
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .memory_stats()
+                .is_none()
+        );
+        drop(session);
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
 }

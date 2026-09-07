@@ -11,14 +11,16 @@ use std::task::{Context, Poll};
 use jxl_gpu_bitstream::{CodestreamInventory, ExtraChannelTypeInventory, SampleBitDepth};
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, MemoryBudget, MemoryBudgetSnapshot, MemoryPermit,
-    ResidentStorageBinding, UnvalidatedGpuImageFrame, WgpuBackend,
+    ResidentStorageBinding, SubmissionPollPermit, UnvalidatedGpuImageFrame, WgpuBackend,
 };
 
 use crate::modular_transform::GpuModularChannelLayout;
 use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::vardct_output::VarDctOutputAlpha;
 use crate::vardct_packet::PendingGlobalModular;
-use crate::wgpu_engine::{ModularSideImageJob, ModularSideImagePipeline};
+use crate::wgpu_engine::{
+    ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStreamPlan,
+};
 use crate::{
     AnimationMetadata, DecodeProfile, Error, GpuCodestream, GpuOutputMapping, GpuOutputRequest,
     GpuPendingFrame, GpuSubmissionSession, PreparedGpuSession, Result, SpotColorPolicy,
@@ -33,6 +35,7 @@ use super::types::{VarDctDecodeError, VarDctDecodeMemoryStats};
 /// Exact buffer requirements for the initial global Modular stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VarDctGlobalModularMemoryStats {
+    /// Reused input binding, including overlap and the four-byte read sentinel.
     pub stream_bytes: u64,
     /// Arena retained through color output when an opacity plane is present.
     pub arena_bytes: u64,
@@ -67,6 +70,8 @@ struct GlobalSource {
     options: VarDctPrepareOptions,
     pipelines: Arc<VarDctPipelines>,
     memory: VarDctGlobalModularMemoryStats,
+    stream: ModularSideImageStreamPlan,
+    next_window: usize,
 }
 
 enum PreparedStage {
@@ -136,27 +141,43 @@ impl VarDctDecodeSession {
         let mut metadata = AnimationMetadata::still(extent);
         metadata.extra_channels = inventory.image_header.extra_channels.clone();
         let end = packet.packet_end().map_err(VarDctDecodeError::from)?;
-        let global_memory = VarDctGlobalModularMemoryStats {
-            stream_bytes: ModularSideImagePipeline::stream_bytes(&packet.image, end)?,
-            arena_bytes: ModularSideImagePipeline::arena_bytes(&packet.image)?,
-            total_bytes: pipelines
-                .raw_hf_dequant
-                .modular()
-                .memory_bytes(&packet.image, end)?,
-        };
         let limits = backend.device().limits();
         let stream_limit = options
             .stream_window_limit
             .map_or(u64::MAX, |value| value.get())
             .min(limits.max_buffer_size)
             .min(limits.max_storage_buffer_binding_size);
-        if global_memory.stream_bytes > stream_limit {
-            return Err(VarDctDecodeError::GlobalModularWindow {
-                required_bytes: global_memory.stream_bytes,
-                limit_bytes: stream_limit,
+        let mut stream = pipelines.raw_hf_dequant.modular().plan_source(
+            &codestream,
+            &packet.image,
+            end,
+            stream_limit,
+        )?;
+        if stream.memory_bytes > options.memory_limit_bytes {
+            let fixed_bytes = stream.memory_bytes - stream.stream_bytes;
+            let minimum_stream = stream
+                .stream_bytes
+                .min(crate::entropy_window::MIN_STREAM_WINDOW_BYTES);
+            let available = options.memory_limit_bytes.saturating_sub(fixed_bytes) & !3;
+            if available < minimum_stream {
+                return Err(VarDctDecodeError::MemoryBudgetTooSmall {
+                    required_bytes: fixed_bytes + minimum_stream,
+                    limit_bytes: options.memory_limit_bytes,
+                }
+                .into());
             }
-            .into());
+            stream = pipelines.raw_hf_dequant.modular().plan_source(
+                &codestream,
+                &packet.image,
+                end,
+                stream_limit.min(available),
+            )?;
         }
+        let global_memory = VarDctGlobalModularMemoryStats {
+            stream_bytes: stream.stream_bytes,
+            arena_bytes: ModularSideImagePipeline::arena_bytes(&packet.image)?,
+            total_bytes: stream.memory_bytes,
+        };
         if global_memory.total_bytes > options.memory_limit_bytes {
             return Err(VarDctDecodeError::MemoryBudgetTooSmall {
                 required_bytes: global_memory.total_bytes,
@@ -181,6 +202,8 @@ impl VarDctDecodeSession {
                 options,
                 pipelines,
                 memory: global_memory,
+                stream,
+                next_window: 1,
             }))),
         };
         Ok(PreparedGpuSession::new(decode_profile, metadata, session)
@@ -268,10 +291,7 @@ impl GpuSubmissionSession for VarDctDecodeSession {
                         &self.backend,
                         &source.codestream,
                         &source.packet.image,
-                        source
-                            .packet
-                            .packet_end()
-                            .map_err(VarDctDecodeError::from)?,
+                        &source.stream,
                     )?
                     .finish();
                 debug_assert_eq!(job.memory_bytes(), source.memory.total_bytes);
@@ -281,24 +301,7 @@ impl GpuSubmissionSession for VarDctDecodeSession {
                     job,
                     _transient: transient,
                 });
-                let submission = self.backend.queue().submit([commands]);
-                let completion = Arc::new(MapCompletion::default());
-                lifetime.job.mark_status_mapped();
-                let callback_lifetime = Arc::clone(&lifetime);
-                let callback_completion = Arc::clone(&completion);
-                lifetime.job.status_staging().slice(..).map_async(
-                    wgpu::MapMode::Read,
-                    move |result| {
-                        drop(callback_lifetime);
-                        callback_completion.complete(result.map_err(|error| error.to_string()));
-                    },
-                );
-                let poll_completion = Arc::clone(&completion);
-                if let Err(error) = poll.register(submission, move |error| {
-                    poll_completion.complete(Err(error));
-                }) {
-                    completion.complete(Err(error.to_string()));
-                }
+                let completion = submit_global(&self.backend, &lifetime, poll, commands);
                 let Some(PreparedStage::Global(source)) = self.prepared.take() else {
                     unreachable!("global source is retained through submission");
                 };
@@ -325,6 +328,36 @@ struct GlobalLifetime {
     arena: GpuBufferLease,
     _transient: MemoryPermit,
 }
+
+fn submit_global(
+    backend: &WgpuBackend,
+    lifetime: &Arc<GlobalLifetime>,
+    poll: SubmissionPollPermit,
+    commands: wgpu::CommandBuffer,
+) -> Arc<MapCompletion> {
+    let submission = backend.queue().submit([commands]);
+    let completion = Arc::new(MapCompletion::default());
+    lifetime.job.mark_status_mapped();
+    let callback_lifetime = Arc::clone(lifetime);
+    let callback_completion = Arc::clone(&completion);
+    lifetime
+        .job
+        .status_staging()
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            // Completion publication also hands exclusive ownership back to the continuation.
+            drop(callback_lifetime);
+            callback_completion.complete(result.map_err(|error| error.to_string()));
+        });
+    let poll_completion = Arc::clone(&completion);
+    if let Err(error) = poll.register(submission, move |error| {
+        poll_completion.complete(Err(error));
+    }) {
+        completion.complete(Err(error.to_string()));
+    }
+    completion
+}
+
 enum PendingStage {
     Global {
         source: Box<GlobalSource>,
@@ -363,7 +396,9 @@ impl VarDctPendingFrame {
     fn resume_global(&mut self, mapping: std::result::Result<(), String>) -> Result<()> {
         let state = std::mem::replace(&mut self.state, PendingStage::Consumed);
         let PendingStage::Global {
-            source, lifetime, ..
+            mut source,
+            lifetime,
+            ..
         } = state
         else {
             return Err(VarDctDecodeError::CompletionConsumed.into());
@@ -375,10 +410,19 @@ impl VarDctPendingFrame {
             .packet_end()
             .map_err(VarDctDecodeError::from)?;
         let plan = &source.packet.image;
-        if !status.is_ok()
-            || status.decoded_samples != plan.decoded_words
+        let segment =
+            source
+                .stream
+                .segments
+                .get(source.next_window - 1)
+                .ok_or(Error::EngineContract(
+                    "Modular side-image has no submitted window",
+                ))?;
+        if !(status.is_ok() || status.is_in_progress())
+            || status.decoded_samples > plan.decoded_words
+            || (status.is_ok() && status.decoded_samples != plan.decoded_words)
             || status.cursor < plan.token_bit_offset
-            || status.cursor > end
+            || status.cursor > plan.token_bit_offset + segment.available_token_end
             || status.expected_cursor != end
         {
             return Err(VarDctDecodeError::GlobalModularStatus {
@@ -389,6 +433,56 @@ impl VarDctPendingFrame {
                 packet_end: end,
             }
             .into());
+        }
+        let mut lifetime = Arc::try_unwrap(lifetime).map_err(|_| {
+            Error::EngineContract("Modular side-image callback retained resources after completion")
+        })?;
+        let commands = if status.is_in_progress() {
+            let segment =
+                source
+                    .stream
+                    .segments
+                    .get(source.next_window)
+                    .ok_or(Error::EngineContract(
+                        "Modular side-image yielded after its final window",
+                    ))?;
+            // Reserve the polling slot before recording uploads or consuming the next window.
+            let poll = self
+                .backend
+                .submission_poller()
+                .try_reserve()
+                .map_err(Error::PollBackpressure)?;
+            let commands =
+                lifetime
+                    .job
+                    .record_next_window(&self.backend, &source.codestream, segment)?;
+            source.next_window += 1;
+            Some((commands, poll))
+        } else if lifetime.job.has_inverse_commands() {
+            let poll = self
+                .backend
+                .submission_poller()
+                .try_reserve()
+                .map_err(Error::PollBackpressure)?;
+            lifetime
+                .job
+                .take_inverse_commands()
+                .map(|commands| (commands, poll))
+        } else {
+            None
+        };
+        if let Some((commands, poll)) = commands {
+            let lifetime = Arc::new(lifetime);
+            let completion = submit_global(&self.backend, &lifetime, poll, commands);
+            self.runtime
+                .submissions_per_frame
+                .fetch_add(1, Ordering::AcqRel);
+            self.state = PendingStage::Global {
+                source,
+                lifetime,
+                completion,
+            };
+            return Ok(());
         }
         let alpha = source
             .inventory
@@ -472,7 +566,7 @@ impl VarDctPendingFrame {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn wait_until_dependency_submitted(&mut self) -> Result<()> {
-        if let PendingStage::Global { completion, .. } = &self.state {
+        while let PendingStage::Global { completion, .. } = &self.state {
             let mapping = completion.wait();
             self.resume_global(mapping)?;
         }
@@ -494,6 +588,10 @@ impl VarDctPendingFrame {
                 return Poll::Pending;
             };
             self.resume_global(mapping)?;
+            if matches!(self.state, PendingStage::Global { .. }) {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
         }
         match &mut self.state {
             PendingStage::Color(pending) => pending.poll_until_dependency_submitted(context),
@@ -506,7 +604,7 @@ impl GpuPendingFrame for VarDctPendingFrame {
     type Frame = GpuImageFrame;
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(mut self) -> Result<SubmittedGpuFrame<Self::Frame>> {
-        if let PendingStage::Global { completion, .. } = &self.state {
+        while let PendingStage::Global { completion, .. } = &self.state {
             let mapping = completion.wait();
             self.resume_global(mapping)?;
         }
@@ -528,6 +626,12 @@ impl GpuPendingFrame for VarDctPendingFrame {
                 return Poll::Pending;
             };
             self.resume_global(mapping)?;
+            // Yield between windows even if a fast adapter already completed the next map.
+            // This keeps cancellation responsive and avoids monopolizing a browser executor.
+            if matches!(self.state, PendingStage::Global { .. }) {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
         }
         match &mut self.state {
             PendingStage::Color(pending) => Pin::new(pending.as_mut()).poll_complete(context),
