@@ -44,12 +44,12 @@ use super::types::{
 use super::window_plan::{PacketStage, PacketWindowExecutionPlan, map_codestream_source_error};
 
 mod coefficients;
-use coefficients::{HfCoefficientBatchSubmission, prepare_hf_batches};
+use coefficients::{HfCoefficientWindowCommands, prepare_hf_windows};
 mod extra;
 mod packet;
 
 use packet::{
-    PacketBatchSubmission, prepare_packet_windows, submit_packet_batches, submit_packet_commands,
+    PacketWindowCommands, prepare_packet_windows, submit_packet_commands, submit_packet_windows,
 };
 mod raw_matrix;
 use extra::{ExtraLifetime, ExtraWork, HfValidation, map_extra_error};
@@ -231,14 +231,19 @@ fn create_hf_coefficient_job_buffers(
 
 enum PacketCommands {
     Whole(wgpu::CommandBuffer),
-    Windowed(Vec<PacketBatchSubmission>),
+    Windowed(PacketWindowCommands),
+}
+
+enum HfCoefficientCommands {
+    Whole(wgpu::CommandBuffer),
+    Windowed(HfCoefficientWindowCommands),
 }
 
 enum VarDctDownstreamCommands {
     Whole(wgpu::CommandBuffer),
     Windowed {
         before_coefficients: wgpu::CommandBuffer,
-        coefficient_batches: Vec<HfCoefficientBatchSubmission>,
+        coefficient_windows: HfCoefficientWindowCommands,
         device: wgpu::Device,
         pipelines: Arc<VarDctPipelines>,
         after_coefficients: wgpu::CommandBuffer,
@@ -294,7 +299,7 @@ fn submit_vardct_downstream(
         }
         VarDctDownstreamCommands::Windowed {
             before_coefficients,
-            coefficient_batches,
+            coefficient_windows,
             device,
             pipelines,
             after_coefficients,
@@ -307,25 +312,14 @@ fn submit_vardct_downstream(
                 .ok_or(VarDctDecodeError::EntropyWindowContract {
                     detail: "windowed AC commands have no retained coefficient buffers",
                 })?;
-            let stream =
-                buffers
-                    .stream_window
-                    .as_ref()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "windowed AC commands have no stream upload",
-                    })?;
-            let params =
-                buffers
-                    .params_window
-                    .as_ref()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "windowed AC commands have no parameter upload",
-                    })?;
-            for batch in coefficient_batches {
-                queue.write_buffer(stream, 0, &batch.stream_upload);
-                queue.write_buffer(params, 0, &batch.params_upload);
-                queue.submit([batch.record(&device, &pipelines, buffers, &lifetime._groups)?]);
-            }
+            coefficient_windows.submit(
+                &device,
+                queue,
+                &pipelines,
+                buffers,
+                &lifetime._groups,
+                None,
+            )?;
             Ok(queue.submit([after_coefficients]))
         }
     }
@@ -882,7 +876,7 @@ impl FramePendingFrame {
             .transpose()?;
         let completion = Arc::new(MapCompletion::default());
         let (submission, deferred_commands) = if let Some(batches) = windowed_batches {
-            let batch_count = batches.len();
+            let batch_count = batches.batch_count();
             let additional_submissions =
                 batch_count
                     .checked_sub(1)
@@ -906,7 +900,7 @@ impl FramePendingFrame {
                 .store(total_submissions, Ordering::Release);
             match post_lf {
                 PostLfCommands::Direct(downstream) => (
-                    submit_packet_batches(
+                    submit_packet_windows(
                         &self.backend,
                         &self.pipelines,
                         batches,
@@ -916,7 +910,7 @@ impl FramePendingFrame {
                     None,
                 ),
                 PostLfCommands::DeferredHfGlobal(deferred) => (
-                    submit_packet_batches(&self.backend, &self.pipelines, batches, None, lifetime)?,
+                    submit_packet_windows(&self.backend, &self.pipelines, batches, None, lifetime)?,
                     Some(deferred),
                 ),
             }
@@ -1256,50 +1250,47 @@ impl FramePendingFrame {
             .map_err(DecodeError::PollBackpressure)?;
         let device = self.backend.device();
         let buffers = create_hf_coefficient_job_buffers(device, &plan);
-        let mut coefficient_batches = Vec::new();
-        let mut whole_coefficients = None;
-        if plan.uses_bounded_stream_windows() {
-            coefficient_batches = prepare_hf_batches(&source.codestream, &plan)?;
-        } else {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("jxl-wgpu deferred whole-range HF coefficients"),
-            });
-            for ((group_plan, hf_buffers), group_buffers) in plan
-                .groups
-                .iter()
-                .zip(&buffers.groups)
-                .zip(&lifetime._groups)
-            {
-                let params =
-                    hf_buffers
-                        .params
-                        .as_ref()
-                        .ok_or(VarDctDecodeError::EntropyWindowContract {
+        let coefficient_commands =
+            if plan.uses_bounded_stream_windows() {
+                HfCoefficientCommands::Windowed(prepare_hf_windows(&source.codestream, &plan)?)
+            } else {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu deferred whole-range HF coefficients"),
+                });
+                for ((group_plan, hf_buffers), group_buffers) in plan
+                    .groups
+                    .iter()
+                    .zip(&buffers.groups)
+                    .zip(&lifetime._groups)
+                {
+                    let params = hf_buffers.params.as_ref().ok_or(
+                        VarDctDecodeError::EntropyWindowContract {
                             detail: "deferred whole-range HF plan has no parameters",
-                        })?;
-                self.pipelines.hf_coefficients.encode(
-                    device,
-                    &mut encoder,
-                    HfCoefficientBuffers {
-                        codestream: &lifetime._codestream,
-                        entropy_bundle: &buffers.entropy_bundle,
-                        reconstruction: &group_buffers.reconstructed,
-                        params,
-                        status: &hf_buffers.status,
-                        artifact: &group_buffers.artifact,
-                        order_table: &buffers.order_table,
-                        coefficients: &group_buffers.coefficients,
-                        sink_params: &hf_buffers.sink_params,
-                    },
-                    u32::try_from(group_plan.params.len()).map_err(|_| {
-                        VarDctDecodeError::ArithmeticOverflow {
-                            field: "deferred HF dispatch count",
-                        }
-                    })?,
-                );
-            }
-            whole_coefficients = Some(encoder.finish());
-        }
+                        },
+                    )?;
+                    self.pipelines.hf_coefficients.encode(
+                        device,
+                        &mut encoder,
+                        HfCoefficientBuffers {
+                            codestream: &lifetime._codestream,
+                            entropy_bundle: &buffers.entropy_bundle,
+                            reconstruction: &group_buffers.reconstructed,
+                            params,
+                            status: &hf_buffers.status,
+                            artifact: &group_buffers.artifact,
+                            order_table: &buffers.order_table,
+                            coefficients: &group_buffers.coefficients,
+                            sink_params: &hf_buffers.sink_params,
+                        },
+                        u32::try_from(group_plan.params.len()).map_err(|_| {
+                            VarDctDecodeError::ArithmeticOverflow {
+                                field: "deferred HF dispatch count",
+                            }
+                        })?,
+                    );
+                }
+                HfCoefficientCommands::Whole(encoder.finish())
+            };
         let mut status_commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu deferred HF status aggregation"),
         });
@@ -1350,8 +1341,8 @@ impl FramePendingFrame {
         }
         lock_unpoisoned(&lifetime._transient_permits).push(dynamic_permit);
 
-        let submission =
-            if let Some(whole_coefficients) = whole_coefficients {
+        let submission = match coefficient_commands {
+            HfCoefficientCommands::Whole(whole_coefficients) => {
                 let mut submissions = Vec::with_capacity(4);
                 if let Some(before_coefficients) = commands.before_coefficients.take() {
                     submissions.push(before_coefficients);
@@ -1362,62 +1353,20 @@ impl FramePendingFrame {
                     status_commands.finish(),
                 ]);
                 self.backend.queue().submit(submissions)
-            } else {
+            }
+            HfCoefficientCommands::Windowed(windows) => {
                 let retained = lock_unpoisoned(&lifetime._hf_coefficients);
                 let buffers = retained.as_ref().ok_or(VarDctDecodeError::EngineContract {
                     detail: "deferred HF coefficient buffers disappeared before submission",
                 })?;
-                let stream = buffers.stream_window.as_ref().ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "deferred HF coefficient buffers have no stream window",
-                    },
+                let batch_count = windows.submit(
+                    device,
+                    self.backend.queue(),
+                    &self.pipelines,
+                    buffers,
+                    &lifetime._groups,
+                    commands.before_coefficients.take(),
                 )?;
-                let params = buffers.params_window.as_ref().ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "deferred HF coefficient buffers have no parameter window",
-                    },
-                )?;
-                let mut batches = coefficient_batches.into_iter();
-                let first = batches
-                    .next()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "deferred windowed HF plan has no batches",
-                    })?;
-                self.backend
-                    .queue()
-                    .write_buffer(stream, 0, &first.stream_upload);
-                self.backend
-                    .queue()
-                    .write_buffer(params, 0, &first.params_upload);
-                let first_commands =
-                    first.record(device, &self.pipelines, buffers, &lifetime._groups)?;
-                if let Some(before_coefficients) = commands.before_coefficients.take() {
-                    self.backend
-                        .queue()
-                        .submit([before_coefficients, first_commands]);
-                } else {
-                    self.backend.queue().submit([first_commands]);
-                }
-                let mut batch_count = 1_usize;
-                for batch in batches {
-                    self.backend
-                        .queue()
-                        .write_buffer(stream, 0, &batch.stream_upload);
-                    self.backend
-                        .queue()
-                        .write_buffer(params, 0, &batch.params_upload);
-                    self.backend.queue().submit([batch.record(
-                        device,
-                        &self.pipelines,
-                        buffers,
-                        &lifetime._groups,
-                    )?]);
-                    batch_count = batch_count.checked_add(1).ok_or(
-                        VarDctDecodeError::ArithmeticOverflow {
-                            field: "deferred HF batch count",
-                        },
-                    )?;
-                }
                 // The known count already includes LF/HF packets and any preceding Modular
                 // stages. Each newly discovered coefficient batch adds one queue submission.
                 let total_submissions = self
@@ -1435,7 +1384,8 @@ impl FramePendingFrame {
                 self.backend
                     .queue()
                     .submit([commands.after_coefficients, status_commands.finish()])
-            };
+            }
+        };
         let completion = Arc::new(MapCompletion::default());
         arm_status_map(
             lifetime,
@@ -2346,18 +2296,20 @@ fn submit_vardct(
     } else {
         None
     };
-    let mut windowed_before_coefficients = None;
-    let mut windowed_coefficient_batches = Vec::new();
+    let mut windowed_coefficients = None;
     if let (Some(plan), Some(buffers)) = (
         source.hf_coefficients.as_ref(),
         hf_coefficient_buffers.as_ref(),
     ) {
         if plan.uses_bounded_stream_windows() {
-            windowed_before_coefficients = Some(commands.finish());
+            let before_coefficients = commands.finish();
             commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu bounded VarDCT post-coefficient stage"),
             });
-            windowed_coefficient_batches = prepare_hf_batches(&source.codestream, plan)?;
+            windowed_coefficients = Some((
+                before_coefficients,
+                prepare_hf_windows(&source.codestream, plan)?,
+            ));
         } else {
             for ((group_plan, hf_buffers), group_buffers) in
                 plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
@@ -2911,8 +2863,7 @@ fn submit_vardct(
         .map(|ac| std::mem::replace(&mut after_coefficients, ac.finish()));
     let (downstream_commands, mut deferred_commands) =
         if let Some(before_coefficients) = deferred_before_coefficients {
-            debug_assert!(windowed_before_coefficients.is_none());
-            debug_assert!(windowed_coefficient_batches.is_empty());
+            debug_assert!(windowed_coefficients.is_none());
             (
                 None,
                 Some(DeferredHfGlobalCommands {
@@ -2921,17 +2872,18 @@ fn submit_vardct(
                 }),
             )
         } else {
-            let downstream = if let Some(before_coefficients) = windowed_before_coefficients {
-                VarDctDownstreamCommands::Windowed {
-                    before_coefficients,
-                    coefficient_batches: windowed_coefficient_batches,
-                    device: device.clone(),
-                    pipelines: Arc::clone(&pipelines),
-                    after_coefficients,
-                }
-            } else {
-                VarDctDownstreamCommands::Whole(after_coefficients)
-            };
+            let downstream =
+                if let Some((before_coefficients, coefficient_windows)) = windowed_coefficients {
+                    VarDctDownstreamCommands::Windowed {
+                        before_coefficients,
+                        coefficient_windows,
+                        device: device.clone(),
+                        pipelines: Arc::clone(&pipelines),
+                        after_coefficients,
+                    }
+                } else {
+                    VarDctDownstreamCommands::Whole(after_coefficients)
+                };
             (Some(downstream), None)
         };
     let lifetime = Arc::new(VarDctJobLifetime {
@@ -3085,7 +3037,7 @@ fn submit_vardct(
                 detail: "windowed packet execution is missing downstream commands",
             })?;
             (
-                submit_packet_batches(
+                submit_packet_windows(
                     backend,
                     &pending.pipelines,
                     batches,

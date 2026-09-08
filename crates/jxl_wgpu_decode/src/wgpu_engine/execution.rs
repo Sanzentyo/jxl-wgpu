@@ -15,8 +15,7 @@ use jxl_wgpu::{
 use crate::buffer_pool::{DecodeBufferLease, DecodeBufferPool};
 use crate::entropy::EntropyStreamParams;
 use crate::entropy_window::{
-    GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
-    build_stream_batches_for_len as build_entropy_stream_batches,
+    EntropyStreamPlan, GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES,
 };
 use crate::model::native_modular_format;
 use crate::modular_finalize::{
@@ -67,10 +66,8 @@ pub(super) struct GroupDispatchLayout {
     pub(super) max_lz77_scratch_words: u32,
     pub(super) parallel_group_lanes: usize,
     pub(super) reconstructed_bytes: u64,
-    pub(super) global_stream_segments: Arc<[GroupStreamSegment]>,
-    pub(super) global_stream_batches: Arc<[StreamBatch]>,
-    pub(super) stream_segments: Arc<[GroupStreamSegment]>,
-    pub(super) stream_batches: Arc<[StreamBatch]>,
+    pub(super) global_streams: EntropyStreamPlan,
+    pub(super) streams: EntropyStreamPlan,
     pub(super) stream_bytes: u64,
     pub(super) status_stride: u64,
     pub(super) status_bytes: u64,
@@ -363,21 +360,20 @@ impl GroupDispatchLayout {
         }
         let group_count = u64::try_from(profile.entropy_groups.len())
             .map_err(|_| Error::backend("Modular group count exceeds u64"))?;
-        let (global_stream_segments, global_stream_batches, global_stream_bytes) =
-            profile.global_stream.map_or_else(
-                || Ok((Vec::new(), Vec::new(), 0)),
-                |stream| {
-                    build_entropy_stream_batches(
-                        codestream_bytes,
-                        &[GroupEntropyRange {
-                            token_bit_offset: stream.token_bit_offset,
-                            token_bit_end: stream.token_bit_end,
-                        }],
-                        stream_limit,
-                        1,
-                    )
-                },
-            )?;
+        let global_streams = profile.global_stream.map_or_else(
+            || Ok(EntropyStreamPlan::default()),
+            |stream| {
+                EntropyStreamPlan::new(
+                    codestream_bytes,
+                    &[GroupEntropyRange {
+                        token_bit_offset: stream.token_bit_offset,
+                        token_bit_end: stream.token_bit_end,
+                    }],
+                    stream_limit,
+                    1,
+                )
+            },
+        )?;
         let status_record_count = group_count
             .checked_add(u64::from(profile.global_stream.is_some()))
             .ok_or_else(|| Error::backend("Modular status record count overflow"))?;
@@ -437,7 +433,10 @@ impl GroupDispatchLayout {
         let selected = if global_only {
             // All channels are reconstructed in the frame arena by DC-global. There are no
             // subimage lanes or pass-group dispatches; only the common binding placeholder lives.
-            Some((0, Vec::new(), Vec::new(), 0))
+            Some(ParallelGroupLayout {
+                lanes: 0,
+                streams: EntropyStreamPlan::default(),
+            })
         } else {
             match select_parallel_group_layout(
                 codestream_bytes,
@@ -471,8 +470,11 @@ impl GroupDispatchLayout {
                 options.memory_limit_bytes
             ))
         })?;
-        let (parallel_group_lanes, stream_segments, stream_batches, group_stream_bytes) = selected;
-        let stream_bytes = group_stream_bytes.max(global_stream_bytes);
+        let ParallelGroupLayout {
+            lanes: parallel_group_lanes,
+            streams,
+        } = selected;
+        let stream_bytes = streams.stream_bytes().max(global_streams.stream_bytes());
         let reconstructed_bytes = reconstruction_lane_stride
             .checked_mul(u64::try_from(parallel_group_lanes).unwrap_or(u64::MAX))
             .ok_or_else(|| Error::backend("parallel Modular scratch size overflow"))?
@@ -497,10 +499,8 @@ impl GroupDispatchLayout {
             max_lz77_scratch_words,
             parallel_group_lanes,
             reconstructed_bytes,
-            global_stream_segments: global_stream_segments.into(),
-            global_stream_batches: global_stream_batches.into(),
-            stream_segments: stream_segments.into(),
-            stream_batches: stream_batches.into(),
+            global_streams,
+            streams,
             stream_bytes,
             status_stride,
             status_bytes,
@@ -513,12 +513,12 @@ impl GroupDispatchLayout {
     }
 }
 
-pub(super) fn build_stream_batches(
+pub(super) fn plan_group_streams(
     codestream_bytes: u64,
     groups: &[ModularGroup],
     stream_limit: u64,
     max_groups_per_batch: usize,
-) -> Result<(Vec<GroupStreamSegment>, Vec<StreamBatch>, u64)> {
+) -> Result<EntropyStreamPlan> {
     let ranges = groups
         .iter()
         .map(|group| GroupEntropyRange {
@@ -526,7 +526,7 @@ pub(super) fn build_stream_batches(
             token_bit_end: group.token_bit_end,
         })
         .collect::<Vec<_>>();
-    build_entropy_stream_batches(
+    EntropyStreamPlan::new(
         codestream_bytes,
         &ranges,
         stream_limit,
@@ -534,7 +534,10 @@ pub(super) fn build_stream_batches(
     )
 }
 
-pub(super) type ParallelGroupLayout = (usize, Vec<GroupStreamSegment>, Vec<StreamBatch>, u64);
+pub(super) struct ParallelGroupLayout {
+    pub(super) lanes: usize,
+    pub(super) streams: EntropyStreamPlan,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ParallelGroupLimits {
@@ -570,15 +573,14 @@ pub(super) fn select_parallel_group_layout(
             lanes -= 1;
             continue;
         }
-        let (segments, batches, stream_bytes) =
-            build_stream_batches(codestream_bytes, groups, effective_stream_limit, lanes)?;
+        let streams = plan_group_streams(codestream_bytes, groups, effective_stream_limit, lanes)?;
         let required = limits
             .fixed_bytes
-            .checked_add(stream_bytes)
+            .checked_add(streams.stream_bytes())
             .and_then(|bytes| bytes.checked_add(scratch_bytes))
             .ok_or_else(|| Error::backend("parallel Modular memory target overflow"))?;
         if required <= limits.per_frame_target {
-            return Ok(Some((lanes, segments, batches, stream_bytes)));
+            return Ok(Some(ParallelGroupLayout { lanes, streams }));
         }
         lanes -= 1;
     }
@@ -1712,15 +1714,14 @@ pub(super) fn validate_device_limits(
     let transient_bytes = per_frame
         .checked_sub(output_bytes)
         .ok_or_else(|| Error::backend("Modular transient memory accounting underflow"))?;
-    let max_dispatch_workgroups = dispatch
-        .global_stream_batches
-        .iter()
-        .chain(dispatch.stream_batches.iter())
-        .try_fold(0u32, |maximum, batch| {
-            u32::try_from(batch.group_count)
-                .map(|groups| maximum.max(groups.div_ceil(dispatch.group_workgroup_size)))
-                .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))
-        })?;
+    let max_dispatch_workgroups = u32::try_from(
+        dispatch
+            .global_streams
+            .max_group_count()
+            .max(dispatch.streams.max_group_count()),
+    )
+    .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))?
+    .div_ceil(dispatch.group_workgroup_size);
     if max_dispatch_workgroups == 0 {
         return Err(Error::backend("Modular stream batch layout is empty"));
     }
@@ -1759,14 +1760,14 @@ pub(super) fn validate_device_limits(
         max_lz77_window_words: dispatch.max_lz77_window_words,
         max_lz77_scratch_words: dispatch.max_lz77_scratch_words,
         stream_batch_count: dispatch
-            .global_stream_batches
-            .len()
-            .checked_add(dispatch.stream_batches.len())
+            .global_streams
+            .batch_count()
+            .checked_add(dispatch.streams.batch_count())
             .ok_or_else(|| Error::backend("Modular stream batch count overflow"))?,
         submissions_per_frame: dispatch
-            .global_stream_batches
-            .len()
-            .checked_add(dispatch.stream_batches.len())
+            .global_streams
+            .batch_count()
+            .checked_add(dispatch.streams.batch_count())
             .ok_or_else(|| Error::backend("Modular submission count overflow"))?,
         parallel_group_lanes: dispatch.parallel_group_lanes,
         group_workgroup_size: dispatch.group_workgroup_size,
@@ -2016,7 +2017,7 @@ pub(super) fn submit_decode(
         .map_err(|_| Error::backend("bounded stream upload exceeds host address space"))?;
     let mut stream_upload = vec![0u8; upload_len];
     let mut final_submission = None;
-    let has_global_stream = !source.dispatch_layout.global_stream_batches.is_empty();
+    let has_global_stream = source.dispatch_layout.global_streams.batch_count() != 0;
     if has_global_stream {
         let global_record_index = source.profile.entropy_groups.len();
         let global_record_index_u32 = u32::try_from(global_record_index)
@@ -2025,27 +2026,14 @@ pub(super) fn submit_decode(
             .ok()
             .and_then(|index| index.checked_mul(source.dispatch_layout.params_stride))
             .ok_or_else(|| Error::backend("DC-global parameter offset overflow"))?;
-        for (batch_index, batch) in source
-            .dispatch_layout
-            .global_stream_batches
-            .iter()
-            .enumerate()
-        {
+        for (batch_index, batch) in source.dispatch_layout.global_streams.batches().enumerate() {
             stream_upload.fill(0);
-            let segment_index = batch.segments.start;
-            if batch.segments.end != segment_index + 1 {
+            let [segment] = batch.segments() else {
                 return Err(Error::EngineContract(
                     "one DC-global entropy batch must contain exactly one segment",
                 ));
-            }
-            let segment = source
-                .dispatch_layout
-                .global_stream_segments
-                .get(segment_index)
-                .copied()
-                .ok_or(Error::EngineContract(
-                    "DC-global entropy stream segment is missing",
-                ))?;
+            };
+            let segment = *segment;
             copy_stream_segment(source, segment, &mut stream_upload, "DC-global")?;
             let params = build_global_params(segment, global_record_index_u32, source)?;
             backend.queue().write_buffer(
@@ -2092,8 +2080,8 @@ pub(super) fn submit_decode(
                 pass.set_bind_group(0, global_binding.as_ref().unwrap_or(&binding), &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            let final_batch = source.dispatch_layout.stream_batches.is_empty()
-                && batch_index + 1 == source.dispatch_layout.global_stream_batches.len();
+            let final_batch = source.dispatch_layout.streams.batch_count() == 0
+                && batch_index + 1 == source.dispatch_layout.global_streams.batch_count();
             let uniforms = if final_batch {
                 encode_frame_completion(
                     device,
@@ -2113,15 +2101,9 @@ pub(super) fn submit_decode(
             }
         }
     }
-    for (batch_index, batch) in source.dispatch_layout.stream_batches.iter().enumerate() {
+    for (batch_index, batch) in source.dispatch_layout.streams.batches().enumerate() {
         stream_upload.fill(0);
-        for segment_index in batch.segments.clone() {
-            let segment = source
-                .dispatch_layout
-                .stream_segments
-                .get(segment_index)
-                .copied()
-                .ok_or_else(|| Error::backend("group stream segment is missing"))?;
+        for &segment in batch.segments() {
             copy_stream_segment(source, segment, &mut stream_upload, "group")?;
 
             let group = source
@@ -2159,9 +2141,9 @@ pub(super) fn submit_decode(
         }
         backend.queue().write_buffer(&stream, 0, &stream_upload);
         let control = DispatchControl {
-            first_group: u32::try_from(batch.first_group)
+            first_group: u32::try_from(batch.first_group())
                 .map_err(|_| Error::backend("batch group index exceeds WGSL u32"))?,
-            group_count: u32::try_from(batch.group_count)
+            group_count: u32::try_from(batch.group_count())
                 .map_err(|_| Error::backend("batch group count exceeds WGSL u32"))?,
             lane_stride_words: u32::try_from(source.dispatch_layout.reconstruction_lane_stride / 4)
                 .map_err(|_| Error::backend("reconstruction lane stride exceeds WGSL u32"))?,
@@ -2204,26 +2186,20 @@ pub(super) fn submit_decode(
                 1,
             );
         }
-        let final_batch = batch_index + 1 == source.dispatch_layout.stream_batches.len();
+        let final_batch = batch_index + 1 == source.dispatch_layout.streams.batch_count();
         let mut inverse_uniforms = Vec::new();
         if !source.channel_layout_offsets.is_empty() {
             let inverse = pipelines.inverse.ok_or(Error::EngineContract(
                 "descriptor reconstruction is missing resident inverse pipelines",
             ))?;
-            for segment_index in batch.segments.clone() {
-                let segment = source
-                    .dispatch_layout
-                    .stream_segments
-                    .get(segment_index)
-                    .copied()
-                    .ok_or_else(|| Error::backend("group stream segment is missing"))?;
+            for &segment in batch.segments() {
                 if segment.flags & GroupStreamSegment::FINAL == 0 {
                     continue;
                 }
                 let lane_index = segment
                     .group_index
-                    .checked_sub(batch.first_group)
-                    .filter(|lane| *lane < batch.group_count)
+                    .checked_sub(batch.first_group())
+                    .filter(|lane| *lane < batch.group_count())
                     .ok_or_else(|| {
                         Error::backend("final Modular group lane is outside its batch")
                     })?;

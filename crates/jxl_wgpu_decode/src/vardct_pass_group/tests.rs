@@ -134,9 +134,16 @@ fn a_pass_termination_change_reaches_every_window_without_changing_other_passes(
     .unwrap();
     assert!(plan.groups.len() > 1);
     let selected = plan.groups[0].params[0].global_group_index;
+    let derived_params = |group: &HfCoefficientGroupExecutionPlan| {
+        group
+            .streams
+            .batches()
+            .flat_map(|batch| batch.segments().to_vec())
+            .map(|segment| group.params_for_segment(segment).unwrap())
+            .collect::<Vec<_>>()
+    };
     assert!(
-        plan.groups[0]
-            .segment_params
+        derived_params(&plan.groups[0])
             .iter()
             .filter(|p| p.global_group_index == selected)
             .count()
@@ -149,7 +156,8 @@ fn a_pass_termination_change_reaches_every_window_without_changing_other_passes(
         Err(HfCoefficientPlanError::MissingPassGroup { .. })
     ));
     for group in &plan.groups {
-        for params in group.params.iter().chain(&group.segment_params) {
+        let segments = derived_params(group);
+        for params in group.params.iter().chain(&segments) {
             assert_eq!(
                 params.stream_end,
                 u32::from(params.global_group_index == selected)
@@ -159,10 +167,11 @@ fn a_pass_termination_change_reaches_every_window_without_changing_other_passes(
     plan.set_stream_end(selected, HfCoefficientStreamEnd::Packet)
         .unwrap();
     assert!(plan.groups.iter().all(|group| {
+        let segments = derived_params(group);
         group
             .params
             .iter()
-            .chain(&group.segment_params)
+            .chain(&segments)
             .all(|p| p.stream_end == 0)
     }));
 }

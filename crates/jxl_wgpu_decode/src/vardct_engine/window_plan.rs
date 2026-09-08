@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::entropy_window::{
-    EntropyStreamWindows, GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES,
-    StreamBatch, build_stream_batches_for_len,
+    EntropyStreamPlan, EntropyStreamWindows, GroupEntropyRange, GroupStreamSegment,
+    MIN_STREAM_WINDOW_BYTES,
 };
 use crate::vardct_packet::{
     BoundedHfMetadataContinuation, BoundedVarDctGroupEntry, BoundedVarDctGroupPlan,
@@ -120,10 +120,16 @@ pub(super) enum PacketStage {
 #[derive(Clone, Debug)]
 pub(super) struct PacketWindowExecutionPlan {
     pub(super) stage: PacketStage,
-    pub(super) stream_segments: Arc<[GroupStreamSegment]>,
-    pub(super) stream_batches: Arc<[StreamBatch]>,
-    pub(super) segment_params: Arc<[VarDctModularParams]>,
+    pub(super) streams: EntropyStreamPlan,
+    groups: Arc<[PacketWindowGroup]>,
     pub(super) stream_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PacketWindowGroup {
+    params: VarDctModularParams,
+    stream_base_bit: u32,
+    state_offset: u32,
 }
 
 struct PacketStreamDescriptor {
@@ -345,7 +351,7 @@ impl PacketWindowExecutionPlan {
             .iter()
             .map(|descriptor| descriptor.range)
             .collect::<Vec<_>>();
-        let (segments, batches, stream_bytes) = build_stream_batches_for_len(
+        let streams = EntropyStreamPlan::new(
             codestream_bytes,
             &ranges,
             stream_limit,
@@ -356,24 +362,18 @@ impl PacketWindowExecutionPlan {
             },
         )
         .map_err(map_packet_window_plan_error)?;
-        if segments
-            .iter()
-            .all(|segment| segment.flags == (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL))
-        {
+        if !streams.uses_windows() {
             return Ok(None);
         }
-        let mut segment_params = Vec::with_capacity(segments.len());
-        for &segment in &segments {
-            let group = packet.groups.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "packet segment references an absent group",
-                },
-            )?;
-            let descriptor = descriptors.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "packet segment has no entropy descriptor",
-                },
-            )?;
+        if descriptors.len() != packet.groups.len() {
+            return Err(VarDctDecodeError::GroupPlanCount {
+                component: "packet stream descriptor",
+                expected: packet.groups.len(),
+                actual: descriptors.len(),
+            });
+        }
+        let mut groups = Vec::with_capacity(descriptors.len());
+        for (group, descriptor) in packet.groups.iter().zip(descriptors) {
             // Undiscovered HF descriptors need conservative predictor capacity. Eager HF-only
             // entries use the exact same compact layout as their admitted GPU allocation.
             let state_offset = group.packet_execution_state_offset_words(
@@ -385,17 +385,17 @@ impl PacketWindowExecutionPlan {
                         field: "packet stream base bit",
                     }
                 })?;
-            segment_params.push(descriptor.params.with_stream_segment(
-                segment,
+            groups.push(PacketWindowGroup {
+                params: descriptor.params,
                 stream_base_bit,
                 state_offset,
-            ));
+            });
         }
+        let stream_bytes = streams.stream_bytes();
         Ok(Some(Self {
             stage,
-            stream_segments: segments.into(),
-            stream_batches: batches.into(),
-            segment_params: segment_params.into(),
+            streams,
+            groups: groups.into(),
             // A clipped LF window can be smaller than a later HF suffix or packed HF batch.
             // Those descriptors are still unknown, so reserve the selected shared capacity.
             stream_bytes: if stage == PacketStage::Lf {
@@ -407,7 +407,25 @@ impl PacketWindowExecutionPlan {
     }
 
     pub(super) fn batch_count(&self) -> usize {
-        self.stream_batches.len()
+        self.streams.batch_count()
+    }
+
+    pub(super) fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub(super) fn params_for_segment(
+        &self,
+        segment: GroupStreamSegment,
+    ) -> Result<VarDctModularParams, VarDctDecodeError> {
+        let group = self.groups.get(segment.group_index).ok_or(
+            VarDctDecodeError::EntropyWindowContract {
+                detail: "packet segment has no parameter record",
+            },
+        )?;
+        Ok(group
+            .params
+            .with_stream_segment(segment, group.stream_base_bit, group.state_offset))
     }
 }
 
@@ -423,6 +441,50 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn packet_planning_keeps_one_parameter_record_for_a_huge_stream() {
+        let bytes = decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_raw_matrix_local_packets.jxl.hex"
+        ));
+        let parsed = parse(&bytes, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let mut packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
+        packet.groups.truncate(1);
+        let range = GroupEntropyRange {
+            token_bit_offset: 7,
+            token_bit_end: 7 + u64::from(u32::MAX),
+        };
+        let plan = PacketWindowExecutionPlan::new(
+            PacketStage::Lf,
+            range.token_bit_end.div_ceil(8),
+            &packet,
+            vec![PacketStreamDescriptor {
+                range,
+                params: VarDctModularParams::default(),
+            }],
+            40,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.batch_count() > 134_000_000);
+        assert_eq!(plan.group_count(), 1);
+        assert_eq!(plan.stream_bytes, 40);
+        for index in [0, plan.batch_count() / 2, plan.batch_count() - 1] {
+            let batch = plan.streams.batch(index).unwrap();
+            let segment = batch.segments()[0];
+            let params = plan.params_for_segment(segment).unwrap();
+            let phase_flags = GroupStreamSegment::FIRST | GroupStreamSegment::FINAL;
+            assert_eq!(params.window_contract()[4] & phase_flags, segment.flags);
+            assert_ne!(params.window_contract()[4] & !phase_flags, 0);
+            assert_eq!(
+                params.window_contract()[5],
+                packet.groups[0]
+                    .packet_execution_state_offset_words(true)
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
@@ -461,8 +523,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let lf_peak = lf
-            .stream_segments
-            .iter()
+            .streams
+            .batches()
+            .flat_map(|batch| batch.segments().to_vec())
             .map(|segment| (segment.input_end - segment.input_start).div_ceil(4) * 4 + 4)
             .max()
             .unwrap();
@@ -537,8 +600,12 @@ mod tests {
                 assert_eq!(plan.stage, PacketStage::Hf);
                 assert!(plan.stream_bytes <= limit);
                 assert!(plan.batch_count() > 1);
-                for (segment, params) in plan.stream_segments.iter().zip(plan.segment_params.iter())
+                for segment in plan
+                    .streams
+                    .batches()
+                    .flat_map(|batch| batch.segments().to_vec())
                 {
+                    let params = plan.params_for_segment(segment).unwrap();
                     let group = &packet.groups[segment.group_index];
                     assert!(
                         segment.upload_offset + segment.input_end - segment.input_start + 4

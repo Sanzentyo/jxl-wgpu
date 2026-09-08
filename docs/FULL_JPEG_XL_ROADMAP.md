@@ -110,6 +110,15 @@ correctness. Dependencies name other item IDs in this document.
 | `ENT-E01` | P1 | **Partial** | Add GPU ANS token serialization, histogram clustering, context clustering, hybrid-uint selection, general LZ77 search/distances, and canonical entropy metadata. `djxl`/`jxl` must accept every generated family. | — |
 | `ENT-E02` | P2 | **Missing** | Select entropy configurations by effort and workload with deterministic modes. Report density and speed independently; no heuristic may change lossless pixels. | `ENT-E01`, `QA-05` |
 
+The common entropy plan for `ENT-D02` now stores O(coded streams) packed runs and oversized-stream
+geometry, including Modular DC-global/groups and VarDCT LF/HF/combined packets and AC. Budget
+selection computes counts, peaks and lane occupancy without per-window tables. Packet/AC
+submission derives parameters and fills one reusable host upload from retained compressed spans;
+GPU commands are recorded at that same boundary. Near-u32-bit tests cover more than 134 million
+windows, exact first/middle/last ABI records, shared LF-to-HF capacity and bounded Modular budget
+selection. This closes eager host window/parameter/upload accumulation; the remaining side-image,
+frame integration and conformance requirements above still apply.
+
 ### D. Modular decode
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |

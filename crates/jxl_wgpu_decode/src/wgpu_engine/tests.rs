@@ -63,12 +63,17 @@ fn stream_batches_rebase_unaligned_group_bits_and_respect_peak_window() {
         stream_index: 0,
     };
     let groups = [group(3, 67), group(75, 139), group(147, 211)];
-    let (segments, batches, peak) =
-        build_stream_batches(codestream.len() as u64, &groups, 40, 1).unwrap();
+    let plan = plan_group_streams(codestream.len() as u64, &groups, 40, 1).unwrap();
+    let batches = plan.batches().collect::<Vec<_>>();
+    let segments = batches
+        .iter()
+        .flat_map(|batch| batch.segments().iter().copied())
+        .collect::<Vec<_>>();
+    let peak = plan.stream_bytes();
     assert_eq!(
         batches
             .iter()
-            .map(|batch| (batch.first_group, batch.group_count))
+            .map(|batch| (batch.first_group(), batch.group_count()))
             .collect::<Vec<_>>(),
         [(0, 1), (1, 1), (2, 1)]
     );
@@ -112,12 +117,16 @@ fn stream_batches_never_alias_more_groups_than_scratch_lanes() {
             stream_index: index as u32,
         })
         .collect::<Vec<_>>();
-    let (segments, batches, _) =
-        build_stream_batches(codestream.len() as u64, &groups, 1024, 2).unwrap();
+    let plan = plan_group_streams(codestream.len() as u64, &groups, 1024, 2).unwrap();
+    let batches = plan.batches().collect::<Vec<_>>();
+    let segments = batches
+        .iter()
+        .flat_map(|batch| batch.segments().iter().copied())
+        .collect::<Vec<_>>();
     assert_eq!(
         batches
             .iter()
-            .map(|batch| (batch.first_group, batch.group_count))
+            .map(|batch| (batch.first_group(), batch.group_count()))
             .collect::<Vec<_>>(),
         [(0, 2), (2, 2), (4, 1)]
     );
@@ -138,8 +147,13 @@ fn oversized_unaligned_group_is_split_with_overlap_and_single_lane_batches() {
         height: 1,
         stream_index: 0,
     }];
-    let (segments, batches, peak) =
-        build_stream_batches(codestream.len() as u64, &groups, 64, 8).unwrap();
+    let plan = plan_group_streams(codestream.len() as u64, &groups, 64, 8).unwrap();
+    let batches = plan.batches().collect::<Vec<_>>();
+    let segments = batches
+        .iter()
+        .flat_map(|batch| batch.segments().iter().copied())
+        .collect::<Vec<_>>();
+    let peak = plan.stream_bytes();
     assert!(segments.len() > 2);
     assert_eq!(segments.len(), batches.len());
     assert_eq!(peak, 64);
@@ -155,13 +169,13 @@ fn oversized_unaligned_group_is_split_with_overlap_and_single_lane_batches() {
     );
     assert_eq!(segments.last().unwrap().available_token_end, 1600);
     assert_eq!(segments.last().unwrap().stream_token_end, 1600);
-    for (index, (segment, batch)) in segments.iter().zip(&batches).enumerate() {
+    for (segment, batch) in segments.iter().zip(&batches) {
         assert_eq!(segment.group_index, 0);
         assert_eq!(segment.window_upload_start, 3);
         assert!(segment.input_end - segment.input_start <= 60);
-        assert_eq!(batch.first_group, 0);
-        assert_eq!(batch.group_count, 1);
-        assert_eq!(batch.segments, index..index + 1);
+        assert_eq!(batch.first_group(), 0);
+        assert_eq!(batch.group_count(), 1);
+        assert_eq!(batch.segments(), std::slice::from_ref(segment));
     }
     for adjacent in segments.windows(2) {
         assert!(adjacent[1].window_logical_start < adjacent[0].window_yield_end);
@@ -182,13 +196,18 @@ fn every_oversized_modular_group_uses_bounded_segments() {
         height: 1,
         stream_index: 0,
     }];
-    let (segments, batches, peak) =
-        build_stream_batches(codestream.len() as u64, &groups, 64, 1).unwrap();
+    let plan = plan_group_streams(codestream.len() as u64, &groups, 64, 1).unwrap();
+    let batches = plan.batches().collect::<Vec<_>>();
+    let segments = batches
+        .iter()
+        .flat_map(|batch| batch.segments().iter().copied())
+        .collect::<Vec<_>>();
+    let peak = plan.stream_bytes();
     assert!(segments.len() > 1);
     assert_eq!(segments.len(), batches.len());
     assert_eq!(peak, 64);
     assert!(matches!(
-        build_stream_batches(codestream.len() as u64, &groups, 39, 1),
+        plan_group_streams(codestream.len() as u64, &groups, 39, 1),
         Err(Error::StreamWindowTooSmall {
             limit_bytes: 39,
             minimum_bytes: 40,
@@ -210,7 +229,7 @@ fn adaptive_stream_layout_coalesces_or_trades_lanes_for_the_byte_budget() {
             stream_index: index as u32,
         })
         .collect::<Vec<_>>();
-    let (lanes, _, batches, peak) = select_parallel_group_layout(
+    let selected = select_parallel_group_layout(
         codestream.len() as u64,
         &groups,
         ParallelGroupLimits {
@@ -223,13 +242,16 @@ fn adaptive_stream_layout_coalesces_or_trades_lanes_for_the_byte_budget() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(lanes, 8);
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].first_group, 0);
-    assert_eq!(batches[0].group_count, 8);
-    assert_eq!(peak, 8 * 1024 + STREAM_SENTINEL_BYTES);
+    assert_eq!(selected.lanes, 8);
+    assert_eq!(selected.streams.batch_count(), 1);
+    assert_eq!(selected.streams.batch(0).unwrap().first_group(), 0);
+    assert_eq!(selected.streams.batch(0).unwrap().group_count(), 8);
+    assert_eq!(
+        selected.streams.stream_bytes(),
+        8 * 1024 + STREAM_SENTINEL_BYTES
+    );
 
-    let (lanes, _, batches, peak) = select_parallel_group_layout(
+    let selected = select_parallel_group_layout(
         codestream.len() as u64,
         &groups,
         ParallelGroupLimits {
@@ -242,9 +264,39 @@ fn adaptive_stream_layout_coalesces_or_trades_lanes_for_the_byte_budget() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(lanes, 4);
-    assert!(batches.iter().all(|batch| batch.group_count == 2));
-    assert_eq!(peak, 2 * 1024 + STREAM_SENTINEL_BYTES);
+    assert_eq!(selected.lanes, 4);
+    assert!(
+        selected
+            .streams
+            .batches()
+            .all(|batch| batch.group_count() == 2)
+    );
+    assert_eq!(
+        selected.streams.stream_bytes(),
+        2 * 1024 + STREAM_SENTINEL_BYTES
+    );
+
+    let huge_group = ModularGroup {
+        token_bit_offset: 3,
+        token_bit_end: 3 + u64::from(u32::MAX),
+        ..groups[0]
+    };
+    let selected = select_parallel_group_layout(
+        huge_group.token_bit_end.div_ceil(8),
+        &[huge_group],
+        ParallelGroupLimits {
+            stream_limit: 40,
+            lane_cap: 1,
+            lane_stride: 4096,
+            fixed_bytes: 1024,
+            per_frame_target: 1024 + 4096 + 40,
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.lanes, 1);
+    assert_eq!(selected.streams.stream_bytes(), 40);
+    assert!(selected.streams.batch_count() > 134_000_000);
 }
 
 #[test]

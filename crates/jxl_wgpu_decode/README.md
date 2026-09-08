@@ -826,13 +826,23 @@ positive difference from the same budget. Actual-adapter runs force a 40-byte st
 blocking or runtime-neutral async decode, typed corruption/backpressure, and cancellation-driven
 reservation release.
 
-Packet and AC window preparation retains host uploads and dispatch records. GPU commands and bind
-groups are recorded immediately before each ordered submission, including deferred AC after
-HF-global parsing. This avoids exhausting Metal's command resources when the minimum 40-byte
+Modular DC-global/group and VarDCT packet/AC window plans retain packed short streams or constant-
+size geometry for each oversized stream. Counts, peaks and maximum lane occupancy are computed
+without expanding windows. Packet and AC parameters are derived from one base record per coded
+stream, including termination changes made before deferred submission. Preparation retains these
+records and the compressed source lease; one host upload and the active parameter batch are filled
+at submission. Explicit host window storage is O(coded streams + selected cap), in addition to
+the existing compressed-source and entropy-table storage. The last upload releases its source
+lease, while submitted GPU work keeps its existing callback-owned reservations.
+
+GPU commands and bind groups are recorded immediately before each ordered submission, including
+deferred AC after HF-global parsing. This avoids exhausting Metal's command resources when the minimum 40-byte
 window splits a 1024×128 recursive DC+AC stream into thousands of submissions. Seventeen-byte
 transport chunks and asynchronous completion produce exactly the same RGB8 bytes as whole input;
 both independent decoders agree within one code. Cancellation before and after LF/HF transitions
 releases input and producer reservations after callbacks retire.
+Near-u32-bit geometry tests describe more than 134 million windows, directly inspect first/middle/
+last batches and parameter records, and exercise Modular budget selection without window tables.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27

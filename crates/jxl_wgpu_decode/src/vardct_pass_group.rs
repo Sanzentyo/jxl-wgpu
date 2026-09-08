@@ -4,9 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
-use crate::entropy_window::{
-    GroupEntropyRange, GroupStreamSegment, StreamBatch, build_stream_batches_for_len,
-};
+use crate::entropy_window::{EntropyStreamPlan, GroupEntropyRange, GroupStreamSegment};
 use crate::vardct_artifact::{
     HF_ORDER_CHANNELS, HF_ORDER_COUNT, HfCoefficientSinkParams, VarDctArtifactLayout,
 };
@@ -109,10 +107,7 @@ pub struct HfCoefficientGroupExecutionPlan {
     pub params: Vec<HfCoefficientPassParams>,
     pub sink_params: HfCoefficientSinkParams,
     pub lz77_scratch_words: u32,
-    pub(crate) stream_segments: Vec<GroupStreamSegment>,
-    pub(crate) stream_batches: Vec<StreamBatch>,
-    pub(crate) segment_params: Vec<HfCoefficientPassParams>,
-    pub(crate) stream_bytes: u64,
+    pub(crate) streams: EntropyStreamPlan,
 }
 
 /// Shared immutable entropy/order tables plus independently bounded LF-group jobs.
@@ -171,7 +166,7 @@ impl HfCoefficientExecutionPlan {
     ) -> Result<(), HfCoefficientPlanError> {
         let mut found = false;
         for group in &mut self.groups {
-            for params in group.params.iter_mut().chain(&mut group.segment_params) {
+            for params in &mut group.params {
                 if params.global_group_index == pass_group {
                     params.stream_end = end as u32;
                     found = true;
@@ -404,7 +399,7 @@ impl HfCoefficientExecutionPlan {
                         field: "HF execution-state offset",
                     })?;
             }
-            let (stream_segments, stream_batches, stream_bytes) = build_stream_batches_for_len(
+            let streams = EntropyStreamPlan::new(
                 codestream_bytes,
                 &stream_ranges,
                 stream_limit,
@@ -413,20 +408,6 @@ impl HfCoefficientExecutionPlan {
             .map_err(|error| HfCoefficientPlanError::EntropyWindow {
                 message: error.to_string(),
             })?;
-            let segment_params = stream_segments
-                .iter()
-                .map(|segment| {
-                    let mut params = params[segment.group_index];
-                    params.entropy.token_start = 0;
-                    params.entropy.token_end = segment.available_token_end;
-                    params.window_logical_start = segment.window_logical_start;
-                    params.window_upload_start = segment.window_upload_start;
-                    params.stream_token_end = segment.stream_token_end;
-                    params.window_yield_end = segment.window_yield_end;
-                    params.window_flags = segment.flags;
-                    params
-                })
-                .collect();
             groups.push(HfCoefficientGroupExecutionPlan {
                 lf_group_index: lf_group.index,
                 params,
@@ -439,10 +420,7 @@ impl HfCoefficientExecutionPlan {
                     _reserved: [0; 3],
                 },
                 lz77_scratch_words,
-                stream_segments,
-                stream_batches,
-                segment_params,
-                stream_bytes,
+                streams,
             });
         }
 
@@ -479,18 +457,14 @@ impl HfCoefficientExecutionPlan {
 
     #[must_use]
     pub fn uses_bounded_stream_windows(&self) -> bool {
-        self.groups.iter().any(|group| {
-            group.stream_segments.iter().any(|segment| {
-                segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
-            })
-        })
+        self.groups.iter().any(|group| group.streams.uses_windows())
     }
 
     #[must_use]
     pub fn stream_window_bytes(&self) -> u64 {
         self.groups
             .iter()
-            .map(|group| group.stream_bytes)
+            .map(|group| group.streams.stream_bytes())
             .max()
             .unwrap_or(0)
     }
@@ -499,7 +473,7 @@ impl HfCoefficientExecutionPlan {
     pub fn stream_batch_count(&self) -> usize {
         self.groups
             .iter()
-            .map(|group| group.stream_batches.len())
+            .map(|group| group.streams.batch_count())
             .sum()
     }
 
@@ -507,9 +481,9 @@ impl HfCoefficientExecutionPlan {
     pub fn reusable_params_bytes(&self) -> u64 {
         self.groups
             .iter()
-            .flat_map(|group| &group.stream_batches)
-            .map(|batch| {
-                batch.group_count as u64 * std::mem::size_of::<HfCoefficientPassParams>() as u64
+            .map(|group| {
+                group.streams.max_group_count() as u64
+                    * std::mem::size_of::<HfCoefficientPassParams>() as u64
             })
             .max()
             .unwrap_or(0)
@@ -517,6 +491,21 @@ impl HfCoefficientExecutionPlan {
 }
 
 impl HfCoefficientGroupExecutionPlan {
+    pub(crate) fn params_for_segment(
+        &self,
+        segment: GroupStreamSegment,
+    ) -> Option<HfCoefficientPassParams> {
+        let mut params = *self.params.get(segment.group_index)?;
+        params.entropy.token_start = 0;
+        params.entropy.token_end = segment.available_token_end;
+        params.window_logical_start = segment.window_logical_start;
+        params.window_upload_start = segment.window_upload_start;
+        params.stream_token_end = segment.stream_token_end;
+        params.window_yield_end = segment.window_yield_end;
+        params.window_flags = segment.flags;
+        Some(params)
+    }
+
     #[must_use]
     pub fn status_bytes(&self) -> u64 {
         self.params.len() as u64 * HF_COEFFICIENT_STATUS_BYTES

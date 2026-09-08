@@ -607,11 +607,21 @@ HF metadata completion. Staged LF reserves the selected aligned cap even when it
 are smaller: an eventual HF suffix or packed HF batch can exceed that initial peak while still
 fitting the cap.
 
-Window preparation stores host uploads and dispatch records rather than one GPU command buffer
-per future window. Packet and AC command buffers and bind groups are created immediately before
-their ordered submissions, retaining the existing map boundaries and byte reservations. This also
-applies to deferred AC discovered at an HF-global cursor. A 40-byte 1024×128 recursive DC+AC case
-guards against exhausting Metal's command resources before the first coefficient submission.
+The common `EntropyStreamPlan` stores short packed groups once and a constant-size geometry record
+for each oversized group. Batch counts, upload peaks and maximum lane occupancy are computed in
+O(coded streams), including every candidate evaluated by budget selection. It serves ordinary
+Modular groups and DC-global as well as VarDCT LF/HF/combined packets and AC. Near-u32-bit tests
+represent more than 134 million windows with three runs and inspect boundary batches directly.
+Packet parameters use one base record per group; HF coefficient parameters derive each window
+from the current pass record, preserving stream-end changes without updating a window table.
+
+Packet and AC preparation retains compressed source leases and group records. Submission reuses
+one host stream upload and an active parameter batch, then records and submits that window's GPU
+commands. Explicit host window storage is O(coded streams + selected cap), beyond compressed spans
+and entropy metadata. This also applies to deferred AC discovered at an HF-global cursor. Final
+uploads retire their source references; GPU map boundaries and reservations retain callback-owned
+lifetimes. A 40-byte 1024×128 recursive DC+AC case guards against exhausting Metal's command
+resources before the first coefficient submission.
 
 ## Shader write bounds fixed by this audit
 

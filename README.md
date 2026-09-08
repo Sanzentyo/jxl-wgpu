@@ -73,6 +73,9 @@ dependency on the same queue. LF consumers whose first stream is HF metadata obe
 window cap as ordinary LF/HF packets. Packet and AC commands are recorded just before submission,
 so tiny windows do not retain thousands of unsubmitted GPU command buffers. A recursive DC+AC
 stream matches whole-input output exactly through 40-byte windows and fragmented async input.
+Modular DC-global/groups and VarDCT packets/AC share a compact stream plan: geometry and parameter
+storage scale with coded streams, and one host upload is filled as each window is submitted.
+Planning more than 134 million windows requires no per-window arrays or compressed-data copies.
 Parametric custom dequantization matrices are expanded as bounded
 scalar metadata and installed directly in the resident resource table. Raw mode-7 matrices now use
 the common GPU Modular entropy and inverse-transform pipelines. One reusable input window obeys

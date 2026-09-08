@@ -287,6 +287,19 @@ The packet plan also covers a shared-capacity counterexample: two 260-byte LF ra
 240-byte upload peak under a 256-byte cap, but their later HF suffixes need a 256-byte shared
 upload. Staged LF must reserve the selected cap until those HF descriptors are known.
 
+The common entropy plan tests mix empty, unaligned, packed and oversized streams across caps and
+lane counts, checking exact source ranges, overlap coverage, lane isolation, indexed/iterated
+batch equality, submission counts and peak uploads. A near-u32-bit stream describes more than
+134 million windows between two short streams while retaining only three plan runs. First and
+last windows remain directly accessible without expanding the middle. VarDCT packet planning
+likewise keeps one base parameter record for that geometry and derives first/middle/last resume
+records. Modular budget selection handles the same scale within one scratch lane plus a 40-byte
+upload. The AC termination test changes one pass's end rule and checks both base and lazily derived
+parameters, leaving other passes unchanged. These are geometry/ABI tests and allocate no synthetic
+half-gigabyte source. Actual-adapter packet, recursive DC+AC, raw-matrix, Modular Gradient/Weighted
+and transformed multi-group tests separately validate pixels, submission accounting and source
+lease retirement through the lazy upload path.
+
 `vardct_engine_gpu::vardct_stream_windows_adapt_to_the_shared_frame_budget` opens the same
 438×589 global-tree/nonzero-AC fixture at 40-byte and 256-byte caller caps, then chooses a shared
 budget strictly between those exact frame totals. Production planning must resolve a four-byte-
