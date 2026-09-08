@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use jxl_gpu_formats::ImageLayout;
 use jxl_wgpu::{
@@ -45,11 +46,13 @@ pub(super) struct VarDctSource {
     pub(super) frame_upsample: Option<ResidentUpsampleKernel>,
     pub(super) output: VarDctFrameOutput,
     pub(super) layout: ImageLayout,
+    pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     pub(super) quant_biases: [f32; 4],
     pub(super) frame_name: String,
     pub(super) memory: VarDctDecodeMemoryStats,
     pub(super) external_lf: Option<ProgressiveDcXybPlanes>,
-    pub(super) extra_plane: Option<super::staging::ResidentModularPlane>,
+    pub(super) extra_planes: Vec<super::staging::ResidentModularPlane>,
+    pub(super) extra_indices: Vec<usize>,
     pub(super) extra_render: Option<crate::modular_render::ModularRenderPlan>,
     pub(super) extra_declarations: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
     pub(super) global_extra_prefix: Option<jxl_wgpu::GpuBufferLease>,
@@ -145,6 +148,7 @@ pub(super) fn prepare_packet_source(
         output,
         layout,
         quant_biases,
+        surface,
     } = prepare_presentation(
         backend,
         inventory,
@@ -331,54 +335,51 @@ pub(super) fn prepare_packet_source(
             &compact,
         )?)
     };
-    let extra_index =
-        match output {
-            VarDctFrameOutput::Extra { index, .. } => Some(index as usize),
-            VarDctFrameOutput::Color { .. } => inventory
-                .image_header
-                .extra_channels
+    let extra_indices =
+        super::output::selected_extra_indices(request, &inventory.image_header.extra_channels);
+    let extra_render = (!extra_indices.is_empty()
+        && (surface.is_some()
+            || extra_indices
                 .iter()
-                .position(|extra| {
-                    matches!(
-                        extra.channel_type,
-                        jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
-                    )
-                }),
-        };
-    let extra_render = extra_index
-        .filter(|&index| inventory.frames[0].extra_channel_upsampling[index] != 1)
-        .map(|index| {
-            let topology = crate::modular_geometry::source_topology(
-                &inventory.image_header,
-                &inventory.frames[0],
-                0,
-            )
+                .any(|&index| frame.extra_channel_upsampling[index] != 1)))
+    .then(|| {
+        let topology = crate::modular_geometry::source_topology(&inventory.image_header, frame, 0)
             .map_err(|source| VarDctDecodeError::ModularExtra {
                 source: Box::new(source),
             })?;
-            let mut plane = topology.gpu_layout().map_err(|_| {
-                crate::modular_render::ModularRenderError::Invalid {
-                    reason: "extra-channel source layout",
-                }
-            })?[index];
-            let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } =
-                inventory.image_header.extra_channels[index].bit_depth
-            else {
-                unreachable!("integer profile")
-            };
-            plane.bit_depth = bits_per_sample;
-            Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
-                jxl_gpu_protocol::Extent2d::new(
-                    packet.profile.output_width,
-                    packet.profile.output_height,
-                ),
-                vec![plane],
-                vec![inventory.frames[0].extra_channel_upsampling[index]],
-                &inventory.image_header.upsampling_weights,
-                &backend.device().limits(),
-            )?)
-        })
-        .transpose()?;
+        let planes = topology.gpu_layout().map_err(|_| {
+            crate::modular_render::ModularRenderError::Invalid {
+                reason: "extra-channel source layout",
+            }
+        })?;
+        let sources = extra_indices
+            .iter()
+            .map(|&index| {
+                let mut plane = planes[index];
+                let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } =
+                    inventory.image_header.extra_channels[index].bit_depth
+                else {
+                    unreachable!("integer profile")
+                };
+                plane.bit_depth = bits_per_sample;
+                plane
+            })
+            .collect();
+        Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
+            jxl_gpu_protocol::Extent2d::new(
+                packet.profile.output_width,
+                packet.profile.output_height,
+            ),
+            sources,
+            extra_indices
+                .iter()
+                .map(|&index| frame.extra_channel_upsampling[index])
+                .collect(),
+            &inventory.image_header.upsampling_weights,
+            &backend.device().limits(),
+        )?)
+    })
+    .transpose()?;
     let resident_memory = packet
         .groups
         .iter()
@@ -434,7 +435,13 @@ pub(super) fn prepare_packet_source(
                 epf_iterations: epf.as_ref().map_or(0, |plan| plan.passes.len() as u32),
                 resident: &resident_memory,
                 render_color,
-                output: output.memory(),
+                output: {
+                    let mut memory = output.memory();
+                    if let Some(surface) = &surface {
+                        memory.storage_bytes = surface.storage_bytes;
+                    }
+                    memory
+                },
                 extra_render_bytes: extra_render.as_ref().map_or(0, |plan| plan.total_bytes()),
             })?;
             Ok(VarDctEntropyPlanSelection {
@@ -506,7 +513,9 @@ pub(super) fn prepare_packet_source(
         frame_name,
         memory,
         external_lf: None,
-        extra_plane: None,
+        extra_planes: Vec::new(),
+        extra_indices,
+        surface,
         extra_render,
         extra_declarations: inventory.image_header.extra_channels.clone(),
         global_extra_prefix: None,

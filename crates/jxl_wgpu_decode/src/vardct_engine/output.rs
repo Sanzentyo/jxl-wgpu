@@ -14,6 +14,7 @@ use jxl_gpu_bitstream::{
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{KernelVariant, WgpuBackend};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(super) enum VarDctFrameOutput {
@@ -58,6 +59,7 @@ pub(super) struct VarDctPresentation {
     pub(super) output: VarDctFrameOutput,
     pub(super) layout: ImageLayout,
     pub(super) quant_biases: [f32; 4],
+    pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
 }
 
 pub(super) fn prepare_presentation(
@@ -103,6 +105,7 @@ pub(super) fn prepare_presentation(
             output: VarDctFrameOutput::Extra { index, plan },
             layout,
             quant_biases: [0.0; 4],
+            surface: None,
         });
     }
     if request.mapping() != GpuOutputMapping::Color {
@@ -193,7 +196,21 @@ pub(super) fn prepare_presentation(
         transform: output_transform,
         alpha_conversion: request.alpha_conversion(&inventory.image_header.extra_channels),
     };
-    let layout = ImageLayout::packed(output_config.output_extent(), request.format().clone())?;
+    let surface = request
+        .retains_frame_surface()
+        .then(|| {
+            crate::frame_surface::FrameSurfaceLayout::new(
+                output_config.output_extent(),
+                inventory.image_header.extra_channels.len(),
+                &backend.device().limits(),
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
+    let layout = match &surface {
+        Some(surface) => surface.color.clone(),
+        None => ImageLayout::packed(output_config.output_extent(), request.format().clone())?,
+    };
     output_config.validate_layout(&layout)?;
     let output_plan =
         VarDctOutputPlan::for_limits_with_variant(&layout, &backend.device().limits(), variant)?;
@@ -204,5 +221,28 @@ pub(super) fn prepare_presentation(
         },
         layout,
         quant_biases,
+        surface,
     })
+}
+
+pub(super) fn selected_extra_indices(
+    request: &GpuOutputRequest,
+    extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
+) -> Vec<usize> {
+    if request.retains_frame_surface() {
+        return (0..extras.len()).collect();
+    }
+    request
+        .extra_channel()
+        .map(|index| index as usize)
+        .or_else(|| {
+            extras.iter().position(|extra| {
+                matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
+                )
+            })
+        })
+        .into_iter()
+        .collect()
 }

@@ -31,6 +31,7 @@ mod entropy;
 mod entropy_window;
 mod error;
 mod frame_plan;
+mod frame_surface;
 mod inflight;
 mod input_budget;
 mod model;
@@ -82,6 +83,7 @@ pub use error::{
 pub use frame_plan::{
     FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,
 };
+pub use frame_surface::FrameSurfaceError;
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
     IncrementalInputBudget, IncrementalInputBudgetError, IncrementalInputBudgetSnapshot,

@@ -50,6 +50,27 @@ impl OutputChannels {
             });
         }
         let color_count = profile.channels.color_count() as usize;
+        if request.retains_frame_surface() {
+            let indices = (0..3)
+                .map(|index| if color_count == 1 { 0 } else { index })
+                .chain(color_count..color_count + profile.extra_channels.len())
+                .collect();
+            let mut depths = vec![profile.bits_per_sample; 3];
+            depths.extend(
+                profile
+                    .extra_channels
+                    .iter()
+                    .map(|extra| integer_bits(extra.bit_depth))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            return Ok(Self {
+                indices,
+                depths,
+                format_channels: ModularChannels::Rgb,
+                bits: profile.bits_per_sample,
+                alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
+            });
+        }
         if profile
             .extra_channels
             .iter()

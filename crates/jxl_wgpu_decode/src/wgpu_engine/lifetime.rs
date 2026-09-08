@@ -22,7 +22,7 @@ pub(super) struct DecodeSource {
     pub(super) global_ma_metadata_offset: Option<u32>,
     pub(super) channel_layout_offsets: Arc<[u32]>,
     pub(super) global_channel_layout_offset: Option<u32>,
-    pub(super) finalize_params: Arc<[ModularFinalizeParams]>,
+    pub(super) finalize_params: Arc<[Vec<ModularFinalizeParams>]>,
     pub(super) output: OutputPlan,
 }
 

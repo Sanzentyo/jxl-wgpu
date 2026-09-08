@@ -117,6 +117,9 @@ name shown in parentheses.
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `ShaderParams` / `Params` | entropy prefix/window, group geometry, sample/channel counts, channel-layout offset, output kind/transfer/range, channels/order/depth, 4 plane offset/stride pairs, chroma geometry/size/mapping, status/stream/fixed-leaf/weighted-predictor fields; canvas width/height and orientation | 256 | 4 | read-only storage element |
 | `jxl_wgpu_decode/lossless_gray8.wgsl` | `DecodeStatus` / `status[0..4]` | `code, decoded_samples, cursor, expected_cursor` | 16 | 4 | storage/readback record |
 | `jxl_wgpu_decode/vardct_raw_matrix.wgsl` | `RawMatrixParams` / `RawMatrixParams` | denominator, raster width/height, target count, then padded four-lane source offsets, source strides, and resident resource target offsets | 64 | 16 | uniform |
+| `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendParams` / `Params` | canvas, intersection, source, dispatch, four reference geometry/presence records | 128 | 16 | uniform |
+| `jxl_wgpu_decode/codec_engine/composition/blend.wgsl` | `BlendChannel` / `Channel` | mode, background slot, alpha plane, clamp/association flags, alpha-background slot, three pads | 32 | 16 | read-only storage element |
+| `jxl_wgpu_decode/codec_engine/composition/native.wgsl` | `NativeParams` / `Params` | extent, format, output, source (plane words, first alpha, scalar plane, F32 flag) | 64 | 16 | uniform |
 
 The Modular finalizer has its own 176-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
 binding 2. Eleven `vec4<u32>` records contain the source extent, region/status, four source offsets,
@@ -354,7 +357,7 @@ against device limits prior to pipeline compilation and dispatch recording.
 | Core resident arena | Planner accounts physical slots once, respects simultaneous lifetimes, validates every slot against `max_buffer_size` and every bound plane against `max_storage_buffer_binding_size`. | Buffer pool has a configured hard byte limit and never leases one buffer concurrently. | Pipeline/driver memory excluded. |
 | VarDCT transform kernels | Exact coefficient, compact task/artifact, all normative default matrix/AFV resources, two global scratch buffers, and 27 aligned 144-byte uniform records are included in the core transient total. Every binding is checked against `min(max_buffer_size, max_storage_buffer_binding_size)`. | Included in core pending total. | Regular buckets use global ping-pong scratch; special buckets use fixed 2,304-byte workgroup storage. Empty indirect records perform no work. |
 | Incremental decoder input | `GpuDecodeStreamStats` reports the inventory scanner counters, exact retained logical codestream bytes, physical span count, completed frames, authoritative-end state, and the shared input-budget snapshot. | One growable permit per stream reserves each nonempty `CodestreamChunk` before scanner mutation. Exhaustion is typed and retryable with the borrowed event. The permit moves into `GpuCodestream`; Modular drops it after upload submission, staged local-tree VarDCT retains it through HF planning/submission, and every error/cancellation path drops it. Concurrent streams share a caller-replaceable `IncrementalInputBudget`. | Allocator capacity, span-table metadata, auxiliary boxes, and caller allocations outside the retained logical slice are excluded. Host bytes are not charged to the GPU `MemoryBudget`, avoiding a false deadlock while source and upload coexist. |
-| Decoder frame sequence | Bounded inventories and `FrameExecutionPlan` describe physical producers, four versioned references, and presentation ranges. Independent Replace uses existing producer ABI. Composed frames use packed original-encoding F32 RGBA, an 80-byte crop/blend uniform, and a 48-byte native or 192-byte common output uniform. | Four post-transform slots retain shared output leases; each composition/packing allocation and uniform reserves exact bytes from the backend budget. Source/ref/output leases remain in submission callbacks until completion. Initial admission failures retain the producer; dependent prefetch reports `FrameDependency`. Blocking and async advance the same ordered stages and release references on final output/cancellation. | General extra channels and pre-transform patch surfaces remain. Mid-presentation allocation failure is terminal, as for staged VarDCT. Independent Replace still prunes overwritten entropy after structural validation; composed sequences decode all physical color producers. Pipeline/driver and host descriptor capacity exclusions remain unchanged. |
+| Decoder frame sequence | Bounded inventories and `FrameExecutionPlan` describe physical producers, four versioned references, and presentation ranges. Independent Replace uses existing producer ABI. Composed frames use one planar F32 allocation for RGB plus all extras, a 128-byte geometry uniform, 32 bytes of blend metadata per channel, and a 64-byte native/scalar or 192-byte common output uniform. | Four post-transform slots retain all planes through shared output leases; each complete aligned surface, operation table and uniform reserves exact bytes from the backend budget. Source/ref/output leases remain in submission callbacks until completion. Initial admission failures retain the producer; dependent prefetch reports `FrameDependency`. Blocking and async advance the same ordered stages and release references on final output/cancellation. | Floating samples and pre-transform patch surfaces remain. Mid-presentation allocation failure is terminal, as for staged VarDCT. Independent Replace still prunes overwritten entropy after structural validation; composed sequences decode all physical color/extra producers. Pipeline/driver and host descriptor capacity exclusions remain unchanged. |
 | Bounded VarDCT decoder | `VarDctDecodeMemoryStats` accounts codestream, entropy metadata including HF block-context thresholds, every LF group's parameters/LZ/status plus the selected 64/128-byte packet-state capacity, 464 bytes of AC resume state per pass group, the resolved four-byte-aligned stream cap, one reusable packet stream peak and initial batch count, reusable AC stream peak and batch count, per-pass 39-descriptor/all-order coordinate tables, packet/artifact records, occupancy, reconstruction, capacity-strided raw metadata, coefficients, shared full-image LF/correlation/default-or-parametric-matrix/AFV resources, exact per-component resident transform planes (physically compact under JPEG subsampling), packed output storage, one optional three-plane restoration scratch set, restoration uniforms, and aggregate validation staging. Packet state is included once inside reconstruction bytes and also exposed as an audit subtotal. Staged LF groups reserve 128 bytes because the HF tree is discovered only after LF completion. Every staged single-entry frame reserves worst-case AC LZ, 464-byte execution state, status, parameters, and sink uniforms before its HF-global cursor is known. | One shared backend byte reservation covers all LF-group transient buffers until final validation and output bytes until the last lease clone. The caller/device stream cap is an upper bound; deterministic total-capacity planning searches four-byte-aligned layouts down to the 40-byte overlap/sentinel minimum, records the resolved cap, and returns typed `MemoryBudgetTooSmall` before submission if that layout cannot fit. Live concurrency remains typed non-blocking admission rather than changing an opened session's plan. Sectioned global-tree packets use one known-range packet plan and no intermediate map; their final window is co-submitted with downstream work. Windowed staged LF and host-discovered HF reuse one upload/state sequentially; only LF maps cursors, while final HF is co-submitted with downstream work and one final map validates all status. `hf_packet_stream_batch_count()` and the exact local-tree submission count become available after that plan is installed; a larger local-HF metadata peak separately admits its exact difference. A single-entry frame maps status 31, admits only exact late entropy/order/window buffers from the same budget, uploads any parametric matrix into the existing resource region, and retains both physical lifetimes until the logical final frame completes. Cancellation leaves callback-owned permits and buffers alive until mapping completes. Gaborish and EPF share one ping-pong scratch set. | Pipeline/driver-private allocations are excluded. The retained whole-codestream GPU buffer is mapped at creation and filled directly from checked source spans, with no full-size host `Vec`; it remains part of this decoder layout until every whole-range kernel is windowed. All bounded host metadata readers consume those spans directly and never decode image entropy or own an intermediate image. |
 | VarDCT encoder | `VarDctMemoryPlan` charges either the bounded 512-byte parameter plus 26,880-byte artifact pair, or the 256-byte scalable parameter plus variable artifact, and an equal-size mapped readback. The bounded artifact retains its GPU-generated DC and AC fragments, histograms, and forward/quantized coefficients. The scalable artifact is a 64-word header, two words per LF group, then independently 64-word-aligned strategy (`N`), DC/token/extra (`3N` each), and checked maximum entropy-fragment sections. The source binding is reported but caller-owned. | The context's backend-wide byte budget reserves parameter + artifact + readback through map validation. The host validates fragment lengths, token counts, histograms, and zero padding before appending GPU-owned bits; it does not rescan image coefficients. Tiled quantization uses a 2-D block dispatch, so the device workgroup limit is checked per axis rather than against `blocks_x * blocks_y`; storage binding and buffer limits independently cap the complete artifact. | Bounded DCT8 AC serialization is sequential inside its control pass and capped at 256 words. Scalable/tiled and non-DCT8 paths remain zero-AC. Full 16K-square allocation is profile-valid but adapter/budget-dependent; actual-adapter coverage exercises 16Kx1 and 1x16K without claiming every adapter admits a 16K square. |
 | Lossless Modular encoder | `LosslessModularMemoryPlan` reports source binding ranges (full and peak), 256-byte-aligned parameter storage, peak artifact storage, mapped readback, diagnostic total artifact bytes, batch count, exact GPU submission count, streaming mode, valid bits, component storage bytes, channel count, format, group grid, owned bytes/job and addressed bytes/job. `EncoderBufferPoolStats` separately reports exact idle bytes, three-buffer set counts, hits, misses and evictions. | Every submit non-blockingly reserves `owned_bytes_per_job` from the context's shared `MemoryBudget`. The exclusive buffer lease and permit survive until mapped artifacts are consumed. If the future is abandoned, its callback-owned lifetime unmaps and returns the set only after mapping resolves; the mapped artifact buffer is parsed in place instead of being duplicated into a host `Vec`. A bounded poll slot is reserved before `Queue::submit`, so poll saturation returns both memory and buffers without orphaning GPU work. The idle pool uses exact artifact-size matching and has an independent 32 MiB default hard limit, configurable down to zero, plus a 256-set object-count cap for tiny workloads. | Caller-owned source bindings are sampled directly: they are reported as addressed, are neither copied nor pooled, and are not charged as encoder-owned. Queue/driver-private command metadata excluded. Physical caller-visible allocation is bounded by live admitted bytes plus the separately reported idle-pool bytes. |
@@ -629,42 +632,63 @@ observable in-flight total before the shader is advertised as supported.
 
 ## Decoder crop/blend composition ABI and lifetime
 
-`jxl_wgpu_decode::codec_engine::composition` uses one packed F32 RGBA buffer per physical
-color result or composed canvas, with `16 * width * height` logical bytes. Actual producer
-allocation reservations follow the original `GpuBufferLease`; a reference clone does not charge
-those bytes twice. References are immutable until their replacement is ready. Color and alpha
-backgrounds bind separately, so their source slots need not match. Missing backgrounds bind a
-valid foreground allocation but have their reads disabled by flags; no full-size zero buffer is
-allocated. Without a real alpha channel, every composed pixel has opaque virtual alpha.
+`jxl_wgpu_decode::codec_engine::composition` retains original-encoding RGB followed by every
+extra plane in one F32 allocation. A plane has `width * height` samples and its starting byte
+offset is aligned to `max(4, min_storage_buffer_offset_alignment)`. The complete allocation is
+`(3 + extra_count) * aligned_plane_bytes`. `FrameSurfaceLayout` validates this total against
+buffer/binding/u32 limits before allocating extra views. Output 0 describes only the three color
+planes; outputs 1 onward describe independently normalized scalar extras with their real global
+offsets and logical ends. Every output aliases the same tracked `GpuBufferLease`, so one allocation
+is charged once. Import validates layout, extent, output IDs and buffer identity. Only the private
+physical-producer/compositor boundary exposes these all-channel views.
 
-The 80-byte `BlendParams` has five 16-byte records: canvas/source/dispatch geometry, clipped
-canvas intersection, source origin plus reference strides, color/alpha modes and clamp flags,
-and presence/alpha-association flags. Negative origins and potentially oversized rectangles are intersected in
-host `i64`, producing unsigned in-bounds coordinates for WGSL. One 64-lane invocation owns one
-canvas pixel. Replace, Add, straight/associated source-over, alpha-weighted Add and Multiply operate
-without integer quantization; color source-over also updates its selected alpha. Alpha's own
-MultiplyAdd retains background alpha. Multiply's clamp applies to the foreground operand.
+Modular uses one 176-byte color finalizer plus a 176-byte scalar finalizer per extra, for every
+existing group/frame-finalizer batch. The shared allocation and all uniforms enter admission
+before GPU submission. Resampled sources pass all selected planes through the common resident
+normalizer/filter, without an RGBA channel-count cap. VarDCT retains a vector of original extra
+views over one global/distributed arena lease, normalizes/resamples them together, then copies the
+F32 planes to their aligned final offsets after color packing. The render output therefore has
+`STORAGE | COPY_SRC` usage. Shared arena reservations are subtracted once at stage transitions,
+regardless of how many views retain them. All outputs and changed regions are published only after
+physical entropy/inverse validation.
 
-Reference surfaces keep the image-header association. The physical producer requests Preserve,
-so neither source-over nor reference retention observes an already unpremultiplied surface.
-The last word of the 80-byte blend uniform selects associated source-over.
+The 128-byte, 16-byte-aligned `BlendParams` contains canvas geometry (width, height, plane words,
+channel count), crop intersection, foreground geometry, dispatch geometry, and four reference
+geometry/presence records starting at byte 64. A separate readonly table has one 32-byte
+`BlendChannel` per color/extra plane: mode, background slot, absolute alpha plane, clamp/association
+bits; then alpha-background slot and three reserved words. The shader binds foreground at 0,
+four references at 1–4, output at 5, channel metadata at 6 and the uniform at 7. Its seven storage
+bindings fit the portable limit. Missing slots bind foreground but disable reads; no image-sized
+zero buffer is allocated. Metadata selectors and device binding/workgroup limits are checked
+before submission. Reference clones share their allocation charge and remain immutable until
+replacement is ready.
 
-Final packing follows composition. Native integer output uses a 48-byte `NativeParams` with
-output/source extents, channel/depth/row format and byte-size/dispatch/orientation records; one
-invocation owns one 32-bit output word, including tail padding. Other color formats use the
-192-byte `ImageOutputParams` and shared orientation/conversion shader, sourcing RGB
-and alpha from the packed canvas. Packing supports two-dimensional dispatch when the linear
-word count exceeds one workgroup axis. Checked allocation bounds cover WGSL u32 byte addressing,
-`max_buffer_size`, `max_storage_buffer_binding_size`, overflow and both dispatch dimensions.
+Negative/oversized crops are intersected using host `i64` and lowered to in-bounds unsigned
+coordinates. One 64-lane invocation owns one channel sample. Each channel uses its own background
+slot and alpha selector; the alpha background comes from the selected alpha's own slot. Replace,
+Add, straight/associated source-over, alpha-weighted Add and Multiply run without quantization.
+Color source-over updates its selected alpha; alpha's own weighted Add keeps its background.
+Multiply clamps only foreground. Absent alpha declarations make color Blend replace and weighted
+Add add, with virtual opaque alpha at presentation. References keep the image-header association;
+the physical producer requests Preserve, and only final output may change association.
+
+Final packing uses either the shared 192-byte `ImageOutputParams` with planar source overrides or
+the 64-byte, 16-byte-aligned `NativeParams`: output/source extents, channel/depth/row format,
+byte-size/dispatch/orientation/alpha-conversion, then source plane stride, first-alpha plane,
+selected scalar plane and F32 flag at byte 48. Native color and selected extras clamp and round
+once at presentation; scalar F32 preserves extended normalized values without color/alpha
+conversion. One invocation owns one output word including tail padding. Both shaders support 2-D
+linear dispatch and checked u32 byte addressing, buffer/binding sizes and arithmetic overflow.
 
 Each job reserves a native poll slot before submission, takes GPU access guards on every input,
-and retains source/reference/output leases and uniform bytes in completion/error callbacks.
-Cancellation drops unsubmitted codestream input immediately; submitted GPU reservations survive
-until the callbacks release them. A presentation completes only after all physical codec status
-checks and its final packing work. An unvalidated output is unavailable until packing has been
-submitted. Initial admission can be retried without changing frame order; later allocation
-failure returns a terminal pending-frame error. The dependency admission cell permits one
-composed presentation at a time, while caller-held previous output leases remain independent.
+and retains source/reference/output leases, operation-table bytes and uniforms through completion
+or error callbacks. `composition::submission` owns this common lifetime; `composition::blend`
+lowers the per-channel metadata, while `composition::gpu` handles surfaces and output pipelines.
+Cancellation drops unsubmitted input immediately; submitted reservations survive until callbacks
+release them. Presentation completes only after every physical status check and final packing.
+Unvalidated output is unavailable until packing is submitted. Initial admission can be retried
+without changing frame order; later allocation failure is terminal. One composed presentation
+runs at a time while caller-held previous output leases remain independent.
 
 Native completion uses the command encoder's work-done callback. On WebGPU those callbacks
 require `Send`, while browser buffer handles are local to the event loop. A separately accounted
@@ -686,6 +710,7 @@ The Modular finalizer retains its 176-byte ABI: `bounds.w` at byte 156 now carri
 A converting RGB request retains its first-alpha source view even if the destination omits alpha.
 It uses the generalized finalizer instead of a direct integer kernel; no extra copy or buffer is
 needed. Numeric requests always select Preserve. The composition native packer uses `output.w`
-at byte 44 for the same conversion; its 48-byte ABI and output word ownership are unchanged.
+at byte 44 for the same conversion; its 64-byte ABI adds planar source addressing at byte 48
+and preserves output word ownership.
 All references keep the source association, independent of the caller's output policy. Enlarged
 common-output uniforms are charged through the existing size-derived admission and lifetime paths.

@@ -1162,8 +1162,8 @@ without consuming the source, canceled callback ownership after multiple windows
 fixture zeroes only entropy bits 885..3436 of `rgba`, preserving both descriptors and later color
 data; GPU status rejects it before a color plan or frame is exposed. Color planning remains absent
 until global cursor validation; later LF/HF descriptors retain their separately admitted dynamic
-bytes. Shifted samples and associated alpha
-remain gaps. No production picture data or entropy token crosses to a CPU decoder.
+bytes. Shifted samples and associated alpha were gaps at that checkpoint; the extensions below
+add both. No production picture data or entropy token crosses to a CPU decoder.
 
 `tests/vardct_engine_gpu/extra_channels/scalar.rs` selects all 32 extra planes in those seven
 fixtures. Native unsigned output with Keep orientation equals the source formula exactly at each
@@ -1345,8 +1345,9 @@ retry after initial backpressure, cancellation and subsequent successful reuse f
 Host render-plan tests verify aligned disjoint destination views, one shared normalization
 scratch plane, weight deduplication and rejection before allocation on geometry/address/limit errors.
 
-Associated alpha, floating source samples, general extra-channel composition and resampled
-crop/blend cross-products remain conformance gaps.
+At that checkpoint associated alpha, floating source samples, general extra-channel composition
+and resampled crop/blend cross-products remained conformance gaps. The following sections add
+associated integer alpha and all-channel integer composition, including resampled cases.
 
 Validation on Apple M5/Metal: the serial full workspace passes 682 tests with one existing manual
 allocation benchmark ignored. After tightening workgroup and source-address admission, all 159
@@ -1444,9 +1445,9 @@ packing; NV12 and odd-width YUYV/UYVY use the shared scalar layout oracle, inclu
 final-luma alpha. Both compare within one stored code and check zero padding bits. Low-level output
 tests reject association conversion without an alpha
 binding before allocation, while existing ABI tests parse and validate the enlarged common
-192-byte uniform. Production still has no CPU image-domain fallback. Floating source samples,
-general extra-channel composition and associated/resampled composition cross-products remain
-separate completion gates.
+192-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
+a completion gate; the all-channel composition extension below adds integer extras and
+associated/resampled composition cross-products.
 
 | File | Encoded bytes after hex decoding | SHA-256 of encoded file |
 |---|---:|---|
@@ -1473,3 +1474,97 @@ existing manual benchmark ignored. Formatting, all-target/all-feature checks, wa
 and rustdoc, Rust 1.89, and the six-crate `wasm32-unknown-unknown` compile check pass. The reference
 and Metal verification harnesses each pass all 18 cases; indexed Gray8 decoding to U8 CPU readback
 also passes. All 17 new fixture lengths and SHA-256 values match the table above.
+
+## Composition of every integer extra channel
+
+`test-data/generate_extra_composition.c OUTPUT_DIR`, built against libjxl 0.12.0, generates seven
+additional independent codestreams. The production path uses no CPU codec. Physical Modular and
+VarDCT producers return one accounted, aligned planar F32 allocation containing RGB and every extra
+plane. The compositor retains all planes in reference slots; each extra has its own blend mode,
+background slot, alpha selector and clamp flag. Color output selects the first declared alpha only
+at presentation. Scalar F32 exposes the normalized composed value without clipping or color/alpha
+conversion. Native scalar output clamps and rounds once at the declaration's integer depth.
+
+| Suffix in `composition_extras_*.jxl.hex` | Canvas | Color / mode | Extras | Orientation |
+|---|---|---|---|---:|
+| `rgb` | 259×17 | RGB12, Modular | nine, first alpha unassociated | 6 |
+| `gray` | 37×9 | Gray16, Modular | nine, first alpha associated | 8 |
+| `vardct` | 259×17 | RGB12, VarDCT distance 2 | nine, first alpha unassociated | 5 |
+| `distributed` | 2051×17 | RGB12, VarDCT distance 2, effort 7 responsive/progressive | nine, first alpha associated | 3 |
+| `resampled` | 259×17 | RGB12, Modular, color factor 2 / extra factor 8 | nine, first alpha associated, dimension shift 1 | 7 |
+| `vardct_resampled` | 259×17 | RGB12, VarDCT distance 2, color factor 2 / extra factor 8 | nine, first alpha unassociated, dimension shift 1 | 2 |
+| `data` | 33×7 | RGB8, Modular | Depth16, SelectionMask1, no alpha | 4 |
+
+The nine declarations, in order, are Depth16, SelectionMask1, Alpha7, SpotColour12, CFA4, Thermal8,
+Black6, Optional10 and Alpha15. The second alpha has the opposite association to the first. Names
+are `composed-plane-C-depth-BITS`, spot RGBA is `(0.25, 0.5, 0.75, 0.5)`, and CFA index is 3.
+Source values are integer codes divided by `2^bits - 1`. The deterministic code for local `(x,y)`,
+channel `c` and physical frame `f` is
+`(193*x + 317*y + 97*c + (x XOR y)*(23+c) + f*(71+c)) AND (2^bits-1)`, overridden to zero when
+`x % 11 == 0` and to the maximum when `x % 11 == 1`. Extra source channel numbering follows the
+one or three color channels. KEEP_INVISIBLE is enabled, patches disabled, extra distance zero,
+and progressive AC enabled. Inputs to the offline encoder use F32 transport but the codestreams
+have integer sample declarations.
+
+All seven files have nine physical layers and six presentations. The crop/duration/reference
+schedule matches `generate_frame_composition.c`: negative, oversized, partial and fully off-canvas
+layers; durations `[1,0,2,1,0,1,1,0,2]`; full Replace, Blend, Add, Multiply and weighted Add; reference
+slots 1 and 2 overwritten between presentations and missing slots used as zeros. Color selects
+alpha 2 or 8 on alternating layers. Each extra cycles through all five modes, chooses a separate
+source slot `(color_source + c % 3) % 4`, alternates alpha 2/8, and has an independent clamp bit.
+The no-alpha file exercises color Blend-as-Replace and weighted-Add-as-Add alongside data-plane
+blending. Source-over updates only its selected alpha; alpha's weighted Add preserves its own
+background. The selected alpha's background comes from its own reference slot. These operations
+follow libjxl's [blending implementation](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/blending.cc)
+and [alpha equations](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/alpha.cc).
+
+Four tests in `tests/vardct_engine_gpu/extra_channels/composition.rs` cover:
+
+- RGBA F32 plus every extra as normalized scalar F32, all six presentations, whole blocking and
+  43-byte fragmented asynchronous input with a 1024-byte entropy window. Outputs are byte-identical
+  across input strategies. Numeric requests also prove that association policy does not affect data.
+- Native scalar output for every declaration in `gray` and `vardct_resampled`, codestream orientation,
+  whole/bounded equality, depth masks and rounding within one integer code of libjxl's composed F32.
+- Preserve/Associated/Unassociated planar linear BGRA output for Gray and VarDCT multi-alpha
+  composition, compared with libjxl's coalesced original encoding followed by analytic transfer and
+  requested association. Near-zero-alpha comparisons undo the output division before evaluating
+  reconstruction error.
+- Repeated initial memory pressure, dependent prefetch, and cancellation with caller-held previous
+  scalar output for Modular, distributed VarDCT and resampled Modular. Every hidden plane/reference
+  reservation disappears after submitted work completes; only the caller's output lease remains.
+
+The optional libjxl C oracle runs with preserved alpha and checks every presentation and plane;
+its source code remains test-only. Relative error is `abs(actual-reference) / max(1,abs(reference))`:
+less than `8e-6` for Modular color, `3e-3` for VarDCT color and `4e-6` for extras. Analytic linear
+output uses `2e-5` for Modular and `3e-3` for VarDCT. Rust `jxl` 0.6 independently checks all unshifted
+initial Replace presentations. It is not the numeric authority for the subsequent reference chain:
+its known clamped-Multiply operand reversal yields `1` where libjxl/GPU preserve `1.8245761` in the
+RGB fixture. Its dimension-shift defect also excludes the two resampled files. When libjxl is
+unavailable, those numeric checks are skipped; this checkpoint ran with libjxl installed.
+
+Two CPU layout tests prove aligned, nonoverlapping real-offset views and reject a total all-plane
+allocation that exceeds the device limit even when RGB alone fits. Compile-time ABI checks cover
+128-byte blend geometry, 32-byte per-channel metadata and 64-byte native/scalar output parameters,
+including alignment and field offsets. Actual GPU execution validates the corresponding WGSL.
+Floating sample declarations, pre-transform patch references, general original color domains and
+broader resampling/metadata cross-products remain separate roadmap gates.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `composition_extras_data.jxl.hex` | 11336 | `cb12ce6bdd36d36b3d0d0fb58852fa58f093e8578078f7a131b9acc7c1079520` |
+| `composition_extras_distributed.jxl.hex` | 1128801 | `54c4e2ecde9b0f9ab9991514919fc5d4bd6de4710553433084f262a04be9f529` |
+| `composition_extras_gray.jxl.hex` | 31315 | `b6f1d09a7b0e9960123436c4b714629473525ff44a242e344663fc29b7a0a3db` |
+| `composition_extras_resampled.jxl.hex` | 26973 | `25ef2e245bcdb37e8c84ede27747f182fa14ff1110c41b270fbfec43d3a1b882` |
+| `composition_extras_rgb.jxl.hex` | 234974 | `12b6d8721b0237ecabdea5e5541da464e97bdc30c229844695ed77c0ad8ade2f` |
+| `composition_extras_vardct.jxl.hex` | 187027 | `1f000437952cbe26e98cea30324806b31e2c4af2e6810f191566836d452db449` |
+| `composition_extras_vardct_resampled.jxl.hex` | 12625 | `71ad39384633bc38327aca77fd004cb6f3d91bc47b7d0aacbf23855d7c7c09e8` |
+
+Validation on 2026-09-08 Apple M5/Metal covers all 24 workspace test targets: 692 distinct tests
+pass, with one existing manual benchmark ignored. This combines the serial all-target/all-feature
+workspace run, the corrected obsolete rejection test, and the remaining encoder suite. The updated
+selection contract test verifies six composed scalar presentations and a typed out-of-range index
+error, then passes with all features enabled. No runtime implementation change was needed for that
+expectation update. Formatting, all-target/all-feature checks, warning-free Clippy/rustdoc,
+Rust 1.89 and six-crate WASM compilation pass. Reference and Metal harnesses each pass 18 cases;
+indexed Gray8 U8 CPU readback passes. Regenerating all seven fixtures with the checked-in C source
+produces byte-identical codestreams and matching lengths/SHA-256 values.

@@ -36,7 +36,11 @@ fn stills() -> Vec<(&'static str, &'static str)> {
     .collect()
 }
 
-fn floating_request(policy: AlphaOutputPolicy, linear: bool, keep: bool) -> GpuOutputRequest {
+pub(super) fn floating_request(
+    policy: AlphaOutputPolicy,
+    linear: bool,
+    keep: bool,
+) -> GpuOutputRequest {
     let mut color = vardct_rgb8_format().color_spec;
     if linear {
         let jxl_gpu_formats::ColorSpecification::Defined(ref mut spec) = color else {
@@ -63,7 +67,7 @@ fn floating_request(policy: AlphaOutputPolicy, linear: bool, keep: bool) -> GpuO
     .with_spot_color_policy(SpotColorPolicy::Preserve)
 }
 
-fn decode(
+pub(super) fn decode(
     backend: &WgpuBackend,
     data: &[u8],
     request: GpuOutputRequest,
@@ -113,7 +117,7 @@ fn decode(
     frames
 }
 
-fn unpack(layout: &ImageLayout, bytes: &[u8], planar: bool) -> Vec<f32> {
+pub(super) fn unpack(layout: &ImageLayout, bytes: &[u8], planar: bool) -> Vec<f32> {
     let width = layout.extent.width as usize;
     (0..layout.extent.area().unwrap())
         .flat_map(|pixel| {
@@ -130,7 +134,7 @@ fn unpack(layout: &ImageLayout, bytes: &[u8], planar: bool) -> Vec<f32> {
         .collect()
 }
 
-fn associate(values: &mut [f32], policy: AlphaOutputPolicy, source_associated: bool) {
+pub(super) fn associate(values: &mut [f32], policy: AlphaOutputPolicy, source_associated: bool) {
     for pixel in values.chunks_exact_mut(4) {
         let alpha = pixel[3].max(1.0 / 67108864.0);
         let factor = match (policy, source_associated) {
@@ -144,7 +148,7 @@ fn associate(values: &mut [f32], policy: AlphaOutputPolicy, source_associated: b
     }
 }
 
-fn linearize(values: &mut [f32]) {
+pub(super) fn linearize(values: &mut [f32]) {
     for pixel in values.chunks_exact_mut(4) {
         for value in &mut pixel[..3] {
             let magnitude = value.abs();

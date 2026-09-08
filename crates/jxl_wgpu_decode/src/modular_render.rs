@@ -70,7 +70,7 @@ impl ModularRenderPlan {
             || extent.width > i32::MAX as u32 / 2
             || extent.height > i32::MAX as u32 / 2
             || sources.is_empty()
-            || sources.len() > 4
+            || u32::try_from(sources.len()).is_err()
             || sources.len() != factors.len()
         {
             return invalid("extent or selected channel count");
@@ -188,7 +188,7 @@ impl ModularRenderPlan {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         };

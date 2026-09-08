@@ -1,65 +1,41 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
 
 use bytemuck::{Pod, Zeroable};
-use jxl_gpu_bitstream::FrameInventory;
+use jxl_gpu_bitstream::{
+    ExtraChannelInventory, ExtraChannelTypeInventory, FrameInventory, SampleBitDepth,
+};
 use jxl_gpu_formats::ImageLayout;
 use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding};
 use jxl_wgpu::{
     GpuBufferLease, GpuImageOutput, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
-    ImageOutputParams, ImageOutputSource, MemoryPermit, WgpuBackend,
+    ImageOutputParams, ImageOutputSource, WgpuBackend,
 };
-use wgpu::util::DeviceExt;
 
+use super::blend::{BlendParams, blend_channels, intersection};
+use super::submission::{GpuWork, Submission, submit, validate_size};
+use crate::frame_surface::FrameSurfaceLayout;
 use crate::{Error, GpuOutputRequest, Result};
 
-/// The composition boundary is tightly packed, unrounded, unrotated, original-encoding RGBA.
-/// The fourth component is virtual opaque alpha when the codestream has no alpha channel.
+/// Unrounded original-encoding RGB followed by independently normalized extra planes.
 #[derive(Clone, Debug)]
 pub(super) struct Surface {
     pub(super) buffer: GpuBufferLease,
     pub(super) extent: Extent2d,
+    plane_words: u32,
 }
 
-impl Surface {
-    pub(super) fn from_output(
-        output: GpuImageOutput,
-        working_format: &jxl_gpu_formats::PixelFormat,
-    ) -> Result<Self> {
-        let expected = ImageLayout::packed(output.layout.extent, working_format.clone())?;
-        if output.layout != expected || output.buffer.size() < expected.logical_size {
-            return Err(Error::EngineContract(
-                "frame producer returned an invalid F32 composition surface",
-            ));
-        }
-        Ok(Self {
-            buffer: output.buffer,
-            extent: output.layout.extent,
-        })
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct BlendParams {
-    canvas: [u32; 4],
-    intersection: [u32; 4],
-    source: [u32; 4],
-    blend: [u32; 4],
-    flags: [u32; 4],
-}
-
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct NativeParams {
     extent: [u32; 4],
     format: [u32; 4],
     output: [u32; 4],
+    source: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<BlendParams>() == 80);
-const _: () = assert!(std::mem::size_of::<NativeParams>() == 48);
+const _: () = assert!(std::mem::size_of::<NativeParams>() == 64);
+const _: () = assert!(std::mem::align_of::<NativeParams>() == 16);
+const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 48);
 
 #[derive(Debug)]
 enum Packing {
@@ -71,7 +47,8 @@ enum Packing {
 pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
-    alpha_associated: Option<bool>,
+    extras: Vec<ExtraChannelInventory>,
+    surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
     pack: wgpu::ComputePipeline,
     packing: Packing,
@@ -84,7 +61,7 @@ impl Compositor {
     pub(super) fn new(
         backend: WgpuBackend,
         canvas: Extent2d,
-        alpha_associated: Option<bool>,
+        extras: &[ExtraChannelInventory],
         grayscale: bool,
         orientation: OutputOrientation,
         request: &GpuOutputRequest,
@@ -92,24 +69,117 @@ impl Compositor {
         let orientation = request.orientation_policy().resolve(orientation);
         let layout = ImageLayout::packed(orientation.map_extent(canvas), request.format().clone())?;
         let device = backend.device();
-        validate_size(device, surface_bytes(canvas)?)?;
+        let surface = FrameSurfaceLayout::new(canvas, extras.len(), &device.limits())?;
         let output_size = aligned(layout.logical_size)?;
         validate_size(device, output_size)?;
-        let blend_dispatch = dispatch(device, u64::from(canvas.width) * u64::from(canvas.height))?;
+        let bindings = device.limits().max_storage_buffers_per_shader_stage;
+        if bindings < 7 {
+            return Err(Error::CompositionResourceLimit {
+                resource: "storage bindings",
+                requested: 7,
+                limit: u64::from(bindings),
+            });
+        }
+        for (resource, required, available) in [
+            (
+                "workgroup invocations",
+                64,
+                device.limits().max_compute_invocations_per_workgroup,
+            ),
+            (
+                "workgroup X size",
+                64,
+                device.limits().max_compute_workgroup_size_x,
+            ),
+            (
+                "bind group entries",
+                8,
+                device.limits().max_bindings_per_bind_group,
+            ),
+            (
+                "uniform bindings",
+                1,
+                device.limits().max_uniform_buffers_per_shader_stage,
+            ),
+        ] {
+            if available < required {
+                return Err(Error::CompositionResourceLimit {
+                    resource,
+                    requested: u64::from(required),
+                    limit: u64::from(available),
+                });
+            }
+        }
+        let blend_dispatch = dispatch(
+            device,
+            u64::from(canvas.width) * u64::from(canvas.height) * (3 + extras.len() as u64),
+        )?;
         let output_dispatch = dispatch(device, output_size / 4)?;
-        let alpha_conversion = if request.mapping() == crate::GpuOutputMapping::Color {
-            request.alpha_output_policy().conversion(alpha_associated)
-        } else {
-            jxl_wgpu::AlphaConversion::Preserve
-        };
-        let (packing, source) = if let Some(native) =
-            crate::model::native_modular_format(request.format())
+        let first_alpha = extras.iter().enumerate().find_map(|(index, extra)| {
+            if let ExtraChannelTypeInventory::Alpha { associated } = extra.channel_type {
+                Some((index, associated))
+            } else {
+                None
+            }
+        });
+        let alpha_channel = first_alpha.map_or(u32::MAX, |(index, _)| 3 + index as u32);
+        let alpha_conversion = request.alpha_conversion(extras);
+        let selected = request
+            .extra_channel()
+            .map(|index| {
+                extras
+                    .get(index as usize)
+                    .ok_or(Error::ExtraChannelIndex {
+                        index,
+                        count: extras.len() as u32,
+                    })
+                    .map(|extra| (3 + index, extra))
+            })
+            .transpose()?;
+        if request.mapping() == crate::GpuOutputMapping::Color
+            && extras.iter().any(|extra| {
+                extra.channel_type == ExtraChannelTypeInventory::NonOptional
+                    || (request.spot_color_policy() == crate::SpotColorPolicy::Render
+                        && matches!(
+                            extra.channel_type,
+                            ExtraChannelTypeInventory::SpotColour { .. }
+                        ))
+            })
         {
-            if native.channels == crate::ModularChannels::Gray && !grayscale {
+            return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
+                "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
+        }
+        let native = crate::model::native_modular_format(request.format());
+        let scalar_float = matches!(
+            request.mapping(),
+            crate::GpuOutputMapping::Numeric(crate::NumericSampleMapping::NormalizedUnsigned)
+        ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
+        let (packing, source) = if native.is_some() || scalar_float {
+            if selected.is_none()
+                && (scalar_float
+                    || native.is_some_and(|n| n.channels == crate::ModularChannels::Gray))
+                && !grayscale
+            {
+                return Err(Error::UnsupportedOutputFormat("numeric grayscale composition requires a grayscale codestream or selected extra channel".into()));
+            }
+            if let (Some(native), Some((_, extra))) = (native, selected)
+                && (native.channels != crate::ModularChannels::Gray
+                    || extra.bit_depth
+                        != (SampleBitDepth::Integer {
+                            bits_per_sample: u32::from(native.bits_per_sample),
+                        }))
+            {
                 return Err(Error::UnsupportedOutputFormat(
-                    "numeric grayscale composition requires a grayscale codestream".into(),
+                    "native composed extra output must match its declared unsigned depth".into(),
                 ));
             }
+            let (channels, bits, sample_bytes) = native.map_or((1, 32, 4), |native| {
+                (
+                    native.channels.count(),
+                    u32::from(native.bits_per_sample),
+                    u32::from(native.storage_bits) / 8,
+                )
+            });
             (
                 Packing::Native(NativeParams {
                     extent: [
@@ -119,9 +189,9 @@ impl Compositor {
                         canvas.height,
                     ],
                     format: [
-                        native.channels.count(),
-                        u32::from(native.bits_per_sample),
-                        u32::from(native.storage_bits) / 8,
+                        channels,
+                        bits,
+                        sample_bytes,
                         u32::try_from(layout.planes[0].row_stride).map_err(|_| address_error())?,
                     ],
                     output: [
@@ -129,6 +199,12 @@ impl Compositor {
                         output_dispatch[0] * 64,
                         orientation.to_exif_value() - 1,
                         alpha_conversion as u32,
+                    ],
+                    source: [
+                        (surface.plane_bytes / 4) as u32,
+                        alpha_channel,
+                        selected.map_or(0, |(index, _)| index),
+                        u32::from(scalar_float),
                     ],
                 }),
                 format!(
@@ -138,6 +214,9 @@ impl Compositor {
                 ),
             )
         } else {
+            if request.mapping() != crate::GpuOutputMapping::Color {
+                return Err(Error::UnsupportedOutputFormat("composed numeric samples require matching native unsigned or scalar normalized F32 output".into()));
+            }
             (
                 Packing::Color(Box::new(
                     ImageOutputParams::new(
@@ -145,7 +224,7 @@ impl Compositor {
                         ImageOutputSource {
                             extent: canvas,
                             orientation,
-                            strides: [canvas.width * 4; 3],
+                            strides: [canvas.width; 3],
                             encoding: RgbColorEncoding::SRGB_BT709,
                         },
                         output_dispatch[0] * 64,
@@ -159,18 +238,24 @@ impl Compositor {
             device,
             "JPEG XL frame composition",
             include_str!("blend.wgsl"),
-            false,
+            &[],
         );
-        let pack = pipeline(
-            device,
-            "JPEG XL composed frame output",
-            &source,
-            matches!(packing, Packing::Color(_)),
-        );
+        let constants = if matches!(packing, Packing::Color(_)) {
+            vec![
+                ("wg_x", 64.0),
+                ("wg_y", 1.0),
+                ("surface_plane_words", (surface.plane_bytes / 4) as f64),
+                ("surface_alpha_channel", f64::from(alpha_channel)),
+            ]
+        } else {
+            Vec::new()
+        };
+        let pack = pipeline(device, "JPEG XL composed frame output", &source, &constants);
         Ok(Self {
             backend,
             canvas,
-            alpha_associated,
+            extras: extras.to_vec(),
+            surface,
             blend,
             pack,
             packing,
@@ -180,15 +265,50 @@ impl Compositor {
         })
     }
 
+    pub(super) fn import(&self, mut outputs: Vec<GpuImageOutput>) -> Result<Surface> {
+        let first = outputs.first().ok_or(Error::EngineContract(
+            "physical producer returned no surface",
+        ))?;
+        let extent = first.layout.extent;
+        let expected =
+            FrameSurfaceLayout::new(extent, self.extras.len(), &self.backend.device().limits())?;
+        if outputs.len() != 1 + self.extras.len()
+            || outputs.iter().zip(expected.layouts()).enumerate().any(
+                |(index, (output, layout))| {
+                    output.id != jxl_gpu_protocol::OutputId(index as u32)
+                        || &output.layout != layout
+                        || output.buffer.size() < expected.storage_bytes
+                        || output.buffer.as_wgpu_buffer() != first.buffer.as_wgpu_buffer()
+                },
+            )
+        {
+            return Err(Error::EngineContract(
+                "physical producer returned an invalid all-channel frame surface",
+            ));
+        }
+        Ok(Surface {
+            buffer: outputs.remove(0).buffer,
+            extent,
+            plane_words: (expected.plane_bytes / 4) as u32,
+        })
+    }
+
+    pub(super) fn completed_surface(&self, buffer: GpuBufferLease) -> Surface {
+        Surface {
+            buffer,
+            extent: self.canvas,
+            plane_words: (self.surface.plane_bytes / 4) as u32,
+        }
+    }
+
     pub(super) fn blend(
         &self,
         foreground: &Surface,
-        color: Option<&Surface>,
-        alpha: Option<&Surface>,
+        references: &[Option<Surface>; 4],
         frame: &FrameInventory,
     ) -> Result<GpuWork> {
         if foreground.extent != Extent2d::new(frame.width, frame.height)
-            || [color, alpha].into_iter().flatten().any(|base| {
+            || references.iter().flatten().any(|base| {
                 base.extent.width < self.canvas.width || base.extent.height < self.canvas.height
             })
         {
@@ -196,199 +316,82 @@ impl Compositor {
                 "composition surface geometry disagrees with the frame plan",
             ));
         }
+        let channels = blend_channels(frame, &self.extras)?;
         let (intersection, origin) = intersection(self.canvas, frame);
-        let ec = frame
-            .extra_channel_blends
-            .first()
-            .copied()
-            .unwrap_or_default();
         let params = BlendParams {
             canvas: [
                 self.canvas.width,
                 self.canvas.height,
-                foreground.extent.width,
-                self.blend_dispatch[0] * 64,
+                (self.surface.plane_bytes / 4) as u32,
+                3 + self.extras.len() as u32,
             ],
             intersection,
             source: [
                 origin[0],
                 origin[1],
-                color.map_or(0, |s| s.extent.width),
-                alpha.map_or(0, |s| s.extent.width),
+                foreground.extent.width,
+                foreground.plane_words,
             ],
-            blend: [
-                frame.color_blend.mode as u32,
-                ec.mode as u32,
-                u32::from(frame.color_blend.clamp),
-                u32::from(ec.clamp),
-            ],
-            flags: [
-                u32::from(self.alpha_associated.is_some()),
-                u32::from(color.is_some()),
-                u32::from(alpha.is_some()),
-                u32::from(self.alpha_associated == Some(true)),
-            ],
+            dispatch: [self.blend_dispatch[0] * 64, 0, 0, 0],
+            references: std::array::from_fn(|index| {
+                references[index].as_ref().map_or([0; 4], |surface| {
+                    [
+                        surface.extent.width,
+                        surface.extent.height,
+                        surface.plane_words,
+                        1,
+                    ]
+                })
+            }),
         };
-        let size = surface_bytes(self.canvas)?;
-        self.submit(
-            &self.blend,
-            bytemuck::bytes_of(&params),
-            &[
-                (0, &foreground.buffer),
-                (1, &color.unwrap_or(foreground).buffer),
-                (2, &alpha.unwrap_or(foreground).buffer),
-            ],
-            3,
-            4,
-            size,
-            self.blend_dispatch,
+        let inputs: Vec<_> = std::iter::once((0, &foreground.buffer))
+            .chain(references.iter().enumerate().map(|(index, reference)| {
+                (
+                    (index + 1) as u32,
+                    &reference.as_ref().unwrap_or(foreground).buffer,
+                )
+            }))
+            .collect();
+        submit(
+            &self.backend,
+            Submission {
+                pipeline: &self.blend,
+                params: bytemuck::bytes_of(&params),
+                inputs: &inputs,
+                metadata: Some((6, bytemuck::cast_slice(&channels))),
+                output_binding: 5,
+                uniform_binding: 7,
+                size: self.surface.storage_bytes,
+                dispatch: self.blend_dispatch,
+            },
         )
     }
 
     pub(super) fn pack(&self, source: &Surface) -> Result<GpuWork> {
-        if source.extent != self.canvas {
+        if source.extent != self.canvas
+            || source.plane_words != (self.surface.plane_bytes / 4) as u32
+        {
             return Err(Error::EngineContract(
-                "presentation canvas has the wrong extent",
+                "presentation canvas has the wrong extent or plane stride",
             ));
         }
         let (params, output_binding, uniform_binding): (&[u8], _, _) = match &self.packing {
             Packing::Color(params) => (bytemuck::bytes_of(params.as_ref()), 3, 4),
             Packing::Native(params) => (bytemuck::bytes_of(params), 1, 2),
         };
-        self.submit(
-            &self.pack,
-            params,
-            &[(0, &source.buffer)],
-            output_binding,
-            uniform_binding,
-            aligned(self.layout.logical_size)?,
-            self.output_dispatch,
+        submit(
+            &self.backend,
+            Submission {
+                pipeline: &self.pack,
+                params,
+                inputs: &[(0, &source.buffer)],
+                metadata: None,
+                output_binding,
+                uniform_binding,
+                size: aligned(self.layout.logical_size)?,
+                dispatch: self.output_dispatch,
+            },
         )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn submit(
-        &self,
-        pipeline: &wgpu::ComputePipeline,
-        params: &[u8],
-        inputs: &[(u32, &GpuBufferLease)],
-        output_binding: u32,
-        uniform_binding: u32,
-        size: u64,
-        dispatch: [u32; 2],
-    ) -> Result<GpuWork> {
-        let device = self.backend.device();
-        let memory = self.backend.transient_memory_budget();
-        let poll = self.backend.submission_poller().try_reserve()?;
-        let output_permit = memory.try_reserve(size)?;
-        let uniform_permit = memory.try_reserve(params.len() as u64 + completion_fence_bytes())?;
-        let guards = inputs
-            .iter()
-            .map(|(_, lease)| lease.try_acquire_gpu_submission())
-            .collect::<jxl_wgpu::Result<Vec<_>>>()?;
-        let output = GpuBufferLease::from_tracked(
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("JPEG XL composed frame"),
-                size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            output_permit,
-        );
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("JPEG XL composition parameters"),
-            contents: params,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let mut entries = inputs
-            .iter()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: buffer.as_wgpu_buffer().as_entire_binding(),
-            })
-            .collect::<Vec<_>>();
-        entries.push(wgpu::BindGroupEntry {
-            binding: output_binding,
-            resource: output.as_wgpu_buffer().as_entire_binding(),
-        });
-        entries.push(wgpu::BindGroupEntry {
-            binding: uniform_binding,
-            resource: uniform.as_entire_binding(),
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JPEG XL composition bindings"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("JPEG XL frame composition"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("JPEG XL frame composition"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(dispatch[0], dispatch[1], 1);
-        }
-        let completion = Arc::new(Completion::default());
-        // wgpu work-done callbacks require Send even on WebGPU. A tiny mapped completion fence
-        // uses the browser-local map callback instead, retaining the non-Send WebGPU handles.
-        // Its contents are never read; no image samples cross the CPU boundary.
-        #[cfg(target_arch = "wasm32")]
-        let completion_fence = {
-            let fence = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("JPEG XL composition completion fence"),
-                size: completion_fence_bytes(),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            encoder.clear_buffer(&fence, 0, None);
-            fence
-        };
-        let lifetime = Arc::new(WorkLifetime {
-            _buffers: inputs
-                .iter()
-                .map(|(_, b)| (*b).clone())
-                .chain([output.clone()])
-                .collect(),
-            _uniform: uniform,
-            _permit: uniform_permit,
-            #[cfg(target_arch = "wasm32")]
-            completion_fence,
-        });
-        let done = Arc::clone(&completion);
-        let retained = Arc::clone(&lifetime);
-        #[cfg(not(target_arch = "wasm32"))]
-        encoder.on_submitted_work_done(move || {
-            drop(retained);
-            done.complete(Ok(()));
-        });
-        let submission = self.backend.queue().submit([encoder.finish()]);
-        drop(guards);
-        #[cfg(target_arch = "wasm32")]
-        lifetime
-            .completion_fence
-            .map_async(wgpu::MapMode::Read, .., move |result| {
-                if result.is_ok() {
-                    retained.completion_fence.unmap();
-                }
-                drop(retained);
-                done.complete(result.map_err(|error| error.to_string()));
-            });
-        let failed = Arc::clone(&completion);
-        poll.register(submission, move |error| {
-            #[cfg(not(target_arch = "wasm32"))]
-            drop(lifetime);
-            failed.complete(Err(error));
-        })?;
-        Ok(GpuWork {
-            output: Some(output),
-            completion,
-        })
     }
 }
 
@@ -396,7 +399,7 @@ fn pipeline(
     device: &wgpu::Device,
     label: &str,
     source: &str,
-    color: bool,
+    constants: &[(&str, f64)],
 ) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -408,11 +411,7 @@ fn pipeline(
         module: &module,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions {
-            constants: if color {
-                &[("wg_x", 64.0), ("wg_y", 1.0)]
-            } else {
-                &[]
-            },
+            constants,
             ..Default::default()
         },
         cache: None,
@@ -427,37 +426,10 @@ fn address_error() -> Error {
     }
 }
 
-fn surface_bytes(extent: Extent2d) -> Result<u64> {
-    u64::from(extent.width)
-        .checked_mul(u64::from(extent.height))
-        .and_then(|pixels| pixels.checked_mul(16))
-        .ok_or_else(address_error)
-}
-
 fn aligned(size: u64) -> Result<u64> {
     size.checked_add(3)
         .map(|n| n & !3)
         .ok_or_else(address_error)
-}
-
-fn validate_size(device: &wgpu::Device, size: u64) -> Result<()> {
-    let limits = device.limits();
-    let limit = u64::from(u32::MAX - 3)
-        .min(limits.max_buffer_size)
-        .min(limits.max_storage_buffer_binding_size);
-    if size == 0 {
-        return Err(Error::EngineContract(
-            "composition requires a nonempty surface",
-        ));
-    }
-    if size > limit {
-        return Err(Error::CompositionResourceLimit {
-            resource: "buffer bytes",
-            requested: size,
-            limit,
-        });
-    }
-    Ok(())
 }
 
 fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
@@ -477,113 +449,4 @@ fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
         });
     }
     Ok([x as u32, y as u32])
-}
-
-fn intersection(canvas: Extent2d, frame: &FrameInventory) -> ([u32; 4], [u32; 2]) {
-    fn axis(limit: u32, origin: i32, size: u32) -> (u32, u32, u32) {
-        let start = i64::from(origin).clamp(0, i64::from(limit));
-        let end = (i64::from(origin) + i64::from(size)).clamp(start, i64::from(limit));
-        let width = (end - start) as u32;
-        let source = if width == 0 {
-            0
-        } else {
-            (start - i64::from(origin)) as u32
-        };
-        (start as u32, width, source)
-    }
-    let (x, width, sx) = axis(canvas.width, frame.x0, frame.width);
-    let (y, height, sy) = axis(canvas.height, frame.y0, frame.height);
-    ([x, y, width, height], [sx, sy])
-}
-
-struct WorkLifetime {
-    _buffers: Vec<GpuBufferLease>,
-    _uniform: wgpu::Buffer,
-    _permit: MemoryPermit,
-    #[cfg(target_arch = "wasm32")]
-    completion_fence: wgpu::Buffer,
-}
-
-const fn completion_fence_bytes() -> u64 {
-    if cfg!(target_arch = "wasm32") { 4 } else { 0 }
-}
-
-#[derive(Debug, Default)]
-struct Completion {
-    state: Mutex<CompletionState>,
-    condition: Condvar,
-}
-#[derive(Debug, Default)]
-struct CompletionState {
-    result: Option<std::result::Result<(), String>>,
-    waker: Option<Waker>,
-}
-
-impl Completion {
-    fn complete(&self, result: std::result::Result<(), String>) {
-        let waker = {
-            let mut state = super::lock(&self.state);
-            if state.result.is_some() {
-                return;
-            }
-            state.result = Some(result);
-            state.waker.take()
-        };
-        self.condition.notify_all();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-    fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
-        let mut state = super::lock(&self.state);
-        if let Some(result) = state.result.as_ref() {
-            return Poll::Ready(result.clone().map_err(Error::backend));
-        }
-        state.waker = Some(context.waker().clone());
-        Poll::Pending
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn wait(&self) -> Result<()> {
-        let mut state = super::lock(&self.state);
-        while state.result.is_none() {
-            state = self
-                .condition
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        state
-            .result
-            .as_ref()
-            .expect("completion signalled")
-            .clone()
-            .map_err(Error::backend)
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct GpuWork {
-    output: Option<GpuBufferLease>,
-    completion: Arc<Completion>,
-}
-impl GpuWork {
-    pub(super) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<GpuBufferLease>> {
-        self.completion.poll(context).map(|result| {
-            result?;
-            self.output.take().ok_or(Error::EngineContract(
-                "composition completion consumed twice",
-            ))
-        })
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn wait(mut self) -> Result<GpuBufferLease> {
-        self.completion.wait()?;
-        self.output.take().ok_or(Error::EngineContract(
-            "composition completion consumed twice",
-        ))
-    }
-    pub(super) fn unvalidated(&self) -> Result<GpuBufferLease> {
-        self.output.clone().ok_or(Error::EngineContract(
-            "composition completion consumed twice",
-        ))
-    }
 }

@@ -312,6 +312,7 @@ impl WgpuSubmissionEngine {
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let output_channels = super::channels::OutputChannels::negotiate(&profile, request)?;
         profile.generalized_channels |= !output_channels.direct(&profile)
+            || request.retains_frame_surface()
             || request.extra_channel().is_some()
             || matches!(
                 request.mapping(),
@@ -433,6 +434,15 @@ impl WgpuSubmissionEngine {
             self.capabilities(),
         )?;
         output.source_channels = output_channels;
+        if request.retains_frame_surface() {
+            let surface = crate::frame_surface::FrameSurfaceLayout::new(
+                extent,
+                profile.extra_channels.len(),
+                &self.backend.device().limits(),
+            )?;
+            output.layout = surface.color.clone();
+            output.surface = Some(Arc::new(surface));
+        }
         let factors: Vec<_> = output
             .source_channels
             .indices
@@ -523,7 +533,8 @@ impl WgpuSubmissionEngine {
                 )
             })
             .transpose()?;
-        let finalize_params: Arc<[ModularFinalizeParams]> = if profile.progressive_dc.is_some() {
+        let finalize_params: Arc<[Vec<ModularFinalizeParams>]> = if profile.progressive_dc.is_some()
+        {
             Arc::from([])
         } else if let Some(frame_plan) = &profile.resident_frame_plan {
             vec![modular_frame_finalize_params(

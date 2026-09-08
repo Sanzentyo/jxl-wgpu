@@ -88,6 +88,8 @@ pub enum VarDctDecodeError {
     ScalarOutput(#[from] crate::ModularScalarOutputError),
     #[error(transparent)]
     ModularRender(#[from] crate::ModularRenderError),
+    #[error(transparent)]
+    FrameSurface(#[from] crate::FrameSurfaceError),
     #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]
     InvalidOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]

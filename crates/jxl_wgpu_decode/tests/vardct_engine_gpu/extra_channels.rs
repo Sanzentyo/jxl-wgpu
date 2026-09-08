@@ -5,6 +5,8 @@ use jxl_wgpu_decode::{OrientationPolicy, SpotColorPolicy};
 
 #[path = "extra_channels/associated.rs"]
 mod associated;
+#[path = "extra_channels/composition.rs"]
+mod composition;
 #[path = "extra_channels/distributed.rs"]
 mod distributed;
 #[path = "../common/extra_channel_oracle.rs"]

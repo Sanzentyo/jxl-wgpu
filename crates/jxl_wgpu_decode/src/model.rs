@@ -350,6 +350,7 @@ pub struct GpuOutputRequest {
     extra_channel: Option<u32>,
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
+    frame_surface: bool,
 }
 
 /// Association of the first alpha channel and color output. Numeric requests, including selected
@@ -479,6 +480,7 @@ impl GpuOutputRequest {
             extra_channel: None,
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
+            frame_surface: false,
         }
     }
 
@@ -495,6 +497,18 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn alpha_output_policy(&self) -> AlphaOutputPolicy {
         self.alpha
+    }
+
+    pub(crate) fn for_frame_surface(mut self) -> Self {
+        self.frame_surface = true;
+        self.alpha = AlphaOutputPolicy::Preserve;
+        self.spot_colors = SpotColorPolicy::Preserve;
+        self.orientation = OrientationPolicy::Keep;
+        self
+    }
+
+    pub(crate) const fn retains_frame_surface(&self) -> bool {
+        self.frame_surface
     }
 
     #[must_use]

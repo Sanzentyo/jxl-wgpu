@@ -241,15 +241,17 @@ impl VarDctSubmissionEngine {
         inventory: &CodestreamInventory,
         role: crate::vardct_frontend::VarDctFrameRole,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        if inventory.image_header.extra_channels.iter().any(|extra| {
-            extra.channel_type == ExtraChannelTypeInventory::NonOptional
-                || (request.mapping() == GpuOutputMapping::Color
-                    && request.spot_color_policy() == SpotColorPolicy::Render
-                    && matches!(
-                        extra.channel_type,
-                        ExtraChannelTypeInventory::SpotColour { .. }
-                    ))
-        }) {
+        if !request.retains_frame_surface()
+            && inventory.image_header.extra_channels.iter().any(|extra| {
+                extra.channel_type == ExtraChannelTypeInventory::NonOptional
+                    || (request.mapping() == GpuOutputMapping::Color
+                        && request.spot_color_policy() == SpotColorPolicy::Render
+                        && matches!(
+                            extra.channel_type,
+                            ExtraChannelTypeInventory::SpotColour { .. }
+                        ))
+            })
+        {
             return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
                 "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
         }

@@ -318,10 +318,22 @@ fn extra_channel_selection_validates_indices_and_preserves_retry_and_cancellatio
     let composed = encoded(include_str!(
         "../../test-data/composition_gray_alpha.jxl.hex"
     ));
-    assert!(
-        matches!(decoder.open(&composed, scalar().with_extra_channel(0).unwrap()),
-        Err(Error::UnsupportedProfile(ref e)) if e.feature == UnsupportedCodestreamFeature::ExtraChannels)
-    );
+    {
+        let mut session = decoder
+            .open(&composed, scalar().with_extra_channel(0).unwrap())
+            .unwrap();
+        let mut frames = 0;
+        while let Some(frame) = session.next_frame().unwrap() {
+            assert_eq!(frame.output().outputs.len(), 1);
+            assert_eq!(frame.output().outputs[0].layout.format, *scalar().format());
+            frames += 1;
+        }
+        assert_eq!(frames, 6);
+    }
+    assert!(matches!(
+        decoder.open(&composed, scalar().with_extra_channel(1).unwrap()),
+        Err(Error::ExtraChannelIndex { index: 1, count: 1 })
+    ));
     let color = GpuOutputRequest::color(PixelFormat::rgb_f32(
         RgbChannelOrder::Rgba,
         false,

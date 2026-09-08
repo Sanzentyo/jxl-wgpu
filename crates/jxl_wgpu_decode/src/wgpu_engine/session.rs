@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{ChangedRegions, OutputId, Region, SubmissionToken};
+use jxl_gpu_protocol::SubmissionToken;
 use jxl_wgpu::{
-    GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryBudgetSnapshot, UnvalidatedGpuImageFrame,
-    UnvalidatedGpuImageOutput, WgpuBackend,
+    GpuImageFrame, MemoryBudget, MemoryBudgetSnapshot, UnvalidatedGpuImageFrame, WgpuBackend,
 };
 
 use crate::buffer_pool::DecodeBufferPool;
@@ -120,6 +118,7 @@ pub struct WgpuPendingFrame {
     pub(super) lifetime: Option<Arc<DecodeJobLifetime>>,
     pub(super) token: SubmissionToken,
     pub(super) layout: ImageLayout,
+    pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     pub(super) completion: Arc<MapCompletion>,
     pub(super) stream_sample_counts: Arc<[u32]>,
     pub(super) status_stride: u64,
@@ -163,11 +162,11 @@ impl WgpuPendingFrame {
         ))?;
         Ok(UnvalidatedGpuImageFrame {
             token: self.token,
-            outputs: vec![UnvalidatedGpuImageOutput {
-                id: OutputId(0),
-                layout: self.layout.clone(),
-                buffer: lifetime.output.clone(),
-            }],
+            outputs: crate::frame_surface::unvalidated_outputs(
+                &self.layout,
+                self.surface.as_deref(),
+                &lifetime.output,
+            ),
         })
     }
 
@@ -227,17 +226,6 @@ impl WgpuPendingFrame {
             }
         }
 
-        let output_id = OutputId(0);
-        let mut regions = BTreeMap::new();
-        regions.insert(
-            output_id,
-            vec![Region::new(
-                0,
-                0,
-                self.layout.extent.width,
-                self.layout.extent.height,
-            )],
-        );
         Ok(SubmittedGpuFrame::new(
             FrameMetadata {
                 index: 0,
@@ -250,12 +238,15 @@ impl WgpuPendingFrame {
             },
             GpuImageFrame {
                 token: self.token,
-                outputs: vec![GpuImageOutput {
-                    id: output_id,
-                    layout: self.layout.clone(),
-                    buffer: lifetime.output.clone(),
-                }],
-                changed: ChangedRegions { outputs: regions },
+                outputs: crate::frame_surface::outputs(
+                    &self.layout,
+                    self.surface.as_deref(),
+                    &lifetime.output,
+                ),
+                changed: crate::frame_surface::changed_regions(
+                    &self.layout,
+                    self.surface.as_deref(),
+                ),
             },
         ))
     }

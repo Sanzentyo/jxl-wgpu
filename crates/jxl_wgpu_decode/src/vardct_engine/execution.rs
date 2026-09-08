@@ -1,17 +1,16 @@
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region, SubmissionToken};
+use jxl_gpu_protocol::{Extent2d, SubmissionToken};
 use jxl_wgpu::{
-    GpuBufferLease, GpuImageFrame, GpuImageOutput, MemoryBudget, MemoryPermit, ResidentChromaShift,
+    GpuBufferLease, GpuImageFrame, MemoryBudget, MemoryPermit, ResidentChromaShift,
     ResidentChromaUpsampleInputs, ResidentEpfInputs, ResidentF32Plane, ResidentGaborishInputs,
     ResidentStorageBinding, ResidentUpsampleInputs, ResidentUpsampleWeights, ResidentVarDctInputs,
     ResidentVarDctRenderConfig, ResidentVarDctScratch, SubmissionPollPermit,
-    UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput, WgpuBackend,
+    UnvalidatedGpuImageFrame, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
@@ -584,7 +583,7 @@ struct VarDctJobLifetime {
     _adaptive_lf_uniform: Option<wgpu::Buffer>,
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
-    _extra_plane: Option<super::staging::ResidentModularPlane>,
+    _extra_planes: Vec<super::staging::ResidentModularPlane>,
     extra_frame: Option<GpuBufferLease>,
     _extra_prefix: Option<GpuBufferLease>,
     _extra_uniforms: Vec<wgpu::Buffer>,
@@ -626,6 +625,7 @@ pub struct FramePendingFrame {
     stage: VarDctPendingStage,
     token: SubmissionToken,
     layout: ImageLayout,
+    surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
     expected_hf: Vec<HfValidation>,
@@ -728,11 +728,11 @@ impl FramePendingFrame {
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
         Ok(UnvalidatedGpuImageFrame {
             token: self.token,
-            outputs: vec![UnvalidatedGpuImageOutput {
-                id: OutputId(0),
-                layout: self.layout.clone(),
-                buffer: lifetime.output.clone(),
-            }],
+            outputs: crate::frame_surface::unvalidated_outputs(
+                &self.layout,
+                self.surface.as_deref(),
+                &lifetime.output,
+            ),
         })
     }
 
@@ -2041,17 +2041,6 @@ impl FramePendingFrame {
             .map_err(VarDctDecodeError::from)?;
         }
         drop(mapped);
-        let output_id = OutputId(0);
-        let mut regions = BTreeMap::new();
-        regions.insert(
-            output_id,
-            vec![Region::new(
-                0,
-                0,
-                self.layout.extent.width,
-                self.layout.extent.height,
-            )],
-        );
         Ok(SubmittedGpuFrame::new(
             FrameMetadata {
                 index: 0,
@@ -2064,12 +2053,15 @@ impl FramePendingFrame {
             },
             GpuImageFrame {
                 token: self.token,
-                outputs: vec![GpuImageOutput {
-                    id: output_id,
-                    layout: self.layout.clone(),
-                    buffer: lifetime.output.clone(),
-                }],
-                changed: ChangedRegions { outputs: regions },
+                outputs: crate::frame_surface::outputs(
+                    &self.layout,
+                    self.surface.as_deref(),
+                    &lifetime.output,
+                ),
+                changed: crate::frame_surface::changed_regions(
+                    &self.layout,
+                    self.surface.as_deref(),
+                ),
             },
         ))
     }
@@ -3150,21 +3142,28 @@ fn submit_vardct(
             .extra_render
             .as_ref()
             .map(|plan| {
-                let extra = source.extra_plane.as_ref().ok_or(
+                let extra = source.extra_planes.first().ok_or(
                     VarDctDecodeError::EntropyWindowContract {
                         detail: "resampled output lacks its extra plane",
                     },
                 )?;
                 let buffers = plan.allocate(device)?;
-                let mut plane = extra.plane;
-                plane.bit_depth = extra.bits;
+                let planes = source
+                    .extra_planes
+                    .iter()
+                    .map(|extra| {
+                        let mut plane = extra.plane;
+                        plane.bit_depth = extra.bits;
+                        plane
+                    })
+                    .collect::<Vec<_>>();
                 extra_uniforms.extend(pipelines.modular_render.encode(
                     device,
                     &mut commands,
                     plan,
                     &buffers,
                     resident_binding(extra.arena.as_wgpu_buffer())?,
-                    &[plane],
+                    &planes,
                 )?);
                 Ok::<_, VarDctDecodeError>(buffers)
             })
@@ -3400,7 +3399,9 @@ fn submit_vardct(
                 device,
                 &mut commands,
                 VarDctOutputInputs {
-                    alpha: if let (Some(plan), Some(buffers)) =
+                    alpha: if source.surface.is_some() {
+                        None
+                    } else if let (Some(plan), Some(buffers)) =
                         (&source.extra_render, &rendered_extra)
                     {
                         let plane = plan.planes()[0];
@@ -3415,8 +3416,8 @@ fn submit_vardct(
                         })
                     } else {
                         source
-                            .extra_plane
-                            .as_ref()
+                            .extra_planes
+                            .first()
                             .map(super::staging::ResidentModularPlane::alpha_binding)
                             .transpose()?
                     },
@@ -3468,8 +3469,8 @@ fn submit_vardct(
         VarDctFrameOutput::Extra { index, plan } => {
             let extra =
                 source
-                    .extra_plane
-                    .as_ref()
+                    .extra_planes
+                    .first()
                     .ok_or(VarDctDecodeError::EntropyWindowContract {
                         detail: "scalar output lacks its selected resident extra plane",
                     })?;
@@ -3509,6 +3510,36 @@ fn submit_vardct(
             )
         }
     };
+    if let Some(surface) = &source.surface
+        && !surface.extras.is_empty()
+    {
+        let plan =
+            source
+                .extra_render
+                .as_ref()
+                .ok_or(VarDctDecodeError::EntropyWindowContract {
+                    detail: "frame surface lacks normalized extra planes",
+                })?;
+        let buffers = rendered_extra
+            .as_ref()
+            .ok_or(VarDctDecodeError::EntropyWindowContract {
+                detail: "frame surface lacks normalized extra storage",
+            })?;
+        if plan.planes().len() != surface.extras.len() {
+            return Err(VarDctDecodeError::EntropyWindowContract {
+                detail: "frame surface extra plane count changed",
+            });
+        }
+        for (plane, layout) in plan.planes().iter().zip(&surface.extras) {
+            commands.copy_buffer_to_buffer(
+                &buffers.output,
+                u64::from(plane.word_offset) * 4,
+                &output,
+                layout.planes[0].offset,
+                u64::from(plane.width) * u64::from(plane.height) * 4,
+            );
+        }
+    }
     let packet_status_end = source.memory.packet_status_bytes;
     let artifact_status_end = packet_status_end
         .checked_add(
@@ -3606,7 +3637,7 @@ fn submit_vardct(
         _adaptive_lf_uniform: adaptive_lf_uniform,
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
-        _extra_plane: source.extra_plane.take(),
+        _extra_planes: std::mem::take(&mut source.extra_planes),
         extra_frame,
         _extra_prefix: source.global_extra_prefix.take(),
         _extra_uniforms: extra_uniforms,
@@ -3683,6 +3714,7 @@ fn submit_vardct(
         },
         token: SubmissionToken(1),
         layout,
+        surface: source.surface.clone(),
         frame_name,
         expected_groups,
         expected_hf,

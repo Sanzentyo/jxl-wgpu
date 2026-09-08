@@ -100,8 +100,9 @@ unchanged, and F32 retains finite negative, extended and invisible color values.
 output clips only at final packing. Numeric mappings and selected extra channels ignore this policy
 and retain their existing exact-code/normalization contracts. Metadata always describes the source.
 
-Composition keeps unrounded original-encoding RGBA and its declared association in every reference
-slot. Associated source-over computes `top + bottom * (1 - top_alpha)`; unassociated source-over
+Composition keeps unrounded original-encoding RGB and every independently normalized extra plane
+in one GPU allocation per reference slot. Associated source-over computes
+`top + bottom * (1 - top_alpha)`; unassociated source-over
 retains its alpha-weighted normalization. Conversion requested by the caller occurs only after all
 layers contributing to a presentation, including when RGB and alpha use different background slots.
 Fourteen associated still fixtures cover equal/independent depths, Gray+alpha, a first alpha after
@@ -109,6 +110,16 @@ other extras, zero alpha with nonzero color, one-pixel axes, shifted resampling,
 and progressive AC. Three nine-layer sequences add all five blend modes, extended reference values,
 crops and slot replacement in both coding modes. Native RGB/RGBA, planar/interleaved F32, Apply/Keep,
 NV12, odd-width YUYV/UYVY and BT.2020 constant-luminance P010 exercise final packing under whole and bounded input.
+
+Each extra channel has its own blend mode, reference slot, alpha selector and clamp flag.
+Multiple alpha declarations may use different association and depth; color Blend updates its
+selected alpha, while presentation uses the first declared alpha. Raw F32 extra output preserves
+the composed normalized result, including extended values. Native composed extra output requires
+the declaration's depth and clamps/rounds the final result to that unsigned range; the exact-code
+contract for unresampled stills is unchanged. Spot data remains selectable with the same explicit
+base-color policy. Seven nine-layer fixtures exercise all nine extra declarations, independent
+reference chains, Gray/RGB, both coding modes, distributed groups, shifted resampling and six
+presentations. Admission retries and cancellation release every hidden plane and its shared lease.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
@@ -279,12 +290,13 @@ formerly rejected crop/Add fixtures now execute and match both decoders.
 
 Sequences containing crops, blends, or reference-only frames decode every physical color producer
 and its LF dependency closure, including hidden zero-duration layers. The working surface is
-unrounded, unrotated F32 RGBA in the original enumerated D65 sRGB encoding. Up to four reference
+unrounded, unrotated planar F32 RGB in the original enumerated D65 sRGB encoding, followed by
+every extra plane at its own normalized depth. Up to four reference
 slots retain accounted buffer leases; an overwritten slot releases its old version after any
 submitted consumer completes. Empty references are zero, with opaque presentation alpha for
 images without an alpha channel. Signed crops are intersected on the host with checked wide
 arithmetic; all pixel copying and Replace/Add/Blend/Mul/MulAdd operations execute on the GPU.
-Color and alpha may read different background slots. Source-over also writes its selected alpha,
+Color and every extra may read different background slots and select different alpha declarations. Source-over also writes its selected alpha,
 and Multiply clamps the foreground when requested. Native 1–16-bit Gray/RGB/RGBA packing and
 the shared color-output conversion run after the full canvas has been composed; Apply/Keep
 orientation never changes the coordinate system of a retained reference.
@@ -305,7 +317,8 @@ uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` 
 `1e-4` for VarDCT-containing sequences. A separate Multiply-clamp case verifies extended reference
 values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.
 Re-serialized reference-only variants independently pass both decoders and exercise slot 3.
-Post-transform composition rejects pre-transform reference domains before submission. General extra-channel composition, resampled composition conformance, pre-transform patch execution, non-sRGB/ICC composition,
+Post-transform composition rejects pre-transform reference domains before submission. Floating extra-channel
+composition, pre-transform patch execution, non-sRGB/ICC composition,
 and non-coalesced/progressive delivery remain required for full JPEG XL.
 
 ### Bounded standard VarDCT engine
@@ -713,7 +726,7 @@ This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-general extra-channel composition and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+floating extra-channel composition and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

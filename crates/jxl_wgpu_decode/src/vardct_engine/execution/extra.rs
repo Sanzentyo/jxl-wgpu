@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use jxl_gpu_bitstream::{ExtraChannelTypeInventory, SampleBitDepth};
+use jxl_gpu_bitstream::SampleBitDepth;
 
 use crate::modular_assembly::encode_plane_copies;
 use crate::vardct_extra::VarDctExtraSubimage;
@@ -42,13 +42,7 @@ pub(super) fn prepare_frame_arena(
         mapped_at_creation: false,
     });
     let arena = GpuBufferLease::from_tracked(buffer, permit);
-    let index = match source.output {
-        VarDctFrameOutput::Extra { index, .. } => Some(index as usize),
-        VarDctFrameOutput::Color { .. } => source.extra_declarations.iter().position(|extra| {
-            matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
-        }),
-    };
-    if let Some(index) = index {
+    for &index in &source.extra_indices {
         let declaration =
             source
                 .extra_declarations
@@ -64,12 +58,14 @@ pub(super) fn prepare_frame_arena(
         let plane = plan.inverse.final_gpu_layouts().get(index).copied().ok_or(
             DecodeError::EngineContract("selected extra channel has no reconstructed plane"),
         )?;
-        source.extra_plane = Some(super::super::staging::ResidentModularPlane {
-            index: index as u32,
-            arena: arena.clone(),
-            plane,
-            bits: bits_per_sample,
-        });
+        source
+            .extra_planes
+            .push(super::super::staging::ResidentModularPlane {
+                index: index as u32,
+                arena: arena.clone(),
+                plane,
+                bits: bits_per_sample,
+            });
     }
     Ok(Some(arena))
 }

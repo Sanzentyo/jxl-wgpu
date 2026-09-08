@@ -23,12 +23,15 @@ use super::sequence::{SequenceSource, submission_counter};
 use super::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
 use crate::{
     Error, FrameExecutionPlan, FrameMetadata, FramePlanError, GpuCodestream, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionSession, OrientationPolicy, Result, SubmittedGpuFrame,
-    UnsupportedCodestreamFeature, UnsupportedProfile,
+    GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
+    UnsupportedProfile,
 };
 
+mod blend;
 mod gpu;
-use gpu::{Compositor, GpuWork, Surface};
+mod submission;
+use gpu::{Compositor, Surface};
+use submission::GpuWork;
 
 #[derive(Debug)]
 struct Carry {
@@ -61,40 +64,19 @@ impl CompositionSession {
         request: &GpuOutputRequest,
         plan: &FrameExecutionPlan,
     ) -> Result<Self> {
-        if request.extra_channel().is_some()
-            || inventory.image_header.extra_channels.len() > 1
-            || inventory.image_header.extra_channels.iter().any(|extra| {
-                !matches!(
-                    extra.channel_type,
-                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
-                )
-            })
-        {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::ExtraChannels,
-                "general extra-channel frame composition is not yet connected",
-            )
-            .into());
-        }
         validate(inventory, plan)?;
         let image = &inventory.image_header;
         let working = GpuOutputRequest::color(PixelFormat::rgb_f32(
-            RgbChannelOrder::Rgba,
-            false,
+            RgbChannelOrder::Rgb,
+            true,
             crate::vardct_rgb8_format().color_spec,
         ))?
-        .with_orientation_policy(OrientationPolicy::Keep)
-        .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
+        .for_frame_surface()
         .with_max_frame_slots(request.max_frame_slots());
         let compositor = Arc::new(Compositor::new(
             engine.backend().clone(),
             Extent2d::new(image.width, image.height),
-            image.extra_channels.first().map(|extra| {
-                matches!(
-                    extra.channel_type,
-                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: true }
-                )
-            }),
+            &image.extra_channels,
             image.grayscale,
             OutputOrientation::from_exif_value(image.orientation).ok_or(
                 Error::InvalidImageOrientation {
@@ -303,24 +285,15 @@ impl CompositionPending {
             .carry
             .as_ref()
             .ok_or(Error::EngineContract("composition carry was lost"))?;
-        let mut outputs = frame.output.outputs;
-        if outputs.len() != 1 {
-            return Err(Error::EngineContract(
-                "physical producer requires one color output",
-            ));
-        }
-        let surface = Surface::from_output(outputs.remove(0), carry.source.request.format())?;
+        let surface = self.compositor.import(frame.output.outputs)?;
         let node = &self.nodes[self.physical - self.first];
         if node.needs_composition {
             let header = &carry.source.inventory.frames[self.physical];
-            let color = carry.references[header.color_blend.source as usize].as_ref();
-            let alpha = header
-                .extra_channel_blends
-                .first()
-                .and_then(|blend| carry.references[blend.source as usize].as_ref());
-            self.stage = Some(Stage::Blend(
-                self.compositor.blend(&surface, color, alpha, header)?,
-            ));
+            self.stage = Some(Stage::Blend(self.compositor.blend(
+                &surface,
+                &carry.references,
+                header,
+            )?));
             self.submissions.fetch_add(1, Ordering::AcqRel);
             Ok(())
         } else {
@@ -414,17 +387,7 @@ impl CompositionPending {
                         Poll::Ready(result) => result?,
                     };
                     self.stage = None;
-                    let extent = &self
-                        .carry
-                        .as_ref()
-                        .expect("live composition source")
-                        .source
-                        .inventory
-                        .image_header;
-                    self.record(Surface {
-                        buffer,
-                        extent: Extent2d::new(extent.width, extent.height),
-                    })?;
+                    self.record(self.compositor.completed_surface(buffer))?;
                 }
                 Stage::Pack(work) => {
                     let buffer = match work.poll(context) {
@@ -448,18 +411,7 @@ impl CompositionPending {
             {
                 Stage::Decode(pending, count) => self.decoded(pending.wait()?, &count)?,
                 Stage::Blend(work) => {
-                    let image = &self
-                        .carry
-                        .as_ref()
-                        .expect("live composition source")
-                        .source
-                        .inventory
-                        .image_header;
-                    let extent = Extent2d::new(image.width, image.height);
-                    self.record(Surface {
-                        buffer: work.wait()?,
-                        extent,
-                    })?;
+                    self.record(self.compositor.completed_surface(work.wait()?))?;
                 }
                 Stage::Pack(work) => return self.finish(work.wait()?),
             }

@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{CodestreamInventory, ExtraChannelTypeInventory, SampleBitDepth};
+use jxl_gpu_bitstream::{CodestreamInventory, SampleBitDepth};
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, MemoryBudget, MemoryBudgetSnapshot, MemoryPermit,
     ResidentStorageBinding, SubmissionPollPermit, UnvalidatedGpuImageFrame, WgpuBackend,
@@ -475,25 +475,17 @@ impl VarDctPendingFrame {
         }
         let distributed = source.packet.has_distributed_extras();
         let global_extra_prefix = distributed.then(|| lifetime.arena.clone());
-        let extra_index = source
-            .request
-            .extra_channel()
-            .map(|index| index as usize)
-            .or_else(|| {
-                source
-                    .inventory
-                    .image_header
-                    .extra_channels
-                    .iter()
-                    .position(|extra| {
-                        matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
-                    })
-            });
-        let extra_plane = extra_index.filter(|_| !distributed).map(|index| {
+        let extra_planes = super::output::selected_extra_indices(
+            &source.request,
+            &source.inventory.image_header.extra_channels,
+        )
+        .into_iter()
+        .filter(|_| !distributed)
+        .map(|index| {
             let SampleBitDepth::Integer { bits_per_sample } =
                 source.inventory.image_header.extra_channels[index].bit_depth
             else {
-                unreachable!("integer extra-channel profile");
+                unreachable!("integer extra-channel profile")
             };
             ResidentModularPlane {
                 index: index as u32,
@@ -501,15 +493,16 @@ impl VarDctPendingFrame {
                 plane: plan.final_planes[index],
                 bits: bits_per_sample,
             }
-        });
+        })
+        .collect::<Vec<_>>();
         drop(lifetime);
         let mut options = source.options;
         options.memory_limit_bytes = options.memory_limit_bytes.saturating_sub(
             global_extra_prefix
                 .as_ref()
                 .map_or(0, GpuBufferLease::reserved_bytes)
-                + extra_plane
-                    .as_ref()
+                + extra_planes
+                    .first()
                     .map_or(0, |plane| plane.arena.reserved_bytes()),
         );
         let packet = source
@@ -524,7 +517,7 @@ impl VarDctPendingFrame {
             options,
             packet,
         )?;
-        frame.extra_plane = extra_plane;
+        frame.extra_planes = extra_planes;
         frame.global_extra_prefix = global_extra_prefix;
         *self
             .frame_memory

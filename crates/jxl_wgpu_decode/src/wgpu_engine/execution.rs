@@ -281,6 +281,13 @@ impl GroupDispatchLayout {
         {
             (std::mem::size_of::<ModularFinalizeParams>() as u64)
                 .checked_mul(
+                    output
+                        .surface
+                        .as_ref()
+                        .map_or(1, |surface| 1 + surface.extras.len() as u64),
+                )
+                .ok_or_else(|| Error::backend("Modular finalizer channel count overflow"))?
+                .checked_mul(
                     u64::try_from(if profile.resident_frame_plan.is_some() {
                         1
                     } else {
@@ -386,7 +393,7 @@ impl GroupDispatchLayout {
             .ok_or_else(|| Error::backend("Modular parameter buffer size overflow"))?;
         let fixed_bytes = [
             modular_metadata_bytes(modular_metadata)?,
-            align4(output.layout.logical_size)?,
+            output.storage_bytes()?,
             if output.f64_output_path == Some(F64OutputPath::NativeArithmetic) {
                 NATIVE_F64_DUMMY_WORD_BYTES
             } else {
@@ -856,7 +863,7 @@ pub(super) fn modular_finalize_params(
     output: &OutputPlan,
     group_index: usize,
     group: ModularGroup,
-) -> Result<ModularFinalizeParams> {
+) -> Result<Vec<ModularFinalizeParams>> {
     if output.render.is_some() {
         if group_index != 0 || profile.resident_entropy_plans.len() != 1 {
             return Err(Error::EngineContract(
@@ -865,11 +872,11 @@ pub(super) fn modular_finalize_params(
         }
         return modular_render_finalize_params(output, 0);
     }
-    let finalize_output = modular_finalize_output(output)?;
     let resident = resident_entropy_plan(profile, group_index)?;
     let selection = &output.source_channels;
     let planes = selection.select(&resident.inverse_plan.final_gpu_layouts())?;
-    ModularFinalizeParams::new(
+    build_modular_finalizers(
+        output,
         ModularFinalizeRegion {
             source_extent: Extent2d::new(group.width, group.height),
             canvas_extent: output.source_extent,
@@ -879,20 +886,17 @@ pub(super) fn modular_finalize_params(
             status_index: u32::try_from(group_index)
                 .map_err(|_| Error::backend("Modular finalizer status index exceeds u32"))?,
         },
-        selection.bits,
         &planes,
         resident.inverse_plan.arena_words(),
-        finalize_output,
+        crate::ModularSampleDomain::SignedInteger,
     )
-    .map(|params| params.with_alpha_conversion(selection.alpha_conversion))
-    .map_err(Error::from)
 }
 
 pub(super) fn modular_frame_finalize_params(
     profile: &StandardModularProfile,
     output: &OutputPlan,
     frame_plan: &ResidentModularFramePlan,
-) -> Result<ModularFinalizeParams> {
+) -> Result<Vec<ModularFinalizeParams>> {
     let status_index = if profile.global_stream.is_some() {
         u32::try_from(profile.entropy_groups.len())
             .map_err(|_| Error::backend("DC-global finalizer status index exceeds u32"))?
@@ -904,7 +908,8 @@ pub(super) fn modular_frame_finalize_params(
     }
     let selection = &output.source_channels;
     let planes = selection.select(&frame_plan.inverse_plan.final_gpu_layouts())?;
-    ModularFinalizeParams::new(
+    build_modular_finalizers(
+        output,
         ModularFinalizeRegion {
             source_extent: Extent2d::new(profile.width, profile.height),
             canvas_extent: output.source_extent,
@@ -913,24 +918,22 @@ pub(super) fn modular_frame_finalize_params(
             origin_y: 0,
             status_index,
         },
-        selection.bits,
         &planes,
         frame_plan.inverse_plan.arena_words(),
-        modular_finalize_output(output)?,
+        crate::ModularSampleDomain::SignedInteger,
     )
-    .map(|params| params.with_alpha_conversion(selection.alpha_conversion))
-    .map_err(Error::from)
 }
 
 fn modular_render_finalize_params(
     output: &OutputPlan,
     status_index: u32,
-) -> Result<ModularFinalizeParams> {
+) -> Result<Vec<ModularFinalizeParams>> {
     let render = output
         .render
         .as_ref()
         .ok_or(Error::EngineContract("missing Modular render plan"))?;
-    Ok(ModularFinalizeParams::new(
+    build_modular_finalizers(
+        output,
         ModularFinalizeRegion {
             source_extent: render.extent,
             canvas_extent: output.source_extent,
@@ -939,13 +942,68 @@ fn modular_render_finalize_params(
             origin_y: 0,
             status_index,
         },
-        output.source_channels.bits,
         render.planes(),
         (render.output_bytes / 4) as u32,
+        crate::ModularSampleDomain::NormalizedF32,
+    )
+}
+
+fn build_modular_finalizers(
+    output: &OutputPlan,
+    region: ModularFinalizeRegion,
+    planes: &[crate::modular_transform::GpuModularChannelLayout],
+    arena_words: u32,
+    domain: crate::ModularSampleDomain,
+) -> Result<Vec<ModularFinalizeParams>> {
+    let color_planes = if output.surface.is_some() {
+        &planes[..3]
+    } else {
+        planes
+    };
+    let color = ModularFinalizeParams::new(
+        region,
+        output.source_channels.bits,
+        color_planes,
+        arena_words,
         modular_finalize_output(output)?,
     )?
-    .with_source_domain(crate::ModularSampleDomain::NormalizedF32)
-    .with_alpha_conversion(output.source_channels.alpha_conversion))
+    .with_source_domain(domain)
+    .with_alpha_conversion(output.source_channels.alpha_conversion);
+    let mut result = vec![color];
+    if let Some(surface) = &output.surface {
+        if planes.len() != 3 + surface.extras.len() {
+            return Err(Error::EngineContract(
+                "frame surface is missing reconstructed planes",
+            ));
+        }
+        for (source, layout) in planes[3..].iter().zip(&surface.extras) {
+            let destination = &layout.planes[0];
+            result.push(
+                ModularFinalizeParams::new(
+                    region,
+                    source.bit_depth as u8,
+                    std::slice::from_ref(source),
+                    arena_words,
+                    ModularFinalizeOutput {
+                        kind: OutputKind::NumericFloat as u32,
+                        transfer: 0,
+                        limited_range: false,
+                        channels: 1,
+                        order: 0,
+                        bits: 32,
+                        storage_bits: 32,
+                        numeric_mapping: 4,
+                        plane_offsets: [destination.offset as u32, 0, 0, 0],
+                        plane_strides: [destination.row_stride as u32, 0, 0, 0],
+                        logical_size: layout.logical_size as u32,
+                        chroma_extent: Extent2d::new(0, 0),
+                    },
+                )?
+                .with_source_domain(domain),
+            );
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn modular_finalize_output(output: &OutputPlan) -> Result<ModularFinalizeOutput> {
@@ -998,6 +1056,7 @@ pub(super) enum OutputKind {
 }
 
 pub(super) struct OutputPlan {
+    pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     pub(super) render: Option<crate::modular_render::ModularRenderPlan>,
     pub(super) source_channels: super::channels::OutputChannels,
     pub(super) layout: ImageLayout,
@@ -1015,6 +1074,12 @@ pub(super) struct OutputPlan {
 }
 
 impl OutputPlan {
+    pub(super) fn storage_bytes(&self) -> Result<u64> {
+        self.surface.as_ref().map_or_else(
+            || align4(self.layout.logical_size),
+            |surface| Ok(surface.storage_bytes),
+        )
+    }
     pub(super) fn new(
         source_extent: Extent2d,
         orientation: OutputOrientation,
@@ -1045,6 +1110,7 @@ impl OutputPlan {
                     )));
                 }
                 let output = Self {
+                    surface: None,
                     render: None,
                     source_channels: super::channels::OutputChannels::identity(
                         source_channels,
@@ -1273,6 +1339,7 @@ impl OutputPlan {
             }
         };
         let output = Self {
+            surface: None,
             render: None,
             source_channels: super::channels::OutputChannels::identity(
                 source_channels,
@@ -1522,7 +1589,7 @@ pub(super) fn validate_device_limits(
     let buffer_limit = device.limits().max_buffer_size;
     let stream_bytes = dispatch.stream_bytes;
     let metadata_bytes = modular_metadata_bytes(modular_metadata)?;
-    let output_bytes = align4(output.layout.logical_size)?;
+    let output_bytes = output.storage_bytes()?;
     let dispatch_control_bytes = std::mem::size_of::<DispatchControl>() as u64;
     let native_f64_dummy_bytes = if output.f64_output_path == Some(F64OutputPath::NativeArithmetic)
     {
@@ -1749,7 +1816,7 @@ pub(super) fn submit_decode(
             ProgressiveDcXybPlanes::new(device, source.profile.width, source.profile.height, 0)
         })
         .transpose()?;
-    let output_size = align4(source.output.layout.logical_size)?;
+    let output_size = source.output.storage_bytes()?;
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
     if backend.direct_readback_enabled() {
@@ -2155,7 +2222,7 @@ pub(super) fn submit_decode(
                         lane_index,
                     )?;
                 } else if source.profile.progressive_dc.is_none() {
-                    inverse_uniforms.push(encode_modular_finalize(
+                    inverse_uniforms.extend(encode_modular_finalize(
                         device,
                         &mut commands,
                         source,
@@ -2198,6 +2265,7 @@ pub(super) fn submit_decode(
         lifetime: Some(lifetime),
         token: SubmissionToken(1),
         layout: source.output.layout.clone(),
+        surface: source.output.surface.clone(),
         completion,
         stream_sample_counts: {
             let mut expected = source
@@ -2258,7 +2326,7 @@ fn encode_frame_completion(
             inverse,
         )?);
         if source.profile.progressive_dc.is_none() {
-            inverse_uniforms.push(encode_frame_modular_finalize(
+            inverse_uniforms.extend(encode_frame_modular_finalize(
                 device, commands, source, lifetime, inverse,
             )?);
         }
@@ -2630,11 +2698,10 @@ pub(super) fn encode_modular_finalize(
     pipelines: &ModularInversePipelines,
     group_index: usize,
     lane_index: usize,
-) -> Result<wgpu::Buffer> {
+) -> Result<Vec<wgpu::Buffer>> {
     let params = source
         .finalize_params
         .get(group_index)
-        .copied()
         .ok_or(Error::EngineContract(
             "descriptor reconstruction is missing final-output parameters",
         ))?;
@@ -2671,36 +2738,41 @@ pub(super) fn encode_modular_finalize(
     let output_words_size = NonZeroU64::new(output_words_buffer.size()).ok_or(
         Error::EngineContract("descriptor reconstruction produced an empty word output"),
     )?;
-    pipelines
-        .finalize
-        .encode(
-            device,
-            encoder,
-            ModularFinalizeBindings {
-                arena,
-                output_words: ResidentStorageBinding {
-                    buffer: output_words_buffer,
-                    offset: 0,
-                    size: output_words_size,
-                },
-                status: ResidentStorageBinding {
-                    buffer: lifetime._status.buffer(),
-                    offset: 0,
-                    size: NonZeroU64::new(lifetime._status.buffer().size()).ok_or(
-                        Error::EngineContract(
-                            "descriptor reconstruction produced an empty status allocation",
-                        ),
-                    )?,
-                },
-                output_f64: native_f64_dummy_words.map(|_| ResidentStorageBinding {
-                    buffer: output,
-                    offset: 0,
-                    size: output_size,
-                }),
-            },
-            params,
-        )
-        .map_err(Error::from)
+    params
+        .iter()
+        .map(|params| {
+            pipelines
+                .finalize
+                .encode(
+                    device,
+                    encoder,
+                    ModularFinalizeBindings {
+                        arena,
+                        output_words: ResidentStorageBinding {
+                            buffer: output_words_buffer,
+                            offset: 0,
+                            size: output_words_size,
+                        },
+                        status: ResidentStorageBinding {
+                            buffer: lifetime._status.buffer(),
+                            offset: 0,
+                            size: NonZeroU64::new(lifetime._status.buffer().size()).ok_or(
+                                Error::EngineContract(
+                                    "descriptor reconstruction produced an empty status allocation",
+                                ),
+                            )?,
+                        },
+                        output_f64: native_f64_dummy_words.map(|_| ResidentStorageBinding {
+                            buffer: output,
+                            offset: 0,
+                            size: output_size,
+                        }),
+                    },
+                    *params,
+                )
+                .map_err(Error::from)
+        })
+        .collect()
 }
 
 pub(super) fn encode_frame_modular_finalize(
@@ -2709,14 +2781,10 @@ pub(super) fn encode_frame_modular_finalize(
     source: &DecodeSource,
     lifetime: &DecodeJobLifetime,
     pipelines: &ModularInversePipelines,
-) -> Result<wgpu::Buffer> {
-    let params = source
-        .finalize_params
-        .first()
-        .copied()
-        .ok_or(Error::EngineContract(
-            "frame Modular reconstruction is missing final-output parameters",
-        ))?;
+) -> Result<Vec<wgpu::Buffer>> {
+    let params = source.finalize_params.first().ok_or(Error::EngineContract(
+        "frame Modular reconstruction is missing final-output parameters",
+    ))?;
     let plan = source
         .profile
         .resident_frame_plan
@@ -2759,7 +2827,10 @@ pub(super) fn encode_frame_modular_finalize(
     let output_words_size = NonZeroU64::new(output_words_buffer.size()).ok_or(
         Error::EngineContract("frame Modular reconstruction produced an empty word output"),
     )?;
-    pipelines
+    params
+        .iter()
+        .map(|params| {
+            pipelines
         .finalize
         .encode(
             device,
@@ -2786,9 +2857,11 @@ pub(super) fn encode_frame_modular_finalize(
                     size: output_size,
                 }),
             },
-            params,
+            *params,
         )
         .map_err(Error::from)
+        })
+        .collect()
 }
 
 pub(super) fn build_params(
