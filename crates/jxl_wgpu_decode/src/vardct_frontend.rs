@@ -1290,8 +1290,7 @@ fn validate_image(
     }
     if image.extra_channel_count as usize != image.extra_channels.len()
         || image.extra_channels.iter().any(|extra| {
-            !crate::modular_sample::ModularSampleEncoding::new(extra.bit_depth)
-                .is_some_and(|encoding| encoding.is_float() || encoding.bits() <= 16)
+            crate::modular_sample::ModularSampleEncoding::new(extra.bit_depth).is_none()
                 || extra.dimension_shift > 3
         })
     {

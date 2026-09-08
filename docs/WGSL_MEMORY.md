@@ -725,6 +725,23 @@ unmaps the fence and signals completion without a runtime dependency or CPU imag
 
 ## Alpha association at output
 
+Integer sample delivery covers valid depths 1–31 with canonical 8/16/32-bit storage. The existing
+Modular finalizer (176 bytes), scalar packer (64 bytes), and composition native packer (64 bytes)
+retain their layouts. Their existing component-storage field determines one, two, or four output
+bytes; valid precision never substitutes for storage stride. Native high padding bits remain zero.
+
+`modular_sample.wgsl` shares exact integer alpha rescaling and final F32 quantization. Multiplication
+uses two `u32` limbs; alpha division uses a bounded 32-step unsigned quotient with a 31-bit divisor.
+Quantization decomposes the binary32 significand, multiplies by the exact requested maximum and
+rounds the rational product to the nearest integer (half up). This avoids F32 multiply rounding
+and 31-bit endpoint overflow without requiring `SHADER_F64`. Intermediates are invocation-local;
+no new workgroup memory, bindings, uniforms, scratch allocation or readback is required.
+
+High-precision Modular sources select the descriptor-based entropy/inverse/finalizer path so the
+legacy 8/16-bit direct packers cannot truncate them. Converted wide color output uses the existing
+accounted all-channel F32 presentation surface, shared with floating sources and composition.
+That surface's allocation and lifetime continue to follow the common frame byte budget.
+
 The shared `ImageOutputParams` is 192 bytes: `alpha[0]` at byte 176 selects Preserve (0),
 Unpremultiply (1) or Premultiply (2), followed by three zero padding words. Existing field offsets
 are unchanged. `AlphaConversion` is a typed host enum and `ALPHA_OUTPUT_SHADER` is shared by the

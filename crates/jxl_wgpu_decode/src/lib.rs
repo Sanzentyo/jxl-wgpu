@@ -1,10 +1,11 @@
 //! GPU-required JPEG XL decode orchestration.
 //!
-//! This crate has no production CPU pixel/entropy decoder and no fallback policy. The stock
+//! This crate has no production CPU image pixel/entropy decoder and no fallback policy. The stock
 //! [`WgpuSubmissionEngine`] inventories standard JPEG XL frame sections, parses only bounded
-//! Modular prefix metadata, and decodes single- or multi-group lossless 1-16-bit Gray/RGB/RGBA
-//! token streams in WGSL. Single-root-group streams may use arbitrary resident
-//! RCT/Palette/Squeeze stacks; no decoded sample crosses a CPU or mapped-buffer boundary.
+//! Modular prefix metadata, and decodes single- or multi-group Gray/RGB and extra-channel token
+//! streams in WGSL with 1–31-bit integer or legal JPEG XL floating precision. Resident
+//! RCT/Palette/Squeeze precede sample interpretation. [`GpuDecoder::wgpu`] also selects VarDCT and
+//! the shared frame composition/presentation graph; no decoded sample crosses a CPU or mapped-buffer boundary.
 //! It returns GPU-resident frames in the requested generic [`PixelFormat`]; no private sidecar box
 //! is required. Unsupported profiles and incomplete generic frontend stages are typed errors.
 //! Submission and completion are separate: sessions can prefetch an ordered bounded queue of
@@ -97,7 +98,7 @@ pub use model::{
     AlphaOutputPolicy, AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration,
     FrameMetadata, FrameTimebase, GpuOutputMapping, GpuOutputRequest, ModularChannelCounts,
     ModularChannels, ModularGrouping, ModularPredictionProfile, ModularPredictor,
-    NumericSampleMapping, OrientationPolicy, SpotColorPolicy,
+    NumericSampleMapping, OrientationPolicy, SpotColorPolicy, native_modular_pixel_format,
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;

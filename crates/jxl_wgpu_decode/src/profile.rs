@@ -180,9 +180,7 @@ fn validate_image_header(
     if image.extra_channels.len() != channels.extra_count() as usize
         || image.extra_channel_count != channels.extra_count()
         || image.extra_channels.iter().any(|extra| {
-            !ModularSampleEncoding::new(extra.bit_depth)
-                .is_some_and(|encoding| encoding.is_float() || encoding.bits() <= 16)
-                || extra.dimension_shift > 3
+            ModularSampleEncoding::new(extra.bit_depth).is_none() || extra.dimension_shift > 3
         })
     {
         return Err(UnsupportedProfile::new(
@@ -228,9 +226,7 @@ fn parse_modular_profile(
     if image.width == 0 || image.height == 0 {
         return unsupported("the lossless Modular GPU profile requires a non-empty image");
     }
-    let sample_encoding = match ModularSampleEncoding::new(image.bit_depth)
-        .filter(|encoding| encoding.is_float() || encoding.bits() <= 16)
-    {
+    let sample_encoding = match ModularSampleEncoding::new(image.bit_depth) {
         Some(encoding) => encoding,
         None => {
             return Err(UnsupportedProfile::new(
@@ -240,7 +236,7 @@ fn parse_modular_profile(
                         bits_per_sample, ..
                     } => u8::try_from(bits_per_sample).unwrap_or(u8::MAX),
                 }),
-                "the Modular GPU frontend requires 1–16-bit integers or legal JPEG XL floating samples",
+                "the Modular GPU frontend requires 1–31-bit integers or legal JPEG XL floating samples",
             )
             .into());
         }
@@ -853,6 +849,7 @@ fn parse_modular_profile(
             )
             && image.extra_channels[0].bit_depth == image.bit_depth);
     let generalized_channels = sample_encoding.is_float()
+        || sample_encoding.bits() > 16
         || resampling
         || !conventional_alpha
         || frame_plan_seed.is_some()
@@ -1311,6 +1308,76 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn wide_integer_fixtures_execute_real_rct_squeeze_and_multiple_groups() {
+        use crate::modular_inverse::ModularInverseJob;
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/integer");
+        let mut names: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter_map(|name| name.to_str()?.strip_suffix(".u32.hex").map(str::to_owned))
+            .collect();
+        assert_eq!(names.len(), 42);
+        names.push("extras_integer_distributed_extended31".into());
+        for name in names {
+            let text = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("test-data/integer/{name}.jxl.hex")),
+            )
+            .unwrap();
+            let bytes = fixture(&text);
+            let parsed = parse(&bytes, ParseLimits::default()).unwrap();
+            let inventory = parsed
+                .codestream_inventory(InventoryLimits::default())
+                .unwrap();
+            let source = GpuCodestream::from_spans([(
+                0,
+                StreamSlice::from_shared(Arc::from(parsed.codestream())),
+            )])
+            .unwrap();
+            let profile = parse_standard_modular_profile(&source, &inventory).unwrap();
+            assert!(!profile.sample_encoding.is_float());
+            if profile.sample_encoding.bits() > 16 {
+                assert!(profile.generalized_channels);
+            }
+            let jobs: Vec<_> = profile
+                .resident_frame_plan
+                .iter()
+                .flat_map(|frame| frame.inverse_plan.jobs())
+                .chain(
+                    profile
+                        .resident_entropy_plans
+                        .iter()
+                        .flat_map(|plan| plan.inverse_plan.jobs()),
+                )
+                .collect();
+            let rct = if name.ends_with("-r6") {
+                Some(6)
+            } else if name.ends_with("-r41") {
+                Some(41)
+            } else {
+                None
+            };
+            if let Some(rct) = rct {
+                assert!(jobs.iter().any(|job| matches!(job, ModularInverseJob::Rct { params } if params.operation[0] == rct)));
+            }
+            if name == "extras_integer_distributed_extended31" {
+                assert!(profile.groups.len() > 1);
+                assert!(
+                    jobs.iter()
+                        .any(|job| matches!(job, ModularInverseJob::Squeeze { .. }))
+                );
+            } else {
+                assert!(
+                    !jobs
+                        .iter()
+                        .any(|job| matches!(job, ModularInverseJob::Palette { .. })),
+                    "{name}: a precision transplant must not depend on implicit Palette entries"
+                );
+            }
+        }
+    }
 
     #[test]
     fn floating_fixtures_cover_global_only_distributed_and_squeezed_topologies() {

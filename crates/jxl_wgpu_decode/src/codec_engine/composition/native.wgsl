@@ -1,3 +1,4 @@
+/*__JXL_MODULAR_SAMPLE__*/
 struct Params {
     extent: vec4<u32>, // output width/height, source width/height
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
@@ -40,7 +41,7 @@ fn output_byte(offset: u32) -> u32 {
         return (bitcast<u32>(value) >> ((in_row % params.format.z) * 8u)) & 255u;
     }
     let mask = (1u << params.format.y) - 1u;
-    let code = u32(floor(clamp(value, 0.0, 1.0) * f32(mask) + 0.5));
+    let code = modular_quantize_unsigned(value, mask);
     return (code >> ((in_row % params.format.z) * 8u)) & 255u;
 }
 @compute @workgroup_size(64)

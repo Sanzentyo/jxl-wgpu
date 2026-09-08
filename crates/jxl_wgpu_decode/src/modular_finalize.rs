@@ -304,7 +304,7 @@ fn validate_output(
             || !matches!(output.channels, 1 | 3 | 4)
             || output.bits != u32::from(source_bits)
             || output.numeric_mapping != 3
-            || !matches!(output.storage_bits, 8 | 16)
+            || output.storage_bits != u32::from(source_bits).next_power_of_two().max(8)
         {
             return Err(ModularFinalizeError::InvalidParams {
                 reason: "native Modular output has an invalid depth or channel mapping",

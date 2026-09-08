@@ -90,7 +90,7 @@ impl ModularScalarOutputPlan {
                     .ok_or(ModularScalarOutputError::Invalid {
                         reason: "native scalar depth must match the extra-channel declaration",
                     })?;
-                u32::from(native.bits_per_sample).div_ceil(8)
+                u32::from(native.storage_bits) / 8
             }
             NumericSampleMapping::NormalizedUnsigned if !config.encoding.is_float() => {
                 if !matches!(classify_pixel_format(&layout.format),

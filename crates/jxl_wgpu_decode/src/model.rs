@@ -296,13 +296,13 @@ pub enum NumericSampleMapping {
     /// operate on the decoded floating values before delivery.
     NativeFloat,
     /// Preserve the decoded unsigned integer code exactly in the low valid bits of the canonical
-    /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
-    /// codestream depth must match. Working samples outside that unsigned range return a typed
-    /// error rather than wrapping or clipping.
+    /// lossless-Modular Gray `u8`/`u16`/`u32` storage descriptor. The requested valid depth and the
+    /// codestream depth must match. Uncomposed working samples outside that unsigned range return
+    /// a typed error. Composed presentation clamps to the output range.
     /// Resampled planes are reconstructed at presentation resolution first, then rounded to the
-    /// nearest code at the declared depth; exact preservation applies to unresampled samples.
+    /// nearest code at the declared depth; exact preservation applies before filtering/composition.
     NativeUnsigned,
-    /// Divide a 1–16-bit unsigned source by its own maximum code into scalar F32 storage.
+    /// Divide a 1–31-bit unsigned source by its own maximum code into scalar F32 storage.
     /// No transfer function or color conversion is applied, including for extra channels.
     /// Signed working samples outside the declared unsigned range remain outside `[0, 1]`;
     /// normalization does not wrap or clamp them.
@@ -650,16 +650,21 @@ pub(crate) struct NativeModularFormat {
     pub storage_bits: u8,
 }
 
-pub(crate) fn native_modular_pixel_format(
+/// Creates the canonical unsigned Gray/RGB/RGBA delivery layout for 1–31 valid bits.
+/// Samples occupy native-endian 8-, 16-, or 32-bit words with zero high padding bits.
+/// Unfiltered integer Modular planes retain their exact codes; rendering or composition uses
+/// F32 working values and quantizes at presentation. Integer alpha with an independent depth
+/// is rescaled to the requested color depth.
+pub fn native_modular_pixel_format(
     channels: ModularChannels,
     bits_per_sample: u8,
 ) -> Result<PixelFormat> {
-    if !(1..=16).contains(&bits_per_sample) {
+    if !(1..=31).contains(&bits_per_sample) {
         return Err(Error::UnsupportedOutputFormat(
-            "native lossless-Modular depth must be in 1..=16".into(),
+            "native lossless-Modular depth must be in 1..=31".into(),
         ));
     }
-    let storage_bits = if bits_per_sample <= 8 { 8 } else { 16 };
+    let storage_bits = native_integer_storage_bits(bits_per_sample);
     let (model, color_spec, swizzle, components): (_, _, _, &[Channel]) = match channels {
         ModularChannels::Gray => (
             ColorModel::NonColor,
@@ -707,7 +712,15 @@ pub(crate) fn native_modular_pixel_format(
     })
 }
 
-/// Recognizes the exact pitch-linear descriptor shared with the GPU lossless Modular encoder.
+const fn native_integer_storage_bits(bits: u8) -> u8 {
+    match bits {
+        0..=8 => 8,
+        9..=16 => 16,
+        _ => 32,
+    }
+}
+
+/// Recognizes the canonical valid-bit-padded integer delivery descriptor.
 pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModularFormat> {
     if format.validate().is_err()
         || format.sample_kind != SampleKind::Unsigned
@@ -762,9 +775,9 @@ pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModula
             _ => return None,
         };
         let word_bits = padding.checked_add(bits)?;
-        let expected_storage_bits = if bits <= 8 { 8 } else { 16 };
+        let expected_storage_bits = native_integer_storage_bits(bits);
         if channel != *expected_channel
-            || !(1..=16).contains(&bits)
+            || !(1..=31).contains(&bits)
             || word_bits != expected_storage_bits
             || bits_per_sample.is_some_and(|value| value != bits)
             || storage_bits.is_some_and(|value| value != word_bits)

@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "floating_samples.h"
+#include "integer_samples.h"
 
 static int floating;
+static int wide_integer;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static const JxlExtraChannelType types[] = {
@@ -45,11 +47,12 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   info.have_animation = JXL_TRUE;
   info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
   info.animation.num_loops = 2; info.animation.have_timecodes = JXL_TRUE;
-  if (floating) check(JxlEncoderSetCodestreamLevel(enc, 10));
+  if (floating || wide_integer) check(JxlEncoderSetCodestreamLevel(enc, 10));
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
     JxlExtraChannelInfo extra; JxlEncoderInitExtraChannelInfo(types[c], &extra);
     extra.bits_per_sample = depths[c]; extra.dim_shift = resampling ? 1 : 0;
+    if (wide_integer) extra.bits_per_sample = integer_extra_bits[c];
     if (floating) {
       extra.bits_per_sample = floating_extra_bits[c];
       extra.exponent_bits_per_sample = floating_extra_exponents[c];
@@ -62,7 +65,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     extra.spot_color[2] = 0.75f; extra.spot_color[3] = 0.5f;
     extra.cfa_channel = 3;
     check(JxlEncoderSetExtraChannelInfo(enc, c, &extra));
-    char name[64]; int n = snprintf(name, sizeof(name), "composed-plane-%u-depth-%u", c, depths[c]);
+    char name[64]; int n = snprintf(name, sizeof(name), "composed-plane-%u-depth-%u", c, wide_integer ? extra.bits_per_sample : depths[c]);
     check(JxlEncoderSetExtraChannelName(enc, c, name, (size_t)n));
   }
   JxlColorEncoding color; JxlColorEncodingSetToSRGB(&color, colors == 1);
@@ -118,12 +121,14 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     float* data = malloc(pixels * colors * sizeof(float)); if (!data) exit(2);
     for (uint32_t y=0; y<layer->height; ++y) for (uint32_t x=0; x<layer->width; ++x)
       for (uint32_t c=0; c<colors; ++c) data[((size_t)y*layer->width+x)*colors+c] =
-        floating ? floating_sample(x,y,c,frame,1) : sample(x,y,c,frame,bits);
+        wide_integer ? integer_sample(x,y,c,frame,bits) :
+          floating ? floating_sample(x,y,c,frame,1) : sample(x,y,c,frame,bits);
     JxlPixelFormat format = {colors, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
     check(JxlEncoderAddImageFrame(settings, &format, data, pixels * colors * sizeof(float)));
     for (uint32_t c=0; c<extras; ++c) {
       for (uint32_t y=0; y<layer->height; ++y) for (uint32_t x=0; x<layer->width; ++x)
-        data[(size_t)y*layer->width+x] = floating ? (floating_extra_exponents[c] ?
+        data[(size_t)y*layer->width+x] = wide_integer ? integer_sample(x,y,colors+c,frame,integer_extra_bits[c]) :
+          floating ? (floating_extra_exponents[c] ?
           floating_sample(x,y,colors+c,frame,0) : sample(x,y,colors+c,frame,floating_extra_bits[c])) :
           sample(x,y,colors+c,frame,depths[c]);
       check(JxlEncoderSetExtraChannelBuffer(settings, &format, data, pixels * sizeof(float), c));
@@ -150,6 +155,15 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--integer")) {
+    wide_integer = 1;
+    generate(argv[1], "integer_rgb", 37, 17, 3, 24, 9, 6, 0, 0, 0, 0);
+    generate(argv[1], "integer_gray", 37, 9, 1, 23, 9, 8, 0, 0, 0, 1);
+    generate(argv[1], "integer_vardct", 37, 17, 3, 20, 9, 5, 1, 0, 0, 0);
+    generate(argv[1], "integer_resampled", 37, 17, 3, 24, 9, 7, 0, 0, 1, 1);
+    generate(argv[1], "integer_vardct_resampled", 37, 17, 3, 24, 9, 2, 1, 0, 1, 0);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--floating")) {
     floating = 1;
     generate(argv[1], "float_rgb", 37, 17, 3, 16, 9, 6, 0, 0, 0, 0);

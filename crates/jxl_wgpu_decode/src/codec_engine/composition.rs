@@ -55,12 +55,27 @@ pub(super) fn needs_surface(
             if spec.space == ColorSpace::Bt709 && spec.range == ColorRange::Full
                 && matches!(spec.transfer, TransferFunction::Srgb | TransferFunction::Sycc
                     | TransferFunction::Linear | TransferFunction::Bt709 | TransferFunction::Bt2020));
-    let floating_conversion = matches!(
-        inventory.image_header.bit_depth,
-        jxl_gpu_bitstream::SampleBitDepth::Float { .. }
-    ) && request.mapping() == crate::GpuOutputMapping::Color
-        && !direct_float;
-    floating_conversion
+    let image = &inventory.image_header;
+    let native = crate::model::native_modular_format(request.format());
+    let direct_integer = native.is_some_and(|format| {
+        image.bit_depth
+            == (jxl_gpu_bitstream::SampleBitDepth::Integer {
+                bits_per_sample: u32::from(format.bits_per_sample),
+            })
+    });
+    let source_conversion = match image.bit_depth {
+        jxl_gpu_bitstream::SampleBitDepth::Float { .. } => !direct_float,
+        jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } => {
+            bits_per_sample > 16 && !direct_float && !direct_integer
+        }
+    };
+    let wide_vardct_output = native.is_some_and(|format| format.bits_per_sample > 16)
+        && inventory
+            .frames
+            .iter()
+            .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
+    ((source_conversion || wide_vardct_output)
+        && request.mapping() == crate::GpuOutputMapping::Color)
         || request.renders_spot_colors(&inventory.image_header.extra_channels)
         || plan.nodes.iter().any(|node| node.needs_composition)
         || inventory

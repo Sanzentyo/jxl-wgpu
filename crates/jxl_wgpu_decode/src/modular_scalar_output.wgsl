@@ -29,7 +29,7 @@ fn output_byte(byte_offset: u32) -> u32 {
         } else if !(normalized >= 0.0 && normalized <= 1.0) {
             atomicStore(&status, 1u); code = 0u;
         } else {
-            code = u32(floor(normalized * f32(maximum) + 0.5));
+            code = modular_quantize_unsigned(normalized, maximum);
         }
     } else if params.encoding.z != 0u {
         // The integer arena may contain negative or overshoot values after lossy prediction.

@@ -102,11 +102,8 @@ fn alpha_multiplier(x: u32, y: u32) -> f32 {
 }
 
 fn write_stored_code(offset: u32, value: u32) {
-    if params.format.z == 8u {
-        write_byte(offset, value);
-    } else {
-        write_byte(offset, value);
-        write_byte(offset + 1u, value >> 8u);
+    for (var byte = 0u; byte < params.format.z / 8u; byte += 1u) {
+        write_byte(offset + byte, value >> (8u * byte));
     }
 }
 
@@ -122,17 +119,17 @@ fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
             if channel < 3u && params.bounds.w != 0u {
                 let normalized = source_normalized(source_channel, source_x, source_y)
                     * alpha_multiplier(source_x, source_y);
-                value = u32(floor(clamp(normalized, 0.0, 1.0) * f32(source_mask()) + 0.5));
+                value = modular_quantize_unsigned(normalized, source_mask());
             } else if params.region.w == 1u || modular_sample_is_float(params.source_encodings[source_channel]) {
                 let normalized = source_normalized(source_channel, source_x, source_y);
                 if modular_sample_is_float(params.source_encodings[source_channel]) && params.output.w > 1u {
-                    value = u32(floor(clamp(normalized, 0.0, 1.0) * f32(source_mask()) + 0.5));
+                    value = modular_quantize_unsigned(normalized, source_mask());
                 } else if !(normalized >= 0.0 && normalized <= 1.0) { reject_output_mapping(); value = 0u; }
-                else { value = u32(floor(normalized * f32(source_mask()) + 0.5)); }
+                else { value = modular_quantize_unsigned(normalized, source_mask()); }
             } else {
                 value = source_sample(source_channel, source_x, source_y);
                 let mask = modular_sample_maximum(params.source_encodings[source_channel]);
-                if mask != source_mask() { value = (value * source_mask() + mask / 2u) / mask; }
+                value = modular_rescale_unsigned(value, mask, source_mask());
             }
         }
         write_stored_code(

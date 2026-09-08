@@ -10,12 +10,12 @@ tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 mixed Modular/VarDCT presentations and recursive progressive DC. It uses the shared frame executor
 described below.
 
-The low-level `WgpuSubmissionEngine` implements a standards-only integer Modular still profile:
+The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
 - one final still frame with Gray or RGB Modular samples and arbitrary extra planes, each with
-  independent 1–16-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color/extra resampling, over a bounded
+  independent 1–31-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color/extra resampling, over a bounded
   128/256/512/1024-pixel pass-group grid and one through three passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
@@ -39,7 +39,7 @@ presentation buffers across Modular, VarDCT, mixed sequences and recursive DC; p
 ordering and frame timing remain unchanged. `FrameExecutionPlan::negotiate_with_orientation`
 exposes the matching plan metadata.
 
-All supported 1–16-bit Gray/RGB/RGBA Modular sources can also return F32 color through
+All supported 1–31-bit Gray/RGB/RGBA Modular sources can also return F32 color through
 `PixelFormat::rgb_f32`, in planar or interleaved RGB/BGR/RGBA/BGRA order. Integer samples normalize
 by their actual bit depth after inverse transforms; gray expands to RGB, missing alpha is one,
 and decoded alpha normalizes independently of the RGB transfer. This path currently accepts
@@ -47,6 +47,35 @@ explicit full-range BT.709 primaries and sRGB/SYCC, Linear, BT.709 or BT.2020 tr
 It preserves the existing native integer output contracts and uses the same resident output leases.
 Gray+alpha and independent alpha precision use the same path. Floating sources decode their
 declared representation before color conversion. Additional source color domains remain unsupported.
+
+### Integer source samples
+
+All 1–31-bit primary and extra-channel declarations are admitted by Modular and XYB VarDCT.
+`native_modular_pixel_format(ModularChannels::Gray, bits)` creates a canonical scalar layout for
+`NumericSampleMapping::NativeUnsigned` from Modular grayscale or a selected extra in either mode;
+RGB/RGBA layouts can be passed to `GpuOutputRequest::color`. General VarDCT numeric color-channel
+delivery remains a separate incomplete output feature.
+Valid depths 1–8, 9–16 and 17–31 use 8-, 16- and 32-bit words, respectively, with zero high padding.
+The encoder's current 1–16-bit input limit is independent of this decoder delivery API.
+
+Unfiltered integer planes retain their exact codes through entropy, prediction and inverse
+transforms. Independent integer alpha precision is rescaled using a two-word product/division
+on GPU. `NormalizedUnsigned` and F32 color divide by the declared maximum; wide-source F32
+output agrees with the independent libjxl normalization within one ULP. Native scalar working
+values outside the unsigned range return a typed error, while F32 retains negative/overshoot values.
+
+Resampling, spots, alpha association and frame composition operate in decoded F32. Native
+presentation rounds that F32 value against the exact requested integer maximum using integer
+significand arithmetic, including 31-bit endpoints and half-code boundaries. This avoids an
+additional rounding loss from F32 multiplication; it does not recover precision lost in earlier
+filtering, blending or VarDCT reconstruction. Wide-source RGB8 and other converted color formats
+use the common accounted F32 presentation surface. Non-XYB YCbCr remains an 8-bit source profile.
+
+`tests/integer_samples.rs` checks 42 exact-source fixtures and 40 libjxl rendering cases, including
+all source precisions, large predictor residuals, real RCT/Squeeze, independently coded alpha,
+orientations, 2×/4×/8× reconstruction, progressive DC and animation. Whole and bounded fragmented
+output must agree. `cargo run -p jxl_wgpu_decode --example regenerate_integer` reproduces the corpus;
+its documented header generation covers legal precisions beyond libjxl's public encoder limit.
 
 ### Floating source samples
 
@@ -350,7 +379,7 @@ submitted consumer completes. Empty references are zero, with opaque presentatio
 images without an alpha channel. Signed crops are intersected on the host with checked wide
 arithmetic; all pixel copying and Replace/Add/Blend/Mul/MulAdd operations execute on the GPU.
 Color and every extra may read different background slots and select different alpha declarations. Source-over also writes its selected alpha,
-and Multiply clamps the foreground when requested. Native 1–16-bit Gray/RGB/RGBA packing and
+and Multiply clamps the foreground when requested. Native 1–31-bit Gray/RGB/RGBA packing and
 the shared color-output conversion run after the full canvas has been composed; Apply/Keep
 orientation never changes the coordinate system of a retained reference.
 
@@ -539,7 +568,7 @@ initial-stage reusable stream, arena and total buffer bytes. Both stages share t
 `in_flight_memory_stats()` includes every live permit. Submission counts grow as stages become
 known. A pending global stage cannot expose an unvalidated frame. Dropping it retains GPU
 buffers and permits in the map callback until completion. Color metadata reports the actual
-1–16-bit source depth and preserves all extra-channel declarations.
+1–31-bit source depth and preserves all extra-channel declarations.
 
 Six internal substream fixtures still compare every reconstructed plane to exact source codes
 and Rust `jxl`/libjxl. Seven public fixtures add color and first-alpha comparisons, including a

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "floating_samples.h"
+#include "integer_samples.h"
 
 static int vardct;
 static int responsive;
@@ -18,6 +19,7 @@ static int dimension_shift;
 static int associated;
 static int spots;
 static int floating;
+static int wide_integer;
 static int floating_narrow;
 static int integer_primary;
 static int progressive_dc;
@@ -57,11 +59,12 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   if (floating && !integer_primary) info.exponent_bits_per_sample = floating_exponent(bits);
   info.num_color_channels = colors; info.num_extra_channels = extras;
   info.uses_original_profile = !vardct; info.orientation = (JxlOrientation)orientation;
-  if (floating) check(JxlEncoderSetCodestreamLevel(enc, 10));
+  if (floating || wide_integer) check(JxlEncoderSetCodestreamLevel(enc, 10));
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
     JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : (spots ? spot_types[c] : types[c]), &ec);
     ec.bits_per_sample = alpha_only ? alpha_depth : depths[c];
+    if (wide_integer) ec.bits_per_sample = alpha_only ? alpha_depth : integer_extra_bits[c];
     if (floating) {
       ec.bits_per_sample = alpha_only ? 32 : floating_extra_bits[c];
       ec.exponent_bits_per_sample = alpha_only ? 8 : floating_extra_exponents[c];
@@ -89,7 +92,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
   if (floating) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_PREDICTOR, 0));
-  if (floating && (strstr(name, "distributed") || strstr(name, "squeeze")))
+  if ((floating || wide_integer) && (strstr(name, "distributed") || strstr(name, "squeeze")))
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_GROUP_SIZE, 0));
   if (associated) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1));
   if (progressive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
@@ -105,15 +108,18 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   float* data = malloc(pixels * colors * sizeof(float));
   if (!data) exit(2);
   for (uint32_t y=0; y<height; ++y) for (uint32_t x=0; x<width; ++x) for (uint32_t c=0; c<colors; ++c)
-    data[((size_t)y*width+x)*colors+c] = floating && !integer_primary ? floating_sample(x,y,c,0,1) :
+    data[((size_t)y*width+x)*colors+c] = wide_integer ? integer_sample(x,y,c,0,bits) :
+      floating && !integer_primary ? floating_sample(x,y,c,0,1) :
       (float)(associated && x % 11 == 0 && y % 2 ? 23 : code(x,y,c,bits)) / (float)((1u<<bits)-1);
   JxlPixelFormat format = {colors, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
   check(JxlEncoderAddImageFrame(settings, &format, data, pixels * colors * sizeof(float)));
   for (uint32_t c=0; c<extras; ++c) {
     uint32_t depth = alpha_only ? alpha_depth : depths[c];
+    if (wide_integer && !alpha_only) depth = integer_extra_bits[c];
     if (floating) depth = alpha_only ? 32 : floating_extra_bits[c];
     for (uint32_t y=0; y<height; ++y) for (uint32_t x=0; x<width; ++x)
-      data[(size_t)y*width+x] = floating && (alpha_only || floating_extra_exponents[c]) ?
+      data[(size_t)y*width+x] = wide_integer ? integer_sample(x,y,colors+c,0,depth) :
+        floating && (alpha_only || floating_extra_exponents[c]) ?
         floating_sample(x,y,colors+c,0,0) : (float)code(x,y,colors+c,depth) / (float)((1u<<depth)-1);
     check(JxlEncoderSetExtraChannelBuffer(settings, &format, data, pixels * sizeof(float), c));
   }
@@ -137,6 +143,31 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--integer")) {
+    wide_integer = 1; alpha_depth = 23;
+    for (vardct = 0; vardct <= 1; ++vardct) {
+      resampling = ec_resampling = 1; dimension_shift = responsive = associated = 0;
+      generate(argv[1], "integer_rgb", 33, 7, 3, 17, 9, 6, 7, 0, 0);
+      generate(argv[1], "integer_gray", 17, 9, 1, 24, 9, 8, 7, 0, 0);
+      associated = 1;
+      generate(argv[1], "integer_associated", 37, 9, 3, 23, 9, 5, 7, 0, 0);
+      resampling = 2; ec_resampling = 8; dimension_shift = 1;
+      generate(argv[1], "integer_resampled", 37, 17, 3, 24, 9, 7, 7, 0, 0);
+      resampling = 4; ec_resampling = 4; dimension_shift = 2;
+      generate(argv[1], "integer_resampled4", 17, 9, 1, 19, 1, 4, 7, 1, 0);
+      resampling = 8; ec_resampling = 8; dimension_shift = 3;
+      generate(argv[1], "integer_resampled8", 9, 1, 3, 17, 1, 2, 7, 1, 0);
+      resampling = ec_resampling = 1; dimension_shift = associated = 0; responsive = 1;
+      generate(argv[1], "integer_distributed", 257, 9, 3, 24, 9, 3, 7, 0, 1);
+      responsive = 0;
+      if (vardct) {
+        progressive_dc = 1;
+        generate(argv[1], "integer_progressive_dc", 65, 33, 3, 24, 0, 2, 7, 0, 1);
+        progressive_dc = 0;
+      }
+    }
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--floating")) {
     floating = 1;
     for (vardct = 0; vardct <= 1; ++vardct) {

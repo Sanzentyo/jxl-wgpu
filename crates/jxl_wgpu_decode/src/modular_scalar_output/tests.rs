@@ -105,9 +105,16 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
         Extent2d::new(3, 1),
         Extent2d::new(129, 9),
     ] {
-        for bits in [1, 5, 8, 12, 16] {
+        for bits in [1, 5, 8, 12, 16, 17, 24, 25, 31] {
             let mask = (1_u32 << bits) - 1;
-            let values = [-7, 0, mask as i32, mask as i32 + 13, (mask / 2) as i32, -1];
+            let values = [
+                -7,
+                0,
+                mask as i32,
+                (mask as i32).saturating_add(13),
+                (mask / 2) as i32,
+                -1,
+            ];
             let plane = GpuModularChannelLayout {
                 word_offset: 2,
                 row_stride_words: extent.width + 2,
@@ -172,7 +179,7 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                             )
                             .unwrap(),
                             NumericSampleMapping::NativeUnsigned,
-                            bits.div_ceil(8),
+                            bits.next_power_of_two().max(8) / 8,
                         )
                     };
                     let stride = u64::from((oriented.width + 2) * sample_bytes);
@@ -341,6 +348,13 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                                 [(plane.word_offset + y * plane.row_stride_words + x) as usize];
                             let code = if floating {
                                 (sample as f32 / mask as f32).to_bits()
+                            } else if domain == crate::ModularSampleDomain::DecodedF32 {
+                                let normalized = sample as f32 / mask as f32;
+                                if (0.0..=1.0).contains(&normalized) {
+                                    (f64::from(normalized) * f64::from(mask)).round() as u32
+                                } else {
+                                    0
+                                }
                             } else {
                                 u32::try_from(sample)
                                     .ok()

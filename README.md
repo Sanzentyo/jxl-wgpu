@@ -94,7 +94,7 @@ also verify padded edge blocks and preservation of GPU-decoded raw quantization 
 HF-global metadata continuations. These paths return packed RGB8 and match both reference decoders
 within one code value under whole and bounded asynchronous input.
 
-XYB VarDCT accepts every integer source depth from 1 through 16.
+XYB VarDCT accepts every integer source depth from 1 through 31.
 Twenty synthetic fixtures cover every depth, plus high-depth grayscale, orientation, resampling,
 multiple LF groups, and recursive DC. Both reference decoders agree within one RGB8 code; the
 non-XYB YCbCr profile remains limited to 8-bit integer input. XYB VarDCT also accepts legal JPEG XL
@@ -108,7 +108,7 @@ JPEG upsampling, recursive DC, and Display-P3/BT.2020 conversion. Non-color nume
 luminance mapping needed for PQ/HLG output remain unsupported in this decoder path.
 
 Both coding modes now return planar/interleaved F32 RGB/BGR/RGBA/BGRA through
-`PixelFormat::rgb_f32`. Modular normalizes 1–16-bit Gray/RGB/RGBA samples, preserving alpha;
+`PixelFormat::rgb_f32`. Modular normalizes 1–31-bit Gray/RGB/RGBA samples, preserving alpha;
 VarDCT keeps unclipped reconstructed color. Float outputs retain negative and greater-than-one
 values, use the existing GPU leases, and can feed an `Rgba16Float` display texture. Modular float
 conversion currently supports BT.709 primaries with sRGB, Linear, BT.709 or BT.2020 transfer;
@@ -125,6 +125,15 @@ Seven nine-layer fixtures cover nine independently typed/depth-coded extras, two
 Gray/RGB, both coding modes, distributed groups and shifted resampling. Pre-transform patch
 references and broader original color domains remain pending.
 
+Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
+Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular
+integer planes preserve exact codes; independently declared alpha rescales with exact GPU integer
+arithmetic. Filtering/composition uses F32, and final integer rounding evaluates the exact F32
+value against the requested maximum without losing additional low bits. Source precision does
+not imply lossless precision after filtering or lossy VarDCT reconstruction. The new corpus
+contains 42 precision/predictor/alpha fixtures and 40 rendering cases, including every 25–31-bit
+XYB metadata declaration, wide extras, RCT/Squeeze, resampling and layered composition.
+
 JPEG XL floating sources support all 154 legal combinations of 2–8 exponent bits and 2–23 mantissa
 bits, including binary16 and binary32. `DecodeProfile` retains `SampleBitDepth`, including the
 exponent width. `NumericSampleMapping::NativeFloat` returns scalar F32 from a Modular gray source
@@ -135,7 +144,7 @@ F32 values. Integer and floating extras can coexist. RGB8 output quantizes after
 The checked-in corpus covers every floating precision and 27 rendering/animation cases against
 libjxl, with byte-identical whole and bounded fragmented GPU output.
 
-Modular reconstructs integer extra channels with independent 1–16-bit precision.
+Modular reconstructs integer extra channels with independent 1–31-bit precision.
 `DecodeProfile` reports color and extra-channel counts separately from native output formats, and
 `AnimationMetadata::extra_channels` retains each declaration. `GpuOutputRequest::with_extra_channel`
 selects one plane for native unsigned or normalized scalar F32 output. Color output uses the first

@@ -182,6 +182,19 @@ impl Compositor {
                 "numeric mapping does not match the declared source sample type".into(),
             ));
         }
+        if request.mapping()
+            == crate::GpuOutputMapping::Numeric(crate::NumericSampleMapping::NativeUnsigned)
+            && native.is_none_or(|format| {
+                source_depth
+                    != (SampleBitDepth::Integer {
+                        bits_per_sample: u32::from(format.bits_per_sample),
+                    })
+            })
+        {
+            return Err(Error::UnsupportedOutputFormat(
+                "native composed scalar output must match its declared unsigned depth".into(),
+            ));
+        }
         let scalar_float = matches!(
             request.mapping(),
             crate::GpuOutputMapping::Numeric(
@@ -245,7 +258,7 @@ impl Compositor {
                 format!(
                     "{IMAGE_ORIENTATION_SHADER}\n{}\n{spot_source}\n{}",
                     jxl_wgpu::ALPHA_OUTPUT_SHADER,
-                    include_str!("native.wgsl")
+                    crate::modular_sample::shader(include_str!("native.wgsl"))
                 ),
             )
         } else {

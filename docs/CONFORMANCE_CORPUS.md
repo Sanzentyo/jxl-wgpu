@@ -1717,3 +1717,81 @@ pass. Formatting, warning-free Clippy/rustdoc, all-target/all-feature checking, 
 six-crate WASM gate pass. Reference and Metal harnesses each pass 18 cases, and the indexed Gray8
 U8 readback case passes. All 416 floating-corpus files regenerate byte-identically with libjxl
 0.12.0; the extended generators also reproduce all 20 original integer still/composition fixtures.
+
+## Integer JPEG XL precision through 31 bits
+
+`crates/jxl_wgpu_decode/test-data/integer/` contains 82 encoded fixtures and their references
+(286 files). Reproduce them with libjxl/libjxl_cms 0.12.0 using
+`cargo run -p jxl_wgpu_decode --example regenerate_integer -- [output-directory]`.
+The C generators are compiled offline with `-std=c11 -Wall -Wextra -Werror`; production never
+links or selects the CPU codec. Integer and floating generation now share checked subprocess,
+hex, and independent extra-plane oracle utilities in `examples/support/offline.rs`.
+
+The 42 precision fixtures consist of 31 grayscale declarations, six independently declared
+RGB/alpha combinations, three large 31-bit predictor cases and two 29-bit RCT cases. Their source
+`.u32.hex` files record exact codes, including zero, maximum, adjacent endpoints, the 24-bit
+mantissa boundary, large half-range values and deterministic full-range words. Cases with 257×9
+images force Gradient, Weighted and predictor 13; the 129×5 RGB cases force RCT 6 and 41.
+CPU inventory tests require real RCT jobs and a separate distributed Squeeze topology, rather
+than trusting encoder settings or fixture names. The direct tests compare every source code,
+including integer alpha rescaling computed independently in Rust `u64`, through whole input and
+256-byte entropy windows supplied in 43-byte transport chunks. Selected alpha retains its own
+native precision. The F32 tests compare independently decoded libjxl RGBA and scalar samples
+within one binary32 ULP.
+
+libjxl's public encoder [accepts integer precision only through 24 bits](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/encode.cc).
+Its image API also converts pixels through F32. To preserve every source bit, the precision
+generator stores raw words in binary32 Modular frames, then serializes explicit integer sRGB
+image metadata. Frame boundaries come from inventory, not fixed byte offsets. The RCT cases use
+29-bit/7-exponent-bit floating representation so the encoder retains enough working headroom
+to actually emit RCT. No Palette is emitted, so changing sample interpretation does not alter
+implicit Palette entries. The final integer codestream is parsed in full and independently
+decoded by libjxl before any reference is saved.
+
+The 40 rendering fixtures include 20 public-encoder streams with primary and extra precisions
+17–24, then 20 variants with extended declarations. Fourteen variants cover each XYB primary depth
+18–31 (17-bit input is covered by the original), completing the earlier 1–16-bit corpus. Six more cover Modular resampling/distribution, both-mode resampling, recursive DC, and
+Modular/VarDCT animation at 31 bits. Extended variants locate fixed-width integer precision
+fields by parsing the image grammar, increase each extra's declaration by seven bits, and clear
+the 16-bit-working-buffer hint. They retain all encoded frame bytes, names, crops, blend selectors,
+transforms and entropy. References are recomputed from these complete streams; changing a
+Modular declaration changes its normalization denominator while XYB metadata does not rescale
+the reconstructed color.
+
+Rendering covers two independently associated alphas, depth, selection, spot, CFA, thermal,
+black and optional planes, all five blend modes, 2×/4×/8× color and extra reconstruction, dimension
+shifts, orientation, Squeeze/distributed streams, recursive progressive DC and seven nine-layer
+animations. The shared `tests/support/rendering.rs` checks every selected extra, base RGBA, spots
+and preserved alpha association against libjxl. Scalar/alpha tolerance is `2e-6 * (1 + abs(reference))`;
+Modular color uses `2e-5` and VarDCT color uses `0.003`, with the established inverse-alpha
+amplification adjustment. Whole and bounded fragmented outputs must be byte-identical; frame
+counts, metadata and released reservations are checked. Eight additional color-output cases
+exercise RGB8/RGBA8 and native 17–31-bit words, including zero high padding after composition.
+RGB8/RGBA8 permit one code; native wide color retains the same normalized reconstruction
+tolerance. Source metadata precision is not a claim of 31-bit accurate lossy reconstruction.
+
+`unsigned_quantization_and_alpha_rescaling_are_exact_on_gpu` compares 34,224 arithmetic cases:
+all 31×31 integer alpha depth pairs, endpoints and deterministic values, plus binary32 values
+on both sides of half-code boundaries. Rescaling uses a Rust `u64` reference. Quantization uses
+the exact rational value in Rust `u128`; even F64 multiplication can round a 55-bit product onto
+the wrong side of a half-code boundary. The production WGSL uses two `u32` limbs, requiring no
+F64 capability or new buffer. Extended scalar-packer tests cover 17/24/25/31-bit storage, negative
+and overshoot values, decoded F32 inputs, all orientations, one-pixel axes, padded rows,
+nonzero binding offsets, two-dimensional dispatch and guard bytes. Invalid integer declarations
+and mismatched native storage remain typed failures.
+
+The first validation caught two test-oracle assumptions: F64 was insufficient for an exact
+half-code reference, and libjxl's chosen group size did not guarantee distribution. The reference
+now evaluates exact rationals and generation explicitly selects 128-pixel groups. Both corrected
+checks pass along with all precision/rendering cases. The decoder's unrelated original-color,
+lossy/XYB Modular, pre-transform reference and full conformance requirements remain open.
+
+Validation on 2026-09-08 Apple M5/Metal: 713 distinct tests pass across 28 workspace targets;
+one existing manual benchmark remains ignored. A serial workspace run passes 712 tests, and
+the subsequently expanded integer target passes all six tests across 40 rendering fixtures;
+the profile target and expanded CPU topology gate also pass. Formatting, warning-free
+Clippy/rustdoc, all-target/all-feature checking, Rust 1.89 and the six-crate WASM gate pass.
+Reference and Metal harnesses each pass 18 cases, and the indexed Gray8 U8 readback case passes.
+All 286 integer-corpus files regenerate byte-identically with libjxl 0.12.0. The shared generator
+refactor reproduces all 416 floating-corpus files and all 20 original integer still/composition
+fixtures byte-identically.

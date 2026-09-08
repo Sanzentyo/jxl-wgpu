@@ -42,7 +42,7 @@ fn unsupported_integer_depth_errors_preserve_the_declared_depth_and_color_domain
         (
             include_str!("../test-data/testsrc_vardct_depth_rgb_16_single.jxl.hex"),
             VarDctColorTransform::Xyb,
-            [0, 17, 31],
+            [0, 32, u32::MAX],
         ),
         (
             include_str!("../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"),
