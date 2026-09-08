@@ -41,7 +41,7 @@ pub(super) struct DecodeJobLifetime {
     pub(super) _dispatch_control: DecodeBufferLease,
     pub(super) _transient_permit: MemoryPermit,
     pub(super) progressive_dc_planes: Option<ProgressiveDcXybPlanes>,
-    pub(super) _progressive_dc_uniform: Mutex<Option<wgpu::Buffer>>,
+    pub(super) lf_render: Option<crate::modular_render::ModularLfBuffers>,
 }
 
 impl Drop for DecodeJobLifetime {

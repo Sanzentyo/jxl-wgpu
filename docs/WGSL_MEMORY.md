@@ -111,7 +111,6 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_pass_group.wgsl` | `HfCoefficientPassParams` / `Params` | 92-byte stream/geometry prefix, 48-byte block-context locations, component shifts, metadata/order bases, spatial group index, one pad | 160 | Rust 16 / WGSL 4 | read-only storage |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `GenericPacketExecutionState` / reconstruction words | common entropy/LZ/consumer state, active LF/HF phase, decoded LF/HF counts, first-block count, extra precision, previous gradient, two pads | 64 | 16 | storage subrecord |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `WeightedPacketExecutionState` / reconstruction words | generic prefix plus four true errors, twelve subprediction-error accumulators, two pads | 128 | 16 | storage subrecord |
-| `jxl_wgpu_decode/progressive_dc.wgsl` | `ProgressiveDcConvertParams` / `ConvertParams` | extent/count, three source offset/stride/extents, three output strides, three LF multipliers and reserved lanes | 96 | 16 | uniform |
 | `jxl_wgpu_decode/progressive_dc.wgsl` | `ProgressiveDcPackParams` / `PackParams` | extent/count, three input strides, LF vec4 offset/stride and two reserved words | 48 | 16 | uniform |
 | `jxl_wgpu_encode/vardct_encoder.wgsl` | `VarDctKernelParams` / `Params` | source/block geometry, strategy/global/LF quantization, separate 19-entry DC and HF prefix tables, X/Y/B LF quantization, LF/HF X/B correlation, X/Y/B HF quantization, and explicit padding | 512 | 4 | read-only storage |
 | `jxl_wgpu_encode/vardct_encoder.wgsl` | `VarDctKernelArtifact` / `Artifact` | 16-entry strategy map, 48 DC samples/tokens/extras, 64-word DC fragment, DC histogram, 256-word AC fragment, AC histogram, and 3×1024 forward/quantized XYB coefficient words | 26,880 | 4 | storage/readback record |
@@ -250,7 +249,7 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_resource` (decoder) | LF-group table RO, full-image dequantized-LF atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | checked per-component extents/source bases and global atlas base/stride/origin; coalesced XYB can apply chroma-from-luma, while JPEG sampling writes compact component grids directly; one 1D workgroup per LF-group block batch |
 | `vardct_raw_matrix` (decoder) | inverse-transformed side-image arena RO, resident resource table and shared decode status RW, U | 64x1 default, autotuned linear lanes | Tier A (`KernelVariant` 1-D) | one invocation per canonical matrix sample; checked plane offsets/strides and one, two, or four aliased resource targets; non-positive or oversized weights set a typed sticky status before AC/render |
 | `vardct_packet` (decoder) | whole or reusable-window codestream/MA metadata RO, reconstruction/raw metadata/coefficients/status RW, control U, Modular params RW | 1x1 | Tier B (fixed) | combined/global-tree and split LF/HF local-tree entry points use logical channel widths with explicit physical strides; all packet forms resume across ordered windows using one 64/128-byte aligned state and reusable upload, while local trees and single-entry TOCs map LF cursors; single-entry TOCs also map the HF-global boundary before the final authoritative map |
-| `progressive_dc::{convert_modular,pack_lf}` (decoder) | Modular arena or X/Y/B planes RO, resident X/Y/B planes or VarDCT resources RW, U | 64x1 | Tier A (`KernelVariant` linear) | checked common extents/strides, source arena ranges, destination resource vec4 range, storage limits and WGSL-u32 addresses; four versioned LF slots retain tracked plane leases through the last consumer; scratch is released after producer validation |
+| `progressive_dc::pack_lf` (decoder) | X/Y/B planes RO, VarDCT resources RW, U | 64x1 | Tier A (`KernelVariant` linear) | checked common extents/strides, plane binding ranges, destination resource vec4 range, storage limits and WGSL-u32 addresses; four versioned LF slots retain tracked plane leases through the last consumer; scratch is released after producer validation |
 | `vardct_artifact` (decoder) | LF-group raw metadata RO, artifact/occupancy plus full-image resources RW, U | 1x1 | Tier B (fixed) | validates non-overlapping mixed varblocks, global LF/correlation strides and aligned destination origin, derives per-channel task masks/destinations/LF offsets from JPEG shifts, compacts all 27 strategy buckets, and emits three bounded indirect records per strategy plus exact coefficient ranges |
 | resident `vardct_general` (decoder) | coefficients/artifact/resources RO, two global scratch buffers and X/Y/B output RW, U | 64x1 | Tier B (fixed) | one indirect dequantize/horizontal/vertical sequence per populated regular strategy bucket; task/artifact/resource/per-channel-LF/output ranges are host-validated |
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
@@ -792,3 +791,15 @@ buffer and VarDCT block-plane contracts. The scheduler and resident Rust records
 field order; ABI reflection and actual GPU filtering validate this boundary. Invalid constants,
 Modular sigma below 1e-8, mismatched grids and device limits are typed errors. Every temporary
 allocation is included in `ModularRenderPlan::total_bytes` and the shared decoder reservation.
+
+Modular LF producers share `modular_render/color.wgsl` normalization (80-byte `NormalizeColorParams`),
+Gaborish, constant-sigma EPF and frame upsampling with presentation frames. They stop before the
+color packer. `modular_render_bytes` includes every reconstruction allocation, weight and uniform;
+`progressive_dc_plane_bytes` and `progressive_dc_uniform_bytes` report subsets of that total.
+The final buffer set is upsampled storage when present, otherwise the restoration destination
+selected by pass parity. Each final plane splits its exact reservation from the exclusive
+transient permit before submission. Releasing producer scratch preserves only those three plane
+reservations; cloning/deleting LF slot versions does not duplicate/release a live reservation.
+The allocation test covers 32 combinations of factors 1/2/4/8, Gaborish and EPF0/1/2/3 with
+37×17 final geometry and padded input rows. Both lane selection and frame admission include this
+complete footprint. No separate Modular-to-LF conversion shader or uniform remains.

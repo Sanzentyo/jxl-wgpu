@@ -906,6 +906,43 @@ pre-restoration planes; saving the final pre-color-transform planes fixes it. Th
 matches [libjxl's render pipeline](https://github.com/libjxl/libjxl/blob/main/lib/jxl/dec_cache.cc).
 No CPU entropy or pixel work is added to the production decoder.
 
+`lf_modular_root_{16x2,8x1,4x1,2x1}.jxl.hex` are independent libjxl 0.12.0 lossy XYB Modular
+seeds from `test-data/generate_lf_modular.c`. For factor F=1/2/4/8, the image is
+16/F × ceil(2/F), R=`13*x*F+7*y`, G=`(3*x*F) XOR (11*y)`, B=`5*x*F+17*y` (RGB8). The public
+encoder API uses distance 2, effort 7, Modular=1, original-profile=false, and disables restoration
+and resampling. Reproduce the four hex streams with:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror crates/jxl_wgpu_decode/test-data/generate_lf_modular.c \
+  $(pkg-config --cflags --libs libjxl) -o /tmp/generate_lf_modular
+/tmp/generate_lf_modular crates/jxl_wgpu_decode/test-data
+```
+
+| Modular LF seed | Binary bytes | SHA-256 |
+|---|---:|---|
+| `lf_modular_root_16x2.jxl.hex` | 81 | `5f5093182e96981854b681d087b2cc6ec036e0c73018a5e771d14bdc942a9105` |
+| `lf_modular_root_8x1.jxl.hex` | 50 | `2915e2f96db37d4c1df84b21da91b13966f72990246f025135143e57f60109a0` |
+| `lf_modular_root_4x1.jxl.hex` | 47 | `bcb408ffefc4a3666762ecbb25048524a7e9c611afb4dbf3b98c3e0439d8d3f1` |
+| `lf_modular_root_2x1.jxl.hex` | 44 | `60ff1368e1db4a2f21f0e27a404159f5b79e3eaf87bc92063f30bc74c6c09627` |
+
+The test preserves their entropy and replaces only the physical header with LF level 2. Eleven
+configurations cover no filtering, default Gaborish, each EPF iteration count, custom per-channel
+Gaborish weights and EPF sigma parameters, and 2×/4×/8× upsampling. All feeds replace the first
+root of an optional generated 1024×128 DC2 stream. Every fixed-size filtering variant changes the
+independent RGB8 reference; expanded seeds retain an input gradient even at 2×1. Whole blocking
+and 256-byte-window fragmented async outputs agree with Rust `jxl` and `djxl` within one code;
+all shared input/GPU reservations return to zero. The independent allocation test also verifies
+that each of 32 reconstruction configurations retains exactly three 37×17 F32 allocations after
+producer scratch is dropped, including odd/even restoration passes and all upsampling factors.
+
+Modular LF reconstruction checkpoint on 2026-09-08 Apple M5/Metal: all 730 workspace tests pass
+across 31 targets, with one existing manual benchmark ignored. All six LF tests, the 32-case
+allocation check, and the existing lossy Modular presentation corpus pass. Formatting, workspace
+check, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal
+harnesses each pass 18 cases; indexed Gray8 U8 readback passes. The four seeds regenerate
+byte-for-byte. This completes the filtered/resampled XYB Modular LF checkpoint, while the full
+JPEG XL goal and remaining roadmap gates stay active.
+
 LF graph checkpoint on 2026-09-08 Apple M5/Metal: all 729 workspace tests pass across 31 targets,
 with one existing manual benchmark ignored. The 19-test frame-sequence target and five focused
 LF tests pass; the latter include restored/upsampled VarDCT roots. Formatting, workspace check,

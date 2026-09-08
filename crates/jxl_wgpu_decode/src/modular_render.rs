@@ -14,7 +14,10 @@ use crate::modular_sample::ModularOutputPlane;
 use crate::modular_transform::GpuModularChannelLayout;
 
 mod color;
+mod lf;
 pub(crate) use color::ModularColorConfig;
+pub(crate) use color::ReconstructionPipeline as ModularReconstructionPipeline;
+pub(crate) use lf::{ModularLfBuffers, ModularLfPlan};
 
 /// Interpretation of resident Modular output words after inverse transforms or resampling.
 #[repr(u32)]
@@ -293,7 +296,7 @@ pub(crate) fn upsample_kernel(
 }
 
 pub(crate) struct ModularRenderBuffers {
-    color: Option<color::ColorBuffers>,
+    color: Option<color::ReconstructionBuffers>,
     pub output: wgpu::Buffer,
     scratch: Option<wgpu::Buffer>,
     weights: Vec<ResidentUpsampleWeights>,
@@ -382,7 +385,6 @@ impl ModularRenderPipeline {
                     source: input,
                     sources,
                     output: binding(&buffers.output)?,
-                    upsample: &self.upsample,
                     weights,
                 },
             )?);

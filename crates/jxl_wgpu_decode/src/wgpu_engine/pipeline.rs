@@ -16,13 +16,13 @@ use crate::modular_palette::{
     DEFAULT_MODULAR_PALETTE_VARIANT, MODULAR_PALETTE_KERNEL_KEY, ModularPalettePipeline,
 };
 use crate::modular_rct::{DEFAULT_MODULAR_RCT_VARIANT, MODULAR_RCT_KERNEL_KEY, ModularRctPipeline};
+use crate::modular_render::ModularReconstructionPipeline;
 use crate::modular_squeeze::ModularSqueezePipeline;
 use crate::modular_tree::MaTreeNodeIr;
 use crate::profile::{
     StandardModularProfile, parse_modular_frame_profile, parse_progressive_dc_modular_profile,
     parse_standard_modular_profile,
 };
-use crate::progressive_dc::ProgressiveDcPipeline;
 use crate::{
     AnimationMetadata, DecodeProfile, Error, GpuCodestream, GpuOutputRequest, GpuSubmissionEngine,
     ModularPredictionProfile, PreparedGpuSession, Result,
@@ -186,7 +186,7 @@ impl WgpuSubmissionEngine {
             pipelines,
             native_f64_pipelines,
             inverse_pipelines: Arc::new(ModularInversePipelineCache::default()),
-            progressive_dc_pipeline: Arc::new(OnceLock::new()),
+            lf_reconstruction_pipeline: Arc::new(OnceLock::new()),
             memory: memory_budget,
             buffers,
             stream_window_limit: None,
@@ -461,7 +461,31 @@ impl WgpuSubmissionEngine {
             .is_none()
             .then_some(profile.color_render.clone())
             .flatten();
-        if factors.iter().any(|&factor| factor != 1) || color_render.is_some() {
+        if profile.progressive_dc.is_some() {
+            let inverse = if let Some(frame) = &profile.resident_frame_plan {
+                &frame.inverse_plan
+            } else {
+                &profile
+                    .resident_entropy_plans
+                    .first()
+                    .ok_or(Error::EngineContract(
+                        "LF reconstruction has no resident inverse topology",
+                    ))?
+                    .inverse_plan
+            };
+            output.lf_render = Some(crate::modular_render::ModularLfPlan::new(
+                color_render.ok_or(Error::EngineContract(
+                    "LF reconstruction configuration is missing",
+                ))?,
+                extent,
+                &output
+                    .source_channels
+                    .select(&inverse.final_gpu_layouts())?,
+                profile.channel_upsampling[0],
+                &profile.upsampling_weights,
+                &self.backend.device().limits(),
+            )?);
+        } else if factors.iter().any(|&factor| factor != 1) || color_render.is_some() {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
                 &frame.inverse_plan
             } else {
@@ -606,18 +630,13 @@ impl WgpuSubmissionEngine {
             DeviceAdmissionOptions {
                 requested_frame_slots: request.max_frame_slots().get(),
                 memory_limit_bytes,
-                progressive_dc: profile.progressive_dc.is_some(),
             },
         )?;
-        let progressive_dc_pipeline = profile
+        let lf_reconstruction_pipeline = profile
             .progressive_dc
             .map(|_| {
-                match self.progressive_dc_pipeline.get_or_init(|| {
-                    ProgressiveDcPipeline::with_policy(
-                        self.backend.device(),
-                        self.backend.kernel_policy(),
-                    )
-                    .map(Arc::new)
+                match self.lf_reconstruction_pipeline.get_or_init(|| {
+                    ModularReconstructionPipeline::new(self.backend.device()).map(Arc::new)
                 }) {
                     Ok(pipeline) => Ok(Arc::clone(pipeline)),
                     Err(error) => Err(error.clone()),
@@ -707,7 +726,7 @@ impl WgpuSubmissionEngine {
                 buffers: Arc::clone(&self.buffers),
                 f64_output_path,
                 inverse_pipelines,
-                progressive_dc_pipeline,
+                lf_reconstruction_pipeline,
             },
         )
         .with_resolved_frame_slots(resolved_frame_slots))

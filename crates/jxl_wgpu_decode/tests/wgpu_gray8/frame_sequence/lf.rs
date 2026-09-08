@@ -263,10 +263,6 @@ fn cancelling_after_lf_validation_releases_tracked_planes_and_incremental_input(
 /// Reframe an independent cjxl VarDCT packet at LF level 2. This preserves all entropy bytes;
 /// only the normative physical header changes. The small image has restoration disabled.
 fn vardct_root(gaborish: bool, upsampling: u32) -> Vec<u8> {
-    use jxl_gpu_bitstream::{
-        BitRange, BitWriter, EdgePreservingFilterInventory, GaborishInventory,
-        RestorationFilterInventory,
-    };
     let case = Case {
         name: "lf_root",
         hex: if upsampling == 1 {
@@ -278,14 +274,30 @@ fn vardct_root(gaborish: bool, upsampling: u32) -> Vec<u8> {
         bits: 8,
         vardct: true,
     };
-    let data = encoded(&case);
+    lf_root(&case, gaborish, 0, upsampling, false)
+}
+
+fn lf_root(case: &Case, gaborish: bool, epf: u32, upsampling: u32, custom: bool) -> Vec<u8> {
+    use jxl_gpu_bitstream::{
+        BitRange, BitWriter, EdgePreservingFilterInventory, GaborishInventory,
+        RestorationFilterInventory,
+    };
+    let data = encoded(case);
     let parsed = parse(&data, Default::default()).unwrap();
     let inventory = parsed.codestream_inventory(Default::default()).unwrap();
     let mut frame = inventory.frames[0].clone();
-    assert_eq!(frame.encoding, FrameEncoding::VarDct);
+    assert_eq!(
+        frame.encoding,
+        if case.vardct {
+            FrameEncoding::VarDct
+        } else {
+            FrameEncoding::Modular
+        }
+    );
+    assert!(inventory.image_header.xyb_encoded);
     assert_eq!(
         frame.color_sample_extent(),
-        Some((16 / upsampling, 2 / upsampling))
+        Some((16_u32.div_ceil(upsampling), 2_u32.div_ceil(upsampling)))
     );
     assert_eq!(frame.upsampling, 1);
     assert_eq!(frame.num_passes, 1);
@@ -300,7 +312,7 @@ fn vardct_root(gaborish: bool, upsampling: u32) -> Vec<u8> {
     let mut header = BitWriter::new();
     header.write_bits(0, 1).unwrap(); // non-default physical header
     header.write_bits(1, 2).unwrap(); // LowFrequency
-    header.write_bits(0, 1).unwrap(); // VarDCT
+    header.write_bits(u64::from(!case.vardct), 1).unwrap(); // encoding
     if frame.flags == 0 {
         header.write_bits(0, 2).unwrap();
     } else {
@@ -310,17 +322,43 @@ fn vardct_root(gaborish: bool, upsampling: u32) -> Vec<u8> {
     header
         .write_bits(u64::from(upsampling.trailing_zeros()), 2)
         .unwrap(); // frame upsampling
-    header.write_bits(u64::from(frame.x_qm_scale), 3).unwrap();
-    header.write_bits(u64::from(frame.b_qm_scale), 3).unwrap();
+    if case.vardct {
+        header.write_bits(u64::from(frame.x_qm_scale), 3).unwrap();
+        header.write_bits(u64::from(frame.b_qm_scale), 3).unwrap();
+    } else {
+        header
+            .write_bits(u64::from(frame.group_size_shift), 2)
+            .unwrap();
+    }
     header.write_bits(0, 2).unwrap(); // one pass
     header.write_bits(1, 2).unwrap(); // LF level 2
     header.write_bits(0, 2).unwrap(); // empty name
     header.write_bits(0, 1).unwrap(); // custom restoration
     header.write_bits(u64::from(gaborish), 1).unwrap();
     if gaborish {
-        header.write_bits(0, 1).unwrap();
-    } // default Gaborish weights
-    header.write_bits(0, 2).unwrap(); // no EPF
+        header.write_bits(u64::from(custom), 1).unwrap();
+        if custom {
+            for (a, b) in [(0x2c00, 0x2800), (0x3000, 0x2800), (0x2800, 0x2400)] {
+                header.write_bits(a, 16).unwrap();
+                header.write_bits(b, 16).unwrap();
+            }
+        }
+    }
+    header.write_bits(u64::from(epf), 2).unwrap();
+    if epf != 0 {
+        assert!(!case.vardct);
+        header.write_bits(0, 1).unwrap(); // default channel weights
+        header.write_bits(u64::from(custom), 1).unwrap();
+        if custom {
+            for value in [0x3e00, 0x3a00, 0x3d00] {
+                // pass0 1.5, pass2 .75, border 1.25
+                header.write_bits(value, 16).unwrap();
+            }
+        }
+        header
+            .write_bits(if custom { 0x4000 } else { 0x3c00 }, 16)
+            .unwrap(); // Modular sigma
+    }
     header.write_bits(0, 2).unwrap(); // no restoration extensions
     header.write_bits(0, 2).unwrap(); // no frame extensions
     frame.header_bits = BitRange {
@@ -428,6 +466,125 @@ fn vardct_lf_roots_and_skip_progressive_consumers_match_both_reference_decoders(
                     0
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn modular_lf_restoration_and_upsampling_match_both_reference_decoders() {
+    let Some(original) = crate::common::cjxl_progressive_dc_codestream(2) else {
+        return;
+    };
+    let Some(backend) = backend() else {
+        return;
+    };
+    let parsed = parse(&original, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let data = parsed.codestream();
+    let start = inventory.frames[0].header_bits.offset as usize / 8;
+    let end = inventory.frames[1].header_bits.offset as usize / 8;
+    let mut previous = None;
+    for (gaborish, epf, upsampling, custom) in [
+        (false, 0, 1, false),
+        (true, 0, 1, false),
+        (false, 1, 1, false),
+        (false, 2, 1, false),
+        (false, 3, 1, false),
+        (true, 1, 1, true),
+        (true, 2, 1, true),
+        (true, 3, 1, true),
+        (true, 3, 2, true),
+        (true, 3, 4, true),
+        (true, 3, 8, true),
+    ] {
+        let seed = Case {
+            name: "modular_lf_root",
+            format: LosslessModularFormat::Rgb,
+            bits: 8,
+            vardct: false,
+            hex: match upsampling {
+                1 => include_str!("../../../test-data/lf_modular_root_16x2.jxl.hex"),
+                2 => include_str!("../../../test-data/lf_modular_root_8x1.jxl.hex"),
+                4 => include_str!("../../../test-data/lf_modular_root_4x1.jxl.hex"),
+                8 => include_str!("../../../test-data/lf_modular_root_2x1.jxl.hex"),
+                _ => unreachable!(),
+            },
+        };
+        let root = lf_root(&seed, gaborish, epf, upsampling, custom);
+        let mut modified = data[..start].to_vec();
+        modified.extend_from_slice(&root);
+        modified.extend_from_slice(&data[end..]);
+        let case = Case {
+            vardct: true,
+            ..seed
+        };
+        let checked = parse(&modified, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap();
+        assert_eq!(checked.frames[0].encoding, FrameEncoding::Modular);
+        assert_eq!(checked.frames[0].upsampling, upsampling);
+        assert_eq!(checked.frames[0].lf_level, 2);
+        assert_eq!(
+            checked.frames[0].color_sample_extent(),
+            Some((16_u32.div_ceil(upsampling), 2_u32.div_ceil(upsampling)))
+        );
+        FrameExecutionPlan::negotiate(&checked).unwrap();
+        let expected = rust_frames(&case, &modified);
+        let djxl = djxl_frames(&case, &modified);
+        assert_eq!(expected.len(), 1);
+        // Filtering must affect the independent reference; otherwise this would only test routing.
+        if let Some(previous) = previous.as_ref().filter(|_| upsampling == 1) {
+            assert!(
+                &expected[0].1 != previous,
+                "unchanged reference: Gaborish={gaborish}, EPF={epf}, upsampling={upsampling}, custom={custom}"
+            );
+        }
+        previous = Some(expected[0].1.clone());
+        for bounded in [false, true] {
+            let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+            let decoder = GpuDecoder::new(if bounded {
+                engine.with_stream_window_limit(NonZeroU64::new(256).unwrap())
+            } else {
+                engine
+            });
+            let mut session = if bounded {
+                incremental(&decoder, &modified, request(&case))
+            } else {
+                decoder.open(&modified, request(&case)).unwrap()
+            };
+            let frame = if bounded {
+                pollster::block_on(session.next_frame_async())
+                    .unwrap()
+                    .unwrap()
+            } else {
+                session.next_frame().unwrap().unwrap()
+            };
+            let pixels = samples(&read_output(&backend, &frame.output().outputs[0]), 8);
+            for oracle in
+                std::iter::once(&expected[0].1).chain(djxl.as_ref().map(|frames| &frames[0]))
+            {
+                assert_eq!(pixels.len(), oracle.len());
+                let max_error = pixels
+                    .iter()
+                    .zip(oracle)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    max_error <= 1,
+                    "Gaborish={gaborish}, EPF={epf}, upsampling={upsampling}, custom={custom}, bounded={bounded}: {max_error}"
+                );
+            }
+            drop(frame);
+            assert!(session.next_frame().unwrap().is_none());
+            drop(session);
+            retired(&backend);
+            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+            assert_eq!(
+                decoder.incremental_input_budget().snapshot().reserved_bytes,
+                0
+            );
         }
     }
 }

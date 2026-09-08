@@ -25,13 +25,11 @@ use crate::modular_finalize::{
 use crate::modular_inverse::{ModularInverseJob, ModularInversePlan};
 use crate::modular_palette::ModularPaletteWeightedParams;
 use crate::modular_rct::{ModularRctArena, ModularRctParams};
+use crate::modular_render::ModularReconstructionPipeline;
 use crate::modular_squeeze::{ModularSqueezeArena, ModularSqueezeParams};
 use crate::modular_tree::EntropyCoderIr;
 use crate::profile::{
     ModularGroup, ResidentModularFramePlan, ResidentModularGroupPlan, StandardModularProfile,
-};
-use crate::progressive_dc::{
-    ProgressiveDcConvertInputs, ProgressiveDcPipeline, ProgressiveDcXybPlanes,
 };
 use crate::{
     Error, F64OutputPolicy, GpuOutputMapping, GpuOutputRequest, ModularPredictor,
@@ -407,6 +405,10 @@ impl GroupDispatchLayout {
             final_output_uniform_bytes,
             frame_modular_arena_bytes,
             output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
+            output
+                .lf_render
+                .as_ref()
+                .map_or(0, |plan| plan.total_bytes()),
         ]
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1061,6 +1063,7 @@ pub(super) enum OutputKind {
 pub(super) struct OutputPlan {
     pub(super) surface: Option<Arc<crate::frame_surface::FrameSurfaceLayout>>,
     pub(super) render: Option<crate::modular_render::ModularRenderPlan>,
+    pub(super) lf_render: Option<crate::modular_render::ModularLfPlan>,
     pub(super) source_channels: super::channels::OutputChannels,
     pub(super) layout: ImageLayout,
     pub(super) source_extent: Extent2d,
@@ -1119,6 +1122,7 @@ impl OutputPlan {
                 let output = Self {
                     surface: None,
                     render: None,
+                    lf_render: None,
                     source_channels: super::channels::OutputChannels::identity(
                         source_channels,
                         source_encoding,
@@ -1367,6 +1371,7 @@ impl OutputPlan {
         let output = Self {
             surface: None,
             render: None,
+            lf_render: None,
             source_channels: super::channels::OutputChannels::identity(
                 source_channels,
                 source_encoding,
@@ -1600,7 +1605,6 @@ pub(super) struct ModularMetadataInventory {
 pub(super) struct DeviceAdmissionOptions {
     pub(super) requested_frame_slots: usize,
     pub(super) memory_limit_bytes: u64,
-    pub(super) progressive_dc: bool,
 }
 
 pub(super) fn validate_device_limits(
@@ -1623,20 +1627,14 @@ pub(super) fn validate_device_limits(
     } else {
         0
     };
-    let progressive_dc_plane_bytes = if options.progressive_dc {
-        u64::from(output.layout.extent.width)
-            .checked_mul(u64::from(output.layout.extent.height))
-            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
-            .and_then(|bytes| bytes.checked_mul(3))
-            .ok_or_else(|| Error::backend("progressive-DC plane byte count overflow"))?
-    } else {
-        0
-    };
-    let progressive_dc_uniform_bytes = if options.progressive_dc {
-        std::mem::size_of::<crate::progressive_dc::ProgressiveDcConvertParams>() as u64
-    } else {
-        0
-    };
+    let progressive_dc_plane_bytes = output
+        .lf_render
+        .as_ref()
+        .map_or(0, |plan| plan.plane_bytes());
+    let progressive_dc_uniform_bytes = output
+        .lf_render
+        .as_ref()
+        .map_or(0, |plan| plan.uniform_bytes());
     for (name, required) in [
         ("bounded group stream window", stream_bytes),
         ("Modular metadata", metadata_bytes),
@@ -1686,9 +1684,11 @@ pub(super) fn validate_device_limits(
         dispatch_control_bytes,
         dispatch.inverse_transform_uniform_bytes,
         dispatch.final_output_uniform_bytes,
-        progressive_dc_plane_bytes,
-        progressive_dc_uniform_bytes,
         output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
+        output
+            .lf_render
+            .as_ref()
+            .map_or(0, |plan| plan.total_bytes()),
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1726,7 +1726,11 @@ pub(super) fn validate_device_limits(
     }
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
-        modular_render_bytes: output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
+        modular_render_bytes: output.render.as_ref().map_or(0, |plan| plan.total_bytes())
+            + output
+                .lf_render
+                .as_ref()
+                .map_or(0, |plan| plan.total_bytes()),
         modular_metadata_bytes: metadata_bytes,
         local_ma_stream_count: metadata_inventory.local_ma_stream_count,
         unique_ma_config_count: metadata_inventory.unique_ma_config_count,
@@ -1777,7 +1781,7 @@ pub(super) fn validate_device_limits(
 pub(super) struct SubmitPipelines<'a> {
     pub(super) decode: &'a wgpu::ComputePipeline,
     pub(super) inverse: Option<&'a ModularInversePipelines>,
-    pub(super) progressive_dc: Option<&'a ProgressiveDcPipeline>,
+    pub(super) lf_reconstruction: Option<&'a ModularReconstructionPipeline>,
 }
 
 pub(super) fn submit_decode(
@@ -1835,19 +1839,13 @@ pub(super) fn submit_decode(
             std::mem::align_of::<u32>() as u64,
         )
     });
-    let progressive_dc_planes = source
-        .profile
-        .progressive_dc
-        .map(|_| {
-            ProgressiveDcXybPlanes::new(
-                device,
-                source.profile.width,
-                source.profile.height,
-                0,
-                &mut memory_permits.transient,
-            )
-        })
-        .transpose()?;
+    let (lf_render, progressive_dc_planes) = match &source.output.lf_render {
+        Some(plan) => {
+            let (buffers, planes) = plan.allocate(device, &mut memory_permits.transient)?;
+            (Some(buffers), Some(planes))
+        }
+        None => (None, None),
+    };
     let output_size = source.output.storage_bytes()?;
     let mut output_usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
@@ -2012,7 +2010,7 @@ pub(super) fn submit_decode(
         _dispatch_control: dispatch_control,
         _transient_permit: memory_permits.transient,
         progressive_dc_planes,
-        _progressive_dc_uniform: Mutex::new(None),
+        lf_render,
     });
     let upload_len = usize::try_from(source.dispatch_layout.stream_bytes)
         .map_err(|_| Error::backend("bounded stream upload exceeds host address space"))?;
@@ -2363,16 +2361,13 @@ fn encode_frame_completion(
             )?);
         }
     }
-    if let Some(progressive) = source.profile.progressive_dc {
-        let pipeline = pipelines.progressive_dc.ok_or(Error::EngineContract(
-            "progressive-DC Modular conversion pipeline is missing",
+    if let Some(plan) = &source.output.lf_render {
+        let pipeline = pipelines.lf_reconstruction.ok_or(Error::EngineContract(
+            "LF Modular reconstruction pipeline is missing",
         ))?;
-        let planes = lifetime
-            .progressive_dc_planes
-            .as_ref()
-            .ok_or(Error::EngineContract(
-                "progressive-DC Modular conversion planes are missing",
-            ))?;
+        let buffers = lifetime.lf_render.as_ref().ok_or(Error::EngineContract(
+            "LF Modular reconstruction buffers are missing",
+        ))?;
         let (arena, final_planes) = if let Some(frame_plan) = &source.profile.resident_frame_plan {
             let arena = lifetime._frame_arena.as_ref().ok_or(Error::EngineContract(
                 "progressive-DC frame inverse arena is missing",
@@ -2389,33 +2384,17 @@ fn encode_frame_completion(
                 group_plan.inverse_plan.final_gpu_layouts(),
             )
         };
-        let source_planes = final_planes.try_into().map_err(|_| {
-            Error::EngineContract(
-                "progressive-DC Modular root must reconstruct exactly three XYB planes",
-            )
-        })?;
-        let arena_size = NonZeroU64::new(arena.size()).ok_or(Error::EngineContract(
-            "progressive-DC Modular arena is empty",
-        ))?;
-        let uniform = pipeline.encode_convert(
-            device,
-            commands,
-            ProgressiveDcConvertInputs {
-                arena: ResidentStorageBinding {
-                    buffer: arena,
-                    offset: 0,
-                    size: arena_size,
-                },
-                source_planes,
-                outputs: planes,
-                multipliers: progressive.lf_dequantization(),
-            },
-        )?;
-        *lifetime
-            ._progressive_dc_uniform
-            .lock()
-            .map_err(|_| Error::backend("progressive-DC uniform lock was poisoned"))? =
-            Some(uniform);
+        inverse_uniforms.extend(
+            plan.encode(
+                device,
+                commands,
+                pipeline,
+                buffers,
+                ResidentStorageBinding::entire(arena)
+                    .map_err(|_| Error::EngineContract("LF Modular arena is empty"))?,
+                &source.output.source_channels.select(&final_planes)?,
+            )?,
+        );
     }
     commands.copy_buffer_to_buffer(
         lifetime._status.buffer(),

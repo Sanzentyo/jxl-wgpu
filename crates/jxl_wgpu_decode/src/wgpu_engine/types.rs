@@ -9,8 +9,8 @@ use crate::entropy::EntropyStreamParams;
 use crate::modular_finalize::ModularFinalizePipeline;
 use crate::modular_palette::ModularPalettePipeline;
 use crate::modular_rct::ModularRctPipeline;
+use crate::modular_render::ModularReconstructionPipeline;
 use crate::modular_squeeze::ModularSqueezePipeline;
-use crate::progressive_dc::{ProgressiveDcGpuError, ProgressiveDcPipeline};
 pub(super) const SHADER_TEMPLATE: &str = include_str!("../lossless_gray8.wgsl");
 pub(super) const MODULAR_ENTROPY_ABI_SHADER: &str = include_str!("../modular_entropy_abi.wgsl");
 pub(super) const MODULAR_ENTROPY_SHADER: &str = include_str!("../modular_entropy.wgsl");
@@ -139,11 +139,11 @@ pub struct WgpuDecodeMemoryStats {
     pub inverse_transform_uniform_bytes: u64,
     /// Final source-plane packing uniform retained through the same submission.
     pub final_output_uniform_bytes: u64,
-    /// Selected F32 render planes, reusable normalization scratch, weights and uniforms.
+    /// All F32 reconstruction planes, scratch, weights and uniforms, including LF producers.
     pub modular_render_bytes: u64,
-    /// Three planar F32 XYB dependency buffers retained by a progressive-DC producer.
+    /// Retained LF XYB buffers, included in `modular_render_bytes` and split from transient scratch.
     pub progressive_dc_plane_bytes: u64,
-    /// Modular-to-XYB conversion uniform retained through the producer submission.
+    /// LF normalization, restoration and upsampling uniforms, included in `modular_render_bytes`.
     pub progressive_dc_uniform_bytes: u64,
     /// Largest descriptor-derived LZ history ring used by one group lane.
     pub max_lz77_window_words: u32,
@@ -392,8 +392,11 @@ pub struct WgpuSubmissionEngine {
     pub(super) pipelines: Arc<DecodePipelineCache>,
     pub(super) native_f64_pipelines: Option<Arc<DecodePipelineCache>>,
     pub(super) inverse_pipelines: Arc<ModularInversePipelineCache>,
-    pub(super) progressive_dc_pipeline:
-        Arc<OnceLock<std::result::Result<Arc<ProgressiveDcPipeline>, ProgressiveDcGpuError>>>,
+    pub(super) lf_reconstruction_pipeline: Arc<
+        OnceLock<
+            std::result::Result<Arc<ModularReconstructionPipeline>, crate::ModularRenderError>,
+        >,
+    >,
     pub(super) memory: MemoryBudget,
     pub(super) buffers: Arc<DecodeBufferPool>,
     pub(super) stream_window_limit: Option<NonZeroU64>,

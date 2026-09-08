@@ -9,7 +9,8 @@ use jxl_wgpu::{
 };
 
 use crate::buffer_pool::DecodeBufferPool;
-use crate::progressive_dc::{ProgressiveDcPipeline, ProgressiveDcXybPlanes};
+use crate::modular_render::ModularReconstructionPipeline;
+use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{
     Error, FrameDuration, FrameMetadata, GpuPendingFrame, GpuSubmissionSession, Result,
     SubmittedGpuFrame,
@@ -31,7 +32,7 @@ pub struct WgpuDecodeSession {
     pub(super) buffers: Arc<DecodeBufferPool>,
     pub(super) f64_output_path: Option<F64OutputPath>,
     pub(super) inverse_pipelines: Option<Arc<ModularInversePipelines>>,
-    pub(super) progressive_dc_pipeline: Option<Arc<ProgressiveDcPipeline>>,
+    pub(super) lf_reconstruction_pipeline: Option<Arc<ModularReconstructionPipeline>>,
 }
 
 impl std::fmt::Debug for WgpuDecodeSession {
@@ -70,7 +71,7 @@ impl GpuSubmissionSession for WgpuDecodeSession {
             SubmitPipelines {
                 decode: &self.pipeline,
                 inverse: self.inverse_pipelines.as_deref(),
-                progressive_dc: self.progressive_dc_pipeline.as_deref(),
+                lf_reconstruction: self.lf_reconstruction_pipeline.as_deref(),
             },
             source,
             &self.buffers,

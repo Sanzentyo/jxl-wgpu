@@ -4,11 +4,13 @@ use crate::modular_grouping::{
 };
 
 use jxl_gpu_bitstream::{
-    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
-    EdgePreservingFilterInventory, ExtraChannelTypeInventory, FiniteF16, FrameBlendInfo,
-    FrameEncoding, FrameSectionKind, FrameType, GaborishInventory, ImageHeaderInventory,
-    PrimariesInventory, RestorationFilterInventory, SampleBitDepth, TransferFunctionInventory,
-    WhitePointInventory,
+    CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory, ExtraChannelTypeInventory,
+    FiniteF16, FrameBlendInfo, FrameEncoding, FrameSectionKind, FrameType, ImageHeaderInventory,
+    PrimariesInventory, SampleBitDepth, TransferFunctionInventory, WhitePointInventory,
+};
+#[cfg(test)]
+use jxl_gpu_bitstream::{
+    EdgePreservingFilterInventory, GaborishInventory, RestorationFilterInventory,
 };
 use jxl_gpu_protocol::OutputOrientation;
 
@@ -95,6 +97,7 @@ pub(crate) struct ProgressiveDcModularProfile {
     pub lf_dequantization: [FiniteF16; 3],
 }
 
+#[cfg(test)]
 impl ProgressiveDcModularProfile {
     pub(crate) fn lf_dequantization(self) -> [f32; 3] {
         self.lf_dequantization.map(FiniteF16::to_f32)
@@ -281,14 +284,6 @@ fn parse_modular_profile(
             .extra_channel_upsampling
             .iter()
             .any(|&factor| !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling)
-        || (purpose == ModularProfilePurpose::ProgressiveDc
-            && !matches!(
-                frame.restoration_filter,
-                RestorationFilterInventory::Custom {
-                    gaborish: GaborishInventory::Disabled,
-                    epf: EdgePreservingFilterInventory::Disabled,
-                }
-            ))
         || frame.group_size_shift > 3
         || (purpose == ModularProfilePurpose::Presentation
             && (frame.have_crop
@@ -319,7 +314,7 @@ fn parse_modular_profile(
         }
         ModularProfilePurpose::ProgressiveDc => {
             frame.frame_type != FrameType::LowFrequency
-                || frame.lf_level == 0
+                || !(1..=4).contains(&frame.lf_level)
                 || frame.lf_source_frame.is_some()
                 || frame.is_last
                 || !frame.save_before_color_transform
@@ -386,15 +381,11 @@ fn parse_modular_profile(
     let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
     let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
-    let color_render = if purpose == ModularProfilePurpose::ProgressiveDc {
-        None
-    } else {
-        crate::modular_render::ModularColorConfig::new(
-            image,
-            frame,
-            lf_dequantization.map(FiniteF16::to_f32),
-        )?
-    };
+    let color_render = crate::modular_render::ModularColorConfig::new(
+        image,
+        frame,
+        lf_dequantization.map(FiniteF16::to_f32),
+    )?;
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
             &mut reader,
@@ -940,12 +931,12 @@ fn parse_modular_profile(
         width: frame_width,
         height: frame_height,
         output_width: if purpose == ModularProfilePurpose::ProgressiveDc {
-            frame_width
+            frame.width.div_ceil(1 << (3 * frame.lf_level))
         } else {
             frame.width
         },
         output_height: if purpose == ModularProfilePurpose::ProgressiveDc {
-            frame_height
+            frame.height.div_ceil(1 << (3 * frame.lf_level))
         } else {
             frame.height
         },

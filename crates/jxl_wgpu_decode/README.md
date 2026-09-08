@@ -548,14 +548,18 @@ tested on horizontal, vertical, two-axis, odd-edge cases; a valid subsampled-res
 fixture is still needed for end-to-end libjxl conformance. The common frame executor accepts
 recursive progressive-DC dependencies, including VarDCT roots without an LF source and
 LF-dependent SkipProgressive frames. These stills expose `DecodeProfile::FrameSequence` and
-`WgpuDecodeSubmissionSession::Sequence`. It keeps three F32 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
+`WgpuDecodeSubmissionSession::Sequence`. It keeps three F32 XYB planes resident, uses shared 80-byte Modular normalization and 48-byte LF-pack `Pod` uniforms, validates every
 hidden and visible status, and publishes only complete presentations. A physical LF node is
 decoded once, even when unused, overwritten, or shared across multiple presentations. The plan
 checks LF flags, levels, exact slot versions and sample/block extents before submission.
 `MemoryPermit::split_off` transfers each plane's actual byte reservation from producer scratch
-into a `GpuBufferLease` without readmission. VarDCT LF capture selects the final pre-color-transform
-planes after restoration and frame upsampling, with that output geometry and stride. Gaborish and
-2× LF variants match both independent decoders. Four versioned LF slots retain these leases through
+into a `GpuBufferLease` without readmission. Both Modular and VarDCT LF capture retain the final
+pre-color-transform planes after restoration and frame upsampling, with that output geometry and
+stride. Modular reuses the presentation reconstruction implementation and skips RGB conversion.
+Its default/custom Gaborish, EPF1/2/3, custom sigma, and 2×/4×/8× LF variants match both independent
+decoders. `modular_render_bytes` includes the full reconstruction footprint; LF plane/uniform
+counters are subsets of that total. Final planes retain their exact byte permits while intermediate
+normalization/restoration allocations are released after producer validation. Four versioned LF slots retain these leases through
 the last consumer; expired planes and validated scratch are released before the next admission. A single-entry intermediate frame
 first executes HF metadata on GPU, maps its bounded HF-global cursor, host-parses only scalar
 HF-global tables, and resumes general AC plus downstream reconstruction on the same queue.

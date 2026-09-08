@@ -264,7 +264,10 @@ transforms, patches, splines, and noise still require production integration and
 Independent Replace presentations validate each overwritten color/extra layer before returning
 the final producer's native output. LF sequences execute every physical node once, retain only
 the reference planes through their last consumer, and accept Modular or VarDCT LF roots and
-LF-dependent SkipProgressive frames. Truncated hidden Modular,
+LF-dependent SkipProgressive frames. Modular LF producers share the normal reconstruction pipeline:
+Gaborish, EPF and 2×/4×/8× upsampling finish before the final XYB planes are retained. Eleven
+restoration/resampling configurations match both reference decoders with whole and bounded async
+input. Truncated hidden Modular,
 VarDCT, and DC data are rejected through blocking and async completion. A 129-layer Gray31 still
 preserves exact integer codes while reusing the first layer's GPU memory footprint.
 
