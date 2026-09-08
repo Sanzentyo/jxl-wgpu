@@ -21,6 +21,7 @@ use crate::{BitReader, Error as BitReaderError};
 mod image_extensions;
 
 const FLAG_USE_LF_FRAME: u64 = 0x20;
+const FLAG_SKIP_ADAPTIVE_LF_SMOOTHING: u64 = 0x80;
 const GROUP_DIM_LOG2_MINUS_ONE: u32 = 7;
 const MAX_EXTRA_CHANNELS: u32 = 256;
 const MAX_TOC_ENTRIES: u64 = 65_536;
@@ -575,6 +576,19 @@ pub struct FrameInventory {
 }
 
 impl FrameInventory {
+    /// Validate JPEG component sampling and its LF-smoothing constraint.
+    ///
+    /// Parsing checks this before the TOC. Callers that construct or modify the public
+    /// inventory fields can use the same validation before deriving component geometry.
+    pub fn validate_jpeg_sampling(&self) -> Result<(), InventoryError> {
+        validate_jpeg_sampling(
+            self.encoding,
+            self.flags,
+            self.do_ycbcr,
+            self.jpeg_upsampling,
+        )
+    }
+
     /// Encoded color-sample extent after frame upsampling and progressive-DC downsampling.
     ///
     /// A level-`n` LF frame represents one sample for each `8^n` samples of the declared frame
@@ -631,6 +645,15 @@ pub enum InventoryError {
     InvalidEnum { name: &'static str, value: u32 },
     #[error("invalid frame header: {0}")]
     InvalidFrame(&'static str),
+    #[error("invalid JPEG sampling selectors {jpeg_upsampling:?} with do_YCbCr={do_ycbcr}")]
+    InvalidJpegSampling {
+        jpeg_upsampling: [u32; 3],
+        do_ycbcr: bool,
+    },
+    #[error(
+        "adaptive LF smoothing requires equal JPEG component sampling factors, got {jpeg_upsampling:?}"
+    )]
+    SubsampledAdaptiveLfSmoothing { jpeg_upsampling: [u32; 3] },
     #[error(
         "frame {frame_index} references LF level {lf_level}, but no earlier frame produced that level"
     )]
@@ -1505,6 +1528,32 @@ fn resolve_extra_channel_upsampling(
         ))
 }
 
+fn validate_jpeg_sampling(
+    encoding: FrameEncoding,
+    flags: u64,
+    do_ycbcr: bool,
+    jpeg_upsampling: [u32; 3],
+) -> Result<(), InventoryError> {
+    if jpeg_upsampling.into_iter().any(|value| value > 3)
+        || (!do_ycbcr && jpeg_upsampling != [0; 3])
+    {
+        return Err(InventoryError::InvalidJpegSampling {
+            jpeg_upsampling,
+            do_ycbcr,
+        });
+    }
+    // F.2 requires no subsampled channel when adaptive LF smoothing is enabled.
+    // Selectors encode sampling factors, not actual shifts: each shift is relative
+    // to the maximum factor. All four equal-selector triples are therefore 4:4:4.
+    if encoding == FrameEncoding::VarDct
+        && flags & FLAG_SKIP_ADAPTIVE_LF_SMOOTHING == 0
+        && jpeg_upsampling != [jpeg_upsampling[0]; 3]
+    {
+        return Err(InventoryError::SubsampledAdaptiveLfSmoothing { jpeg_upsampling });
+    }
+    Ok(())
+}
+
 fn parse_frame_header(
     reader: &mut BitReader<'_>,
     context: FrameContext,
@@ -1584,6 +1633,7 @@ fn parse_frame_header(
             *value = read_bits(reader, 2)? as u32;
         }
     }
+    validate_jpeg_sampling(encoding, flags, do_ycbcr, jpeg_upsampling)?;
     let upsampling = if has_lf_frame {
         1
     } else {
@@ -2305,6 +2355,74 @@ mod tests {
     use super::*;
     use crate::{BitWriter, FragmentedContainerWriter, ParseLimits, parse, write_container};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn jpeg_sampling_and_lf_smoothing_are_validated_before_the_toc() {
+        let context = ImageContext {
+            width: 257,
+            height: 17,
+            preview_size: None,
+            xyb_encoded: false,
+            num_extra_channels: 0,
+            extra_channel_shifts: Vec::new(),
+            have_animation: false,
+            have_timecodes: false,
+        };
+        for cb in 0..4 {
+            for y in 0..4 {
+                for cr in 0..4 {
+                    let selectors = [cb, y, cr];
+                    for modular in [false, true] {
+                        for skip_smoothing in [false, true] {
+                            let mut writer = BitWriter::new();
+                            writer.write_bits(0, 3).unwrap(); // explicit regular frame
+                            writer.write_bits(u64::from(modular), 1).unwrap();
+                            if skip_smoothing {
+                                writer.write_bits(2, 2).unwrap();
+                                writer.write_bits(128 - 17, 8).unwrap();
+                            } else {
+                                writer.write_bits(0, 2).unwrap();
+                            }
+                            writer.write_bits(1, 1).unwrap(); // do_YCbCr
+                            for value in selectors {
+                                writer.write_bits(u64::from(value), 2).unwrap();
+                            }
+                            writer.write_bits(0, 2).unwrap(); // frame upsampling 1
+                            if modular {
+                                writer.write_bits(1, 2).unwrap();
+                            }
+                            writer.write_bits(0, 5).unwrap(); // one pass, no crop, Replace
+                            writer.write_bits(1, 1).unwrap(); // last frame
+                            writer.write_bits(0, 10).unwrap(); // empty name, disabled filters/extensions
+                            let bit_length = writer.bit_len() as u64;
+                            let data = writer.into_bytes();
+                            let mut reader = BitReader::new(&data);
+                            let result = parse_frame_header(
+                                &mut reader,
+                                context.frame_context(false).unwrap(),
+                                false,
+                                InventoryLimits::default(),
+                            );
+                            let equal_factors =
+                                matches!(selectors, [0, 0, 0] | [1, 1, 1] | [2, 2, 2] | [3, 3, 3]);
+                            if modular || skip_smoothing || equal_factors {
+                                let header = result.unwrap();
+                                assert_eq!(header.jpeg_upsampling, selectors);
+                                assert_eq!(reader.bit_offset(), bit_length);
+                            } else {
+                                assert!(
+                                    matches!(result, Err(InventoryError::SubsampledAdaptiveLfSmoothing {
+                                    jpeg_upsampling,
+                                }) if jpeg_upsampling == selectors)
+                                );
+                                assert!(reader.bit_offset() < bit_length);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn effective_extra_upsampling_includes_default_header_dimension_shifts() {

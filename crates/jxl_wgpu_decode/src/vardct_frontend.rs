@@ -72,7 +72,6 @@ pub enum UnsupportedVarDctFeature {
     ModularFrame,
     FrameFeatures,
     Ycbcr,
-    JpegSubsampling,
     Upsampling,
     Cropping,
     Blending,
@@ -83,6 +82,8 @@ pub enum UnsupportedVarDctFeature {
 /// Typed failure from profile negotiation or section packet construction.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum VarDctFrontendError {
+    #[error(transparent)]
+    InvalidFrameHeader(#[from] jxl_gpu_bitstream::InventoryError),
     #[error("standard GPU VarDCT profile does not support {feature:?}")]
     Unsupported { feature: UnsupportedVarDctFeature },
     #[error("the JPEG XL VarDCT frame name is not valid UTF-8")]
@@ -1165,8 +1166,12 @@ impl StandardVarDctProfile {
         ])
     }
 
-    pub(crate) fn uses_chroma_from_luma(&self) -> bool {
-        self.jpeg_upsampling == [0; 3]
+    pub(crate) fn uses_lf_chroma_from_luma(&self) -> bool {
+        // Sampling factors are relative. Equal nonzero selectors still reconstruct
+        // three full-resolution LF planes and require the signaled color correlation.
+        self.channel_shifts
+            .into_iter()
+            .all(|shift| !shift.is_subsampled())
     }
 }
 
@@ -1367,12 +1372,7 @@ fn validate_frame(
     if inventory.image_header.xyb_encoded && frame.do_ycbcr {
         return unsupported(UnsupportedVarDctFeature::Ycbcr);
     }
-    if frame.jpeg_upsampling.into_iter().any(|value| value > 3) {
-        return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
-    }
-    if !frame.do_ycbcr && frame.jpeg_upsampling != [0; 3] {
-        return unsupported(UnsupportedVarDctFeature::JpegSubsampling);
-    }
+    frame.validate_jpeg_sampling()?;
     if !matches!(frame.upsampling, 1 | 2 | 4 | 8)
         || frame.extra_channel_upsampling.len() != inventory.image_header.extra_channels.len()
         || frame

@@ -2265,3 +2265,87 @@ check, warning-free Clippy/rustdoc, the Rust 1.89 all-target/all-feature check a
 WASM check pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU readback
 passes. All 64 codestreams and four linear F32 references regenerate byte-identically, and the
 41 preceding files remain unchanged. Full JPEG XL conformance remains open.
+
+### All JPEG component sampling selectors and adaptive LF validation
+
+`examples/regenerate_jpeg_sampling.rs` creates 136 independent-entropy codestreams in
+`test-data/jpeg_sampling/`: 128 cover the sampling matrix and eight add nonzero LF correlation.
+The selector digits are in JPEG XL's Cb, Y, Cr order, with each digit in `0..=3`; every one of
+the 64 triples is included for each extent.
+
+| Fixtures | Presented extent | Coverage |
+|---|---:|---|
+| `sampling_{000..333}.jxl.hex` (base-four digits) | 272×32 | Aligned 34×4 block grid, two AC groups, every sampling triple |
+| `odd_{000..333}.jxl.hex` (base-four digits) | 257×17 | Odd right/bottom borders, component-specific MCU padding, two AC groups |
+| `correlation_sampling_{0..3}.jxl.hex` | 272×32 | Four equal-factor triples with LF correlation factors [16, −24] |
+| `correlation_odd_{0..3}.jxl.hex` | 257×17 | The same nonzero LF correlation with independently padded odd borders |
+
+The source is a deterministic RGB ramp with channel-dependent slopes and wraps, encoded with
+cjpeg quality 90 and the corresponding Y/Cb/Cr sampling factors, then losslessly transcoded by
+libjxl 0.12.0 with ISO-800 noise and disabled restoration/JPEG reconstruction metadata. JPEG's
+ten-block MCU limit excludes three equal 2×2 factors. For that triple, the generator instead
+preserves every entropy byte from the aligned equal-1×1 JPEG stream, changes the selectors and,
+for the odd case, rewrites the image size. Both resulting streams retain the same padded 34×4
+block grid. The generator reparses every output and checks metadata, dimensions, section counts
+and byte-identical entropy payloads. This synthesis does not decode or encode image samples on
+the production CPU path.
+
+`tests/jpeg_sampling.rs` checks both the signaled and zeroed noise models for all 128 streams.
+Each of the eight equal-factor streams also enables adaptive LF smoothing. This gives 272
+independent output comparisons against each of Rust jxl 0.6 and live native libjxl, with the
+existing bounds of 1e-5 and 1/1024 respectively. Every output must be bit-identical between whole
+input and 43-byte transport chunks under a 256-byte GPU window. Thus both fused output-time
+component upsampling and resident expansion before nonzero noise are exercised. Noise must
+change each image. The aligned equal-factor cases must also change pixels when smoothing is
+enabled, and all four equivalent sampling encodings must produce identical pixels for each
+noise/smoothing state. Odd equal factors retain their own padded entropy/border semantics and
+are compared independently. Every completed decode releases GPU and retained-input reservations.
+
+The eight correlation streams expose a production defect that the zero-correlation JPEG inputs
+could not detect. LF dequantization previously disabled chroma-from-luma for any nonzero raw
+selector, even when the three actual LF planes had equal resolution. The aligned `[1,1,1]`
+case reproduced GPU/native maxAE 0.13254036 before the fix. The decision now uses normalized
+component shifts, matching
+[libjxl's LF dequantization](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/compressed_dc.cc#L201).
+These eight streams retain base correlation [0,0], colour factor 84 and all original entropy,
+changing only the two eight-bit LF correlation fields. Whole/fragmented output is identical for
+all 32 combinations of noise and smoothing, and the four aligned factor encodings agree exactly.
+Native checks all 32 cases at 1/1024. Rust checks the 16 zero-model cases at 1e-5 because its
+documented noise stage uses LF-adjusted correlation; that existing oracle exception also affects
+these YCbCr streams. Observed correlation-subset maxAE is 0.00001564 against native and
+0.0000002981 against Rust, with no tolerance increase.
+
+The LF restriction follows F.2 of ISO/IEC 18181-1:2022: adaptive smoothing requires no subsampled
+channel. Its enforcement agrees with
+[libjxl's frame validation](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc#L206)
+and uses the relative factors in its
+[component sampling definition](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/frame_header.h#L81).
+Raw nonzero selectors do not by themselves imply subsampling: every equal-selector triple is
+4:4:4, while its raw factors still determine MCU padding. `FrameInventory::validate_jpeg_sampling`
+now shares this constraint between whole/incremental header parsing and public VarDCT inventory
+negotiation. Unequal factors with smoothing enabled return
+`InventoryError::SubsampledAdaptiveLfSmoothing { jpeg_upsampling }` before the TOC is read.
+Invalid public selector values or selectors without YCbCr return `InvalidJpegSampling`.
+The obsolete `UnsupportedSubsampledStage` and `UnsupportedVarDctFeature::JpegSubsampling`
+variants are removed; these errors now identify malformed input.
+
+A 256-case parser matrix crosses all selectors, both coding modes and the skip flag; Modular
+headers remain unaffected by the VarDCT-only restriction. All 60 unequal-factor smoothing
+mutations fail whole parsing, direct profile negotiation and incremental parsing at chunk sizes
+1, 43 and the whole input. No frame or entropy section is emitted, and subsequent input reports
+a poisoned scanner. Public GPU open and seven-byte streamed input reject all 60 mutations before
+admission, release every retained span immediately and preserve zero in-flight GPU reservations.
+
+Observed on Apple M5/Metal: the 272 GPU/Rust comparisons have maxAE 0.0000003875; GPU/native
+maxAE is 0.00001623. The odd-extent subsets are below 0.0000001193 and 0.0000009090 respectively.
+An offline jxl-oxide 0.12.6 check was not selected as an oracle: it differs by about 0.3464 for
+equal nonzero selectors, while native libjxl, Rust jxl and the GPU agree. The production shader
+and resource ABI are unchanged; the existing LF-correlation uniform flag now uses normalized
+geometry. Broader asymmetric restoration/resampling combinations and full
+18181-3 precision coverage remain open.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+757 tests across 37 targets, with one existing manual benchmark ignored. Formatting, workspace
+check, warning-free Clippy/rustdoc, the Rust 1.89 all-target/all-feature check and the six-crate
+WASM check pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU readback
+passes. All 136 new codestreams regenerate byte-identically. Full JPEG XL conformance remains open.

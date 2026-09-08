@@ -197,16 +197,6 @@ pub(super) fn prepare_packet_source(
         1.0,
         dequant_matrix_multiplier("B", frame.b_qm_scale)?,
     ];
-    let has_subsampled_channels = packet
-        .profile
-        .channel_shifts
-        .into_iter()
-        .any(|shift| shift.is_subsampled());
-    if has_subsampled_channels && packet.profile.adaptive_lf_smoothing {
-        return Err(VarDctDecodeError::UnsupportedSubsampledStage {
-            stage: "adaptive LF smoothing",
-        });
-    }
     let deferred_hf = DeferredHfCoefficientLayout::plan(&packet)?;
     let codestream_bytes = codestream.logical_bytes();
     let codestream_len =
@@ -263,7 +253,7 @@ pub(super) fn prepare_packet_source(
             channel_shifts: packet.profile.channel_shifts,
             lf_offsets,
             lf_strides: resource_layout.lf_strides,
-            apply_chroma_from_luma: packet.profile.uses_chroma_from_luma(),
+            apply_chroma_from_luma: packet.profile.uses_lf_chroma_from_luma(),
             global_scale: packet.global_scale,
             quant_lf: packet.quant_lf,
             lf_dequantization: packet.lf_dequantization.multipliers,

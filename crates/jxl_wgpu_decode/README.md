@@ -567,9 +567,18 @@ the GPU reads and validates the actual strategy map. This intentionally trades t
 shortcut for complete metadata handling. Each entropy stage retains bounded windows and shares one
 logical pending frame and byte budget.
 
-Subsampled YCbCr with adaptive LF smoothing still returns a typed unsupported-stage error.
-libjxl 0.12 also rejects this signaling combination; its validity and error classification need
-conformance validation. Gaborish and EPF are connected: shifted components use a fused
+Adaptive LF smoothing requires equal component sampling factors. The shared frame-header parser
+rejects unequal factors with `InventoryError::SubsampledAdaptiveLfSmoothing` before the TOC,
+section delivery or GPU admission; public inventory negotiation reuses that validation. All four
+equal-selector triples remain valid 4:4:4, including nonzero selectors with additional MCU padding.
+`tests/jpeg_sampling.rs` verifies all 64 triples at both 272×32 and 257×17, with nonzero/zero noise,
+independent native/Rust F32 references and exact whole/bounded input equality. Equal factors also
+exercise adaptive LF smoothing. Eight additional streams with nonzero LF correlation guard
+equal nonzero selectors: LF dequantization now applies correlation based on the actual channel
+shifts. Native checks both noise states, while Rust checks the zero model because of its documented
+noise-correlation difference. Sixty invalid smoothing combinations have whole/incremental
+rejection, poisoned-stream and immediate source-release checks. Gaborish and EPF are connected:
+shifted components use a fused
 horizontal/vertical quarter/three-quarter resident upsample before the full-resolution restoration
 cursor, while unshifted component buffers are reused directly. All destination planes and 32-byte
 `Pod` uniforms are included in the shared byte budget. The interpolation primitive is actual-GPU
@@ -931,8 +940,8 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Explicitly published
-progressive intermediates, larger/transformed raw-matrix conformance, subsampled adaptive-LF signal validation,
-uncommon asymmetric JPEG component layouts and other Modular side images,
+progressive intermediates, larger/transformed raw-matrix conformance, broader asymmetric JPEG
+restoration/resampling combinations and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping,
 and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
