@@ -210,6 +210,7 @@ impl CodestreamStreamScanner {
             progress: InventoryProgress {
                 total_toc_entries: 0,
                 total_section_bytes: 0,
+                noise_seed: [0; 2],
             },
             lf_frames: LowFrequencyFrameTracker::new(),
             active_frame: None,

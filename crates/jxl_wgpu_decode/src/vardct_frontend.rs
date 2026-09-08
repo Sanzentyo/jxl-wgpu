@@ -688,6 +688,9 @@ fn validate_gpu_u32(field: &'static str, value: u64) -> Result<(), VarDctPacketE
 impl LfGlobalPrefix {
     /// Parses LF dequantization, block-context, and channel-correlation headers without expanding
     /// image entropy on the host.
+    ///
+    /// `packet.offset` must point to LF dequantization, after any rendering-feature prefix.
+    /// Use [`crate::vardct::packet::BoundedVarDctPacketPlan`] to parse a frame with signaled noise.
     pub fn parse(codestream: &[u8], packet: BitRange) -> Result<Self, VarDctPacketError> {
         let packet_end = packet.end().ok_or(VarDctPacketError::PacketRangeOverflow)?;
         validate_packet_end(codestream, packet_end)?;
@@ -698,7 +701,7 @@ impl LfGlobalPrefix {
         Self::parse_reader(&mut reader, packet_end)
     }
 
-    /// Parses this prefix from a reader positioned at the packet's absolute bit offset.
+    /// Parses this prefix from a reader positioned immediately before LF dequantization.
     pub(crate) fn parse_reader(
         reader: &mut impl BitInput,
         packet_end: u64,
@@ -1349,14 +1352,16 @@ fn validate_frame(
     if frame.encoding != FrameEncoding::VarDct {
         return unsupported(UnsupportedVarDctFeature::ModularFrame);
     }
-    // Noise, patches, splines, and unknown frame extensions remain outside the transform
+    // Patches, splines, and unknown frame extensions remain outside the transform
     // capability. LF-frame reuse is resolved by the common physical frame executor.
     let supported_flags = if role == VarDctFrameRole::Presentation {
-        0x80
+        0x80 | 1
     } else {
-        0x20 | 0x80
+        0x20 | 0x80 | 1
     };
-    if frame.flags & !supported_flags != 0 {
+    if frame.flags & !supported_flags != 0
+        || (frame.flags & 1 != 0 && !inventory.image_header.xyb_encoded)
+    {
         return unsupported(UnsupportedVarDctFeature::FrameFeatures);
     }
     if !inventory.image_header.xyb_encoded && !frame.do_ycbcr {
@@ -1720,7 +1725,7 @@ pub(crate) fn metadata_f16(
     }
 }
 
-fn metadata_error(stage: &'static str, source: crate::Error) -> VarDctPacketError {
+pub(crate) fn metadata_error(stage: &'static str, source: crate::Error) -> VarDctPacketError {
     match source {
         crate::Error::Bitstream(source) => VarDctPacketError::MetadataBitstream {
             stage,

@@ -127,6 +127,8 @@ pub enum VarDctDecodeError {
     #[error(transparent)]
     Gaborish(#[from] ResidentGaborishError),
     #[error(transparent)]
+    Noise(#[from] jxl_wgpu::ResidentNoiseError),
+    #[error(transparent)]
     Epf(#[from] ResidentEpfError),
     #[error(transparent)]
     EpfSigma(#[from] EpfSigmaError),
@@ -313,6 +315,8 @@ pub struct VarDctDecodeMemoryStats {
     /// Three full-resolution ping-pong destinations shared by Gaborish and EPF.
     pub restoration_scratch_bytes: u64,
     pub gaborish_uniform_bytes: u64,
+    pub noise_bytes: u64,
+    pub noise_uniform_bytes: u64,
     pub epf_sigma_bytes: u64,
     pub epf_sigma_uniform_bytes: u64,
     pub epf_filter_uniform_bytes: u64,
@@ -336,6 +340,7 @@ pub struct VarDctDecodeMemoryStats {
 impl VarDctDecodeMemoryStats {
     pub(super) fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
         let VarDctDecodeMemoryInputs {
+            noise,
             stream_limit,
             codestream_len,
             packet,
@@ -717,7 +722,11 @@ impl VarDctDecodeMemoryStats {
             .transpose()
             .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?
             .unwrap_or(0);
+        let noise_bytes = noise.map_or(0, jxl_wgpu::ResidentNoisePlan::storage_bytes);
+        let noise_uniform_bytes = noise.map_or(0, |_| jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES);
         let transient_bytes = [
+            noise_bytes,
+            noise_uniform_bytes,
             codestream_bytes,
             modular_metadata_bytes,
             reconstructed_bytes,
@@ -776,6 +785,8 @@ impl VarDctDecodeMemoryStats {
             },
         )?;
         Ok(Self {
+            noise_bytes,
+            noise_uniform_bytes,
             resolved_stream_window_limit_bytes: stream_limit,
             codestream_bytes,
             modular_metadata_bytes,
@@ -834,6 +845,7 @@ impl VarDctDecodeMemoryStats {
 }
 
 pub(super) struct VarDctDecodeMemoryInputs<'a> {
+    pub(super) noise: Option<&'a jxl_wgpu::ResidentNoisePlan>,
     pub(super) stream_limit: u64,
     pub(super) codestream_len: usize,
     pub(super) packet: &'a BoundedVarDctPacketPlan,

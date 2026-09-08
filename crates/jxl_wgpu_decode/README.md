@@ -332,7 +332,7 @@ channels whose horizontal and vertical transformed shifts are both at least thre
 the remaining channels, including asymmetric shifts. LF streams execute before nonempty pass
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through three passes produce a complete final
-image; intermediate pass presentation is not yet exposed. Patches, splines, noise and broader
+image; intermediate pass presentation is not yet exposed. Patches, splines and broader
 original color profiles remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -360,7 +360,19 @@ whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quan
 reservation release. Fifteen stills and the initial Replace presentation of four animations also
 match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
 clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
-color management, pre-transform references, patches, splines and noise remain separate work.
+color management, pre-transform references, patches and splines remain separate work.
+
+Both XYB coding modes parse the bounded 80-bit `NoiseModel` and use the shared
+`jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before color conversion.
+`FrameInventory::noise_seed` preserves the visible/nonvisible counters when a physical frame is
+projected into a producer. SplitMix64/Xorshift128Plus execute as portable WGSL u32 pairs; no CPU
+random image is uploaded. Three random F32 planes and one 96-byte uniform join the same frame
+reservation and callback lifetime. An all-zero model allocates and dispatches nothing.
+`tests/noise.rs` compares nine libjxl fixtures and their zero-model variants against Rust jxl and
+optional live libjxl F32 output, including 2×/4×/8× upsampling and five mixed physical frames with
+three presentations. It requires exact whole/256-byte-window output agreement, admission retry
+and cancellation cleanup. Non-XYB noise is still rejected; preview, LF/reference-only and
+patch/spline combinations and custom correlation need further conformance coverage.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after

@@ -52,6 +52,7 @@ mod modular_side_image;
 pub mod modular_squeeze;
 mod modular_transform;
 mod modular_tree;
+mod noise;
 mod profile;
 mod progressive_dc;
 mod restoration;
@@ -105,6 +106,7 @@ pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;
 pub use modular_render::{ModularRenderError, ModularSampleDomain};
 pub use modular_scalar_output::ModularScalarOutputError;
+pub use noise::NoiseModel;
 pub use progressive_dc::ProgressiveDcGpuError;
 pub use restoration::RestorationError;
 pub use session::{

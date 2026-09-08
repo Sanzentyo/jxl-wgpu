@@ -48,6 +48,8 @@ pub enum ModularRenderError {
     #[error(transparent)]
     Epf(#[from] jxl_wgpu::ResidentEpfError),
     #[error(transparent)]
+    Noise(#[from] jxl_wgpu::ResidentNoiseError),
+    #[error(transparent)]
     ColorOutput(std::sync::Arc<crate::color_output::ColorOutputError>),
     #[error(transparent)]
     Layout(#[from] jxl_gpu_formats::LayoutError),

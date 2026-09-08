@@ -22,6 +22,7 @@ use crate::color_output::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
+    noise: Option<jxl_wgpu::ResidentNoiseParameters>,
     xyb: Option<([f32; 3], InverseOpsin)>,
     gaborish: Option<ResidentGaborishWeights>,
     epf: Vec<ResidentEpfParameters>,
@@ -33,6 +34,7 @@ impl ModularColorConfig {
         image: &ImageHeaderInventory,
         frame: &FrameInventory,
         lf: [f32; 3],
+        noise: Option<crate::NoiseModel>,
     ) -> Result<Option<Self>> {
         let (gaborish, epf) = crate::restoration::restoration_config(frame.restoration_filter)?;
         let sigma = match frame.restoration_filter {
@@ -60,6 +62,7 @@ impl ModularColorConfig {
         };
         Ok(
             (xyb.is_some() || gaborish.is_some() || epf.is_some()).then(|| Self {
+                noise: noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0])),
                 xyb,
                 gaborish,
                 epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
@@ -145,6 +148,7 @@ impl ColorPlan {
 /// Shared pre-color-transform reconstruction for presentation and LF dependency frames.
 #[derive(Debug)]
 pub(crate) struct ReconstructionPlan {
+    noise: Option<jxl_wgpu::ResidentNoisePlan>,
     config: ModularColorConfig,
     source_extent: Extent2d,
     pub(super) output_extent: Extent2d,
@@ -221,14 +225,24 @@ impl ReconstructionPlan {
             .min(u64::from(u32::MAX) * 4);
         require("color source plane", source_plane_bytes, limit)?;
         require("color upsampling plane", upsample_plane_bytes, limit)?;
+        let noise = config
+            .noise
+            .map(|parameters| jxl_wgpu::ResidentNoisePlan::new(extent, parameters, limits))
+            .transpose()?;
         let storage_bytes = source_plane_bytes
             * if config.gaborish.is_some() || !config.epf.is_empty() {
                 6
             } else {
                 3
             }
-            + upsample_plane_bytes * 3;
-        let uniform_bytes = std::mem::size_of::<NormalizeColorParams>() as u64
+            + upsample_plane_bytes * 3
+            + noise
+                .as_ref()
+                .map_or(0, jxl_wgpu::ResidentNoisePlan::storage_bytes);
+        let uniform_bytes = noise
+            .as_ref()
+            .map_or(0, |_| jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES)
+            + std::mem::size_of::<NormalizeColorParams>() as u64
             + config
                 .gaborish
                 .map_or(0, |_| jxl_wgpu::ResidentGaborishMemoryPlan::UNIFORM_BYTES)
@@ -240,6 +254,7 @@ impl ReconstructionPlan {
             };
         Ok(Self {
             config,
+            noise,
             source_extent: Extent2d::new(source.width, source.height),
             output_extent: extent,
             factor,
@@ -278,6 +293,7 @@ impl ReconstructionPlan {
             })
         };
         ReconstructionBuffers {
+            noise: self.noise.as_ref().map(|plan| plan.allocate(device)),
             normalized: create("jxl-wgpu Modular decoded color", self.source_plane_bytes),
             scratch: (self.config.gaborish.is_some() || !self.config.epf.is_empty()).then(|| {
                 create(
@@ -295,6 +311,7 @@ impl ReconstructionPlan {
     }
 }
 pub(crate) struct ReconstructionBuffers {
+    noise: Option<wgpu::Buffer>,
     normalized: [wgpu::Buffer; 3],
     scratch: Option<[wgpu::Buffer; 3]>,
     upsampled: Option<[wgpu::Buffer; 3]>,
@@ -364,6 +381,9 @@ impl ColorPipeline {
 }
 
 pub(crate) struct ReconstructionPipeline {
+    noise: std::sync::OnceLock<
+        std::result::Result<jxl_wgpu::ResidentNoisePipeline, jxl_wgpu::ResidentNoiseError>,
+    >,
     normalize: wgpu::ComputePipeline,
     gaborish: ResidentGaborishPipeline,
     epf: ResidentEpfPipeline,
@@ -390,6 +410,8 @@ impl ReconstructionPipeline {
             gaborish: ResidentGaborishPipeline::new(device)?,
             epf: ResidentEpfPipeline::new(device)?,
             upsample: ResidentUpsamplePipeline::new(device)?,
+            // Noise pipelines are compiled only for frames carrying a nonzero model.
+            noise: std::sync::OnceLock::new(),
         })
     }
 
@@ -538,6 +560,24 @@ impl ReconstructionPipeline {
                 )?);
             }
         }
+        if let Some(noise) = &plan.noise {
+            let pipeline = self
+                .noise
+                .get_or_init(|| jxl_wgpu::ResidentNoisePipeline::new(device))
+                .as_ref()
+                .map_err(Clone::clone)?;
+            uniforms.push(pipeline.encode(
+                device,
+                encoder,
+                jxl_wgpu::ResidentNoiseInputs {
+                    plan: noise,
+                    planes: resident_planes(plan.output_buffers(buffers), plan.output_extent)?,
+                    scratch: buffers.noise.as_ref().ok_or(ModularRenderError::Invalid {
+                        reason: "missing noise scratch",
+                    })?,
+                },
+            )?);
+        }
         Ok(uniforms)
     }
 }
@@ -619,6 +659,7 @@ mod tests {
             for gaborish in [false, true] {
                 for iterations in 0..=3 {
                     let config = ModularColorConfig {
+                        noise: None,
                         xyb: None,
                         gaborish: gaborish.then_some(ResidentGaborishWeights::DEFAULT),
                         epf: if iterations == 0 {
@@ -703,6 +744,7 @@ mod tests {
             })
             .collect();
         let config = ModularColorConfig {
+            noise: None,
             xyb: None,
             gaborish: Some(ResidentGaborishWeights::DEFAULT),
             epf: crate::restoration::restoration_config(RestorationFilterInventory::Default)

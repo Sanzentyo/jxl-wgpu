@@ -31,6 +31,9 @@ use super::staging::VarDctDecodeSession;
 use super::types::{VAR_DCT_PARSE_LIMIT_BYTES, VarDctDecodeError};
 
 pub(super) struct VarDctPipelines {
+    pub(super) noise: std::sync::OnceLock<
+        std::result::Result<jxl_wgpu::ResidentNoisePipeline, jxl_wgpu::ResidentNoiseError>,
+    >,
     pub(super) packet: VarDctPacketPipeline,
     pub(super) resource: VarDctResourcePipeline,
     pub(super) adaptive_lf: AdaptiveLfPipeline,
@@ -76,6 +79,7 @@ impl VarDctPipelines {
         let device = backend.device();
         Ok(Self {
             packet: VarDctPacketPipeline::new(device),
+            noise: std::sync::OnceLock::new(),
             resource: VarDctResourcePipeline::with_variant(device, resource_variant)?,
             adaptive_lf: AdaptiveLfPipeline::new(device),
             artifact: HfMetadataLoweringPipeline::new(device),

@@ -35,6 +35,7 @@ use super::window_plan::{
 use crate::restoration::restoration_config;
 
 pub(super) struct VarDctSource {
+    pub(super) noise: Option<jxl_wgpu::ResidentNoisePlan>,
     pub(super) codestream: GpuCodestream,
     pub(super) packet: BoundedVarDctPacketPlan,
     pub(super) groups: Vec<VarDctGroupSource>,
@@ -166,6 +167,25 @@ pub(super) fn prepare_packet_source(
         options.output_variant,
     )?;
     let render_color = output.is_color();
+    let noise = if render_color {
+        packet
+            .noise
+            .map(|noise| {
+                noise.plan(
+                    frame,
+                    jxl_gpu_protocol::Extent2d::new(
+                        packet.profile.output_width,
+                        packet.profile.output_height,
+                    ),
+                    packet.lf_correlation.base,
+                    &backend.device().limits(),
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let (gaborish, epf_header) = restoration_config(frame.restoration_filter)?;
     let (gaborish, epf_header) = if render_color {
         (gaborish, epf_header)
@@ -427,6 +447,7 @@ pub(super) fn prepare_packet_source(
                 deferred_hf.as_ref()
             };
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
+                noise: noise.as_ref(),
                 stream_limit,
                 codestream_len,
                 packet: &packet,
@@ -510,6 +531,7 @@ pub(super) fn prepare_packet_source(
         hf_coefficients,
         deferred_hf,
         gaborish,
+        noise,
         epf,
         frame_upsample,
         output,
@@ -682,6 +704,7 @@ fn validate_device_limits(
             true,
         ),
         ("EPF sigma plane", memory.epf_sigma_bytes, true),
+        ("noise planes", memory.noise_bytes, true),
         (
             "frame upsample plane",
             memory.frame_upsample_bytes / 3,
@@ -727,6 +750,7 @@ fn validate_device_limits(
             },
         ),
         ("Gaborish uniform", memory.gaborish_uniform_bytes),
+        ("noise uniform", memory.noise_uniform_bytes),
         (
             "pre-restoration upsample uniform",
             if memory.pre_restoration_upsample_uniform_bytes == 0 {

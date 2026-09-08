@@ -134,6 +134,7 @@ pub enum GpuVarDctPacketError {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundedVarDctPacketPlan {
     pub profile: StandardVarDctProfile,
+    pub noise: Option<crate::NoiseModel>,
     /// LF-global packet containing the scalar quantizer fields and global MA descriptor.
     pub lf_global: BitRange,
     /// Separate HF-global packet, or `None` when all three packets share a single TOC entry.
@@ -463,6 +464,7 @@ pub(crate) enum VarDctPacketPreparation {
 
 struct VarDctPacketPrefix {
     profile: StandardVarDctProfile,
+    noise: Option<crate::NoiseModel>,
     lf_global_packet: BitRange,
     lf_group_packets: Vec<BitRange>,
     hf_global: Option<BitRange>,
@@ -525,6 +527,7 @@ impl VarDctPacketPrefix {
     ) -> Result<BoundedVarDctPacketPlan, BoundedVarDctPacketError> {
         let Self {
             profile,
+            noise,
             lf_global_packet,
             lf_group_packets,
             hf_global,
@@ -785,6 +788,7 @@ impl VarDctPacketPrefix {
         };
         Ok(BoundedVarDctPacketPlan {
             profile,
+            noise,
             lf_global: lf_global_packet,
             hf_global,
             entropy_bit_offset,
@@ -908,6 +912,15 @@ impl BoundedVarDctPacketPlan {
                 })?;
         validate_source_packet_end(source, lf_global_end)?;
         let mut lf_global_reader = source_reader_at(source, lf_global_packet.offset)?;
+        let noise = if inventory.frames[0].flags & 1 != 0 {
+            Some(
+                crate::NoiseModel::parse(&mut lf_global_reader, lf_global_end).map_err(
+                    |error| crate::vardct_frontend::metadata_error("noise model", error),
+                )?,
+            )
+        } else {
+            None
+        };
         let lf_global = LfGlobalPrefix::parse_reader(&mut lf_global_reader, lf_global_end)?;
         let (global_ma_config, descriptor_end) =
             if let Some(tree_offset) = lf_global.global_ma_tree_bit_offset {
@@ -932,6 +945,7 @@ impl BoundedVarDctPacketPlan {
         }
         let mut prefix = VarDctPacketPrefix {
             profile,
+            noise,
             lf_global_packet,
             lf_group_packets,
             hf_global,

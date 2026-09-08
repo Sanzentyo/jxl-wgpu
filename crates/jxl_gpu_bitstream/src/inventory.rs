@@ -525,6 +525,9 @@ pub struct FrameSection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameInventory {
     pub frame_index: u32,
+    /// Visible/nonvisible counters after advancing to this physical frame, used by noise.
+    /// Kept with the frame so projecting a sequence into individual decode jobs preserves seeds.
+    pub noise_seed: [u32; 2],
     pub is_preview: bool,
     pub header_bits: BitRange,
     pub toc_bits: BitRange,
@@ -683,6 +686,7 @@ impl ImageContext {
 pub(crate) struct InventoryProgress {
     pub(crate) total_toc_entries: usize,
     pub(crate) total_section_bytes: u64,
+    pub(crate) noise_seed: [u32; 2],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -762,6 +766,7 @@ pub(crate) fn parse_codestream_inventory(
     let mut is_preview = parsed_image.context.preview_size.is_some();
     let mut total_toc_entries = 0usize;
     let mut total_section_bytes = 0u64;
+    let mut noise_seed = [0; 2];
     let mut lf_frames = LowFrequencyFrameTracker::default();
 
     loop {
@@ -783,6 +788,7 @@ pub(crate) fn parse_codestream_inventory(
             InventoryProgress {
                 total_toc_entries,
                 total_section_bytes,
+                noise_seed,
             },
         )?;
         lf_frames.resolve(&mut parsed_frame.frame)?;
@@ -814,6 +820,7 @@ pub(crate) fn parse_codestream_inventory(
 
         total_toc_entries = parsed_frame.progress.total_toc_entries;
         total_section_bytes = parsed_frame.progress.total_section_bytes;
+        noise_seed = parsed_frame.progress.noise_seed;
         let is_last = parsed_frame.frame.is_last;
         frames.push(parsed_frame.frame);
 
@@ -937,8 +944,26 @@ pub(crate) fn parse_frame_prefix(
         section_cursor = section_end;
     }
 
+    let visible = matches!(
+        header.frame_type,
+        FrameType::Regular | FrameType::SkipProgressive
+    ) && (header.duration != 0 || header.is_last);
+    let noise_seed = if visible {
+        [progress.noise_seed[0].wrapping_add(1), 0]
+    } else {
+        [
+            progress.noise_seed[0],
+            progress.noise_seed[1].wrapping_add(1),
+        ]
+    };
+    let next_noise_seed = if is_preview && header.is_last {
+        [0; 2]
+    } else {
+        noise_seed
+    };
     let frame = FrameInventory {
         frame_index,
+        noise_seed,
         is_preview,
         header_bits: BitRange::between(
             base_bit_offset
@@ -997,6 +1022,7 @@ pub(crate) fn parse_frame_prefix(
         progress: InventoryProgress {
             total_toc_entries,
             total_section_bytes,
+            noise_seed: next_noise_seed,
         },
     })
 }

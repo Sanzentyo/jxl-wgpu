@@ -38,6 +38,7 @@ mod readback;
 mod resident_chroma_upsample;
 mod resident_epf;
 mod resident_gaborish;
+mod resident_noise;
 mod resident_upsample;
 mod resident_vardct;
 mod scheduler;
@@ -96,6 +97,10 @@ pub use resident_epf::{
 pub use resident_gaborish::{
     ResidentGaborishError, ResidentGaborishInputs, ResidentGaborishMemoryPlan,
     ResidentGaborishPipeline, ResidentGaborishWeights,
+};
+pub use resident_noise::{
+    ResidentNoiseError, ResidentNoiseInputs, ResidentNoiseParameters, ResidentNoisePipeline,
+    ResidentNoisePlan,
 };
 pub use resident_upsample::{
     ResidentUpsampleError, ResidentUpsampleInputs, ResidentUpsampleKernel,

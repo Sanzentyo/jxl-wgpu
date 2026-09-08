@@ -82,6 +82,7 @@ name shown in parentheses.
 | `jxl_wgpu/gaborish.wgsl` | `GaborishUniform` / `Params` | `width, height, input_stride, output_stride, weight0, weight1, weight2, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/gaborish_rgb.wgsl` | `GaborishRgbUniform` or `ResidentGaborishParams` / `Params` | dimensions/6 strides, then four values for each of X, Y and B: `weight0, weight1, weight2, pad` | 80 | 4 / 16 | uniform |
 | `jxl_wgpu/epf.wgsl` | `EpfUniform` or `ResidentEpfUniform` / `Params` | dimensions/6 image strides, sigma dimensions/stride/kind, 6 filter floats, constant inverse sigma, one pad | 80 | 4 / 16 | uniform |
+| `jxl_wgpu/noise.wgsl` | `NoiseParams` | geometry `width,height,group_dimension,plane_pixels`; visible/nonvisible seed and two pads; three image strides and pad; two correlation ratios and two pads; eight LUT floats | 96 | 16 | shared uniform for generation and addition |
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
 | `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu_decode/modular_rct` | `ModularRctParams` / `Params` | three in-place plane `width,height,row_stride,word_offset` records, then RCT type and 3 reserved words | 64 | 16 | uniform |
@@ -260,6 +261,7 @@ The table below states the default workgroup configuration for each entry point:
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
 | `vardct_epf` (decoder, `epf0`/`epf1`/`epf2`) | resident X/Y/B/sigma RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual extent, padded plane strides/ranges, sigma block-grid coverage, finite parameters, binding/device limits, and mirrored whole-image neighbors |
+| resident `noise::generate` / `noise::apply` | random planes RW plus U; random and X/Y/B RW plus U | 8x1 / 16x16 | Tier B fixed generation / Tier A 2-D addition | generation has eight independent RNG lanes per full-resolution group; addition reads immutable random neighbors and updates one color pixel; checked dimensions, independent strides, disjoint storage ranges, finite model, workgroups and u32 addresses |
 | decoder `lossless_gray8` | codestream/prefix RO, reconstructed/output/status RW, 256-byte parameter records RO, 16-byte dispatch U | 64x1 | Tier A (`KernelVariant` 1-D) | bounded `jwgp` index, aligned token words plus sentinel, per-group MA metadata base, channel-layout tables, four planes/final addresses, packed-row alignment, sample/output ranges and status allocation are prevalidated; one invocation per group lane; channel-fixed Gradient groups may resume through 16-byte-overlapped stream segments using one aligned 32-byte state record per lane |
 | encoder `vardct_encode_bounded` | source RO, parameters RO, artifact RW | 256x1 | Tier C (`KernelVariant` 1-D) | one workgroup cooperatively loads and transforms at most 1,024 pixels; fixed 16 KiB workgroup storage is validated before pipeline creation |
 | encoder `vardct_encode_quantize` | source RO, parameters RO, artifact RW | 64x1 | Tier C (`KernelVariant` 1-D) | one workgroup per checked 8x8 block; lanes stride over exactly 64 samples and use fixed 1 KiB workgroup storage |
@@ -839,3 +841,28 @@ reservations; cloning/deleting LF slot versions does not duplicate/release a liv
 The allocation test covers 32 combinations of factors 1/2/4/8, Gaborish and EPF0/1/2/3 with
 37×17 final geometry and padded input rows. Both lane selection and frame admission include this
 complete footprint. No separate Modular-to-LF conversion shader or uniform remains.
+
+### Shared resident noise
+
+`ResidentNoisePlan` validates a nonzero output extent, one of the 128/256/512/1024 group
+dimensions, finite LUT values in [0,1), finite correlation ratios, dispatch limits and every
+scratch address before allocation. Its validated geometry and byte counts are private. Encoding
+rechecks the actual device, each color plane's extent/stride/storage range and alignment, scratch
+usage and size, and rejects color overlap or scratch aliasing before recording either dispatch.
+The shader uses wrapping u32 pairs for the RNG; it needs neither shader-i64 nor workgroup memory.
+
+Generation writes three contiguous random F32 planes: exactly `12 * width * height` bytes at
+the post-upsampling extent. The second dispatch fuses the mirrored 5×5 convolution with
+luma-dependent XYB addition, reading only immutable random neighbors and the invocation's own
+color pixel. Both dispatches share one 96-byte `Pod` uniform. No convolved-noise scratch or host
+random image is allocated. Pipelines initialize lazily for a nonzero signaled model.
+
+VarDCT exposes `noise_bytes` and `noise_uniform_bytes` in its frame memory plan. Modular includes
+the same plan in reconstruction storage/uniform totals and `modular_render_bytes`. Both reserve
+the complete footprint before the first queue submission and retain buffers/uniforms through
+their existing callback-owned job lifetime. The noise integration test observes admission through
+the public executor, including Modular's composition producer: nonzero versus zero models add
+exactly 52,524 bytes for 257×17, one byte below the required capacity leaves no partial permit,
+retry succeeds after release, and abandoning a submitted fragmented session releases all permits
+after completion callbacks run. All-zero models consume their 80 metadata bits but allocate no
+noise resources.

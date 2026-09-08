@@ -339,6 +339,8 @@ struct VarDctGroupJobBuffers {
 
 #[derive(Default)]
 struct PostTransformJobBuffers {
+    _noise: Option<wgpu::Buffer>,
+    _noise_uniform: Option<wgpu::Buffer>,
     _restoration_planes: Option<[wgpu::Buffer; 3]>,
     _pre_restoration_planes: Option<[wgpu::Buffer; 3]>,
     _pre_restoration_uniforms: Vec<wgpu::Buffer>,
@@ -2631,6 +2633,30 @@ fn submit_vardct(
             });
             let [stride_x, stride_y, stride_b] = presentation_strides;
             let presentation_strides = [stride_x?, stride_y?, stride_b?];
+            let noise = source.noise.as_ref().map(|plan| plan.allocate(device));
+            let noise_uniform = if let (Some(plan), Some(scratch)) = (&source.noise, &noise) {
+                let pipeline = pipelines
+                    .noise
+                    .get_or_init(|| jxl_wgpu::ResidentNoisePipeline::new(device))
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                Some(pipeline.encode(
+                    device,
+                    &mut commands,
+                    jxl_wgpu::ResidentNoiseInputs {
+                        plan,
+                        scratch,
+                        planes: resident_image_planes(
+                            presentation_planes,
+                            output_width,
+                            output_height,
+                            presentation_stride,
+                        )?,
+                    },
+                )?)
+            } else {
+                None
+            };
             let output_scratch = pipelines.output.encode(
                 device,
                 &mut commands,
@@ -2707,6 +2733,8 @@ fn submit_vardct(
                 None
             };
             let post_transform_buffers = PostTransformJobBuffers {
+                _noise: noise,
+                _noise_uniform: noise_uniform,
                 _restoration_planes: restoration_planes,
                 _pre_restoration_planes: pre_restoration_planes,
                 _pre_restoration_uniforms: pre_restoration_uniforms,

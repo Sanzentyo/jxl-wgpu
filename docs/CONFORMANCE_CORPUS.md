@@ -2061,3 +2061,63 @@ Formatting, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM gate p
 Reference and Metal harnesses each pass 18 cases, and indexed Gray8 U8 CPU readback passes.
 Both new fixtures regenerate byte-identically; live libjxl 0.12.0 accepts both and produces identical
 pixels. Larger/transformed raw images and broader cross-feature conformance remain separate gates.
+
+## GPU noise synthesis
+
+`crates/jxl_wgpu_decode/test-data/generate_noise.c` generates nine small XYB streams with
+libjxl 0.12.0. It uses distance 2, effort 1, disabled patches/dots/progressive DC, explicitly
+enabled noise and photon ISO 800. Source RGB8 samples are
+`32 + ((x * (c + 2) + y * (7 - c) + frame * 11) % 192)` for channels 0 through 2.
+
+| Fixture | Geometry | Coding and rendering |
+|---|---|---|
+| `noise/vardct_257x17.jxl.hex` | 257×17 | VarDCT, no filtering or resampling |
+| `noise/modular_257x17.jxl.hex` | 257×17 | Modular, no filtering or resampling |
+| `noise/{vardct,modular}_up{2,4,8}.jxl.hex` | 259×33 | Both modes at every factor, Gaborish and EPF2 |
+| `noise/mixed_frames.jxl.hex` | 37×19 | Five alternating VarDCT/Modular physical frames; durations 2/0/0/3/0, three presentations |
+
+Regenerate into an existing output directory with:
+
+```sh
+cc crates/jxl_wgpu_decode/test-data/generate_noise.c \
+  $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-generate-noise
+/tmp/jxl-generate-noise crates/jxl_wgpu_decode/test-data/noise
+cargo test -p jxl_wgpu_decode --test noise -- --test-threads=1
+cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
+```
+
+`tests/noise.rs` parses the real signaled model and also clears exactly its ten bytes to compare
+the same entropy with a zero model. Every noisy result must differ from its zero-model result.
+Whole input and 43-byte source chunks under a 256-byte GPU window cap must produce bit-identical
+F32 RGBA output for every presentation. Both variants are compared against independent Rust jxl
+and optional live libjxl: maximum absolute error must stay below 0.0001 and 1/1024 respectively.
+The latter is a quarter of one RGB8 code; noise-free upsampled controls exhibit the same native
+transform-rounding scale (observed maximum 0.0002591). Noise does not justify relaxing this bound.
+The mixed stream explicitly checks seeds `[1,0], [1,1], [1,2], [2,0], [3,0]` and complete output
+length, and every execution checks that the shared reservation is returned.
+
+The resident GPU test independently computes SplitMix64/Xorshift128Plus with native scalar u64
+arithmetic and requires exact random F32 bits. It covers all four group dimensions, 1×1 and
+other odd extents, horizontal/vertical tile boundaries, partial 16-sample row tails, wrapped
+frame counters, independent padded color strides, nondefault correlations and LUT interpolation
+including endpoint clipping. Fused convolution/addition must match the scalar result within
+2e-6 without changing row padding. Portable Naga validation and invalid geometry/model/address
+limits are checked. The metadata unit test exercises every truncated length of a skewed 80-bit
+model, preserving the following packet data. Public admission tests compare zero/nonzero memory,
+force a one-byte capacity shortfall, retry and abandon submitted work.
+
+Production noise uses base X/B correlation, following
+[libjxl's noise stage](https://github.com/libjxl/libjxl/blob/main/lib/jxl/render_pipeline/stage_noise.cc)
+and [jxl-oxide's noise implementation](https://github.com/tirr-c/jxl-oxide/blob/main/crates/jxl-render/src/features/noise.rs).
+Rust jxl 0.6 instead uses LF-adjusted correlation in its noise stage; that distinction still
+requires a custom-correlation codestream fixture and should not be resolved by loosening oracle
+tolerances. Non-XYB noise remains typed unsupported. Preview, LF/reference-only frames,
+patch/spline combinations, and the full 18181-3 precision corpus remain open conformance gates.
+No production CPU image codec, random-plane upload or intermediate image readback is introduced.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+745 tests across 33 targets, with one existing manual benchmark ignored. Both noise integration
+tests also pass after adding explicit finite-sample assertions. Formatting, workspace check,
+warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal
+harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All nine fixtures regenerate
+byte-identically with the checked generator and libjxl 0.12.0.

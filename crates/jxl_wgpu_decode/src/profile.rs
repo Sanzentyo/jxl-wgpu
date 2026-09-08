@@ -284,7 +284,8 @@ fn parse_modular_profile(
     let frame = &inventory.frames[0];
     let shared_frame_is_invalid = frame.is_preview
         || frame.encoding != FrameEncoding::Modular
-        || frame.flags != 0
+        || frame.flags & !1 != 0
+        || (frame.flags & 1 != 0 && !image.xyb_encoded)
         || frame.do_ycbcr
         || frame.jpeg_upsampling != [0; 3]
         || !matches!(frame.upsampling, 1 | 2 | 4 | 8)
@@ -389,11 +390,23 @@ fn parse_modular_profile(
     .ok_or_else(|| unsupported_error("the Modular frame is missing DC-global metadata"))?;
     let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
+    let noise = if frame.flags & 1 != 0 {
+        Some(crate::NoiseModel::parse(
+            &mut reader,
+            dc_global
+                .bits
+                .end()
+                .ok_or_else(|| unsupported_error("DC-global bit range overflow"))?,
+        )?)
+    } else {
+        None
+    };
     let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
     let color_render = crate::modular_render::ModularColorConfig::new(
         image,
         frame,
         lf_dequantization.map(FiniteF16::to_f32),
+        noise,
     )?;
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
