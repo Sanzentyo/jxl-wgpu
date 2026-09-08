@@ -1175,7 +1175,8 @@ output uniform and four-byte output status. All reservations retire after frame/
 Wrong indices/depths fail before admission. A progressive fixture whose final AC section is zeroed
 still validates the global extra stream, then returns `HfCoefficientGpu` without a scalar frame.
 
-The standalone scalar packer test checks 320 combinations of five integer precisions, four
+The standalone scalar packer test checks 640 combinations of two resident source domains
+(signed integer and normalized F32), five integer precisions, four
 extents (including both one-sample axes and a forced 2-D dispatch), all eight orientations and
 both mappings. It supplies signed negative/overshoot values, nonzero source/binding/plane offsets,
 padded source/output rows and guard bytes. Native out-of-range values set a typed rejection;
@@ -1294,4 +1295,84 @@ allocation benchmark ignored. The strengthened late-admission assertion also pas
 GPU rerun. Final formatting, workspace check, warning-free Clippy/rustdoc, Rust 1.89 and the
 six-crate WASM check pass. Reference and Metal harnesses each pass all 18 cases, and indexed GPU
 decode with CPU readback passes. This closes the distributed full-resolution integer-extra path;
-shifted/resampled/floating extras, associated alpha and broader cross-feature conformance remain.
+At that checkpoint shifted/resampled/floating extras, associated alpha and broader cross-feature
+conformance remained; the following checkpoint adds integer resampling.
+
+## Integer channel resampling
+
+`generate_extra_channels.c OUTPUT_DIR --resampled` generates the following ten cases in both
+Modular and VarDCT form with libjxl 0.12. Filenames use `extras_` or `vardct_extras_` followed by
+the suffix below and `.jxl.hex`. The source formula and independent extra depths are unchanged
+from the earlier extra-channel fixtures. Color is lossless Modular or VarDCT distance 1; extras
+have distance 0 before the requested downsampling. These are supported still-image fixtures,
+not claims of lossless reconstruction after resampling.
+
+| Suffix | Original extent | Color/depth | Color factor | Extra factor | Dimension shift | Orientation |
+|---|---|---|---:|---:|---:|---:|
+| `resampled_2` | 517×9 | RGB12 + Alpha5 | 1 | 2 | 0 | 6 |
+| `resampled_4` | 37×17 | Gray8 + nine independent extras | 1 | 4 | 0 | 8 |
+| `resampled_8` | 2051×9 | RGB16 + Alpha5 | 1 | 8 | 0 | 5 |
+| `resampled_color` | 259×17 | RGB8 + Alpha5 | 2 | 8 | 0 | 7 |
+| `resampled_color4` | 17×257 | Gray8 + Alpha5 | 4 | 4 | 0 | 4 |
+| `resampled_color8` | 9×1 | RGB16 + Alpha5 | 8 | 8 | 0 | 2 |
+| `resampled_squeeze` | 2051×17 | RGB12 + Alpha5, effort 7, responsive/progressive | 1 | 2 | 0 | 6 |
+| `shifted` | 37×9 | RGB8 + Alpha5 | 1 | 2 | 1 | 3 |
+| `shifted4` | 37×9 | RGB12 + Alpha5 | 2 | 4 | 2 | 1 |
+| `shifted8` | 2051×9 | RGB8 + Alpha5 | 1 | 8 | 3 | 7 |
+
+`tests/vardct_engine_gpu/extra_channels/resampled.rs` drives both producers through the public
+decoder. All extra planes are selected independently as native codes and normalized F32, plus
+RGBA color/first-alpha output. Whole blocking and 43-byte fragmented asynchronous input with a
+1024-byte entropy cap must produce identical bytes. Native resampled codes are within one code
+of final rounding of the float oracle; scalar/alpha F32 error must be below `4e-7`, Modular color
+below `1e-6`, and VarDCT color below `3e-4` against Rust `jxl` or `2e-3` against libjxl. Every frame
+retains only its output lease after completion; releasing it returns the reservation to zero.
+
+Rust `jxl` 0.6 handles `dimension_shift` inconsistently, so the six explicitly shifted cases use
+the independent libjxl C oracle and are skipped only when that optional native tool is unavailable.
+The other fourteen cases compare both oracles when libjxl is installed. Inventory unit tests also
+verify that an all-default frame includes image-header shifts and reject effective factors above
+8 or below the color factor. The interpretation follows the reference
+[frame-header visitor](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/frame_header.cc) and
+[default-field initialization](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/fields.cc).
+
+Ten runtime fixture variants replace the custom transform-data weight fields with all three
+binary16 `1/32` compact kernels while preserving the original opsin data and entropy packets.
+Raw/container inputs are first resolved to their logical codestream. Both GPU producers compare
+color/alpha against Rust and libjxl for these non-default kernels, including 4×/8× color resampling
+and the one-sample axis. Separate actual-adapter tests prove reservation before submission,
+retry after initial backpressure, cancellation and subsequent successful reuse for both modes.
+Host render-plan tests verify aligned disjoint destination views, one shared normalization
+scratch plane, weight deduplication and rejection before allocation on geometry/address/limit errors.
+
+Associated alpha, floating source samples, general extra-channel composition and resampled
+crop/blend cross-products remain conformance gaps.
+
+Validation on Apple M5/Metal: the serial full workspace passes 682 tests with one existing manual
+allocation benchmark ignored. After tightening workgroup and source-address admission, all 159
+decoder library tests and all four resampling integration tests pass again. Final formatting,
+workspace check, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference
+and Metal harnesses each pass all 18 cases, and indexed GPU decode with CPU readback passes.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `extras_resampled_2.jxl.hex` | 10687 | `e9fb348591270f92512a111d20c50dc9caf99c90ee7805d1152642e14729c5fc` |
+| `extras_resampled_4.jxl.hex` | 1491 | `f6c8995e76eccada796f2df0abd96a3c1c2f5c5603cbe7fbb856d91a8f05dc83` |
+| `extras_resampled_8.jxl.hex` | 28250 | `b16b9d3c815cf6430dfdb9e9d32b19611b240a5393fbda565f227d2087c124a5` |
+| `extras_resampled_color.jxl.hex` | 3418 | `5ecc157683dcecb32949eb8b0fd9f2bb6d0e1e1b7a55a36c8c150576e0232a00` |
+| `extras_resampled_color4.jxl.hex` | 376 | `7960a7bcd0ecc72a4b63f660dbb8bd4f7d2566e5ae185cdcfa9921608d7aa24a` |
+| `extras_resampled_color8.jxl.hex` | 111 | `f9a429de9771559a9127c9c4871cbb79776b5cbd486dab2f8bbc37259f3efa5e` |
+| `extras_resampled_squeeze.jxl.hex` | 98793 | `7edf36718efcad326ce119da67e2ecc3bff07474408f2f221f6b4819953c4348` |
+| `extras_shifted.jxl.hex` | 942 | `083ae680f7e5fcceea763b8d5acd30837e6692b1948fc2c3633267297dc9b84d` |
+| `extras_shifted4.jxl.hex` | 480 | `56b4e62579a85b344271783ea9fa28def4cc1298cecdbe7773d02e42aeaefd30` |
+| `extras_shifted8.jxl.hex` | 50176 | `940d6e4ea71af8377d658b66bfb49e238a1933f9b1f3afe622b48ea68e57df99` |
+| `vardct_extras_resampled_2.jxl.hex` | 6791 | `4b41f970e5984854e9b58021f4f5749080024df14ad78467fed9785655cef15b` |
+| `vardct_extras_resampled_4.jxl.hex` | 1556 | `4f2a534676de0bb309ffc878e871c9ed5572c29f72f6d6ea893dea7a7cee8288` |
+| `vardct_extras_resampled_8.jxl.hex` | 5877 | `9c808eca038ec93727c7d483e8d8b0c0c11622e907a35a9293ad1cb0d3648a07` |
+| `vardct_extras_resampled_color.jxl.hex` | 2400 | `b04d13da9f3d67b43d6182149dd4ab0783a5a697e1c850e54137475fe3f63dd6` |
+| `vardct_extras_resampled_color4.jxl.hex` | 535 | `56c1a03182ae862e9db34035abe9bc9c2ef9e36cf377d7608a3baadfb5eda8e4` |
+| `vardct_extras_resampled_color8.jxl.hex` | 103 | `247c3daffb86a564d984697b906edf1249ded8b15fe15ec8b57d761844690e7b` |
+| `vardct_extras_resampled_squeeze.jxl.hex` | 44561 | `aef8458b298255e2b12e1a6c42fac7549f0f4b3d3c3ef2bee476957ff00c3817` |
+| `vardct_extras_shifted.jxl.hex` | 801 | `20e154cdb46cac67b7580709f5e10a39403df8cdd87e8058cf3c548935457516` |
+| `vardct_extras_shifted4.jxl.hex` | 324 | `20b89f55f2c160095ab84fab8e7d2c6f2c445af4033f40f37db9ffcbe31d5bb4` |
+| `vardct_extras_shifted8.jxl.hex` | 27420 | `8eb30fc3415876b82453dc922445e1763cf9c3a72441f6860a7c5b7a36c73641` |

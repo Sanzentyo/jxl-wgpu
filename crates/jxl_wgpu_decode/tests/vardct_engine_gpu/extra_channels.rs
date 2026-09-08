@@ -7,6 +7,8 @@ use jxl_wgpu_decode::{OrientationPolicy, SpotColorPolicy};
 mod distributed;
 #[path = "../common/extra_channel_oracle.rs"]
 mod oracle;
+#[path = "extra_channels/resampled.rs"]
+mod resampled;
 #[path = "extra_channels/scalar.rs"]
 mod scalar;
 

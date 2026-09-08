@@ -54,6 +54,7 @@ impl ResidentModularPlane {
         &self,
     ) -> std::result::Result<VarDctOutputAlpha<'_>, VarDctDecodeError> {
         Ok(VarDctOutputAlpha {
+            domain: crate::ModularSampleDomain::SignedInteger,
             storage: ResidentStorageBinding::entire(self.arena.as_wgpu_buffer())?,
             width: self.plane.width,
             height: self.plane.height,

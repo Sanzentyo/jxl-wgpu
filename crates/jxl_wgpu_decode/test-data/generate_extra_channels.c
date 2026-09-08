@@ -1,6 +1,6 @@
 /* Offline libjxl 0.12 fixture generator; production never links this CPU codec.
  * cc generate_extra_channels.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-extras
- * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed]
+ * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed|--resampled]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
@@ -11,6 +11,9 @@
 
 static int vardct;
 static int responsive;
+static int resampling = 1;
+static int ec_resampling = 1;
+static int dimension_shift;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static const JxlExtraChannelType types[] = {
@@ -38,6 +41,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   for (uint32_t c = 0; c < extras; ++c) {
     JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : types[c], &ec);
     ec.bits_per_sample = alpha_only ? 5 : depths[c];
+    ec.dim_shift = dimension_shift;
     ec.spot_color[0] = 0.25f; ec.spot_color[1] = 0.5f; ec.spot_color[2] = 0.75f; ec.spot_color[3] = 0.5f;
     ec.cfa_channel = 3;
     check(JxlEncoderSetExtraChannelInfo(enc, c, &ec));
@@ -56,6 +60,8 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     check(JxlEncoderSetFrameDistance(settings, 1.0f));
     for (uint32_t c=0; c<extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0.0f));
   } else check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
+  check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESAMPLING, resampling));
+  check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EXTRA_CHANNEL_RESAMPLING, ec_resampling));
   size_t pixels = (size_t)width * height;
   float* data = malloc(pixels * colors * sizeof(float));
   if (!data) exit(2);
@@ -89,6 +95,33 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--resampled")) {
+    for (vardct = 0; vardct <= 1; ++vardct) {
+      ec_resampling = 2;
+      generate(argv[1], "resampled_2", 517, 9, 3, 12, 1, 6, 1, 1, 0);
+      ec_resampling = 4;
+      generate(argv[1], "resampled_4", 37, 17, 1, 8, 9, 8, 1, 0, 0);
+      ec_resampling = 8;
+      generate(argv[1], "resampled_8", 2051, 9, 3, 16, 1, 5, 1, 1, 0);
+      resampling = 2;
+      generate(argv[1], "resampled_color", 259, 17, 3, 8, 1, 7, 1, 1, 0);
+      resampling = 4; ec_resampling = 4;
+      generate(argv[1], "resampled_color4", 17, 257, 1, 8, 1, 4, 1, 1, 0);
+      resampling = 8; ec_resampling = 8;
+      generate(argv[1], "resampled_color8", 9, 1, 3, 16, 1, 2, 1, 1, 0);
+      resampling = 2; ec_resampling = 4; dimension_shift = 2;
+      generate(argv[1], "shifted4", 37, 9, 3, 12, 1, 1, 1, 1, 0);
+      resampling = 1; ec_resampling = 8; dimension_shift = 3;
+      generate(argv[1], "shifted8", 2051, 9, 3, 8, 1, 7, 1, 1, 0);
+      resampling = 1; ec_resampling = 2; dimension_shift = 1;
+      generate(argv[1], "shifted", 37, 9, 3, 8, 1, 3, 1, 1, 0);
+      dimension_shift = 0;
+      responsive = 1;
+      generate(argv[1], "resampled_squeeze", 2051, 17, 3, 12, 1, 6, 7, 1, 1);
+      responsive = 0;
+    }
+    return 0;
+  }
   if (argc != 2 && (argc != 3 || (strcmp(argv[2], "--vardct") && strcmp(argv[2], "--vardct-distributed")))) return 2;
   vardct = argc == 3;
   if (vardct && !strcmp(argv[2], "--vardct-distributed")) {

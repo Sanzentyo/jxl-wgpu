@@ -65,7 +65,9 @@ fn source_alpha_at(x: u32, y: u32) -> f32 {
     let alpha = source_params.alpha_geometry;
     if alpha.w == 0u { return 1.0; }
     let coordinate = source_coordinate(vec2<u32>(x, y));
-    return f32(bitcast<i32>(source_alpha[alpha.x + coordinate.y * alpha.y + coordinate.x])) / f32(alpha.z);
+    let word = source_alpha[alpha.x + coordinate.y * alpha.y + coordinate.x];
+    if alpha.w == 2u { return bitcast<f32>(word); }
+    return f32(bitcast<i32>(word)) / f32(alpha.z);
 }
 
 fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {

@@ -423,7 +423,7 @@ impl WgpuSubmissionEngine {
             })
             .transpose()?;
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
-        let extent = Extent2d::new(profile.width, profile.height);
+        let extent = Extent2d::new(profile.output_width, profile.output_height);
         let mut output = OutputPlan::new(
             extent,
             profile.orientation,
@@ -433,6 +433,29 @@ impl WgpuSubmissionEngine {
             self.capabilities(),
         )?;
         output.source_channels = output_channels;
+        let factors: Vec<_> = output
+            .source_channels
+            .indices
+            .iter()
+            .map(|&index| profile.channel_upsampling[index])
+            .collect();
+        if factors.iter().any(|&factor| factor != 1) {
+            let inverse = if let Some(frame) = &profile.resident_frame_plan {
+                &frame.inverse_plan
+            } else {
+                &profile.resident_entropy_plans[0].inverse_plan
+            };
+            output.render = Some(crate::modular_render::ModularRenderPlan::new(
+                extent,
+                output
+                    .source_channels
+                    .select(&inverse.final_gpu_layouts())?,
+                factors,
+                &profile.upsampling_weights,
+                &self.backend.device().limits(),
+            )?);
+        }
+
         let output_write_path = if generalized_channels {
             OutputWritePath::AtomicBytes
         } else {
@@ -496,6 +519,7 @@ impl WgpuSubmissionEngine {
                     needs_palette,
                     needs_squeeze,
                     needs_rct,
+                    output.render.is_some(),
                 )
             })
             .transpose()?;
@@ -613,7 +637,7 @@ impl WgpuSubmissionEngine {
             uses_self_correcting: reported_ma_config.needs_self_correcting(),
         };
         Ok(PreparedGpuSession::new(
-            DecodeProfile::ModularLossless {
+            DecodeProfile::Modular {
                 bits_per_sample: profile.bits_per_sample,
                 channels: profile.channels,
                 prediction,
@@ -666,6 +690,7 @@ impl ModularInversePipelineCache {
         needs_palette: bool,
         needs_squeeze: bool,
         needs_rct: bool,
+        needs_render: bool,
     ) -> Result<Arc<ModularInversePipelines>> {
         let palette = if needs_palette {
             let variant = backend
@@ -737,7 +762,21 @@ impl ModularInversePipelineCache {
             Ok(pipeline) => Arc::clone(pipeline),
             Err(error) => return Err(error.clone().into()),
         };
+        let render = needs_render
+            .then(|| {
+                self.render
+                    .get_or_init(|| {
+                        crate::modular_render::ModularRenderPipeline::new(backend.device())
+                            .map(Arc::new)
+                    })
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(Clone::clone)
+            })
+            .transpose()?;
         Ok(Arc::new(ModularInversePipelines {
+            render,
+
             palette,
             squeeze,
             rct,

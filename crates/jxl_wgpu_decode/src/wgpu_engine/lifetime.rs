@@ -27,6 +27,8 @@ pub(super) struct DecodeSource {
 }
 
 pub(super) struct DecodeJobLifetime {
+    pub(super) render: Option<crate::modular_render::ModularRenderBuffers>,
+    pub(super) render_uniforms: Mutex<Vec<wgpu::Buffer>>,
     pub(super) output: GpuBufferLease,
     pub(super) _modular_metadata: DecodeBufferLease,
     pub(super) _reconstructed: DecodeBufferLease,

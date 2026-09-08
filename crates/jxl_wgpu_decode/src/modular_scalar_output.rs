@@ -193,6 +193,13 @@ pub(crate) struct ModularScalarOutputScratch {
     pub status: wgpu::Buffer,
 }
 
+pub(crate) struct ModularScalarOutputInputs<'a> {
+    pub plane: GpuModularChannelLayout,
+    pub domain: crate::ModularSampleDomain,
+    pub arena: ResidentStorageBinding<'a>,
+    pub output: ResidentStorageBinding<'a>,
+}
+
 impl ModularScalarOutputScratch {
     pub(crate) fn validate_status(bytes: &[u8]) -> Result<()> {
         match bytes.try_into().map(u32::from_le_bytes) {
@@ -230,10 +237,14 @@ impl ModularScalarOutputPipeline {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         plan: ModularScalarOutputPlan,
-        plane: GpuModularChannelLayout,
-        arena: ResidentStorageBinding<'_>,
-        output: ResidentStorageBinding<'_>,
+        inputs: ModularScalarOutputInputs<'_>,
     ) -> Result<ModularScalarOutputScratch> {
+        let ModularScalarOutputInputs {
+            plane,
+            domain,
+            arena,
+            output,
+        } = inputs;
         if self.variant != plan.variant
             || plane.width != plan.config.extent.width
             || plane.height != plan.config.extent.height
@@ -268,7 +279,7 @@ impl ModularScalarOutputPipeline {
                 plan.logical_bytes,
                 (plan.storage_bytes / 4) as u32,
                 plan.dispatch_width,
-                0,
+                domain as u32,
             ],
         };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

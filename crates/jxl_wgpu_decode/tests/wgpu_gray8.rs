@@ -791,7 +791,7 @@ fn standard_raw_and_jxlc_multigroup_extreme_aspects_reconstruct_exactly_on_gpu()
         });
         assert!(matches!(
             session.profile(),
-            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            jxl_wgpu_decode::DecodeProfile::Modular {
                 prediction: jxl_wgpu_decode::ModularPredictionProfile::MetaAdaptive {
                     node_count,
                     decision_node_count,
@@ -981,7 +981,7 @@ fn weighted_ma_groups_resume_across_bounded_gpu_stream_windows() {
     let mut blocking = decoder.open(encoded, request()).unwrap();
     assert!(matches!(
         blocking.profile(),
-        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+        jxl_wgpu_decode::DecodeProfile::Modular {
             prediction: jxl_wgpu_decode::ModularPredictionProfile::MetaAdaptive {
                 uses_self_correcting: true,
                 ..
@@ -1240,7 +1240,7 @@ fn cjxl_multigroup_global_palette_is_exact_through_frame_resident_inverse() {
         .expect("GPU decoder accepts the cjxl global Palette transform");
     assert!(matches!(
         session.profile(),
-        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+        jxl_wgpu_decode::DecodeProfile::Modular {
             grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
             ..
         }
@@ -1348,7 +1348,7 @@ fn cjxl_progressive_multigroup_squeeze_is_exact_through_frame_resident_inverse()
         .expect("GPU decoder accepts the cjxl progressive Squeeze transform");
     assert!(matches!(
         session.profile(),
-        jxl_wgpu_decode::DecodeProfile::ModularLossless { passes: 2, .. }
+        jxl_wgpu_decode::DecodeProfile::Modular { passes: 2, .. }
     ));
     let stats = session
         .submission_session()
@@ -1447,7 +1447,7 @@ fn cjxl_multigroup_local_transforms_finish_each_reused_gpu_lane_exactly() {
         .expect("cjxl local transforms select the Modular engine")
         .memory_stats();
     let group_count = match session.profile() {
-        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+        jxl_wgpu_decode::DecodeProfile::Modular {
             grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { columns, rows },
             ..
         } => usize::try_from(columns * rows).unwrap(),
@@ -1529,7 +1529,7 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         });
         assert!(matches!(
             session.profile(),
-            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            jxl_wgpu_decode::DecodeProfile::Modular {
                 bits_per_sample: actual_bits,
                 channels: actual_channels,
                 grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
@@ -1621,7 +1621,7 @@ fn standard_modular_fused_rgb_and_rgba_groups_are_exact_on_gpu() {
         let mut session = decoder.open(&encoded, request).unwrap();
         assert!(matches!(
             session.profile(),
-            jxl_wgpu_decode::DecodeProfile::ModularLossless {
+            jxl_wgpu_decode::DecodeProfile::Modular {
                 grouping: jxl_wgpu_decode::ModularGrouping::SingleGroup,
                 ..
             }
@@ -1779,7 +1779,7 @@ fn local_ma_multigroup_codestream_reconstructs_exactly_on_gpu_and_rust() {
         .expect("GPU decoder accepts local per-group MA configurations");
     assert!(matches!(
         session.profile(),
-        jxl_wgpu_decode::DecodeProfile::ModularLossless {
+        jxl_wgpu_decode::DecodeProfile::Modular {
             grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups {
                 columns: 3,
                 rows: 2,

@@ -543,7 +543,8 @@ pub struct FrameInventory {
     pub do_ycbcr: bool,
     pub jpeg_upsampling: [u32; 3],
     pub upsampling: u32,
-    /// One upsampling factor per image-header extra channel, in channel order.
+    /// Effective upsampling factors, including each image-header `dimension_shift`.
+    /// Every factor is 1, 2, 4 or 8 and at least the color upsampling factor.
     pub extra_channel_upsampling: Vec<u32>,
     pub group_size_shift: u32,
     pub x_qm_scale: u32,
@@ -649,19 +650,23 @@ pub(crate) struct ParsedImageHeader {
     pub(crate) context: ImageContext,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ImageContext {
     width: u32,
     height: u32,
     preview_size: Option<(u32, u32)>,
     xyb_encoded: bool,
     num_extra_channels: u32,
+    extra_channel_shifts: Vec<u32>,
     have_animation: bool,
     have_timecodes: bool,
 }
 
 impl ImageContext {
-    pub(crate) fn frame_context(self, is_preview: bool) -> Result<FrameContext, InventoryError> {
+    pub(crate) fn frame_context(
+        &self,
+        is_preview: bool,
+    ) -> Result<FrameContext<'_>, InventoryError> {
         let mut context = FrameContext::from_image(self);
         if is_preview {
             let (width, height) = self
@@ -1121,6 +1126,10 @@ pub(crate) fn parse_image_header(
         .and_then(|icc| icc.bit_range.end())
         .unwrap_or(header_bits);
 
+    let extra_channel_shifts = extra_channels
+        .iter()
+        .map(|extra| extra.dimension_shift)
+        .collect();
     let inventory = ImageHeaderInventory {
         bit_range: BitRange {
             offset: 0,
@@ -1156,6 +1165,7 @@ pub(crate) fn parse_image_header(
             preview_size,
             xyb_encoded: metadata.xyb_encoded,
             num_extra_channels: extra_channel_count,
+            extra_channel_shifts,
             have_animation: metadata.animation.is_some(),
             have_timecodes: animation.is_some_and(|animation| animation.have_timecodes),
         },
@@ -1400,22 +1410,24 @@ fn transformed_icc_output_size(encoded: &[u8]) -> Result<u64, InventoryError> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct FrameContext {
+pub(crate) struct FrameContext<'a> {
     width: u32,
     height: u32,
     xyb_encoded: bool,
     num_extra_channels: u32,
+    extra_channel_shifts: &'a [u32],
     have_animation: bool,
     have_timecodes: bool,
 }
 
-impl FrameContext {
-    pub(crate) fn from_image(image: ImageContext) -> Self {
+impl<'a> FrameContext<'a> {
+    pub(crate) fn from_image(image: &'a ImageContext) -> Self {
         Self {
             width: image.width,
             height: image.height,
             xyb_encoded: image.xyb_encoded,
             num_extra_channels: image.num_extra_channels,
+            extra_channel_shifts: &image.extra_channel_shifts,
             have_animation: image.have_animation,
             have_timecodes: image.have_timecodes,
         }
@@ -1454,6 +1466,19 @@ struct ParsedFrameHeader {
     max_vertical_shift: u32,
 }
 
+fn resolve_extra_channel_upsampling(
+    encoded: u32,
+    shift: u32,
+    color: u32,
+) -> Result<u32, InventoryError> {
+    encoded
+        .checked_shl(shift)
+        .filter(|&factor| matches!(factor, 1 | 2 | 4 | 8) && factor >= color)
+        .ok_or(InventoryError::InvalidFrame(
+            "invalid effective extra-channel upsampling",
+        ))
+}
+
 fn parse_frame_header(
     reader: &mut BitReader<'_>,
     context: FrameContext,
@@ -1472,7 +1497,11 @@ fn parse_frame_header(
             do_ycbcr: false,
             jpeg_upsampling: [0; 3],
             upsampling: 1,
-            extra_channel_upsampling: vec![1; extra_channel_count],
+            extra_channel_upsampling: context
+                .extra_channel_shifts
+                .iter()
+                .map(|&shift| resolve_extra_channel_upsampling(1, shift, 1))
+                .collect::<Result<_, _>>()?,
             group_size_shift: 1,
             x_qm_scale: if context.xyb_encoded { 3 } else { 2 },
             b_qm_scale: 2,
@@ -1535,10 +1564,16 @@ fn parse_frame_header(
         read_u32(reader, [c(1), c(2), c(4), c(8)])?
     };
     let mut extra_channel_upsampling = vec![1; extra_channel_count];
-    if !has_lf_frame {
-        for value in &mut extra_channel_upsampling {
-            *value = read_u32(reader, [c(1), c(2), c(4), c(8)])?;
-        }
+    for (value, &shift) in extra_channel_upsampling
+        .iter_mut()
+        .zip(context.extra_channel_shifts)
+    {
+        let encoded = if has_lf_frame {
+            1
+        } else {
+            read_u32(reader, [c(1), c(2), c(4), c(8)])?
+        };
+        *value = resolve_extra_channel_upsampling(encoded, shift, upsampling)?;
     }
     let group_size_shift = if encoding == FrameEncoding::Modular {
         read_bits(reader, 2)? as u32
@@ -2244,6 +2279,37 @@ mod tests {
     use super::*;
     use crate::{BitWriter, FragmentedContainerWriter, ParseLimits, parse, write_container};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn effective_extra_upsampling_includes_default_header_dimension_shifts() {
+        let context = ImageContext {
+            width: 37,
+            height: 9,
+            preview_size: None,
+            xyb_encoded: true,
+            num_extra_channels: 4,
+            extra_channel_shifts: vec![0, 1, 2, 3],
+            have_animation: false,
+            have_timecodes: false,
+        };
+        let mut reader = BitReader::new(&[1]);
+        let header = parse_frame_header(
+            &mut reader,
+            context.frame_context(false).unwrap(),
+            false,
+            InventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(header.extra_channel_upsampling, [1, 2, 4, 8]);
+        assert_eq!(reader.bit_offset(), 1);
+        assert_eq!(resolve_extra_channel_upsampling(2, 2, 4).unwrap(), 8);
+        for (encoded, shift, color) in [(8, 1, 1), (1, 4, 1), (1, 32, 1), (1, 1, 4), (4, 31, 1)] {
+            assert!(matches!(
+                resolve_extra_channel_upsampling(encoded, shift, color),
+                Err(InventoryError::InvalidFrame(_))
+            ));
+        }
+    }
 
     fn inventory(input: &[u8]) -> CodestreamInventory {
         parse(input, ParseLimits::default())

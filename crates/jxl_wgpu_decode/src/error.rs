@@ -251,6 +251,8 @@ pub enum Error {
     #[error(transparent)]
     ModularFinalize(#[from] crate::modular_finalize::ModularFinalizeError),
     #[error(transparent)]
+    ModularRender(#[from] crate::ModularRenderError),
+    #[error(transparent)]
     ModularPalette(#[from] crate::modular_palette::ModularPaletteError),
     #[error(transparent)]
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),

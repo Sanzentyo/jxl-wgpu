@@ -72,6 +72,11 @@ fn write_word(offset: u32, value: u32) {
 fn source_mask() -> u32 {
     return (1u << params.extent.w) - 1u;
 }
+fn source_normalized(channel: u32, x: u32, y: u32) -> f32 {
+    let word = arena[params.source_offsets[channel] + y * params.source_strides[channel] + x];
+    if params.region.w == 1u { return bitcast<f32>(word); }
+    return f32(bitcast<i32>(word)) / f32(params.source_masks[channel]);
+}
 
 fn source_sample(channel: u32, x: u32, y: u32) -> u32 {
     let raw = bitcast<i32>(arena[
@@ -104,9 +109,15 @@ fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
         var value = source_mask();
         if channel < 3u || params.extent.z == 4u {
             let source_channel = select(channel, 0u, params.extent.z == 1u && channel < 3u);
-            value = source_sample(source_channel, source_x, source_y);
-            let mask = params.source_masks[source_channel];
-            if mask != source_mask() { value = (value * source_mask() + mask / 2u) / mask; }
+            if params.region.w == 1u {
+                let normalized = source_normalized(source_channel, source_x, source_y);
+                if !(normalized >= 0.0 && normalized <= 1.0) { reject_output_mapping(); value = 0u; }
+                else { value = u32(floor(normalized * f32(source_mask()) + 0.5)); }
+            } else {
+                value = source_sample(source_channel, source_x, source_y);
+                let mask = params.source_masks[source_channel];
+                if mask != source_mask() { value = (value * source_mask() + mask / 2u) / mask; }
+            }
         }
         write_stored_code(
             pixel_offset + channel * bytes_per_component,
@@ -174,7 +185,8 @@ fn write_numeric_sample(x: u32, y: u32, sample: u32) {
     for (var component = 0u; component < params.output.w; component += 1u) {
         let offset = pixel_offset + component * bytes_per_component;
         if params.format.w == 4u {
-            write_word(offset, bitcast<u32>(f32(bitcast<i32>(sample)) / f32(params.source_masks.x)));
+            if params.region.w == 1u { write_word(offset, sample); }
+            else { write_word(offset, bitcast<u32>(f32(bitcast<i32>(sample)) / f32(params.source_masks.x))); }
             continue;
         }
         if params.output.x == 0u {
@@ -215,8 +227,7 @@ fn srgb_to_linear(value: f32) -> f32 {
     return pow((value + 0.055) / 1.055, 2.4);
 }
 
-fn target_nonlinear(value: u32) -> f32 {
-    let encoded = f32(value) / f32(source_mask());
+fn target_nonlinear(encoded: f32) -> f32 {
     if params.output.y == 0u {
         return encoded;
     }
@@ -244,9 +255,9 @@ fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
         var value = 1.0;
         if canonical < 3u {
             let channel = select(canonical, 0u, params.extent.z == 1u);
-            value = target_nonlinear(source_sample(channel, source_x, source_y));
+            value = target_nonlinear(source_normalized(channel, source_x, source_y));
         } else if params.extent.z == 4u {
-            value = f32(source_sample(3u, source_x, source_y)) / f32(params.source_masks.w);
+            value = source_normalized(3u, source_x, source_y);
         }
         var offset = params.plane01.x + y * params.plane01.y + (x * params.output.w + position) * 4u;
         if params.output.x == 6u { offset = offsets[position] + y * strides[position] + x * 4u; }
@@ -254,7 +265,7 @@ fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
     }
 }
 
-fn color_code(value: u32) -> u32 {
+fn color_code(value: f32) -> u32 {
     let nonlinear = clamp(target_nonlinear(value), 0.0, 1.0);
     let maximum = f32((1u << params.format.y) - 1u);
     var code = maximum * nonlinear;
@@ -280,10 +291,8 @@ fn stored_rgb_code(position: u32, gray: u32) -> u32 {
     return gray;
 }
 
-fn write_gray_pixel(x: u32, y: u32, sample: u32) {
-    if params.output.x == 0u || params.output.x == 7u || params.output.x == 8u {
-        write_numeric_sample(x, y, sample);
-    } else if params.output.x == 1u || params.output.x == 2u || params.output.x == 3u {
+fn write_gray_pixel(x: u32, y: u32, sample: f32) {
+    if params.output.x == 1u || params.output.x == 2u || params.output.x == 3u {
         let bytes_per_sample = params.format.z / 8u;
         write_stored_code(
             params.plane01.x + y * params.plane01.y + x * bytes_per_sample,
@@ -330,7 +339,7 @@ fn write_chroma(x: u32, y: u32) {
     }
 }
 
-fn write_packed_422(x: u32, y: u32, sample: u32) {
+fn write_packed_422(x: u32, y: u32, sample: f32) {
     // Each source pixel owns its luma byte and one neutral chroma byte. A rotated group boundary
     // can split a packed pair, so neither invocation may overwrite the complete word.
     let pair = params.plane01.x + y * params.plane01.y + (x / 2u) * 4u;
@@ -367,16 +376,19 @@ fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     if params.output.x == 4u {
-        write_packed_422(x, y, source_sample(0u, source_x, source_y));
+        write_packed_422(x, y, source_normalized(0u, source_x, source_y));
         return;
     }
-    var sample = 0u;
-    if params.format.w == 4u {
-        // Scalar normalization preserves signed working samples outside the nominal range.
-        sample = arena[params.source_offsets.x + source_y * params.source_strides.x + source_x];
-    } else {
-        sample = source_sample(0u, source_x, source_y);
+    if params.output.x == 0u || params.output.x == 7u || params.output.x == 8u {
+        var sample = 0u;
+        if params.format.w == 4u {
+            sample = arena[params.source_offsets.x + source_y * params.source_strides.x + source_x];
+        } else if params.region.w == 1u {
+            sample = u32(floor(clamp(source_normalized(0u, source_x, source_y), 0.0, 1.0) * f32(source_mask()) + 0.5));
+        } else { sample = source_sample(0u, source_x, source_y); }
+        write_numeric_sample(x, y, sample);
+        return;
     }
-    write_gray_pixel(x, y, sample);
+    write_gray_pixel(x, y, source_normalized(0u, source_x, source_y));
     write_chroma(x, y);
 }

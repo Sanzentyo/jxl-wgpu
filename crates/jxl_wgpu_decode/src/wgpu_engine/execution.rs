@@ -399,6 +399,7 @@ impl GroupDispatchLayout {
             inverse_transform_uniform_bytes,
             final_output_uniform_bytes,
             frame_modular_arena_bytes,
+            output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
         ]
         .into_iter()
         .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -856,6 +857,14 @@ pub(super) fn modular_finalize_params(
     group_index: usize,
     group: ModularGroup,
 ) -> Result<ModularFinalizeParams> {
+    if output.render.is_some() {
+        if group_index != 0 || profile.resident_entropy_plans.len() != 1 {
+            return Err(Error::EngineContract(
+                "resampled Modular groups require frame assembly",
+            ));
+        }
+        return modular_render_finalize_params(output, 0);
+    }
     let finalize_output = modular_finalize_output(output)?;
     let resident = resident_entropy_plan(profile, group_index)?;
     let selection = &output.source_channels;
@@ -889,6 +898,9 @@ pub(super) fn modular_frame_finalize_params(
     } else {
         0
     };
+    if output.render.is_some() {
+        return modular_render_finalize_params(output, status_index);
+    }
     let selection = &output.source_channels;
     let planes = selection.select(&frame_plan.inverse_plan.final_gpu_layouts())?;
     ModularFinalizeParams::new(
@@ -906,6 +918,31 @@ pub(super) fn modular_frame_finalize_params(
         modular_finalize_output(output)?,
     )
     .map_err(Error::from)
+}
+
+fn modular_render_finalize_params(
+    output: &OutputPlan,
+    status_index: u32,
+) -> Result<ModularFinalizeParams> {
+    let render = output
+        .render
+        .as_ref()
+        .ok_or(Error::EngineContract("missing Modular render plan"))?;
+    Ok(ModularFinalizeParams::new(
+        ModularFinalizeRegion {
+            source_extent: render.extent,
+            canvas_extent: output.source_extent,
+            orientation: output.orientation,
+            origin_x: 0,
+            origin_y: 0,
+            status_index,
+        },
+        output.source_channels.bits,
+        render.planes(),
+        (render.output_bytes / 4) as u32,
+        modular_finalize_output(output)?,
+    )?
+    .with_source_domain(crate::ModularSampleDomain::NormalizedF32))
 }
 
 pub(super) fn modular_finalize_output(output: &OutputPlan) -> Result<ModularFinalizeOutput> {
@@ -958,6 +995,7 @@ pub(super) enum OutputKind {
 }
 
 pub(super) struct OutputPlan {
+    pub(super) render: Option<crate::modular_render::ModularRenderPlan>,
     pub(super) source_channels: super::channels::OutputChannels,
     pub(super) layout: ImageLayout,
     pub(super) source_extent: Extent2d,
@@ -1004,6 +1042,7 @@ impl OutputPlan {
                     )));
                 }
                 let output = Self {
+                    render: None,
                     source_channels: super::channels::OutputChannels::identity(
                         source_channels,
                         source_bits,
@@ -1231,6 +1270,7 @@ impl OutputPlan {
             }
         };
         let output = Self {
+            render: None,
             source_channels: super::channels::OutputChannels::identity(
                 source_channels,
                 source_bits,
@@ -1552,6 +1592,7 @@ pub(super) fn validate_device_limits(
         dispatch.final_output_uniform_bytes,
         progressive_dc_plane_bytes,
         progressive_dc_uniform_bytes,
+        output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
     ]
     .into_iter()
     .try_fold(0u64, |total, bytes| total.checked_add(bytes))
@@ -1589,6 +1630,7 @@ pub(super) fn validate_device_limits(
     }
     Ok(WgpuDecodeMemoryStats {
         per_frame_bytes: per_frame,
+        modular_render_bytes: output.render.as_ref().map_or(0, |plan| plan.total_bytes()),
         modular_metadata_bytes: metadata_bytes,
         local_ma_stream_count: metadata_inventory.local_ma_stream_count,
         unique_ma_config_count: metadata_inventory.unique_ma_config_count,
@@ -1853,6 +1895,13 @@ pub(super) fn submit_decode(
         _modular_metadata: metadata_buffer,
         _reconstructed: reconstructed,
         _frame_arena: frame_arena,
+        render: source
+            .output
+            .render
+            .as_ref()
+            .map(|plan| plan.allocate(device))
+            .transpose()?,
+        render_uniforms: Mutex::new(Vec::new()),
         _native_f64_dummy_words: native_f64_dummy_words,
         _status: status,
         status_staging,
@@ -2533,6 +2582,43 @@ pub(super) fn encode_subimage_plane_copies(
     )
 }
 
+fn render_modular_source<'a>(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    source: &DecodeSource,
+    lifetime: &'a DecodeJobLifetime,
+    pipelines: &ModularInversePipelines,
+    arena: ResidentStorageBinding<'a>,
+    planes: &[crate::modular_transform::GpuModularChannelLayout],
+) -> Result<ResidentStorageBinding<'a>> {
+    let Some(plan) = &source.output.render else {
+        return Ok(arena);
+    };
+    let buffers = lifetime
+        .render
+        .as_ref()
+        .ok_or(Error::EngineContract("missing Modular render buffers"))?;
+    let render = pipelines
+        .render
+        .as_ref()
+        .ok_or(Error::EngineContract("missing Modular render pipeline"))?;
+    let uniforms = render.encode(
+        device,
+        encoder,
+        plan,
+        buffers,
+        arena,
+        &source.output.source_channels.select(planes)?,
+    )?;
+    lifetime
+        .render_uniforms
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(uniforms);
+    ResidentStorageBinding::entire(&buffers.output)
+        .map_err(|_| Error::EngineContract("empty Modular render arena"))
+}
+
 pub(super) fn encode_modular_finalize(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -2557,6 +2643,19 @@ pub(super) fn encode_modular_finalize(
         .ok()
         .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
         .ok_or_else(|| Error::backend("resident Modular lane offset overflow"))?;
+    let arena = render_modular_source(
+        device,
+        encoder,
+        source,
+        lifetime,
+        pipelines,
+        ResidentStorageBinding {
+            buffer: lifetime._reconstructed.buffer(),
+            offset: arena_offset,
+            size: arena_size,
+        },
+        &plan.inverse_plan.final_gpu_layouts(),
+    )?;
     let output = lifetime.output.as_wgpu_buffer();
     let output_size = NonZeroU64::new(output.size()).ok_or(Error::EngineContract(
         "descriptor reconstruction produced an empty output allocation",
@@ -2575,11 +2674,7 @@ pub(super) fn encode_modular_finalize(
             device,
             encoder,
             ModularFinalizeBindings {
-                arena: ResidentStorageBinding {
-                    buffer: lifetime._reconstructed.buffer(),
-                    offset: arena_offset,
-                    size: arena_size,
-                },
+                arena,
                 output_words: ResidentStorageBinding {
                     buffer: output_words_buffer,
                     offset: 0,
@@ -2636,6 +2731,19 @@ pub(super) fn encode_frame_modular_finalize(
     let arena_size = NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
         Error::EngineContract("frame Modular reconstruction produced an empty arena"),
     )?;
+    let arena = render_modular_source(
+        device,
+        encoder,
+        source,
+        lifetime,
+        pipelines,
+        ResidentStorageBinding {
+            buffer: frame_arena,
+            offset: 0,
+            size: arena_size,
+        },
+        &plan.inverse_plan.final_gpu_layouts(),
+    )?;
     let output = lifetime.output.as_wgpu_buffer();
     let output_size = NonZeroU64::new(output.size()).ok_or(Error::EngineContract(
         "frame Modular reconstruction produced an empty output allocation",
@@ -2654,11 +2762,7 @@ pub(super) fn encode_frame_modular_finalize(
             device,
             encoder,
             ModularFinalizeBindings {
-                arena: ResidentStorageBinding {
-                    buffer: frame_arena,
-                    offset: 0,
-                    size: arena_size,
-                },
+                arena,
                 output_words: ResidentStorageBinding {
                     buffer: output_words_buffer,
                     offset: 0,

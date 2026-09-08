@@ -78,7 +78,8 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
 | `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu_decode/modular_rct` | `ModularRctParams` / `Params` | three in-place plane `width,height,row_stride,word_offset` records, then RCT type and 3 reserved words | 64 | 16 | uniform |
-| `jxl_wgpu_decode/modular_scalar_output.wgsl` | `ScalarParams` | source width/height/word stride/offset; destination width/height/byte stride/offset; maximum code/component bytes/float flag/orientation; logical bytes/output words/dispatch width/pad | 64 | 16 | uniform binding 2; a separate four-byte atomic status at binding 3 records unrepresentable native samples |
+| `jxl_wgpu_decode/modular_scalar_output.wgsl` | `ScalarParams` | source width/height/word stride/offset; destination width/height/byte stride/offset; maximum code/component bytes/float flag/orientation; logical bytes/output words/dispatch width/source domain | 64 | 16 | uniform binding 2; a separate four-byte atomic status at binding 3 records unrepresentable native samples |
+| `jxl_wgpu_decode/modular_render.wgsl` | `NormalizeParams` | source width/height/word stride/offset; integer maximum/output stride/two zero words | 32 | 16 | uniform binding 2; signed integer input at binding 0 and distinct normalized F32 output at binding 1; 16×16 workgroups |
 | `jxl_wgpu/upsample.wgsl` | `UpsampleUniform` or resident `UpsampleParams` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, factor, _pad0` | 32 | 4 / 16 | uniform |
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/xyb_to_rgb.wgsl` | `XybUniform` / `Params` | dimensions/6 strides, three padded inverse-opsin rows, padded cube-root bias, padded scaled bias, `intensity_scale`, 3 pads | 128 | 4 | uniform |
@@ -122,6 +123,11 @@ binding 2. Eleven `vec4<u32>` records contain the source extent, region/status, 
 four source strides, four source masks, output/format fields, two plane offset/stride pairs,
 logical/chroma bounds, and the complete unrotated canvas width/height, oriented output width,
 and orientation. Source masks start at byte 64 and the canvas record starts at byte 160.
+The region's final word at byte 28 identifies signed integer (`0`) or normalized F32 (`1`)
+source words. Scalar packing uses the same values in its final uniform word at byte 60.
+VarDCT alpha's fourth geometry word is `0` for absent, `1` for signed integer and `2` for
+normalized F32; its 160-byte source uniform is unchanged. Native resampled output rounds once
+at the destination depth and rejects nonrepresentable values; F32 retains interpolation fractions.
 Ordinary entropy parameter records are 256 bytes; their final canvas width, canvas height,
 and orientation words are at offsets 244, 248, and 252. Compile-time
 Rust sizes/alignment, byte-order assertions, Naga validation, and actual-device output cover both.
@@ -515,6 +521,22 @@ local reservation. LF completion resumes HF metadata; AC completion checks paddi
 boundary. Once all required subimages finish, a retained command buffer runs the global inverse
 and output. The frame exposes no unvalidated output before this tail is submitted. All stages
 use the existing entropy/status/parameter ABIs; no pixel or coefficient readback is introduced.
+
+Selected resampled integer channels now use `ModularRenderPlan` in both coding-mode producers.
+It allocates one aligned F32 destination arena, one reusable low-resolution normalization plane
+large enough for the largest selected resampled input, and one weight table per distinct factor.
+Destination view offsets satisfy the adapter's storage alignment. Each selected source has a
+32-byte normalization uniform; each factor above one adds the existing 32-byte upsampling uniform.
+The source domain is normalized before interpolation, so packing performs no intermediate integer
+quantization. Only bounded scalar weight expansion runs on the host.
+
+`modular_render_bytes` (Modular) and `extra_render_bytes` (VarDCT) include every destination,
+scratch, weight and uniform byte in the base admission plan. Modular resampling forces frame-wide
+assembly when multiple groups contribute, preserving filter neighbors across group boundaries.
+VarDCT keeps its existing extra arena lease and renders only the first alpha or selected scalar
+plane. Render buffers and uniforms remain in the frame lifetime through cancellation and the
+final validation callback. The reconstruction/packing dispatches join the existing output tail;
+they add neither a submission nor a status readback.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,

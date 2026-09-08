@@ -145,9 +145,10 @@ pub struct VarDctOutputInputs<'a> {
     pub config: VarDctOutputConfig,
 }
 
-/// An integer opacity plane in a resident Modular arena. Samples occupy one word each.
+/// An opacity plane in a resident Modular or normalized F32 arena, one word per sample.
 #[derive(Clone, Copy, Debug)]
 pub struct VarDctOutputAlpha<'a> {
+    pub domain: crate::ModularSampleDomain,
     pub storage: ResidentStorageBinding<'a>,
     pub width: u32,
     pub height: u32,
@@ -716,7 +717,7 @@ fn validate_inputs(
             alpha.word_offset,
             alpha.stride,
             (1 << alpha.bits_per_sample) - 1,
-            1,
+            1 + alpha.domain as u32,
         ]
     } else {
         [0; 4]
@@ -1217,6 +1218,7 @@ mod tests {
                             &mut encoder,
                             VarDctOutputInputs {
                                 alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
+                                    domain: crate::ModularSampleDomain::SignedInteger,
                                     storage: binding(&alpha),
                                     width: extent.width,
                                     height: extent.height,

@@ -36,10 +36,12 @@ mod input_budget;
 mod model;
 mod modular_assembly;
 mod modular_finalize;
+mod modular_geometry;
 mod modular_grouping;
 mod modular_inverse;
 mod modular_palette;
 pub mod modular_rct;
+mod modular_render;
 mod modular_scalar_output;
 mod modular_side_image;
 pub mod modular_squeeze;
@@ -95,6 +97,7 @@ pub use model::{
 };
 pub use modular_finalize::ModularFinalizeError;
 pub use modular_palette::ModularPaletteError;
+pub use modular_render::{ModularRenderError, ModularSampleDomain};
 pub use modular_scalar_output::ModularScalarOutputError;
 pub use progressive_dc::ProgressiveDcGpuError;
 pub use session::{

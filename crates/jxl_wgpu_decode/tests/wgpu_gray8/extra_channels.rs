@@ -142,7 +142,7 @@ fn arbitrary_modular_extra_channels_preserve_native_codes_and_independent_precis
                         .unwrap_or_else(|e| panic!("{name} plane {index}: {e}"))
                 };
                 assert_eq!(&session.metadata().extra_channels, &image.extra_channels);
-                let jxl_wgpu_decode::DecodeProfile::ModularLossless {
+                let jxl_wgpu_decode::DecodeProfile::Modular {
                     channels,
                     prediction,
                     ..

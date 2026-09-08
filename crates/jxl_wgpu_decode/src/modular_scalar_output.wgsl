@@ -20,7 +20,16 @@ fn output_byte(byte_offset: u32) -> u32 {
     let point = image_source_coordinate(vec2<u32>(x, y), params.source.xy, params.encoding.w);
     let sample = samples[params.source.w + point.y * params.source.z + point.x];
     var code = bitcast<u32>(sample);
-    if params.encoding.z != 0u {
+    if params.bounds.w == 1u {
+        let normalized = bitcast<f32>(sample);
+        if params.encoding.z != 0u {
+            code = bitcast<u32>(normalized);
+        } else if !(normalized >= 0.0 && normalized <= 1.0) {
+            atomicStore(&status, 1u); code = 0u;
+        } else {
+            code = u32(floor(normalized * f32(params.encoding.x) + 0.5));
+        }
+    } else if params.encoding.z != 0u {
         // The integer arena may contain negative or overshoot values after lossy prediction.
         // Normalization preserves those values; it never applies color conversion or a mask.
         code = bitcast<u32>(f32(sample) / f32(params.encoding.x));

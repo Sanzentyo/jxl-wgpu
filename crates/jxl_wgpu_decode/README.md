@@ -10,12 +10,12 @@ tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 mixed Modular/VarDCT presentations and recursive progressive DC. It uses the shared frame executor
 described below.
 
-The low-level `WgpuSubmissionEngine` implements a standards-only lossless Modular still profile:
+The low-level `WgpuSubmissionEngine` implements a standards-only integer Modular still profile:
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
-- one final still frame with 1–16-bit integer Gray or RGB lossless Modular samples and arbitrary
-  full-resolution integer extra channels with independent 1–16-bit precision, over a bounded
+- one final still frame with 1–16-bit integer Gray or RGB Modular samples and arbitrary
+  integer extras at independent 1–16-bit precision, including 2×/4×/8× color/extra resampling, over a bounded
   128/256/512/1024-pixel pass-group grid and one through three passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
@@ -48,7 +48,7 @@ It preserves the existing native integer output contracts and uses the same resi
 Gray+alpha and independent alpha precision use the same path. Floating-point JPEG XL source
 metadata and additional source color domains remain unsupported.
 
-Codestream topology is separate from native pixel formats: `DecodeProfile::ModularLossless`
+Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
 `ModularChannels` describes native Gray/RGB/RGBA output arrangements. `AnimationMetadata::extra_channels`
 preserves declaration order, names, original depths and type-specific metadata. Color output uses
@@ -56,7 +56,7 @@ the first alpha declaration regardless of its position among other extras; nativ
 alpha to the output depth, while F32 normalizes it by its own depth. Missing alpha is opaque.
 
 `GpuOutputRequest::with_extra_channel(index)` selects a zero-based extra-channel declaration.
-Use a canonical native unsigned Gray format at that channel's depth for exact integer codes,
+Use a canonical native unsigned Gray format at that channel's depth for integer codes,
 or a scalar F32 descriptor with `NumericSampleMapping::NormalizedUnsigned` for codes divided by
 that channel's unsigned maximum. Scalar data receives orientation but no color transfer:
 
@@ -67,8 +67,23 @@ let request = GpuOutputRequest::numeric(
 )?.with_extra_channel(2)?;
 ```
 
+Frame inventory resolves each extra's effective factor, including `dimension_shift`, and validates
+that it is 1, 2, 4 or 8 and at least the color factor. Both producers reconstruct channels on their
+own grids. The common GPU render stage normalizes selected integer planes before the normative
+5×5 interpolation, using standard or custom image-header weights. A frame arena retains neighbors
+across Modular group boundaries. Color and extra factors may differ; all three factors also work
+for Modular color. F32 preserves interpolation fractions and signed working ranges. Native output
+rounds after resampling at the requested depth; unresampled native codes stay exact.
+
+`WgpuDecodeMemoryStats::modular_render_bytes` and
+`VarDctDecodeMemoryStats::extra_render_bytes` include output planes, shared normalization scratch,
+deduplicated weights and uniforms. These transient resources are admitted before submission and
+retained through cancellation callbacks. `DecodeProfile::Modular` replaces `ModularLossless` so
+the coding-mode name does not imply that resampled reconstruction is lossless.
+
+
 All source channels still pass through GPU entropy decoding and inverse transforms before output
-selection. Selecting one plane adds no CPU image path or intermediate image copy. Unknown
+selection. Selected resampled planes normalize and interpolate in resident F32 storage. Unknown
 non-optional extras cannot silently be omitted from color interpretation. Spot-color data can be
 selected like other extras; `with_spot_color_policy(SpotColorPolicy::Preserve)` explicitly returns
 the base color. Default `Render` rejects spot images until the spot rendering stage is connected.
@@ -77,10 +92,10 @@ topology, independent depths, a one-leaf MA tree, and transformed multi-group st
 planes match source codes exactly, and F32 matches Rust `jxl` and the optional libjxl C oracle.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
-reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, full-resolution integer extras,
+reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
 all orientations, intrinsic-size hints, and named channel declarations can use the supported
-reconstruction path. Unsupported ICC/color, associated alpha, dimension shifts, extra-channel
-resampling, and restoration remain rejected. Unknown image,
+reconstruction path. Unsupported ICC/color, associated alpha, and Modular restoration remain
+rejected. Unknown image,
 frame, and restoration extension selectors are typed inventory errors before any GPU work.
 Twenty-three checked-in libjxl fixtures compare exact native samples with their deterministic
 source and Rust jxl, plus exact Gray/RGB samples from djxl. Twelve gray fixtures cover all 30 VPI formats under both whole blocking
@@ -193,7 +208,7 @@ proves that LZ history is invocation-private, the reconstruction lane retains on
 previous rows (512 physical words versus 65,536 logical sample words for a full 256x256 group).
 Wider LZ histories, native Modular output, RGB(A), and every other VPI mapping keep
 the complete logical reconstruction workspace and finalize through the generic output contract.
-`DecodeProfile::ModularLossless` reports the declared pass count and this specialization as
+`DecodeProfile::Modular` reports the declared pass count and this specialization as
 `ModularPredictionProfile::MetaAdaptive` with exact node/decision/leaf counts, maximum depth, and
 self-correcting usage; custom synthetic engines use the distinct `Fixed` variant.
 
@@ -206,7 +221,7 @@ the remaining channels, including asymmetric shifts. LF streams execute before n
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through three passes produce an exact final
 image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular,
-shifted/resampled extras, associated alpha,
+associated alpha,
 patches, splines, and noise remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -273,7 +288,7 @@ uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` 
 values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.
 Re-serialized reference-only variants independently pass both decoders and exercise slot 3.
 Post-transform composition rejects pre-transform reference domains before submission. Associated
-alpha, additional/shifted extra channels, pre-transform patch execution, non-sRGB/ICC composition,
+alpha, general extra-channel composition, resampled composition conformance, pre-transform patch execution, non-sRGB/ICC composition,
 and non-coalesced/progressive delivery remain required for full JPEG XL.
 
 ### Bounded standard VarDCT engine
@@ -461,7 +476,7 @@ The scalar tail reserves a 64-byte uniform, a four-byte range status and four mo
 existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
 public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
 corrupting a later AC section still fails the scalar request after the global stream succeeds.
-Associated alpha and shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
+Associated alpha and floating-point source samples remain gaps. Raw matrix side images still need window continuation.
 
 For LF/AC distribution, Modular headers and transform topology now parse separately from MA and
 image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
@@ -681,7 +696,7 @@ This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-shifted/resampled extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+general extra-channel composition and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

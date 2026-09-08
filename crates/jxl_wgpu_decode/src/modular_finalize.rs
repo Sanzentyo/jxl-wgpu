@@ -103,6 +103,10 @@ const _: () = {
 };
 
 impl ModularFinalizeParams {
+    pub(crate) fn with_source_domain(mut self, domain: crate::ModularSampleDomain) -> Self {
+        self.region[3] = domain as u32;
+        self
+    }
     pub(crate) fn new(
         region: impl Into<ModularFinalizeRegion>,
         source_bits: u8,

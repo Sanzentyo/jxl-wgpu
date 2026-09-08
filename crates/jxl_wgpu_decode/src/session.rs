@@ -1182,7 +1182,7 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
         DecodeProfile::FrameSequence { .. } => {
             Err(Error::EngineContract("invalid frame sequence counts"))
         }
-        DecodeProfile::ModularLossless {
+        DecodeProfile::Modular {
             bits_per_sample: 1..=16,
             passes: 1..=3,
             prediction,
@@ -1207,7 +1207,7 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
                 "MA prediction profile has inconsistent node/context/depth metadata",
             )),
         },
-        DecodeProfile::ModularLossless { .. } => Err(Error::EngineContract(
+        DecodeProfile::Modular { .. } => Err(Error::EngineContract(
             "lossless Modular profile must use 1 through 16 bits per sample and 1 through 3 passes",
         )),
         DecodeProfile::VarDct {
@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn modular_profile_accepts_only_the_negotiated_progressive_pass_range() {
-        let profile = |passes| DecodeProfile::ModularLossless {
+        let profile = |passes| DecodeProfile::Modular {
             bits_per_sample: 8,
             channels: crate::ModularChannels::Gray.into(),
             prediction: crate::ModularPredictionProfile::Fixed {

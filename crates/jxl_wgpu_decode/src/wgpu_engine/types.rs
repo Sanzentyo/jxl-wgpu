@@ -139,6 +139,8 @@ pub struct WgpuDecodeMemoryStats {
     pub inverse_transform_uniform_bytes: u64,
     /// Final source-plane packing uniform retained through the same submission.
     pub final_output_uniform_bytes: u64,
+    /// Selected F32 render planes, reusable normalization scratch, weights and uniforms.
+    pub modular_render_bytes: u64,
     /// Three planar F32 XYB dependency buffers retained by a progressive-DC producer.
     pub progressive_dc_plane_bytes: u64,
     /// Modular-to-XYB conversion uniform retained through the producer submission.
@@ -409,6 +411,9 @@ pub(super) struct DecodePipelineCache {
 
 #[derive(Default)]
 pub(super) struct ModularInversePipelineCache {
+    pub(super) render: OnceLock<
+        Result<Arc<crate::modular_render::ModularRenderPipeline>, crate::ModularRenderError>,
+    >,
     pub(super) palette: OnceLock<
         std::result::Result<
             Arc<ModularPalettePipeline>,
@@ -430,6 +435,7 @@ pub(super) struct ModularInversePipelineCache {
 }
 
 pub(super) struct ModularInversePipelines {
+    pub(super) render: Option<Arc<crate::modular_render::ModularRenderPipeline>>,
     pub(super) palette: Option<Arc<ModularPalettePipeline>>,
     pub(super) squeeze: Option<Arc<ModularSqueezePipeline>>,
     pub(super) rct: Option<Arc<ModularRctPipeline>>,

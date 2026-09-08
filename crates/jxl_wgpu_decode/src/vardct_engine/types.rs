@@ -86,6 +86,8 @@ pub enum VarDctDecodeError {
     ExtraChannelIndex { index: u32, count: usize },
     #[error(transparent)]
     ScalarOutput(#[from] crate::ModularScalarOutputError),
+    #[error(transparent)]
+    ModularRender(#[from] crate::ModularRenderError),
     #[error("the JPEG XL image orientation must be in 1..=8, got {orientation}")]
     InvalidOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
@@ -320,6 +322,8 @@ pub struct VarDctDecodeMemoryStats {
     pub extra_arena_bytes: u64,
     /// Global inverse uniforms, executed after all distributed subimages validate.
     pub extra_inverse_uniform_bytes: u64,
+    /// Normalization, full-resolution extra plane, filter weights and uniforms.
+    pub extra_render_bytes: u64,
     /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// All non-output GPU buffers retained through status validation.
@@ -347,6 +351,7 @@ impl VarDctDecodeMemoryStats {
             resident,
             render_color,
             output,
+            extra_render_bytes,
         } = inputs;
         fn checked_sum(
             values: impl IntoIterator<Item = u64>,
@@ -747,6 +752,7 @@ impl VarDctDecodeMemoryStats {
             output_status_bytes,
             extra_arena_bytes,
             extra_inverse_uniform_bytes,
+            extra_render_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, |total, value| {
@@ -814,6 +820,7 @@ impl VarDctDecodeMemoryStats {
             total_frame_bytes,
             extra_arena_bytes,
             extra_inverse_uniform_bytes,
+            extra_render_bytes,
         })
     }
 }
@@ -834,6 +841,7 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) epf_sigma: Option<EpfSigmaMemoryPlan>,
     pub(super) epf_iterations: u32,
     pub(super) resident: &'a [ResidentVarDctMemoryPlan],
+    pub(super) extra_render_bytes: u64,
     pub(super) render_color: bool,
     pub(super) output: super::output::FrameOutputMemory,
 }

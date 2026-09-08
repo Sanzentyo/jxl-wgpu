@@ -582,6 +582,7 @@ impl CodestreamStreamScanner {
         }
         let context = self
             .image_context
+            .as_ref()
             .ok_or(CodestreamStreamError::Contract(
                 "frame prefix has no image-header context",
             ))?

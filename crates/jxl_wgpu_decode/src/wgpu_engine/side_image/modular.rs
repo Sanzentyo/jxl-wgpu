@@ -407,6 +407,7 @@ impl ModularSideImagePipeline {
             plan.jobs()
                 .iter()
                 .any(|job| matches!(job, ModularInverseJob::Rct { .. })),
+            false,
         )?;
         encode_modular_inverse_jobs(
             backend.device(),

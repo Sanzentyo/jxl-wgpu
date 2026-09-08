@@ -58,6 +58,10 @@ impl ModularGroup {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StandardModularProfile {
+    pub output_width: u32,
+    pub output_height: u32,
+    pub channel_upsampling: Vec<u32>,
+    pub upsampling_weights: jxl_gpu_bitstream::UpsamplingWeightsInventory,
     pub frame_name: String,
     pub width: u32,
     pub height: u32,
@@ -179,7 +183,7 @@ fn validate_image_header(
                 SampleBitDepth::Integer {
                     bits_per_sample: 1..=16
                 }
-            ) || extra.dimension_shift != 0
+            ) || extra.dimension_shift > 3
                 || matches!(
                     extra.channel_type,
                     ExtraChannelTypeInventory::Alpha { associated: true }
@@ -281,8 +285,12 @@ fn parse_modular_profile(
         || frame.flags != 0
         || frame.do_ycbcr
         || frame.jpeg_upsampling != [0; 3]
-        || frame.upsampling != 1
-        || frame.extra_channel_upsampling != vec![1; image.extra_channels.len()]
+        || !matches!(frame.upsampling, 1 | 2 | 4 | 8)
+        || frame.extra_channel_upsampling.len() != image.extra_channels.len()
+        || frame
+            .extra_channel_upsampling
+            .iter()
+            .any(|&factor| !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling)
         || !matches!(
             frame.restoration_filter,
             RestorationFilterInventory::Custom {
@@ -349,13 +357,14 @@ fn parse_modular_profile(
         .into());
     }
 
-    let (frame_width, frame_height) = match purpose {
-        ModularProfilePurpose::Presentation => (image.width, image.height),
-        ModularProfilePurpose::Frame => (frame.width, frame.height),
-        ModularProfilePurpose::ProgressiveDc => frame
-            .color_sample_extent()
-            .ok_or_else(|| unsupported_error("progressive-DC frame extent is invalid"))?,
-    };
+    let (frame_width, frame_height) = frame
+        .color_sample_extent()
+        .ok_or_else(|| unsupported_error("Modular frame extent is invalid"))?;
+    let resampling = frame.upsampling != 1
+        || frame
+            .extra_channel_upsampling
+            .iter()
+            .any(|&factor| factor != 1);
     if frame_width == 0 || frame_height == 0 {
         return unsupported("the Modular GPU profile requires a non-empty frame extent");
     }
@@ -391,10 +400,7 @@ fn parse_modular_profile(
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
             &mut reader,
-            channels,
-            frame_width,
-            frame_height,
-            u32::from(bits_per_sample),
+            crate::modular_geometry::source_topology(image, frame, channels.color_count())?,
         )?;
     let dc_end = dc_global
         .bits
@@ -449,10 +455,11 @@ fn parse_modular_profile(
             &frame.progressive_passes.downsampling,
             &frame.progressive_passes.last_pass,
         )?;
-        let requires_frame_arena = transform_plan
-            .transforms
-            .iter()
-            .any(|transform| !matches!(transform, ModularTransformIr::Rct(_)));
+        let requires_frame_arena = resampling
+            || transform_plan
+                .transforms
+                .iter()
+                .any(|transform| !matches!(transform, ModularTransformIr::Rct(_)));
         let global_channel_count =
             global_subimage_channel_count(&transform_plan.topology, group_dimension);
         for channel in &transform_plan.topology.channels()[global_channel_count..] {
@@ -844,7 +851,8 @@ fn parse_modular_profile(
             && image.extra_channels[0].channel_type
                 == (ExtraChannelTypeInventory::Alpha { associated: false })
             && image.extra_channels[0].bit_depth == image.bit_depth);
-    let generalized_channels = !conventional_alpha
+    let generalized_channels = resampling
+        || !conventional_alpha
         || frame_plan_seed.is_some()
         || concrete_transform_plans
             .iter()
@@ -923,6 +931,20 @@ fn parse_modular_profile(
         })?,
         width: frame_width,
         height: frame_height,
+        output_width: if purpose == ModularProfilePurpose::ProgressiveDc {
+            frame_width
+        } else {
+            frame.width
+        },
+        output_height: if purpose == ModularProfilePurpose::ProgressiveDc {
+            frame_height
+        } else {
+            frame.height
+        },
+        channel_upsampling: std::iter::repeat_n(frame.upsampling, channels.color_count() as usize)
+            .chain(frame.extra_channel_upsampling.iter().copied())
+            .collect(),
+        upsampling_weights: image.upsampling_weights.clone(),
         orientation,
         bits_per_sample,
         channels,
@@ -1049,10 +1071,7 @@ fn parse_lf_channel_dequantization(reader: &mut impl BitInput) -> Result<[Finite
 
 fn parse_dc_global_ir(
     reader: &mut impl BitInput,
-    channels: ModularChannelCounts,
-    width: u32,
-    height: u32,
-    bit_depth: u32,
+    topology: ModularChannelTopology,
 ) -> Result<(
     MaConfigIr,
     bool,
@@ -1066,13 +1085,6 @@ fn parse_dc_global_ir(
     let use_global_tree = reader.read_bits(1)? != 0;
     let wp_header = WpHeaderIr::parse(reader)?;
     let limits = ModularTransformLimits::default();
-    let topology = ModularChannelTopology::full_resolution(
-        width,
-        height,
-        bit_depth,
-        channels.count(),
-        limits,
-    )?;
     let transform_plan = parse_modular_transforms(reader, topology, limits)?;
     let local_ma_config = (!use_global_tree)
         .then(|| parse_ma_config(reader, MaTreeLimits::default()))
@@ -1341,7 +1353,7 @@ mod tests {
                 ..alpha.clone()
             },
             jxl_gpu_bitstream::ExtraChannelInventory {
-                dimension_shift: 1,
+                dimension_shift: 4,
                 ..alpha.clone()
             },
             jxl_gpu_bitstream::ExtraChannelInventory {
@@ -1368,7 +1380,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(parsed.codestream());
         let source = GpuCodestream::from_spans([(0, StreamSlice::from_shared(bytes))]).unwrap();
         parse_standard_modular_profile(&source, &inventory).unwrap();
-        inventory.frames[0].extra_channel_upsampling = vec![2];
+        inventory.frames[0].extra_channel_upsampling = vec![16];
         assert!(parse_standard_modular_profile(&source, &inventory).is_err());
         inventory.frames[0].extra_channel_upsampling = vec![1];
         inventory.frames[0].restoration_filter = RestorationFilterInventory::Default;

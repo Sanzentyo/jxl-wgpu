@@ -1225,7 +1225,7 @@ fn one_decoder_routes_modular_and_all_bounded_vardct_packets_on_gpu() {
     );
     assert!(matches!(
         modular_session.profile(),
-        DecodeProfile::ModularLossless { .. }
+        DecodeProfile::Modular { .. }
     ));
     assert!(modular_session.submission_session().modular().is_some());
     let modular_frame = modular_session.next_frame().unwrap().unwrap();

@@ -904,15 +904,13 @@ impl BoundedVarDctPacketPlan {
                 .map(|packet| VarDctPacketPreparation::Ready(Box::new(packet)));
         }
         let profile = &prefix.profile;
-        if profile.upsampling != 1 || profile.lf_level != 0 || profile.uses_lf_frame {
+        if profile.lf_level != 0 || profile.uses_lf_frame {
             return Err(BoundedVarDctPacketError::GlobalModularGeometry);
         }
-        let topology = crate::modular_transform::ModularChannelTopology::full_resolution(
-            profile.output_width,
-            profile.output_height,
-            profile.bits_per_sample,
-            inventory.image_header.extra_channel_count,
-            crate::modular_transform::ModularTransformLimits::default(),
+        let topology = crate::modular_geometry::source_topology(
+            &inventory.image_header,
+            &inventory.frames[0],
+            0,
         )
         .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
         let mut reader = source_reader_at(source, descriptor_end)?;

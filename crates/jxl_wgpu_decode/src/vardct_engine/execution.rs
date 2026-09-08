@@ -588,6 +588,7 @@ struct VarDctJobLifetime {
     extra_frame: Option<GpuBufferLease>,
     _extra_prefix: Option<GpuBufferLease>,
     _extra_uniforms: Vec<wgpu::Buffer>,
+    _rendered_extra: Option<crate::modular_render::ModularRenderBuffers>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: Option<[wgpu::Buffer; 3]>,
     _post_transform: PostTransformJobBuffers,
@@ -3121,7 +3122,7 @@ fn submit_vardct(
             }),
         )
     });
-    let extra_uniforms = if let (Some(plan), Some(arena)) =
+    let mut extra_uniforms = if let (Some(plan), Some(arena)) =
         (source.packet.extra_channels.as_ref(), extra_frame.as_ref())
     {
         pipelines
@@ -3144,6 +3145,30 @@ fn submit_vardct(
             field: "padded output width",
         })?;
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
+    let rendered_extra =
+        source
+            .extra_render
+            .as_ref()
+            .map(|plan| {
+                let extra = source.extra_plane.as_ref().ok_or(
+                    VarDctDecodeError::EntropyWindowContract {
+                        detail: "resampled output lacks its extra plane",
+                    },
+                )?;
+                let buffers = plan.allocate(device)?;
+                let mut plane = extra.plane;
+                plane.bit_depth = extra.bits;
+                extra_uniforms.extend(pipelines.modular_render.encode(
+                    device,
+                    &mut commands,
+                    plan,
+                    &buffers,
+                    resident_binding(extra.arena.as_wgpu_buffer())?,
+                    &[plane],
+                )?);
+                Ok::<_, VarDctDecodeError>(buffers)
+            })
+            .transpose()?;
     let (output_scratch, post_transform_buffers) = match source.output {
         VarDctFrameOutput::Color { config, plan } => {
             let resident_planes =
@@ -3375,11 +3400,26 @@ fn submit_vardct(
                 device,
                 &mut commands,
                 VarDctOutputInputs {
-                    alpha: source
-                        .extra_plane
-                        .as_ref()
-                        .map(super::staging::ResidentModularPlane::alpha_binding)
-                        .transpose()?,
+                    alpha: if let (Some(plan), Some(buffers)) =
+                        (&source.extra_render, &rendered_extra)
+                    {
+                        let plane = plan.planes()[0];
+                        Some(crate::vardct_output::VarDctOutputAlpha {
+                            domain: crate::ModularSampleDomain::NormalizedF32,
+                            storage: resident_binding(&buffers.output)?,
+                            width: plane.width,
+                            height: plane.height,
+                            stride: plane.row_stride_words,
+                            word_offset: plane.word_offset,
+                            bits_per_sample: plane.bit_depth,
+                        })
+                    } else {
+                        source
+                            .extra_plane
+                            .as_ref()
+                            .map(super::staging::ResidentModularPlane::alpha_binding)
+                            .transpose()?
+                    },
                     planes: [
                         VarDctOutputPlane {
                             storage: resident_binding(&presentation_planes[0])?,
@@ -3438,13 +3478,30 @@ fn submit_vardct(
                     detail: "scalar output precision differs from the selected extra plane",
                 });
             }
+            let (plane, domain, arena) =
+                if let (Some(plan), Some(buffers)) = (&source.extra_render, &rendered_extra) {
+                    (
+                        plan.planes()[0],
+                        crate::ModularSampleDomain::NormalizedF32,
+                        &buffers.output,
+                    )
+                } else {
+                    (
+                        extra.plane,
+                        crate::ModularSampleDomain::SignedInteger,
+                        extra.arena.as_wgpu_buffer(),
+                    )
+                };
             let scratch = pipelines.scalar_output.encode(
                 device,
                 &mut commands,
                 plan,
-                extra.plane,
-                resident_binding(extra.arena.as_wgpu_buffer())?,
-                resident_binding(&output)?,
+                crate::modular_scalar_output::ModularScalarOutputInputs {
+                    plane,
+                    domain,
+                    arena: resident_binding(arena)?,
+                    output: resident_binding(&output)?,
+                },
             )?;
             (
                 FrameOutputScratch::Extra { scratch },
@@ -3553,6 +3610,7 @@ fn submit_vardct(
         extra_frame,
         _extra_prefix: source.global_extra_prefix.take(),
         _extra_uniforms: extra_uniforms,
+        _rendered_extra: rendered_extra,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
         _post_transform: post_transform_buffers,

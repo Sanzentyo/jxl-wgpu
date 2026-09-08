@@ -131,7 +131,27 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                 contents: bytemuck::cast_slice(&words),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-            for exif in 1..=8 {
+            for (domain, exif) in [
+                crate::ModularSampleDomain::SignedInteger,
+                crate::ModularSampleDomain::NormalizedF32,
+            ]
+            .into_iter()
+            .flat_map(|domain| (1..=8).map(move |exif| (domain, exif)))
+            {
+                let normalized_arena =
+                    (domain == crate::ModularSampleDomain::NormalizedF32).then(|| {
+                        let values: Vec<_> = words
+                            .iter()
+                            .map(|&sample| sample as f32 / mask as f32)
+                            .collect();
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("normalized scalar source with offset and stride"),
+                            contents: bytemuck::cast_slice(&values),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        })
+                    });
+                let arena = normalized_arena.as_ref().unwrap_or(&arena);
+
                 let orientation = OutputOrientation::from_exif_value(exif).unwrap();
                 let oriented = orientation.map_extent(extent);
                 for floating in [false, true] {
@@ -212,9 +232,12 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                             device,
                             &mut encoder,
                             plan,
-                            plane,
-                            ResidentStorageBinding::entire(&arena).unwrap(),
-                            target(&output),
+                            ModularScalarOutputInputs {
+                                plane,
+                                domain,
+                                arena: ResidentStorageBinding::entire(arena).unwrap(),
+                                output: target(&output),
+                            },
                         )
                         .unwrap();
                     let _legacy_uniform = if floating {
@@ -246,14 +269,15 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                                 chroma_extent: Extent2d::new(0, 0),
                             },
                         )
-                        .unwrap();
+                        .unwrap()
+                        .with_source_domain(domain);
                         Some(
                             finalize
                                 .encode(
                                     device,
                                     &mut encoder,
                                     ModularFinalizeBindings {
-                                        arena: ResidentStorageBinding::entire(&arena).unwrap(),
+                                        arena: ResidentStorageBinding::entire(arena).unwrap(),
                                         output_words: target(&legacy),
                                         output_f64: None,
                                         status: ResidentStorageBinding::entire(&status).unwrap(),

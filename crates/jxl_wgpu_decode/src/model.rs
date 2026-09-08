@@ -19,8 +19,8 @@ pub enum DecodeProfile {
         physical_frames: usize,
         presentation_frames: usize,
     },
-    /// Lossless Modular data reconstructed by a GPU entropy/MA pipeline.
-    ModularLossless {
+    /// Integer Modular data reconstructed by a GPU entropy/MA pipeline, with optional resampling.
+    Modular {
         bits_per_sample: u8,
         channels: ModularChannelCounts,
         prediction: ModularPredictionProfile,
@@ -292,6 +292,8 @@ pub enum NumericSampleMapping {
     /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
     /// codestream depth must match. Working samples outside that unsigned range return a typed
     /// error rather than wrapping or clipping.
+    /// Resampled planes are reconstructed at presentation resolution first, then rounded to the
+    /// nearest code at the declared depth; exact preservation applies to unresampled samples.
     NativeUnsigned,
     /// Divide a 1–16-bit unsigned source by its own maximum code into scalar F32 storage.
     /// No transfer function or color conversion is applied, including for extra channels.

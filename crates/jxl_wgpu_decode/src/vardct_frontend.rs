@@ -1283,7 +1283,7 @@ fn validate_image(
                 SampleBitDepth::Integer {
                     bits_per_sample: 1..=16
                 }
-            ) || extra.dimension_shift != 0
+            ) || extra.dimension_shift > 3
                 || matches!(
                     extra.channel_type,
                     jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: true }
@@ -1366,7 +1366,7 @@ fn validate_frame(
         || frame
             .extra_channel_upsampling
             .iter()
-            .any(|&value| value != 1)
+            .any(|&value| !matches!(value, 1 | 2 | 4 | 8) || value < frame.upsampling)
     {
         return unsupported(UnsupportedVarDctFeature::Upsampling);
     }
