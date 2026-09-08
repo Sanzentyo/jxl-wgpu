@@ -124,7 +124,7 @@ impl GpuSubmissionEngine for ReadyEngine {
         &self,
         codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert_jxl_signature(&codestream);
         Ok(PreparedGpuSession::new(
@@ -198,7 +198,7 @@ impl GpuSubmissionEngine for TimecodeEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -360,7 +360,7 @@ impl GpuSubmissionEngine for PendingEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(16, ModularPredictor::West),
@@ -490,7 +490,7 @@ impl GpuSubmissionEngine for PrefetchAnimationEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -695,7 +695,7 @@ impl GpuSubmissionEngine for ResolvedSlotEngine {
         &self,
         _codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),
@@ -752,7 +752,7 @@ impl GpuSubmissionEngine for TypedRejectEngine {
         &self,
         codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        _inventory: Arc<CodestreamInventory>,
+        _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert_eq!(codestream.is_container(), self.expected_container);
         assert_jxl_signature(&codestream);
@@ -828,7 +828,7 @@ impl GpuSubmissionEngine for CapturingEngine {
         &self,
         codestream: GpuCodestream,
         _request: &GpuOutputRequest,
-        inventory: Arc<CodestreamInventory>,
+        inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         assert_jxl_signature(&codestream);
         *self.opened.lock().unwrap() = Some(OpenedSource {
@@ -837,7 +837,7 @@ impl GpuSubmissionEngine for CapturingEngine {
             retained_input_bytes: codestream.retained_input_bytes(),
             is_container: codestream.is_container(),
             is_contiguous: codestream.contiguous_bytes().is_some(),
-            inventory: (*inventory).clone(),
+            inventory: inventory.source_inventory().clone(),
         });
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),

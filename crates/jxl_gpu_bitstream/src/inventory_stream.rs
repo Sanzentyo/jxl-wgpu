@@ -779,14 +779,12 @@ impl CodestreamStreamScanner {
             .checked_add(1)
             .ok_or(CodestreamStreamError::SizeOverflow)?;
         self.prefix_base = active.section_end_byte;
-        if active.frame.is_last {
-            if active.frame.is_preview {
-                self.is_preview = false;
-                self.lf_frames.clear();
-                self.phase = Phase::FramePrefix;
-            } else {
-                self.phase = Phase::AwaitEnd;
-            }
+        if active.frame.is_preview {
+            self.is_preview = false;
+            self.lf_frames.clear();
+            self.phase = Phase::FramePrefix;
+        } else if active.frame.is_last {
+            self.phase = Phase::AwaitEnd;
         } else {
             self.phase = Phase::FramePrefix;
         }

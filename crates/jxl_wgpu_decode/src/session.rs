@@ -151,6 +151,8 @@ pub struct PrefetchProgress {
 /// Implementations own header/entropy/group parsing and GPU packet submission. Returning CPU pixel
 /// data through `Frame` violates this crate's contract; unsupported input must instead return
 /// [`Error::UnsupportedProfile`] or [`Error::FrontendIncomplete`].
+/// The selected image inventory already separates the preview and main canvas while preserving
+/// physical source IDs. Engines execute its reconstruction inventory and do not select again.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait GpuSubmissionEngine: Send + Sync + 'static {
     type Session: GpuSubmissionSession;
@@ -169,7 +171,7 @@ pub trait GpuSubmissionEngine: Send + Sync + 'static {
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
-        inventory: Arc<CodestreamInventory>,
+        inventory: crate::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>>;
 }
 
@@ -192,7 +194,7 @@ pub trait GpuSubmissionEngine: 'static {
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
-        inventory: Arc<CodestreamInventory>,
+        inventory: crate::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>>;
 }
 
@@ -287,6 +289,7 @@ impl<E: GpuSubmissionEngine> GpuDecoder<E> {
         request.format().validate()?;
         let (codestream, inventory) =
             parse_shared(encoded, self.parse_limits, self.engine.inventory_limits())?;
+        let inventory = crate::SelectedImageInventory::new(inventory, request.image_selection())?;
         let prepared = self.engine.open(codestream, &request, inventory)?;
         GpuDecodeSession::new(prepared, request)
     }
@@ -557,6 +560,8 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
                 "incremental source length differs from authoritative transport end",
             ));
         }
+        let inventory =
+            crate::SelectedImageInventory::new(inventory, self.request.image_selection())?;
         let prepared = self.engine.open(codestream, &self.request, inventory)?;
         GpuDecodeSession::new(prepared, self.request)
     }

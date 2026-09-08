@@ -350,6 +350,7 @@ pub enum GpuOutputMapping {
 /// constructor which guesses one from the pixel format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuOutputRequest {
+    image: crate::ImageSelection,
     format: PixelFormat,
     mapping: GpuOutputMapping,
     max_frame_slots: NonZeroUsize,
@@ -491,6 +492,7 @@ impl GpuOutputRequest {
 
     fn from_parts(format: PixelFormat, mapping: GpuOutputMapping) -> Self {
         Self {
+            image: crate::ImageSelection::Main,
             format,
             mapping,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
@@ -505,6 +507,18 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn format(&self) -> &PixelFormat {
         &self.format
+    }
+
+    /// Select the main image/animation or the independent embedded preview.
+    #[must_use]
+    pub const fn with_image_selection(mut self, selection: crate::ImageSelection) -> Self {
+        self.image = selection;
+        self
+    }
+
+    #[must_use]
+    pub const fn image_selection(&self) -> crate::ImageSelection {
+        self.image
     }
 
     #[must_use]

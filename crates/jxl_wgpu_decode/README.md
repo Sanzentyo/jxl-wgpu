@@ -10,6 +10,54 @@ tracked in [`FULL_JPEG_XL_ROADMAP.md`](../../docs/FULL_JPEG_XL_ROADMAP.md).
 mixed Modular/VarDCT presentations and recursive progressive DC. It uses the shared frame executor
 described below.
 
+`GpuOutputRequest::with_image_selection(ImageSelection::Preview)` selects the embedded preview.
+The default is `ImageSelection::Main`. Both use the ordinary GPU session and output APIs:
+
+```rust,no_run
+use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, ImageSelection, vardct_rgb8_format};
+
+# fn example(backend: jxl_wgpu::WgpuBackend, encoded: &[u8]) -> jxl_wgpu_decode::Result<()> {
+let decoder = GpuDecoder::wgpu(backend)?;
+let request = GpuOutputRequest::color(vardct_rgb8_format())?
+    .with_image_selection(ImageSelection::Preview);
+let mut preview = decoder.open(encoded, request)?;
+// preview.metadata().extent is the preview's own oriented extent.
+let frame = preview.next_frame()?.expect("one preview presentation");
+# drop(frame);
+# Ok(())
+# }
+```
+
+The frontend creates a `SelectedImageInventory` once, before the `GpuSubmissionEngine::open`
+boundary. `source_inventory()` preserves the original metadata; `reconstruction_inventory()`
+contains only the selected image domain. A preview becomes one final still with its own
+dimensions and no intrinsic-size override, duration or animation timecode. An encoded
+`is_last=false` preview still ends after exactly one physical frame. Main selection excludes
+that frame and retains all main LF/reference dependencies and presentation timing.
+`FrameExecutionPlan` consumes the reconstruction inventory and rejects an unselected preview
+inventory with `FramePlanError::ImageNotSelected`.
+
+Physical IDs, entropy ranges and noise seeds are never renumbered during selection or producer
+projection. `CodestreamInventory::frame_position` resolves IDs to local vector positions.
+The preview uses noise seed `[0, 1]`; leading nonvisible main frames continue that counter,
+and the first visible main frame advances to `[1, 0]`. Reference and LF image state remain
+separate across the boundary. This matters for a preview followed by noisy progressive DC.
+
+All eight orientation values, Apply/Keep, supported color and scalar-extra delivery, and leased
+output ownership apply to both selections. A missing preview returns
+`Error::ImageSelection(ImageSelectionError::MissingPreview)` before engine admission.
+Whole `open` and fragmented `stream(...).finish()` both require complete transport and frame
+inventory; a preview alone does not validate an incomplete main image. Early preview delivery
+while main input is still arriving is not yet exposed.
+
+`tests/preview.rs` checks 48 reproducible streams against native libjxl's preview API and
+independent main-image controls, with byte-identical whole/bounded output. It includes all
+16 dimension encodings in both modes, alpha, JPEG sampling, floating samples, resampling,
+non-final preview headers, main animations and recursive LF, syntax/entropy failures,
+one-byte inventory delivery, admission retry and cancellation.
+`cargo run -p jxl_wgpu_decode --example regenerate_previews` reproduces the corpus with offline
+libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced.
+
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
@@ -387,7 +435,7 @@ under whole and bounded fragmented delivery; cancellation checks intermediate LF
 A pinned, development-only jxl-oxide oracle and independent scalar Gaborish calculation cover
 vertical-subsampling defects in the other references. LF color uses the existing Rust sRGB and
 native sRGB/linear tolerances; scalar extras remain exact. See the conformance corpus for the
-reference selection and observed errors. Preview/reference-only, patch/spline combinations and
+reference selection and observed errors. Reference-only, patch/spline combinations and
 broader LF filter/resampling combinations need further coverage.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
@@ -518,8 +566,8 @@ state machine owns every LF submission, both aggregate status maps, and the init
 admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-group `cjxl` output
 through blocking and async completion. The image header
 must declare the standard sRGB/D65
-RGB or grayscale presentation encoding, no ICC profile or extra channel, and no preview or other
-unsupported frame feature. Cropped/blended animations and layered stills enter through the frame
+RGB or grayscale presentation encoding, with supported extra channels and no ICC profile.
+It receives one selected image inventory. Cropped/blended animations and layered stills enter through the frame
 executor above; the low-level standalone VarDCT entry point remains an uncropped still API.
 
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `ColorOutputConfig` explicitly

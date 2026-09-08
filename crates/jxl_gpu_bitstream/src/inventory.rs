@@ -1,24 +1,23 @@
 //! Bounded standard-codestream header and TOC inventory.
 //!
-//! Image-header grammar is delegated to the header-only `jxl-image` crate. Frame headers are
-//! parsed locally, while the published `jxl-coding` metadata decoder is used only for the
+//! Image and frame grammar is parsed locally with header-only `jxl-image` primitive bundles,
+//! while the published `jxl-coding` metadata decoder is used only for the
 //! entropy-coded TOC permutation. No image sample, Modular, or VarDCT data is decoded here.
 
 use jxl_bitstream::Bitstream as ImageBitstream;
 use jxl_image::{
-    BitDepth as JxlBitDepth, ExtraChannelType as JxlExtraChannelType, ImageHeader,
+    BitDepth as JxlBitDepth, ExtraChannelType as JxlExtraChannelType,
     color::{
         ColourEncoding as JxlColourEncoding, ColourSpace as JxlColourSpace,
         Primaries as JxlPrimaries, RenderingIntent as JxlRenderingIntent,
         TransferFunction as JxlTransferFunction, WhitePoint as JxlWhitePoint,
     },
 };
-use jxl_oxide_common::Bundle;
 use thiserror::Error;
 
 use crate::{BitReader, Error as BitReaderError};
 
-mod image_extensions;
+mod image_header;
 
 const FLAG_USE_LF_FRAME: u64 = 0x20;
 const FLAG_SKIP_ADAPTIVE_LF_SMOOTHING: u64 = 0x80;
@@ -630,6 +629,20 @@ pub struct CodestreamInventory {
     pub frames: Vec<FrameInventory>,
 }
 
+impl CodestreamInventory {
+    /// Resolve a physical codestream frame ID in a contiguous frame projection.
+    /// Projections retain physical IDs and may start after an embedded preview or earlier frames.
+    #[must_use]
+    pub fn frame_position(&self, frame_index: u32) -> Option<usize> {
+        let first = self.frames.first()?.frame_index;
+        let position = usize::try_from(frame_index.checked_sub(first)?).ok()?;
+        self.frames
+            .get(position)
+            .filter(|frame| frame.frame_index == frame_index)?;
+        Some(position)
+    }
+}
+
 /// Failure while constructing a bounded standard codestream inventory.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum InventoryError {
@@ -645,6 +658,8 @@ pub enum InventoryError {
     InvalidEnum { name: &'static str, value: u32 },
     #[error("invalid frame header: {0}")]
     InvalidFrame(&'static str),
+    #[error("preview dimensions {width}x{height} exceed the JPEG XL maximum of 4096x4096")]
+    InvalidPreviewDimensions { width: u32, height: u32 },
     #[error("invalid JPEG sampling selectors {jpeg_upsampling:?} with do_YCbCr={do_ycbcr}")]
     InvalidJpegSampling {
         jpeg_upsampling: [u32; 3],
@@ -847,13 +862,12 @@ pub(crate) fn parse_codestream_inventory(
         let is_last = parsed_frame.frame.is_last;
         frames.push(parsed_frame.frame);
 
-        if is_last {
-            if is_preview {
-                is_preview = false;
-                lf_frames.clear();
-            } else {
-                break;
-            }
+        // A.1 contains exactly one preview frame, independently of its is_last field.
+        if is_preview {
+            is_preview = false;
+            lf_frames.clear();
+        } else if is_last {
+            break;
         }
     }
 
@@ -967,10 +981,14 @@ pub(crate) fn parse_frame_prefix(
         section_cursor = section_end;
     }
 
-    let visible = matches!(
-        header.frame_type,
-        FrameType::Regular | FrameType::SkipProgressive
-    ) && (header.duration != 0 || header.is_last);
+    // A preview advances the nonvisible counter even when its header says is_last or carries
+    // duration. Leading LF/hidden main frames continue that count; only a visible frame resets it.
+    let visible = !is_preview
+        && matches!(
+            header.frame_type,
+            FrameType::Regular | FrameType::SkipProgressive
+        )
+        && (header.duration != 0 || header.is_last);
     let noise_seed = if visible {
         [progress.noise_seed[0].wrapping_add(1), 0]
     } else {
@@ -978,11 +996,6 @@ pub(crate) fn parse_frame_prefix(
             progress.noise_seed[0],
             progress.noise_seed[1].wrapping_add(1),
         ]
-    };
-    let next_noise_seed = if is_preview && header.is_last {
-        [0; 2]
-    } else {
-        noise_seed
     };
     let frame = FrameInventory {
         frame_index,
@@ -1045,7 +1058,7 @@ pub(crate) fn parse_frame_prefix(
         progress: InventoryProgress {
             total_toc_entries,
             total_section_bytes,
-            noise_seed: next_noise_seed,
+            noise_seed,
         },
     })
 }
@@ -1088,31 +1101,26 @@ pub(crate) fn parse_image_header(
     let max_header_bytes = usize::try_from(limits.max_image_header_bytes).unwrap_or(usize::MAX);
     let visible_bytes = codestream.len().min(max_header_bytes);
     let mut bitstream = ImageBitstream::new(&codestream[..visible_bytes]);
-    let image = match ImageHeader::parse(&mut bitstream, ()) {
+    let image = match image_header::parse(&mut bitstream) {
         Ok(image) => image,
-        Err(error) if error.unexpected_eof() && visible_bytes < codestream.len() => {
+        Err(image_header::HeaderError::Syntax(error))
+            if error.unexpected_eof() && visible_bytes < codestream.len() =>
+        {
             return Err(InventoryError::ResourceLimit("image header bytes"));
         }
-        Err(error) if error.unexpected_eof() => {
+        Err(image_header::HeaderError::Syntax(error)) if error.unexpected_eof() => {
             return Err(InventoryError::UnexpectedEndOfBits {
                 bit_offset: u64::try_from(bitstream.num_read_bits())
                     .map_err(|_| InventoryError::SizeOverflow)?,
             });
         }
-        Err(error) => return Err(InventoryError::ImageHeader(error.to_string())),
+        Err(image_header::HeaderError::Syntax(error)) => {
+            return Err(InventoryError::ImageHeader(error.to_string()));
+        }
+        Err(image_header::HeaderError::Inventory(error)) => return Err(error),
     };
     let header_bits =
         u64::try_from(bitstream.num_read_bits()).map_err(|_| InventoryError::SizeOverflow)?;
-    // jxl-image deliberately skips unknown extension payloads. Authoritative decode must reject
-    // them instead of assuming that an unknown rendering extension leaves pixels unchanged.
-    if let Some((_, selector)) = image_extensions::read_selector(&codestream[..visible_bytes])?
-        && selector != 0
-    {
-        return Err(InventoryError::UnsupportedExtensions {
-            scope: "image",
-            selector,
-        });
-    }
 
     let metadata = &image.metadata;
     let extra_channel_count = u32::try_from(metadata.ec_info.len())
@@ -1160,10 +1168,7 @@ pub(crate) fn parse_image_header(
             num_loops: animation.num_loops,
             have_timecodes: animation.have_timecodes,
         });
-    let preview_size = metadata
-        .preview
-        .as_ref()
-        .map(|preview| (preview.width, preview.height));
+    let preview_size = image.preview_size;
 
     let embedded_icc = if metadata.colour_encoding.want_icc() {
         Some(parse_embedded_icc(codestream, header_bits, limits)?)
@@ -1751,6 +1756,11 @@ fn parse_frame_header(
     } else {
         0
     };
+    if is_preview && save_as_reference != 0 {
+        return Err(InventoryError::InvalidFrame(
+            "preview cannot save a reference",
+        ));
+    }
     let can_be_referenced = !is_last
         && frame_type != FrameType::LowFrequency
         && (duration == 0 || save_as_reference != 0);
@@ -2355,6 +2365,73 @@ mod tests {
     use super::*;
     use crate::{BitWriter, FragmentedContainerWriter, ParseLimits, parse, write_container};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn preview_headers_use_preview_geometry_and_cannot_retain_reference_slots() {
+        let context = ImageContext {
+            width: 37,
+            height: 9,
+            preview_size: Some((15, 27)),
+            xyb_encoded: true,
+            num_extra_channels: 0,
+            extra_channel_shifts: Vec::new(),
+            have_animation: false,
+            have_timecodes: false,
+        };
+        let default_header = parse_frame_header(
+            &mut BitReader::new(&[1]),
+            context.frame_context(true).unwrap(),
+            true,
+            InventoryLimits::default(),
+        )
+        .unwrap();
+        assert_eq!((default_header.width, default_header.height), (15, 27));
+        assert!(default_header.is_last);
+        for reference in 0..4 {
+            let mut bits = BitWriter::new();
+            bits.write_bits(0, 3).unwrap(); // explicit Regular
+            bits.write_bits(1, 1).unwrap(); // Modular
+            bits.write_bits(0, 4).unwrap(); // flags, upsampling 1
+            bits.write_bits(1, 2).unwrap(); // 256-pixel groups
+            bits.write_bits(0, 6).unwrap(); // one pass, no crop, Replace, not last
+            bits.write_bits(reference, 2).unwrap();
+            let reference_end = bits.bit_len() as u64;
+            bits.write_bits(0, 3).unwrap(); // save_before_ct=false, empty name
+            bits.write_bits(1, 1).unwrap(); // default restoration
+            bits.write_bits(0, 2).unwrap(); // no extensions
+            let mut reader = BitReader::new(bits.as_bytes());
+            let result = parse_frame_header(
+                &mut reader,
+                context.frame_context(true).unwrap(),
+                true,
+                InventoryLimits::default(),
+            );
+            if reference == 0 {
+                let header = result.unwrap();
+                assert!(!header.is_last);
+                assert_eq!(header.save_as_reference, 0);
+                assert_eq!(reader.bit_offset(), bits.bit_len() as u64);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(InventoryError::InvalidFrame(
+                        "preview cannot save a reference"
+                    ))
+                ));
+                assert_eq!(reader.bit_offset(), reference_end);
+            }
+            // The same non-final reference slots are legal for an ordinary main frame.
+            assert!(
+                parse_frame_header(
+                    &mut BitReader::new(bits.as_bytes()),
+                    context.frame_context(false).unwrap(),
+                    false,
+                    InventoryLimits::default()
+                )
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn jpeg_sampling_and_lf_smoothing_are_validated_before_the_toc() {

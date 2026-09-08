@@ -46,17 +46,26 @@ own mode controls this rule; it does not inherit the color mode. Actual libjxl R
 with different color/alpha modes and sources exercise this grammar through contiguous and
 fragmented GPU decode, including the formerly misaligned full-frame MultiplyAdd/Replace header.
 
-The image-header grammar comes from the lightweight `jxl-image` crate. Frame-header and TOC-size
-grammar is parsed locally with explicit limits. Entropy-coded TOC permutations use the published
+Image/frame-header and TOC-size grammar is parsed locally with explicit limits, reusing the
+lightweight `jxl-image` primitive bundles for sample/color metadata. Entropy-coded TOC permutations use the published
 `jxl-coding` metadata decoder, producing both physical bitstream indices and logical TOC indices.
 Embedded ICC streams are reconstructed with bounded `jxl-color` primitives and retained alongside
 their exact compressed bit range. Neither path decodes Modular, VarDCT, or pixel data. Returned
 section ranges are relative to the contiguous standard codestream, so the same inventory applies
 to raw, `jxlc`, and reconstructed `jxlp` input.
 
+Preview width is read only when its aspect-ratio selector is zero; all eight ratios and both
+dimension encodings preserve the following metadata bit position. Explicit and derived preview
+axes are limited to 4096, with `InvalidPreviewDimensions` for larger values. There is exactly
+one independent Regular preview frame, even when its `is_last` is false. A preview cannot crop,
+blend or save a nonzero reference slot. Both scanners reset LF dependencies after that frame.
+Noise counters follow physical frames: the preview increments the nonvisible count, which
+continues into leading main LF/hidden frames until the first visible frame resets it.
+`CodestreamInventory::frame_position` resolves physical IDs in projections that start after zero.
+
 Unknown image, frame, and restoration extension selectors return the typed
 `InventoryError::UnsupportedExtensions { scope, selector }` before an authoritative decode can
-use the inventory. A bounded walk through the public `jxl-image` field parsers observes the image
-selector that its opaque extension bundle otherwise skips. Empty unknown payloads are also
+use the inventory. The single image-metadata walk checks the selector directly, avoiding an
+opaque extension parser and a second grammar walk. Empty unknown payloads are also
 rejected; frame/restoration payload lengths still obey the explicit extension-bit limit. Safe
 auxiliary container boxes continue through the transport event path independently.

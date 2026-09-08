@@ -2349,3 +2349,87 @@ Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature works
 check, warning-free Clippy/rustdoc, the Rust 1.89 all-target/all-feature check and the six-crate
 WASM check pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU readback
 passes. All 136 new codestreams regenerate byte-identically. Full JPEG XL conformance remains open.
+
+### Independent embedded preview and main-image selection
+
+`examples/regenerate_previews.rs` reproduces 48 codestreams in `test-data/preview/`.
+An offline libjxl 0.12 `cjxl` invocation creates independent Modular or VarDCT preview entropy
+from a deterministic RGB ramp with ISO-800 noise and disabled Gaborish/EPF. Its color intent
+matches the selected main fixture. The fixture writer inserts the preview metadata, rewrites
+frame timing/TOC syntax where needed, and appends the original main frames. It canonicalizes
+container inputs first and checks that every original entropy section remains byte-identical.
+Eight additional streams reuse a source frame as both preview and main to cover other profiles.
+No production CPU image decoder or encoder is used.
+
+| Fixture family | Preview extent | Main coverage |
+|---|---:|---|
+| `modular`, `vardct` | 15×27 | 257×17 noisy VarDCT |
+| `nonfinal_{mode}` | 15×27 | The same main with preview `is_last=false` |
+| `main_modular_preview_{mode}` | 15×27 | 257×17 noisy Modular |
+| `lf_{mode}` | 15×27 | Three-frame progressive-DC/AC chain with two noisy LF levels |
+| `animation_{mode}` | 15×27 | Five mixed physical frames, three presentations; preview carries duration 7 and a non-final header |
+| `ratio_{mode}_{div8}_{ratio}` | Height 27 or 16, width from the coded ratio | All 15 remaining aspect/div8 encodings per mode, including odd implicit widths |
+| `alpha_modular`, `alpha_vardct` | 259×9 / 63×9 | Independently coded alpha and scalar-extra delivery |
+| `rgb_modular`, `rgb_vardct`, `jpeg_420` | 257×17 | Original RGB and JPEG 4:2:0 |
+| `float_vardct`, `resampled_{mode}` | 259×33 | Original F32 precision and 4× frame resampling |
+
+The frontend now supplies a `SelectedImageInventory` to every submission engine. Its source
+inventory preserves the complete physical stream; its reconstruction inventory selects one
+image domain. Main excludes the preview but retains physical IDs starting at one, so frame
+planning and LF/reference lookup explicitly resolve IDs to local positions. Preview lowers to
+one final still with its own extent, no animation/intrinsic context, and unchanged physical
+entropy ranges and noise seed. Missing previews are typed selection errors before admission.
+This is an explicit frontend operation rather than an engine-specific synthetic codestream.
+
+The outer image-header parser now reads width only for preview ratio zero and rejects explicit
+or derived axes above 4096. The old primitive preview bundle consumed width bits for implicit
+ratios and misaligned following metadata. Whole and incremental parsing now end preview after
+exactly one frame, regardless of `is_last`, and reject a nonzero saved-reference slot.
+These rules follow A.1, D.3.3 and F.2 of
+[ISO/IEC 18181-1:2024](https://previewnorm.com/iso/ISO%20IEC%2018181-1-2024%20PDF.pdf).
+Header unit tests check all 16 aspect/div8 forms without consuming a sentinel field, default
+preview geometry, both 4096 boundaries, and early reference-slot rejection.
+
+Noise counting also required a production correction. The preview is nonvisible for the noise
+seed even when its header says final or carries duration. Its seed is `[0,1]`; leading main
+LF/hidden frames continue the nonvisible count until the first visible main frame resets it.
+This follows
+[libjxl's physical-frame counter](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc#L159).
+Thus the recursive fixture uses `[0,1], [0,2], [0,3], [1,0]`. Resetting the counter after preview
+produced native linear-F32 maxAE 0.39835846; preserving it reduces that error to 0.000107646.
+LF/reference image slots remain separate between the preview and main domains.
+
+`tests/preview.rs` checks all 48 noisy/original previews and 46 zero-model controls against
+`JxlDecoderSetPreviewOutBuffer`/`JXL_DEC_PREVIEW_IMAGE` via the optional native C oracle.
+The 94 comparisons retain the 1/1024 F32 bound; the observed maximum is 0.000299241.
+Every signaled preview noise model must change pixels. Whole input and 43-byte transport chunks under
+a 256-byte GPU window produce identical pixels and metadata. The 18 non-ratio cases also compare
+all main presentations against independent GPU controls, Rust jxl and native libjxl.
+The 22 main Rust comparisons have maxAE 0.000092388 under 1e-4; native's maximum is 0.000232317
+under 1/1024. The existing high-contrast progressive-AC fixture uses native linear output to
+avoid magnifying IDCT rounding through dark sRGB, with the same bound as its prior LF gate.
+For its independent Rust/main control, the original root LF is repeated before the chain:
+the first root result is overwritten while its nonvisible count matches the preview prefix.
+This avoids depending on Rust jxl 0.6's preview skip/counter behavior.
+
+All eight orientations and Apply/Keep are checked for both image selections and both preview
+encodings. Alpha's numeric F32 preview plane agrees exactly with the original independent
+extra-channel oracle. All 48 inventories agree under whole, one-byte and 43-byte delivery,
+including physical sections, timing and LF resolution. Lowering preserves the source inventory,
+physical IDs and ranges, while malformed preview topology is rejected. Non-Regular preview
+mutations and incomplete main input fail before submission and immediately release retained
+input. Corrupt entropy in an unselected image leaves the selected image unchanged; selecting
+that corruption fails negotiation or validation without returning a frame. Full-budget admission
+is retryable, caller leases retain output after session drop, and pending cancellation returns
+both GPU and incremental-input reservations to zero.
+
+The production shader ABI and GPU allocation lifetimes are unchanged. Sessions still open only
+after authoritative end-of-input; early preview delivery, intermediate progressive output,
+encoder preview emission and full 18181-3 conformance remain open.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+770 tests across 39 targets, with zero failures and one existing manual benchmark ignored.
+Formatting, workspace check, warning-free Clippy/rustdoc, Rust 1.89 all-target/all-feature check
+and the six-crate WASM check pass. The reference and Metal harnesses each pass 18 cases;
+indexed Gray8 U8 CPU readback passes with direct mapping. All 48 preview codestreams reproduce
+byte-identically. The full JPEG XL goal remains active.

@@ -59,11 +59,14 @@ pub enum FramePlanError {
     InvalidTimebase,
     #[error("invalid image orientation {orientation}")]
     InvalidOrientation { orientation: u32 },
-    #[error("preview presentation is not connected to the GPU frame executor")]
-    PreviewUnsupported,
+    #[error("frame execution requires a selected image reconstruction inventory")]
+    ImageNotSelected,
 }
 
 impl FrameExecutionPlan {
+    /// Plans an image-domain inventory, such as
+    /// [`SelectedImageInventory::reconstruction_inventory`](crate::SelectedImageInventory::reconstruction_inventory).
+    /// Physical frame IDs may start after zero and are never treated as vector positions.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, FramePlanError> {
         Self::negotiate_with_orientation(inventory, crate::OrientationPolicy::Apply)
     }
@@ -75,7 +78,7 @@ impl FrameExecutionPlan {
     ) -> Result<Self, FramePlanError> {
         let image = &inventory.image_header;
         if image.preview_size.is_some() || inventory.frames.iter().any(|frame| frame.is_preview) {
-            return Err(FramePlanError::PreviewUnsupported);
+            return Err(FramePlanError::ImageNotSelected);
         }
         if inventory.frames.is_empty() {
             return Err(FramePlanError::MissingFrame);
@@ -114,6 +117,7 @@ impl FrameExecutionPlan {
         let mut presentations = Vec::new();
         let mut first = 0;
         let mut ticks = 0_u64;
+        let first_frame_index = inventory.frames[0].frame_index;
         for (index, frame) in inventory.frames.iter().enumerate() {
             let invalid = |reason| FramePlanError::InvalidFrame {
                 frame_index: frame.frame_index,
@@ -123,7 +127,12 @@ impl FrameExecutionPlan {
                 frame.frame_type,
                 FrameType::Regular | FrameType::SkipProgressive
             );
-            if usize::try_from(frame.frame_index).ok() != Some(index) {
+            if frame
+                .frame_index
+                .checked_sub(first_frame_index)
+                .and_then(|value| usize::try_from(value).ok())
+                != Some(index)
+            {
                 return Err(invalid("noncontiguous physical indices"));
             }
             if frame.is_last != (index + 1 == inventory.frames.len()) || (frame.is_last && !normal)
@@ -153,7 +162,10 @@ impl FrameExecutionPlan {
                         "LF dependency is not the current producer at the next level",
                     ));
                 }
-                let producer = &inventory.frames[source as usize];
+                let source_position = inventory
+                    .frame_position(source)
+                    .ok_or_else(|| invalid("LF producer is outside the selected image"))?;
+                let producer = &inventory.frames[source_position];
                 let (width, height) = frame
                     .color_sample_extent()
                     .ok_or_else(|| invalid("invalid encoded sample extent"))?;
@@ -168,7 +180,7 @@ impl FrameExecutionPlan {
                         "LF producer extent does not match the consumer block extent",
                     ));
                 }
-                nodes[source as usize].lf_last_use = Some(frame.frame_index);
+                nodes[source_position].lf_last_use = Some(frame.frame_index);
             }
             if is_lf {
                 lf_references[frame.lf_level as usize - 1] = Some(frame.frame_index);
@@ -233,9 +245,9 @@ impl FrameExecutionPlan {
                         // later dependency closure before a seek can use this as a restart point.
                         is_keyframe: nodes[first..].iter().all(|node| {
                             !node.needs_composition
-                                && node
-                                    .lf_source_frame
-                                    .is_none_or(|source| source as usize >= first)
+                                && node.lf_source_frame.is_none_or(|source| {
+                                    source >= inventory.frames[first].frame_index
+                                })
                         }) && inventory.frames[first..=index]
                             .iter()
                             .all(|layer| layer.flags & 2 == 0),

@@ -385,8 +385,14 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
                 }
                 .into());
             }
-            let producer = &inventory.frames[reference.frame_index as usize];
-            if !plan.nodes[reference.frame_index as usize].needs_composition
+            let position =
+                inventory
+                    .frame_position(reference.frame_index)
+                    .ok_or(Error::EngineContract(
+                        "reference is outside the selected image",
+                    ))?;
+            let producer = &inventory.frames[position];
+            if !plan.nodes[position].needs_composition
                 && (producer.x0 != 0
                     || producer.y0 != 0
                     || producer.width < image.width

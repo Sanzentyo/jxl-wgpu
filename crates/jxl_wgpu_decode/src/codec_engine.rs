@@ -167,10 +167,10 @@ impl GpuSubmissionEngine for WgpuDecodeEngine {
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
-        inventory: Arc<jxl_gpu_bitstream::CodestreamInventory>,
+        inventory: crate::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
         let codestream = Arc::new(codestream);
-        self.open_with_inventory_data(codestream, request, &inventory)
+        self.open_with_inventory_data(codestream, request, inventory.reconstruction_inventory())
     }
 }
 
@@ -179,10 +179,8 @@ fn project_frame_inventory(
     frame_index: u32,
 ) -> Result<CodestreamInventory> {
     let frame = inventory
-        .frames
-        .get(frame_index as usize)
-        .filter(|frame| frame.frame_index == frame_index)
-        .cloned()
+        .frame_position(frame_index)
+        .map(|position| inventory.frames[position].clone())
         .ok_or(Error::EngineContract(
             "frame execution plan references a missing physical frame",
         ))?;

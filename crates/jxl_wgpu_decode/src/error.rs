@@ -172,6 +172,8 @@ impl FrontendIncomplete {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error(transparent)]
+    ImageSelection(#[from] crate::ImageSelectionError),
     #[error("Modular stream {stream_index} selects a missing global MA tree")]
     MissingGlobalMaTree { stream_index: u32 },
     #[error(transparent)]

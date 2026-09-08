@@ -27,6 +27,15 @@ not production dependencies or fallback paths.
 
 ## Execution contract
 
+`GpuOutputRequest::with_image_selection(ImageSelection::Preview)` decodes an embedded preview on
+the GPU; the default `Main` selects the main still or animation. Selection separates each canvas
+and presentation clock while preserving physical frame IDs, entropy ranges and noise counters.
+The 48-stream preview corpus covers both coding modes, all preview aspect encodings, non-final
+preview headers, alpha, original RGB, JPEG sampling, floating samples, resampling and main
+LF/animation dependencies. Whole and bounded fragmented input produce identical output.
+Both entry points currently validate complete input before opening a session; early preview
+delivery and intermediate progressive output remain separate work.
+
 The Modular decoder also reconstructs lossy XYB and original-sRGB color on the GPU. A shared
 color-output module serves both coding modes; Modular joins Gaborish, EPF, resampling, alpha,
 spot colors and frame composition through the same accounted planar boundary. The reproducible
@@ -293,7 +302,7 @@ whole and bounded fragmented input. Subsampled components expand before noise wi
 storage; zero-model allocation, admission retry and cancellation are checked. Twenty JPEG streams
 combine component expansion, Gaborish, active EPF 1–3 and noise. Seven LF chains cover both root
 coding modes, individual nested models, Gaborish, progressive AC, alpha/depth preservation and
-cancellation during dependency execution. Preview/reference-only and broader render combinations
+cancellation during dependency execution. Reference-only and broader render combinations
 remain conformance work. Documented reference differences use independent scalar filtering and
 separate sRGB/linear comparisons; they do not increase the existing noise tolerances.
 

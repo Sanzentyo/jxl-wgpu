@@ -1023,7 +1023,6 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
 
     fn inventory_limits(&self) -> InventoryLimits {
         InventoryLimits {
-            max_frames: 1,
             max_total_section_bytes: self.parse_limits().max_codestream_bytes,
             ..InventoryLimits::default()
         }
@@ -1033,8 +1032,8 @@ impl GpuSubmissionEngine for WgpuSubmissionEngine {
         &self,
         codestream: GpuCodestream,
         request: &GpuOutputRequest,
-        inventory: Arc<CodestreamInventory>,
+        inventory: crate::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        self.open_with_inventory(codestream, request, &inventory)
+        self.open_with_inventory(codestream, request, inventory.reconstruction_inventory())
     }
 }
