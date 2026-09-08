@@ -1,6 +1,11 @@
 use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Output};
+
+#[path = "offline/hex.rs"]
+mod hex;
+pub use hex::{hex, unhex};
+
 pub fn run(command: &mut Command) -> Output {
     let output = command.output().expect("run offline fixture tool");
     assert!(
@@ -25,25 +30,6 @@ pub fn compile(source: &Path, binary: &Path, libraries: &[&str]) {
         )
         .arg("-o")
         .arg(binary));
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    let mut text = String::new();
-    for line in bytes.chunks(32) {
-        for byte in line {
-            write!(text, "{byte:02x}").unwrap();
-        }
-        text.push('\n');
-    }
-    text
-}
-
-pub fn unhex(text: &str) -> Vec<u8> {
-    let hex = text.split_whitespace().collect::<String>();
-    hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect()
 }
 
 pub fn float_hex(bytes: &[u8]) -> String {

@@ -11,11 +11,8 @@ use crate::vardct_resource::{VarDctResourceLayout, hf_matrix_param_index};
 use crate::vardct_side_image::RawHfDequantSideImagePlan;
 use crate::{Error, Result};
 pub(crate) use modular::{
-    ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStreamPlan,
-};
-pub(crate) use modular::{
-    ModularSideImageJob as RawHfDequantSideImageJob,
-    ModularSideImageStatus as RawHfDequantSideImageStatus,
+    ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStatus,
+    ModularSideImageStreamPlan,
 };
 
 const OVERLAY_SHADER: &str = include_str!("../vardct_raw_matrix.wgsl");
@@ -77,16 +74,16 @@ impl RawHfDequantSideImagePipeline {
     pub(crate) fn prepare(
         &self,
         backend: &WgpuBackend,
-        codestream: &wgpu::Buffer,
+        codestream: &crate::GpuCodestream,
         resources: &wgpu::Buffer,
         resource_layout: VarDctResourceLayout,
         plan: &RawHfDequantSideImagePlan,
-        packet_end: u32,
-    ) -> Result<RawHfDequantSideImageJob> {
+        stream: &ModularSideImageStreamPlan,
+    ) -> Result<ModularSideImageJob> {
         let device = backend.device();
         let mut recording = self
             .image
-            .record(backend, codestream, &plan.image, packet_end)?;
+            .record_source(backend, codestream, &plan.image, stream)?;
         let params = overlay_params(resource_layout, plan)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu raw HF dequant overlay parameters"),
@@ -104,12 +101,12 @@ impl RawHfDequantSideImagePipeline {
             ],
         });
         {
-            let mut pass = recording
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = recording.completion_encoder(device).begin_compute_pass(
+                &wgpu::ComputePassDescriptor {
                     label: Some("jxl-wgpu raw HF dequant matrix overlay"),
                     timestamp_writes: None,
-                });
+                },
+            );
             pass.set_pipeline(&self.overlay);
             pass.set_bind_group(0, &binding, &[]);
             let samples = params
@@ -121,15 +118,21 @@ impl RawHfDequantSideImagePipeline {
         recording.retain_uniform(uniform)?;
         Ok(recording.finish())
     }
-    pub(crate) fn memory_bytes(
+    pub(crate) fn plan_source(
         &self,
+        source: &crate::GpuCodestream,
         plan: &RawHfDequantSideImagePlan,
         packet_end: u32,
-    ) -> Result<u64> {
-        self.image
-            .memory_bytes(&plan.image, packet_end)?
+        stream_limit: u64,
+    ) -> Result<ModularSideImageStreamPlan> {
+        let mut stream = self
+            .image
+            .plan_source(source, &plan.image, packet_end, stream_limit)?;
+        stream.memory_bytes = stream
+            .memory_bytes
             .checked_add(std::mem::size_of::<RawMatrixParams>() as u64)
-            .ok_or_else(|| Error::backend("raw HF dequant memory bytes overflow"))
+            .ok_or_else(|| Error::backend("raw HF dequant memory bytes overflow"))?;
+        Ok(stream)
     }
 }
 

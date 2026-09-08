@@ -546,23 +546,33 @@ the cursor are admitted through the same shared budget. `cjxl --progressive_dc=1
 completion against Rust `jxl` within one RGB8 code. Parametric matrix modes 0 through 6 populate the
 resident resource table. For raw mode 7, the sectioned global-tree path now decodes the complete
 three-channel Modular side image with the common GPU entropy executor, runs its resident
-Palette/RCT/Squeeze inverse schedule, validates one 16-byte mapped status, and overlays positive
+Palette/RCT/Squeeze inverse schedule, validates a 16-byte mapped status, and overlays positive
 finite weights into each aliased strategy-matrix target before AC/render. A real cjpeg-to-cjxl
-JPEG-transcode stream covers that primitive on an actual adapter. Local-tree packets now complete
+JPEG-transcode stream and two reproducible local-MA variants cover that primitive on an actual
+adapter. Local-tree packets now complete
 their LF cursor and every HF-local metadata window before entering the same repeated raw-matrix
-state; each raw stage copies only its four-byte-aligned HF-global packet range into a dedicated
-storage binding and rebases the mapped cursor. Four 264x64 cjpeg fixtures cover 4:4:4, 4:2:2,
+state. Raw stages reuse one bounded upload from shared source spans and resume their entropy,
+predictor and LZ state. The input cap follows caller/device limits and shrinks to fit available
+shared budget, down to 40 bytes when continuation is needed. Each map validates progress and an
+absolute cursor; inverse transforms and overlay wait for complete entropy. No later HF-global
+suffix is uploaded once that cursor is known. Four 264x64 cjpeg fixtures cover 4:4:4, 4:2:2,
 4:4:0, and 4:2:0 through the public decoder: LF/AC entropy uses exact per-component dimensions,
 tasks carry three LF offsets and component destinations, and the packed output kernel applies
 separable quarter/three-quarter JPEG upsampling with replicated edges followed by encoded BT.601
 YCbCr-to-RGB conversion. Actual-GPU RGB8 differs from Rust `jxl` and optional `djxl` by at most one
-code. A local-tree raw conformance fixture, uncommon asymmetric component sampling, and subsampled
-restoration remain gaps.
+code. Global- and local-MA raw images also match whole input byte-for-byte with 40/64/256-byte caps
+and seven-byte transport chunks, including a stream with local LF/HF trees and no global MA tree.
+The final aggregate validator tracks the actual HF-metadata entry point through that late raw
+stage. Larger/transformed raw matrices, uncommon asymmetric component sampling, and subsampled
+restoration still need conformance coverage.
 
 `ModularSideImagePlan` and `wgpu_engine::side_image::modular` now own the shared substream
-descriptor, entropy/inverse recording, exact allocation size and mapped absolute cursor. The
-raw-matrix layer supplies only its denominator, alias targets and overlay. Recording keeps the
-resident arena available to a downstream consumer before the final status copy; arbitrary
+descriptor, bounded entropy/inverse recording, exact allocation size and mapped absolute cursor.
+The raw-matrix layer supplies only its denominator, alias targets and overlay. Completion work
+shares the initial encoder for a whole stream and a deferred encoder for windowed input. The
+raw map callback owns both image and frame allocations until GPU completion, including cancellation
+during the first window, a continuation, or finalization. Recording keeps the resident arena
+available to a downstream consumer before the final status copy; arbitrary
 one-, two-, three- or many-plane topologies share the same descriptor-based GPU executor.
 The common executor retains original samples as signed integer words and performs no color
 conversion. The 256-byte entropy ABI, 16-byte status and 64-byte matrix overlay ABI are unchanged.
@@ -612,7 +622,8 @@ The scalar tail reserves a 64-byte uniform, a four-byte range status and four mo
 existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
 public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
 corrupting a later AC section still fails the scalar request after the global stream succeeds.
-Floating extras use `NativeFloat` and the same scalar tail. Raw matrix side images still need window continuation.
+Floating extras use `NativeFloat` and the same scalar tail. Raw matrix side images now share this
+bounded executor and its deferred finalization contract.
 
 For LF/AC distribution, Modular headers and transform topology now parse separately from MA and
 image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
@@ -829,9 +840,9 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Explicitly published
-progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
+progressive intermediates, larger/transformed raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-numeric color-channel output, ICC/HDR luminance mapping, greater-than-16-bit integer source metadata,
+numeric color-channel output, ICC/HDR luminance mapping,
 and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.

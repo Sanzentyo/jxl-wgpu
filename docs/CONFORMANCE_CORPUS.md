@@ -1847,3 +1847,45 @@ warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM compile gate pass.
 harnesses each pass 18 cases; indexed Gray8 U8 CPU readback and the final output-quantization
 rerun pass. All 76 new corpus files, 416 floating-corpus files, 286 integer-corpus files and
 20 original integer still/composition fixtures regenerate byte-identically with libjxl 0.12.0.
+
+## Bounded raw dequantization images
+
+Two small fixtures derive from the existing 188-byte, 264×64 cjpeg-to-cjxl 4:2:0 source.
+`cargo run -p jxl_wgpu_decode --example regenerate_raw_matrix -- [output-directory]` copies its
+322-bit MA descriptor into the raw DCT8 image, selects the local tree, normalizes section byte
+padding, and rewrites the TOC. `jpeg_transcode_raw_matrix_local.jxl.hex` is 228 bytes and retains
+the frame's global descriptor. `jpeg_transcode_raw_matrix_local_packets.jxl.hex` is 269 bytes:
+it removes the global tree and embeds separate local descriptors in LF quantization, HF metadata
+and the raw matrix. The offline jxl-vardct decoder locates LF/HF boundaries. Every image entropy
+token stays unchanged; neither generator work nor CPU image decoding enters production.
+
+`vardct_packet::tests::raw_matrix` runs all three descriptor forms through whole input and
+40/44/64-byte windows, with source spans only seven bytes long. After each submission it reads the destination
+matrix and requires the initial values until entropy has completed and finalization has run.
+Every final matrix value and the absolute end cursor must equal whole execution; the
+existing independent JPEG quantizer test fixes all 192 samples. A one-bit cutoff at the actual
+entropy end must fail after intermediate windows and leave the destination unchanged, even though
+the source still contains the untruncated suffix.
+
+`tests/vardct_engine_gpu/raw_matrix.rs` drives all three inputs through the public runtime-neutral
+async decoder with whole input or 40/64/256-byte caps and seven-byte transport chunks. RGB8 must remain
+byte-identical across caps and within one code of independent Rust jxl and optional djxl output.
+The engine's raw-stage tests force late admission to shrink a whole upload to 40 bytes, reject a
+budget four bytes below the minimum, and cancel after the first window, a continuation and the
+finalization submission, both with and without prior local LF/HF staging. All image/frame
+reservations must be released after map completion, without scheduling more work after cancellation.
+No production CPU codec or image readback is added.
+
+The fully local fixture exposed a final-validation mismatch: packet status 31 was accepted at the
+HF handoff but treated as unknown at final output because the expected stop had been fixed before
+LF/HF staging. The frame now records the HF entry point actually submitted and preserves that
+expectation through raw-image completion. This retains all existing sample, cursor and artifact
+validation instead of clearing or ignoring a status.
+
+Validation on 2026-09-08 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+722 tests across 31 targets, with one existing manual allocation benchmark ignored. After expanding
+the raw fixtures and correcting final validation, all 17 affected raw/local/progressive tests pass.
+Formatting, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM gate pass on the final code.
+Reference and Metal harnesses each pass 18 cases, and indexed Gray8 U8 CPU readback passes.
+Both new fixtures regenerate byte-identically; live libjxl 0.12.0 accepts both and produces identical
+pixels. Larger/transformed raw images and broader cross-feature conformance remain separate gates.

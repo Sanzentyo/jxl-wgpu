@@ -448,7 +448,11 @@ impl FramePendingFrame {
                     .zip(work.subimage.targets.iter().copied()),
             )?;
             lifetime.job.encode_status_copy(&mut copies);
-            let mut commands: Vec<_> = lifetime.job.take_inverse_commands().into_iter().collect();
+            let mut commands: Vec<_> = lifetime
+                .job
+                .take_finalization_commands()
+                .into_iter()
+                .collect();
             commands.push(copies.finish());
             work.copied = true;
             commands

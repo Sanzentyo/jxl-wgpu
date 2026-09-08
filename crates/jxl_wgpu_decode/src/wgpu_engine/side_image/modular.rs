@@ -74,44 +74,6 @@ impl ModularSideImagePipeline {
         }
     }
 
-    pub(crate) fn record(
-        &self,
-        backend: &WgpuBackend,
-        codestream: &wgpu::Buffer,
-        plan: &ModularSideImagePlan,
-        packet_end: u32,
-    ) -> Result<ModularSideImageRecording> {
-        self.record_inner(
-            backend,
-            SideImageInput::Resident(codestream),
-            plan,
-            packet_end,
-        )
-    }
-
-    pub(crate) fn record_source(
-        &self,
-        backend: &WgpuBackend,
-        codestream: &crate::GpuCodestream,
-        plan: &ModularSideImagePlan,
-        stream: &ModularSideImageStreamPlan,
-    ) -> Result<ModularSideImageRecording> {
-        self.record_inner(
-            backend,
-            SideImageInput::Encoded(codestream, stream),
-            plan,
-            plan.token_bit_offset
-                .checked_add(
-                    stream
-                        .segments
-                        .get(0)
-                        .expect("initial window")
-                        .stream_token_end,
-                )
-                .ok_or_else(|| Error::backend("Modular side-image packet end overflow"))?,
-        )
-    }
-
     pub(crate) fn plan_source(
         &self,
         codestream: &crate::GpuCodestream,
@@ -142,46 +104,21 @@ impl ModularSideImagePipeline {
         })
     }
 
-    fn record_inner(
+    pub(crate) fn record_source(
         &self,
         backend: &WgpuBackend,
-        codestream: SideImageInput<'_>,
+        source: &crate::GpuCodestream,
         plan: &ModularSideImagePlan,
-        packet_end: u32,
+        layout: &ModularSideImageStreamPlan,
     ) -> Result<ModularSideImageRecording> {
-        if plan.token_bit_offset > packet_end {
-            return Err(Error::EngineContract(
-                "Modular side image entropy starts after its packet",
-            ));
-        }
         let device = backend.device();
-        let stream = match codestream {
-            SideImageInput::Resident(buffer) => {
-                stream_window(buffer, plan.token_bit_offset, packet_end)?
-            }
-            SideImageInput::Encoded(source, layout) => {
-                if u64::from(packet_end) > source.logical_bits()? {
-                    return Err(Error::EngineContract(
-                        "Modular side-image packet exceeds the encoded source",
-                    ));
-                }
-                StreamWindow {
-                    source_offset: 0,
-                    bytes: layout.stream_bytes,
-                    cursor_base_bits: plan.token_bit_offset,
-                    token_start: 0,
-                    token_end: layout
-                        .segments
-                        .get(0)
-                        .expect("initial window")
-                        .stream_token_end,
-                }
-            }
-        };
+        let first = layout.segments.get(0).ok_or(Error::EngineContract(
+            "Modular side-image stream has no initial window",
+        ))?;
         let (metadata, channel_layout_offset) = packed_metadata(plan)?;
         let workspace = workspace(plan)?;
-        let memory_bytes = frame_bytes(plan, metadata.len(), workspace.bytes, stream.bytes)?;
-        validate_limits(device, metadata.len(), workspace.bytes, stream.bytes)?;
+        let memory_bytes = frame_bytes(plan, metadata.len(), workspace.bytes, layout.stream_bytes)?;
+        validate_limits(device, metadata.len(), workspace.bytes, layout.stream_bytes)?;
 
         let source_mask = if plan.bit_depth == 32 {
             u32::MAX
@@ -193,12 +130,12 @@ impl ModularSideImagePipeline {
         };
         let mut params = <ShaderParams as Zeroable>::zeroed();
         params.entropy = EntropyStreamParams {
-            token_start: stream.token_start,
-            token_end: stream.token_end,
+            token_start: 0,
+            token_end: first.stream_token_end,
             lz77_window_mask: plan.lz77_window_words.saturating_sub(1),
         };
-        params.stream_token_end = stream.token_end;
-        params.window_yield_end = stream.token_end;
+        params.stream_token_end = first.stream_token_end;
+        params.window_yield_end = first.stream_token_end;
         params.window_flags = WINDOW_FIRST | WINDOW_FINAL;
         params.entropy_state_offset = workspace.entropy_state_offset_words;
         params.width = plan.maximum_width;
@@ -223,9 +160,7 @@ impl ModularSideImagePipeline {
         params.wp_w1 = plan.wp_header.w1;
         params.wp_w2 = plan.wp_header.w2;
         params.wp_w3 = plan.wp_header.w3;
-        if let SideImageInput::Encoded(_, layout) = codestream {
-            configure_window(&mut params, layout.segments.get(0).expect("initial window"));
-        }
+        configure_window(&mut params, first);
         let params_template = params;
         let control = DispatchControl {
             first_group: 0,
@@ -242,18 +177,11 @@ impl ModularSideImagePipeline {
         });
         let stream_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu Modular side image bounded stream"),
-            size: stream.bytes,
+            size: layout.stream_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        if let SideImageInput::Encoded(source, layout) = codestream {
-            upload_window(
-                backend,
-                source,
-                &stream_buffer,
-                layout.segments.get(0).expect("initial window"),
-            )?;
-        }
+        upload_window(backend, source, &stream_buffer, first)?;
         let arena = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu Modular side image resident arena"),
             size: workspace.bytes,
@@ -308,15 +236,6 @@ impl ModularSideImagePipeline {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu Modular side-image stage"),
         });
-        if let SideImageInput::Resident(codestream) = codestream {
-            encoder.copy_buffer_to_buffer(
-                codestream,
-                stream.source_offset,
-                &stream_buffer,
-                0,
-                stream.bytes,
-            );
-        }
         encoder.clear_buffer(&arena, 0, None);
         encoder.clear_buffer(&dummy_output, 0, None);
         encoder.clear_buffer(&status, 0, None);
@@ -346,24 +265,16 @@ impl ModularSideImagePipeline {
             &plan.inverse_plan,
             plan.wp_header,
         )?;
-        let inverse_commands = deferred_inverse.map(|mut encoder| {
-            encoder.copy_buffer_to_buffer(
-                &status,
-                0,
-                &status_staging,
-                0,
-                std::mem::size_of::<DecodeStatus>() as u64,
-            );
-            encoder.finish()
-        });
         Ok(ModularSideImageRecording {
             encoder,
+            completion_encoder: deferred_inverse,
+            defer_completion: params_template.window_flags & WINDOW_FINAL == 0,
             job: ModularSideImageJob {
                 commands: None,
                 status_staging,
                 status_mapped: AtomicBool::new(false),
                 memory_bytes,
-                cursor_base_bits: stream.cursor_base_bits,
+                cursor_base_bits: plan.token_bit_offset,
                 stream: stream_buffer,
                 _metadata: metadata,
                 arena,
@@ -373,18 +284,11 @@ impl ModularSideImagePipeline {
                 params_template,
                 decode_binding,
                 decode_pipeline: self.decode.clone(),
-                inverse_commands,
+                finalization_commands: None,
                 _control: control,
                 _uniforms: inverse_uniforms,
             },
         })
-    }
-
-    pub(crate) fn memory_bytes(&self, plan: &ModularSideImagePlan, packet_end: u32) -> Result<u64> {
-        let (metadata, _) = packed_metadata(plan)?;
-        let workspace = workspace(plan)?;
-        let stream = stream_window_geometry(plan.token_bit_offset, packet_end)?;
-        frame_bytes(plan, metadata.len(), workspace.bytes, stream.bytes)
     }
 
     pub(crate) fn encode_inverse(
@@ -429,12 +333,6 @@ impl ModularSideImagePipeline {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SideImageInput<'a> {
-    Resident(&'a wgpu::Buffer),
-    Encoded(&'a crate::GpuCodestream, &'a ModularSideImageStreamPlan),
-}
-
 pub(crate) struct ModularSideImageJob {
     commands: Option<wgpu::CommandBuffer>,
     status_staging: wgpu::Buffer,
@@ -450,7 +348,7 @@ pub(crate) struct ModularSideImageJob {
     params_template: ShaderParams,
     decode_binding: wgpu::BindGroup,
     decode_pipeline: wgpu::ComputePipeline,
-    inverse_commands: Option<wgpu::CommandBuffer>,
+    finalization_commands: Option<wgpu::CommandBuffer>,
     _control: wgpu::Buffer,
     _uniforms: Vec<wgpu::Buffer>,
 }
@@ -497,12 +395,12 @@ impl ModularSideImageJob {
         Ok(encoder.finish())
     }
 
-    pub(crate) fn take_inverse_commands(&mut self) -> Option<wgpu::CommandBuffer> {
-        self.inverse_commands.take()
+    pub(crate) fn take_finalization_commands(&mut self) -> Option<wgpu::CommandBuffer> {
+        self.finalization_commands.take()
     }
 
-    pub(crate) fn has_inverse_commands(&self) -> bool {
-        self.inverse_commands.is_some()
+    pub(crate) fn has_finalization_commands(&self) -> bool {
+        self.finalization_commands.is_some()
     }
 
     pub(crate) fn arena(&self) -> &wgpu::Buffer {
@@ -602,62 +500,6 @@ fn upload_window(
     source.copy_range(segment.input_start as u64..segment.input_end as u64, target)?;
     backend.queue().write_buffer(buffer, 0, &upload);
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct StreamWindow {
-    source_offset: u64,
-    bytes: u64,
-    cursor_base_bits: u32,
-    token_start: u32,
-    token_end: u32,
-}
-
-fn stream_window(
-    codestream: &wgpu::Buffer,
-    token_start: u32,
-    token_end: u32,
-) -> Result<StreamWindow> {
-    let window = stream_window_geometry(token_start, token_end)?;
-    let source_end = window
-        .source_offset
-        .checked_add(window.bytes)
-        .ok_or_else(|| Error::backend("Modular side image stream range overflow"))?;
-    if source_end > codestream.size() {
-        return Err(Error::backend(
-            "Modular side image stream range exceeds the retained codestream",
-        ));
-    }
-    Ok(window)
-}
-
-fn stream_window_geometry(token_start: u32, token_end: u32) -> Result<StreamWindow> {
-    if token_start >= token_end {
-        return Err(Error::EngineContract(
-            "Modular side image entropy range is empty or reversed",
-        ));
-    }
-    let first_word = token_start / 32;
-    let end_word = token_end.div_ceil(32);
-    let word_count = end_word
-        .checked_sub(first_word)
-        .ok_or_else(|| Error::backend("Modular side image stream word range underflow"))?;
-    let bytes = u64::from(word_count)
-        .checked_mul(4)
-        .ok_or_else(|| Error::backend("Modular side image stream byte size overflow"))?;
-    let source_offset = u64::from(first_word)
-        .checked_mul(4)
-        .ok_or_else(|| Error::backend("Modular side image stream byte offset overflow"))?;
-    let cursor_base_bits = first_word
-        .checked_mul(32)
-        .ok_or_else(|| Error::backend("Modular side image cursor base overflow"))?;
-    Ok(StreamWindow {
-        source_offset,
-        bytes,
-        cursor_base_bits,
-        token_start: token_start - cursor_base_bits,
-        token_end: token_end - cursor_base_bits,
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -770,10 +612,27 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 
 pub(crate) struct ModularSideImageRecording {
     pub(super) encoder: wgpu::CommandEncoder,
+    completion_encoder: Option<wgpu::CommandEncoder>,
+    defer_completion: bool,
     job: ModularSideImageJob,
 }
 
 impl ModularSideImageRecording {
+    /// Appends work that consumes only the completed and inverse-transformed image.
+    pub(super) fn completion_encoder(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> &mut wgpu::CommandEncoder {
+        if self.defer_completion {
+            self.completion_encoder.get_or_insert_with(|| {
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("jxl-wgpu Modular side-image finalization"),
+                })
+            })
+        } else {
+            &mut self.encoder
+        }
+    }
     pub(super) fn arena(&self) -> &wgpu::Buffer {
         &self.job.arena
     }
@@ -790,6 +649,10 @@ impl ModularSideImageRecording {
         Ok(())
     }
     pub(crate) fn finish(mut self) -> ModularSideImageJob {
+        self.job.finalization_commands = self.completion_encoder.take().map(|mut encoder| {
+            self.job.encode_status_copy(&mut encoder);
+            encoder.finish()
+        });
         self.encoder.copy_buffer_to_buffer(
             &self.job.status,
             0,

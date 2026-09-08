@@ -151,10 +151,9 @@ impl VarDctSubmissionEngine {
 
     /// Caps reusable VarDCT entropy uploads.
     ///
-    /// Combined/global-tree packets, staged local-tree LF/HF packets, and AC pass groups enforce
-    /// this caller upper bound. Device limits and the shared per-frame byte budget may resolve a
-    /// smaller four-byte-aligned cap. Recursive entropy streams will adopt the same policy with
-    /// their resume state.
+    /// Combined/global-tree packets, staged local-tree LF/HF packets, AC pass groups, and Modular
+    /// side images (including raw dequantization matrices) enforce this caller upper bound.
+    /// Device limits and the shared byte budget may resolve a smaller four-byte-aligned cap.
     #[must_use]
     pub fn with_stream_window_limit(mut self, limit: NonZeroU64) -> Self {
         self.stream_window_limit = Some(limit);

@@ -100,19 +100,21 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
         if name == "transformed" {
             assert!(!plan.inverse_plan.jobs().is_empty());
         }
-        let mut codestream = parsed.codestream().to_vec();
-        codestream.resize(codestream.len().next_multiple_of(4), 0);
-        let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("VarDCT extra substream codestream"),
-            contents: &codestream,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let bytes = pipeline.memory_bytes(&plan, end).unwrap();
+        let source = crate::GpuCodestream::from_shared(
+            parsed.codestream().into(),
+            0..parsed.codestream().len(),
+            false,
+        )
+        .unwrap();
+        let stream = pipeline.plan_source(&source, &plan, end, u64::MAX).unwrap();
+        let bytes = stream.memory_bytes;
         let permit = backend
             .transient_memory_budget()
             .try_reserve(bytes)
             .unwrap();
-        let mut recording = pipeline.record(&backend, &input, &plan, end).unwrap();
+        let mut recording = pipeline
+            .record_source(&backend, &source, &plan, &stream)
+            .unwrap();
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VarDCT extra substream oracle readback"),
             size: plan.inverse_plan.arena_bytes(),
@@ -225,12 +227,6 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
         drop(job);
         drop(permit);
         let cap = if name == "transformed" { 1024 } else { 40 };
-        let source = crate::GpuCodestream::from_shared(
-            parsed.codestream().into(),
-            0..parsed.codestream().len(),
-            false,
-        )
-        .unwrap();
         let stream = pipeline.plan_source(&source, &plan, end, cap).unwrap();
         assert!(stream.stream_bytes <= cap);
         assert!(stream.segments.len() > 1);
@@ -286,7 +282,7 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
                 bounded_status.expected_cursor, status.expected_cursor,
                 "{name}"
             );
-            if let Some(inverse) = job.take_inverse_commands() {
+            if let Some(inverse) = job.take_finalization_commands() {
                 commands = inverse;
             } else {
                 break;
@@ -334,18 +330,6 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
             0
         );
     }
-}
-
-#[test]
-fn side_image_stream_window_is_word_aligned_and_cursor_rebased() {
-    let window = stream_window_geometry(35, 100).unwrap();
-    assert_eq!(window.source_offset, 4);
-    assert_eq!(window.bytes, 12);
-    assert_eq!(window.cursor_base_bits, 32);
-    assert_eq!(window.token_start, 3);
-    assert_eq!(window.token_end, 68);
-    assert!(stream_window_geometry(100, 100).is_err());
-    assert!(stream_window_geometry(101, 100).is_err());
 }
 
 #[test]

@@ -471,22 +471,30 @@ are discovered only after the preceding GPU entropy cursor is mapped. The reserv
 packed MA/channel metadata, the transformed/inverse arena plus entropy state and LZ/predictor
 scratch, dummy output, decode status and its staging copy, the 256-byte entropy parameters,
 16-byte dispatch control, 64-byte overlay uniform, and every Palette/RCT/Squeeze inverse uniform.
-It is acquired before allocation and remains attached to the pending stage until status validation
-and matrix overlay complete. The large frame-resident resource table is already covered by
-`VarDctDecodeMemoryStats` and is not charged again. The decode binding is a four-byte-aligned GPU
-copy of only the current HF-global packet
-range; its bytes are included in the same permit, and mapped cursors are rebased to absolute
-codestream bits before parsing resumes.
+It is acquired before allocation and remains attached to the pending stage and its map callback
+until status validation and matrix overlay complete. The callback also retains the frame lifetime,
+so cancellation cannot release either reservation while a submission still uses the resource table.
+The large frame-resident resource table is already covered by
+`VarDctDecodeMemoryStats` and is not charged again. The decode binding is one reusable four-byte-
+aligned upload copied directly from shared codestream spans. Lazy window geometry carries 16-byte
+overlap and a four-byte sentinel; its bytes are included in the same permit. The caller/device cap
+can shrink against currently available budget to the 40-byte minimum. An unaffordable minimum
+returns typed `MemoryBackpressure` before recording that image. Mapped cursors are rebased to
+absolute codestream bits and checked against the current window; a valid terminal sample count and
+ANS state stop before the enclosing HF-global upper bound. The frame's existing whole-codestream
+GPU buffer remains separately accounted for other consumers.
 
 The common `ModularSideImagePlan` separates image geometry, transformed meta-channel count,
 MA/channel descriptors, original plane views, inverse jobs and entropy bounds from the raw-matrix
-denominator and targets. `wgpu_engine::side_image::modular` records entropy plus inverse jobs into
-one encoder and leaves the resident arena and sticky status available for a subsequent consumer.
-Finishing recording copies the final status and owns the command buffer. The raw-matrix wrapper
-adds its overlay to that encoder and retains/charges exactly its 64-byte uniform; existing stage
-admission and callback lifetimes are preserved. The common arena also permits GPU copies for
+denominator and targets. `wgpu_engine::side_image::modular` records entropy into an initial encoder
+and retains inverse jobs and downstream consumers in a completion encoder when input is windowed.
+The raw wrapper appends overlay to that completion encoder even when there are no inverse jobs.
+Each entropy window maps a 16-byte status. Only validated completion submits inverse/overlay work
+and its status copy; whole input keeps them in the initial submission. The wrapper retains and
+charges exactly its 64-byte uniform. The common arena also permits GPU copies for
 downstream plane delivery. Its contents stay integer words, without sample normalization or color
-conversion. The shared entropy/status and raw-matrix ABIs, workgroup memory and matrix submission counts remain unchanged.
+conversion. The 256-byte entropy, 16-byte status and 64-byte overlay ABIs and workgroup memory stay
+unchanged. Submission accounting includes every raw window and any deferred finalization.
 
 The global VarDCT extra-channel stage uses the common executor directly from encoded host spans,
 copying consumed windows into one reusable GPU stream buffer with 16-byte overlap on each side
@@ -574,9 +582,11 @@ per pass group, status, parameters, and sink uniforms are included in the initia
 late buffers use the same budget and all producer lifetimes remain retained. Parametric custom
 matrix modes overwrite the already-accounted resource-table matrix region and add no GPU
 allocation. Sectioned raw matrices add only their exact temporary reservation above; local-tree
-packets validate every LF and bounded HF-local metadata stage before entering it. Local-tree raw
-conformance, Global/LF/HF image streams, and intermediate presentation still require broader
-scheduling.
+packets validate every LF and bounded HF-local metadata stage before entering it. Raw matrices with
+their own local MA tree and local LF/HF packet trees have whole/windowed coverage. Final validation
+records the HF-metadata stop selected when those packet commands are built, including late raw
+continuations. Larger/transformed raw images, the remaining Global/LF/HF streams, and intermediate
+presentation still require broader scheduling.
 
 ## Shader write bounds fixed by this audit
 

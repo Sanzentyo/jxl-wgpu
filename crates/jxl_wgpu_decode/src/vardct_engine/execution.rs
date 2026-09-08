@@ -29,10 +29,6 @@ use crate::vardct_pass_group::{
     HfCoefficientGroupExecutionPlan,
 };
 use crate::vardct_resource::VarDctResourceBuffers;
-use crate::wgpu_engine::{
-    RawHfDequantSideImageJob, RawHfDequantSideImageStatus, raw_matrix_status_ok,
-    raw_matrix_value_error,
-};
 use crate::{
     Error as DecodeError, FrameDuration, FrameMetadata, GpuCodestream, GpuPendingFrame,
     GpuSubmissionSession, Result as DecodeResult, SubmittedGpuFrame,
@@ -50,7 +46,9 @@ use super::window_plan::{
 };
 
 mod extra;
+mod raw_matrix;
 use extra::{ExtraLifetime, ExtraWork, HfValidation, map_extra_error};
+use raw_matrix::{RawMatrixLifetime, RawMatrixWork};
 
 /// One-frame submission state for [`crate::VarDctSubmissionEngine`].
 pub struct FrameDecodeSession {
@@ -315,10 +313,8 @@ enum VarDctPendingContinuation {
         commands: DeferredHfGlobalCommands,
     },
     RawHfDequant {
-        source: Box<VarDctSource>,
-        commands: DeferredHfGlobalCommands,
-        job: Box<RawHfDequantSideImageJob>,
-        permit: MemoryPermit,
+        work: Box<RawMatrixWork>,
+        lifetime: Arc<RawMatrixLifetime>,
     },
 }
 
@@ -630,7 +626,7 @@ pub struct FramePendingFrame {
     expected_groups: Vec<VarDctGroupValidation>,
     expected_hf: Vec<HfValidation>,
     extra_output_commands: Option<wgpu::CommandBuffer>,
-    deferred_hf_global: bool,
+    hf_metadata_stop: bool,
     progressive_dc_extent: Extent2d,
     progressive_dc_stride: u32,
 }
@@ -648,10 +644,8 @@ enum VarDctPendingStage {
     },
     RawHfDequant {
         completion: Arc<MapCompletion>,
-        source: Box<VarDctSource>,
-        commands: Option<DeferredHfGlobalCommands>,
-        job: Option<Box<RawHfDequantSideImageJob>>,
-        permit: Option<MemoryPermit>,
+        work: Box<RawMatrixWork>,
+        lifetime: Arc<RawMatrixLifetime>,
     },
     AcExtra {
         completion: Arc<MapCompletion>,
@@ -767,20 +761,9 @@ impl FramePendingFrame {
             } => commands
                 .take()
                 .map(|commands| VarDctPendingContinuation::HfGlobal { source, commands }),
-            VarDctPendingStage::RawHfDequant {
-                source,
-                mut commands,
-                mut job,
-                mut permit,
-                ..
-            } => commands.take().zip(job.take()).zip(permit.take()).map(
-                |((commands, job), permit)| VarDctPendingContinuation::RawHfDequant {
-                    source,
-                    commands,
-                    job,
-                    permit,
-                },
-            ),
+            VarDctPendingStage::RawHfDequant { work, lifetime, .. } => {
+                Some(VarDctPendingContinuation::RawHfDequant { work, lifetime })
+            }
             VarDctPendingStage::AcExtra { source, .. } => {
                 Some(VarDctPendingContinuation::AcExtra { source })
             }
@@ -804,13 +787,8 @@ impl FramePendingFrame {
                 self.submit_hf_global_stage(mapping, source, commands)?;
                 Ok(true)
             }
-            Some(VarDctPendingContinuation::RawHfDequant {
-                source,
-                commands,
-                job,
-                permit,
-            }) => {
-                self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)?;
+            Some(VarDctPendingContinuation::RawHfDequant { work, lifetime }) => {
+                self.finish_raw_hf_dequant_stage(mapping, work, lifetime)?;
                 Ok(true)
             }
             Some(VarDctPendingContinuation::AcExtra { source }) => {
@@ -1035,6 +1013,9 @@ impl FramePendingFrame {
             .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
 
         let deferred_hf_global = matches!(&post_lf, PostLfCommands::DeferredHfGlobal(_));
+        // Local packet trees can discover a raw matrix after LF preparation. Final validation
+        // must match the entry point actually submitted, including its HF-metadata stop status.
+        self.hf_metadata_stop = deferred_hf_global;
 
         let windowed_batches = if let Some(plan) = &hf_packet_windows {
             let stream = lifetime._packet_stream_window.as_ref().ok_or(
@@ -1280,149 +1261,6 @@ impl FramePendingFrame {
             self.after_coefficients_stage(completion, source)
         };
         Ok(())
-    }
-
-    fn start_raw_hf_dequant_stage(
-        &mut self,
-        source: Box<VarDctSource>,
-        mut commands: DeferredHfGlobalCommands,
-        poll_permit: Option<SubmissionPollPermit>,
-    ) -> Result<(), VarDctDecodeError> {
-        let lifetime = self
-            .lifetime
-            .as_ref()
-            .ok_or(VarDctDecodeError::CompletionConsumed)?;
-        let plan = source
-            .packet
-            .pending_raw_hf_dequant_side_image()
-            .cloned()
-            .ok_or(VarDctDecodeError::EngineContract {
-                detail: "raw HF dequant stage has no pending side image",
-            })?;
-        let packet_end = source.packet.pending_raw_hf_dequant_packet_end().ok_or(
-            VarDctDecodeError::EngineContract {
-                detail: "raw HF dequant stage has no bounded packet end",
-            },
-        )?;
-        let memory_bytes = self
-            .pipelines
-            .raw_hf_dequant
-            .memory_bytes(&plan, packet_end)
-            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
-                matrix: plan.matrix_index,
-                source: Box::new(source),
-            })?;
-        let permit = self.memory.try_reserve(memory_bytes)?;
-        let mut job = self
-            .pipelines
-            .raw_hf_dequant
-            .prepare(
-                &self.backend,
-                &lifetime._codestream,
-                &lifetime._resources,
-                source.resource_layout,
-                &plan,
-                packet_end,
-            )
-            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
-                matrix: plan.matrix_index,
-                source: Box::new(source),
-            })?;
-        if job.memory_bytes() != memory_bytes {
-            return Err(VarDctDecodeError::EngineContract {
-                detail: "raw HF dequant allocation disagrees with its byte admission",
-            });
-        }
-        let poll_permit = match poll_permit {
-            Some(permit) => permit,
-            None => self
-                .backend
-                .submission_poller()
-                .try_reserve()
-                .map_err(VarDctDecodeError::PollBackpressure)?,
-        };
-        let mut submission_commands = Vec::with_capacity(2);
-        if let Some(before_coefficients) = commands.before_coefficients.take() {
-            submission_commands.push(before_coefficients);
-        }
-        submission_commands.push(job.take_commands().map_err(|source| {
-            VarDctDecodeError::RawHfDequantGpu {
-                matrix: plan.matrix_index,
-                source: Box::new(source),
-            }
-        })?);
-        let submission = self.backend.queue().submit(submission_commands);
-        let completion = Arc::new(MapCompletion::default());
-        arm_raw_hf_dequant_status_map(&job, &completion);
-        let poll_completion = Arc::clone(&completion);
-        if let Err(error) = poll_permit.register(submission, move |error| {
-            poll_completion.complete(Err(error));
-        }) {
-            completion.complete(Err(format!(
-                "raw HF dequant GPU poll registration failed: {error}"
-            )));
-        }
-        let submissions = self
-            .runtime_stats
-            .submissions_per_frame
-            .load(Ordering::Acquire)
-            .checked_add(1)
-            .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                field: "raw HF dequant submission count",
-            })?;
-        self.runtime_stats
-            .submissions_per_frame
-            .store(submissions, Ordering::Release);
-        self.stage = VarDctPendingStage::RawHfDequant {
-            completion,
-            source,
-            commands: Some(commands),
-            job: Some(Box::new(job)),
-            permit: Some(permit),
-        };
-        Ok(())
-    }
-
-    fn finish_raw_hf_dequant_stage(
-        &mut self,
-        mapping: Result<(), String>,
-        mut source: Box<VarDctSource>,
-        commands: DeferredHfGlobalCommands,
-        job: Box<RawHfDequantSideImageJob>,
-        permit: MemoryPermit,
-    ) -> DecodeResult<()> {
-        mapping.map_err(DecodeError::backend)?;
-        let plan = source
-            .packet
-            .pending_raw_hf_dequant_side_image()
-            .cloned()
-            .ok_or(VarDctDecodeError::EngineContract {
-                detail: "completed raw HF dequant stage has no parser continuation",
-            })?;
-        let packet_end = source.packet.pending_raw_hf_dequant_packet_end().ok_or(
-            VarDctDecodeError::EngineContract {
-                detail: "completed raw HF dequant stage has no bounded packet end",
-            },
-        )?;
-        let status = job
-            .finish_status()
-            .map_err(|source| VarDctDecodeError::RawHfDequantGpu {
-                matrix: plan.matrix_index,
-                source: Box::new(source),
-            })?;
-        validate_raw_hf_dequant_status(&plan, packet_end, status)?;
-        drop(job);
-        drop(permit);
-        source
-            .packet
-            .resume_hf_global_after_raw_side_image_source(&source.codestream, status.cursor)
-            .map_err(VarDctDecodeError::from)?;
-        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
-            self.start_raw_hf_dequant_stage(source, commands, None)?;
-            Ok(())
-        } else {
-            self.submit_deferred_hf_coefficients(source, commands)
-        }
     }
 
     fn submit_hf_global_stage(
@@ -1965,7 +1803,7 @@ impl FramePendingFrame {
                 expected_quant_lf: expected.expected_quant_lf,
                 expected_extra_precision: expected.expected_extra_precision,
             };
-            let first_blocks = if self.deferred_hf_global {
+            let first_blocks = if self.hf_metadata_stop {
                 packet_status
                     .validate_hf_metadata_stage(validation)
                     .map_err(VarDctDecodeError::from)?;
@@ -3718,7 +3556,7 @@ fn submit_vardct(
         expected_groups,
         expected_hf,
         extra_output_commands,
-        deferred_hf_global: staged_hf_global,
+        hf_metadata_stop: staged_hf_global,
         progressive_dc_extent,
         progressive_dc_stride: padded_width,
     };
@@ -3878,44 +3716,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn validate_raw_hf_dequant_status(
-    plan: &crate::vardct_side_image::RawHfDequantSideImagePlan,
-    packet_end: u32,
-    status: RawHfDequantSideImageStatus,
-) -> Result<(), VarDctDecodeError> {
-    if raw_matrix_value_error(status.code) {
-        return Err(VarDctDecodeError::RawHfDequantValue {
-            matrix: plan.matrix_index,
-        });
-    }
-    if !raw_matrix_status_ok(status.code)
-        || status.decoded_samples != plan.image.decoded_words
-        || status.cursor < plan.image.token_bit_offset
-        || status.cursor > packet_end
-        || status.expected_cursor != packet_end
-    {
-        return Err(VarDctDecodeError::RawHfDequantStatus {
-            matrix: plan.matrix_index,
-            code: status.code,
-            decoded_samples: status.decoded_samples,
-            expected_samples: plan.image.decoded_words,
-            cursor: status.cursor,
-            expected_cursor: status.expected_cursor,
-        });
-    }
-    Ok(())
-}
-
-fn arm_raw_hf_dequant_status_map(job: &RawHfDequantSideImageJob, completion: &Arc<MapCompletion>) {
-    job.mark_status_mapped();
-    let callback_completion = Arc::clone(completion);
-    job.status_staging()
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            callback_completion.complete(result.map_err(|error| error.to_string()));
-        });
 }
 
 fn arm_status_map(

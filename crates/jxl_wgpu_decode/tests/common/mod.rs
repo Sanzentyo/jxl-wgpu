@@ -232,6 +232,24 @@ pub fn jpeg_transcode_raw_matrix() -> &'static [u8] {
     BYTES.as_slice()
 }
 
+pub fn jpeg_transcode_raw_matrix_local() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_raw_matrix_local.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
+pub fn jpeg_transcode_raw_matrix_local_packets() -> &'static [u8] {
+    static BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
+        decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_raw_matrix_local_packets.jxl.hex"
+        ))
+    });
+    BYTES.as_slice()
+}
+
 pub fn jpeg_transcode_444() -> &'static [u8] {
     static BYTES: LazyLock<Vec<u8>> =
         LazyLock::new(|| decode_hex(include_str!("../../test-data/jpeg_transcode_444.jxl.hex")));

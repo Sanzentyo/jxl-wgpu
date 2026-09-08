@@ -3101,6 +3101,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    mod raw_matrix;
+
     #[test]
     fn distributed_extra_channels_partition_before_reading_global_entropy() {
         use crate::modular_grouping::{
@@ -3289,9 +3292,13 @@ mod tests {
     }
 
     fn jpeg_transcode_raw_matrix_fixture() -> (Vec<u8>, RawHfDequantSideImagePlan, u32) {
-        let container = decode_hex(include_str!(
+        parse_raw_matrix_fixture(include_str!(
             "../test-data/jpeg_transcode_raw_matrix.jxl.hex"
-        ));
+        ))
+    }
+
+    fn parse_raw_matrix_fixture(hex: &str) -> (Vec<u8>, RawHfDequantSideImagePlan, u32) {
+        let container = decode_hex(hex);
         let parsed = jxl_gpu_bitstream::parse(&container, Default::default()).unwrap();
         let codestream = parsed.codestream().to_vec();
         let inventory = parsed.codestream_inventory(Default::default()).unwrap();
@@ -3601,14 +3608,12 @@ mod tests {
         let (codestream, plan, packet_end) = jpeg_transcode_raw_matrix_fixture();
         let layout = VarDctResourceLayout::new(1, 1, 1).unwrap();
         let initial_resources = layout.initial_values().unwrap();
-        let codestream_buffer =
-            backend
-                .device()
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("raw HF matrix test codestream"),
-                    contents: &codestream,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                });
+        let source = crate::GpuCodestream::from_shared(
+            codestream.clone().into(),
+            0..codestream.len(),
+            false,
+        )
+        .unwrap();
         let resources = backend
             .device()
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3623,16 +3628,13 @@ mod tests {
             mapped_at_creation: false,
         });
         let pipeline = RawHfDequantSideImagePipeline::new(&backend, KernelVariant::Lanes64);
-        let mut job = pipeline
-            .prepare(
-                &backend,
-                &codestream_buffer,
-                &resources,
-                layout,
-                &plan,
-                packet_end,
-            )
+        let stream = pipeline
+            .plan_source(&source, &plan, packet_end, u64::MAX)
             .unwrap();
+        let mut job = pipeline
+            .prepare(&backend, &source, &resources, layout, &plan, &stream)
+            .unwrap();
+        assert_eq!(job.memory_bytes(), stream.memory_bytes);
         let mut copy = backend
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

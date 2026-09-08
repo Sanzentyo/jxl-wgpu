@@ -447,7 +447,7 @@ impl VarDctPendingFrame {
                     .record_next_window(&self.backend, &source.codestream, segment)?;
             source.next_window += 1;
             Some((commands, poll))
-        } else if lifetime.job.has_inverse_commands() {
+        } else if lifetime.job.has_finalization_commands() {
             let poll = self
                 .backend
                 .submission_poller()
@@ -455,7 +455,7 @@ impl VarDctPendingFrame {
                 .map_err(Error::PollBackpressure)?;
             lifetime
                 .job
-                .take_inverse_commands()
+                .take_finalization_commands()
                 .map(|commands| (commands, poll))
         } else {
             None

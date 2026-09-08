@@ -38,6 +38,8 @@ mod color_output;
 mod common;
 #[path = "vardct_engine_gpu/extra_channels.rs"]
 mod extra_channels;
+#[path = "vardct_engine_gpu/raw_matrix.rs"]
+mod raw_matrix;
 
 static DJXL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
