@@ -372,25 +372,37 @@ it does not reconstruct pixels or entropy on the CPU.
 `WgpuDecodeEngine` executes full-canvas Replace sequences using Modular, VarDCT, or a mixture of
 JPEG-transcode VarDCT and non-XYB Modular. Recursive progressive-DC chains may precede each
 presentation. A Replace presentation completely supersedes earlier zero-duration Replace layers,
-so only its producer and LF dependency closure need image decoding. Headers, TOCs, section bounds,
-and reference versions are still inventoried for every physical frame; discarded entropy is not
-advertised as validated. Layered stills and a final zero-duration animation frame are covered.
+but every color/extra producer and its recursive LF dependency closure still decode and validate.
+Each overwritten output is released before the next physical producer is admitted. Only the final
+producer's output is presented, retaining exact native integer codes without an F32 intermediate.
+Layered stills and a final zero-duration animation frame are covered.
 
 `DecodeProfile::FrameSequence` reports physical/presentation counts. `FrameSequenceSession` exposes
-the execution plan and prepares only one upcoming presentation's entropy/scratch descriptors.
-Blocking, polling, and futures wrap the same producer pending handle. Prefetch preserves ordering,
-byte-budget pressure leaves the next producer available for retry, and progressive-DC root admission
+the execution plan. Each independently pending presentation prepares one color producer and its
+LF closure at a time; immutable inventory/source spans are shared across the bounded prefetch window.
+Blocking, polling, and futures advance the same validated physical stages. Prefetch preserves ordering,
+initial byte-budget pressure leaves the next producer available for retry, and progressive-DC root admission
 no longer consumes the dependency chain on failure. Source spans remain under the shared input
 budget until their last dependent submission; cancellation and output clones retain the existing
-callback/lease ownership contract. Late VarDCT submission counts remain observable through the
-underlying shared counter. Later frame-specific syntax/output errors surface when that presentation
-is prepared. Composition sequences use the physical execution path described below.
+callback/lease ownership contract. Submission counts accumulate every physical producer, including
+late VarDCT continuations. Frame-specific syntax/output errors surface when that producer is prepared;
+a failure after the presentation starts is terminal. Unvalidated handoff reports
+`UnvalidatedOutputNotSubmitted` until the final producer has been submitted, so overwritten outputs
+cannot escape through the presentation API. Composition uses the physical execution path below.
 
 Nine positive libjxl fixtures cover 8/12/16-bit Gray/RGB/RGBA, mixed coding modes, all relevant timing
 fields, 17 physical frames, six orientations, a transposed one-pixel axis, and recursive
 DC2. Actual GPU output is exact for Modular and within one RGB8 code for VarDCT against both Rust
 `jxl` and `djxl`, with byte-identical whole and 4 KiB-window/137-byte-fragment async output. The two
 formerly rejected crop/Add fixtures now execute and match both decoders.
+
+Additional tests shorten only an overwritten entropy section while rebuilding the TOC and
+preserving the complete frame plan. Hidden Modular, VarDCT AC, root LF and intermediate LF failures
+poison the session before its first presentation through both blocking and fragmented async input.
+Reassembled Gray31 stills with 2, 17 and 129 layers preserve checked-in independent integer words
+under a GPU budget restricted to the first producer's footprint. Their submission totals include
+every layer. Cancelling before validation or after advancing several hidden layers releases all
+input/GPU reservations after callbacks retire.
 
 Sequences containing crops, blends, or reference-only frames decode every physical color producer
 and its LF dependency closure, including hidden zero-duration layers. The working surface is

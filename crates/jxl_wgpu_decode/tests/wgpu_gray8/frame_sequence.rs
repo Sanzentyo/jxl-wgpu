@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "frame_sequence/composition.rs"]
 mod composition;
+#[path = "frame_sequence/independent.rs"]
+mod independent;
 #[path = "frame_sequence/reference.rs"]
 mod reference;
 

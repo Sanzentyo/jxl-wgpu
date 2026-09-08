@@ -186,8 +186,7 @@ impl CompositionSession {
         };
         // Initial metadata and output negotiation is performed at open, like the still engines.
         // Subsequent physical producers are prepared one at a time while their pending frame runs.
-        let first = next_producer(
-            &source,
+        let first = source.next_producer(
             plan.presentations[0].physical_frames.start,
             plan.presentations[0].physical_frames.end,
         )?;
@@ -228,8 +227,7 @@ impl CompositionSession {
             .carry
             .as_mut()
             .ok_or(Error::EngineContract("composition source was lost"))?;
-        let physical = next_producer(
-            &carry.source,
+        let physical = carry.source.next_producer(
             presentation.physical_frames.start,
             presentation.physical_frames.end,
         )?;
@@ -324,12 +322,6 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
     Ok(())
 }
 
-fn next_producer(source: &SequenceSource, start: usize, end: usize) -> Result<usize> {
-    (start..end)
-        .find(|&i| source.inventory.frames[i].frame_type != FrameType::LowFrequency)
-        .ok_or(Error::EngineContract("presentation has no color producer"))
-}
-
 #[derive(Debug)]
 enum Stage {
     Decode(Box<WgpuDecodePendingFrame>, Arc<AtomicUsize>),
@@ -411,7 +403,7 @@ impl CompositionPending {
             self.stage = Some(Stage::Pack(self.compositor.pack(&surface)?));
             self.submissions.fetch_add(1, Ordering::AcqRel);
         } else {
-            self.physical = next_producer(&carry.source, self.physical + 1, self.end)?;
+            self.physical = carry.source.next_producer(self.physical + 1, self.end)?;
             let mut prepared = carry.source.prepare_physical(self.physical)?.session;
             let pending = prepared
                 .submit_next()?

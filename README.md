@@ -261,6 +261,11 @@ blend modes against four resident post-transform reference slots. Intermediate p
 presentation, arbitrary ICC
 transforms, patches, splines, and noise still require production integration and conformance.
 
+Independent Replace presentations validate each overwritten color/extra layer and its recursive
+LF dependencies before returning the final producer's native output. Truncated hidden Modular,
+VarDCT, and DC data are rejected through blocking and async completion. A 129-layer Gray31 still
+preserves exact integer codes while reusing the first layer's GPU memory footprint.
+
 [`docs/FULL_JPEG_XL_ROADMAP.md`](docs/FULL_JPEG_XL_ROADMAP.md) is the canonical capability table,
 full-format implementation backlog, dependency order, and acceptance contract. Capability-changing
 commits must update it together with this summary and the affected crate documentation.
@@ -291,9 +296,10 @@ The animation session contracts expose frame timing and loop metadata through bo
 runtime-neutral `Future`/poll APIs. Prefetch submits multiple frames without a host wait; the
 ordered pending queue then completes its front through a native wait or a task waker, without
 depending on Tokio, async-std, or a particular reactor. The stock mode-neutral engine supports
-independent full-canvas Replace animations and layered stills. It prepares only the next presentation,
-retains source spans until the last source-dependent submission, and preserves pending/output leases
-through cancellation. Cropped or blended canvases and reference-only frames remain typed errors.
+independent full-canvas Replace animations and layered stills. Within each presentation it prepares,
+validates, and releases overwritten layers one at a time, retaining source spans for the remaining
+work and preserving pending/output leases through cancellation. Cropped or blended canvases and
+reference-only frames use the shared GPU compositor.
 
 ## Build and validate
 

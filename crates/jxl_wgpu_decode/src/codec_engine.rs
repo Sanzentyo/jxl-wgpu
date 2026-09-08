@@ -433,11 +433,11 @@ fn project_frame_inventory(
 ) -> Result<CodestreamInventory> {
     let frame = inventory
         .frames
-        .iter()
-        .find(|frame| frame.frame_index == frame_index)
+        .get(frame_index as usize)
+        .filter(|frame| frame.frame_index == frame_index)
         .cloned()
         .ok_or(Error::EngineContract(
-            "progressive-DC plan references a missing physical frame",
+            "frame execution plan references a missing physical frame",
         ))?;
     Ok(CodestreamInventory {
         codestream_bytes: inventory.codestream_bytes,

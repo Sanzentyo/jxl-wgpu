@@ -1,14 +1,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{CodestreamInventory, FrameEncoding};
+use jxl_gpu_bitstream::{CodestreamInventory, FrameEncoding, FrameType};
 use jxl_wgpu::{GpuImageFrame, UnvalidatedGpuImageFrame};
 
 use crate::{
-    DecodeProfile, Error, FrameExecutionPlan, FrameMetadata, GpuCodestream, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame,
+    DecodeProfile, Error, FrameExecutionPlan, GpuCodestream, GpuOutputRequest, GpuPendingFrame,
+    PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
 use super::composition::{CompositionPending, CompositionSession};
@@ -17,6 +17,9 @@ use super::{
     map_modular, map_vardct, project_frame_inventory, validate_codestream_limit,
 };
 use crate::GpuSubmissionEngine;
+
+mod independent;
+use independent::{IndependentPending, IndependentSession};
 
 impl WgpuDecodeEngine {
     pub(super) fn open_sequence(
@@ -27,37 +30,28 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        if super::composition::needs_surface(inventory, request, &plan) {
-            let composition =
-                CompositionSession::new(self.clone(), codestream, inventory, request, &plan)?;
-            return Ok(PreparedGpuSession::new(
-                DecodeProfile::FrameSequence {
-                    physical_frames: plan.nodes.len(),
-                    presentation_frames: plan.presentations.len(),
-                },
-                plan.metadata.clone(),
-                WgpuDecodeSubmissionSession::Sequence(Box::new(FrameSequenceSession {
-                    source: None,
-                    current: None,
-                    next_index: 0,
-                    plan,
-                    last_submissions: Arc::new(AtomicUsize::new(0)),
-                    composition: Some(composition),
-                })),
+        let (execution, slots) = if super::composition::needs_surface(inventory, request, &plan) {
+            (
+                SequenceExecution::Composed(CompositionSession::new(
+                    self.clone(),
+                    codestream,
+                    inventory,
+                    request,
+                    &plan,
+                )?),
+                request.max_frame_slots(),
             )
-            .with_resolved_frame_slots(request.max_frame_slots()));
-        }
-        let source = SequenceSource {
-            engine: self.clone(),
-            codestream,
-            inventory: inventory.clone(),
-            request: request.clone(),
-            surface_encodings: None,
+        } else {
+            let source = Arc::new(SequenceSource {
+                engine: self.clone(),
+                codestream,
+                inventory: inventory.clone(),
+                request: request.clone(),
+                surface_encodings: None,
+            });
+            let (session, slots) = IndependentSession::new(source, &plan)?;
+            (SequenceExecution::Independent(session), slots)
         };
-        let prepared = source.prepare(&plan, 0)?;
-        let slots = prepared
-            .resolved_frame_slots()
-            .unwrap_or(request.max_frame_slots());
         Ok(PreparedGpuSession::new(
             DecodeProfile::FrameSequence {
                 physical_frames: plan.nodes.len(),
@@ -65,12 +59,9 @@ impl WgpuDecodeEngine {
             },
             plan.metadata.clone(),
             WgpuDecodeSubmissionSession::Sequence(Box::new(FrameSequenceSession {
-                source: Some(source),
-                current: Some(prepared.session),
+                execution,
                 next_index: 0,
                 plan,
-                last_submissions: Arc::new(AtomicUsize::new(0)),
-                composition: None,
             })),
         )
         .with_resolved_frame_slots(slots))
@@ -87,23 +78,12 @@ pub(super) struct SequenceSource {
 }
 
 impl SequenceSource {
-    fn prepare(
-        &self,
-        plan: &FrameExecutionPlan,
-        index: usize,
-    ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
-        // Prepare only one upcoming presentation. Entropy descriptors and scratch plans must not
-        // grow with the animation length. Full-canvas Replace removes overwritten zero-duration
-        // layers; only the visible producer and its LF dependency closure need image decoding.
-        let frame_index =
-            self.inventory.frames[plan.presentations[index].physical_frames.end - 1].frame_index;
-        let prepared = self.prepare_physical(frame_index as usize)?;
-        if prepared.metadata.extent != plan.metadata.extent {
-            return Err(Error::EngineContract(
-                "frame producer disagrees with the presentation extent",
-            ));
-        }
-        Ok(prepared)
+    /// Color producers execute their recursive LF dependency closure. Both output paths must
+    /// visit every color layer, even when a later full-canvas Replace overwrites its pixels.
+    pub(super) fn next_producer(&self, start: usize, end: usize) -> Result<usize> {
+        (start..end)
+            .find(|&i| self.inventory.frames[i].frame_type != FrameType::LowFrequency)
+            .ok_or(Error::EngineContract("presentation has no color producer"))
     }
 
     pub(super) fn prepare_physical(
@@ -148,12 +128,15 @@ impl SequenceSource {
 /// leases, so independently pending presentations remain accounted by the shared byte budget.
 #[derive(Debug)]
 pub struct FrameSequenceSession {
-    source: Option<SequenceSource>,
-    current: Option<WgpuDecodeSubmissionSession>,
+    execution: SequenceExecution,
     next_index: usize,
     plan: FrameExecutionPlan,
-    last_submissions: Arc<AtomicUsize>,
-    composition: Option<CompositionSession>,
+}
+
+#[derive(Debug)]
+enum SequenceExecution {
+    Independent(IndependentSession),
+    Composed(CompositionSession),
 }
 
 impl FrameSequenceSession {
@@ -163,60 +146,27 @@ impl FrameSequenceSession {
     }
 
     pub(super) fn submissions_per_frame(&self) -> usize {
-        if let Some(composition) = &self.composition {
-            return composition.submissions();
+        match &self.execution {
+            SequenceExecution::Independent(session) => session.submissions(),
+            SequenceExecution::Composed(session) => session.submissions(),
         }
-        self.current.as_ref().map_or_else(
-            || self.last_submissions.load(Ordering::Acquire),
-            |frame| frame.submissions_per_frame(),
-        )
     }
 
     pub(super) fn submit_next(&mut self) -> Result<Option<WgpuDecodePendingFrame>> {
         if self.next_index == self.plan.presentations.len() {
             return Ok(None);
         }
-        if let Some(composition) = &mut self.composition {
-            let pending = composition.submit(&self.plan, self.next_index)?;
-            self.next_index += 1;
-            return Ok(Some(WgpuDecodePendingFrame::Sequence(Box::new(
-                FrameSequencePending {
-                    inner: SequencePending::Composed(Box::new(pending)),
-                },
-            ))));
-        }
-        if self.current.is_none() {
-            self.current = Some(
-                self.source
-                    .as_ref()
-                    .ok_or(Error::EngineContract("frame sequence lost its source"))?
-                    .prepare(&self.plan, self.next_index)?
-                    .session,
-            );
-        }
-        let frame = self
-            .current
-            .as_mut()
-            .expect("the next producer was prepared");
-        // Keep the producer and metadata at the queue front until admission succeeds. Retrying
-        // frame-slot or shared-byte pressure must not consume or reorder a presentation.
-        let pending = frame.submit_next()?.ok_or(Error::EngineContract(
-            "frame graph producer returned no frame",
-        ))?;
-        self.last_submissions = submission_counter(&pending, frame.submissions_per_frame());
-        let metadata = self.plan.presentations[self.next_index].metadata.clone();
+        let inner = match &mut self.execution {
+            SequenceExecution::Independent(session) => {
+                SequencePending::Independent(Box::new(session.submit(&self.plan, self.next_index)?))
+            }
+            SequenceExecution::Composed(session) => {
+                SequencePending::Composed(Box::new(session.submit(&self.plan, self.next_index)?))
+            }
+        };
         self.next_index += 1;
-        self.current = None;
-        if self.next_index == self.plan.presentations.len() {
-            self.source = None;
-        }
         Ok(Some(WgpuDecodePendingFrame::Sequence(Box::new(
-            FrameSequencePending {
-                inner: SequencePending::Independent {
-                    pending: Box::new(pending),
-                    metadata,
-                },
-            },
+            FrameSequencePending { inner },
         ))))
     }
 }
@@ -242,17 +192,14 @@ pub struct FrameSequencePending {
 
 #[derive(Debug)]
 enum SequencePending {
-    Independent {
-        pending: Box<WgpuDecodePendingFrame>,
-        metadata: FrameMetadata,
-    },
+    Independent(Box<IndependentPending>),
     Composed(Box<CompositionPending>),
 }
 
 impl FrameSequencePending {
     pub(super) fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
         match &self.inner {
-            SequencePending::Independent { pending, .. } => pending.unvalidated_gpu_frame(),
+            SequencePending::Independent(pending) => pending.unvalidated(),
             SequencePending::Composed(pending) => pending.unvalidated(),
         }
     }
@@ -263,11 +210,7 @@ impl FrameSequencePending {
     ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
         match &mut self.inner {
             SequencePending::Composed(pending) => pending.poll(context),
-            SequencePending::Independent { pending, metadata } => Pin::new(pending.as_mut())
-                .poll_complete(context)
-                .map(|result| {
-                    result.map(|frame| SubmittedGpuFrame::new(metadata.clone(), frame.output))
-                }),
+            SequencePending::Independent(pending) => pending.poll(context),
         }
     }
 }
@@ -279,9 +222,7 @@ impl GpuPendingFrame for FrameSequencePending {
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         match self.inner {
             SequencePending::Composed(pending) => pending.wait(),
-            SequencePending::Independent { pending, metadata } => pending
-                .wait()
-                .map(|frame| SubmittedGpuFrame::new(metadata, frame.output)),
+            SequencePending::Independent(pending) => pending.wait(),
         }
     }
 

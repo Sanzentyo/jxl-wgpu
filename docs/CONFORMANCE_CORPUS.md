@@ -866,6 +866,29 @@ during staged submission, and output clones surviving session drop. Native RGB p
 an explicitly matching sRGB/BT.709/full-range descriptor so both coding modes share one output
 contract; it does not accept a different transfer or relabel converted pixels.
 
+`frame_sequence/independent.rs` additionally checks discarded-layer validation. It copies the
+original physical headers, shortens the largest selected entropy section by eight bytes, and
+rebuilds canonical TOC lengths. The full `FrameExecutionPlan` remains identical. Truncating the
+first or a later hidden Modular layer, hidden VarDCT AC, or each root/intermediate/final stage of
+an overwritten DC2 color producer must yield a GPU entropy error before presentation, then a
+poisoned-session error. Whole blocking and 4 KiB-window fragmented async completion both reject
+the input, and cancellation/error retirement releases input and GPU reservations.
+
+The same test module combines the `layered_still` physical headers with the checked-in
+`integer/31-1-0-33x5-p0-r0.jxl.hex` image header and entropy. Its 2/17/129-layer stills compare native
+GPU words exactly with the independent `.u32.hex` source, including values that F32 would round.
+After the first submission, a blocker reserves all remaining GPU budget: subsequent layers must
+reuse precisely that producer's footprint. Whole and 256-byte-window fragmented async output are
+exact, and the final submission count equals the per-layer count times the number of layers.
+Cancellation before the first completion and after advancing one or seven layers releases every
+reservation once the submission callbacks retire. No additional binary fixtures are required.
+
+Validation on 2026-09-08 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+725 tests across 31 targets, with one existing manual benchmark ignored. The final sequence
+implementation also passes its 14-test integration target. Formatting, warning-free Clippy/rustdoc,
+Rust 1.89 and the six-crate WASM check pass; reference and Metal harnesses each pass 18 cases,
+and the indexed Gray8 U8 readback case passes.
+
 `rejected_crop` and `rejected_add` retain their original historical filenames. They now execute
 through GPU composition and match both Rust `jxl` and `djxl`. Dependency prefetch is checked
 explicitly, and reference-version/malformed-timecode tests continue to exercise the common plan.
