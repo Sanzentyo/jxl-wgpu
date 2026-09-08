@@ -2064,7 +2064,7 @@ pixels. Larger/transformed raw images and broader cross-feature conformance rema
 
 ## GPU noise synthesis
 
-`crates/jxl_wgpu_decode/test-data/generate_noise.c` generates 22 small streams with
+`crates/jxl_wgpu_decode/test-data/generate_noise.c` generates 30 small streams with
 libjxl 0.12.0. It uses distance 2, effort 1, disabled patches/dots/progressive DC, explicitly
 enabled noise and photon ISO 800. Source RGB8 (or single-channel gray) samples are
 `32 + ((x * (c + 2) + y * (7 - c) + frame * 11) % 192)` for channels 0 through 2.
@@ -2072,7 +2072,18 @@ The original-color corpus declares D65 sRGB and disables channel palettes except
 palette case. `examples/regenerate_noise.rs` also replaces the default LF-global correlation
 bundle in the original VarDCT fixture, rewrites section padding/TOC sizes, and generates two
 custom-correlation codestreams plus noisy/zero-model native linear F32 references. No image
-entropy is re-encoded by this Rust generator.
+entropy is re-encoded by that header rewrite. The driver also transcodes five deterministic
+257×17 JPEG inputs made with `cjpeg` quality 90 and sampling factors 1×1, 2×1, 1×2, 2×2, or gray.
+`cjxl --lossless_jpeg=1 --photon_noise_iso=800 --allow_jpeg_reconstruction=0 --gaborish=0 --epf=0`
+retains the JPEG coefficient coding and adds the model; these cases do not exercise restoration.
+
+The original-RGB fixtures declare `uses_original_profile` and disable Modular coding.
+[libjxl's image-input encoder](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/encode.cc)
+chooses `kNone` for this profile, even if the color-transform setting requests YCbCr. The actual
+JPEG fixtures exercise `do_ycbcr`; the tests assert both image/frame color flags and every sampling
+selector to distinguish the two valid domains. The production `Rgb` plane contract follows
+[libjxl's color-stage selection](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc),
+which preserves `kNone` planes. Both non-XYB domains use the normative default F32 quantization biases.
 
 | Fixture | Geometry | Coding and rendering |
 |---|---|---|
@@ -2086,8 +2097,20 @@ entropy is re-encoded by this Rust generator.
 | `noise/modular_rgb_palette.jxl.hex` | 129×17 | Original-sRGB with a lossy single-channel palette and implicit indices |
 | `noise/vardct_lf_correlation.jxl.hex` | 257×17 | Base correlation [0, 1], color factor 84, nonzero LF factors [12, −19] |
 | `noise/vardct_base_correlation.jxl.hex` | 257×17 | Custom base correlation [0.125, 0.875], color factor 84, zero LF factors |
+| `noise/vardct_rgb_{257x17,gray}.jxl.hex` | 257×17 | Original-sRGB RGB8/gray VarDCT, no filtering or resampling |
+| `noise/vardct_rgb_up{2,4,8}.jxl.hex` | 259×33 | Original-sRGB VarDCT with Gaborish, EPF2 and every upsampling factor |
+| `noise/vardct_rgb_gray16.jxl.hex` | 37×19, presented 19×37 | Original Gray16, orientation 6 |
+| `noise/vardct_rgb_float32_up4.jxl.hex` | 259×33 | Original binary32 RGB, 4× upsampling, Gaborish and EPF2 |
+| `noise/vardct_rgb_frames.jxl.hex` | 37×19, presented 19×37 | Five original RGB VarDCT frames, durations 2/0/0/3/0, orientation 8 |
+| `noise/jpeg_{444,422,440,420,gray}.jxl.hex` | 257×17 | JPEG YCbCr/gray with noise after component interpolation, no restoration or frame resampling |
 
-Regenerate all 24 codestreams and four linear references with:
+The Gray16 source uses `u8_sample * 256 + ((i * 37 + frame * 13) % 256)` at flat channel index `i`.
+The binary32 source uses `(u8_sample + ((i * 37 + frame * 13) % 256) / 256) / 255` with F32
+arithmetic. The tests assert source declarations, orientations and restoration/resampling metadata.
+Container-wrapped originals are tested intact; zero-model controls are rebuilt from logical
+codestream ranges so container headers are never mistaken for LF-global data.
+
+Regenerate all 37 codestreams and four linear references with libjxl 0.12.0, `cjxl`, and `cjpeg`:
 
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_noise -- \
@@ -2099,11 +2122,11 @@ cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
 `tests/noise.rs` parses the real signaled model and also clears exactly its ten bytes to compare
 the same entropy with a zero model. Every noisy result must differ from its zero-model result.
 Whole input and 43-byte source chunks under a 256-byte GPU window cap must produce bit-identical
-F32 RGBA output for every presentation. For 21 cases, both variants are compared against independent
+F32 RGBA output for every presentation. For 34 cases, both variants are compared against independent
 Rust jxl and optional live libjxl: maximum absolute error must stay below 0.0001 and 1/1024 respectively.
 The latter is a quarter of one RGB8 code; noise-free upsampled controls exhibit the same native
 transform-rounding scale (observed maximum 0.0002591). Noise does not justify relaxing this bound.
-The mixed stream explicitly checks seeds `[1,0], [1,1], [1,2], [2,0], [3,0]` and complete output
+Both five-frame streams explicitly check seeds `[1,0], [1,1], [1,2], [2,0], [3,0]` and complete output
 length, and every execution checks that the shared reservation is returned.
 
 The resident GPU test independently computes SplitMix64/Xorshift128Plus with native scalar u64
@@ -2115,9 +2138,14 @@ including endpoint clipping. Fused convolution/addition must match the scalar re
 limits are checked. The metadata unit test exercises every truncated length of a skewed 80-bit
 model, preserving the following packet data. Public admission tests compare zero/nonzero memory,
 force a one-byte capacity shortfall, retry and abandon submitted work. XYB 257×17 adds 52,524
-bytes for the random planes and uniform. Unfiltered original RGB and gray also need normalization
+bytes for the random planes and uniform. Unfiltered original Modular RGB and gray also need normalization
 and aligned render destinations; at the tested 256-byte storage-offset alignment their complete
-increase is 158,376 bytes. All allocations join the initial admission and callback lifetime.
+increase is 158,376 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
+allocation as XYB. Subsampled JPEG needs two padded full-resolution chroma destinations plus two
+32-byte interpolation uniforms, for total increments of 104,812 bytes (4:2:2), 120,172 bytes
+(4:4:0), and 122,220 bytes (4:2:0). The zero model allocates none of those component destinations.
+Output geometry and YCbCr conversion both follow the actual expanded planes. All eleven admission
+cases check the initial reservation, retry and callback/cancellation lifetime.
 
 Production noise uses base X/B correlation, following
 [libjxl's noise stage](https://github.com/libjxl/libjxl/blob/main/lib/jxl/render_pipeline/stage_noise.cc)
@@ -2140,18 +2168,21 @@ clamps indices when the delta count is zero and the predictor is Zero, yielding 
 positions. The native zero-model maxAE is 0.74117655. The dedicated test retains the original
 stream, checks these normative samples and requires the usual 0.0001 GPU/Rust bound; it does
 not use the clamping native implementation as its pixel oracle. The rest of the original-color
-corpus still runs both oracles (observed maxima below 0.000001).
+Modular corpus still runs both oracles (observed maxima below 0.000001). The thirteen original-RGB
+and JPEG VarDCT cases have observed maxima below 0.0000006 against Rust and 0.0000343 against
+native libjxl, including the zero-model controls.
 
-Non-XYB VarDCT noise remains typed unsupported. Preview, LF/reference-only frames,
+Preview, LF/reference-only frames,
 patch/spline combinations, and the full 18181-3 precision corpus remain open conformance gates.
 No production CPU image codec, random-plane upload or intermediate image readback is introduced.
 
-The four expanded noise integration tests pass on Apple M5/Metal, including exact whole/fragmented
-output, every group size, both original-color admission cases and the oracle exceptions above.
+The six expanded noise integration tests cover Apple M5/Metal, exact whole/fragmented output,
+every Modular group size, JPEG sampling, source precision, orientation, all eleven admission
+cases and the oracle exceptions above.
 
 Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
-747 tests across 34 targets, with one existing manual benchmark ignored. Formatting, workspace
+749 tests across 34 targets, with one existing manual benchmark ignored. Formatting, workspace
 check, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and
-Metal harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All 24 codestreams and
-four linear F32 references regenerate byte-identically with libjxl 0.12.0; the original nine
-codestreams are unchanged.
+Metal harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All 37 codestreams and
+four linear F32 references regenerate byte-identically with libjxl 0.12.0 and cjpeg. The preceding
+24 codestreams and four references are unchanged.

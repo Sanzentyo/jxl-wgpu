@@ -45,6 +45,11 @@ fn unsupported_integer_depth_errors_preserve_the_declared_depth_and_color_domain
             [0, 32, u32::MAX],
         ),
         (
+            include_str!("../test-data/noise/vardct_rgb_257x17.jxl.hex"),
+            VarDctColorTransform::Rgb,
+            [0, 32, u32::MAX],
+        ),
+        (
             include_str!("../test-data/testsrc_vardct_jpeg_orientation_6.jxl.hex"),
             VarDctColorTransform::Ycbcr,
             [1, 10, 16],
@@ -53,6 +58,12 @@ fn unsupported_integer_depth_errors_preserve_the_declared_depth_and_color_domain
     for (hex, expected_transform, depths) in cases {
         let bytes = decode_hex(hex);
         let mut inventory = inventory(&bytes);
+        assert_eq!(
+            StandardVarDctProfile::negotiate(&inventory)
+                .unwrap()
+                .color_transform,
+            expected_transform
+        );
         assert!(BoundedVarDctPacketPlan::parse(&bytes, &inventory).is_ok());
         for bits_per_sample in depths {
             inventory.image_header.bit_depth = SampleBitDepth::Integer { bits_per_sample };

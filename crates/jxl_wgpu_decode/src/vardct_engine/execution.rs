@@ -2407,7 +2407,7 @@ fn submit_vardct(
             })
             .transpose()?;
     let (output_scratch, post_transform_buffers, lf_planes) = match source.output {
-        VarDctFrameOutput::Color { config, plan } => {
+        VarDctFrameOutput::Color { mut config, plan } => {
             let resident_planes =
                 resident_planes
                     .as_ref()
@@ -2603,11 +2603,21 @@ fn submit_vardct(
             let presentation_planes = frame_upsample_planes
                 .as_ref()
                 .unwrap_or(presentation_planes);
-            let presentation_shifts = if restoration.is_some() || frame_upsample_planes.is_some() {
+            let presentation_shifts = if pre_restoration_planes.is_some()
+                || restoration.is_some()
+                || frame_upsample_planes.is_some()
+            {
                 [crate::vardct_frontend::VarDctChannelShift::default(); 3]
             } else {
                 source.packet.profile.channel_shifts
             };
+            if let crate::color_output::ColorOutputTransform::Ycbcr { channel_shifts } =
+                &mut config.transform
+            {
+                // Plane geometry and color conversion must agree, including when noise alone
+                // requires expanded components or a zero noise model elides that expansion.
+                *channel_shifts = presentation_shifts;
+            }
             let output_width = source.packet.profile.output_width;
             let output_height = source.packet.profile.output_height;
             let presentation_stride = if frame_upsample_planes.is_some() {

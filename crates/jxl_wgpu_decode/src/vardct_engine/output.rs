@@ -2,7 +2,6 @@
 use super::types::VarDctDecodeError;
 use crate::color_output::{ColorOutputConfig, ColorOutputPlan, ColorOutputTransform, InverseOpsin};
 use crate::modular_scalar_output::{ModularScalarOutputConfig, ModularScalarOutputPlan};
-use crate::restoration::restoration_config;
 use crate::vardct_frontend::VarDctColorTransform;
 use crate::{GpuOutputMapping, GpuOutputRequest};
 use jxl_gpu_bitstream::{
@@ -10,7 +9,7 @@ use jxl_gpu_bitstream::{
     WhitePointInventory,
 };
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{Extent2d, OutputOrientation};
+use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding};
 use jxl_wgpu::{KernelVariant, WgpuBackend};
 use std::sync::Arc;
 
@@ -121,11 +120,6 @@ pub(super) fn prepare_presentation(
     ) {
         return Err(VarDctDecodeError::UnsupportedColorEncoding);
     }
-    let frame = inventory
-        .frames
-        .first()
-        .ok_or(VarDctDecodeError::MissingFrame)?;
-    let (gaborish, epf) = restoration_config(frame.restoration_filter)?;
     let (output_transform, quant_biases) = match profile.color_transform {
         VarDctColorTransform::Xyb => {
             let opsin = inventory
@@ -146,13 +140,14 @@ pub(super) fn prepare_presentation(
                 ],
             )
         }
-        VarDctColorTransform::Ycbcr => (
-            ColorOutputTransform::Ycbcr {
-                channel_shifts: if gaborish.is_some() || epf.is_some() || profile.upsampling != 1 {
-                    [Default::default(); 3]
-                } else {
-                    profile.channel_shifts
-                },
+        VarDctColorTransform::Ycbcr | VarDctColorTransform::Rgb => (
+            if profile.color_transform == VarDctColorTransform::Rgb {
+                ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709)
+            } else {
+                ColorOutputTransform::Ycbcr {
+                    // Execution resolves these shifts from the planes that reach presentation.
+                    channel_shifts: profile.channel_shifts,
+                }
             },
             // Non-XYB image metadata omits the optional opsin object that otherwise carries these
             // TransformData defaults, but VarDCT coefficient biasing still uses their exact F32

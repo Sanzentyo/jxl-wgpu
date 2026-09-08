@@ -302,7 +302,7 @@ pub struct VarDctDecodeMemoryStats {
     /// physically smaller buffers rather than full-resolution padding.
     pub resident_plane_bytes: [u64; 3],
     pub resident_image_bytes: u64,
-    /// Full-resolution destinations allocated only for shifted components before restoration.
+    /// Full-resolution destinations for shifted components before restoration, resampling or noise.
     pub pre_restoration_upsample_bytes: u64,
     /// One 32-byte interpolation uniform for each shifted component.
     pub pre_restoration_upsample_uniform_bytes: u64,
@@ -637,8 +637,8 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let expand_components =
-            render_color && (restoration_scratch || packet.profile.upsampling != 1);
+        let expand_components = render_color
+            && (restoration_scratch || packet.profile.upsampling != 1 || noise.is_some());
         let pre_restoration_upsample_bytes = if expand_components {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {

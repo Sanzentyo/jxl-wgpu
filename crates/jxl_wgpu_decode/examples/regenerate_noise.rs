@@ -154,6 +154,53 @@ fn references(output: &Path, temporary: &Path, name: &str, data: &[u8]) {
     }
 }
 
+fn jpeg_noise(output: &Path, temporary: &Path) {
+    let (width, height) = (257, 17);
+    for (name, sampling, gray) in [
+        ("444", "1x1,1x1,1x1", false),
+        ("422", "2x1,1x1,1x1", false),
+        ("440", "1x2,1x1,1x1", false),
+        ("420", "2x2,1x1,1x1", false),
+        ("gray", "1x1", true),
+    ] {
+        let mut pixels = format!(
+            "{}\n{width} {height}\n255\n",
+            if gray { "P5" } else { "P6" }
+        )
+        .into_bytes();
+        for y in 0..height {
+            for x in 0..width {
+                for channel in 0..if gray { 1 } else { 3 } {
+                    pixels.push((32 + (x * (channel + 2) + y * (7 - channel)) % 192) as u8);
+                }
+            }
+        }
+        let input = temporary.join("jpeg-source.pnm");
+        let jpeg = temporary.join("source.jpg");
+        let jxl = temporary.join("jpeg-noise.jxl");
+        std::fs::write(&input, pixels).unwrap();
+        offline::run(
+            Command::new("cjpeg")
+                .args(["-quality", "90", "-sample", sampling, "-outfile"])
+                .arg(&jpeg)
+                .arg(input),
+        );
+        offline::run(Command::new("cjxl").arg(jpeg).arg(&jxl).args([
+            "--lossless_jpeg=1",
+            "--photon_noise_iso=800",
+            "--allow_jpeg_reconstruction=0",
+            "--gaborish=0",
+            "--epf=0",
+            "--quiet",
+        ]));
+        std::fs::write(
+            output.join(format!("jpeg_{name}.jxl.hex")),
+            offline::hex(&std::fs::read(jxl).unwrap()),
+        )
+        .unwrap();
+    }
+}
+
 fn main() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
     let output = std::env::args_os()
@@ -166,6 +213,7 @@ fn main() {
     let generator = temporary.join("generate");
     offline::compile(&source.join("generate_noise.c"), &generator, &["libjxl"]);
     offline::run(Command::new(generator).arg(&output));
+    jpeg_noise(&output, &temporary);
     offline::compile(
         &source.join("decode_extra_channels.c"),
         &temporary.join("oracle"),

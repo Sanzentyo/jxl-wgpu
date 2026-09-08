@@ -22,6 +22,32 @@ fn encoded(name: &str) -> Vec<u8> {
         .collect()
 }
 
+fn zero_noise(bytes: &[u8], inventory: &jxl_gpu_bitstream::CodestreamInventory) -> Vec<u8> {
+    // Inventory ranges address the logical codestream, including for container-wrapped fixtures.
+    let mut bytes = jxl_gpu_bitstream::parse(bytes, Default::default())
+        .unwrap()
+        .codestream()
+        .to_vec();
+    for frame in &inventory.frames {
+        assert_eq!(frame.flags & (1 | 2 | 16), 1);
+        let section = frame
+            .sections
+            .iter()
+            .find(|section| {
+                matches!(
+                    section.kind,
+                    jxl_gpu_bitstream::FrameSectionKind::Single
+                        | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                )
+            })
+            .unwrap();
+        assert_eq!(section.bits.offset % 8, 0);
+        let start = section.bytes.offset as usize;
+        bytes[start..start + 10].fill(0);
+    }
+    bytes
+}
+
 fn planned_bytes(
     backend: &WgpuBackend,
     session: &mut jxl_wgpu_decode::GpuDecodeSession<jxl_wgpu_decode::WgpuDecodeSubmissionSession>,
@@ -85,27 +111,64 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
         "modular_257x17",
         "modular_rgb_group256",
         "modular_gray",
+        "vardct_rgb_257x17",
+        "vardct_rgb_gray",
+        "jpeg_444",
+        "jpeg_422",
+        "jpeg_440",
+        "jpeg_420",
+        "jpeg_gray",
     ] {
         let bytes = encoded(name);
         let inventory = jxl_gpu_bitstream::parse(&bytes, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap();
-        let mut zero = bytes.clone();
-        let start = inventory.frames[0].sections[0].bytes.offset as usize;
-        zero[start..start + 10].fill(0);
+        let zero = zero_noise(&bytes, &inventory);
         let mut empty = decoder.open(&zero, request.clone()).unwrap();
         let empty_bytes = planned_bytes(&backend, &mut empty);
+        let component_extent = match name {
+            "jpeg_422" => Some((272, 24)),
+            "jpeg_440" => Some((264, 32)),
+            "jpeg_420" => Some((272, 32)),
+            _ => None,
+        };
+        if component_extent.is_some() {
+            let memory = empty
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .memory_stats()
+                .unwrap();
+            assert_eq!(memory.pre_restoration_upsample_bytes, 0);
+            assert_eq!(memory.pre_restoration_upsample_uniform_bytes, 0);
+            assert_eq!(memory.noise_bytes, 0);
+            assert_eq!(memory.noise_uniform_bytes, 0);
+        }
         drop(empty);
         let mut pending = decoder.open(&bytes, request.clone()).unwrap();
         let required = planned_bytes(&backend, &mut pending);
+        let component_bytes = component_extent.map_or(0, |(width, height)| {
+            let memory = pending
+                .submission_session()
+                .vardct()
+                .unwrap()
+                .memory_stats()
+                .unwrap();
+            // Both chroma components need padded, full-resolution destinations for noise.
+            let bytes = width * height * 4 * 2;
+            assert_eq!(memory.pre_restoration_upsample_bytes, bytes);
+            assert_eq!(memory.pre_restoration_upsample_uniform_bytes, 64);
+            bytes + 64
+        });
         assert_eq!(
             required - empty_bytes,
             257 * 17 * 12
                 + jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES
-                + if inventory.image_header.xyb_encoded {
-                    0
-                } else {
+                + component_bytes
+                + if !inventory.image_header.xyb_encoded
+                    && inventory.frames[0].encoding == jxl_gpu_bitstream::FrameEncoding::Modular
+                {
                     // Noise introduces the color renderer for unfiltered original color:
                     // three normalized planes, three aligned render destinations, and packing.
                     let alignment = u64::from(
@@ -119,7 +182,10 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
                         + (257_u64 * 17 * 4).div_ceil(alignment) * alignment * 3
                         + 80
                         + 352
-                }
+                } else {
+                    0
+                },
+            "{name}"
         );
         let budget = backend.transient_memory_budget();
         assert_eq!(budget.snapshot().reserved_bytes, 0);
@@ -191,6 +257,31 @@ fn noise_uses_base_correlations_independently_of_lf_slopes() {
 }
 
 #[test]
+fn original_rgb_vardct_noise_follows_restoration_and_frame_upsampling() {
+    check_cases(
+        &[
+            "vardct_rgb_257x17",
+            "vardct_rgb_gray",
+            "vardct_rgb_up2",
+            "vardct_rgb_up4",
+            "vardct_rgb_up8",
+            "vardct_rgb_gray16",
+            "vardct_rgb_float32_up4",
+            "vardct_rgb_frames",
+        ],
+        Reference::Srgb,
+    );
+}
+
+#[test]
+fn ycbcr_noise_follows_component_upsampling() {
+    check_cases(
+        &["jpeg_444", "jpeg_422", "jpeg_440", "jpeg_420", "jpeg_gray"],
+        Reference::Srgb,
+    );
+}
+
+#[test]
 fn original_rgb_noise_preserves_single_channel_implicit_palette_values() {
     check_cases(&["modular_rgb_palette"], Reference::ImplicitPalette);
 }
@@ -229,6 +320,57 @@ fn check_cases(names: &[&str], reference: Reference) {
             .codestream_inventory(Default::default())
             .unwrap();
         assert!(inventory.frames.iter().all(|frame| frame.flags & 1 != 0));
+        let image = &inventory.image_header;
+        let frame = &inventory.frames[0];
+        if name.starts_with("vardct_rgb_") || name.starts_with("jpeg_") {
+            assert!(!image.xyb_encoded);
+            assert_eq!(frame.encoding, jxl_gpu_bitstream::FrameEncoding::VarDct);
+            assert_eq!(frame.do_ycbcr, name.starts_with("jpeg_"));
+            assert_eq!(image.grayscale, name.contains("_gray"));
+            let (depth, orientation) = match name {
+                "vardct_rgb_gray16" => (
+                    jxl_gpu_bitstream::SampleBitDepth::Integer {
+                        bits_per_sample: 16,
+                    },
+                    6,
+                ),
+                "vardct_rgb_float32_up4" => (
+                    jxl_gpu_bitstream::SampleBitDepth::Float {
+                        bits_per_sample: 32,
+                        exponent_bits_per_sample: 8,
+                    },
+                    1,
+                ),
+                _ => (
+                    jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
+                    if name == "vardct_rgb_frames" { 8 } else { 1 },
+                ),
+            };
+            assert_eq!(image.bit_depth, depth);
+            assert_eq!(image.orientation, orientation);
+            let sampling = match name {
+                "jpeg_422" => [0, 2, 0],
+                "jpeg_440" => [0, 3, 0],
+                "jpeg_420" => [0, 1, 0],
+                _ => [0; 3],
+            };
+            assert_eq!(frame.jpeg_upsampling, sampling);
+            let factor = name
+                .rsplit_once("_up")
+                .map_or(1, |(_, factor)| factor.parse::<u32>().unwrap());
+            assert_eq!(frame.upsampling, factor);
+            assert_eq!(
+                frame.restoration_filter,
+                if factor == 1 {
+                    jxl_gpu_bitstream::RestorationFilterInventory::Custom {
+                        gaborish: jxl_gpu_bitstream::GaborishInventory::Disabled,
+                        epf: jxl_gpu_bitstream::EdgePreservingFilterInventory::Disabled,
+                    }
+                } else {
+                    jxl_gpu_bitstream::RestorationFilterInventory::Default
+                }
+            );
+        }
         assert_eq!(inventory.frames[0].noise_seed, [1, 0]);
         if let Some((_, dimension)) = name.rsplit_once("_group") {
             let dimension: u32 = dimension.parse().unwrap();
@@ -253,7 +395,8 @@ fn check_cases(names: &[&str], reference: Reference) {
             assert_eq!(prefix.lf_correlation.base, base);
             assert_eq!(prefix.lf_correlation.lf_factors, factors);
         }
-        if name == "mixed_frames" {
+        let animation = image.animation.is_some();
+        if animation {
             assert_eq!(
                 inventory
                     .frames
@@ -265,30 +408,15 @@ fn check_cases(names: &[&str], reference: Reference) {
         }
         let mut noisy_words = None;
         for zero_model in [false, true] {
-            let mut bytes = bytes.clone();
-            if zero_model {
-                for frame in &inventory.frames {
-                    assert_eq!(frame.flags & (2 | 16), 0);
-                    let section = frame
-                        .sections
-                        .iter()
-                        .find(|section| {
-                            matches!(
-                                section.kind,
-                                jxl_gpu_bitstream::FrameSectionKind::Single
-                                    | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
-                            )
-                        })
-                        .unwrap();
-                    assert_eq!(section.bits.offset % 8, 0);
-                    let start = section.bytes.offset as usize;
-                    bytes[start..start + 10].fill(0);
-                }
-            }
+            let bytes = if zero_model {
+                zero_noise(&bytes, &inventory)
+            } else {
+                bytes.clone()
+            };
             let pixels =
                 inventory.image_header.width as usize * inventory.image_header.height as usize;
             let rust = (reference != Reference::LinearCorrelation).then(|| {
-                let frames = if name == "mixed_frames" {
+                let frames = if animation {
                     oracle::rust_frame_planes(&bytes)
                 } else {
                     vec![oracle::rust_planes(&bytes)]
@@ -315,7 +443,7 @@ fn check_cases(names: &[&str], reference: Reference) {
                 None
             } else if reference == Reference::LinearCorrelation {
                 oracle::libjxl_output(&bytes, &["--linear"])
-            } else if name == "mixed_frames" {
+            } else if animation {
                 oracle::libjxl_output(&bytes, &[])
             } else {
                 oracle::libjxl_planes(&bytes, pixels, 0).map(|(rgb, _)| rgb)
@@ -346,10 +474,7 @@ fn check_cases(names: &[&str], reference: Reference) {
                 while let Some(frame) = pollster::block_on(session.next_frame_async()).unwrap() {
                     words.extend(planes::read(&backend, &frame.output().outputs[0]));
                 }
-                assert_eq!(
-                    words.len(),
-                    pixels * 4 * if name == "mixed_frames" { 3 } else { 1 }
-                );
+                assert_eq!(words.len(), pixels * 4 * if animation { 3 } else { 1 });
                 if let Some(expected) = &expected_words {
                     assert_eq!(&words, expected, "{name}");
                 }

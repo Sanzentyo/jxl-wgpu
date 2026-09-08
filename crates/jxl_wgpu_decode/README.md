@@ -50,7 +50,7 @@ declared representation before color conversion. Additional source color domains
 
 ### Integer source samples
 
-All 1–31-bit primary and extra-channel declarations are admitted by Modular and XYB VarDCT.
+All 1–31-bit primary and extra-channel declarations are admitted by Modular and XYB/original-sRGB VarDCT.
 `native_modular_pixel_format(ModularChannels::Gray, bits)` creates a canonical scalar layout for
 `NumericSampleMapping::NativeUnsigned` from Modular grayscale or a selected extra in either mode;
 RGB/RGBA layouts can be passed to `GpuOutputRequest::color`. General VarDCT numeric color-channel
@@ -362,22 +362,26 @@ match Rust `jxl`; subsequent reference chains use libjxl because of the document
 clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
 color management, pre-transform references, patches and splines remain separate work.
 
-Both XYB coding modes and original-sRGB Modular RGB/gray parse the bounded 80-bit `NoiseModel` and
+Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before
 color conversion.
 `FrameInventory::noise_seed` preserves the visible/nonvisible counters when a physical frame is
 projected into a producer. SplitMix64/Xorshift128Plus execute as portable WGSL u32 pairs; no CPU
 random image is uploaded. Three random F32 planes and one 96-byte uniform join the same frame
 reservation and callback lifetime. An all-zero model skips noise allocation and dispatch.
-`tests/noise.rs` covers 24 fixtures and their zero-model variants, including all four Modular
-group sizes, 2×/4×/8× upsampling and five mixed physical frames with three presentations. Twenty-one
+`tests/noise.rs` covers 37 fixtures and their zero-model variants, including all four Modular
+group sizes, all four ordinary JPEG sampling layouts, grayscale, 2×/4×/8× upsampling, rotated
+Gray16, F32 RGB and two five-frame sequences with three presentations each. Thirty-four
 use Rust jxl and optional live libjxl F32 references. Two custom base/LF correlation fixtures use
 checked native linear RGB references, avoiding Rust jxl 0.6's LF-slope noise error and extended-range
 sRGB approximations. A single-channel implicit palette case follows H.6.4 and Rust jxl;
 libjxl 0.12 incorrectly clamps those indices. Exact whole/256-byte-window output agreement,
 admission retry and cancellation cleanup cover both XYB and original color, including the
-normalization allocations introduced by nonzero noise. Non-XYB VarDCT noise, preview,
-LF/reference-only and patch/spline combinations need further conformance coverage.
+normalization allocations introduced by nonzero Modular noise. Subsampled VarDCT allocates padded
+full-resolution destinations only for shifted components before noise; output conversion derives
+its sampling geometry from those actual planes, avoiding a second interpolation. Zero models
+retain the fused component-upsampling/output path. Preview, LF/reference-only and patch/spline
+combinations need further conformance coverage.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after
@@ -481,8 +485,8 @@ the final image becomes authoritative. Three checked-in spectral/quantized fixtu
 and 256-byte windowed execution, 37-byte transport chunks, odd extents, center-first order, and two
 LF groups; both CPU oracles agree within one RGB8 code on Apple M5.
 Both forms return one final still frame in the requested color layout; a one-entry TOC has one pass, while sectioned TOCs
-retain every declared pass. The main XYB profile accepts integer source depths 1 through 16; a
-non-XYB JPEG-reconstruction profile accepts 8-bit encoded YCbCr and the codestream's component sampling
+retain every declared pass. XYB and original-sRGB VarDCT accept all legal integer and floating source
+declarations; a JPEG-reconstruction profile accepts 8-bit encoded YCbCr and the codestream's component sampling
 selectors. The packet contract
 accepts either adaptive LF smoothing or its standard skip flag, every 3-bit X/B frame
 quant-matrix scale, every normative default or parametric custom dequantization matrix encoding,
@@ -758,8 +762,9 @@ records. The submission executes every populated bucket through the resident reg
 VarDCT renderer using the normative default matrix for that strategy and an explicit regular/wide/
 special coefficient layout, optionally applies the signaled Gaborish weights, constructs the signaled
 per-block EPF inverse-sigma field, runs EPF0/EPF1/EPF2 as selected by the one-to-three iteration
-contract through a shared resident ping-pong plane set, then either applies inverse opsin plus sRGB
-transfer or fuses JPEG component upsampling and encoded YCbCr conversion. It writes tightly packed
+contract through a shared resident ping-pong plane set, then applies inverse opsin, converts encoded
+YCbCr with any remaining component upsampling, or preserves original RGB. The common output
+packer applies the requested color transfer. It writes tightly packed
 RGB8 without an intermediate image readback. Sectioned global-tree packet and
 AC pass-group ranges that fit the resolved entropy cap retain the one-submission path. Either
 oversized consumer instead uses the consumer-neutral 16-byte overlap plan, one reusable stream/

@@ -54,6 +54,7 @@ impl VarDctChannelShift {
 pub enum VarDctColorTransform {
     Xyb,
     Ycbcr,
+    Rgb,
 }
 
 /// Feature that prevents a codestream from entering the initial GPU VarDCT path.
@@ -62,7 +63,6 @@ pub enum UnsupportedVarDctFeature {
     CodestreamSize,
     ImageDimensions,
     SamplePrecision,
-    NonXybImage,
     EmbeddedIcc,
     ExtraChannels,
     Preview,
@@ -944,7 +944,7 @@ pub struct StandardVarDctProfile {
     pub upsampling: u32,
     pub sample_bit_depth: SampleBitDepth,
     pub color_transform: VarDctColorTransform,
-    /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
+    /// Resident channel order is X/Y/B, Cb/Y/Cr, or R/G/B. Only YCbCr permits shifts.
     pub channel_shifts: [VarDctChannelShift; 3],
     /// Raw JPEG component sampling selectors in Cb/X, Y, Cr/B order.
     pub jpeg_upsampling: [u32; 3],
@@ -997,7 +997,7 @@ impl StandardVarDctProfile {
             } => bits_per_sample,
         }
     }
-    /// Negotiate the single-frame XYB or JPEG-reconstruction VarDCT profile.
+    /// Negotiate the single-frame XYB, YCbCr, or original RGB VarDCT profile.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, VarDctFrontendError> {
         Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
     }
@@ -1039,8 +1039,10 @@ impl StandardVarDctProfile {
             sample_bit_depth: inventory.image_header.bit_depth,
             color_transform: if frame.do_ycbcr {
                 VarDctColorTransform::Ycbcr
-            } else {
+            } else if inventory.image_header.xyb_encoded {
                 VarDctColorTransform::Xyb
+            } else {
+                VarDctColorTransform::Rgb
             },
             channel_shifts: jpeg_channel_shifts(frame.jpeg_upsampling),
             jpeg_upsampling: frame.jpeg_upsampling,
@@ -1359,13 +1361,8 @@ fn validate_frame(
     } else {
         0x20 | 0x80 | 1
     };
-    if frame.flags & !supported_flags != 0
-        || (frame.flags & 1 != 0 && !inventory.image_header.xyb_encoded)
-    {
+    if frame.flags & !supported_flags != 0 {
         return unsupported(UnsupportedVarDctFeature::FrameFeatures);
-    }
-    if !inventory.image_header.xyb_encoded && !frame.do_ycbcr {
-        return unsupported(UnsupportedVarDctFeature::NonXybImage);
     }
     if inventory.image_header.xyb_encoded && frame.do_ycbcr {
         return unsupported(UnsupportedVarDctFeature::Ycbcr);

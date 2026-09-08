@@ -13,6 +13,7 @@ static void check(JxlEncoderStatus status) {
 }
 typedef struct {
   int modular, factor, count, mixed, original, group_shift, gray, channel_palette;
+  int bits, exponent, orientation;
 } Options;
 static void generate(const char* dir, const char* name, uint32_t w, uint32_t h,
                      Options options) {
@@ -22,7 +23,9 @@ static void generate(const char* dir, const char* name, uint32_t w, uint32_t h,
   JxlEncoder* enc = JxlEncoderCreate(NULL);
   JxlBasicInfo info;
   JxlEncoderInitBasicInfo(&info);
-  info.xsize = w; info.ysize = h; info.bits_per_sample = 8;
+  info.xsize = w; info.ysize = h; info.bits_per_sample = options.bits ? options.bits : 8;
+  info.exponent_bits_per_sample = options.exponent;
+  if (options.orientation) info.orientation = options.orientation;
   info.num_color_channels = channels; info.uses_original_profile = options.original;
   info.have_animation = count > 1;
   info.animation.tps_numerator = 10; info.animation.tps_denominator = 1;
@@ -32,7 +35,9 @@ static void generate(const char* dir, const char* name, uint32_t w, uint32_t h,
   check(JxlEncoderSetColorEncoding(enc, &color));
   const size_t size = (size_t)w * h * channels;
   uint8_t* data = malloc(size);
-  if (!data) exit(2);
+  uint16_t* wide = options.bits == 16 ? malloc(size * sizeof(uint16_t)) : NULL;
+  float* floating = options.exponent ? malloc(size * sizeof(float)) : NULL;
+  if (!data || (options.bits == 16 && !wide) || (options.exponent && !floating)) exit(2);
   for (int frame = 0; frame < count; ++frame) {
     for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x)
       for (int c = 0; c < channels; ++c)
@@ -59,9 +64,18 @@ static void generate(const char* dir, const char* name, uint32_t w, uint32_t h,
     header.duration = count == 1 ? 0 : (frame == 0 ? 2 : (frame == 3 ? 3 : 0));
     check(JxlEncoderSetFrameHeader(settings, &header));
     JxlPixelFormat format = {(uint32_t)channels, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
-    check(JxlEncoderAddImageFrame(settings, &format, data, size));
+    const void* pixels = data; size_t bytes = size;
+    if (wide) {
+      for (size_t i = 0; i < size; ++i) wide[i] = data[i] * 256 + (i * 37 + frame * 13) % 256;
+      format.data_type = JXL_TYPE_UINT16; pixels = wide; bytes *= sizeof(uint16_t);
+    } else if (floating) {
+      for (size_t i = 0; i < size; ++i)
+        floating[i] = ((float)data[i] + (float)((i * 37 + frame * 13) % 256) / 256.0f) / 255.0f;
+      format.data_type = JXL_TYPE_FLOAT; pixels = floating; bytes *= sizeof(float);
+    }
+    check(JxlEncoderAddImageFrame(settings, &format, pixels, bytes));
   }
-  free(data);
+  free(floating); free(wide); free(data);
   JxlEncoderCloseInput(enc);
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s.jxl.hex", dir, name);
@@ -106,5 +120,20 @@ int main(int argc, char** argv) {
     generate(argv[1], name, 259, 33,
         (Options){.modular=1, .factor=factor, .count=1, .original=1, .group_shift=0});
   }
+  generate(argv[1], "vardct_rgb_257x17", 257, 17,
+      (Options){.factor=1, .count=1, .original=1, .group_shift=-1});
+  generate(argv[1], "vardct_rgb_gray", 257, 17,
+      (Options){.factor=1, .count=1, .original=1, .group_shift=-1, .gray=1});
+  for (int factor = 2; factor <= 8; factor *= 2) {
+    char name[80]; snprintf(name, sizeof(name), "vardct_rgb_up%d", factor);
+    generate(argv[1], name, 259, 33,
+        (Options){.factor=factor, .count=1, .original=1, .group_shift=-1});
+  }
+  generate(argv[1], "vardct_rgb_gray16", 37, 19,
+      (Options){.factor=1, .count=1, .original=1, .group_shift=-1, .gray=1, .bits=16, .orientation=6});
+  generate(argv[1], "vardct_rgb_float32_up4", 259, 33,
+      (Options){.factor=4, .count=1, .original=1, .group_shift=-1, .bits=32, .exponent=8});
+  generate(argv[1], "vardct_rgb_frames", 37, 19,
+      (Options){.factor=1, .count=5, .original=1, .group_shift=-1, .orientation=8});
   return 0;
 }
