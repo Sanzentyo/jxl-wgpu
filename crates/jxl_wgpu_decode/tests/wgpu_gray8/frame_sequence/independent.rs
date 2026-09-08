@@ -7,7 +7,7 @@ use jxl_wgpu_encode::{
 
 /// Copy original header bits and rebuild only the section sizes. This leaves frame semantics and
 /// the entropy prefix unchanged, so a short payload tests GPU entropy validation after inventory.
-fn reassemble(data: &[u8], frame: &FrameInventory, payloads: Vec<Vec<u8>>) -> Vec<u8> {
+pub(super) fn reassemble(data: &[u8], frame: &FrameInventory, payloads: Vec<Vec<u8>>) -> Vec<u8> {
     assert!(!frame.toc_permuted);
     let mut header = BitWriter::new();
     let bits = &frame.header_bits;
@@ -55,7 +55,7 @@ fn reassemble(data: &[u8], frame: &FrameInventory, payloads: Vec<Vec<u8>>) -> Ve
     .into_bytes()
 }
 
-fn payloads(data: &[u8], frame: &FrameInventory) -> Vec<Vec<u8>> {
+pub(super) fn payloads(data: &[u8], frame: &FrameInventory) -> Vec<Vec<u8>> {
     frame
         .sections
         .iter()
@@ -113,7 +113,7 @@ fn native_layers(count: usize) -> (Vec<u8>, Vec<u32>) {
     (result, expected)
 }
 
-fn retired(backend: &WgpuBackend) {
+pub(super) fn retired(backend: &WgpuBackend) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while backend.submission_poller().in_flight() != 0 && std::time::Instant::now() < deadline {
         backend.device().poll(wgpu::PollType::Poll).unwrap();

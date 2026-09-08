@@ -44,7 +44,7 @@ impl IndependentSession {
         plan: &FrameExecutionPlan,
     ) -> Result<(Self, NonZeroUsize)> {
         let range = &plan.presentations[0].physical_frames;
-        let first = source.next_producer(range.start, range.end)?;
+        let first = range.start;
         let prepared = prepare(&source, first, plan.metadata.extent)?;
         let slots = prepared
             .resolved_frame_slots()
@@ -77,7 +77,7 @@ impl IndependentSession {
             .ok_or(Error::EngineContract("frame sequence lost its source"))?;
         let presentation = &plan.presentations[index];
         let range = &presentation.physical_frames;
-        let physical = source.next_producer(range.start, range.end)?;
+        let physical = range.start;
         if self.prepared.is_none() {
             self.prepared = Some(prepare(source, physical, plan.metadata.extent)?.session);
         }
@@ -161,7 +161,7 @@ impl IndependentPending {
         let source = self.source.as_ref().ok_or(Error::EngineContract(
             "independent presentation lost its source",
         ))?;
-        self.physical = source.next_producer(self.physical + 1, self.end)?;
+        self.physical += 1;
         let mut producer = prepare(source, self.physical, self.extent)?.session;
         let pending = producer
             .submit_next()?

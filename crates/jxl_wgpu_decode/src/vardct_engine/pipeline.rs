@@ -200,25 +200,6 @@ impl VarDctSubmissionEngine {
         )
     }
 
-    pub(crate) fn open_progressive_dc_with_inventory_data(
-        &self,
-        codestream: GpuCodestream,
-        request: &GpuOutputRequest,
-        inventory: &CodestreamInventory,
-        is_final: bool,
-    ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
-        self.open_role(
-            codestream,
-            request,
-            inventory,
-            if is_final {
-                crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
-            } else {
-                crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
-            },
-        )
-    }
-
     pub(crate) fn open_frame_with_inventory_data(
         &self,
         codestream: GpuCodestream,
@@ -229,7 +210,11 @@ impl VarDctSubmissionEngine {
             codestream,
             request,
             inventory,
-            crate::vardct_frontend::VarDctFrameRole::Frame,
+            if inventory.frames[0].frame_type == jxl_gpu_bitstream::FrameType::LowFrequency {
+                crate::vardct_frontend::VarDctFrameRole::LowFrequency
+            } else {
+                crate::vardct_frontend::VarDctFrameRole::Frame
+            },
         )
     }
 

@@ -72,7 +72,9 @@ pub use jxl_gpu_formats::{
     YcbcrEncoding,
 };
 pub use jxl_gpu_protocol::{OutputColorEncoding, RgbColorEncoding, RgbPrimaries};
-pub use memory_budget::{MemoryBudget, MemoryBudgetError, MemoryBudgetSnapshot, MemoryPermit};
+pub use memory_budget::{
+    MemoryBudget, MemoryBudgetError, MemoryBudgetSnapshot, MemoryPermit, MemoryPermitSplitError,
+};
 pub use metrics::{AccuracyMetrics, TimingBreakdown};
 pub use planner::{ExecutionPlan, FusedKernel, PlannedDispatch, Planner};
 pub use poller::{

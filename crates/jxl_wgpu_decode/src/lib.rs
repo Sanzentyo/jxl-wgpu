@@ -75,14 +75,14 @@ pub use buffer_pool::{
     DEFAULT_DECODE_BUFFER_POOL_BYTES, WgpuDecodeBufferPoolLimits, WgpuDecodeBufferPoolStats,
 };
 pub use codec_engine::{
-    FrameSequencePending, FrameSequenceSession, ProgressiveDcPlan, ProgressiveDcStage,
-    WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession,
+    FrameSequencePending, FrameSequenceSession, WgpuDecodeEngine, WgpuDecodePendingFrame,
+    WgpuDecodeSubmissionSession,
 };
 pub use codestream_data::GpuCodestream;
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularInversePlanError, ModularTransformError,
-    ModularTransformFeature, ModularTreeError, ProgressiveDcError, Result,
-    UnsupportedCodestreamFeature, UnsupportedProfile,
+    ModularTransformFeature, ModularTreeError, Result, UnsupportedCodestreamFeature,
+    UnsupportedProfile,
 };
 pub use frame_plan::{
     FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,

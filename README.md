@@ -65,8 +65,8 @@ host-sized `Vec`. All Modular and VarDCT scalar metadata bit parsing is span-nat
 VarDCT block-context maps, custom coefficient-order permutations, MA descriptors, and
 cursor-dependent local-HF headers. Inventory also resolves each `USE_LF_FRAME` read to its exact
 earlier progressive-DC producer across the four normative LF slots. Missing producers are rejected
-before submission. The stock decoder executes recursive progressive-DC chains without pixel
-readback. It converts the Modular root's signed `[Y, X, B-Y]` planes to dequantized XYB, packs them
+before submission. The common physical frame executor validates every LF producer, including unused and overwritten
+versions, and reuses four budget-tracked LF slots across presentations without pixel readback. It converts the Modular root's signed `[Y, X, B-Y]` planes to dequantized XYB, packs them
 into each dependent VarDCT LF atlas, decodes a single-entry intermediate frame's HF metadata on
 GPU, maps only its validated HF-global cursor, then submits its general HF-global/AC and the next
 dependency on the same queue. Parametric custom dequantization matrices are expanded as bounded
@@ -261,8 +261,10 @@ blend modes against four resident post-transform reference slots. Intermediate p
 presentation, arbitrary ICC
 transforms, patches, splines, and noise still require production integration and conformance.
 
-Independent Replace presentations validate each overwritten color/extra layer and its recursive
-LF dependencies before returning the final producer's native output. Truncated hidden Modular,
+Independent Replace presentations validate each overwritten color/extra layer before returning
+the final producer's native output. LF sequences execute every physical node once, retain only
+the reference planes through their last consumer, and accept Modular or VarDCT LF roots and
+LF-dependent SkipProgressive frames. Truncated hidden Modular,
 VarDCT, and DC data are rejected through blocking and async completion. A 129-layer Gray31 still
 preserves exact integer codes while reusing the first layer's GPU memory footprint.
 

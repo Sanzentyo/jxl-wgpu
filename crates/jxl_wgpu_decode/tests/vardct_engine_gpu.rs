@@ -788,7 +788,7 @@ fn progressive_ac_combines_with_recursive_gpu_resident_dc() {
             .unwrap();
         assert!(matches!(
             session.submission_session(),
-            WgpuDecodeSubmissionSession::ProgressiveDc(_)
+            WgpuDecodeSubmissionSession::Sequence(_)
         ));
         let frame = pollster::block_on(session.next_frame_async())
             .unwrap()
@@ -2675,13 +2675,13 @@ fn libjxl_progressive_dc_chain_stays_gpu_resident_until_one_visible_output() {
         .unwrap();
     assert!(matches!(
         session.submission_session(),
-        WgpuDecodeSubmissionSession::ProgressiveDc(_)
+        WgpuDecodeSubmissionSession::Sequence(_)
     ));
-    assert_eq!(session.submission_session().submissions_per_frame(), 2);
 
     let frame = pollster::block_on(session.next_frame_async())
         .unwrap()
         .unwrap();
+    assert_eq!(session.submission_session().submissions_per_frame(), 2);
     assert!(session.next_frame().unwrap().is_none());
     let readback = ImageReadbackPipeline::new(&backend)
         .submit(frame.output())
@@ -2735,20 +2735,19 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
         .unwrap();
     assert!(matches!(
         session.submission_session(),
-        WgpuDecodeSubmissionSession::ProgressiveDc(_)
+        WgpuDecodeSubmissionSession::Sequence(_)
     ));
-    assert_eq!(session.submission_session().submissions_per_frame(), 4);
+
     session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
     assert!(matches!(
         session
             .front_pending_frame()
             .unwrap()
             .unvalidated_gpu_frame(),
-        Err(DecodeError::VarDct(
-            VarDctDecodeError::UnvalidatedOutputNotSubmitted
-        ))
+        Err(DecodeError::UnvalidatedOutputNotSubmitted)
     ));
     let frame = session.next_frame().unwrap().unwrap();
+    assert_eq!(session.submission_session().submissions_per_frame(), 4);
     assert!(session.next_frame().unwrap().is_none());
     let readback = ImageReadbackPipeline::new(&backend)
         .submit(frame.output())
@@ -2819,6 +2818,10 @@ fn multi_level_progressive_dc_executes_general_single_packet_ac_on_gpu() {
         )) if requested_bytes > 0
     ));
     drop(budget_blocker);
+    assert!(matches!(
+        probe.next_frame(),
+        Err(DecodeError::SessionPoisoned)
+    ));
     drop(probe);
     let fence = backend.queue().submit(std::iter::empty());
     backend

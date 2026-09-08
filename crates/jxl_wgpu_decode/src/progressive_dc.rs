@@ -8,7 +8,10 @@
 use std::num::NonZeroU64;
 
 use bytemuck::{Pod, Zeroable};
-use jxl_wgpu::{KernelPolicy, KernelVariant, ResidentStorageBinding};
+use jxl_wgpu::{
+    GpuBufferLease, KernelPolicy, KernelVariant, MemoryPermit, MemoryPermitSplitError,
+    ResidentStorageBinding,
+};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -27,7 +30,7 @@ pub(crate) const DEFAULT_PROGRESSIVE_DC_VARIANT: KernelVariant = KernelVariant::
 /// One owned GPU-resident F32 XYB plane.
 #[derive(Clone, Debug)]
 pub(crate) struct ProgressiveDcXybPlane {
-    pub(crate) buffer: wgpu::Buffer,
+    pub(crate) buffer: GpuBufferLease,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) stride: u32,
@@ -42,8 +45,8 @@ impl ProgressiveDcXybPlane {
 
 /// Three owned GPU-resident planar F32 buffers in `[X, Y, B]` order.
 ///
-/// `wgpu::Buffer` handles are cloneable references to the same GPU allocation, so cloning this
-/// value is inexpensive and preserves the ability to retain the planes across submissions.
+/// Cloning retains both the allocation and its byte reservation across submissions. Producer
+/// scratch can be released as soon as validation completes, independently of LF consumers.
 #[derive(Clone, Debug)]
 pub(crate) struct ProgressiveDcXybPlanes {
     pub(crate) planes: [ProgressiveDcXybPlane; 3],
@@ -59,6 +62,7 @@ impl ProgressiveDcXybPlanes {
         width: u32,
         height: u32,
         stride: u32,
+        permit: &mut MemoryPermit,
     ) -> Result<Self, ProgressiveDcGpuError> {
         let stride = normalized_stride(width, height, stride, "XYB output")?;
         let required_scalars = required_plane_scalars(width, height, stride, "XYB output scalars")?;
@@ -76,13 +80,22 @@ impl ProgressiveDcXybPlanes {
             "jxl-wgpu progressive-DC Y plane",
             "jxl-wgpu progressive-DC B plane",
         ];
-        let planes = std::array::from_fn(|index| ProgressiveDcXybPlane {
-            buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(labels[index]),
-                size: required_bytes,
-                usage,
-                mapped_at_creation: false,
-            }),
+        let reservations = [
+            permit.split_off(required_bytes)?,
+            permit.split_off(required_bytes)?,
+            permit.split_off(required_bytes)?,
+        ];
+        let mut labels = labels.into_iter();
+        let planes = reservations.map(|reservation| ProgressiveDcXybPlane {
+            buffer: GpuBufferLease::from_tracked(
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: labels.next(),
+                    size: required_bytes,
+                    usage,
+                    mapped_at_creation: false,
+                }),
+                reservation,
+            ),
             width,
             height,
             stride,
@@ -95,8 +108,8 @@ impl ProgressiveDcXybPlanes {
     /// Buffer usage, range, and device-limit checks are deferred to [`ProgressiveDcPipeline`] so
     /// this constructor can remain independent of a device handle while still validating all
     /// geometry and arithmetic that is intrinsic to the representation.
-    pub(crate) fn from_buffers(
-        buffers: [wgpu::Buffer; 3],
+    pub(crate) fn from_leases(
+        buffers: [GpuBufferLease; 3],
         width: u32,
         height: u32,
         stride: u32,
@@ -184,6 +197,8 @@ pub(crate) struct ProgressiveDcPackParams {
 /// Typed errors raised before a progressive-DC dispatch is recorded.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProgressiveDcGpuError {
+    #[error("progressive-DC plane reservation: {0}")]
+    MemoryPartition(#[from] MemoryPermitSplitError),
     #[error("progressive-DC {role} has an empty {axis} extent")]
     EmptyExtent {
         role: &'static str,
@@ -348,7 +363,7 @@ impl ProgressiveDcPipeline {
             .outputs
             .planes
             .iter()
-            .map(|plane| entire_storage_binding(&plane.buffer))
+            .map(|plane| entire_storage_binding(plane.buffer.as_wgpu_buffer()))
             .collect::<Result<Vec<_>, _>>()?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jxl-wgpu progressive-DC conversion bindings"),
@@ -399,7 +414,7 @@ impl ProgressiveDcPipeline {
             .planes
             .planes
             .iter()
-            .map(|plane| entire_storage_binding(&plane.buffer))
+            .map(|plane| entire_storage_binding(plane.buffer.as_wgpu_buffer()))
             .collect::<Result<Vec<_>, _>>()?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jxl-wgpu progressive-DC LF packing bindings"),
@@ -715,7 +730,7 @@ fn validate_xyb_outputs(
                 field: "XYB output bytes",
             },
         )?;
-        let binding = entire_storage_binding(&output.buffer)?;
+        let binding = entire_storage_binding(output.buffer.as_wgpu_buffer())?;
         validate_storage_binding(device, "XYB output", binding, required_bytes, F32_BYTES)?;
         strides[plane] = output.stride;
     }

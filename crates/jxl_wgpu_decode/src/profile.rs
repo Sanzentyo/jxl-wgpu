@@ -1942,9 +1942,9 @@ mod tests {
                 &codestream,
                 &projected,
                 if is_final {
-                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcFinal
+                    crate::vardct_frontend::VarDctFrameRole::Frame
                 } else {
-                    crate::vardct_frontend::VarDctFrameRole::ProgressiveDcRefinement
+                    crate::vardct_frontend::VarDctFrameRole::LowFrequency
                 },
             )
             .unwrap();

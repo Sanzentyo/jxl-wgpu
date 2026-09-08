@@ -22,6 +22,7 @@ use jxl_wgpu::{
 use super::sequence::{SequenceSource, submission_counter};
 use super::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
 use crate::frame_surface::FrameSurfaceEncoding;
+use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{
     Error, FrameExecutionPlan, FrameMetadata, FramePlanError, GpuCodestream, GpuOutputRequest,
     GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
@@ -97,10 +98,61 @@ pub(super) fn needs_surface(
 }
 
 #[derive(Debug)]
+enum Output {
+    Native,
+    Composed(Arc<Compositor>),
+}
+
+impl Output {
+    fn compositor(&self) -> Result<&Compositor> {
+        match self {
+            Self::Composed(compositor) => Ok(compositor),
+            Self::Native => Err(Error::EngineContract(
+                "native sequence requested composition",
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LfFrame {
+    frame_index: u32,
+    last_use: u32,
+    planes: ProgressiveDcXybPlanes,
+}
+
+#[derive(Debug)]
 struct Carry {
     source: SequenceSource,
     references: [Option<Surface>; 4],
+    lf: [Option<LfFrame>; 4],
     prepared: Option<WgpuDecodeSubmissionSession>,
+}
+
+impl Carry {
+    fn prepare(
+        &self,
+        index: usize,
+        node: &crate::FrameExecutionNode,
+    ) -> Result<WgpuDecodeSubmissionSession> {
+        let mut session = self.source.prepare_physical(index)?.session;
+        if let Some(source) = node.lf_source_frame {
+            let level = self.source.inventory.frames[index].lf_level;
+            let planes = self
+                .lf
+                .get(level as usize)
+                .and_then(Option::as_ref)
+                .filter(|lf| lf.frame_index == source)
+                .ok_or(Error::EngineContract(
+                    "LF slot version does not match the execution plan",
+                ))?;
+            let WgpuDecodeSubmissionSession::VarDct(producer) = &mut session else {
+                return Err(Error::EngineContract("LF consumer is not VarDCT"));
+            };
+            producer.set_progressive_dc_source(planes.planes.clone())?;
+        }
+        Ok(session)
+    }
 }
 
 #[derive(Debug)]
@@ -113,13 +165,13 @@ struct Shared {
 /// The session and its one active presentation share only a handoff cell. GPU completion never
 /// locks the cell: the pending state returns the next reference version after validation.
 #[derive(Debug)]
-pub(super) struct CompositionSession {
+pub(super) struct DependentSession {
     shared: Arc<Mutex<Shared>>,
-    compositor: Arc<Compositor>,
+    output: Arc<Output>,
     submissions: Arc<AtomicUsize>,
 }
 
-impl CompositionSession {
+impl DependentSession {
     pub(super) fn new(
         engine: WgpuDecodeEngine,
         codestream: Arc<GpuCodestream>,
@@ -127,81 +179,39 @@ impl CompositionSession {
         request: &GpuOutputRequest,
         plan: &FrameExecutionPlan,
     ) -> Result<Self> {
-        validate(inventory, plan)?;
-        let image = &inventory.image_header;
-        if inventory
-            .frames
-            .iter()
-            .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct)
-            && matches!(request.format().color_spec, jxl_gpu_formats::ColorSpecification::Defined(color)
-                if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
-        {
-            return Err(crate::VarDctDecodeError::Output(
-                crate::color_output::ColorOutputError::HdrLuminanceMappingRequired,
-            )
-            .into());
-        }
-        let working = GpuOutputRequest::color(PixelFormat::rgb_f32(
-            RgbChannelOrder::Rgb,
-            true,
-            crate::vardct_rgb8_format().color_spec,
-        ))?
-        .for_frame_surface(FrameSurfaceEncoding::Srgb)
-        .with_max_frame_slots(request.max_frame_slots());
-        let compositor = Arc::new(Compositor::new(
-            engine.backend().clone(),
-            Extent2d::new(image.width, image.height),
-            &image.extra_channels,
-            image.grayscale,
-            image.bit_depth,
-            OutputOrientation::from_exif_value(image.orientation).ok_or(
-                Error::InvalidImageOrientation {
-                    value: image.orientation,
+        let (source, output) = if needs_surface(inventory, request, plan) {
+            let (source, compositor) =
+                composed_source(engine, codestream, inventory, request, plan)?;
+            (source, Output::Composed(compositor))
+        } else {
+            (
+                SequenceSource {
+                    engine,
+                    codestream,
+                    inventory: inventory.clone(),
+                    request: request.clone(),
+                    surface_encodings: None,
                 },
-            )?,
-            request,
-        )?);
-        let source = SequenceSource {
-            engine,
-            codestream,
-            inventory: inventory.clone(),
-            request: working,
-            surface_encodings: Some(
-                plan.nodes
-                    .iter()
-                    .zip(&inventory.frames)
-                    .map(|(node, frame)| {
-                        if image.xyb_encoded
-                            && !frame.do_ycbcr
-                            && !node.needs_composition
-                            && (node.save_reference.is_none() || frame.save_before_color_transform)
-                        {
-                            FrameSurfaceEncoding::Linear
-                        } else {
-                            FrameSurfaceEncoding::Srgb
-                        }
-                    })
-                    .collect(),
-            ),
+                Output::Native,
+            )
         };
         // Initial metadata and output negotiation is performed at open, like the still engines.
         // Subsequent physical producers are prepared one at a time while their pending frame runs.
-        let first = source.next_producer(
-            plan.presentations[0].physical_frames.start,
-            plan.presentations[0].physical_frames.end,
-        )?;
-        let prepared = Some(source.prepare_physical(first)?.session);
+        let first = plan.presentations[0].physical_frames.start;
+        let mut carry = Carry {
+            source,
+            references: std::array::from_fn(|_| None),
+            lf: std::array::from_fn(|_| None),
+            prepared: None,
+        };
+        carry.prepared = Some(carry.prepare(first, &plan.nodes[first])?);
         Ok(Self {
             shared: Arc::new(Mutex::new(Shared {
-                carry: Some(Carry {
-                    source,
-                    references: std::array::from_fn(|_| None),
-                    prepared,
-                }),
+                carry: Some(carry),
                 in_flight: None,
                 failed: false,
             })),
-            compositor,
+            output: Arc::new(output),
             submissions: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -214,7 +224,7 @@ impl CompositionSession {
         &mut self,
         plan: &FrameExecutionPlan,
         index: usize,
-    ) -> Result<CompositionPending> {
+    ) -> Result<DependentPending> {
         let mut shared = lock(&self.shared);
         if shared.failed {
             return Err(Error::SessionPoisoned);
@@ -227,12 +237,9 @@ impl CompositionSession {
             .carry
             .as_mut()
             .ok_or(Error::EngineContract("composition source was lost"))?;
-        let physical = carry.source.next_producer(
-            presentation.physical_frames.start,
-            presentation.physical_frames.end,
-        )?;
+        let physical = presentation.physical_frames.start;
         if carry.prepared.is_none() {
-            carry.prepared = Some(carry.source.prepare_physical(physical)?.session);
+            carry.prepared = Some(carry.prepare(physical, &plan.nodes[physical])?);
         }
         let producer = carry.prepared.as_mut().expect("physical producer prepared");
         let pending = producer
@@ -243,21 +250,94 @@ impl CompositionSession {
         // Nothing leaves the queue until the first physical GPU submission is admitted.
         let carry = shared.carry.take().expect("physical producer admitted");
         shared.in_flight = Some(index);
-        self.submissions.store(0, Ordering::Release);
-        Ok(CompositionPending {
+        self.submissions
+            .store(count.load(Ordering::Acquire), Ordering::Release);
+        Ok(DependentPending {
             shared: Arc::clone(&self.shared),
             carry: Some(carry),
-            compositor: Arc::clone(&self.compositor),
+            output: Arc::clone(&self.output),
             metadata: presentation.metadata.clone(),
             nodes: plan.nodes[presentation.physical_frames.clone()].to_vec(),
             first: presentation.physical_frames.start,
             end: presentation.physical_frames.end,
             physical,
-            stage: Some(Stage::Decode(Box::new(pending), count)),
+            stage: Some(Stage::Decode {
+                pending: Box::new(pending),
+                count,
+                lf: None,
+            }),
             submissions: Arc::clone(&self.submissions),
+            completed_submissions: 0,
             finished: false,
         })
     }
+}
+
+fn composed_source(
+    engine: WgpuDecodeEngine,
+    codestream: Arc<GpuCodestream>,
+    inventory: &CodestreamInventory,
+    request: &GpuOutputRequest,
+    plan: &FrameExecutionPlan,
+) -> Result<(SequenceSource, Arc<Compositor>)> {
+    validate(inventory, plan)?;
+    let image = &inventory.image_header;
+    if inventory
+        .frames
+        .iter()
+        .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct)
+        && matches!(request.format().color_spec, jxl_gpu_formats::ColorSpecification::Defined(color)
+                if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
+    {
+        return Err(crate::VarDctDecodeError::Output(
+            crate::color_output::ColorOutputError::HdrLuminanceMappingRequired,
+        )
+        .into());
+    }
+    let working = GpuOutputRequest::color(PixelFormat::rgb_f32(
+        RgbChannelOrder::Rgb,
+        true,
+        crate::vardct_rgb8_format().color_spec,
+    ))?
+    .for_frame_surface(FrameSurfaceEncoding::Srgb)
+    .with_max_frame_slots(request.max_frame_slots());
+    let compositor = Arc::new(Compositor::new(
+        engine.backend().clone(),
+        Extent2d::new(image.width, image.height),
+        &image.extra_channels,
+        image.grayscale,
+        image.bit_depth,
+        OutputOrientation::from_exif_value(image.orientation).ok_or(
+            Error::InvalidImageOrientation {
+                value: image.orientation,
+            },
+        )?,
+        request,
+    )?);
+    let source = SequenceSource {
+        engine,
+        codestream,
+        inventory: inventory.clone(),
+        request: working,
+        surface_encodings: Some(
+            plan.nodes
+                .iter()
+                .zip(&inventory.frames)
+                .map(|(node, frame)| {
+                    if image.xyb_encoded
+                        && !frame.do_ycbcr
+                        && !node.needs_composition
+                        && (node.save_reference.is_none() || frame.save_before_color_transform)
+                    {
+                        FrameSurfaceEncoding::Linear
+                    } else {
+                        FrameSurfaceEncoding::Srgb
+                    }
+                })
+                .collect(),
+        ),
+    };
+    Ok((source, compositor))
 }
 
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
@@ -324,16 +404,20 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
 
 #[derive(Debug)]
 enum Stage {
-    Decode(Box<WgpuDecodePendingFrame>, Arc<AtomicUsize>),
+    Decode {
+        pending: Box<WgpuDecodePendingFrame>,
+        count: Arc<AtomicUsize>,
+        lf: Option<ProgressiveDcXybPlanes>,
+    },
     Blend(GpuWork),
     Pack(GpuWork),
 }
 
 #[derive(Debug)]
-pub(super) struct CompositionPending {
+pub(super) struct DependentPending {
     shared: Arc<Mutex<Shared>>,
     carry: Option<Carry>,
-    compositor: Arc<Compositor>,
+    output: Arc<Output>,
     metadata: FrameMetadata,
     nodes: Vec<crate::FrameExecutionNode>,
     first: usize,
@@ -341,109 +425,176 @@ pub(super) struct CompositionPending {
     physical: usize,
     stage: Option<Stage>,
     submissions: Arc<AtomicUsize>,
+    completed_submissions: usize,
     finished: bool,
 }
 
-impl CompositionPending {
+impl DependentPending {
     pub(super) fn unvalidated(&self) -> Result<UnvalidatedGpuImageFrame> {
-        let Some(Stage::Pack(work)) = &self.stage else {
-            return Err(Error::UnvalidatedOutputNotSubmitted);
-        };
-        Ok(UnvalidatedGpuImageFrame {
-            token: SubmissionToken(1),
-            outputs: vec![UnvalidatedGpuImageOutput {
-                id: OutputId(0),
-                layout: self.compositor.layout.clone(),
-                buffer: work.unvalidated()?,
-            }],
-        })
+        match (&*self.output, &self.stage) {
+            (Output::Native, Some(Stage::Decode { pending, .. }))
+                if self.physical + 1 == self.end =>
+            {
+                pending.unvalidated_gpu_frame()
+            }
+            (Output::Composed(compositor), Some(Stage::Pack(work))) => {
+                Ok(UnvalidatedGpuImageFrame {
+                    token: SubmissionToken(1),
+                    outputs: vec![UnvalidatedGpuImageOutput {
+                        id: OutputId(0),
+                        layout: compositor.layout.clone(),
+                        buffer: work.unvalidated()?,
+                    }],
+                })
+            }
+            _ => Err(Error::UnvalidatedOutputNotSubmitted),
+        }
     }
 
     fn decoded(
         &mut self,
         frame: SubmittedGpuFrame<GpuImageFrame>,
         count: &AtomicUsize,
-    ) -> Result<()> {
-        self.submissions
-            .fetch_add(count.load(Ordering::Acquire), Ordering::AcqRel);
+        lf: Option<ProgressiveDcXybPlanes>,
+    ) -> Result<Option<SubmittedGpuFrame<GpuImageFrame>>> {
+        self.completed_submissions =
+            update_count(self.completed_submissions, count, &self.submissions)?;
+        let carry = self
+            .carry
+            .as_mut()
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
+        let node = &self.nodes[self.physical - self.first];
+        let header = &carry.source.inventory.frames[self.physical];
+        // Validation has released this consumer's scratch and its LF input ownership. Clear
+        // expired slot versions before admitting the next producer, including across presentations.
+        for slot in &mut carry.lf {
+            if slot
+                .as_ref()
+                .is_some_and(|lf| lf.last_use <= node.frame_index)
+            {
+                *slot = None;
+            }
+        }
+        if header.frame_type == FrameType::LowFrequency {
+            carry.lf[header.lf_level as usize - 1] = match node.lf_last_use {
+                Some(last_use) => Some(LfFrame {
+                    frame_index: node.frame_index,
+                    last_use,
+                    planes: lf.ok_or(Error::EngineContract(
+                        "validated LF producer lost its planes",
+                    ))?,
+                }),
+                None => None,
+            };
+            drop(frame);
+            self.advance()?;
+            return Ok(None);
+        }
+        match &*self.output {
+            Output::Native => {
+                if self.physical + 1 == self.end {
+                    return self.finish_output(frame.output).map(Some);
+                }
+                drop(frame);
+                self.advance()?;
+            }
+            Output::Composed(compositor) => {
+                let surface = compositor.import(frame.output.outputs)?;
+                if node.needs_composition {
+                    self.stage = Some(Stage::Blend(compositor.blend(
+                        &surface,
+                        &carry.references,
+                        header,
+                    )?));
+                    self.submissions.fetch_add(1, Ordering::AcqRel);
+                    self.completed_submissions += 1;
+                } else {
+                    self.record(surface)?;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.physical += 1;
+        if self.physical >= self.end {
+            return Err(Error::EngineContract(
+                "presentation ended without a color producer",
+            ));
+        }
         let carry = self
             .carry
             .as_ref()
-            .ok_or(Error::EngineContract("composition carry was lost"))?;
-        let surface = self.compositor.import(frame.output.outputs)?;
-        let node = &self.nodes[self.physical - self.first];
-        if node.needs_composition {
-            let header = &carry.source.inventory.frames[self.physical];
-            self.stage = Some(Stage::Blend(self.compositor.blend(
-                &surface,
-                &carry.references,
-                header,
-            )?));
-            self.submissions.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        } else {
-            self.record(surface)
-        }
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
+        let mut prepared = carry.prepare(self.physical, &self.nodes[self.physical - self.first])?;
+        let pending = prepared
+            .submit_next()?
+            .ok_or(Error::EngineContract("physical producer returned no frame"))?;
+        let count = submission_counter(&pending, prepared.submissions_per_frame());
+        update_count(self.completed_submissions, &count, &self.submissions)?;
+        self.stage = Some(Stage::Decode {
+            pending: Box::new(pending),
+            count,
+            lf: None,
+        });
+        Ok(())
     }
 
     fn record(&mut self, surface: Surface) -> Result<()> {
         let carry = self
             .carry
             .as_mut()
-            .ok_or(Error::EngineContract("composition carry was lost"))?;
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
         let node = &self.nodes[self.physical - self.first];
         let header = &carry.source.inventory.frames[self.physical];
         if let Some(slot) = node.save_reference {
-            // Pre-transform references belong to patches, which this producer does not yet
-            // execute. Never reinterpret an RGB surface as XYB/YCbCr patch storage.
+            // Pre-transform references belong to patches. Never reinterpret RGB as XYB/YCbCr.
             carry.references[slot as usize] =
                 (!header.save_before_color_transform).then(|| surface.clone());
         }
         if self.physical + 1 == self.end {
-            self.stage = Some(Stage::Pack(self.compositor.pack(&surface)?));
+            self.stage = Some(Stage::Pack(self.output.compositor()?.pack(&surface)?));
             self.submissions.fetch_add(1, Ordering::AcqRel);
+            self.completed_submissions += 1;
         } else {
-            self.physical = carry.source.next_producer(self.physical + 1, self.end)?;
-            let mut prepared = carry.source.prepare_physical(self.physical)?.session;
-            let pending = prepared
-                .submit_next()?
-                .ok_or(Error::EngineContract("physical producer returned no frame"))?;
-            let count = submission_counter(&pending, prepared.submissions_per_frame());
-            self.stage = Some(Stage::Decode(Box::new(pending), count));
+            self.advance()?;
         }
         Ok(())
+    }
+
+    fn finish_output(&mut self, output: GpuImageFrame) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
+        let carry = self
+            .carry
+            .take()
+            .ok_or(Error::EngineContract("dependent sequence finished twice"))?;
+        let mut shared = lock(&self.shared);
+        shared.in_flight = None;
+        shared.carry = (!self.metadata.is_last).then_some(carry);
+        self.finished = true;
+        Ok(SubmittedGpuFrame::new(self.metadata.clone(), output))
     }
 
     fn finish(
         &mut self,
         buffer: jxl_wgpu::GpuBufferLease,
     ) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
-        let carry = self
-            .carry
-            .take()
-            .ok_or(Error::EngineContract("composition finished twice"))?;
-        let mut shared = lock(&self.shared);
-        shared.in_flight = None;
-        shared.carry = (!self.metadata.is_last).then_some(carry);
-        self.finished = true;
-        let extent = self.compositor.layout.extent;
-        Ok(SubmittedGpuFrame::new(
-            self.metadata.clone(),
-            GpuImageFrame {
-                token: SubmissionToken(1),
-                outputs: vec![GpuImageOutput {
-                    id: OutputId(0),
-                    layout: self.compositor.layout.clone(),
-                    buffer,
-                }],
-                changed: ChangedRegions {
-                    outputs: BTreeMap::from([(
-                        OutputId(0),
-                        vec![Region::new(0, 0, extent.width, extent.height)],
-                    )]),
-                },
+        let compositor = self.output.compositor()?;
+        let extent = compositor.layout.extent;
+        self.finish_output(GpuImageFrame {
+            token: SubmissionToken(1),
+            outputs: vec![GpuImageOutput {
+                id: OutputId(0),
+                layout: compositor.layout.clone(),
+                buffer,
+            }],
+            changed: ChangedRegions {
+                outputs: BTreeMap::from([(
+                    OutputId(0),
+                    vec![Region::new(0, 0, extent.width, extent.height)],
+                )]),
             },
-        ))
+        })
     }
 
     pub(super) fn poll(
@@ -454,17 +605,33 @@ impl CompositionPending {
             let stage = self
                 .stage
                 .as_mut()
-                .ok_or(Error::EngineContract("composition stage was lost"))?;
+                .ok_or(Error::EngineContract("dependent sequence stage was lost"))?;
             match stage {
-                Stage::Decode(pending, _) => {
-                    let frame = match Pin::new(pending.as_mut()).poll_complete(context) {
+                Stage::Decode { pending, lf, count } => {
+                    if self.nodes[self.physical - self.first].lf_last_use.is_some() && lf.is_none()
+                    {
+                        if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
+                            let result = pending.poll_until_dependency_submitted(context);
+                            update_count(self.completed_submissions, count, &self.submissions)?;
+                            match result {
+                                Poll::Pending => return Poll::Pending,
+                                Poll::Ready(result) => result?,
+                            }
+                        }
+                        *lf = Some(lf_planes(pending)?);
+                    }
+                    let result = Pin::new(pending.as_mut()).poll_complete(context);
+                    update_count(self.completed_submissions, count, &self.submissions)?;
+                    let frame = match result {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result?,
                     };
-                    let Some(Stage::Decode(_, count)) = self.stage.take() else {
+                    let Some(Stage::Decode { count, lf, .. }) = self.stage.take() else {
                         unreachable!()
                     };
-                    self.decoded(frame, &count)?;
+                    if let Some(frame) = self.decoded(frame, &count, lf)? {
+                        return Poll::Ready(Ok(frame));
+                    }
                 }
                 Stage::Blend(work) => {
                     let buffer = match work.poll(context) {
@@ -472,7 +639,7 @@ impl CompositionPending {
                         Poll::Ready(result) => result?,
                     };
                     self.stage = None;
-                    self.record(self.compositor.completed_surface(buffer))?;
+                    self.record(self.output.compositor()?.completed_surface(buffer))?;
                 }
                 Stage::Pack(work) => {
                     let buffer = match work.poll(context) {
@@ -492,11 +659,26 @@ impl CompositionPending {
             match self
                 .stage
                 .take()
-                .ok_or(Error::EngineContract("composition stage was lost"))?
+                .ok_or(Error::EngineContract("dependent sequence stage was lost"))?
             {
-                Stage::Decode(pending, count) => self.decoded(pending.wait()?, &count)?,
+                Stage::Decode {
+                    mut pending,
+                    count,
+                    mut lf,
+                } => {
+                    if self.nodes[self.physical - self.first].lf_last_use.is_some() && lf.is_none()
+                    {
+                        if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
+                            pending.wait_until_dependency_submitted()?;
+                        }
+                        lf = Some(lf_planes(&pending)?);
+                    }
+                    if let Some(frame) = self.decoded(pending.wait()?, &count, lf)? {
+                        return Ok(frame);
+                    }
+                }
                 Stage::Blend(work) => {
-                    self.record(self.compositor.completed_surface(work.wait()?))?;
+                    self.record(self.output.compositor()?.completed_surface(work.wait()?))?;
                 }
                 Stage::Pack(work) => return self.finish(work.wait()?),
             }
@@ -504,7 +686,27 @@ impl CompositionPending {
     }
 }
 
-impl Drop for CompositionPending {
+fn lf_planes(pending: &WgpuDecodePendingFrame) -> Result<ProgressiveDcXybPlanes> {
+    match pending {
+        WgpuDecodePendingFrame::Modular(pending) => pending.progressive_dc_planes(),
+        WgpuDecodePendingFrame::VarDct(pending) => Ok(pending.progressive_dc_planes()?),
+        WgpuDecodePendingFrame::Sequence(_) => {
+            Err(Error::EngineContract("LF producer is a sequence"))
+        }
+    }
+}
+
+fn update_count(completed: usize, active: &AtomicUsize, total: &AtomicUsize) -> Result<usize> {
+    let count = completed
+        .checked_add(active.load(Ordering::Acquire))
+        .ok_or(Error::EngineContract(
+            "sequence submission count overflowed",
+        ))?;
+    total.store(count, Ordering::Release);
+    Ok(count)
+}
+
+impl Drop for DependentPending {
     fn drop(&mut self) {
         if !self.finished {
             let mut shared = lock(&self.shared);

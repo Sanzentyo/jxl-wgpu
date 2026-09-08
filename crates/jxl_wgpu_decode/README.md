@@ -363,7 +363,7 @@ clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color
 color management, pre-transform references, patches, splines and noise remain separate work.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
-exact earlier LF producers, the four reference-slot versions before each frame, save-before/after
+exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after
 color-transform metadata, and whether the frame needs canvas composition. Presentation metadata
 retains orientation-normalized extent, rational timebase, loop count (including zero for infinite
 looping), accumulated ticks, exact timecode, finality, and UTF-8 name. The plan is backend-neutral;
@@ -372,17 +372,19 @@ it does not reconstruct pixels or entropy on the CPU.
 `WgpuDecodeEngine` executes full-canvas Replace sequences using Modular, VarDCT, or a mixture of
 JPEG-transcode VarDCT and non-XYB Modular. Recursive progressive-DC chains may precede each
 presentation. A Replace presentation completely supersedes earlier zero-duration Replace layers,
-but every color/extra producer and its recursive LF dependency closure still decode and validate.
+but every physical color/extra/LF producer still decodes and validates exactly once. Unused and
+overwritten LF versions are included; consumers reuse the exact planned slot version.
 Each overwritten output is released before the next physical producer is admitted. Only the final
 producer's output is presented, retaining exact native integer codes without an F32 intermediate.
 Layered stills and a final zero-duration animation frame are covered.
 
 `DecodeProfile::FrameSequence` reports physical/presentation counts. `FrameSequenceSession` exposes
-the execution plan. Each independently pending presentation prepares one color producer and its
-LF closure at a time; immutable inventory/source spans are shared across the bounded prefetch window.
+the execution plan. Independent presentations prepare one producer at a time and share immutable
+inventory/source spans across the bounded prefetch window. LF or composition dependencies use
+a serial physical executor; dependent prefetch reports `FrameDependency` while one presentation runs.
 Blocking, polling, and futures advance the same validated physical stages. Prefetch preserves ordering,
-initial byte-budget pressure leaves the next producer available for retry, and progressive-DC root admission
-no longer consumes the dependency chain on failure. Source spans remain under the shared input
+initial byte-budget pressure leaves the first physical producer available for retry. Once a
+presentation has started, a later admission failure poisons the session. Source spans remain under the shared input
 budget until their last dependent submission; cancellation and output clones retain the existing
 callback/lease ownership contract. Submission counts accumulate every physical producer, including
 late VarDCT continuations. Frame-specific syntax/output errors surface when that producer is prepared;
@@ -404,8 +406,8 @@ under a GPU budget restricted to the first producer's footprint. Their submissio
 every layer. Cancelling before validation or after advancing several hidden layers releases all
 input/GPU reservations after callbacks retire.
 
-Sequences containing crops, blends, or reference-only frames decode every physical color producer
-and its LF dependency closure, including hidden zero-duration layers. The working surface is
+Sequences containing crops, blends, or reference-only frames use the same ordered LF/physical
+executor, including hidden zero-duration layers. The working surface is
 unrounded, unrotated planar F32 RGB in the original enumerated D65 sRGB encoding, followed by
 every extra plane at its own normalized depth. Up to four reference
 slots retain accounted buffer leases; an overwritten slot releases its old version after any
@@ -543,10 +545,18 @@ horizontal/vertical quarter/three-quarter resident upsample before the full-reso
 cursor, while unshifted component buffers are reused directly. All destination planes and 32-byte
 `Pod` uniforms are included in the shared byte budget. The interpolation primitive is actual-GPU
 tested on horizontal, vertical, two-axis, odd-edge cases; a valid subsampled-restoration codestream
-fixture is still needed for end-to-end libjxl conformance. A separate stock path accepts recursive
-progressive-DC dependencies. It keeps three F32
-XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
-hidden and visible status, and publishes only the final frame. A single-entry intermediate frame
+fixture is still needed for end-to-end libjxl conformance. The common frame executor accepts
+recursive progressive-DC dependencies, including VarDCT roots without an LF source and
+LF-dependent SkipProgressive frames. These stills expose `DecodeProfile::FrameSequence` and
+`WgpuDecodeSubmissionSession::Sequence`. It keeps three F32 XYB planes resident, uses 96-byte conversion and 48-byte LF-pack `Pod` uniforms, validates every
+hidden and visible status, and publishes only complete presentations. A physical LF node is
+decoded once, even when unused, overwritten, or shared across multiple presentations. The plan
+checks LF flags, levels, exact slot versions and sample/block extents before submission.
+`MemoryPermit::split_off` transfers each plane's actual byte reservation from producer scratch
+into a `GpuBufferLease` without readmission. VarDCT LF capture selects the final pre-color-transform
+planes after restoration and frame upsampling, with that output geometry and stride. Gaborish and
+2× LF variants match both independent decoders. Four versioned LF slots retain these leases through
+the last consumer; expired planes and validated scratch are released before the next admission. A single-entry intermediate frame
 first executes HF metadata on GPU, maps its bounded HF-global cursor, host-parses only scalar
 HF-global tables, and resumes general AC plus downstream reconstruction on the same queue.
 Global-only Modular roots run their inverse/conversion and final status map in the last DC-global

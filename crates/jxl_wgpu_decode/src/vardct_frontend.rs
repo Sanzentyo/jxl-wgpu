@@ -1197,8 +1197,7 @@ fn jpeg_channel_shifts(jpeg_upsampling: [u32; 3]) -> [VarDctChannelShift; 3] {
 pub(crate) enum VarDctFrameRole {
     Presentation,
     Frame,
-    ProgressiveDcRefinement,
-    ProgressiveDcFinal,
+    LowFrequency,
 }
 
 fn group_rect(
@@ -1326,15 +1325,11 @@ fn validate_frame(
                 FrameType::Regular | FrameType::SkipProgressive | FrameType::ReferenceOnly
             ) || frame.lf_level != 0
         }
-        VarDctFrameRole::ProgressiveDcRefinement => {
+        VarDctFrameRole::LowFrequency => {
             frame.frame_type != FrameType::LowFrequency
                 || frame.is_last
-                || !frame.uses_lf_frame()
                 || frame.lf_level == 0
                 || !frame.save_before_color_transform
-        }
-        VarDctFrameRole::ProgressiveDcFinal => {
-            frame.frame_type != FrameType::Regular || !frame.uses_lf_frame() || frame.lf_level != 0
         }
     };
     if role_is_invalid || frame.is_preview {
@@ -1344,7 +1339,7 @@ fn validate_frame(
         return unsupported(UnsupportedVarDctFeature::ModularFrame);
     }
     // Noise, patches, splines, and unknown frame extensions remain outside the transform
-    // capability. LF-frame reuse is accepted only by the recursive progressive-DC entry point.
+    // capability. LF-frame reuse is resolved by the common physical frame executor.
     let supported_flags = if role == VarDctFrameRole::Presentation {
         0x80
     } else {

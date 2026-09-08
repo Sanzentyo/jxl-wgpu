@@ -7,14 +7,14 @@ use jxl_gpu_bitstream::{CodestreamInventory, FrameEncoding, FrameType};
 use jxl_wgpu::{GpuImageFrame, UnvalidatedGpuImageFrame};
 
 use crate::{
-    DecodeProfile, Error, FrameExecutionPlan, GpuCodestream, GpuOutputRequest, GpuPendingFrame,
+    DecodeProfile, FrameExecutionPlan, GpuCodestream, GpuOutputRequest, GpuPendingFrame,
     PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
-use super::composition::{CompositionPending, CompositionSession};
+use super::composition::{DependentPending, DependentSession};
 use super::{
-    ProgressiveDcPlan, WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession,
-    map_modular, map_vardct, project_frame_inventory, validate_codestream_limit,
+    WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession, map_modular, map_vardct,
+    project_frame_inventory, validate_codestream_limit,
 };
 use crate::GpuSubmissionEngine;
 
@@ -30,9 +30,14 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        let (execution, slots) = if super::composition::needs_surface(inventory, request, &plan) {
+        let (execution, slots) = if super::composition::needs_surface(inventory, request, &plan)
+            || inventory
+                .frames
+                .iter()
+                .any(|frame| frame.frame_type == FrameType::LowFrequency)
+        {
             (
-                SequenceExecution::Composed(CompositionSession::new(
+                SequenceExecution::Dependent(DependentSession::new(
                     self.clone(),
                     codestream,
                     inventory,
@@ -78,14 +83,6 @@ pub(super) struct SequenceSource {
 }
 
 impl SequenceSource {
-    /// Color producers execute their recursive LF dependency closure. Both output paths must
-    /// visit every color layer, even when a later full-canvas Replace overwrites its pixels.
-    pub(super) fn next_producer(&self, start: usize, end: usize) -> Result<usize> {
-        (start..end)
-            .find(|&i| self.inventory.frames[i].frame_type != FrameType::LowFrequency)
-            .ok_or(Error::EngineContract("presentation has no color producer"))
-    }
-
     pub(super) fn prepare_physical(
         &self,
         index: usize,
@@ -95,30 +92,38 @@ impl SequenceSource {
             || self.request.clone(),
             |encodings| self.request.clone().for_frame_surface(encodings[index]),
         );
-        if let Some(dc) = ProgressiveDcPlan::for_frame(&self.inventory, frame_index)? {
-            self.engine.open_progressive_dc(
-                Arc::clone(&self.codestream),
-                &request,
-                &self.inventory,
-                dc,
-            )
-        } else {
-            let projected = project_frame_inventory(&self.inventory, frame_index)?;
-            match projected.frames[0].encoding {
-                FrameEncoding::Modular => {
-                    map_modular(self.engine.modular.open_frame_with_inventory_data(
+        let projected = project_frame_inventory(&self.inventory, frame_index)?;
+        match projected.frames[0].encoding {
+            FrameEncoding::Modular => {
+                let prepared = if projected.frames[0].frame_type == FrameType::LowFrequency {
+                    self.engine
+                        .modular
+                        .open_progressive_dc_with_inventory_data(
+                            Arc::clone(&self.codestream),
+                            &request,
+                            &projected,
+                        )?
+                } else {
+                    self.engine.modular.open_frame_with_inventory_data(
                         Arc::clone(&self.codestream),
                         &request,
                         &projected,
-                    )?)
-                }
-                FrameEncoding::VarDct => {
-                    map_vardct(self.engine.vardct.open_frame_with_inventory_data(
-                        (*self.codestream).clone(),
-                        &request,
-                        &projected,
-                    )?)
-                }
+                    )?
+                };
+                map_modular(prepared)
+            }
+            FrameEncoding::VarDct => {
+                let request = if projected.frames[0].frame_type == FrameType::LowFrequency {
+                    GpuOutputRequest::color(crate::vardct_rgb8_format())?
+                        .with_max_frame_slots(request.max_frame_slots())
+                } else {
+                    request
+                };
+                map_vardct(self.engine.vardct.open_frame_with_inventory_data(
+                    (*self.codestream).clone(),
+                    &request,
+                    &projected,
+                )?)
             }
         }
     }
@@ -136,7 +141,7 @@ pub struct FrameSequenceSession {
 #[derive(Debug)]
 enum SequenceExecution {
     Independent(IndependentSession),
-    Composed(CompositionSession),
+    Dependent(DependentSession),
 }
 
 impl FrameSequenceSession {
@@ -148,7 +153,7 @@ impl FrameSequenceSession {
     pub(super) fn submissions_per_frame(&self) -> usize {
         match &self.execution {
             SequenceExecution::Independent(session) => session.submissions(),
-            SequenceExecution::Composed(session) => session.submissions(),
+            SequenceExecution::Dependent(session) => session.submissions(),
         }
     }
 
@@ -160,8 +165,8 @@ impl FrameSequenceSession {
             SequenceExecution::Independent(session) => {
                 SequencePending::Independent(Box::new(session.submit(&self.plan, self.next_index)?))
             }
-            SequenceExecution::Composed(session) => {
-                SequencePending::Composed(Box::new(session.submit(&self.plan, self.next_index)?))
+            SequenceExecution::Dependent(session) => {
+                SequencePending::Dependent(Box::new(session.submit(&self.plan, self.next_index)?))
             }
         };
         self.next_index += 1;
@@ -178,7 +183,6 @@ pub(super) fn submission_counter(
     match pending {
         WgpuDecodePendingFrame::Modular(_) => Arc::new(AtomicUsize::new(planned)),
         WgpuDecodePendingFrame::VarDct(frame) => frame.submissions_per_frame_counter(),
-        WgpuDecodePendingFrame::ProgressiveDc(frame) => Arc::clone(&frame.submissions_per_frame),
         WgpuDecodePendingFrame::Sequence(_) => Arc::new(AtomicUsize::new(planned)),
     }
 }
@@ -193,14 +197,14 @@ pub struct FrameSequencePending {
 #[derive(Debug)]
 enum SequencePending {
     Independent(Box<IndependentPending>),
-    Composed(Box<CompositionPending>),
+    Dependent(Box<DependentPending>),
 }
 
 impl FrameSequencePending {
     pub(super) fn unvalidated_gpu_frame(&self) -> Result<UnvalidatedGpuImageFrame> {
         match &self.inner {
             SequencePending::Independent(pending) => pending.unvalidated(),
-            SequencePending::Composed(pending) => pending.unvalidated(),
+            SequencePending::Dependent(pending) => pending.unvalidated(),
         }
     }
 
@@ -209,7 +213,7 @@ impl FrameSequencePending {
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
         match &mut self.inner {
-            SequencePending::Composed(pending) => pending.poll(context),
+            SequencePending::Dependent(pending) => pending.poll(context),
             SequencePending::Independent(pending) => pending.poll(context),
         }
     }
@@ -221,7 +225,7 @@ impl GpuPendingFrame for FrameSequencePending {
 
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         match self.inner {
-            SequencePending::Composed(pending) => pending.wait(),
+            SequencePending::Dependent(pending) => pending.wait(),
             SequencePending::Independent(pending) => pending.wait(),
         }
     }

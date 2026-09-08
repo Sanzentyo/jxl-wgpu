@@ -542,9 +542,6 @@ impl VarDctPendingFrame {
     pub(crate) fn submissions_per_frame_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.runtime.submissions_per_frame)
     }
-    pub(crate) fn dependency_submission_ready(&self) -> bool {
-        matches!(&self.state, PendingStage::Frame(pending) if pending.dependency_submission_ready())
-    }
     pub(crate) fn progressive_dc_planes(
         &self,
     ) -> std::result::Result<ProgressiveDcXybPlanes, VarDctDecodeError> {

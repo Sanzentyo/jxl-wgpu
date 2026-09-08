@@ -21,6 +21,8 @@ pub struct FrameExecutionNode {
     pub frame_index: u32,
     pub encoding: FrameEncoding,
     pub lf_source_frame: Option<u32>,
+    /// Last physical consumer of this LF slot version. Unused LF nodes still execute.
+    pub lf_last_use: Option<u32>,
     /// Snapshot before this frame writes a slot. Empty slots represent a zero background.
     /// Patch references discovered later in entropy use this same snapshot.
     pub references: [Option<FrameReference>; 4],
@@ -107,7 +109,8 @@ impl FrameExecutionPlan {
         };
         metadata.extra_channels = image.extra_channels.clone();
         let mut references = [None; 4];
-        let mut nodes = Vec::with_capacity(inventory.frames.len());
+        let mut lf_references = [None; 4];
+        let mut nodes: Vec<FrameExecutionNode> = Vec::with_capacity(inventory.frames.len());
         let mut presentations = Vec::new();
         let mut first = 0;
         let mut ticks = 0_u64;
@@ -135,11 +138,40 @@ impl FrameExecutionPlan {
             {
                 return Err(invalid("timing does not match the image header"));
             }
-            if let Some(source) = frame.lf_source_frame
-                && (source >= frame.frame_index
-                    || inventory.frames[source as usize].frame_type != FrameType::LowFrequency)
-            {
-                return Err(invalid("LF dependency is not an earlier LF producer"));
+            let is_lf = frame.frame_type == FrameType::LowFrequency;
+            if (is_lf && !(1..=4).contains(&frame.lf_level)) || (!is_lf && frame.lf_level != 0) {
+                return Err(invalid("invalid LF frame level"));
+            }
+            if frame.uses_lf_frame() != frame.lf_source_frame.is_some() {
+                return Err(invalid("LF dependency does not match the frame flags"));
+            }
+            if let Some(source) = frame.lf_source_frame {
+                if frame.encoding != FrameEncoding::VarDct
+                    || lf_references.get(frame.lf_level as usize) != Some(&Some(source))
+                {
+                    return Err(invalid(
+                        "LF dependency is not the current producer at the next level",
+                    ));
+                }
+                let producer = &inventory.frames[source as usize];
+                let (width, height) = frame
+                    .color_sample_extent()
+                    .ok_or_else(|| invalid("invalid encoded sample extent"))?;
+                // LF slots store the reconstructed frame after restoration and frame upsampling.
+                let lf_scale = 1_u32 << (3 * producer.lf_level);
+                let source_extent = (
+                    producer.width.div_ceil(lf_scale),
+                    producer.height.div_ceil(lf_scale),
+                );
+                if source_extent != (width.div_ceil(8), height.div_ceil(8)) {
+                    return Err(invalid(
+                        "LF producer extent does not match the consumer block extent",
+                    ));
+                }
+                nodes[source as usize].lf_last_use = Some(frame.frame_index);
+            }
+            if is_lf {
+                lf_references[frame.lf_level as usize - 1] = Some(frame.frame_index);
             }
             if frame.save_as_reference >= 4
                 || frame.color_blend.source >= 4
@@ -172,6 +204,7 @@ impl FrameExecutionPlan {
                 frame_index: frame.frame_index,
                 encoding: frame.encoding,
                 lf_source_frame: frame.lf_source_frame,
+                lf_last_use: None,
                 references,
                 save_reference: can_reference.then_some(frame.save_as_reference),
                 needs_composition,

@@ -883,7 +883,37 @@ exact, and the final submission count equals the per-layer count times the numbe
 Cancellation before the first completion and after advancing one or seven layers releases every
 reservation once the submission callbacks retire. No additional binary fixtures are required.
 
-Validation on 2026-09-08 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+`frame_sequence/lf.rs` exercises the common physical LF executor. A duplicated DC2 Modular root
+is valid in both reference decoders but unused after its slot is replaced; truncating that root's
+entropy must still reject the presentation. Removing subsequent LF producers from the DC2
+animation forces multiple presentations to share the first decoded slot version. Whole blocking
+and bounded fragmented async output match both reference decoders, while the idle GPU budget
+contains exactly the padded VarDCT planes until their final consumer and then returns to zero.
+Tests also cancel before/after LF validation and reject inconsistent plan levels, flags, source
+versions, encodings and extents.
+
+`lf_vardct_root_16x2.jxl.hex` and `lf_vardct_root_8x1.jxl.hex` are independent cjxl 0.12.0 VarDCT seeds: P6 RGB8 16×2 and 8×1 with
+R=`13*x+7*y`, G=`(3*x) XOR (11*y)`, B=`5*x+17*y`, encoded using `-d 2 -e 7 -m 0 --container=0
+--gaborish=0 --epf=0 --num_threads=1`. The test preserves its entropy while replacing the physical
+header with an LF-level-2 header. Variants enable default Gaborish and 2× frame upsampling,
+so consumers must receive the restored/upsampled planes and their final geometry. They replace
+or precede the Modular root in an optional generated
+`cjxl --progressive_dc=2` 1024×128 stream, then changes the final Regular header to SkipProgressive.
+Both used and unused VarDCT roots and the LF-dependent SkipProgressive output match Rust `jxl`
+and `djxl` within one RGB8 code through whole and 256-byte-window fragmented async execution.
+An enabled-Gaborish variant previously diverged beyond one code when LF handoff used the
+pre-restoration planes; saving the final pre-color-transform planes fixes it. This ordering also
+matches [libjxl's render pipeline](https://github.com/libjxl/libjxl/blob/main/lib/jxl/dec_cache.cc).
+No CPU entropy or pixel work is added to the production decoder.
+
+LF graph checkpoint on 2026-09-08 Apple M5/Metal: all 729 workspace tests pass across 31 targets,
+with one existing manual benchmark ignored. The 19-test frame-sequence target and five focused
+LF tests pass; the latter include restored/upsampled VarDCT roots. Formatting, workspace check,
+warning-free Clippy/rustdoc, Rust 1.89, and the six-crate WASM check pass. CPU reference and Metal
+harnesses each pass 18 cases, and the indexed Gray8 U8 readback case passes. Full JPEG XL remains
+the active goal; this checkpoint does not complete the remaining roadmap gates.
+
+Previous checkpoint (`e88ad8f`, 2026-09-08 Apple M5/Metal): the serial all-target/all-feature workspace run passes
 725 tests across 31 targets, with one existing manual benchmark ignored. The final sequence
 implementation also passes its 14-test integration target. Formatting, warning-free Clippy/rustdoc,
 Rust 1.89 and the six-crate WASM check pass; reference and Metal harnesses each pass 18 cases,

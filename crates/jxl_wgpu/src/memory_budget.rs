@@ -145,10 +145,43 @@ pub struct MemoryPermit {
     reservation: Arc<MemoryReservation>,
 }
 
+/// A reservation can be partitioned only before it has been shared with another owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MemoryPermitSplitError {
+    #[error("cannot partition a shared memory reservation")]
+    Shared,
+    #[error("cannot split {requested_bytes} bytes from a {reserved_bytes}-byte reservation")]
+    ExceedsReservation {
+        requested_bytes: u64,
+        reserved_bytes: u64,
+    },
+}
+
 impl MemoryPermit {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.reservation.bytes
+    }
+
+    /// Transfers part of an exclusive reservation into an independently released permit.
+    ///
+    /// Total admitted bytes do not change and there is no release/re-admission race. The source
+    /// must have no clones; a failure leaves both its size and the shared budget unchanged.
+    pub fn split_off(&mut self, bytes: u64) -> Result<Self, MemoryPermitSplitError> {
+        let reservation =
+            Arc::get_mut(&mut self.reservation).ok_or(MemoryPermitSplitError::Shared)?;
+        let remaining = reservation.bytes.checked_sub(bytes).ok_or(
+            MemoryPermitSplitError::ExceedsReservation {
+                requested_bytes: bytes,
+                reserved_bytes: reservation.bytes,
+            },
+        )?;
+        let part = Arc::new(MemoryReservation {
+            budget: Arc::clone(&reservation.budget),
+            bytes,
+        });
+        reservation.bytes = remaining;
+        Ok(Self { reservation: part })
     }
 }
 
@@ -167,7 +200,54 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use super::{MemoryBudget, MemoryBudgetError};
+    use super::{MemoryBudget, MemoryBudgetError, MemoryPermitSplitError};
+
+    #[test]
+    fn partitioned_reservations_release_each_last_owner_without_readmission() {
+        let budget = MemoryBudget::new(NonZeroU64::new(100).unwrap());
+        let mut scratch = budget.try_reserve(100).unwrap();
+        let planes = scratch.split_off(36).unwrap();
+        let consumer = planes.clone();
+        assert_eq!(scratch.bytes(), 64);
+        assert_eq!(planes.bytes(), 36);
+        assert_eq!(budget.snapshot().reserved_bytes, 100);
+        drop(scratch);
+        assert_eq!(budget.snapshot().reserved_bytes, 36);
+        let next_job = budget.try_reserve(64).unwrap();
+        drop(planes);
+        assert_eq!(budget.snapshot().reserved_bytes, 100);
+        drop(consumer);
+        assert_eq!(budget.snapshot().reserved_bytes, 64);
+        drop(next_job);
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn partition_failure_preserves_shared_and_undersized_reservations() {
+        let budget = MemoryBudget::new(NonZeroU64::new(10).unwrap());
+        let mut permit = budget.try_reserve(10).unwrap();
+        assert!(matches!(
+            permit.split_off(11),
+            Err(MemoryPermitSplitError::ExceedsReservation {
+                requested_bytes: 11,
+                reserved_bytes: 10,
+            })
+        ));
+        let clone = permit.clone();
+        assert!(matches!(
+            permit.split_off(3),
+            Err(MemoryPermitSplitError::Shared)
+        ));
+        assert_eq!(permit.bytes(), 10);
+        assert_eq!(budget.snapshot().reserved_bytes, 10);
+        drop(clone);
+        let empty = permit.split_off(0).unwrap();
+        let all = permit.split_off(10).unwrap();
+        drop((permit, empty));
+        assert_eq!(budget.snapshot().reserved_bytes, 10);
+        drop(all);
+        assert_eq!(budget.snapshot().reserved_bytes, 0);
+    }
 
     #[test]
     fn reservations_are_byte_weighted_and_clone_owned() {

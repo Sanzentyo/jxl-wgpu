@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{Extent2d, SubmissionToken};
+use jxl_gpu_protocol::SubmissionToken;
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, MemoryBudget, MemoryPermit, ResidentChromaShift,
     ResidentChromaUpsampleInputs, ResidentEpfInputs, ResidentF32Plane, ResidentGaborishInputs,
@@ -586,6 +586,7 @@ struct VarDctJobLifetime {
     _rendered_extra: Option<crate::modular_render::ModularRenderBuffers>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: Option<[wgpu::Buffer; 3]>,
+    lf_planes: Option<ProgressiveDcXybPlanes>,
     _post_transform: PostTransformJobBuffers,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: FrameOutputScratch,
@@ -627,8 +628,6 @@ pub struct FramePendingFrame {
     expected_hf: Vec<HfValidation>,
     extra_output_commands: Option<wgpu::CommandBuffer>,
     hf_metadata_stop: bool,
-    progressive_dc_extent: Extent2d,
-    progressive_dc_stride: u32,
 }
 
 enum VarDctPendingStage {
@@ -699,16 +698,10 @@ impl FramePendingFrame {
             .lifetime
             .as_ref()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
-        ProgressiveDcXybPlanes::from_buffers(
-            lifetime
-                ._resident_planes
-                .clone()
-                .ok_or(VarDctDecodeError::UnvalidatedOutputNotSubmitted)?,
-            self.progressive_dc_extent.width,
-            self.progressive_dc_extent.height,
-            self.progressive_dc_stride,
-        )
-        .map_err(Into::into)
+        lifetime
+            .lf_planes
+            .clone()
+            .ok_or(VarDctDecodeError::UnvalidatedOutputNotSubmitted)
     }
 
     /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
@@ -2057,7 +2050,7 @@ fn submit_vardct(
     memory: MemoryBudget,
     runtime_stats: Arc<VarDctRuntimeStats>,
     mut source: VarDctSource,
-    permits: VarDctMemoryPermits,
+    mut permits: VarDctMemoryPermits,
     poll_permit: SubmissionPollPermit,
 ) -> Result<FramePendingFrame, VarDctDecodeError> {
     let device = backend.device();
@@ -3004,7 +2997,7 @@ fn submit_vardct(
                 Ok::<_, VarDctDecodeError>(buffers)
             })
             .transpose()?;
-    let (output_scratch, post_transform_buffers) = match source.output {
+    let (output_scratch, post_transform_buffers, lf_planes) = match source.output {
         VarDctFrameOutput::Color { config, plan } => {
             let resident_planes =
                 resident_planes
@@ -3283,6 +3276,29 @@ fn submit_vardct(
                 },
             )?;
             debug_assert_eq!(output_scratch.plan, plan);
+            // An LF slot contains the complete pre-color-transform image, including restoration
+            // and frame upsampling. Retain only these final allocations after validation.
+            let lf_planes = if source.packet.profile.lf_level != 0 {
+                let mut tracked = |buffer: &wgpu::Buffer| {
+                    let permit = permits
+                        .transient
+                        .split_off(buffer.size())
+                        .map_err(ProgressiveDcGpuError::from)?;
+                    Ok::<_, VarDctDecodeError>(GpuBufferLease::from_tracked(buffer.clone(), permit))
+                };
+                Some(ProgressiveDcXybPlanes::from_leases(
+                    [
+                        tracked(&presentation_planes[0])?,
+                        tracked(&presentation_planes[1])?,
+                        tracked(&presentation_planes[2])?,
+                    ],
+                    output_width,
+                    output_height,
+                    presentation_stride,
+                )?)
+            } else {
+                None
+            };
             let post_transform_buffers = PostTransformJobBuffers {
                 _restoration_planes: restoration_planes,
                 _pre_restoration_planes: pre_restoration_planes,
@@ -3300,6 +3316,7 @@ fn submit_vardct(
                     _scratch: output_scratch,
                 },
                 post_transform_buffers,
+                lf_planes,
             )
         }
         VarDctFrameOutput::Extra { index, plan } => {
@@ -3343,6 +3360,7 @@ fn submit_vardct(
             (
                 FrameOutputScratch::Extra { scratch },
                 PostTransformJobBuffers::default(),
+                None,
             )
         }
     };
@@ -3481,6 +3499,7 @@ fn submit_vardct(
         _rendered_extra: rendered_extra,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
+        lf_planes,
         _post_transform: post_transform_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,
@@ -3536,10 +3555,6 @@ fn submit_vardct(
         .unwrap_or_default();
     let layout = source.layout.clone();
     let frame_name = source.frame_name.clone();
-    let progressive_dc_extent = Extent2d {
-        width: source.packet.profile.width,
-        height: source.packet.profile.height,
-    };
     let mut pending = FramePendingFrame {
         backend: backend.clone(),
         pipelines,
@@ -3557,8 +3572,6 @@ fn submit_vardct(
         expected_hf,
         extra_output_commands,
         hf_metadata_stop: staged_hf_global,
-        progressive_dc_extent,
-        progressive_dc_stride: padded_width,
     };
     if source.packet.pending_raw_hf_dequant_side_image().is_some()
         && packet_stage_commands.is_none()

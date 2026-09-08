@@ -1785,7 +1785,7 @@ pub(super) fn submit_decode(
     pipelines: SubmitPipelines<'_>,
     source: &DecodeSource,
     buffers: &Arc<DecodeBufferPool>,
-    memory_permits: DecodeMemoryPermits,
+    mut memory_permits: DecodeMemoryPermits,
     poll_permit: SubmissionPollPermit,
 ) -> Result<WgpuPendingFrame> {
     let device = backend.device();
@@ -1839,7 +1839,13 @@ pub(super) fn submit_decode(
         .profile
         .progressive_dc
         .map(|_| {
-            ProgressiveDcXybPlanes::new(device, source.profile.width, source.profile.height, 0)
+            ProgressiveDcXybPlanes::new(
+                device,
+                source.profile.width,
+                source.profile.height,
+                0,
+                &mut memory_permits.transient,
+            )
         })
         .transpose()?;
     let output_size = source.output.storage_bytes()?;
