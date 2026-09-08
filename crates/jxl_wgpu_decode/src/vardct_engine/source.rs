@@ -29,7 +29,7 @@ use super::types::{
     VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats,
 };
 use super::window_plan::{
-    AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
+    AdaptiveStreamLimitDecision, PacketStage, PacketWindowExecutionPlan,
     VarDctEntropyPlanSelection, select_budget_adaptive_stream_limit,
 };
 use crate::restoration::restoration_config;
@@ -38,8 +38,7 @@ pub(super) struct VarDctSource {
     pub(super) codestream: GpuCodestream,
     pub(super) packet: BoundedVarDctPacketPlan,
     pub(super) groups: Vec<VarDctGroupSource>,
-    pub(super) lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
-    pub(super) combined_packet_windows: Option<CombinedPacketWindowExecutionPlan>,
+    pub(super) packet_windows: Option<PacketWindowExecutionPlan>,
     pub(super) stream_limit: u64,
     pub(super) resource_layout: VarDctResourceLayout,
     pub(super) hf_coefficients: Option<HfCoefficientExecutionPlan>,
@@ -62,13 +61,21 @@ pub(super) struct VarDctSource {
 }
 
 impl VarDctSource {
+    pub(super) fn packet_window_batches(&self, stage: PacketStage) -> usize {
+        self.packet_windows
+            .as_ref()
+            .filter(|plan| plan.stage == stage)
+            .map_or(0, PacketWindowExecutionPlan::batch_count)
+    }
+
+    pub(super) fn fuses_packet_stages(&self) -> bool {
+        self.packet_window_batches(PacketStage::Combined) != 0
+    }
     pub(super) fn staged_lf_submission_count(&self) -> usize {
         if self.packet.profile.uses_lf_frame && !self.packet.requires_lf_extra_staging() {
             0
         } else {
-            self.lf_packet_windows
-                .as_ref()
-                .map_or(1, LfPacketWindowExecutionPlan::batch_count)
+            self.packet_window_batches(PacketStage::Lf).max(1)
         }
     }
 
@@ -79,10 +86,10 @@ impl VarDctSource {
             {
                 // The final AC/render submission is known up front. Each raw side image adds its
                 // own submission as the resumable HF-global parser discovers it.
-                return 1;
+                return self.packet_window_batches(PacketStage::Hf) + 1;
             }
             if self.packet.profile.uses_lf_frame && !self.packet.requires_lf_extra_staging() {
-                return 2;
+                return self.packet_window_batches(PacketStage::Hf).max(1) + 1;
             }
             let coefficient_batches = self.hf_coefficients.as_ref().map_or(0, |coefficients| {
                 if coefficients.uses_bounded_stream_windows() {
@@ -97,15 +104,14 @@ impl VarDctSource {
                 .saturating_add(2);
         }
         let local_lf = if self.packet.requires_hf_metadata_staging() {
-            self.lf_packet_windows
-                .as_ref()
-                .map_or(1, LfPacketWindowExecutionPlan::batch_count)
+            self.packet_window_batches(PacketStage::Lf).max(1)
         } else {
             0
         };
-        let combined_packet_extra = self
-            .combined_packet_windows
+        let packet_extra = self
+            .packet_windows
             .as_ref()
+            .filter(|plan| plan.stage != PacketStage::Lf)
             .map_or(0, |plan| plan.batch_count().saturating_sub(1));
         if let Some(coefficients) = &self.hf_coefficients
             && coefficients.uses_bounded_stream_windows()
@@ -113,9 +119,9 @@ impl VarDctSource {
             // Packet/pre-coefficient work, one ordered submission per reusable upload, then the
             // resident inverse-transform/render/status tail. Local-tree frames additionally map
             // their LF cursors before this sequence.
-            local_lf + combined_packet_extra + 2 + coefficients.stream_batch_count()
+            local_lf + packet_extra + 2 + coefficients.stream_batch_count()
         } else {
-            local_lf + combined_packet_extra + 1
+            local_lf + packet_extra + 1
         }
     }
 }
@@ -397,18 +403,11 @@ pub(super) fn prepare_packet_source(
         .collect::<Result<Vec<_>, _>>()?;
     let plan_at_limit =
         |stream_limit: u64| -> Result<VarDctEntropyPlanSelection, VarDctDecodeError> {
-            let lf_packet_windows = staged_lf
-                .then(|| LfPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit))
-                .transpose()?
-                .flatten();
-            let combined_packet_windows = (!staged_lf
-                && !packet.profile.uses_lf_frame
-                && packet.pending_raw_hf_dequant_side_image().is_none())
-            .then(|| {
-                CombinedPacketWindowExecutionPlan::new(codestream_bytes, &packet, stream_limit)
-            })
-            .transpose()?
-            .flatten();
+            let packet_windows =
+                PacketWindowExecutionPlan::initial(codestream_bytes, &packet, stream_limit)?;
+            let fuses_packet_stages = packet_windows
+                .as_ref()
+                .is_some_and(|plan| plan.stage == PacketStage::Combined);
             let hf_coefficients = packet
                 .hf_coefficients
                 .as_ref()
@@ -422,7 +421,7 @@ pub(super) fn prepare_packet_source(
                     )
                 })
                 .transpose()?;
-            let deferred_hf_plan = if combined_packet_windows.is_some() {
+            let deferred_hf_plan = if fuses_packet_stages {
                 None
             } else {
                 deferred_hf.as_ref()
@@ -432,8 +431,7 @@ pub(super) fn prepare_packet_source(
                 codestream_len,
                 packet: &packet,
                 groups: &groups,
-                lf_packet_windows: lf_packet_windows.as_ref(),
-                combined_packet_windows: combined_packet_windows.as_ref(),
+                packet_windows: packet_windows.as_ref(),
                 resource: resource_layout,
                 hf_coefficients: hf_coefficients.as_ref(),
                 deferred_hf: deferred_hf_plan,
@@ -455,8 +453,7 @@ pub(super) fn prepare_packet_source(
             })?;
             Ok(VarDctEntropyPlanSelection {
                 stream_limit,
-                lf_packet_windows,
-                combined_packet_windows,
+                packet_windows,
                 hf_coefficients,
                 memory,
             })
@@ -477,19 +474,19 @@ pub(super) fn prepare_packet_source(
     let entropy_plan = plan_at_limit(selected_stream_limit)?;
     let VarDctEntropyPlanSelection {
         stream_limit,
-        lf_packet_windows,
-        combined_packet_windows,
+        packet_windows,
         hf_coefficients,
         memory,
     } = entropy_plan;
-    let deferred_hf = if combined_packet_windows.is_some() {
+    let fuses_packet_stages = packet_windows
+        .as_ref()
+        .is_some_and(|plan| plan.stage == PacketStage::Combined);
+    let deferred_hf = if fuses_packet_stages {
         None
     } else {
         deferred_hf
     };
-    if packet.requires_hf_global_staging()
-        && combined_packet_windows.is_none()
-        && !packet.profile.uses_lf_frame
+    if packet.requires_hf_global_staging() && !fuses_packet_stages && !packet.profile.uses_lf_frame
     {
         for (packet_group, group) in packet.groups.iter().zip(&mut groups) {
             group.control = packet_group.lf_stage_control(&packet)?;
@@ -507,8 +504,7 @@ pub(super) fn prepare_packet_source(
         codestream,
         packet,
         groups,
-        lf_packet_windows,
-        combined_packet_windows,
+        packet_windows,
         stream_limit,
         resource_layout,
         hf_coefficients,

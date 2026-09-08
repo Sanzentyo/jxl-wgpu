@@ -536,6 +536,10 @@ impl VarDctPendingFrame {
         self.runtime
             .submissions_per_frame
             .fetch_add(frame.submissions_per_frame(), Ordering::AcqRel);
+        self.runtime.hf_packet_stream_batch_count.store(
+            frame.packet_window_batches(super::window_plan::PacketStage::Hf),
+            Ordering::Release,
+        );
         let mut session = FrameDecodeSession {
             backend: self.backend.clone(),
             pipelines: source.pipelines,

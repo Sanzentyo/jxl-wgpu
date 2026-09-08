@@ -278,7 +278,9 @@ impl VarDctSubmissionEngine {
         let submissions_per_frame = source.submissions_per_frame();
         let runtime_stats = Arc::new(VarDctRuntimeStats {
             submissions_per_frame: Arc::new(AtomicUsize::new(submissions_per_frame)),
-            hf_packet_stream_batch_count: AtomicUsize::new(0),
+            hf_packet_stream_batch_count: AtomicUsize::new(
+                source.packet_window_batches(super::window_plan::PacketStage::Hf),
+            ),
         });
         let mut metadata = AnimationMetadata::still(extent);
         metadata.extra_channels = source.extra_declarations.clone();

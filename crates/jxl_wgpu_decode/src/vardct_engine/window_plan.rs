@@ -5,7 +5,8 @@ use crate::entropy_window::{
     StreamBatch, build_stream_batches_for_len,
 };
 use crate::vardct_packet::{
-    BoundedHfMetadataContinuation, BoundedVarDctPacketPlan, VarDctModularParams,
+    BoundedHfMetadataContinuation, BoundedVarDctGroupEntry, BoundedVarDctGroupPlan,
+    BoundedVarDctPacketPlan, VarDctModularParams,
 };
 use crate::vardct_pass_group::HfCoefficientExecutionPlan;
 use crate::{Error as DecodeError, GpuCodestream};
@@ -14,8 +15,7 @@ use super::types::{VarDctDecodeError, VarDctDecodeMemoryStats};
 
 pub(super) struct VarDctEntropyPlanSelection {
     pub(super) stream_limit: u64,
-    pub(super) lf_packet_windows: Option<LfPacketWindowExecutionPlan>,
-    pub(super) combined_packet_windows: Option<CombinedPacketWindowExecutionPlan>,
+    pub(super) packet_windows: Option<PacketWindowExecutionPlan>,
     pub(super) hf_coefficients: Option<HfCoefficientExecutionPlan>,
     pub(super) memory: VarDctDecodeMemoryStats,
 }
@@ -109,28 +109,46 @@ pub(super) fn select_budget_adaptive_stream_limit(
     Ok(AdaptiveStreamLimitDecision::Selected(best_limit))
 }
 
+/// The entropy entry point is independent of whether a reusable upload is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PacketStage {
+    Lf,
+    Hf,
+    Combined,
+}
+
 #[derive(Clone, Debug)]
-pub(super) struct LfPacketWindowExecutionPlan {
+pub(super) struct PacketWindowExecutionPlan {
+    pub(super) stage: PacketStage,
     pub(super) stream_segments: Arc<[GroupStreamSegment]>,
     pub(super) stream_batches: Arc<[StreamBatch]>,
     pub(super) segment_params: Arc<[VarDctModularParams]>,
     pub(super) stream_bytes: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct CombinedPacketWindowExecutionPlan {
-    pub(super) stream_segments: Arc<[GroupStreamSegment]>,
-    pub(super) stream_batches: Arc<[StreamBatch]>,
-    pub(super) segment_params: Arc<[VarDctModularParams]>,
-    pub(super) stream_bytes: u64,
+struct PacketStreamDescriptor {
+    range: GroupEntropyRange,
+    params: VarDctModularParams,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct HfPacketWindowExecutionPlan {
-    pub(super) stream_segments: Arc<[GroupStreamSegment]>,
-    pub(super) stream_batches: Arc<[StreamBatch]>,
-    pub(super) segment_params: Arc<[VarDctModularParams]>,
-    pub(super) stream_bytes: u64,
+impl PacketStreamDescriptor {
+    fn group(
+        group: &BoundedVarDctGroupPlan,
+        token_bit_offset: u32,
+        params: VarDctModularParams,
+    ) -> Result<Self, VarDctDecodeError> {
+        Ok(Self {
+            range: GroupEntropyRange {
+                token_bit_offset: u64::from(token_bit_offset),
+                token_bit_end: group.lf_group.end().ok_or(
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "packet stream end",
+                    },
+                )?,
+            },
+            params,
+        })
+    }
 }
 
 fn map_packet_window_plan_error(error: DecodeError) -> VarDctDecodeError {
@@ -188,76 +206,6 @@ pub(super) fn copy_stream_segment(
         .map_err(map_codestream_source_error)
 }
 
-impl LfPacketWindowExecutionPlan {
-    pub(super) fn new(
-        codestream_bytes: u64,
-        packet: &BoundedVarDctPacketPlan,
-        stream_limit: u64,
-    ) -> Result<Option<Self>, VarDctDecodeError> {
-        let ranges = packet
-            .groups
-            .iter()
-            .map(|group| {
-                let token_bit_end =
-                    group
-                        .lf_group
-                        .end()
-                        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                            field: "LF packet stream end",
-                        })?;
-                Ok(GroupEntropyRange {
-                    token_bit_offset: u64::from(group.entry.bit_offset()),
-                    token_bit_end,
-                })
-            })
-            .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
-        let (segments, batches, _) =
-            build_stream_batches_for_len(codestream_bytes, &ranges, stream_limit, 1)
-                .map_err(map_packet_window_plan_error)?;
-        let uses_windows = segments.iter().any(|segment| {
-            segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
-        });
-        if !uses_windows {
-            return Ok(None);
-        }
-        let mut segment_params = Vec::with_capacity(segments.len());
-        for &segment in &segments {
-            let group = packet.groups.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment references an absent group",
-                },
-            )?;
-            // Local-tree staging reserves the conservative predictor/LZ layout because the HF
-            // descriptor is discovered only after this stage. The LF state itself records only
-            // the predictor fields selected by its parsed tree.
-            let state_offset = group.packet_execution_state_offset_words(true)?;
-            let modular =
-                group
-                    .entry
-                    .modular()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "LF coefficient window has no initial entropy metadata",
-                    })?;
-            segment_params.push(
-                VarDctModularParams::default()
-                    .with_lz77_window(modular.lz77_window_words)
-                    .with_self_correcting(modular.needs_self_correcting)
-                    .with_stream_segment(segment, group.entry.bit_offset(), state_offset),
-            );
-        }
-        Ok(Some(Self {
-            stream_segments: segments.into(),
-            stream_batches: batches.into(),
-            segment_params: segment_params.into(),
-            stream_bytes: stream_limit & !3,
-        }))
-    }
-
-    pub(super) fn batch_count(&self) -> usize {
-        self.stream_batches.len()
-    }
-}
-
 /// Reserve a bounded upload for an HF descriptor hidden behind extra-channel entropy. The
 /// enclosing packet is a conservative range: the eventual HF stream is always a suffix of it.
 pub(super) fn deferred_hf_stream_window_bytes(
@@ -289,76 +237,68 @@ pub(super) fn deferred_hf_stream_window_bytes(
     Ok(bytes)
 }
 
-impl CombinedPacketWindowExecutionPlan {
-    pub(super) fn new(
+impl PacketWindowExecutionPlan {
+    pub(super) fn initial(
         codestream_bytes: u64,
         packet: &BoundedVarDctPacketPlan,
         stream_limit: u64,
     ) -> Result<Option<Self>, VarDctDecodeError> {
-        let mut stream_bases = Vec::with_capacity(packet.groups.len());
-        let ranges = packet
+        let stage = if packet.requires_lf_extra_staging() {
+            return Ok(None);
+        } else if packet.requires_lf_staging() {
+            PacketStage::Lf
+        } else if packet.profile.uses_lf_frame {
+            PacketStage::Hf
+        } else if packet.pending_raw_hf_dequant_side_image().is_some() {
+            return Ok(None);
+        } else {
+            PacketStage::Combined
+        };
+        let descriptors = packet
             .groups
             .iter()
-            .map(|group| {
-                let control = group.packet_control(packet)?;
-                let token_bit_offset = u64::from(control.section_bits[0]);
-                let token_bit_end = u64::from(control.section_bits[1]);
-                stream_bases.push(control.section_bits[0]);
-                Ok(GroupEntropyRange {
-                    token_bit_offset,
-                    token_bit_end,
-                })
+            .map(|group| match stage {
+                PacketStage::Lf | PacketStage::Hf => {
+                    let modular = match (&group.entry, stage) {
+                        (
+                            BoundedVarDctGroupEntry::LfCoefficients { modular, .. },
+                            PacketStage::Lf,
+                        ) => modular,
+                        (BoundedVarDctGroupEntry::HfMetadata(continuation), PacketStage::Hf) => {
+                            &continuation.modular
+                        }
+                        _ => {
+                            return Err(VarDctDecodeError::EntropyWindowContract {
+                                detail: "initial packet stage disagrees with its entropy entry",
+                            });
+                        }
+                    };
+                    PacketStreamDescriptor::group(
+                        group,
+                        group.entry.bit_offset(),
+                        VarDctModularParams::default()
+                            .with_lz77_window(modular.lz77_window_words)
+                            .with_self_correcting(modular.needs_self_correcting),
+                    )
+                }
+                PacketStage::Combined => {
+                    let control = group.packet_control(packet)?;
+                    Ok(PacketStreamDescriptor {
+                        range: GroupEntropyRange {
+                            token_bit_offset: u64::from(control.section_bits[0]),
+                            token_bit_end: u64::from(control.section_bits[1]),
+                        },
+                        params: VarDctModularParams::default()
+                            .with_lz77_window(group.lz77_window_words)
+                            .with_self_correcting(packet.needs_self_correcting),
+                    })
+                }
             })
-            .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
-        let (segments, batches, stream_bytes) = build_stream_batches_for_len(
-            codestream_bytes,
-            &ranges,
-            stream_limit,
-            packet.groups.len().max(1),
-        )
-        .map_err(map_packet_window_plan_error)?;
-        let uses_windows = segments.iter().any(|segment| {
-            segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
-        });
-        if !uses_windows {
-            return Ok(None);
-        }
-        let mut segment_params = Vec::with_capacity(segments.len());
-        for &segment in &segments {
-            let group = packet.groups.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "combined packet segment references an absent group",
-                },
-            )?;
-            let stream_base_bit = *stream_bases.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "combined packet segment has no stream base",
-                },
-            )?;
-            let state_offset =
-                group.packet_execution_state_offset_words(packet.needs_self_correcting)?;
-            segment_params.push(
-                VarDctModularParams::default()
-                    .with_lz77_window(group.lz77_window_words)
-                    .with_self_correcting(packet.needs_self_correcting)
-                    .with_stream_segment(segment, stream_base_bit, state_offset),
-            );
-        }
-        Ok(Some(Self {
-            stream_segments: segments.into(),
-            stream_batches: batches.into(),
-            segment_params: segment_params.into(),
-            stream_bytes,
-        }))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(stage, codestream_bytes, packet, descriptors, stream_limit)
     }
 
-    pub(super) fn batch_count(&self) -> usize {
-        self.stream_batches.len()
-    }
-}
-
-impl HfPacketWindowExecutionPlan {
-    pub(super) fn new(
+    pub(super) fn hf(
         codestream_bytes: u64,
         packet: &BoundedVarDctPacketPlan,
         continuations: &[BoundedHfMetadataContinuation],
@@ -371,62 +311,263 @@ impl HfPacketWindowExecutionPlan {
                 actual: continuations.len(),
             });
         }
-        let ranges = packet
+        let descriptors = packet
             .groups
             .iter()
             .zip(continuations)
             .map(|(group, continuation)| {
-                let token_bit_end =
-                    group
-                        .lf_group
-                        .end()
-                        .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                            field: "HF packet stream end",
-                        })?;
-                Ok(GroupEntropyRange {
-                    token_bit_offset: u64::from(continuation.token_bit_offset),
-                    token_bit_end,
-                })
+                PacketStreamDescriptor::group(
+                    group,
+                    continuation.token_bit_offset,
+                    VarDctModularParams::default()
+                        .with_lz77_window(continuation.modular.lz77_window_words)
+                        .with_self_correcting(continuation.modular.needs_self_correcting),
+                )
             })
-            .collect::<Result<Vec<_>, VarDctDecodeError>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(
+            PacketStage::Hf,
+            codestream_bytes,
+            packet,
+            descriptors,
+            stream_limit,
+        )
+    }
+
+    fn new(
+        stage: PacketStage,
+        codestream_bytes: u64,
+        packet: &BoundedVarDctPacketPlan,
+        descriptors: Vec<PacketStreamDescriptor>,
+        stream_limit: u64,
+    ) -> Result<Option<Self>, VarDctDecodeError> {
+        let ranges = descriptors
+            .iter()
+            .map(|descriptor| descriptor.range)
+            .collect::<Vec<_>>();
         let (segments, batches, stream_bytes) = build_stream_batches_for_len(
             codestream_bytes,
             &ranges,
             stream_limit,
-            packet.groups.len().max(1),
+            if stage == PacketStage::Lf {
+                1
+            } else {
+                packet.groups.len().max(1)
+            },
         )
         .map_err(map_packet_window_plan_error)?;
-        let uses_windows = segments.iter().any(|segment| {
-            segment.flags != (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL)
-        });
-        if !uses_windows {
+        if segments
+            .iter()
+            .all(|segment| segment.flags == (GroupStreamSegment::FIRST | GroupStreamSegment::FINAL))
+        {
             return Ok(None);
         }
         let mut segment_params = Vec::with_capacity(segments.len());
         for &segment in &segments {
             let group = packet.groups.get(segment.group_index).ok_or(
                 VarDctDecodeError::EntropyWindowContract {
-                    detail: "HF packet segment references an absent group",
+                    detail: "packet segment references an absent group",
                 },
             )?;
-            let continuation = continuations.get(segment.group_index).ok_or(
+            let descriptor = descriptors.get(segment.group_index).ok_or(
                 VarDctDecodeError::EntropyWindowContract {
-                    detail: "HF packet segment references an absent continuation",
+                    detail: "packet segment has no entropy descriptor",
                 },
             )?;
-            let state_offset = group.packet_execution_state_offset_words(true)?;
-            segment_params.push(
-                VarDctModularParams::default()
-                    .with_lz77_window(continuation.modular.lz77_window_words)
-                    .with_self_correcting(continuation.modular.needs_self_correcting)
-                    .with_stream_segment(segment, continuation.token_bit_offset, state_offset),
-            );
+            // Undiscovered HF descriptors need conservative predictor capacity. Eager HF-only
+            // entries use the exact same compact layout as their admitted GPU allocation.
+            let state_offset = group.packet_execution_state_offset_words(
+                packet.needs_self_correcting || packet.requires_hf_metadata_staging(),
+            )?;
+            let stream_base_bit =
+                u32::try_from(descriptor.range.token_bit_offset).map_err(|_| {
+                    VarDctDecodeError::ArithmeticOverflow {
+                        field: "packet stream base bit",
+                    }
+                })?;
+            segment_params.push(descriptor.params.with_stream_segment(
+                segment,
+                stream_base_bit,
+                state_offset,
+            ));
         }
         Ok(Some(Self {
+            stage,
             stream_segments: segments.into(),
             stream_batches: batches.into(),
             segment_params: segment_params.into(),
-            stream_bytes,
+            // A clipped LF window can be smaller than a later HF suffix or packed HF batch.
+            // Those descriptors are still unknown, so reserve the selected shared capacity.
+            stream_bytes: if stage == PacketStage::Lf {
+                stream_limit & !3
+            } else {
+                stream_bytes
+            },
         }))
+    }
+
+    pub(super) fn batch_count(&self) -> usize {
+        self.stream_batches.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vardct_frontend::VarDctFrameRole;
+    use jxl_gpu_bitstream::{CodestreamInventory, FrameType, parse};
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        let hex = hex.split_whitespace().collect::<String>();
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn staged_lf_reserves_capacity_for_larger_hf_suffix_windows() {
+        let bytes = decode_hex(include_str!(
+            "../../test-data/jpeg_transcode_raw_matrix_local_packets.jxl.hex"
+        ));
+        let parsed = parse(&bytes, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let mut packet = BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory).unwrap();
+        assert!(packet.requires_lf_staging());
+        packet.groups = vec![packet.groups[0].clone(); 2];
+
+        // Geometry-only counterexample using two copies of a real predictor layout. Each LF
+        // range clips to two windows with a 240-byte peak. One later HF suffix fits whole but
+        // needs 256 bytes; the other still needs splitting, so both use the shared HF upload.
+        let descriptors = |ranges: [(u64, u64); 2]| {
+            ranges
+                .into_iter()
+                .map(|(start, end)| PacketStreamDescriptor {
+                    range: GroupEntropyRange {
+                        token_bit_offset: start * 8,
+                        token_bit_end: end * 8,
+                    },
+                    params: VarDctModularParams::default(),
+                })
+                .collect()
+        };
+        let lf = PacketWindowExecutionPlan::new(
+            PacketStage::Lf,
+            520,
+            &packet,
+            descriptors([(0, 260), (260, 520)]),
+            256,
+        )
+        .unwrap()
+        .unwrap();
+        let lf_peak = lf
+            .stream_segments
+            .iter()
+            .map(|segment| (segment.input_end - segment.input_start).div_ceil(4) * 4 + 4)
+            .max()
+            .unwrap();
+        assert_eq!(lf_peak, 240);
+        let hf = PacketWindowExecutionPlan::new(
+            PacketStage::Hf,
+            520,
+            &packet,
+            descriptors([(10, 260), (261, 520)]),
+            256,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hf.stream_bytes, 256);
+        assert!(hf.stream_bytes > lf_peak as u64);
+        assert!(hf.stream_bytes <= lf.stream_bytes);
+    }
+
+    #[test]
+    fn lf_consumers_bound_initial_hf_packets_with_their_admitted_predictor_layout() {
+        let bytes = decode_hex(include_str!(
+            "../../test-data/testsrc_vardct_progressive_dc_ac.jxl.hex"
+        ));
+        let parsed = parse(&bytes, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let source = GpuCodestream::from_shared(
+            parsed.codestream().into(),
+            0..parsed.codestream().len(),
+            false,
+        )
+        .unwrap();
+        let mut bounded = 0;
+        let mut generic_bounded = 0;
+        for frame in inventory
+            .frames
+            .iter()
+            .filter(|frame| frame.uses_lf_frame())
+        {
+            let projected = CodestreamInventory {
+                frames: vec![frame.clone()],
+                ..inventory.clone()
+            };
+            let packet = BoundedVarDctPacketPlan::parse_frame_source(
+                &source,
+                &projected,
+                if frame.frame_type == FrameType::LowFrequency {
+                    VarDctFrameRole::LowFrequency
+                } else {
+                    VarDctFrameRole::Frame
+                },
+            )
+            .unwrap();
+            assert!(
+                packet
+                    .groups
+                    .iter()
+                    .all(|group| matches!(group.entry, BoundedVarDctGroupEntry::HfMetadata(_)))
+            );
+            assert!(!packet.requires_hf_metadata_staging());
+            assert!(
+                PacketWindowExecutionPlan::initial(source.logical_bytes(), &packet, u64::MAX)
+                    .unwrap()
+                    .is_none()
+            );
+            for limit in [40, 64, 128] {
+                let Some(plan) =
+                    PacketWindowExecutionPlan::initial(source.logical_bytes(), &packet, limit)
+                        .unwrap()
+                else {
+                    continue;
+                };
+                assert_eq!(plan.stage, PacketStage::Hf);
+                assert!(plan.stream_bytes <= limit);
+                assert!(plan.batch_count() > 1);
+                for (segment, params) in plan.stream_segments.iter().zip(plan.segment_params.iter())
+                {
+                    let group = &packet.groups[segment.group_index];
+                    assert!(
+                        segment.upload_offset + segment.input_end - segment.input_start + 4
+                            <= plan.stream_bytes as usize
+                    );
+                    // The generic predictor allocation is intentionally smaller than the weighted
+                    // one. A hardcoded conservative resume offset would write outside this buffer.
+                    let words = group
+                        .reconstructed_words(packet.needs_self_correcting)
+                        .unwrap();
+                    let state_words = crate::vardct_packet::packet_execution_state_bytes(
+                        packet.needs_self_correcting,
+                    ) / 4;
+                    assert_eq!(
+                        u64::from(params.window_contract()[5]) + state_words,
+                        u64::from(words)
+                    );
+                }
+                bounded += 1;
+                generic_bounded += usize::from(!packet.needs_self_correcting);
+            }
+        }
+        assert!(
+            bounded >= 1,
+            "the checked LF consumers must actually require HF windows"
+        );
+        assert!(
+            generic_bounded > 0,
+            "a compact generic predictor allocation is required"
+        );
     }
 }

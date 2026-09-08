@@ -597,6 +597,22 @@ records the HF-metadata stop selected when those packet commands are built, incl
 continuations. Larger/transformed raw images, the remaining Global/LF/HF streams, and intermediate
 presentation still require broader scheduling.
 
+The initial VarDCT packet window has one explicit LF, HF-only, or combined stage. An LF consumer
+with a parsed HF descriptor reserves its upload from the caller/device/budget cap up front;
+`packet_stream_batch_count` includes these initial HF batches. The packet resume offset uses the
+same generic/weighted predictor capacity as `reconstructed_bytes`, avoiding a conservative offset
+outside a compact HF-only allocation. LF-extra consumers still admit descriptors after their GPU
+cursor boundary. Sectioned raw matrices following bounded HF-only packets begin after validated
+HF metadata completion. Staged LF reserves the selected aligned cap even when its clipped windows
+are smaller: an eventual HF suffix or packed HF batch can exceed that initial peak while still
+fitting the cap.
+
+Window preparation stores host uploads and dispatch records rather than one GPU command buffer
+per future window. Packet and AC command buffers and bind groups are created immediately before
+their ordered submissions, retaining the existing map boundaries and byte reservations. This also
+applies to deferred AC discovered at an HF-global cursor. A 40-byte 1024×128 recursive DC+AC case
+guards against exhausting Metal's command resources before the first coefficient submission.
+
 ## Shader write bounds fixed by this audit
 
 The Gray8 encoder artifact consists of 53 header words followed by four-word events. The WGSL

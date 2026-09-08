@@ -22,8 +22,7 @@ use crate::progressive_dc::{
 use crate::vardct_artifact::{GpuVarDctArtifactStatus, HfMetadataLoweringBuffers};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams};
 use crate::vardct_packet::{
-    GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
-    VarDctPacketValidation,
+    GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketValidation,
 };
 use crate::vardct_pass_group::{
     GpuHfCoefficientStatus, HfCoefficientBuffers, HfCoefficientExecutionPlan,
@@ -42,11 +41,16 @@ use super::source::{VarDctSource, check_limit};
 use super::types::{
     ARTIFACT_STATUS_BYTES, PACKET_STATUS_BYTES, VarDctDecodeError, VarDctDecodeMemoryStats,
 };
-use super::window_plan::{
-    HfPacketWindowExecutionPlan, copy_stream_segment, map_codestream_source_error,
-};
+use super::window_plan::{PacketStage, PacketWindowExecutionPlan, map_codestream_source_error};
 
+mod coefficients;
+use coefficients::{HfCoefficientBatchSubmission, prepare_hf_batches};
 mod extra;
+mod packet;
+
+use packet::{
+    PacketBatchSubmission, prepare_packet_windows, submit_packet_batches, submit_packet_commands,
+};
 mod raw_matrix;
 use extra::{ExtraLifetime, ExtraWork, HfValidation, map_extra_error};
 use raw_matrix::{RawMatrixLifetime, RawMatrixWork};
@@ -225,45 +229,9 @@ fn create_hf_coefficient_job_buffers(
     }
 }
 
-struct HfCoefficientBatchSubmission {
-    stream_upload: Box<[u8]>,
-    params_upload: Box<[u8]>,
-    commands: wgpu::CommandBuffer,
-}
-
-struct LfPacketBatchSubmission {
-    group_index: usize,
-    stream_upload: Box<[u8]>,
-    params: VarDctModularParams,
-    commands: wgpu::CommandBuffer,
-}
-
-struct CombinedPacketGroupUpload {
-    group_index: usize,
-    params: VarDctModularParams,
-}
-
-struct CombinedPacketBatchSubmission {
-    stream_upload: Box<[u8]>,
-    groups: Box<[CombinedPacketGroupUpload]>,
-    commands: wgpu::CommandBuffer,
-}
-
-struct HfPacketGroupUpload {
-    group_index: usize,
-    control: VarDctPacketControl,
-    params: VarDctModularParams,
-}
-
-struct HfPacketBatchSubmission {
-    stream_upload: Box<[u8]>,
-    groups: Box<[HfPacketGroupUpload]>,
-    commands: wgpu::CommandBuffer,
-}
-
-enum LfPacketCommands {
+enum PacketCommands {
     Whole(wgpu::CommandBuffer),
-    Windowed(Vec<LfPacketBatchSubmission>),
+    Windowed(Vec<PacketBatchSubmission>),
 }
 
 enum VarDctDownstreamCommands {
@@ -271,6 +239,8 @@ enum VarDctDownstreamCommands {
     Windowed {
         before_coefficients: wgpu::CommandBuffer,
         coefficient_batches: Vec<HfCoefficientBatchSubmission>,
+        device: wgpu::Device,
+        pipelines: Arc<VarDctPipelines>,
         after_coefficients: wgpu::CommandBuffer,
     },
 }
@@ -311,146 +281,6 @@ enum VarDctPendingContinuation {
     },
 }
 
-fn submit_lf_packet_commands(
-    queue: &wgpu::Queue,
-    commands: LfPacketCommands,
-    lifetime: &VarDctJobLifetime,
-) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
-    match commands {
-        LfPacketCommands::Whole(commands) => Ok(queue.submit([commands])),
-        LfPacketCommands::Windowed(batches) => {
-            let stream = lifetime._packet_stream_window.as_ref().ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "windowed LF packet commands have no retained stream upload",
-                },
-            )?;
-            let mut last_submission = None;
-            for batch in batches {
-                let group = lifetime._groups.get(batch.group_index).ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "windowed LF packet batch references an absent group",
-                    },
-                )?;
-                queue.write_buffer(stream, 0, &batch.stream_upload);
-                queue.write_buffer(&group.modular_params, 0, bytemuck::bytes_of(&batch.params));
-                last_submission = Some(queue.submit([batch.commands]));
-            }
-            last_submission.ok_or(VarDctDecodeError::EntropyWindowContract {
-                detail: "windowed LF packet execution has no batches",
-            })
-        }
-    }
-}
-
-fn write_combined_packet_batch(
-    queue: &wgpu::Queue,
-    stream: &wgpu::Buffer,
-    batch: &CombinedPacketBatchSubmission,
-    lifetime: &VarDctJobLifetime,
-) -> Result<(), VarDctDecodeError> {
-    queue.write_buffer(stream, 0, &batch.stream_upload);
-    for upload in &batch.groups {
-        let group = lifetime._groups.get(upload.group_index).ok_or(
-            VarDctDecodeError::EntropyWindowContract {
-                detail: "windowed combined packet batch references an absent group",
-            },
-        )?;
-        queue.write_buffer(&group.modular_params, 0, bytemuck::bytes_of(&upload.params));
-    }
-    Ok(())
-}
-
-fn submit_combined_packet_commands(
-    queue: &wgpu::Queue,
-    mut batches: Vec<CombinedPacketBatchSubmission>,
-    downstream: VarDctDownstreamCommands,
-    lifetime: &VarDctJobLifetime,
-) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
-    let stream = lifetime._packet_stream_window.as_ref().ok_or(
-        VarDctDecodeError::EntropyWindowContract {
-            detail: "windowed combined packet commands have no retained stream upload",
-        },
-    )?;
-    let final_batch = batches
-        .pop()
-        .ok_or(VarDctDecodeError::EntropyWindowContract {
-            detail: "windowed combined packet execution has no batches",
-        })?;
-    for batch in batches {
-        write_combined_packet_batch(queue, stream, &batch, lifetime)?;
-        queue.submit([batch.commands]);
-    }
-    write_combined_packet_batch(queue, stream, &final_batch, lifetime)?;
-    submit_vardct_downstream(queue, vec![final_batch.commands], downstream, lifetime)
-}
-
-fn write_hf_packet_batch(
-    queue: &wgpu::Queue,
-    stream: &wgpu::Buffer,
-    batch: &HfPacketBatchSubmission,
-    lifetime: &VarDctJobLifetime,
-) -> Result<(), VarDctDecodeError> {
-    queue.write_buffer(stream, 0, &batch.stream_upload);
-    for upload in &batch.groups {
-        let group = lifetime._groups.get(upload.group_index).ok_or(
-            VarDctDecodeError::EntropyWindowContract {
-                detail: "windowed HF packet batch references an absent group",
-            },
-        )?;
-        queue.write_buffer(
-            &group.packet_control,
-            0,
-            bytemuck::bytes_of(&upload.control),
-        );
-        queue.write_buffer(&group.modular_params, 0, bytemuck::bytes_of(&upload.params));
-    }
-    Ok(())
-}
-
-fn submit_hf_packet_commands(
-    queue: &wgpu::Queue,
-    mut batches: Vec<HfPacketBatchSubmission>,
-    downstream: VarDctDownstreamCommands,
-    lifetime: &VarDctJobLifetime,
-) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
-    let stream = lifetime._packet_stream_window.as_ref().ok_or(
-        VarDctDecodeError::EntropyWindowContract {
-            detail: "windowed HF packet commands have no retained stream upload",
-        },
-    )?;
-    let final_batch = batches
-        .pop()
-        .ok_or(VarDctDecodeError::EntropyWindowContract {
-            detail: "windowed HF packet execution has no batches",
-        })?;
-    for batch in batches {
-        write_hf_packet_batch(queue, stream, &batch, lifetime)?;
-        queue.submit([batch.commands]);
-    }
-    write_hf_packet_batch(queue, stream, &final_batch, lifetime)?;
-    submit_vardct_downstream(queue, vec![final_batch.commands], downstream, lifetime)
-}
-
-fn submit_hf_metadata_packet_commands(
-    queue: &wgpu::Queue,
-    batches: Vec<HfPacketBatchSubmission>,
-    lifetime: &VarDctJobLifetime,
-) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
-    let stream = lifetime._packet_stream_window.as_ref().ok_or(
-        VarDctDecodeError::EntropyWindowContract {
-            detail: "windowed HF-metadata commands have no retained stream upload",
-        },
-    )?;
-    let mut last_submission = None;
-    for batch in batches {
-        write_hf_packet_batch(queue, stream, &batch, lifetime)?;
-        last_submission = Some(queue.submit([batch.commands]));
-    }
-    last_submission.ok_or(VarDctDecodeError::EntropyWindowContract {
-        detail: "windowed HF-metadata execution has no batches",
-    })
-}
-
 fn submit_vardct_downstream(
     queue: &wgpu::Queue,
     mut prefix: Vec<wgpu::CommandBuffer>,
@@ -465,6 +295,8 @@ fn submit_vardct_downstream(
         VarDctDownstreamCommands::Windowed {
             before_coefficients,
             coefficient_batches,
+            device,
+            pipelines,
             after_coefficients,
         } => {
             prefix.push(before_coefficients);
@@ -492,7 +324,7 @@ fn submit_vardct_downstream(
             for batch in coefficient_batches {
                 queue.write_buffer(stream, 0, &batch.stream_upload);
                 queue.write_buffer(params, 0, &batch.params_upload);
-                queue.submit([batch.commands]);
+                queue.submit([batch.record(&device, &pipelines, buffers, &lifetime._groups)?]);
             }
             Ok(queue.submit([after_coefficients]))
         }
@@ -934,7 +766,7 @@ impl FramePendingFrame {
                     .map_err(VarDctDecodeError::from)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let hf_packet_windows = HfPacketWindowExecutionPlan::new(
+        let hf_packet_windows = PacketWindowExecutionPlan::hf(
             source.codestream.logical_bytes(),
             &source.packet,
             &continuations,
@@ -1036,116 +868,18 @@ impl FramePendingFrame {
         // must match the entry point actually submitted, including its HF-metadata stop status.
         self.hf_metadata_stop = deferred_hf_global;
 
-        let windowed_batches = if let Some(plan) = &hf_packet_windows {
-            let stream = lifetime._packet_stream_window.as_ref().ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "windowed HF packet plan has no shared stream buffer",
-                },
-            )?;
-            let upload_len = usize::try_from(plan.stream_bytes).map_err(|_| {
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "HF packet stream window host length",
-                }
-            })?;
-            let mut submissions = Vec::with_capacity(plan.stream_batches.len());
-            for batch in plan.stream_batches.iter() {
-                if batch.group_count == 0 || batch.segments.is_empty() {
-                    return Err(VarDctDecodeError::EntropyWindowContract {
-                        detail: "HF packet batch contains no segment",
-                    }
-                    .into());
-                }
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu bounded HF packet stream batch"),
-                });
-                let mut stream_upload = vec![0_u8; upload_len];
-                let mut group_uploads = Vec::with_capacity(batch.group_count);
-                for segment_index in batch.segments.clone() {
-                    let segment = *plan.stream_segments.get(segment_index).ok_or(
-                        VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet batch references an absent segment",
-                        },
-                    )?;
-                    let buffers = lifetime._groups.get(segment.group_index).ok_or(
-                        VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment references an absent GPU group",
-                        },
-                    )?;
-                    let metadata = metadata_buffers.get(segment.group_index).ok_or(
-                        VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment references absent Modular metadata",
-                        },
-                    )?;
-                    let control = *controls.get(segment.group_index).ok_or(
-                        VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment references an absent control record",
-                        },
-                    )?;
-                    let params = *plan.segment_params.get(segment_index).ok_or(
-                        VarDctDecodeError::EntropyWindowContract {
-                            detail: "HF packet segment has no parameter record",
-                        },
-                    )?;
-                    copy_stream_segment(
-                        &source.codestream,
-                        segment,
-                        &mut stream_upload,
-                        "HF packet segment exceeds the source or reusable upload",
-                    )?;
-                    let packet_buffers = VarDctPacketBuffers {
-                        codestream: stream,
-                        modular_metadata: metadata,
-                        reconstructed_lf: &buffers.reconstructed,
-                        raw_hf_metadata: &buffers.raw_metadata,
-                        coefficients: &buffers.coefficients,
-                        status: &buffers.packet_status,
-                        control: &buffers.packet_control,
-                        modular_params: &buffers.modular_params,
-                    };
-                    if deferred_hf_global {
-                        self.pipelines.packet.encode_hf_metadata(
-                            device,
-                            &mut encoder,
-                            packet_buffers,
-                        );
-                        encoder.copy_buffer_to_buffer(
-                            &buffers.packet_status,
-                            0,
-                            &lifetime.status_staging,
-                            u64::try_from(segment.group_index).map_err(|_| {
-                                VarDctDecodeError::ArithmeticOverflow {
-                                    field: "windowed HF-metadata status index",
-                                }
-                            })? * PACKET_STATUS_BYTES,
-                            PACKET_STATUS_BYTES,
-                        );
-                    } else {
-                        self.pipelines
-                            .packet
-                            .encode_hf(device, &mut encoder, packet_buffers);
-                    }
-                    group_uploads.push(HfPacketGroupUpload {
-                        group_index: segment.group_index,
-                        control,
-                        params,
-                    });
-                }
-                if group_uploads.len() != batch.group_count {
-                    return Err(VarDctDecodeError::EntropyWindowContract {
-                        detail: "HF packet batch group count disagrees with its segments",
-                    }
-                    .into());
-                }
-                submissions.push(HfPacketBatchSubmission {
-                    stream_upload: stream_upload.into_boxed_slice(),
-                    groups: group_uploads.into_boxed_slice(),
-                    commands: encoder.finish(),
-                });
-            }
-            Some(submissions)
-        } else {
-            None
-        };
+        let windowed_batches = hf_packet_windows
+            .as_ref()
+            .map(|plan| {
+                prepare_packet_windows(
+                    plan,
+                    &source.codestream,
+                    &controls,
+                    deferred_hf_global,
+                    None,
+                )
+            })
+            .transpose()?;
         let completion = Arc::new(MapCompletion::default());
         let (submission, deferred_commands) = if let Some(batches) = windowed_batches {
             let batch_count = batches.len();
@@ -1172,11 +906,17 @@ impl FramePendingFrame {
                 .store(total_submissions, Ordering::Release);
             match post_lf {
                 PostLfCommands::Direct(downstream) => (
-                    submit_hf_packet_commands(self.backend.queue(), batches, downstream, lifetime)?,
+                    submit_packet_batches(
+                        &self.backend,
+                        &self.pipelines,
+                        batches,
+                        Some(downstream),
+                        lifetime,
+                    )?,
                     None,
                 ),
                 PostLfCommands::DeferredHfGlobal(deferred) => (
-                    submit_hf_metadata_packet_commands(self.backend.queue(), batches, lifetime)?,
+                    submit_packet_batches(&self.backend, &self.pipelines, batches, None, lifetime)?,
                     Some(deferred),
                 ),
             }
@@ -1519,70 +1259,7 @@ impl FramePendingFrame {
         let mut coefficient_batches = Vec::new();
         let mut whole_coefficients = None;
         if plan.uses_bounded_stream_windows() {
-            let upload_len = usize::try_from(plan.stream_window_bytes()).map_err(|_| {
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "deferred HF stream window host length",
-                }
-            })?;
-            for ((group_plan, hf_buffers), group_buffers) in plan
-                .groups
-                .iter()
-                .zip(&buffers.groups)
-                .zip(&lifetime._groups)
-            {
-                for batch in &group_plan.stream_batches {
-                    let mut stream_upload = vec![0_u8; upload_len];
-                    for segment in &group_plan.stream_segments[batch.segments.clone()] {
-                        copy_stream_segment(
-                            &source.codestream,
-                            *segment,
-                            &mut stream_upload,
-                            "deferred HF stream segment exceeds the source or reusable upload",
-                        )?;
-                    }
-                    let params_upload =
-                        bytemuck::cast_slice(&group_plan.segment_params[batch.segments.clone()])
-                            .to_vec()
-                            .into_boxed_slice();
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("jxl-wgpu deferred HF coefficient stream batch"),
-                        });
-                    self.pipelines.hf_coefficients.encode(
-                        device,
-                        &mut encoder,
-                        HfCoefficientBuffers {
-                            codestream: buffers.stream_window.as_ref().ok_or(
-                                VarDctDecodeError::EntropyWindowContract {
-                                    detail: "deferred HF plan has no stream window",
-                                },
-                            )?,
-                            entropy_bundle: &buffers.entropy_bundle,
-                            reconstruction: &group_buffers.reconstructed,
-                            params: buffers.params_window.as_ref().ok_or(
-                                VarDctDecodeError::EntropyWindowContract {
-                                    detail: "deferred HF plan has no parameter window",
-                                },
-                            )?,
-                            status: &hf_buffers.status,
-                            artifact: &group_buffers.artifact,
-                            order_table: &buffers.order_table,
-                            coefficients: &group_buffers.coefficients,
-                            sink_params: &hf_buffers.sink_params,
-                        },
-                        u32::try_from(batch.group_count).map_err(|_| {
-                            VarDctDecodeError::ArithmeticOverflow {
-                                field: "deferred HF batch dispatch count",
-                            }
-                        })?,
-                    );
-                    coefficient_batches.push(HfCoefficientBatchSubmission {
-                        stream_upload: stream_upload.into_boxed_slice(),
-                        params_upload,
-                        commands: encoder.finish(),
-                    });
-                }
-            }
+            coefficient_batches = prepare_hf_batches(&source.codestream, &plan)?;
         } else {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu deferred whole-range HF coefficients"),
@@ -1712,12 +1389,14 @@ impl FramePendingFrame {
                 self.backend
                     .queue()
                     .write_buffer(params, 0, &first.params_upload);
+                let first_commands =
+                    first.record(device, &self.pipelines, buffers, &lifetime._groups)?;
                 if let Some(before_coefficients) = commands.before_coefficients.take() {
                     self.backend
                         .queue()
-                        .submit([before_coefficients, first.commands]);
+                        .submit([before_coefficients, first_commands]);
                 } else {
-                    self.backend.queue().submit([first.commands]);
+                    self.backend.queue().submit([first_commands]);
                 }
                 let mut batch_count = 1_usize;
                 for batch in batches {
@@ -1727,7 +1406,12 @@ impl FramePendingFrame {
                     self.backend
                         .queue()
                         .write_buffer(params, 0, &batch.params_upload);
-                    self.backend.queue().submit([batch.commands]);
+                    self.backend.queue().submit([batch.record(
+                        device,
+                        &self.pipelines,
+                        buffers,
+                        &lifetime._groups,
+                    )?]);
                     batch_count = batch_count.checked_add(1).ok_or(
                         VarDctDecodeError::ArithmeticOverflow {
                             field: "deferred HF batch count",
@@ -2093,8 +1777,12 @@ fn submit_vardct(
     )?;
     let staged_lf = source.packet.requires_lf_staging();
     let staged_lf_extras = source.packet.requires_lf_extra_staging();
-    let staged_hf_global =
-        source.packet.requires_hf_global_staging() && source.combined_packet_windows.is_none();
+    // Eager HF-only windows must finish before a sectioned raw matrix begins. Their validated
+    // metadata stop uses the same continuation as a fused HF-global cursor.
+    let staged_hf_global = (source.packet.requires_hf_global_staging()
+        && !source.fuses_packet_stages())
+        || (source.packet.pending_raw_hf_dequant_side_image().is_some()
+            && source.packet_window_batches(PacketStage::Hf) != 0);
     let group_specific_metadata = staged_lf || source.packet.profile.uses_lf_frame;
     let modular_metadata = if group_specific_metadata {
         source
@@ -2435,231 +2123,37 @@ fn submit_vardct(
     if let Some(sigma) = &epf_sigma {
         packet_commands.clear_buffer(sigma, 0, None);
     }
-    let (packet_stage_commands, combined_packet_batches, mut commands) = if staged_lf_extras {
+    let (packet_stage_commands, packet_batches, mut commands) = if staged_lf_extras {
         packet_commands.clear_buffer(&status_staging, 0, None);
         (
-            Some(LfPacketCommands::Whole(packet_commands.finish())),
+            Some(PacketCommands::Whole(packet_commands.finish())),
             None,
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu VarDCT downstream after LF extras"),
             }),
         )
-    } else if let Some(plan) = &source.lf_packet_windows {
-        if !staged_lf {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "LF packet windows require staged local trees",
-            });
+    } else if let Some(plan) = &source.packet_windows {
+        let controls = source
+            .groups
+            .iter()
+            .map(|group| group.control)
+            .collect::<Vec<_>>();
+        let staged = staged_lf || staged_hf_global;
+        let submissions = prepare_packet_windows(
+            plan,
+            &source.codestream,
+            &controls,
+            staged,
+            Some(packet_commands),
+        )?;
+        let commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu VarDCT downstream after packet windows"),
+        });
+        if staged {
+            (Some(PacketCommands::Windowed(submissions)), None, commands)
+        } else {
+            (None, Some(submissions), commands)
         }
-        let stream =
-            packet_stream_window
-                .as_ref()
-                .ok_or(VarDctDecodeError::EntropyWindowContract {
-                    detail: "windowed LF packet plan has no stream buffer",
-                })?;
-        let upload_len = usize::try_from(plan.stream_bytes).map_err(|_| {
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "LF packet stream window host length",
-            }
-        })?;
-        let mut first_commands = Some(packet_commands);
-        let mut submissions = Vec::with_capacity(plan.stream_batches.len());
-        for (batch_index, batch) in plan.stream_batches.iter().enumerate() {
-            if batch.group_count != 1 || batch.segments.end != batch.segments.start + 1 {
-                return Err(VarDctDecodeError::EntropyWindowContract {
-                    detail: "serial LF packet batch does not contain exactly one segment",
-                });
-            }
-            let segment_index = batch.segments.start;
-            let segment = *plan.stream_segments.get(segment_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet batch references an absent segment",
-                },
-            )?;
-            if segment.group_index != batch.first_group {
-                return Err(VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment and batch group indices disagree",
-                });
-            }
-            let buffers = group_buffers.get(segment.group_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment references an absent GPU group",
-                },
-            )?;
-            let metadata = modular_metadata.get(segment.group_index).ok_or(
-                VarDctDecodeError::GroupPlanCount {
-                    component: "LF-local Modular metadata",
-                    expected: group_buffers.len(),
-                    actual: modular_metadata.len(),
-                },
-            )?;
-            let mut encoder = first_commands.take().unwrap_or_else(|| {
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu bounded LF packet stream batch"),
-                })
-            });
-            pipelines.packet.encode_lf(
-                device,
-                &mut encoder,
-                VarDctPacketBuffers {
-                    codestream: stream,
-                    modular_metadata: metadata,
-                    reconstructed_lf: &buffers.reconstructed,
-                    raw_hf_metadata: &buffers.raw_metadata,
-                    coefficients: &buffers.coefficients,
-                    status: &buffers.packet_status,
-                    control: &buffers.packet_control,
-                    modular_params: &buffers.modular_params,
-                },
-            );
-            if batch_index + 1 == plan.stream_batches.len() {
-                for (index, buffers) in group_buffers.iter().enumerate() {
-                    encoder.copy_buffer_to_buffer(
-                        &buffers.packet_status,
-                        0,
-                        &status_staging,
-                        u64::try_from(index).map_err(|_| {
-                            VarDctDecodeError::ArithmeticOverflow {
-                                field: "LF staging status index",
-                            }
-                        })? * PACKET_STATUS_BYTES,
-                        PACKET_STATUS_BYTES,
-                    );
-                }
-            }
-            let mut stream_upload = vec![0_u8; upload_len];
-            copy_stream_segment(
-                &source.codestream,
-                segment,
-                &mut stream_upload,
-                "LF packet segment exceeds the source or reusable upload",
-            )?;
-            let params = *plan.segment_params.get(segment_index).ok_or(
-                VarDctDecodeError::EntropyWindowContract {
-                    detail: "LF packet segment has no parameter record",
-                },
-            )?;
-            submissions.push(LfPacketBatchSubmission {
-                group_index: segment.group_index,
-                stream_upload: stream_upload.into_boxed_slice(),
-                params,
-                commands: encoder.finish(),
-            });
-        }
-        if first_commands.is_some() || submissions.is_empty() {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "windowed LF packet execution has no dispatch",
-            });
-        }
-        (
-            Some(LfPacketCommands::Windowed(submissions)),
-            None,
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("jxl-wgpu bounded VarDCT downstream stage"),
-            }),
-        )
-    } else if let Some(plan) = &source.combined_packet_windows {
-        if staged_lf {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "combined packet windows cannot stage local trees",
-            });
-        }
-        let stream =
-            packet_stream_window
-                .as_ref()
-                .ok_or(VarDctDecodeError::EntropyWindowContract {
-                    detail: "windowed combined packet plan has no stream buffer",
-                })?;
-        let metadata = modular_metadata
-            .first()
-            .ok_or(VarDctDecodeError::GroupPlanCount {
-                component: "global Modular metadata",
-                expected: 1,
-                actual: 0,
-            })?;
-        let upload_len = usize::try_from(plan.stream_bytes).map_err(|_| {
-            VarDctDecodeError::ArithmeticOverflow {
-                field: "combined packet stream window host length",
-            }
-        })?;
-        let mut first_commands = Some(packet_commands);
-        let mut submissions = Vec::with_capacity(plan.stream_batches.len());
-        for batch in plan.stream_batches.iter() {
-            if batch.group_count == 0 || batch.segments.is_empty() {
-                return Err(VarDctDecodeError::EntropyWindowContract {
-                    detail: "combined packet batch contains no segment",
-                });
-            }
-            let mut encoder = first_commands.take().unwrap_or_else(|| {
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("jxl-wgpu bounded combined packet stream batch"),
-                })
-            });
-            let mut stream_upload = vec![0_u8; upload_len];
-            let mut group_uploads = Vec::with_capacity(batch.group_count);
-            for segment_index in batch.segments.clone() {
-                let segment = *plan.stream_segments.get(segment_index).ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "combined packet batch references an absent segment",
-                    },
-                )?;
-                let buffers = group_buffers.get(segment.group_index).ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "combined packet segment references an absent GPU group",
-                    },
-                )?;
-                let params = *plan.segment_params.get(segment_index).ok_or(
-                    VarDctDecodeError::EntropyWindowContract {
-                        detail: "combined packet segment has no parameter record",
-                    },
-                )?;
-                copy_stream_segment(
-                    &source.codestream,
-                    segment,
-                    &mut stream_upload,
-                    "combined packet segment exceeds the source or reusable upload",
-                )?;
-                pipelines.packet.encode(
-                    device,
-                    &mut encoder,
-                    VarDctPacketBuffers {
-                        codestream: stream,
-                        modular_metadata: metadata,
-                        reconstructed_lf: &buffers.reconstructed,
-                        raw_hf_metadata: &buffers.raw_metadata,
-                        coefficients: &buffers.coefficients,
-                        status: &buffers.packet_status,
-                        control: &buffers.packet_control,
-                        modular_params: &buffers.modular_params,
-                    },
-                );
-                group_uploads.push(CombinedPacketGroupUpload {
-                    group_index: segment.group_index,
-                    params,
-                });
-            }
-            if group_uploads.len() != batch.group_count {
-                return Err(VarDctDecodeError::EntropyWindowContract {
-                    detail: "combined packet batch group count disagrees with its segments",
-                });
-            }
-            submissions.push(CombinedPacketBatchSubmission {
-                stream_upload: stream_upload.into_boxed_slice(),
-                groups: group_uploads.into_boxed_slice(),
-                commands: encoder.finish(),
-            });
-        }
-        if first_commands.is_some() || submissions.is_empty() {
-            return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "windowed combined packet execution has no dispatch",
-            });
-        }
-        (
-            None,
-            Some(submissions),
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("jxl-wgpu bounded VarDCT downstream stage"),
-            }),
-        )
     } else {
         for (index, buffers) in group_buffers.iter().enumerate() {
             let metadata = if group_specific_metadata {
@@ -2724,7 +2218,7 @@ fn submit_vardct(
         }
         if staged_lf || staged_hf_global {
             (
-                Some(LfPacketCommands::Whole(packet_commands.finish())),
+                Some(PacketCommands::Whole(packet_commands.finish())),
                 None,
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("jxl-wgpu bounded VarDCT downstream stage"),
@@ -2863,73 +2357,7 @@ fn submit_vardct(
             commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu bounded VarDCT post-coefficient stage"),
             });
-            let stream_window =
-                buffers
-                    .stream_window
-                    .as_ref()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "windowed AC plan has no stream buffer",
-                    })?;
-            let params_window =
-                buffers
-                    .params_window
-                    .as_ref()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "windowed AC plan has no parameter buffer",
-                    })?;
-            let upload_len = usize::try_from(plan.stream_window_bytes()).map_err(|_| {
-                VarDctDecodeError::ArithmeticOverflow {
-                    field: "HF stream window host length",
-                }
-            })?;
-            for ((group_plan, hf_buffers), group_buffers) in
-                plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
-            {
-                for batch in &group_plan.stream_batches {
-                    let mut stream_upload = vec![0_u8; upload_len];
-                    for segment in &group_plan.stream_segments[batch.segments.clone()] {
-                        copy_stream_segment(
-                            &source.codestream,
-                            *segment,
-                            &mut stream_upload,
-                            "HF stream segment exceeds the source or reusable upload",
-                        )?;
-                    }
-                    let params_upload =
-                        bytemuck::cast_slice(&group_plan.segment_params[batch.segments.clone()])
-                            .to_vec()
-                            .into_boxed_slice();
-                    let mut batch_commands =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("jxl-wgpu bounded HF coefficient stream batch"),
-                        });
-                    pipelines.hf_coefficients.encode(
-                        device,
-                        &mut batch_commands,
-                        HfCoefficientBuffers {
-                            codestream: stream_window,
-                            entropy_bundle: &buffers.entropy_bundle,
-                            reconstruction: &group_buffers.reconstructed,
-                            params: params_window,
-                            status: &hf_buffers.status,
-                            artifact: &group_buffers.artifact,
-                            order_table: &buffers.order_table,
-                            coefficients: &group_buffers.coefficients,
-                            sink_params: &hf_buffers.sink_params,
-                        },
-                        u32::try_from(batch.group_count).map_err(|_| {
-                            VarDctDecodeError::ArithmeticOverflow {
-                                field: "HF stream batch dispatch count",
-                            }
-                        })?,
-                    );
-                    windowed_coefficient_batches.push(HfCoefficientBatchSubmission {
-                        stream_upload: stream_upload.into_boxed_slice(),
-                        params_upload,
-                        commands: batch_commands.finish(),
-                    });
-                }
-            }
+            windowed_coefficient_batches = prepare_hf_batches(&source.codestream, plan)?;
         } else {
             for ((group_plan, hf_buffers), group_buffers) in
                 plan.groups.iter().zip(&buffers.groups).zip(&group_buffers)
@@ -3497,6 +2925,8 @@ fn submit_vardct(
                 VarDctDownstreamCommands::Windowed {
                     before_coefficients,
                     coefficient_batches: windowed_coefficient_batches,
+                    device: device.clone(),
+                    pipelines: Arc::clone(&pipelines),
                     after_coefficients,
                 }
             } else {
@@ -3603,9 +3033,9 @@ fn submit_vardct(
     if source.packet.pending_raw_hf_dequant_side_image().is_some()
         && packet_stage_commands.is_none()
     {
-        if combined_packet_batches.is_some() {
+        if packet_batches.is_some() {
             return Err(VarDctDecodeError::EntropyWindowContract {
-                detail: "raw HF dequant side images cannot use combined packet stream windows",
+                detail: "raw HF dequant side images require packet completion before their first window",
             });
         }
         if downstream_commands.is_some() {
@@ -3624,8 +3054,12 @@ fn submit_vardct(
     let completion = Arc::new(MapCompletion::default());
     let (submission, local_commands, deferred_commands) =
         if let Some(packet_stage_commands) = packet_stage_commands {
-            let submission =
-                submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
+            let submission = submit_packet_commands(
+                backend,
+                &pending.pipelines,
+                packet_stage_commands,
+                &lifetime,
+            )?;
             if staged_hf_global || source.packet.pending_raw_hf_dequant_side_image().is_some() {
                 if source.packet.profile.uses_lf_frame && !staged_lf_extras {
                     (submission, None, deferred_commands)
@@ -3646,12 +3080,18 @@ fn submit_vardct(
                     None,
                 )
             }
-        } else if let Some(batches) = combined_packet_batches {
+        } else if let Some(batches) = packet_batches {
             let downstream = downstream_commands.ok_or(VarDctDecodeError::EngineContract {
-                detail: "combined packet execution is missing downstream commands",
+                detail: "windowed packet execution is missing downstream commands",
             })?;
             (
-                submit_combined_packet_commands(backend.queue(), batches, downstream, &lifetime)?,
+                submit_packet_batches(
+                    backend,
+                    &pending.pipelines,
+                    batches,
+                    Some(downstream),
+                    &lifetime,
+                )?,
                 None,
                 None,
             )

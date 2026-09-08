@@ -804,12 +804,16 @@ WebGPU without a Tokio or async-std dependency.
 
 `VarDctDecodeMemoryStats` separately reports the shared packet stream peak, initial packet batch
 count, reusable AC stream peak and batch count, reusable parameter bytes, LZ scratch, and
-execution-state total. For sectioned global-tree packets the initial count covers the complete packet;
-for local trees it covers LF. HF packet descriptors are host-discovered after the LF map, so
-`hf_packet_stream_batch_count()` and `submissions_per_frame()` become exact when that dynamic plan is
-installed; performance harnesses sample them after frame completion. Applying
+execution-state total. One typed initial window plan selects LF, HF-only, or combined packet
+execution. For sectioned global-tree packets the initial count covers the complete packet; for
+local trees it covers LF; for LF consumers with eager HF descriptors it covers HF. Their generic
+64-byte or weighted 128-byte resume record uses the exact admitted predictor layout. HF descriptors
+discovered after an LF cursor update `hf_packet_stream_batch_count()` and `submissions_per_frame()`
+when that dynamic plan is installed; eager HF batches are counted from preparation. Performance
+harnesses sample counts after frame completion. Applying
 `WgpuDecodeEngine::with_stream_window_limit` configures both coding-mode engines and governs
-sectioned global-tree packets, staged LF/HF packets, and AC pass groups. It is a caller upper bound:
+sectioned global-tree packets, staged LF/HF packets, eager HF-only LF consumers, and AC pass groups.
+It is a caller upper bound:
 device limits and deterministic planning against the shared budget's total capacity may select a
 smaller four-byte-aligned value, exposed as
 `VarDctDecodeMemoryStats::resolved_stream_window_limit_bytes`. Planning does not sample live
@@ -821,6 +825,14 @@ positive difference from the same budget. Actual-adapter runs force a 40-byte st
 256-byte shared-global/local-tree/nonzero-AC paths, and an intermediate budget-resolved cap through
 blocking or runtime-neutral async decode, typed corruption/backpressure, and cancellation-driven
 reservation release.
+
+Packet and AC window preparation retains host uploads and dispatch records. GPU commands and bind
+groups are recorded immediately before each ordered submission, including deferred AC after
+HF-global parsing. This avoids exhausting Metal's command resources when the minimum 40-byte
+window splits a 1024×128 recursive DC+AC stream into thousands of submissions. Seventeen-byte
+transport chunks and asynchronous completion produce exactly the same RGB8 bytes as whole input;
+both independent decoders agree within one code. Cancellation before and after LF/HF transitions
+releases input and producer reservations after callbacks retire.
 
 The actual-adapter matrix covers all nine accepted single regular transform extents plus sectioned,
 odd/asymmetric multi-task and multi-pass-group frames. Lower-level GPU kernel oracles cover all 27

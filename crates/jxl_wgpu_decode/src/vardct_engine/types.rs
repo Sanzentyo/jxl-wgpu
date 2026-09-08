@@ -29,7 +29,7 @@ use crate::vardct_pass_group::{
 use crate::vardct_resource::{VarDctResourceError, VarDctResourceLayout, VarDctResourceParams};
 
 use super::source::VarDctGroupSource;
-use super::window_plan::{CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan};
+use super::window_plan::PacketWindowExecutionPlan;
 
 pub(super) const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
 pub(super) const ARTIFACT_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctArtifactStatus>() as u64;
@@ -269,11 +269,11 @@ pub struct VarDctDecodeMemoryStats {
     pub validation_staging_bytes: u64,
     pub packet_control_bytes: u64,
     pub modular_params_bytes: u64,
-    /// Reusable upload shared by staged local-tree LF and HF packet entropy. Zero when every
+    /// Reusable upload shared by LF, HF-only, and combined packet entropy. Zero when every
     /// packet binds the retained whole codestream.
     pub packet_stream_window_bytes: u64,
-    /// Ordered initial packet batches. For local trees this is the staged-LF count; for a
-    /// combined/global-tree packet it covers the complete LF/HF packet.
+    /// Ordered initial packet batches: staged LF, eager HF-only in an LF consumer, or combined
+    /// LF/HF. HF batches discovered after an entropy cursor are reported by the runtime session.
     pub packet_stream_batch_count: usize,
     /// Resume records included in `reconstructed_bytes`, reported separately for ABI auditing.
     pub packet_execution_state_bytes: u64,
@@ -340,8 +340,7 @@ impl VarDctDecodeMemoryStats {
             codestream_len,
             packet,
             groups,
-            lf_packet_windows,
-            combined_packet_windows,
+            packet_windows,
             resource,
             hf_coefficients,
             deferred_hf,
@@ -525,19 +524,17 @@ impl VarDctDecodeMemoryStats {
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
                 field: "Modular parameter bytes",
             })?;
-        debug_assert!(lf_packet_windows.is_none() || combined_packet_windows.is_none());
-        let packet_stream_window_bytes = lf_packet_windows
-            .map(|plan| plan.stream_bytes)
-            .or_else(|| combined_packet_windows.map(|plan| plan.stream_bytes))
-            .unwrap_or(super::window_plan::deferred_hf_stream_window_bytes(
+        let packet_stream_window_bytes = if let Some(plan) = packet_windows {
+            plan.stream_bytes
+        } else {
+            super::window_plan::deferred_hf_stream_window_bytes(
                 codestream_bytes,
                 packet,
                 stream_limit,
-            )?);
-        let packet_stream_batch_count = lf_packet_windows
-            .map(LfPacketWindowExecutionPlan::batch_count)
-            .or_else(|| combined_packet_windows.map(CombinedPacketWindowExecutionPlan::batch_count))
-            .unwrap_or(0);
+            )?
+        };
+        let packet_stream_batch_count =
+            packet_windows.map_or(0, PacketWindowExecutionPlan::batch_count);
         let packet_execution_state_bytes = packet
             .groups
             .iter()
@@ -841,8 +838,7 @@ pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) codestream_len: usize,
     pub(super) packet: &'a BoundedVarDctPacketPlan,
     pub(super) groups: &'a [VarDctGroupSource],
-    pub(super) lf_packet_windows: Option<&'a LfPacketWindowExecutionPlan>,
-    pub(super) combined_packet_windows: Option<&'a CombinedPacketWindowExecutionPlan>,
+    pub(super) packet_windows: Option<&'a PacketWindowExecutionPlan>,
     pub(super) resource: VarDctResourceLayout,
     pub(super) hf_coefficients: Option<&'a HfCoefficientExecutionPlan>,
     pub(super) deferred_hf: Option<&'a DeferredHfCoefficientLayout>,

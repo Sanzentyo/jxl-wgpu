@@ -2721,7 +2721,7 @@ impl VarDctModularParams {
     }
 
     #[cfg(test)]
-    fn window_contract(&self) -> [u32; 7] {
+    pub(crate) fn window_contract(&self) -> [u32; 7] {
         [
             self.window_logical_start,
             self.window_upload_start,

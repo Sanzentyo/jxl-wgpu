@@ -69,7 +69,11 @@ before submission. The common physical frame executor validates every LF produce
 versions, and reuses four budget-tracked LF slots across presentations without pixel readback. It converts the Modular root's signed `[Y, X, B-Y]` planes to dequantized XYB, packs them
 into each dependent VarDCT LF atlas, decodes a single-entry intermediate frame's HF metadata on
 GPU, maps only its validated HF-global cursor, then submits its general HF-global/AC and the next
-dependency on the same queue. Parametric custom dequantization matrices are expanded as bounded
+dependency on the same queue. LF consumers whose first stream is HF metadata obey the same input
+window cap as ordinary LF/HF packets. Packet and AC commands are recorded just before submission,
+so tiny windows do not retain thousands of unsubmitted GPU command buffers. A recursive DC+AC
+stream matches whole-input output exactly through 40-byte windows and fragmented async input.
+Parametric custom dequantization matrices are expanded as bounded
 scalar metadata and installed directly in the resident resource table. Raw mode-7 matrices now use
 the common GPU Modular entropy and inverse-transform pipelines. One reusable input window obeys
 the caller/device cap and shared byte budget, and each 16-byte status supplies a validated cursor.

@@ -774,18 +774,31 @@ fn progressive_ac_combines_with_recursive_gpu_resident_dc() {
     let extent = Extent2d::new(1024, 128);
     let expected = rust_jxl_rgb8(encoded, extent);
     let djxl = djxl_rgb8(encoded, extent);
-    for cap in [u64::MAX, 256] {
+    let mut whole_output = None;
+    let mut whole_submissions = 0;
+    for cap in [u64::MAX, 40, 256] {
         let decoder = GpuDecoder::new(
             WgpuDecodeEngine::new(backend.clone())
                 .unwrap()
                 .with_stream_window_limit(NonZeroU64::new(cap).unwrap()),
         );
-        let mut session = decoder
-            .open(
-                encoded,
-                GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
-            )
-            .unwrap();
+        let request = || GpuOutputRequest::color(vardct_rgb8_format()).unwrap();
+        let mut session = if cap == u64::MAX {
+            decoder.open(encoded, request()).unwrap()
+        } else {
+            let mut stream = decoder.stream(request()).unwrap();
+            let mut transport = ContainerStreamScanner::new(decoder.container_stream_limits());
+            for chunk in encoded.chunks(17) {
+                for event in transport.push_chunk(Arc::from(chunk)).unwrap() {
+                    stream.push_transport_event(&event).unwrap();
+                }
+            }
+            for event in transport.finish_input().unwrap() {
+                stream.push_transport_event(&event).unwrap();
+            }
+            assert!(stream.stats().retained_spans > 2);
+            stream.finish().unwrap()
+        };
         assert!(matches!(
             session.submission_session(),
             WgpuDecodeSubmissionSession::Sequence(_)
@@ -812,10 +825,95 @@ fn progressive_ac_combines_with_recursive_gpu_resident_dc() {
                 "progressive DC+AC cap {cap}: djxl error {error}"
             );
         }
+        let submissions = session.submission_session().submissions_per_frame();
+        if let Some(whole_output) = &whole_output {
+            assert_eq!(
+                actual, whole_output,
+                "cap {cap}: packet resume must preserve every output code"
+            );
+            assert!(
+                submissions > whole_submissions,
+                "cap {cap}: GPU window submissions"
+            );
+        } else {
+            whole_output = Some(actual.clone());
+            whole_submissions = submissions;
+        }
         drop(readback);
         drop(frame);
         drop(session);
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+        assert_eq!(
+            decoder.incremental_input_budget().snapshot().reserved_bytes,
+            0
+        );
+    }
+}
+
+#[test]
+fn cancelling_bounded_hf_only_lf_consumers_releases_producer_and_input_leases() {
+    use std::task::{Context, Poll, Waker};
+    let Some((info, device, queue)) = device() else {
+        return;
+    };
+    let backend =
+        WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
+    let encoded = common::vardct_progressive_dc_ac();
+    let decoder = GpuDecoder::new(
+        WgpuDecodeEngine::new(backend.clone())
+            .unwrap()
+            .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
+    );
+    for transitions in [0, 1, 2] {
+        let mut session = open_incremental(
+            &decoder,
+            encoded,
+            GpuOutputRequest::color(vardct_rgb8_format()).unwrap(),
+        );
+        session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+        let mut observed = session.submission_session().submissions_per_frame();
+        let mut remaining = transitions;
+        let mut context = Context::from_waker(Waker::noop());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while remaining != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            assert!(matches!(
+                session.poll_next_frame(&mut context),
+                Poll::Pending
+            ));
+            let current = session.submission_session().submissions_per_frame();
+            if current > observed {
+                observed = current;
+                remaining -= 1;
+            }
+            std::thread::yield_now();
+        }
+        assert!(decoder.engine().in_flight_memory_stats().reserved_bytes > 0);
+        drop(session);
+        let fence = backend.queue().submit(std::iter::empty());
+        backend
+            .device()
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(fence),
+                timeout: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (decoder.engine().in_flight_memory_stats().reserved_bytes != 0
+            || decoder.incremental_input_budget().snapshot().reserved_bytes != 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            decoder.engine().in_flight_memory_stats().reserved_bytes,
+            0,
+            "transition {transitions}"
+        );
+        assert_eq!(
+            decoder.incremental_input_budget().snapshot().reserved_bytes,
+            0
+        );
     }
 }
 

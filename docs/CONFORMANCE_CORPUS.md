@@ -270,6 +270,23 @@ stream bytes may not exceed the cap, and the submission count must equal the ini
 planned AC batches, and resident pre/post stages without double-counting the co-submitted final
 packet command.
 
+`vardct_engine_gpu::progressive_ac_combines_with_recursive_gpu_resident_dc` also forces 40-byte
+and 256-byte windows on the checked 1024×128 three-frame DC+quantized-AC stream. Seventeen-byte
+transport chunks retain fragmented input until the GPU consumers complete. Whole and bounded
+asynchronous RGB8 output must be byte-identical and within one code of Rust `jxl` and optional
+native `djxl`. The intermediate LF consumer begins directly with HF metadata, so its initial
+packet window exercises a different entry point from staged LF coefficients. A companion plan
+test requires real HF windows and a compact generic predictor allocation, and checks that every
+resume record fits the allocation and every upload fits the cap. The cancellation companion
+abandons the root, first LF/HF transition, and subsequent transition, then requires every GPU and
+input reservation to retire. Packet and AC batches record GPU commands at submission time; the
+40-byte case previously exhausted Metal's command resources when all future commands were built
+before submission.
+
+The packet plan also covers a shared-capacity counterexample: two 260-byte LF ranges have a
+240-byte upload peak under a 256-byte cap, but their later HF suffixes need a 256-byte shared
+upload. Staged LF must reserve the selected cap until those HF descriptors are known.
+
 `vardct_engine_gpu::vardct_stream_windows_adapt_to_the_shared_frame_budget` opens the same
 438×589 global-tree/nonzero-AC fixture at 40-byte and 256-byte caller caps, then chooses a shared
 budget strictly between those exact frame totals. Production planning must resolve a four-byte-
