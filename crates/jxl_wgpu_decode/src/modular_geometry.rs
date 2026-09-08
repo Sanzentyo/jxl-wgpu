@@ -15,10 +15,11 @@ pub(crate) fn source_topology(
     let (width, height) = frame
         .color_sample_extent()
         .ok_or(Error::EngineContract("invalid Modular color grid"))?;
-    let SampleBitDepth::Integer { bits_per_sample } = image.bit_depth else {
-        return Err(Error::EngineContract(
-            "Modular integer topology requires integer precision",
-        ));
+    let bits_per_sample = match image.bit_depth {
+        SampleBitDepth::Integer { bits_per_sample }
+        | SampleBitDepth::Float {
+            bits_per_sample, ..
+        } => bits_per_sample,
     };
     if !matches!(frame.upsampling, 1 | 2 | 4 | 8)
         || frame.extra_channel_upsampling.len() != image.extra_channels.len()

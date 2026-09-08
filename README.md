@@ -97,7 +97,8 @@ within one code value under whole and bounded asynchronous input.
 XYB VarDCT accepts every integer source depth from 1 through 16.
 Twenty synthetic fixtures cover every depth, plus high-depth grayscale, orientation, resampling,
 multiple LF groups, and recursive DC. Both reference decoders agree within one RGB8 code; the
-non-XYB YCbCr profile remains limited to 8-bit input, and floating-point source metadata is pending.
+non-XYB YCbCr profile remains limited to 8-bit integer input. XYB VarDCT also accepts legal JPEG XL
+floating source precision without rescaling its reconstructed XYB samples.
 
 VarDCT output shares the render backend's GPU color conversion and packing. A single fused dispatch
 returns all 20 color VPI pitch-linear layouts, planar YUV, NV21/NV42, P010/P012/P016, and other
@@ -115,14 +116,24 @@ VarDCT uses the shared D65 primary conversion. `GpuOutputRequest::with_orientati
 selects default `OrientationPolicy::Apply` or `Keep` for codestream coordinates, including mixed
 animation and recursive DC. The frame executor uses this unrounded boundary for GPU crop/blend
 composition and four post-transform reference slots. It handles negative/oversized/off-canvas
-rectangles, Replace/Add/Blend/Mul/MulAdd, straight or associated integer alpha with separate background
+rectangles, Replace/Add/Blend/Mul/MulAdd, straight or associated alpha with separate background
 sources, hidden layers, reference-only frames, mixed coding modes, and recursive DC. Packing and
 orientation follow composition. The private frame boundary retains planar RGB plus every extra
 channel in one accounted GPU allocation. Each plane follows its own blend mode, reference slot,
 alpha selector and clamp flag; color output uses the first declared alpha only at presentation.
 Seven nine-layer fixtures cover nine independently typed/depth-coded extras, two alpha planes,
 Gray/RGB, both coding modes, distributed groups and shifted resampling. Pre-transform patch
-references and JPEG XL floating-point source metadata remain pending.
+references and broader original color domains remain pending.
+
+JPEG XL floating sources support all 154 legal combinations of 2–8 exponent bits and 2–23 mantissa
+bits, including binary16 and binary32. `DecodeProfile` retains `SampleBitDepth`, including the
+exponent width. `NumericSampleMapping::NativeFloat` returns scalar F32 from a Modular gray source
+or a selected floating extra channel in either coding mode. Unfiltered, uncomposed delivery widens
+the representation bit-for-bit, preserving signed zeros, subnormals, infinities and NaN payloads.
+Inverse transforms precede conversion; resampling, alpha, spots and composition consume decoded
+F32 values. Integer and floating extras can coexist. RGB8 output quantizes after those operations.
+The checked-in corpus covers every floating precision and 27 rendering/animation cases against
+libjxl, with byte-identical whole and bounded fragmented GPU output.
 
 Modular reconstructs integer extra channels with independent 1–16-bit precision.
 `DecodeProfile` reports color and extra-channel counts separately from native output formats, and
@@ -161,8 +172,8 @@ and transient render buffers participate in admission, cancellation and shared m
 The profile variant is now `DecodeProfile::Modular`, since resampled output is not necessarily
 lossless. Integer extra-channel composition uses the same normalized/resampled planes and retains
 extended values until presentation. Selected native extras clamp and round once at their declared
-depth after composition; scalar F32 preserves the normalized result. Floating-point source samples
-remain pending.
+depth after composition; scalar F32 preserves the normalized result. Floating sources use the same
+filter and composition pipeline after representation conversion, without integer normalization.
 
 Both modes accept associated integer alpha, including independent depths and resampling.
 `GpuOutputRequest::with_alpha_output_policy` selects `Unassociated` (default), `Preserve`, or

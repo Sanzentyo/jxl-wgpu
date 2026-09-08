@@ -14,8 +14,8 @@ The low-level `WgpuSubmissionEngine` implements a standards-only integer Modular
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private
   metadata requirement;
-- one final still frame with 1–16-bit integer Gray or RGB Modular samples and arbitrary
-  integer extras at independent 1–16-bit precision, including 2×/4×/8× color/extra resampling, over a bounded
+- one final still frame with Gray or RGB Modular samples and arbitrary extra planes, each with
+  independent 1–16-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color/extra resampling, over a bounded
   128/256/512/1024-pixel pass-group grid and one through three passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
@@ -45,8 +45,38 @@ by their actual bit depth after inverse transforms; gray expands to RGB, missing
 and decoded alpha normalizes independently of the RGB transfer. This path currently accepts
 explicit full-range BT.709 primaries and sRGB/SYCC, Linear, BT.709 or BT.2020 transfer functions.
 It preserves the existing native integer output contracts and uses the same resident output leases.
-Gray+alpha and independent alpha precision use the same path. Floating-point JPEG XL source
-metadata and additional source color domains remain unsupported.
+Gray+alpha and independent alpha precision use the same path. Floating sources decode their
+declared representation before color conversion. Additional source color domains remain unsupported.
+
+### Floating source samples
+
+`DecodeProfile::{Modular, VarDct}` and `StandardVarDctProfile` expose `sample_bit_depth: SampleBitDepth`
+instead of an integer-only width. All 154 legal floating declarations (2–8 exponent and 2–23 mantissa
+bits) are admitted. The Modular inverse arena remains signed working words; original precision is
+stored separately from transform geometry in a validated `ModularOutputPlane`.
+`ModularSampleDomain::Encoded` identifies those original sample words; `DecodedF32` identifies
+converted values, including filtered planes. Each extra retains its own integer or floating type.
+
+Use `NumericSampleMapping::NativeFloat` with scalar F32 storage for Modular grayscale or a selected
+floating extra in either coding mode. Integer sources continue to use `NativeUnsigned` or
+`NormalizedUnsigned`; mismatched mappings are rejected. Binary16, binary32 and every custom precision
+are widened using integer bit assembly on GPU. Unfiltered, uncomposed F32 samples preserve signed
+zero, subnormals, infinities and NaN payloads; no-op RGB F32 delivery also copies bits directly.
+Filtering, color conversion, alpha and blending operate on decoded values and make no payload or
+bit-exact arithmetic guarantee. Native scalar floating output never divides by an integer maximum.
+
+RGB integer and broader color presentation use the common planar F32 boundary, with quantization
+at final output. The same domain supports mixed extra channels, first-alpha selection, associated
+alpha, spot inks, Squeeze/Palette/RCT, group distribution, orientation, resampling and animation.
+Floating VarDCT source precision describes the original image; it does not reinterpret reconstructed
+XYB coefficients or the integer Modular words used by progressive-DC dependencies.
+
+`tests/floating_samples.rs` checks all 154 precisions against independently decoded libjxl words,
+plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
+Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
+`cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
+libjxl 0.12 tools; the production crates do not link that codec. Original non-sRGB/ICC domains,
+pre-transform references and source integer precision above 16 remain separate requirements.
 
 Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
@@ -133,8 +163,8 @@ trip before standalone VarDCT presentation. Ten deterministic multi-spot stills 
 five inks, independent 1/4/6/10/12-bit coverage, negative/extended RGB and solidity, two alpha planes,
 Gray/RGB, oriented thin axes, shifted resampling, responsive distributed transforms, native 8/12/16-bit
 RGB/RGBA, F32 RGB/BGRA, NV12, packed 4:2:2 and BT.2020 constant-luminance P010. The spot table costs
-32 accounted bytes per ink and exists only for rendered color output. Floating source channels,
-general original color encodings and HDR luminance mapping remain separate roadmap gates.
+32 accounted bytes per ink and exists only for rendered color output. General original color
+encodings and HDR luminance mapping remain separate roadmap gates.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
@@ -189,7 +219,7 @@ intermediates represented by two GPU words. Persistent predictor errors retain t
 Palette entries use a wide product for every 1–32-bit working depth; negative delta entries retain
 the normative 24-bit scaling cap. Direct GPU tests cover signed extremes, binary32 bit patterns,
 all implicit color components, and every predictor against a native-`i64` scalar oracle. This
-working-word support does not change source-sample admission or imply floating-point delivery.
+working-word support also underpins the separate floating representation conversion described above.
 A standalone `ModularRctPipeline` applies every one of the 42 normative operation/permutation
 combinations in place to three equal-size, non-overlapping views of that same arena. Each invocation
 loads all three signed words before writing any permutation, while explicit unsigned add/sub helpers
@@ -340,8 +370,8 @@ uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` 
 `1e-4` for VarDCT-containing sequences. A separate Multiply-clamp case verifies extended reference
 values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.
 Re-serialized reference-only variants independently pass both decoders and exercise slot 3.
-Post-transform composition rejects pre-transform reference domains before submission. Floating extra-channel
-composition, pre-transform patch execution, non-sRGB/ICC composition,
+Post-transform composition rejects pre-transform reference domains before submission. Pre-transform
+patch execution, non-sRGB/ICC composition,
 and non-coalesced/progressive delivery remain required for full JPEG XL.
 
 ### Bounded standard VarDCT engine
@@ -425,7 +455,7 @@ Whole and 256-byte-window async outputs match both CPU oracles within one RGB8 c
 oracle requests sRGB PFM to preserve floating-point reconstruction before one test-only RGB8
 quantization; PNM's source-depth quantization would invalidate this comparison for low-bit inputs.
 Unsupported integer depths retain both the declared depth and color transform in the typed packet
-error. Floating-point source metadata and integer depths above 16 remain unsupported.
+error. Floating-point declarations are also supported; integer depths above 16 remain unsupported.
 
 Ordinary frame upsampling uses the image header's standard or custom 2×/4×/8× weights. The
 profile separates encoded `width`/`height` from presented `output_width`/`output_height`; LF/HF,
@@ -531,7 +561,7 @@ The scalar tail reserves a 64-byte uniform, a four-byte range status and four mo
 existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
 public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
 corrupting a later AC section still fails the scalar request after the global stream succeeds.
-Floating-point source samples remain a gap. Raw matrix side images still need window continuation.
+Floating extras use `NativeFloat` and the same scalar tail. Raw matrix side images still need window continuation.
 
 For LF/AC distribution, Modular headers and transform topology now parse separately from MA and
 image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
@@ -750,8 +780,8 @@ operation.
 This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
-numeric color-channel output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-floating extra-channel composition and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+numeric color-channel output, ICC/HDR luminance mapping, greater-than-16-bit integer source metadata,
+and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

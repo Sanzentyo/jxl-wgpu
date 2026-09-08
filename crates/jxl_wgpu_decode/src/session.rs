@@ -1183,38 +1183,42 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
             Err(Error::EngineContract("invalid frame sequence counts"))
         }
         DecodeProfile::Modular {
-            bits_per_sample: 1..=16,
+            sample_bit_depth,
             passes: 1..=3,
             prediction,
             ..
-        } => match prediction {
-            crate::ModularPredictionProfile::Fixed { .. } => Ok(()),
-            crate::ModularPredictionProfile::MetaAdaptive {
-                node_count,
-                decision_node_count,
-                leaf_context_count,
-                max_depth,
-                ..
-            } if node_count != 0
-                && leaf_context_count != 0
-                && max_depth <= decision_node_count
-                && (max_depth == 0) == (decision_node_count == 0)
-                && decision_node_count.checked_add(leaf_context_count) == Some(node_count) =>
-            {
-                Ok(())
+        } if crate::modular_sample::ModularSampleEncoding::new(sample_bit_depth).is_some() => {
+            match prediction {
+                crate::ModularPredictionProfile::Fixed { .. } => Ok(()),
+                crate::ModularPredictionProfile::MetaAdaptive {
+                    node_count,
+                    decision_node_count,
+                    leaf_context_count,
+                    max_depth,
+                    ..
+                } if node_count != 0
+                    && leaf_context_count != 0
+                    && max_depth <= decision_node_count
+                    && (max_depth == 0) == (decision_node_count == 0)
+                    && decision_node_count.checked_add(leaf_context_count) == Some(node_count) =>
+                {
+                    Ok(())
+                }
+                crate::ModularPredictionProfile::MetaAdaptive { .. } => Err(Error::EngineContract(
+                    "MA prediction profile has inconsistent node/context/depth metadata",
+                )),
             }
-            crate::ModularPredictionProfile::MetaAdaptive { .. } => Err(Error::EngineContract(
-                "MA prediction profile has inconsistent node/context/depth metadata",
-            )),
-        },
+        }
         DecodeProfile::Modular { .. } => Err(Error::EngineContract(
-            "lossless Modular profile must use 1 through 16 bits per sample and 1 through 3 passes",
+            "Modular profile requires valid sample precision and 1 through 3 passes",
         )),
-        DecodeProfile::VarDct {
-            bits_per_sample: 1..=16,
-        } => Ok(()),
+        DecodeProfile::VarDct { sample_bit_depth }
+            if crate::modular_sample::ModularSampleEncoding::new(sample_bit_depth).is_some() =>
+        {
+            Ok(())
+        }
         DecodeProfile::VarDct { .. } => Err(Error::EngineContract(
-            "the VarDCT profile requires 1 through 16 bits per sample",
+            "the VarDCT profile requires valid sample precision",
         )),
     }
 }
@@ -1295,7 +1299,7 @@ mod tests {
     #[test]
     fn modular_profile_accepts_only_the_negotiated_progressive_pass_range() {
         let profile = |passes| DecodeProfile::Modular {
-            bits_per_sample: 8,
+            sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
             channels: crate::ModularChannels::Gray.into(),
             prediction: crate::ModularPredictionProfile::Fixed {
                 predictor: crate::ModularPredictor::Gradient,

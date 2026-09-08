@@ -107,14 +107,10 @@ fn global_modular_extras_resume_vardct_color_and_independent_alpha_on_gpu() {
                     .unwrap_or_else(|e| panic!("{name}: {e}"))
             };
             assert_eq!(session.metadata().extra_channels, image.extra_channels);
-            let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } = image.bit_depth
-            else {
-                unreachable!()
-            };
             assert_eq!(
                 session.profile(),
                 DecodeProfile::VarDct {
-                    bits_per_sample: bits_per_sample as u8
+                    sample_bit_depth: image.bit_depth
                 }
             );
             let producer = session.submission_session().vardct().unwrap();

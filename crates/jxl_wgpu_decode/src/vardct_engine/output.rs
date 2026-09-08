@@ -83,16 +83,15 @@ pub(super) fn prepare_presentation(
                 index,
                 count: inventory.image_header.extra_channels.len(),
             })?;
-        let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } = extra.bit_depth else {
-            return Err(VarDctDecodeError::UnsupportedOutput);
-        };
+        let encoding = crate::modular_sample::ModularSampleEncoding::new(extra.bit_depth)
+            .ok_or(VarDctDecodeError::UnsupportedOutput)?;
         let GpuOutputMapping::Numeric(mapping) = request.mapping() else {
             return Err(VarDctDecodeError::UnsupportedOutput);
         };
         let config = ModularScalarOutputConfig {
             extent: Extent2d::new(profile.output_width, profile.output_height),
             orientation,
-            bits: bits_per_sample,
+            encoding,
             mapping,
         };
         let layout = ImageLayout::packed(

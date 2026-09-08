@@ -19,9 +19,9 @@ pub enum DecodeProfile {
         physical_frames: usize,
         presentation_frames: usize,
     },
-    /// Integer Modular data reconstructed by a GPU entropy/MA pipeline, with optional resampling.
+    /// Modular working words reconstructed by a GPU entropy/MA pipeline, with optional resampling.
     Modular {
-        bits_per_sample: u8,
+        sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth,
         channels: ModularChannelCounts,
         prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
@@ -30,7 +30,9 @@ pub enum DecodeProfile {
     },
     /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer. Transform strategy is
     /// selected independently for every first block and remains GPU-resident.
-    VarDct { bits_per_sample: u8 },
+    VarDct {
+        sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth,
+    },
 }
 
 /// Channel arrangement of a native unsigned Modular output pixel.
@@ -288,6 +290,11 @@ impl AnimationMetadata {
 /// shape, not normalization semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NumericSampleMapping {
+    /// Interpret the declared floating source precision and deliver its exact binary32 widening.
+    /// No integer normalization or color transfer is applied. Unresampled, uncomposed samples
+    /// preserve signed zeros, subnormals, infinities and NaN payloads. Filtering and composition
+    /// operate on the decoded floating values before delivery.
+    NativeFloat,
     /// Preserve the decoded unsigned integer code exactly in the low valid bits of the canonical
     /// lossless-Modular Gray `u8`/`u16` storage descriptor. The requested valid depth and the
     /// codestream depth must match. Working samples outside that unsigned range return a typed
@@ -453,6 +460,15 @@ impl GpuOutputRequest {
             .map_err(|error| Error::UnsupportedOutputFormat(format!("{format:?}: {error}")))?
         {
             PixelFormatClass::Numeric(numeric) => {
+                if mapping == NumericSampleMapping::NativeFloat
+                    && !(numeric.sample_kind == SampleKind::Float
+                        && numeric.bits_per_component == 32
+                        && numeric.components == 1)
+                {
+                    return Err(Error::UnsupportedOutputFormat(
+                        "native floating samples require scalar F32 storage".into(),
+                    ));
+                }
                 let is_f64 = numeric.sample_kind == jxl_gpu_formats::SampleKind::Float
                     && numeric.bits_per_component == 64;
                 match (is_f64, mapping) {
@@ -569,12 +585,14 @@ impl GpuOutputRequest {
             || !matches!(
                 self.mapping,
                 GpuOutputMapping::Numeric(
-                    NumericSampleMapping::NativeUnsigned | NumericSampleMapping::NormalizedUnsigned
+                    NumericSampleMapping::NativeUnsigned
+                        | NumericSampleMapping::NormalizedUnsigned
+                        | NumericSampleMapping::NativeFloat
                 )
             )
         {
             return Err(Error::UnsupportedOutputFormat(
-                "extra-channel output requires scalar native unsigned or normalized F32 samples"
+                "extra-channel output requires scalar native unsigned, normalized integer or floating F32 samples"
                     .into(),
             ));
         }

@@ -6,7 +6,7 @@ use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-use crate::modular_transform::GpuModularChannelLayout;
+use crate::modular_sample::{ModularOutputPlane, ModularSampleEncoding};
 
 const SHADER: &str = include_str!("modular_finalize.wgsl");
 const F64_BINDING_MARKER: &str = "/*__JXL_F64_BINDING__*/";
@@ -88,7 +88,7 @@ pub(crate) struct ModularFinalizeParams {
     region: [u32; 4],
     source_offsets: [u32; 4],
     source_strides: [u32; 4],
-    source_masks: [u32; 4],
+    source_encodings: [u32; 4],
     output: [u32; 4],
     format: [u32; 4],
     plane01: [u32; 4],
@@ -113,8 +113,7 @@ impl ModularFinalizeParams {
     }
     pub(crate) fn new(
         region: impl Into<ModularFinalizeRegion>,
-        source_bits: u8,
-        source_planes: &[GpuModularChannelLayout],
+        source_planes: &[ModularOutputPlane],
         arena_words: u32,
         output: ModularFinalizeOutput,
     ) -> Result<Self, ModularFinalizeError> {
@@ -143,21 +142,23 @@ impl ModularFinalizeParams {
                 reason: "source channel count exceeds u32",
             }
         })?;
-        if !matches!(source_channels, 1 | 3 | 4) || !(1..=16).contains(&source_bits) {
+        if !matches!(source_channels, 1 | 3 | 4) {
             return Err(ModularFinalizeError::InvalidParams {
                 reason: "source channel count or bit depth is unsupported",
             });
         }
+        let source_encoding = source_planes[0].encoding;
+        let source_bits = source_encoding.bits();
         let mut source_offsets = [0u32; 4];
         let mut source_strides = [0u32; 4];
-        let mut source_masks = [0u32; 4];
-        for (index, plane) in source_planes.iter().copied().enumerate() {
+        let mut source_encodings = [0u32; 4];
+        for (index, source) in source_planes.iter().copied().enumerate() {
+            let plane = source.layout;
             if plane.width != extent.width
                 || plane.height != extent.height
                 || plane.hshift != 0
                 || plane.vshift != 0
-                || !(1..=16).contains(&plane.bit_depth)
-                || (index < 3 && plane.bit_depth != u32::from(source_bits))
+                || (index < 3 && source.encoding != source_encoding)
                 || plane.row_stride_words < plane.width
                 || plane.reserved != 0
             {
@@ -181,10 +182,10 @@ impl ModularFinalizeParams {
             }
             source_offsets[index] = plane.word_offset;
             source_strides[index] = plane.row_stride_words;
-            source_masks[index] = (1 << plane.bit_depth) - 1;
+            source_encodings[index] = source.encoding.packed();
         }
         let output_extent = region.orientation.map_extent(region.canvas_extent);
-        validate_output(output_extent, source_channels, source_bits, output)?;
+        validate_output(output_extent, source_channels, source_encoding, output)?;
         extent
             .width
             .checked_mul(extent.height)
@@ -201,7 +202,7 @@ impl ModularFinalizeParams {
             region: [region.origin_x, region.origin_y, region.status_index, 0],
             source_offsets,
             source_strides,
-            source_masks,
+            source_encodings,
             output: [
                 output.kind,
                 output.transfer,
@@ -266,9 +267,10 @@ impl ModularFinalizeParams {
 fn validate_output(
     extent: Extent2d,
     source_channels: u32,
-    source_bits: u8,
+    source_encoding: ModularSampleEncoding,
     output: ModularFinalizeOutput,
 ) -> Result<(), ModularFinalizeError> {
+    let source_bits = source_encoding.bits();
     if output.logical_size == 0 || output.channels == 0 || !output.storage_bits.is_multiple_of(8) {
         return Err(ModularFinalizeError::InvalidParams {
             reason: "output layout is empty or not byte-addressable",
@@ -298,7 +300,8 @@ fn validate_output(
         return validate_output_planes(extent, output);
     }
     if output.kind == 9 {
-        if !matches!(output.channels, 1 | 3 | 4)
+        if source_encoding.is_float()
+            || !matches!(output.channels, 1 | 3 | 4)
             || output.bits != u32::from(source_bits)
             || output.numeric_mapping != 3
             || !matches!(output.storage_bits, 8 | 16)
@@ -314,7 +317,7 @@ fn validate_output(
             reason: "multichannel sources require native Modular or F32 RGB output",
         });
     }
-    if source_bits != 8 {
+    if source_encoding.is_float() || source_bits != 8 {
         return Err(ModularFinalizeError::InvalidParams {
             reason: "converted output requires an 8-bit Gray source",
         });
@@ -607,7 +610,7 @@ fn shader_source(path: ModularFinalizeF64Path) -> String {
         ModularFinalizeF64Path::ExactF32Widening => ("", F64_EXACT_OUTPUT),
         ModularFinalizeF64Path::NativeArithmetic => (F64_NATIVE_BINDING, F64_NATIVE_OUTPUT),
     };
-    let source = SHADER
+    let source = crate::modular_sample::shader(SHADER)
         .replace(F64_BINDING_MARKER, binding)
         .replace(F64_OUTPUT_MARKER, output);
     format!(
@@ -782,12 +785,12 @@ fn binding_entry(binding: u32, storage: ResidentStorageBinding<'_>) -> wgpu::Bin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modular_transform::GpuModularChannelLayout;
 
     fn gray_params(arena_words: u32) -> Result<ModularFinalizeParams, ModularFinalizeError> {
         ModularFinalizeParams::new(
             Extent2d::new(7, 3),
-            8,
-            &[GpuModularChannelLayout {
+            &crate::modular_sample::integer_planes(&[GpuModularChannelLayout {
                 word_offset: 5,
                 row_stride_words: 9,
                 width: 7,
@@ -796,7 +799,7 @@ mod tests {
                 vshift: 0,
                 bit_depth: 8,
                 reserved: 0,
-            }],
+            }]),
             arena_words,
             ModularFinalizeOutput {
                 kind: 9,
@@ -889,8 +892,7 @@ mod tests {
                     origin_y: 0,
                     status_index: 0,
                 },
-                8,
-                &[plane],
+                &crate::modular_sample::integer_planes(&[plane]),
                 3,
                 output,
             )
@@ -904,8 +906,7 @@ mod tests {
         let words = extent.width * extent.height;
         let params = ModularFinalizeParams::new(
             extent,
-            8,
-            &[GpuModularChannelLayout {
+            &crate::modular_sample::integer_planes(&[GpuModularChannelLayout {
                 word_offset: 0,
                 row_stride_words: extent.width,
                 width: extent.width,
@@ -914,7 +915,7 @@ mod tests {
                 vshift: 0,
                 bit_depth: 8,
                 reserved: 0,
-            }],
+            }]),
             words,
             ModularFinalizeOutput {
                 kind: 9,
@@ -1124,24 +1125,21 @@ mod tests {
         };
         let gray_params = ModularFinalizeParams::new(
             Extent2d::new(7, 3),
-            8,
-            &[gray_plane],
+            &crate::modular_sample::integer_planes(&[gray_plane]),
             arena_words.len() as u32,
             native_output(1, 7, 21),
         )
         .unwrap();
         let rgb_params = ModularFinalizeParams::new(
             Extent2d::new(5, 3),
-            8,
-            &rgb_planes,
+            &crate::modular_sample::integer_planes(&rgb_planes),
             arena_words.len() as u32,
             native_output(3, 15, 45),
         )
         .unwrap();
         let nv12_params = ModularFinalizeParams::new(
             Extent2d::new(7, 3),
-            8,
-            &[gray_plane],
+            &crate::modular_sample::integer_planes(&[gray_plane]),
             arena_words.len() as u32,
             ModularFinalizeOutput {
                 kind: 2,
@@ -1161,8 +1159,7 @@ mod tests {
         .unwrap();
         let f64_params = ModularFinalizeParams::new(
             Extent2d::new(7, 3),
-            8,
-            &[gray_plane],
+            &crate::modular_sample::integer_planes(&[gray_plane]),
             arena_words.len() as u32,
             ModularFinalizeOutput {
                 kind: 8,

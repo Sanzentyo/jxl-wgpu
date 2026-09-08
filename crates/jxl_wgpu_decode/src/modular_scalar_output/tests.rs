@@ -18,7 +18,7 @@ fn scalar_plans_reject_mismatched_depth_overflow_and_insufficient_device_limits(
     let config = ModularScalarOutputConfig {
         extent: Extent2d::new(17, 9),
         orientation: OutputOrientation::from_exif_value(6).unwrap(),
-        bits: 12,
+        encoding: crate::modular_sample::ModularSampleEncoding::integer(12).unwrap(),
         mapping: NumericSampleMapping::NativeUnsigned,
     };
     let layout = ImageLayout::packed(
@@ -33,7 +33,10 @@ fn scalar_plans_reject_mismatched_depth_overflow_and_insufficient_device_limits(
     assert_eq!(plan(config, &layout, &limits).unwrap().storage_bytes, 308);
     assert!(matches!(
         plan(
-            ModularScalarOutputConfig { bits: 8, ..config },
+            ModularScalarOutputConfig {
+                encoding: crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
+                ..config
+            },
             &layout,
             &limits
         ),
@@ -132,14 +135,14 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                 usage: wgpu::BufferUsages::STORAGE,
             });
             for (domain, exif) in [
-                crate::ModularSampleDomain::SignedInteger,
-                crate::ModularSampleDomain::NormalizedF32,
+                crate::ModularSampleDomain::Encoded,
+                crate::ModularSampleDomain::DecodedF32,
             ]
             .into_iter()
             .flat_map(|domain| (1..=8).map(move |exif| (domain, exif)))
             {
                 let normalized_arena =
-                    (domain == crate::ModularSampleDomain::NormalizedF32).then(|| {
+                    (domain == crate::ModularSampleDomain::DecodedF32).then(|| {
                         let values: Vec<_> = words
                             .iter()
                             .map(|&sample| sample as f32 / mask as f32)
@@ -191,7 +194,8 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                         ModularScalarOutputConfig {
                             extent,
                             orientation,
-                            bits,
+                            encoding: crate::modular_sample::ModularSampleEncoding::integer(bits)
+                                .unwrap(),
                             mapping,
                         },
                         &layout,
@@ -251,8 +255,7 @@ fn resident_scalar_packing_preserves_signed_normalization_orientation_and_guard_
                                 origin_y: 0,
                                 status_index: 0,
                             },
-                            bits as u8,
-                            &[plane],
+                            &crate::modular_sample::integer_planes(&[plane]),
                             words.len() as u32,
                             ModularFinalizeOutput {
                                 kind: 8,

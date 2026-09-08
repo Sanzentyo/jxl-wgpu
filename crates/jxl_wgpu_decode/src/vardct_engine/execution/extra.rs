@@ -2,8 +2,6 @@
 
 use std::collections::VecDeque;
 
-use jxl_gpu_bitstream::SampleBitDepth;
-
 use crate::modular_assembly::encode_plane_copies;
 use crate::vardct_extra::VarDctExtraSubimage;
 use crate::vardct_pass_group::{HF_COEFFICIENT_STATUS_BYTES, HfCoefficientStreamEnd};
@@ -50,11 +48,10 @@ pub(super) fn prepare_frame_arena(
                 .ok_or(DecodeError::EngineContract(
                     "selected extra channel has no declaration",
                 ))?;
-        let SampleBitDepth::Integer { bits_per_sample } = declaration.bit_depth else {
-            return Err(DecodeError::EngineContract(
-                "integer extra-channel profile changed precision",
-            ));
-        };
+        let encoding = crate::modular_sample::ModularSampleEncoding::new(declaration.bit_depth)
+            .ok_or(DecodeError::EngineContract(
+                "extra-channel profile changed precision",
+            ))?;
         let plane = plan.inverse.final_gpu_layouts().get(index).copied().ok_or(
             DecodeError::EngineContract("selected extra channel has no reconstructed plane"),
         )?;
@@ -64,7 +61,7 @@ pub(super) fn prepare_frame_arena(
                 index: index as u32,
                 arena: arena.clone(),
                 plane,
-                bits: bits_per_sample,
+                encoding,
             });
     }
     Ok(Some(arena))

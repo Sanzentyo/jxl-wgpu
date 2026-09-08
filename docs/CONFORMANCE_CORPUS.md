@@ -130,8 +130,8 @@ A native-`i64` oracle checks all 14 predictors, wide self-correcting intermediat
 execution gate also covers all implicit color components at every 1–32-bit working depth and
 explicit delta reconstruction with signed extremes. Existing whole/bounded entropy and chunked
 Palette tests verify the shared predictor's storage callbacks and continuation state. These gates
-establish working-word arithmetic; floating sample conversion and codestream delivery have their
-own unfinished conformance requirements.
+establish working-word arithmetic; the floating-source checkpoint below separately verifies
+sample conversion and codestream delivery.
 The inverse-Squeeze kernel has separate semantic and execution gates. Naga parses and validates the
 WGSL module without inspecting source substrings. An actual adapter compares horizontal and vertical
 odd extents plus single-pixel axes against a scalar oracle containing `i32::MIN`, `i32::MAX`, smooth
@@ -1657,5 +1657,63 @@ Formatting, warning-free Clippy/rustdoc, all-target/all-feature checking, Rust 1
 WASM compile gate pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU
 readback passes. Regenerating all ten new fixtures and the thirteen original stills with the same
 C generator produces byte-identical files; the ten new lengths and SHA-256 values match above.
-Floating source samples, remaining original color domains and pre-transform patch references
-remain open full-JPEG-XL roadmap gates.
+At that checkpoint floating source samples, remaining original color domains and pre-transform
+patch references were open full-JPEG-XL roadmap gates. Floating source evidence follows below.
+
+## Floating JPEG XL source precision and rendering
+
+`crates/jxl_wgpu_decode/test-data/floating/` contains 181 encoded fixtures and independent libjxl
+0.12.0 binary32 references. Regenerate the 416 hex files with
+`cargo run -p jxl_wgpu_decode --example regenerate_floating -- [output-directory]`.
+The example compiles offline C encoders/oracles; no production crate links libjxl or performs
+CPU pixel reconstruction. Repeated generation on the same libjxl version is byte-identical.
+
+The 154 `BITS-EXPONENT` cases cover every combination of 2–8 exponent and 2–23 mantissa bits.
+Each 24×5 grayscale image contains both signs of zero, subnormals, minimum normal, maximum finite,
+infinity, and multiple quiet/signaling NaN payloads, plus finite values. The `.f32.hex` file stores
+each independently decoded binary32 word. For exponent width eight and total width 11–31,
+libjxl 0.12's custom-float encoder cannot represent the subnormal test inputs correctly. The driver
+therefore combines a valid custom-precision image header with a binary32 Modular frame containing
+the desired raw custom words, with Palette and responsive transforms disabled and Zero prediction.
+Frame boundaries come from the checked codestream inventory, not fixed byte offsets; libjxl
+decodes and validates every resulting complete file. This workaround belongs only to corpus
+generation. All other precision files are encoded directly by libjxl.
+
+`all_floating_precisions_preserve_binary32_bits_through_gpu_decode` compares exact GPU words for
+native scalar F32, fragmented 256-byte-window scalar F32, and unchanged-transfer RGB F32 output:
+462 complete image decodes. It checks source precision metadata, including exponent width.
+
+The 27 named rendering fixtures combine binary16/binary32/custom primary precision with independently
+declared integer and floating extras: depth, selection, two alphas, spot, CFA, thermal, black and
+optional planes. Four cases have integer primary images with floating extras, including direct native-alpha conversion. The cases cover Gray/RGB, associated alpha, rotated odd/thin images, 2×/4×/8×
+resampling and dimension shifts, distributed entropy, Squeeze, a transform-free global-only
+multi-pass Modular frame, and a real progressive-DC dependency. The last case omits extras because
+libjxl disables progressive DC when extras exist. Encoder-downsampled floating planes use binary32
+to preserve the encoder's arbitrary filter output; custom precision remains covered by unfiltered
+and transformed fixtures. Five nine-layer animations cover hidden layers, crop intersections,
+reference replacement and independent per-plane blend/alpha selectors.
+
+For each case, `.f32.hex` contains every coalesced frame's RGBA and original extra planes;
+`.spots.f32.hex` contains spot-rendered RGBA and `.associated.f32.hex` contains RGBA with source
+association preserved. `floating_channels_resample_compose_and_render_against_libjxl` compares
+every extra, base RGBA, rendered spots and preserved association under both whole and fragmented
+256-byte input. The two GPU runs are word-identical and release their reservations. Reference
+limits are `2e-6 × (1 + |reference|)` for scalar/alpha and `2e-5` for Modular color; VarDCT color
+uses `0.003`. When unpremultiplication amplifies a tiny alpha, color error is measured after
+undoing that scale with the existing `2^-26` floor, as in the associated-alpha corpus above.
+
+`floating_color_quantizes_only_at_the_requested_integer_output` verifies nine still/composed/DC
+cases against libjxl F32 followed by one RGB8/RGBA8 clamp/round, within one code. Mapping tests reject
+integer normalization of floating sources, floating mapping of integer extras, and non-scalar or
+non-F32 NativeFloat storage. A CPU topology gate verifies actual global-only, distributed and
+Squeeze inventories. The precision ABI test fixes packed integer/binary16/binary32 values
+and rejects invalid or overflowing declarations. These tests do not establish full source color
+management, integer depths above 16, pre-transform patch references, or lossy/XYB Modular presentation.
+
+Validation on 2026-09-08 Apple M5/Metal: 705 distinct tests pass across 26 workspace targets;
+one existing manual benchmark remains ignored. The workspace run caught an integer-depth diagnostic
+regression; after correction, its profile target, expanded floating target and all remaining targets
+pass. Formatting, warning-free Clippy/rustdoc, all-target/all-feature checking, Rust 1.89 and the
+six-crate WASM gate pass. Reference and Metal harnesses each pass 18 cases, and the indexed Gray8
+U8 readback case passes. All 416 floating-corpus files regenerate byte-identically with libjxl
+0.12.0; the extended generators also reproduce all 20 original integer still/composition fixtures.

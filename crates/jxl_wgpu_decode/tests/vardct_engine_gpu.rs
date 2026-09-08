@@ -401,7 +401,7 @@ fn every_integer_depth_through_sixteen_decodes_xyb_to_rgb8_on_gpu() {
             }
         );
         let packet = BoundedVarDctPacketPlan::parse(&encoded, &inventory).unwrap();
-        assert_eq!(packet.profile.bits_per_sample, bits);
+        assert_eq!(packet.profile.bits_per_sample(), bits);
         assert_eq!(packet.profile.coefficient_shifts, [0, 0, 0]);
         assert_presentation_matches_oracles(
             &backend,

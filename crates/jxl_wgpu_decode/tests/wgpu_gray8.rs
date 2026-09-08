@@ -1530,11 +1530,11 @@ fn standard_modular_native_matrix_is_exact_on_gpu_and_rust_oracle() {
         assert!(matches!(
             session.profile(),
             jxl_wgpu_decode::DecodeProfile::Modular {
-                bits_per_sample: actual_bits,
+                sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: actual_bits },
                 channels: actual_channels,
                 grouping: jxl_wgpu_decode::ModularGrouping::MultipleGroups { .. },
                 ..
-            } if actual_bits == bits_per_sample && actual_channels == expected_channels.into()
+            } if actual_bits == u32::from(bits_per_sample) && actual_channels == expected_channels.into()
         ));
         let bytes_per_sample = if bits_per_sample <= 8 { 1u64 } else { 2 };
         let row_bytes = u64::from(width) * u64::from(format.channel_count()) * bytes_per_sample;

@@ -7,6 +7,7 @@ use jxl_wgpu::{KernelVariant, ResidentStorageBinding};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
+use crate::modular_sample::ModularSampleEncoding;
 use crate::modular_transform::GpuModularChannelLayout;
 use crate::{ModularChannels, NumericSampleMapping};
 
@@ -37,7 +38,7 @@ pub enum ModularScalarOutputError {
 pub(crate) struct ModularScalarOutputConfig {
     pub extent: Extent2d,
     pub orientation: OutputOrientation,
-    pub bits: u32,
+    pub encoding: ModularSampleEncoding,
     pub mapping: NumericSampleMapping,
 }
 
@@ -46,7 +47,7 @@ pub(crate) struct ModularScalarOutputConfig {
 struct ScalarParams {
     source: [u32; 4],      // width, height, word stride, word offset
     destination: [u32; 4], // width, height, byte stride, byte offset
-    encoding: [u32; 4],    // maximum code, component bytes, floating, orientation
+    encoding: [u32; 4],    // source encoding, component bytes, floating output, orientation
     bounds: [u32; 4],      // logical bytes, output words, dispatch width, reserved
 }
 
@@ -74,30 +75,38 @@ impl ModularScalarOutputPlan {
     ) -> Result<Self> {
         if config.extent.width == 0
             || config.extent.height == 0
-            || !(1..=16).contains(&config.bits)
             || config.orientation.map_extent(config.extent) != layout.extent
             || layout.planes.len() != 1
         {
             return invalid("source extent, precision or output geometry");
         }
         let component_bytes = match config.mapping {
-            NumericSampleMapping::NativeUnsigned => {
+            NumericSampleMapping::NativeUnsigned if !config.encoding.is_float() => {
                 let native = crate::model::native_modular_format(&layout.format)
                     .filter(|native| {
                         native.channels == ModularChannels::Gray
-                            && u32::from(native.bits_per_sample) == config.bits
+                            && native.bits_per_sample == config.encoding.bits()
                     })
                     .ok_or(ModularScalarOutputError::Invalid {
                         reason: "native scalar depth must match the extra-channel declaration",
                     })?;
                 u32::from(native.bits_per_sample).div_ceil(8)
             }
-            NumericSampleMapping::NormalizedUnsigned => {
+            NumericSampleMapping::NormalizedUnsigned if !config.encoding.is_float() => {
                 if !matches!(classify_pixel_format(&layout.format),
                     Ok(PixelFormatClass::Numeric(n)) if n.components == 1
                         && n.sample_kind == SampleKind::Float && n.bits_per_component == 32)
                 {
                     return invalid("normalized scalar output requires F32 storage");
+                }
+                4
+            }
+            NumericSampleMapping::NativeFloat if config.encoding.is_float() => {
+                if !matches!(classify_pixel_format(&layout.format),
+                    Ok(PixelFormatClass::Numeric(n)) if n.components == 1
+                        && n.sample_kind == SampleKind::Float && n.bits_per_component == 32)
+                {
+                    return invalid("floating source output requires scalar F32 storage");
                 }
                 4
             }
@@ -270,9 +279,9 @@ impl ModularScalarOutputPipeline {
             ],
             destination: plan.destination,
             encoding: [
-                (1 << plan.config.bits) - 1,
+                plan.config.encoding.packed(),
                 plan.component_bytes,
-                u32::from(plan.config.mapping == NumericSampleMapping::NormalizedUnsigned),
+                u32::from(plan.config.mapping != NumericSampleMapping::NativeUnsigned),
                 plan.config.orientation.to_exif_value() - 1,
             ],
             bounds: [
@@ -341,7 +350,7 @@ fn shader() -> String {
     format!(
         "{}\n{}",
         jxl_wgpu::IMAGE_ORIENTATION_SHADER,
-        include_str!("modular_scalar_output.wgsl")
+        crate::modular_sample::shader(include_str!("modular_scalar_output.wgsl"))
     )
 }
 

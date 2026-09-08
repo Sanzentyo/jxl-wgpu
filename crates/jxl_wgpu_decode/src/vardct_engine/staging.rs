@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
-use jxl_gpu_bitstream::{CodestreamInventory, SampleBitDepth};
+use jxl_gpu_bitstream::CodestreamInventory;
 use jxl_wgpu::{
     GpuBufferLease, GpuImageFrame, MemoryBudget, MemoryBudgetSnapshot, MemoryPermit,
     ResidentStorageBinding, SubmissionPollPermit, UnvalidatedGpuImageFrame, WgpuBackend,
@@ -46,7 +46,7 @@ pub(super) struct ResidentModularPlane {
     pub(super) index: u32,
     pub(super) arena: GpuBufferLease,
     pub(super) plane: GpuModularChannelLayout,
-    pub(super) bits: u32,
+    pub(super) encoding: crate::modular_sample::ModularSampleEncoding,
 }
 
 impl ResidentModularPlane {
@@ -54,13 +54,13 @@ impl ResidentModularPlane {
         &self,
     ) -> std::result::Result<VarDctOutputAlpha<'_>, VarDctDecodeError> {
         Ok(VarDctOutputAlpha {
-            domain: crate::ModularSampleDomain::SignedInteger,
+            domain: crate::ModularSampleDomain::Encoded,
             storage: ResidentStorageBinding::entire(self.arena.as_wgpu_buffer())?,
             width: self.plane.width,
             height: self.plane.height,
             stride: self.plane.row_stride_words,
             word_offset: self.plane.word_offset,
-            bits_per_sample: self.bits,
+            sample_bit_depth: self.encoding.depth(),
         })
     }
 }
@@ -125,7 +125,7 @@ impl VarDctDecodeSession {
         )?;
         let extent = presentation.layout.extent;
         let decode_profile = DecodeProfile::VarDct {
-            bits_per_sample: profile.bits_per_sample as u8,
+            sample_bit_depth: inventory.image_header.bit_depth,
         };
         let mut metadata = AnimationMetadata::still(extent);
         metadata.extra_channels = inventory.image_header.extra_channels.clone();
@@ -482,16 +482,15 @@ impl VarDctPendingFrame {
         .into_iter()
         .filter(|_| !distributed)
         .map(|index| {
-            let SampleBitDepth::Integer { bits_per_sample } =
-                source.inventory.image_header.extra_channels[index].bit_depth
-            else {
-                unreachable!("integer extra-channel profile")
-            };
+            let encoding = crate::modular_sample::ModularSampleEncoding::new(
+                source.inventory.image_header.extra_channels[index].bit_depth,
+            )
+            .expect("negotiated extra-channel precision");
             ResidentModularPlane {
                 index: index as u32,
                 arena: lifetime.arena.clone(),
                 plane: plan.final_planes[index],
-                bits: bits_per_sample,
+                encoding,
             }
         })
         .collect::<Vec<_>>();

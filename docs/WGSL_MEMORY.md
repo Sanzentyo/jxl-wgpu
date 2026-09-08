@@ -85,8 +85,8 @@ name shown in parentheses.
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
 | `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu_decode/modular_rct` | `ModularRctParams` / `Params` | three in-place plane `width,height,row_stride,word_offset` records, then RCT type and 3 reserved words | 64 | 16 | uniform |
-| `jxl_wgpu_decode/modular_scalar_output.wgsl` | `ScalarParams` | source width/height/word stride/offset; destination width/height/byte stride/offset; maximum code/component bytes/float flag/orientation; logical bytes/output words/dispatch width/source domain | 64 | 16 | uniform binding 2; a separate four-byte atomic status at binding 3 records unrepresentable native samples |
-| `jxl_wgpu_decode/modular_render.wgsl` | `NormalizeParams` | source width/height/word stride/offset; integer maximum/output stride/two zero words | 32 | 16 | uniform binding 2; signed integer input at binding 0 and distinct normalized F32 output at binding 1; 16×16 workgroups |
+| `jxl_wgpu_decode/modular_scalar_output.wgsl` | `ScalarParams` | source width/height/word stride/offset; destination width/height/byte stride/offset; packed source precision/component bytes/F32-output flag/orientation; logical bytes/output words/dispatch width/source domain | 64 | 16 | uniform binding 2; a separate four-byte atomic status at binding 3 records unrepresentable native samples |
+| `jxl_wgpu_decode/modular_render.wgsl` | `NormalizeParams` | source width/height/word stride/offset; packed source precision/output stride/two zero words | 32 | 16 | uniform binding 2; encoded input words at binding 0 and distinct decoded binary32 words at binding 1; 16×16 workgroups |
 | `jxl_wgpu/upsample.wgsl` | `UpsampleUniform` or resident `UpsampleParams` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, factor, _pad0` | 32 | 4 / 16 | uniform |
 | `jxl_wgpu/ycbcr_to_rgb.wgsl` | `YcbcrUniform` / `Params` | `width, height, cb_stride, y_stride, cr_stride, output_stride, component, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/xyb_to_rgb.wgsl` | `XybUniform` / `Params` | dimensions/6 strides, three padded inverse-opsin rows, padded cube-root bias, padded scaled bias, `intensity_scale`, 3 pads | 128 | 4 | uniform |
@@ -131,13 +131,13 @@ name shown in parentheses.
 
 The Modular finalizer has its own 176-byte, 16-byte-aligned `ModularFinalizeParams` uniform at
 binding 2. Eleven `vec4<u32>` records contain the source extent, region/status, four source offsets,
-four source strides, four source masks, output/format fields, two plane offset/stride pairs,
+four source strides, four source encodings, output/format fields, two plane offset/stride pairs,
 logical/chroma bounds, and the complete unrotated canvas width/height, oriented output width,
-and orientation. Source masks start at byte 64 and the canvas record starts at byte 160.
-The region's final word at byte 28 identifies signed integer (`0`) or normalized F32 (`1`)
+and orientation. Source encodings start at byte 64 and the canvas record starts at byte 160.
+The region's final word at byte 28 identifies original encoded words (`0`) or decoded F32 (`1`)
 source words. Scalar packing uses the same values in its final uniform word at byte 60.
-VarDCT alpha's fourth geometry word is `0` for absent, `1` for signed integer and `2` for
-normalized F32; its 160-byte source uniform is unchanged. Native resampled output rounds once
+VarDCT alpha's fourth geometry word is `0` for absent, `1` for encoded and `2` for
+decoded F32; its third word stores packed precision. Its 160-byte source uniform is unchanged. Native resampled output rounds once
 at the destination depth and rejects nonrepresentable values; F32 retains interpolation fractions.
 Ordinary entropy parameter records are 256 bytes; their final canvas width, canvas height,
 and orientation words are at offsets 244, 248, and 252. Compile-time
@@ -149,12 +149,17 @@ group's luma word. Native and converted output use the oriented layout's bounds.
 
 Output-channel selection binds up to four views from the complete inverse result, or one view for
 a selected extra channel. Gray+alpha can bind the gray view three times without copying samples.
-Per-view masks retain each channel's original integer precision: alpha normalizes independently
-for F32 and rescales with integer rounding for native output. The prediction/inverse descriptor
-depth remains the image's working depth. Scalar normalized unsigned output uses numeric mapping 4
-and one F32 component; signed working values divide by the declared maximum without clipping,
-wrapping or color transfer. Its source read bypasses the unsigned-code range rejection used by
-native integer output. The enlarged uniform is charged through
+Per-view `ModularSampleEncoding` values retain independently declared precision: total bits occupy
+the low byte and exponent bits the next byte (zero denotes integers). Host validation admits only
+representable declarations. `ModularOutputPlane` pairs this value with geometry without replacing
+the working depth or using reserved descriptor words. Alpha converts independently for F32 output;
+native color output rounds it to the destination precision. Scalar F32 output uses numeric mapping 4:
+integer samples divide by their own maximum, while floating samples are widened by integer bit
+assembly. A shared `modular_sample.wgsl` fragment serves scalar output, finalization, normalization
+and VarDCT alpha. It preserves zeros, subnormals, infinities and NaN payloads without floating
+arithmetic during representation conversion. Decoded scalar words and unchanged-transfer,
+unchanged-association F32 RGB words are copied directly. Filtering, color and composition opt into
+F32 arithmetic. Native unsigned range checks remain separate. The unchanged uniform is charged through
 `size_of::<ModularFinalizeParams>()` for each existing finalizer, adding no buffer or submission.
 All entropy channels, inverse arenas and jobs retain their existing budget/lifetime ownership even
 when only one plane is selected. Public declaration/name vectors remain host metadata, outside
@@ -535,12 +540,12 @@ boundary. Once all required subimages finish, a retained command buffer runs the
 and output. The frame exposes no unvalidated output before this tail is submitted. All stages
 use the existing entropy/status/parameter ABIs; no pixel or coefficient readback is introduced.
 
-Selected resampled integer channels now use `ModularRenderPlan` in both coding-mode producers.
+Selected resampled integer and floating channels use `ModularRenderPlan` in both coding-mode producers.
 It allocates one aligned F32 destination arena, one reusable low-resolution normalization plane
 large enough for the largest selected resampled input, and one weight table per distinct factor.
 Destination view offsets satisfy the adapter's storage alignment. Each selected source has a
 32-byte normalization uniform; each factor above one adds the existing 32-byte upsampling uniform.
-The source domain is normalized before interpolation, so packing performs no intermediate integer
+The source representation is decoded before interpolation, so packing performs no intermediate integer
 quantization. Only bounded scalar weight expansion runs on the host.
 
 `modular_render_bytes` (Modular) and `extra_render_bytes` (VarDCT) include every destination,

@@ -13,6 +13,7 @@ use jxl_gpu_bitstream::{
 use jxl_gpu_protocol::OutputOrientation;
 
 use crate::modular_inverse::{ModularInversePlan, plan_modular_inverse};
+use crate::modular_sample::ModularSampleEncoding;
 use crate::modular_transform::{
     GpuModularChannelLayout, ModularChannelTopology, ModularRct, ModularTransformIr,
     ModularTransformLimits, ModularTransformPlan, PackedModularChannelMetadata,
@@ -67,6 +68,7 @@ pub(crate) struct StandardModularProfile {
     pub height: u32,
     pub orientation: OutputOrientation,
     pub bits_per_sample: u8,
+    pub sample_encoding: ModularSampleEncoding,
     pub channels: ModularChannelCounts,
     pub extra_channels: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
     pub pass_count: u32,
@@ -178,17 +180,14 @@ fn validate_image_header(
     if image.extra_channels.len() != channels.extra_count() as usize
         || image.extra_channel_count != channels.extra_count()
         || image.extra_channels.iter().any(|extra| {
-            !matches!(
-                extra.bit_depth,
-                SampleBitDepth::Integer {
-                    bits_per_sample: 1..=16
-                }
-            ) || extra.dimension_shift > 3
+            !ModularSampleEncoding::new(extra.bit_depth)
+                .is_some_and(|encoding| encoding.is_float() || encoding.bits() <= 16)
+                || extra.dimension_shift > 3
         })
     {
         return Err(UnsupportedProfile::new(
             UnsupportedCodestreamFeature::ExtraChannels,
-            "Modular extra channels require 1–16-bit integer samples and dimension shifts at most three",
+            "Modular extra channels require supported integer or floating samples and dimension shifts at most three",
         ).into());
     }
     Ok(orientation)
@@ -229,11 +228,11 @@ fn parse_modular_profile(
     if image.width == 0 || image.height == 0 {
         return unsupported("the lossless Modular GPU profile requires a non-empty image");
     }
-    let bits_per_sample = match image.bit_depth {
-        SampleBitDepth::Integer {
-            bits_per_sample: bits @ 1..=16,
-        } => u8::try_from(bits).expect("1..=16 fits u8"),
-        _ => {
+    let sample_encoding = match ModularSampleEncoding::new(image.bit_depth)
+        .filter(|encoding| encoding.is_float() || encoding.bits() <= 16)
+    {
+        Some(encoding) => encoding,
+        None => {
             return Err(UnsupportedProfile::new(
                 UnsupportedCodestreamFeature::ModularBitDepth(match image.bit_depth {
                     SampleBitDepth::Integer { bits_per_sample }
@@ -241,11 +240,12 @@ fn parse_modular_profile(
                         bits_per_sample, ..
                     } => u8::try_from(bits_per_sample).unwrap_or(u8::MAX),
                 }),
-                "the stock Modular GPU frontend reconstructs 1 through 16-bit integer samples",
+                "the Modular GPU frontend requires 1–16-bit integers or legal JPEG XL floating samples",
             )
             .into());
         }
     };
+    let bits_per_sample = sample_encoding.bits();
     // XYB Modular dependency frames always contain Y/X/B, including when the final image's
     // presentation encoding is grayscale. Only non-XYB Modular stores a single gray plane.
     let channels = ModularChannelCounts::new(
@@ -451,13 +451,16 @@ fn parse_modular_profile(
             &frame.progressive_passes.downsampling,
             &frame.progressive_passes.last_pass,
         )?;
-        let requires_frame_arena = resampling
+        let global_channel_count =
+            global_subimage_channel_count(&transform_plan.topology, group_dimension);
+        // A multi-entry frame may keep every sample in DC-global even without transforms.
+        // Those channels have no pass-group arena and must survive in the frame allocation.
+        let requires_frame_arena = global_channel_count != 0
+            || resampling
             || transform_plan
                 .transforms
                 .iter()
                 .any(|transform| !matches!(transform, ModularTransformIr::Rct(_)));
-        let global_channel_count =
-            global_subimage_channel_count(&transform_plan.topology, group_dimension);
         for channel in &transform_plan.topology.channels()[global_channel_count..] {
             let (Ok(hshift), Ok(vshift)) =
                 (u32::try_from(channel.hshift), u32::try_from(channel.vshift))
@@ -849,7 +852,8 @@ fn parse_modular_profile(
                 ExtraChannelTypeInventory::Alpha { .. }
             )
             && image.extra_channels[0].bit_depth == image.bit_depth);
-    let generalized_channels = resampling
+    let generalized_channels = sample_encoding.is_float()
+        || resampling
         || !conventional_alpha
         || frame_plan_seed.is_some()
         || concrete_transform_plans
@@ -945,6 +949,7 @@ fn parse_modular_profile(
         upsampling_weights: image.upsampling_weights.clone(),
         orientation,
         bits_per_sample,
+        sample_encoding,
         channels,
         extra_channels: image.extra_channels.clone(),
         pass_count: frame.num_passes,
@@ -1308,6 +1313,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn floating_fixtures_cover_global_only_distributed_and_squeezed_topologies() {
+        for name in ["global", "distributed", "squeeze"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("test-data/floating/extras_float_{name}.jxl.hex"));
+            let encoded = fixture(&std::fs::read_to_string(path).unwrap());
+            let parsed = parse(&encoded, ParseLimits::default()).unwrap();
+            let inventory = parsed
+                .codestream_inventory(InventoryLimits::default())
+                .unwrap();
+            let source = GpuCodestream::from_spans([(
+                0,
+                StreamSlice::from_shared(Arc::from(parsed.codestream())),
+            )])
+            .unwrap();
+            let profile = parse_standard_modular_profile(&source, &inventory).unwrap();
+            assert!(profile.sample_encoding.is_float());
+            assert!(profile.generalized_channels);
+            if name == "global" {
+                assert!(profile.pass_count > 1);
+                assert!(profile.entropy_groups.is_empty());
+                assert!(profile.global_stream.is_some());
+                let frame = profile.resident_frame_plan.unwrap();
+                assert!(frame.inverse_plan.jobs().is_empty());
+                assert_eq!(
+                    frame.channel_metadata.channels.len(),
+                    profile.channels.count() as usize
+                );
+            } else if name == "distributed" {
+                assert!(profile.groups.len() > 1);
+                assert!(profile.entropy_groups.len() > 1);
+            } else {
+                let frame = profile.resident_frame_plan.unwrap();
+                assert!(frame.inverse_plan.jobs().iter().any(|job| matches!(
+                    job,
+                    crate::modular_inverse::ModularInverseJob::Squeeze { .. }
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn modular_header_admission_uses_color_and_alpha_semantics() {
         let encoded = fixture(include_str!(
             "../test-data/testsrc_modular_orientation_rgba_16.jxl.hex"
@@ -1355,7 +1401,7 @@ mod tests {
             },
             jxl_gpu_bitstream::ExtraChannelInventory {
                 bit_depth: SampleBitDepth::Float {
-                    bits_per_sample: 32,
+                    bits_per_sample: 33,
                     exponent_bits_per_sample: 8,
                 },
                 ..alpha.clone()

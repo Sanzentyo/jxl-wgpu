@@ -22,7 +22,7 @@ pub fn vardct_output_shader() -> String {
     format!(
         "{}\n{}",
         jxl_wgpu::IMAGE_OUTPUT_SHADER,
-        include_str!("vardct_output.wgsl")
+        crate::modular_sample::shader(include_str!("vardct_output.wgsl"))
     )
 }
 
@@ -137,7 +137,7 @@ impl VarDctOutputConfig {
 pub struct VarDctOutputInputs<'a> {
     /// X, Y, and B F32 planes, in that order.
     pub planes: [VarDctOutputPlane<'a>; 3],
-    /// Optional full-resolution alpha reconstructed by Modular, independently normalized.
+    /// Optional full-resolution Modular alpha, decoded using its independently declared precision.
     pub alpha: Option<VarDctOutputAlpha<'a>>,
     /// Output storage for the requested pitch-linear layout;
     /// its allocated/bound length is rounded up to four bytes.
@@ -148,7 +148,7 @@ pub struct VarDctOutputInputs<'a> {
     pub config: VarDctOutputConfig,
 }
 
-/// An opacity plane in a resident Modular or normalized F32 arena, one word per sample.
+/// An opacity plane in an encoded Modular or decoded F32 arena, one word per sample.
 #[derive(Clone, Copy, Debug)]
 pub struct VarDctOutputAlpha<'a> {
     pub domain: crate::ModularSampleDomain,
@@ -157,7 +157,8 @@ pub struct VarDctOutputAlpha<'a> {
     pub height: u32,
     pub stride: u32,
     pub word_offset: u32,
-    pub bits_per_sample: u32,
+    /// Original sample declaration, independent of the current resident domain.
+    pub sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth,
 }
 
 /// Exact byte counts for one fused output operation.
@@ -342,8 +343,10 @@ pub struct VarDctOutputScratch {
 pub enum VarDctOutputError {
     #[error("VarDCT output needs five storage bindings, device permits {available}")]
     StorageBindingCount { available: u32 },
-    #[error("VarDCT alpha requires 1–16-bit integer samples, got {bits}")]
-    InvalidAlphaBitDepth { bits: u32 },
+    #[error("VarDCT alpha has invalid sample precision {depth:?}")]
+    InvalidAlphaBitDepth {
+        depth: jxl_gpu_bitstream::SampleBitDepth,
+    },
     #[error("VarDCT alpha conversion requires an alpha input plane")]
     MissingAlphaPlane,
     /// The common output contract rejected color or layout metadata.
@@ -687,11 +690,10 @@ fn validate_inputs(
     )?;
 
     let alpha_geometry = if let Some(alpha) = inputs.alpha {
-        if !(1..=16).contains(&alpha.bits_per_sample) {
-            return Err(VarDctOutputError::InvalidAlphaBitDepth {
-                bits: alpha.bits_per_sample,
-            });
-        }
+        let encoding = crate::modular_sample::ModularSampleEncoding::new(alpha.sample_bit_depth)
+            .ok_or(VarDctOutputError::InvalidAlphaBitDepth {
+                depth: alpha.sample_bit_depth,
+            })?;
         if alpha.width < inputs.config.extent.width || alpha.height < inputs.config.extent.height {
             return Err(VarDctOutputError::InputExtent {
                 plane: 3,
@@ -726,7 +728,7 @@ fn validate_inputs(
         [
             alpha.word_offset,
             alpha.stride,
-            (1 << alpha.bits_per_sample) - 1,
+            encoding.packed(),
             1 + alpha.domain as u32,
         ]
     } else {
@@ -1225,13 +1227,15 @@ mod tests {
                         });
                     let inputs = VarDctOutputInputs {
                         alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
-                            domain: crate::ModularSampleDomain::SignedInteger,
+                            domain: crate::ModularSampleDomain::Encoded,
                             storage: binding(&alpha),
                             width: extent.width,
                             height: extent.height,
                             stride: extent.width,
                             word_offset: 2,
-                            bits_per_sample: 5,
+                            sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer {
+                                bits_per_sample: 5,
+                            },
                         }),
                         planes: [
                             VarDctOutputPlane {

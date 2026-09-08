@@ -2,6 +2,8 @@
 
 override wg_x: u32 = 64u;
 
+/*__JXL_MODULAR_SAMPLE__*/
+
 struct Params {
     // width, height, source channel count, source bit depth
     extent: vec4<u32>,
@@ -9,7 +11,7 @@ struct Params {
     region: vec4<u32>,
     source_offsets: vec4<u32>,
     source_strides: vec4<u32>,
-    source_masks: vec4<u32>,
+    source_encodings: vec4<u32>,
     // output kind, transfer, limited range, component count
     output: vec4<u32>,
     // channel order, component bits, storage bits, numeric mapping
@@ -70,12 +72,15 @@ fn write_word(offset: u32, value: u32) {
 }
 
 fn source_mask() -> u32 {
-    return (1u << params.extent.w) - 1u;
+    return modular_sample_maximum(params.source_encodings.x);
+}
+fn source_f32_bits(channel: u32, x: u32, y: u32) -> u32 {
+    let word = arena[params.source_offsets[channel] + y * params.source_strides[channel] + x];
+    if params.region.w == 1u { return word; }
+    return modular_sample_f32_bits(word, params.source_encodings[channel]);
 }
 fn source_normalized(channel: u32, x: u32, y: u32) -> f32 {
-    let word = arena[params.source_offsets[channel] + y * params.source_strides[channel] + x];
-    if params.region.w == 1u { return bitcast<f32>(word); }
-    return f32(bitcast<i32>(word)) / f32(params.source_masks[channel]);
+    return bitcast<f32>(source_f32_bits(channel, x, y));
 }
 
 fn source_sample(channel: u32, x: u32, y: u32) -> u32 {
@@ -84,7 +89,7 @@ fn source_sample(channel: u32, x: u32, y: u32) -> u32 {
             + y * params.source_strides[channel]
             + x
     ]);
-    if raw < 0i || u32(raw) > params.source_masks[channel] {
+    if raw < 0i || u32(raw) > modular_sample_maximum(params.source_encodings[channel]) {
         reject_output_mapping();
         return 0u;
     }
@@ -118,13 +123,15 @@ fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
                 let normalized = source_normalized(source_channel, source_x, source_y)
                     * alpha_multiplier(source_x, source_y);
                 value = u32(floor(clamp(normalized, 0.0, 1.0) * f32(source_mask()) + 0.5));
-            } else if params.region.w == 1u {
+            } else if params.region.w == 1u || modular_sample_is_float(params.source_encodings[source_channel]) {
                 let normalized = source_normalized(source_channel, source_x, source_y);
-                if !(normalized >= 0.0 && normalized <= 1.0) { reject_output_mapping(); value = 0u; }
+                if modular_sample_is_float(params.source_encodings[source_channel]) && params.output.w > 1u {
+                    value = u32(floor(clamp(normalized, 0.0, 1.0) * f32(source_mask()) + 0.5));
+                } else if !(normalized >= 0.0 && normalized <= 1.0) { reject_output_mapping(); value = 0u; }
                 else { value = u32(floor(normalized * f32(source_mask()) + 0.5)); }
             } else {
                 value = source_sample(source_channel, source_x, source_y);
-                let mask = params.source_masks[source_channel];
+                let mask = modular_sample_maximum(params.source_encodings[source_channel]);
                 if mask != source_mask() { value = (value * source_mask() + mask / 2u) / mask; }
             }
         }
@@ -195,7 +202,7 @@ fn write_numeric_sample(x: u32, y: u32, sample: u32) {
         let offset = pixel_offset + component * bytes_per_component;
         if params.format.w == 4u {
             if params.region.w == 1u { write_word(offset, sample); }
-            else { write_word(offset, bitcast<u32>(f32(bitcast<i32>(sample)) / f32(params.source_masks.x))); }
+            else { write_word(offset, modular_sample_f32_bits(sample, params.source_encodings.x)); }
             continue;
         }
         if params.output.x == 0u {
@@ -261,17 +268,20 @@ fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
     for (var position = 0u; position < params.output.w; position += 1u) {
         var canonical = position;
         if (params.format.x == 1u || params.format.x == 3u) && position < 3u { canonical = 2u - position; }
-        var value = 1.0;
+        var value_bits = 0x3f800000u;
         if canonical < 3u {
             let channel = select(canonical, 0u, params.extent.z == 1u);
-            value = target_nonlinear(source_normalized(channel, source_x, source_y))
-                * alpha_multiplier(source_x, source_y);
+            value_bits = source_f32_bits(channel, source_x, source_y);
+            if params.output.y != 0u || params.bounds.w != 0u {
+                value_bits = bitcast<u32>(target_nonlinear(bitcast<f32>(value_bits))
+                    * alpha_multiplier(source_x, source_y));
+            }
         } else if params.extent.z == 4u {
-            value = source_normalized(3u, source_x, source_y);
+            value_bits = source_f32_bits(3u, source_x, source_y);
         }
         var offset = params.plane01.x + y * params.plane01.y + (x * params.output.w + position) * 4u;
         if params.output.x == 6u { offset = offsets[position] + y * strides[position] + x * 4u; }
-        write_word(offset, bitcast<u32>(value));
+        write_word(offset, value_bits);
     }
 }
 

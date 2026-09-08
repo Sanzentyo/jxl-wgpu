@@ -61,7 +61,7 @@ pub enum VarDctColorTransform {
 pub enum UnsupportedVarDctFeature {
     CodestreamSize,
     ImageDimensions,
-    FloatingPointSamples,
+    SamplePrecision,
     NonXybImage,
     EmbeddedIcc,
     ExtraChannels,
@@ -939,7 +939,7 @@ pub struct StandardVarDctProfile {
     pub output_width: u32,
     pub output_height: u32,
     pub upsampling: u32,
-    pub bits_per_sample: u32,
+    pub sample_bit_depth: SampleBitDepth,
     pub color_transform: VarDctColorTransform,
     /// Resident channel order is Cb/X, Y, Cr/B. XYB uses three zero shifts.
     pub channel_shifts: [VarDctChannelShift; 3],
@@ -974,6 +974,15 @@ pub struct VarDctGroupRect {
 }
 
 impl StandardVarDctProfile {
+    /// Original channel precision declared by the image header, independent of XYB working data.
+    pub const fn bits_per_sample(&self) -> u32 {
+        match self.sample_bit_depth {
+            SampleBitDepth::Integer { bits_per_sample }
+            | SampleBitDepth::Float {
+                bits_per_sample, ..
+            } => bits_per_sample,
+        }
+    }
     /// Negotiate the single-frame XYB or JPEG-reconstruction VarDCT profile.
     pub fn negotiate(inventory: &CodestreamInventory) -> Result<Self, VarDctFrontendError> {
         Self::negotiate_for_role(inventory, VarDctFrameRole::Presentation)
@@ -988,12 +997,15 @@ impl StandardVarDctProfile {
         let sections = collect_sections(inventory, frame)?;
         let frame_name = String::from_utf8(frame.name_bytes.clone())
             .map_err(|_| VarDctFrontendError::InvalidFrameName)?;
-        let bits_per_sample = match inventory.image_header.bit_depth {
-            SampleBitDepth::Integer { bits_per_sample } => bits_per_sample,
-            SampleBitDepth::Float { .. } => {
-                return unsupported(UnsupportedVarDctFeature::FloatingPointSamples);
-            }
-        };
+        // Preserve integer declarations for the packet layer's depth/color-domain diagnostic.
+        if matches!(
+            inventory.image_header.bit_depth,
+            SampleBitDepth::Float { .. }
+        ) && crate::modular_sample::ModularSampleEncoding::new(inventory.image_header.bit_depth)
+            .is_none()
+        {
+            return unsupported(UnsupportedVarDctFeature::SamplePrecision);
+        }
         let invalid_extent = || VarDctFrontendError::Unsupported {
             feature: UnsupportedVarDctFeature::ImageDimensions,
         };
@@ -1010,7 +1022,7 @@ impl StandardVarDctProfile {
             output_width: frame.width.div_ceil(lf_divisor),
             output_height: frame.height.div_ceil(lf_divisor),
             upsampling: frame.upsampling,
-            bits_per_sample,
+            sample_bit_depth: inventory.image_header.bit_depth,
             color_transform: if frame.do_ycbcr {
                 VarDctColorTransform::Ycbcr
             } else {
@@ -1278,12 +1290,9 @@ fn validate_image(
     }
     if image.extra_channel_count as usize != image.extra_channels.len()
         || image.extra_channels.iter().any(|extra| {
-            !matches!(
-                extra.bit_depth,
-                SampleBitDepth::Integer {
-                    bits_per_sample: 1..=16
-                }
-            ) || extra.dimension_shift > 3
+            !crate::modular_sample::ModularSampleEncoding::new(extra.bit_depth)
+                .is_some_and(|encoding| encoding.is_float() || encoding.bits() <= 16)
+                || extra.dimension_shift > 3
         })
     {
         return unsupported(UnsupportedVarDctFeature::ExtraChannels);

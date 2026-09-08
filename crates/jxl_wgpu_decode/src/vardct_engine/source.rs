@@ -355,16 +355,18 @@ pub(super) fn prepare_packet_source(
         let sources = extra_indices
             .iter()
             .map(|&index| {
-                let mut plane = planes[index];
-                let jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } =
-                    inventory.image_header.extra_channels[index].bit_depth
-                else {
-                    unreachable!("integer profile")
-                };
-                plane.bit_depth = bits_per_sample;
-                plane
+                let encoding = crate::modular_sample::ModularSampleEncoding::new(
+                    inventory.image_header.extra_channels[index].bit_depth,
+                )
+                .ok_or(crate::modular_render::ModularRenderError::Invalid {
+                    reason: "extra-channel precision",
+                })?;
+                Ok(crate::modular_sample::ModularOutputPlane::new(
+                    planes[index],
+                    encoding,
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::modular_render::ModularRenderError>>()?;
         Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
             jxl_gpu_protocol::Extent2d::new(
                 packet.profile.output_width,

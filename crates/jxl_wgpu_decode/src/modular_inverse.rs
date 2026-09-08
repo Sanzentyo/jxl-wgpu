@@ -1154,8 +1154,7 @@ mod tests {
                 },
                 ModularFinalizeParams::new(
                     jxl_gpu_protocol::Extent2d::new(9, 5),
-                    8,
-                    &plan.final_gpu_layouts(),
+                    &crate::modular_sample::integer_planes(&plan.final_gpu_layouts()),
                     plan.arena_words(),
                     ModularFinalizeOutput {
                         kind: 9,

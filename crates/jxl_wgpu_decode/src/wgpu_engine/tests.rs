@@ -326,7 +326,7 @@ fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
             OutputOrientation::Identity,
             &request,
             source_channels,
-            8,
+            crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
             PORTABLE_CAPABILITIES,
         )
         .unwrap_or_else(|error| panic!("{name} output plan failed: {error}"));
@@ -343,7 +343,7 @@ fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
         OutputOrientation::Identity,
         &rgb_request,
         crate::ModularChannels::Gray,
-        8,
+        crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
         PORTABLE_CAPABILITIES,
     )
     .unwrap();
@@ -470,7 +470,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
         OutputOrientation::Identity,
         &request,
         crate::ModularChannels::Gray,
-        8,
+        crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
         PORTABLE_CAPABILITIES,
     )
     .unwrap();
@@ -521,7 +521,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
         OutputOrientation::Identity,
         &native_request,
         crate::ModularChannels::Gray,
-        8,
+        crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
         PORTABLE_CAPABILITIES,
     )
     .unwrap();
@@ -540,7 +540,7 @@ fn direct_output_proof_accepts_only_normalized_single_channel_gray8() {
         OutputOrientation::Identity,
         &signed_request,
         crate::ModularChannels::Gray,
-        8,
+        crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
         PORTABLE_CAPABILITIES,
     )
     .unwrap();
@@ -590,7 +590,7 @@ fn output_negotiation_rejects_rgb_without_explicit_transfer_and_range() {
             OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
-            8,
+            crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
             PORTABLE_CAPABILITIES,
         ),
         Err(Error::UnsupportedOutputFormat(_))
@@ -606,7 +606,7 @@ fn output_negotiation_rejects_shader_address_overflow() {
             OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
-            8,
+            crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
             PORTABLE_CAPABILITIES,
         ),
         Err(Error::Backend(_))
@@ -668,7 +668,7 @@ fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
             OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
-            8,
+            crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
             PORTABLE_CAPABILITIES,
         )
         .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));
@@ -713,7 +713,7 @@ fn output_negotiation_covers_all_vpi_pitch_linear_formats() {
             OutputOrientation::Identity,
             &request,
             crate::ModularChannels::Gray,
-            8,
+            crate::modular_sample::ModularSampleEncoding::integer(8).unwrap(),
             PORTABLE_CAPABILITIES,
         )
         .unwrap_or_else(|error| panic!("{} must be supported: {error}", format.name()));

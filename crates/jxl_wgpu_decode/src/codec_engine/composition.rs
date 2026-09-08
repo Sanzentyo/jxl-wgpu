@@ -35,6 +35,40 @@ mod submission;
 use gpu::{Compositor, Surface};
 use submission::GpuWork;
 
+/// Keep producer selection and sequence dispatch consistent about presentation-only conversion.
+pub(super) fn needs_surface(
+    inventory: &CodestreamInventory,
+    request: &GpuOutputRequest,
+    plan: &FrameExecutionPlan,
+) -> bool {
+    use jxl_gpu_formats::{
+        ColorFormatClass, ColorRange, ColorSpace, ColorSpecification, PixelFormatClass, RgbSample,
+        TransferFunction, classify_pixel_format,
+    };
+    let direct_float = matches!(
+        classify_pixel_format(request.format()),
+        Ok(PixelFormatClass::Color(ColorFormatClass::Rgb {
+            sample: RgbSample::F32,
+            ..
+        }))
+    ) && matches!(request.format().color_spec, ColorSpecification::Defined(spec)
+            if spec.space == ColorSpace::Bt709 && spec.range == ColorRange::Full
+                && matches!(spec.transfer, TransferFunction::Srgb | TransferFunction::Sycc
+                    | TransferFunction::Linear | TransferFunction::Bt709 | TransferFunction::Bt2020));
+    let floating_conversion = matches!(
+        inventory.image_header.bit_depth,
+        jxl_gpu_bitstream::SampleBitDepth::Float { .. }
+    ) && request.mapping() == crate::GpuOutputMapping::Color
+        && !direct_float;
+    floating_conversion
+        || request.renders_spot_colors(&inventory.image_header.extra_channels)
+        || plan.nodes.iter().any(|node| node.needs_composition)
+        || inventory
+            .frames
+            .iter()
+            .any(|frame| frame.frame_type == FrameType::ReferenceOnly)
+}
+
 #[derive(Debug)]
 struct Carry {
     source: SequenceSource,
@@ -92,6 +126,7 @@ impl CompositionSession {
             Extent2d::new(image.width, image.height),
             &image.extra_channels,
             image.grayscale,
+            image.bit_depth,
             OutputOrientation::from_exif_value(image.orientation).ok_or(
                 Error::InvalidImageOrientation {
                     value: image.orientation,

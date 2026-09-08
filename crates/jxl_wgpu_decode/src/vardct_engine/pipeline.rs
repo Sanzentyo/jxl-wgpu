@@ -289,7 +289,7 @@ impl VarDctSubmissionEngine {
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
         let extent = source.layout.extent;
         let profile = DecodeProfile::VarDct {
-            bits_per_sample: source.packet.profile.bits_per_sample as u8,
+            sample_bit_depth: source.packet.profile.sample_bit_depth,
         };
         let submissions_per_frame = source.submissions_per_frame();
         let runtime_stats = Arc::new(VarDctRuntimeStats {

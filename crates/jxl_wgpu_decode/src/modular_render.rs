@@ -1,4 +1,4 @@
-//! Reconstruct selected integer Modular planes at presentation resolution on the GPU.
+//! Decode selected Modular sample representations and reconstruct presentation resolution on GPU.
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::UpsamplingWeightsInventory;
@@ -10,14 +10,17 @@ use jxl_wgpu::{
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
+use crate::modular_sample::ModularOutputPlane;
 use crate::modular_transform::GpuModularChannelLayout;
 
 /// Interpretation of resident Modular output words after inverse transforms or resampling.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModularSampleDomain {
-    SignedInteger = 0,
-    NormalizedF32 = 1,
+    /// Integer working words containing the original declared sample representation.
+    Encoded = 0,
+    /// Decoded binary32 values after sample conversion and optional filtering.
+    DecodedF32 = 1,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -40,16 +43,16 @@ type Result<T> = std::result::Result<T, ModularRenderError>;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NormalizeParams {
     source: [u32; 4],  // width, height, stride, word offset
-    mapping: [u32; 4], // integer maximum, output stride, reserved
+    mapping: [u32; 4], // source sample encoding, output stride, reserved
 }
 const _: () = assert!(std::mem::size_of::<NormalizeParams>() == 32);
 
 #[derive(Debug)]
 pub(crate) struct ModularRenderPlan {
     pub extent: Extent2d,
-    sources: Vec<GpuModularChannelLayout>,
+    sources: Vec<ModularOutputPlane>,
     factors: Vec<u32>,
-    planes: Vec<GpuModularChannelLayout>,
+    planes: Vec<ModularOutputPlane>,
     kernels: Vec<ResidentUpsampleKernel>,
     pub output_bytes: u64,
     pub scratch_bytes: u64,
@@ -60,7 +63,7 @@ pub(crate) struct ModularRenderPlan {
 impl ModularRenderPlan {
     pub(crate) fn new(
         extent: Extent2d,
-        sources: Vec<GpuModularChannelLayout>,
+        sources: Vec<ModularOutputPlane>,
         factors: Vec<u32>,
         weights: &UpsamplingWeightsInventory,
         limits: &wgpu::Limits,
@@ -118,12 +121,12 @@ impl ModularRenderPlan {
         let mut kernels = Vec::<ResidentUpsampleKernel>::new();
         let mut planes = Vec::new();
         let mut uniform_bytes = 0;
-        for (index, (&source, &factor)) in sources.iter().zip(&factors).enumerate() {
+        for (index, (&source_info, &factor)) in sources.iter().zip(&factors).enumerate() {
+            let source = source_info.layout;
             if !matches!(factor, 1 | 2 | 4 | 8)
                 || source.width != extent.width.div_ceil(factor)
                 || source.height != extent.height.div_ceil(factor)
                 || source.row_stride_words < source.width
-                || !(1..=16).contains(&source.bit_depth)
                 || source.reserved != 0
                 || source.hshift < 0
                 || source.vshift < 0
@@ -143,16 +146,19 @@ impl ModularRenderPlan {
                     kernels.push(upsample_kernel(weights, factor)?);
                 }
             }
-            planes.push(GpuModularChannelLayout {
-                width: extent.width,
-                height: extent.height,
-                row_stride_words: extent.width,
-                word_offset: (plane_bytes / 4 * index as u64) as u32,
-                hshift: 0,
-                vshift: 0,
-                bit_depth: source.bit_depth,
-                reserved: 0,
-            });
+            planes.push(ModularOutputPlane::new(
+                GpuModularChannelLayout {
+                    width: extent.width,
+                    height: extent.height,
+                    row_stride_words: extent.width,
+                    word_offset: (plane_bytes / 4 * index as u64) as u32,
+                    hshift: 0,
+                    vshift: 0,
+                    bit_depth: source.bit_depth,
+                    reserved: 0,
+                },
+                source_info.encoding,
+            ));
         }
         require("normalization scratch bytes", scratch_bytes, storage_limit)?;
         let weight_bytes = kernels
@@ -179,7 +185,7 @@ impl ModularRenderPlan {
         self.output_bytes + self.scratch_bytes + self.weight_bytes + self.uniform_bytes
     }
 
-    pub(crate) fn planes(&self) -> &[GpuModularChannelLayout] {
+    pub(crate) fn planes(&self) -> &[ModularOutputPlane] {
         &self.planes
     }
 
@@ -236,7 +242,12 @@ impl ModularRenderPipeline {
     pub(crate) fn new(device: &wgpu::Device) -> Result<Self> {
         // Validate the shared 16×16 workgroup before creating either compute pipeline.
         let upsample = ResidentUpsamplePipeline::new(device)?;
-        let shader = device.create_shader_module(wgpu::include_wgsl!("modular_render.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("jxl-wgpu Modular sample decoding"),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::modular_sample::shader(include_str!("modular_render.wgsl")).into(),
+            ),
+        });
         Ok(Self {
             normalize: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("jxl-wgpu Modular sample normalization"),
@@ -257,7 +268,7 @@ impl ModularRenderPipeline {
         plan: &ModularRenderPlan,
         buffers: &ModularRenderBuffers,
         input: ResidentStorageBinding<'_>,
-        sources: &[GpuModularChannelLayout],
+        sources: &[ModularOutputPlane],
     ) -> Result<Vec<wgpu::Buffer>> {
         if !input.buffer.usage().contains(wgpu::BufferUsages::STORAGE)
             || !input.size.get().is_multiple_of(4)
@@ -280,11 +291,12 @@ impl ModularRenderPipeline {
             return invalid("selected source count changed");
         }
         let mut uniforms = Vec::new();
-        for (index, (&source, &factor)) in sources.iter().zip(&plan.factors).enumerate() {
-            let expected = plan.sources[index];
+        for (index, (&source_info, &factor)) in sources.iter().zip(&plan.factors).enumerate() {
+            let source = source_info.layout;
+            let expected = plan.sources[index].layout;
             if source.width != expected.width
                 || source.height != expected.height
-                || source.bit_depth != expected.bit_depth
+                || source_info.encoding != plan.sources[index].encoding
                 || source.row_stride_words < source.width
                 || source.reserved != 0
             {
@@ -300,7 +312,7 @@ impl ModularRenderPipeline {
                 u64::from(u32::MAX),
             )?;
             require("source binding bytes", source_bytes, input.size.get())?;
-            let plane = plan.planes[index];
+            let plane = plan.planes[index].layout;
             let output_binding = ResidentStorageBinding {
                 buffer: &buffers.output,
                 offset: u64::from(plane.word_offset) * 4,
@@ -332,7 +344,7 @@ impl ModularRenderPipeline {
                         source.row_stride_words,
                         source.word_offset,
                     ],
-                    mapping: [(1 << source.bit_depth) - 1, source.width, 0, 0],
+                    mapping: [source_info.encoding.packed(), source.width, 0, 0],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
@@ -434,17 +446,20 @@ mod tests {
         }
     }
 
-    fn plane(extent: Extent2d, factor: u32, bits: u32) -> GpuModularChannelLayout {
-        GpuModularChannelLayout {
-            width: extent.width.div_ceil(factor),
-            height: extent.height.div_ceil(factor),
-            row_stride_words: extent.width.div_ceil(factor) + 2,
-            word_offset: 3,
-            hshift: factor.ilog2() as i32,
-            vshift: factor.ilog2() as i32,
-            bit_depth: bits,
-            reserved: 0,
-        }
+    fn plane(extent: Extent2d, factor: u32, bits: u32) -> ModularOutputPlane {
+        ModularOutputPlane::new(
+            GpuModularChannelLayout {
+                width: extent.width.div_ceil(factor),
+                height: extent.height.div_ceil(factor),
+                row_stride_words: extent.width.div_ceil(factor) + 2,
+                word_offset: 3,
+                hshift: factor.ilog2() as i32,
+                vshift: factor.ilog2() as i32,
+                bit_depth: bits,
+                reserved: 0,
+            },
+            crate::modular_sample::ModularSampleEncoding::integer(bits).unwrap(),
+        )
     }
 
     #[test]
@@ -468,12 +483,20 @@ mod tests {
         assert_eq!(plan.uniform_bytes, 4 * 32 + 3 * 32);
         for (index, plane) in plan.planes().iter().enumerate() {
             assert_eq!(
-                (plane.width, plane.height, plane.hshift, plane.vshift),
+                (
+                    plane.layout.width,
+                    plane.layout.height,
+                    plane.layout.hshift,
+                    plane.layout.vshift
+                ),
                 (17, 9, 0, 0)
             );
-            assert!(u64::from(plane.word_offset * 4).is_multiple_of(alignment));
+            assert!(u64::from(plane.layout.word_offset * 4).is_multiple_of(alignment));
             if index > 0 {
-                assert!(plan.planes()[index - 1].word_offset + 17 * 9 <= plane.word_offset);
+                assert!(
+                    plan.planes()[index - 1].layout.word_offset + 17 * 9
+                        <= plane.layout.word_offset
+                );
             }
         }
         let duplicate = ModularRenderPlan::new(
@@ -516,11 +539,24 @@ mod tests {
         ));
         for (extent, source, factor) in [
             (Extent2d::new(u32::MAX, u32::MAX), source, 2),
-            (extent, GpuModularChannelLayout { width: 8, ..source }, 2),
             (
                 extent,
-                GpuModularChannelLayout {
-                    bit_depth: 17,
+                ModularOutputPlane {
+                    layout: GpuModularChannelLayout {
+                        width: 8,
+                        ..source.layout
+                    },
+                    ..source
+                },
+                2,
+            ),
+            (
+                extent,
+                ModularOutputPlane {
+                    layout: GpuModularChannelLayout {
+                        reserved: 1,
+                        ..source.layout
+                    },
                     ..source
                 },
                 2,
@@ -535,8 +571,11 @@ mod tests {
         assert!(matches!(
             ModularRenderPlan::new(
                 extent,
-                vec![GpuModularChannelLayout {
-                    word_offset: u32::MAX,
+                vec![ModularOutputPlane {
+                    layout: GpuModularChannelLayout {
+                        word_offset: u32::MAX,
+                        ..source.layout
+                    },
                     ..source
                 }],
                 vec![2],

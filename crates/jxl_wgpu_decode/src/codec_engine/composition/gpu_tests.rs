@@ -30,6 +30,7 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
             Extent2d::new(image.width, image.height),
             &image.extra_channels,
             false,
+            image.bit_depth,
             OutputOrientation::from_exif_value(1).unwrap(),
             &request,
         )

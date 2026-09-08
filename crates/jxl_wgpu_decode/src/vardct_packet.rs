@@ -721,7 +721,7 @@ impl VarDctPacketPrefix {
                         })?,
                         block_context: &lf_global.hf_block_context,
                         decoded_symbol_limit,
-                        bit_depth: profile.bits_per_sample,
+                        bit_depth: profile.bits_per_sample(),
                         low_frequency_group_count: profile.low_frequency_group_count,
                         global_ma_config: global_ma_config.as_ref(),
                     },
@@ -826,12 +826,16 @@ impl BoundedVarDctPacketPlan {
         role: crate::vardct_frontend::VarDctFrameRole,
     ) -> Result<VarDctPacketPreparation, BoundedVarDctPacketError> {
         let profile = StandardVarDctProfile::negotiate_for_role(inventory, role)?;
-        if !(1..=16).contains(&profile.bits_per_sample)
+        let supported_precision =
+            crate::modular_sample::ModularSampleEncoding::new(profile.sample_bit_depth)
+                .is_some_and(|encoding| encoding.is_float() || encoding.bits() <= 16);
+        if !supported_precision
             || (profile.color_transform == VarDctColorTransform::Ycbcr
-                && profile.bits_per_sample != 8)
+                && profile.sample_bit_depth
+                    != (jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 }))
         {
             return Err(UnsupportedVarDctPacketFeature::BitDepth {
-                bits_per_sample: profile.bits_per_sample,
+                bits_per_sample: profile.bits_per_sample(),
                 color_transform: profile.color_transform,
             }
             .into());
@@ -933,7 +937,7 @@ impl BoundedVarDctPacketPlan {
                 .parse_global(
                     &mut reader,
                     header,
-                    profile.bits_per_sample,
+                    profile.bits_per_sample(),
                     prefix.global_ma_config.as_ref(),
                 )
                 .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
@@ -944,7 +948,7 @@ impl BoundedVarDctPacketPlan {
                 header
                     .finish(
                         &mut reader,
-                        profile.bits_per_sample,
+                        profile.bits_per_sample(),
                         0,
                         prefix.global_ma_config.as_ref(),
                     )
@@ -1062,7 +1066,7 @@ impl BoundedVarDctPacketPlan {
         let image = crate::modular_side_image::ModularSideImagePlan::parse(
             &mut reader,
             topology,
-            self.profile.bits_per_sample,
+            self.profile.bits_per_sample(),
             stream_index,
             self.global_ma_config.as_ref(),
         )?;
@@ -1252,7 +1256,7 @@ impl BoundedVarDctPacketPlan {
                 })?,
                 block_context: &self.hf_block_context,
                 decoded_symbol_limit,
-                bit_depth: self.profile.bits_per_sample,
+                bit_depth: self.profile.bits_per_sample(),
                 low_frequency_group_count: self.profile.low_frequency_group_count,
                 global_ma_config: self.global_ma_config.as_ref(),
             },
@@ -1297,7 +1301,7 @@ impl BoundedVarDctPacketPlan {
         let parsed = parse_hf_dequant_matrices_from(
             &mut reader,
             pending.matrix_state,
-            self.profile.bits_per_sample,
+            self.profile.bits_per_sample(),
             self.profile.low_frequency_group_count,
             self.global_ma_config.as_ref(),
         )?;
@@ -1328,7 +1332,7 @@ impl BoundedVarDctPacketPlan {
                             group_count: pending.group_count,
                             block_context: &pending.block_context,
                             decoded_symbol_limit: pending.decoded_symbol_limit,
-                            bit_depth: self.profile.bits_per_sample,
+                            bit_depth: self.profile.bits_per_sample(),
                             low_frequency_group_count: self.profile.low_frequency_group_count,
                             global_ma_config: self.global_ma_config.as_ref(),
                         },
@@ -3155,7 +3159,7 @@ mod tests {
             let topology = crate::modular_transform::ModularChannelTopology::full_resolution(
                 profile.output_width,
                 profile.output_height,
-                profile.bits_per_sample,
+                profile.bits_per_sample(),
                 inventory.image_header.extra_channel_count,
                 Default::default(),
             )

@@ -3152,9 +3152,7 @@ fn submit_vardct(
                     .extra_planes
                     .iter()
                     .map(|extra| {
-                        let mut plane = extra.plane;
-                        plane.bit_depth = extra.bits;
-                        plane
+                        crate::modular_sample::ModularOutputPlane::new(extra.plane, extra.encoding)
                     })
                     .collect::<Vec<_>>();
                 extra_uniforms.extend(pipelines.modular_render.encode(
@@ -3406,13 +3404,13 @@ fn submit_vardct(
                     {
                         let plane = plan.planes()[0];
                         Some(crate::vardct_output::VarDctOutputAlpha {
-                            domain: crate::ModularSampleDomain::NormalizedF32,
+                            domain: crate::ModularSampleDomain::DecodedF32,
                             storage: resident_binding(&buffers.output)?,
-                            width: plane.width,
-                            height: plane.height,
-                            stride: plane.row_stride_words,
-                            word_offset: plane.word_offset,
-                            bits_per_sample: plane.bit_depth,
+                            width: plane.layout.width,
+                            height: plane.layout.height,
+                            stride: plane.layout.row_stride_words,
+                            word_offset: plane.layout.word_offset,
+                            sample_bit_depth: plane.encoding.depth(),
                         })
                     } else {
                         source
@@ -3474,7 +3472,7 @@ fn submit_vardct(
                     .ok_or(VarDctDecodeError::EntropyWindowContract {
                         detail: "scalar output lacks its selected resident extra plane",
                     })?;
-            if plan.config.bits != extra.bits || index != extra.index {
+            if plan.config.encoding != extra.encoding || index != extra.index {
                 return Err(VarDctDecodeError::EntropyWindowContract {
                     detail: "scalar output precision differs from the selected extra plane",
                 });
@@ -3482,14 +3480,14 @@ fn submit_vardct(
             let (plane, domain, arena) =
                 if let (Some(plan), Some(buffers)) = (&source.extra_render, &rendered_extra) {
                     (
-                        plan.planes()[0],
-                        crate::ModularSampleDomain::NormalizedF32,
+                        plan.planes()[0].layout,
+                        crate::ModularSampleDomain::DecodedF32,
                         &buffers.output,
                     )
                 } else {
                     (
                         extra.plane,
-                        crate::ModularSampleDomain::SignedInteger,
+                        crate::ModularSampleDomain::Encoded,
                         extra.arena.as_wgpu_buffer(),
                     )
                 };
@@ -3531,6 +3529,7 @@ fn submit_vardct(
             });
         }
         for (plane, layout) in plan.planes().iter().zip(&surface.extras) {
+            let plane = plane.layout;
             commands.copy_buffer_to_buffer(
                 &buffers.output,
                 u64::from(plane.word_offset) * 4,

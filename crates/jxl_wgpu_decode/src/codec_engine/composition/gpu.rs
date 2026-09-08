@@ -70,6 +70,7 @@ impl Compositor {
         canvas: Extent2d,
         extras: &[ExtraChannelInventory],
         grayscale: bool,
+        sample_bit_depth: SampleBitDepth,
         orientation: OutputOrientation,
         request: &GpuOutputRequest,
     ) -> Result<Self> {
@@ -164,9 +165,29 @@ impl Compositor {
         }
         let spot_source = spot_shader(!spots.is_empty());
         let native = crate::model::native_modular_format(request.format());
+        let source_depth = selected.map_or(sample_bit_depth, |(_, extra)| extra.bit_depth);
+        let source_float = matches!(source_depth, SampleBitDepth::Float { .. });
+        let wrong_numeric_type = match request.mapping() {
+            crate::GpuOutputMapping::Numeric(crate::NumericSampleMapping::NativeFloat) => {
+                !source_float
+            }
+            crate::GpuOutputMapping::Numeric(
+                crate::NumericSampleMapping::NormalizedUnsigned
+                | crate::NumericSampleMapping::NativeUnsigned,
+            ) => source_float,
+            _ => false,
+        };
+        if wrong_numeric_type {
+            return Err(Error::UnsupportedOutputFormat(
+                "numeric mapping does not match the declared source sample type".into(),
+            ));
+        }
         let scalar_float = matches!(
             request.mapping(),
-            crate::GpuOutputMapping::Numeric(crate::NumericSampleMapping::NormalizedUnsigned)
+            crate::GpuOutputMapping::Numeric(
+                crate::NumericSampleMapping::NormalizedUnsigned
+                    | crate::NumericSampleMapping::NativeFloat
+            )
         ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
         let (packing, source) = if native.is_some() || scalar_float {
             if selected.is_none()

@@ -103,7 +103,7 @@ impl ByteRange {
 }
 
 /// Image sample representation declared by the JPEG XL image header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SampleBitDepth {
     Integer {
         bits_per_sample: u32,

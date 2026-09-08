@@ -286,11 +286,17 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_progressive_dc_modular_profile(&codestream, inventory)?;
-        let internal_request = GpuOutputRequest::color(native_modular_pixel_format(
-            crate::ModularChannels::Rgb,
-            profile.bits_per_sample,
-        )?)?
-        .with_max_frame_slots(request.max_frame_slots());
+        let format = if profile.sample_encoding.is_float() {
+            jxl_gpu_formats::PixelFormat::rgb_f32(
+                jxl_gpu_formats::RgbChannelOrder::Rgb,
+                false,
+                crate::vardct_rgb8_format().color_spec,
+            )
+        } else {
+            native_modular_pixel_format(crate::ModularChannels::Rgb, profile.bits_per_sample)?
+        };
+        let internal_request =
+            GpuOutputRequest::color(format)?.with_max_frame_slots(request.max_frame_slots());
         self.open_profile(codestream, &internal_request, profile)
     }
 
@@ -430,7 +436,7 @@ impl WgpuSubmissionEngine {
             profile.orientation,
             request,
             output_channels.format_channels,
-            output_channels.bits,
+            output_channels.encoding,
             self.capabilities(),
         )?;
         output.source_channels = output_channels;
@@ -650,7 +656,7 @@ impl WgpuSubmissionEngine {
         };
         Ok(PreparedGpuSession::new(
             DecodeProfile::Modular {
-                bits_per_sample: profile.bits_per_sample,
+                sample_bit_depth: profile.sample_encoding.depth(),
                 channels: profile.channels,
                 prediction,
                 grouping: if profile.groups.len() == 1 {

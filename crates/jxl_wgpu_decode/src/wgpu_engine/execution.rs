@@ -888,7 +888,7 @@ pub(super) fn modular_finalize_params(
         },
         &planes,
         resident.inverse_plan.arena_words(),
-        crate::ModularSampleDomain::SignedInteger,
+        crate::ModularSampleDomain::Encoded,
     )
 }
 
@@ -920,7 +920,7 @@ pub(super) fn modular_frame_finalize_params(
         },
         &planes,
         frame_plan.inverse_plan.arena_words(),
-        crate::ModularSampleDomain::SignedInteger,
+        crate::ModularSampleDomain::Encoded,
     )
 }
 
@@ -944,14 +944,14 @@ fn modular_render_finalize_params(
         },
         render.planes(),
         (render.output_bytes / 4) as u32,
-        crate::ModularSampleDomain::NormalizedF32,
+        crate::ModularSampleDomain::DecodedF32,
     )
 }
 
 fn build_modular_finalizers(
     output: &OutputPlan,
     region: ModularFinalizeRegion,
-    planes: &[crate::modular_transform::GpuModularChannelLayout],
+    planes: &[crate::modular_sample::ModularOutputPlane],
     arena_words: u32,
     domain: crate::ModularSampleDomain,
 ) -> Result<Vec<ModularFinalizeParams>> {
@@ -962,7 +962,6 @@ fn build_modular_finalizers(
     };
     let color = ModularFinalizeParams::new(
         region,
-        output.source_channels.bits,
         color_planes,
         arena_words,
         modular_finalize_output(output)?,
@@ -981,7 +980,6 @@ fn build_modular_finalizers(
             result.push(
                 ModularFinalizeParams::new(
                     region,
-                    source.bit_depth as u8,
                     std::slice::from_ref(source),
                     arena_words,
                     ModularFinalizeOutput {
@@ -1085,9 +1083,10 @@ impl OutputPlan {
         orientation: OutputOrientation,
         request: &GpuOutputRequest,
         source_channels: crate::ModularChannels,
-        source_bits: u8,
+        source_encoding: crate::modular_sample::ModularSampleEncoding,
         capabilities: WgpuDecodeCapabilities,
     ) -> Result<Self> {
+        let source_bits = source_encoding.bits();
         let orientation = request.orientation_policy().resolve(orientation);
         let extent = orientation.map_extent(source_extent);
         let format = request.format().clone();
@@ -1103,7 +1102,10 @@ impl OutputPlan {
                 )
             );
             if native_mapping {
-                if native.channels != source_channels || native.bits_per_sample != source_bits {
+                if source_encoding.is_float()
+                    || native.channels != source_channels
+                    || native.bits_per_sample != source_bits
+                {
                     return Err(Error::UnsupportedOutputFormat(format!(
                         "native Modular output {native:?} does not match {:?} {}-bit source",
                         source_channels, source_bits
@@ -1114,7 +1116,7 @@ impl OutputPlan {
                     render: None,
                     source_channels: super::channels::OutputChannels::identity(
                         source_channels,
-                        source_bits,
+                        source_encoding,
                     ),
                     layout: ImageLayout::packed(extent, format)?,
                     source_extent,
@@ -1142,11 +1144,26 @@ impl OutputPlan {
                 ..
             })
         );
-        let normalized_unsigned = request.mapping()
-            == GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned);
+        let source_float = source_encoding.is_float();
+        let scalar_f32 = match request.mapping() {
+            GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned)
+                if !source_float =>
+            {
+                true
+            }
+            GpuOutputMapping::Numeric(NumericSampleMapping::NativeFloat) if source_float => true,
+            GpuOutputMapping::Numeric(
+                NumericSampleMapping::NormalizedUnsigned | NumericSampleMapping::NativeFloat,
+            ) => {
+                return Err(Error::UnsupportedOutputFormat(
+                    "numeric mapping does not match the declared source sample type".into(),
+                ));
+            }
+            _ => false,
+        };
         if !float_rgb
-            && !normalized_unsigned
-            && (source_channels != crate::ModularChannels::Gray || source_bits != 8)
+            && !scalar_f32
+            && (source_float || source_channels != crate::ModularChannels::Gray || source_bits != 8)
         {
             return Err(Error::UnsupportedOutputFormat(
                 "RGB/RGBA and non-8-bit Modular sources require matching native output or RGB(A) F32"
@@ -1173,7 +1190,9 @@ impl OutputPlan {
         ) = match (class, request.mapping()) {
             (
                 PixelFormatClass::Numeric(numeric),
-                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned),
+                GpuOutputMapping::Numeric(
+                    NumericSampleMapping::NormalizedUnsigned | NumericSampleMapping::NativeFloat,
+                ),
             ) if source_channels == crate::ModularChannels::Gray
                 && numeric.sample_kind == SampleKind::Float
                 && numeric.bits_per_component == 32
@@ -1183,9 +1202,11 @@ impl OutputPlan {
             }
             (
                 PixelFormatClass::Numeric(_),
-                GpuOutputMapping::Numeric(NumericSampleMapping::NormalizedUnsigned),
+                GpuOutputMapping::Numeric(
+                    NumericSampleMapping::NormalizedUnsigned | NumericSampleMapping::NativeFloat,
+                ),
             ) => {
-                return Err(Error::UnsupportedOutputFormat("normalized unsigned samples require a scalar F32 destination and a scalar source".into()));
+                return Err(Error::UnsupportedOutputFormat("numeric sample conversion requires a scalar F32 destination and a scalar source".into()));
             }
             (
                 PixelFormatClass::Numeric(numeric),
@@ -1343,7 +1364,7 @@ impl OutputPlan {
             render: None,
             source_channels: super::channels::OutputChannels::identity(
                 source_channels,
-                source_bits,
+                source_encoding,
             ),
             layout: ImageLayout::packed(extent, format)?,
             source_extent,
@@ -2495,7 +2516,7 @@ pub(super) fn build_global_params(
             "DC-global MA metadata offset is missing",
         ))?;
     params.source_bits = u32::from(source.profile.bits_per_sample);
-    params.source_mask = (1u32 << source.profile.bits_per_sample) - 1;
+    params.source_mask = u32::MAX >> (32 - source.profile.bits_per_sample);
     params.needs_self_correcting = u32::from(
         plan.ma_config
             .resolve(&source.profile.ma_config)
@@ -2974,7 +2995,7 @@ pub(super) fn build_params(
             Error::EngineContract("Modular group MA metadata offset is missing"),
         )?,
         source_bits: u32::from(source.profile.bits_per_sample),
-        source_mask: (1u32 << source.profile.bits_per_sample) - 1,
+        source_mask: u32::MAX >> (32 - source.profile.bits_per_sample),
         needs_self_correcting: u32::from(ma_config.needs_self_correcting()),
         output_kind: source.output.kind as u32,
         transfer: source.output.transfer,

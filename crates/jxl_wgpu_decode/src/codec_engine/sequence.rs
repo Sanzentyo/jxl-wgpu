@@ -27,13 +27,7 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        if request.renders_spot_colors(&inventory.image_header.extra_channels)
-            || plan.nodes.iter().any(|node| node.needs_composition)
-            || inventory
-                .frames
-                .iter()
-                .any(|frame| frame.frame_type == jxl_gpu_bitstream::FrameType::ReferenceOnly)
-        {
+        if super::composition::needs_surface(inventory, request, &plan) {
             let composition =
                 CompositionSession::new(self.clone(), codestream, inventory, request, &plan)?;
             return Ok(PreparedGpuSession::new(
