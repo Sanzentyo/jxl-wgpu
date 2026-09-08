@@ -5,7 +5,7 @@
 //! host. [`packet`] decodes the accepted image entropy on the GPU and [`artifact`]
 //! defines the exact, bytemuck-safe storage ABI used to turn
 //! GPU-reconstructed HF metadata into transform tasks, indirect dispatches, and
-//! a GPU coefficient sink. [`output`] packs resident XYB or JPEG YCbCr component
+//! a GPU coefficient sink. [`crate::color_output`] packs resident XYB or JPEG YCbCr component
 //! planes as RGB8 without a CPU pixel path.
 //!
 //! These modules are low-level building blocks. Applications normally reach
@@ -36,11 +36,6 @@ pub mod packet {
 /// Single-pass DCT8 coefficient entropy execution and typed GPU status ABI.
 pub mod pass_group {
     pub use crate::vardct_pass_group::*;
-}
-
-/// Resident XYB or JPEG YCbCr-to-RGB8 GPU output packing.
-pub mod output {
-    pub use crate::vardct_output::*;
 }
 
 /// Adaptive LF smoothing ABI shared by standard VarDCT submission engines.

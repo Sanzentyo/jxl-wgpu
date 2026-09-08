@@ -74,8 +74,20 @@ pub(super) fn needs_surface(
             .frames
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
-    ((source_conversion || wide_vardct_output)
-        && request.mapping() == crate::GpuOutputMapping::Color)
+    let modular_rendering = request.extra_channel().is_none()
+        && inventory.frames.iter().any(|frame| {
+            frame.encoding == jxl_gpu_bitstream::FrameEncoding::Modular
+                && frame.lf_level == 0
+                && (image.xyb_encoded
+                    || frame.restoration_filter
+                        != jxl_gpu_bitstream::RestorationFilterInventory::Custom {
+                            gaborish: jxl_gpu_bitstream::GaborishInventory::Disabled,
+                            epf: jxl_gpu_bitstream::EdgePreservingFilterInventory::Disabled,
+                        })
+        });
+    modular_rendering
+        || ((source_conversion || wide_vardct_output)
+            && request.mapping() == crate::GpuOutputMapping::Color)
         || request.renders_spot_colors(&inventory.image_header.extra_channels)
         || plan.nodes.iter().any(|node| node.needs_composition)
         || inventory
@@ -125,7 +137,7 @@ impl CompositionSession {
                 if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
         {
             return Err(crate::VarDctDecodeError::Output(
-                crate::vardct_output::VarDctOutputError::HdrLuminanceMappingRequired,
+                crate::color_output::ColorOutputError::HdrLuminanceMappingRequired,
             )
             .into());
         }
@@ -159,8 +171,7 @@ impl CompositionSession {
                     .iter()
                     .zip(&inventory.frames)
                     .map(|(node, frame)| {
-                        if frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct
-                            && image.xyb_encoded
+                        if image.xyb_encoded
                             && !frame.do_ycbcr
                             && !node.needs_composition
                             && (node.save_reference.is_none() || frame.save_before_color_transform)

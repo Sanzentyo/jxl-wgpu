@@ -477,7 +477,8 @@ pub(in crate::scheduler) fn encode_epf(
             channel_scale_y: epf.channel_scale[1],
             channel_scale_b: epf.channel_scale[2],
             min_sigma: MIN_SIGMA,
-            _padding: [0; 2],
+            constant_sigma: 0.0,
+            _padding: 0,
         },
     );
     let (label, entry_point, pass_key) = match epf.pass {

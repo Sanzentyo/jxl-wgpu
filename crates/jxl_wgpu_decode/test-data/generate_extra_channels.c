@@ -23,6 +23,10 @@ static int wide_integer;
 static int floating_narrow;
 static int integer_primary;
 static int progressive_dc;
+static int lossy;
+static int original_lossy;
+static int lossy_epf = -1;
+static int lossy_gaborish = -1;
 static uint32_t alpha_depth = 5;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
@@ -58,7 +62,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
   if (floating && !integer_primary) info.exponent_bits_per_sample = floating_exponent(bits);
   info.num_color_channels = colors; info.num_extra_channels = extras;
-  info.uses_original_profile = !vardct; info.orientation = (JxlOrientation)orientation;
+  info.uses_original_profile = !vardct && (!lossy || original_lossy); info.orientation = (JxlOrientation)orientation;
   if (floating || wide_integer) check(JxlEncoderSetCodestreamLevel(enc, 10));
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
@@ -91,6 +95,11 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, floating ? 7 : effort));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
+  if (lossy) {
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EPF, lossy_epf));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_GABORISH, lossy_gaborish));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_GROUP_SIZE, 0));
+  }
   if (floating) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_PREDICTOR, 0));
   if ((floating || wide_integer) && (strstr(name, "distributed") || strstr(name, "squeeze")))
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_GROUP_SIZE, 0));
@@ -98,7 +107,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   if (progressive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
   if (progressive_dc) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_DC, progressive_dc));
   if (responsive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, 1));
-  if (vardct) {
+  if (vardct || lossy) {
     check(JxlEncoderSetFrameDistance(settings, 1.0f));
     for (uint32_t c=0; c<extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0.0f));
   } else check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
@@ -143,6 +152,34 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--lossy")) {
+    lossy = 1; lossy_gaborish = 0;
+    for (lossy_epf = 0; lossy_epf <= 3; ++lossy_epf) {
+      char name[64]; snprintf(name, sizeof(name), "lossy_epf%d", lossy_epf);
+      generate(argv[1], name, 33, 17, 3, 8, 9, 6, 7, 0, 0);
+    }
+    lossy_epf = 2; lossy_gaborish = 1;
+    generate(argv[1], "lossy_gaborish", 33, 17, 3, 12, 9, 1, 7, 0, 0);
+    generate(argv[1], "lossy_gray", 17, 9, 1, 16, 1, 8, 7, 1, 0);
+    associated = 1;
+    generate(argv[1], "lossy_associated", 33, 17, 3, 12, 9, 5, 7, 0, 0);
+    associated = 0;
+    for (resampling = 2; resampling <= 8; resampling *= 2) {
+      ec_resampling = resampling;
+      char name[64]; snprintf(name, sizeof(name), "lossy_resampled%d", resampling);
+      generate(argv[1], name, 37, 17, 3, 8, 9, 7, 7, 0, 0);
+    }
+    resampling = ec_resampling = 1; responsive = 1;
+    generate(argv[1], "lossy_distributed", 257, 17, 3, 8, 9, 3, 7, 0, 0);
+    responsive = 0;
+    generate(argv[1], "lossy_row", 33, 1, 3, 8, 9, 2, 7, 0, 0);
+    generate(argv[1], "lossy_column", 1, 17, 1, 8, 1, 4, 7, 1, 0);
+    original_lossy = 1;
+    generate(argv[1], "lossy_original", 33, 17, 3, 12, 9, 6, 7, 0, 0);
+    original_lossy = 0; floating = 1;
+    generate(argv[1], "lossy_float", 33, 17, 3, 32, 9, 1, 7, 0, 0);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--integer")) {
     wide_integer = 1; alpha_depth = 23;
     for (vardct = 0; vardct <= 1; ++vardct) {

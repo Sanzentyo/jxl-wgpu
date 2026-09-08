@@ -14,9 +14,9 @@ use jxl_wgpu::{
     ResidentStorageBinding, SubmissionPollPermit, UnvalidatedGpuImageFrame, WgpuBackend,
 };
 
+use crate::color_output::ColorOutputAlpha;
 use crate::modular_transform::GpuModularChannelLayout;
 use crate::progressive_dc::ProgressiveDcXybPlanes;
-use crate::vardct_output::VarDctOutputAlpha;
 use crate::vardct_packet::PendingGlobalModular;
 use crate::wgpu_engine::{
     ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStreamPlan,
@@ -52,8 +52,8 @@ pub(super) struct ResidentModularPlane {
 impl ResidentModularPlane {
     pub(super) fn alpha_binding(
         &self,
-    ) -> std::result::Result<VarDctOutputAlpha<'_>, VarDctDecodeError> {
-        Ok(VarDctOutputAlpha {
+    ) -> std::result::Result<ColorOutputAlpha<'_>, VarDctDecodeError> {
+        Ok(ColorOutputAlpha {
             domain: crate::ModularSampleDomain::Encoded,
             storage: ResidentStorageBinding::entire(self.arena.as_wgpu_buffer())?,
             width: self.plane.width,

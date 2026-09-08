@@ -196,7 +196,7 @@ fn spot_policy_never_tints_selected_numeric_planes_and_hdr_remains_explicit() {
                 ))
                 .unwrap();
                 assert!(matches!(decoder.open(&data, request), Err(DecodeError::VarDct(VarDctDecodeError::Output(
-                    jxl_wgpu_decode::vardct::output::VarDctOutputError::HdrLuminanceMappingRequired)))));
+                    jxl_wgpu_decode::color_output::ColorOutputError::HdrLuminanceMappingRequired)))));
             }
             assert_eq!(
                 backend.transient_memory_budget().snapshot().reserved_bytes,

@@ -8,12 +8,13 @@ use jxl_wgpu::ResidentGaborishWeights;
 use crate::GpuCodestream;
 use crate::entropy_window::GroupStreamSegment;
 
-use super::restoration::{VarDctEpfHeader, dequant_matrix_multiplier, restoration_config};
+use super::restoration::dequant_matrix_multiplier;
 use super::types::VarDctDecodeError;
 use super::window_plan::{
     AdaptiveStreamLimitDecision, AdaptiveStreamMemory, copy_stream_segment,
     select_budget_adaptive_stream_limit,
 };
+use crate::restoration::{EpfConfig, restoration_config};
 
 fn synthetic_stream_memory(
     fixed_bytes: u64,
@@ -148,7 +149,7 @@ fn restoration_contract_rejects_invalid_epf_iterations() {
     .unwrap_err();
     assert!(matches!(
         error,
-        VarDctDecodeError::InvalidEpfIterations { iterations: 0 }
+        crate::RestorationError::InvalidEpfIterations { iterations: 0 }
     ));
 }
 
@@ -165,7 +166,7 @@ fn restoration_contract_preserves_disabled_and_standard_defaults() {
     assert_eq!(gaborish, Some(ResidentGaborishWeights::DEFAULT));
     assert_eq!(
         epf,
-        Some(VarDctEpfHeader {
+        Some(EpfConfig {
             iterations: 2,
             sharp_lut: [
                 0.0,
@@ -224,7 +225,7 @@ fn restoration_contract_preserves_custom_gaborish_and_epf_values() {
     );
     assert_eq!(
         epf,
-        Some(VarDctEpfHeader {
+        Some(EpfConfig {
             iterations: 3,
             sharp_lut: [0.0, 0.25, 0.5, 1.0, 0.0, 0.25, 0.5, 1.0],
             channel_scale: [1.0, 0.5, 0.25],

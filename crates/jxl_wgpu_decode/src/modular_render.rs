@@ -13,6 +13,9 @@ use wgpu::util::DeviceExt;
 use crate::modular_sample::ModularOutputPlane;
 use crate::modular_transform::GpuModularChannelLayout;
 
+mod color;
+pub(crate) use color::ModularColorConfig;
+
 /// Interpretation of resident Modular output words after inverse transforms or resampling.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,9 +38,25 @@ pub enum ModularRenderError {
     },
     #[error(transparent)]
     Upsample(#[from] ResidentUpsampleError),
+    #[error(transparent)]
+    Restoration(#[from] crate::RestorationError),
+    #[error(transparent)]
+    Gaborish(#[from] jxl_wgpu::ResidentGaborishError),
+    #[error(transparent)]
+    Epf(#[from] jxl_wgpu::ResidentEpfError),
+    #[error(transparent)]
+    ColorOutput(std::sync::Arc<crate::color_output::ColorOutputError>),
+    #[error(transparent)]
+    Layout(#[from] jxl_gpu_formats::LayoutError),
 }
 
 type Result<T> = std::result::Result<T, ModularRenderError>;
+
+impl From<crate::color_output::ColorOutputError> for ModularRenderError {
+    fn from(value: crate::color_output::ColorOutputError) -> Self {
+        Self::ColorOutput(std::sync::Arc::new(value))
+    }
+}
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -49,6 +68,7 @@ const _: () = assert!(std::mem::size_of::<NormalizeParams>() == 32);
 
 #[derive(Debug)]
 pub(crate) struct ModularRenderPlan {
+    color: Option<color::ColorPlan>,
     pub extent: Extent2d,
     sources: Vec<ModularOutputPlane>,
     factors: Vec<u32>,
@@ -169,6 +189,7 @@ impl ModularRenderPlan {
             require("weight bytes", kernel.weight_bytes(), storage_limit)?;
         }
         Ok(Self {
+            color: None,
             extent,
             sources,
             factors,
@@ -182,7 +203,50 @@ impl ModularRenderPlan {
     }
 
     pub(crate) fn total_bytes(&self) -> u64 {
-        self.output_bytes + self.scratch_bytes + self.weight_bytes + self.uniform_bytes
+        self.output_bytes
+            + self.scratch_bytes
+            + self.weight_bytes
+            + self.uniform_bytes
+            + self.color.as_ref().map_or(0, |color| color.storage_bytes)
+    }
+
+    pub(crate) fn with_color(
+        mut self,
+        config: ModularColorConfig,
+        target: jxl_gpu_formats::ColorSpecification,
+        limits: &wgpu::Limits,
+    ) -> Result<Self> {
+        let color = color::ColorPlan::new(
+            config,
+            self.extent,
+            &self.sources,
+            &self.factors,
+            &self.planes,
+            target,
+            limits,
+        )?;
+        self.uniform_bytes -= 3 * std::mem::size_of::<NormalizeParams>() as u64
+            + if self.factors[0] == 1 {
+                0
+            } else {
+                3 * ResidentUpsamplePipeline::UNIFORM_BYTES
+            };
+        self.uniform_bytes += color.uniform_bytes;
+        self.scratch_bytes = self
+            .sources
+            .iter()
+            .zip(&self.factors)
+            .skip(3)
+            .filter(|(_, factor)| **factor != 1)
+            .map(|(plane, _)| u64::from(plane.layout.width) * u64::from(plane.layout.height) * 4)
+            .max()
+            .unwrap_or(0);
+        self.color = Some(color);
+        Ok(self)
+    }
+
+    pub(crate) fn color_converted(&self) -> bool {
+        self.color.is_some()
     }
 
     pub(crate) fn planes(&self) -> &[ModularOutputPlane] {
@@ -199,6 +263,7 @@ impl ModularRenderPlan {
             })
         };
         Ok(ModularRenderBuffers {
+            color: self.color.as_ref().map(|plan| plan.allocate(device)),
             output: create(
                 "jxl-wgpu reconstructed Modular render planes",
                 self.output_bytes,
@@ -228,12 +293,14 @@ pub(crate) fn upsample_kernel(
 }
 
 pub(crate) struct ModularRenderBuffers {
+    color: Option<color::ColorBuffers>,
     pub output: wgpu::Buffer,
     scratch: Option<wgpu::Buffer>,
     weights: Vec<ResidentUpsampleWeights>,
 }
 
 pub(crate) struct ModularRenderPipeline {
+    color: std::sync::OnceLock<Result<color::ColorPipeline>>,
     normalize: wgpu::ComputePipeline,
     upsample: ResidentUpsamplePipeline,
 }
@@ -249,6 +316,7 @@ impl ModularRenderPipeline {
             ),
         });
         Ok(Self {
+            color: std::sync::OnceLock::new(),
             normalize: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("jxl-wgpu Modular sample normalization"),
                 layout: None,
@@ -291,6 +359,34 @@ impl ModularRenderPipeline {
             return invalid("selected source count changed");
         }
         let mut uniforms = Vec::new();
+        if let Some(color) = &plan.color {
+            let pipeline = self
+                .color
+                .get_or_init(|| color::ColorPipeline::new(device))
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let buffers_color = buffers.color.as_ref().ok_or(ModularRenderError::Invalid {
+                reason: "missing color render buffers",
+            })?;
+            let weights = plan
+                .kernels
+                .iter()
+                .position(|kernel| kernel.factor() == plan.factors[0])
+                .map(|index| &buffers.weights[index]);
+            uniforms.extend(pipeline.encode(
+                device,
+                encoder,
+                color::ColorInputs {
+                    plan: color,
+                    buffers: buffers_color,
+                    source: input,
+                    sources,
+                    output: binding(&buffers.output)?,
+                    upsample: &self.upsample,
+                    weights,
+                },
+            )?);
+        }
         for (index, (&source_info, &factor)) in sources.iter().zip(&plan.factors).enumerate() {
             let source = source_info.layout;
             let expected = plan.sources[index].layout;
@@ -312,6 +408,9 @@ impl ModularRenderPipeline {
                 u64::from(u32::MAX),
             )?;
             require("source binding bytes", source_bytes, input.size.get())?;
+            if plan.color.is_some() && index < 3 {
+                continue;
+            }
             let plane = plan.planes[index].layout;
             let output_binding = ResidentStorageBinding {
                 buffer: &buffers.output,

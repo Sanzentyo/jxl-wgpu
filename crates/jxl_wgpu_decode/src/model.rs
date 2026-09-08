@@ -652,7 +652,7 @@ pub(crate) struct NativeModularFormat {
 
 /// Creates the canonical unsigned Gray/RGB/RGBA delivery layout for 1–31 valid bits.
 /// Samples occupy native-endian 8-, 16-, or 32-bit words with zero high padding bits.
-/// Unfiltered integer Modular planes retain their exact codes; rendering or composition uses
+/// Unfiltered original-color Modular planes retain their exact codes; XYB reconstruction, rendering or composition uses
 /// F32 working values and quantizes at presentation. Integer alpha with an independent depth
 /// is rescaled to the requested color depth.
 pub fn native_modular_pixel_format(

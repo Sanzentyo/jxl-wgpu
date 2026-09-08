@@ -1795,3 +1795,55 @@ Reference and Metal harnesses each pass 18 cases, and the indexed Gray8 U8 readb
 All 286 integer-corpus files regenerate byte-identically with libjxl 0.12.0. The shared generator
 refactor reproduces all 416 floating-corpus files and all 20 original integer still/composition
 fixtures byte-identically.
+
+## Lossy Modular color and restoration
+
+`crates/jxl_wgpu_decode/test-data/lossy_modular/` contains 19 complete encoded streams and
+independent libjxl references (76 files, 5,388,441 bytes). Reproduce them with
+`cargo run -p jxl_wgpu_decode --example regenerate_lossy_modular -- [output-directory]`, using
+libjxl/libjxl_cms 0.12.0. The C generators use only the offline public encoder API and are compiled
+with `-std=c11 -Wall -Wextra -Werror`; production uses no CPU image codec. Fifteen stills cover XYB
+and original-sRGB Modular, Gray/RGB, all eight orientations, independent alpha, nine mixed extra
+planes, binary32 source metadata and floating extras, one-pixel axes, 2×/4×/8× reconstruction and
+257×17 distributed Squeeze. Four nine-layer animations include RGB, gray, resampled color/extras
+and floating samples, with all five blend modes, independent extra-channel references and alpha.
+
+GPU color normalization implements the [Modular Y/X/(B-Y) and LF dequantization contract](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_modular.cc).
+Gaborish and EPF precede resampling and the shared RGB/XYB/JPEG color packer. Modular EPF uses a
+[frame-constant inverse sigma](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc)
+with the [normative minimum sigma validation](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/loop_filter.cc).
+A CPU topology gate parses every physical frame, requires actual Modular coding, verifies the
+XYB/original color distinction, every EPF iteration count and real multi-group Squeeze, and checks
+that filtering has a frame arena when group boundaries are crossed. Compared with EPF disabled,
+the EPF1/2/3 references change 67/130/132 color words; the corpus actually exercises the filters.
+
+`tests/lossy_modular.rs` compares every delivered extra plane, base RGBA, spot presentation and
+preserved alpha against checked-in libjxl output. All presentations must match between complete
+input and 256-byte entropy windows supplied in 43-byte transport chunks. Color tolerance is
+`1e-4 * (1 + abs(reference))`; extras and alpha retain `2e-6`. For unpremultiplied RGB, error is
+measured after undoing the output alpha division with the established `2^-26` floor. Eight further
+cases exercise final RGB8/RGBA8 and 16-bit RGBA quantization, including resampled and composed
+outputs; tolerances are one and seven codes respectively. Every session must release its shared
+reservations after its outputs are dropped.
+
+The Rust `jxl` 0.6 oracle independently verifies all 15 stills and the initial Replace presentation
+of each animation. It preserves stored associated color, so that case is compared to libjxl's
+explicit preserved-alpha output. Subsequent multi-extra reference chains encounter the previously
+pinned clamped-Multiply operand reversal and are validated against live libjxl and GPU output.
+The test also requires live libjxl output to equal the checked-in reference when libjxl is installed.
+
+Initial GPU comparison exposed spot inks being applied after the XYB transfer function. The common
+executor now retains unreferenced Modular XYB in linear RGB, like VarDCT, and applies spots before
+presentation transfer; referenced/blended frames retain original-sRGB values. The finalizer copies
+already converted color without applying the transfer a second time. The public `color_output`
+module replaces `vardct::output` and accepts explicit RGB, XYB and JPEG-component sources. The
+workspace ABI gate also caught the generic scheduler's old EPF padding-field declaration; both
+Rust records now match the constant-sigma WGSL layout. Original ICC/wide-gamut/HDR color management,
+pre-transform patch references and the remaining render graph still have independent completion gates.
+
+Validation on 2026-09-08 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+719 tests, with one existing manual allocation benchmark ignored and no failures. Formatting,
+warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM compile gate pass. Reference and Metal
+harnesses each pass 18 cases; indexed Gray8 U8 CPU readback and the final output-quantization
+rerun pass. All 76 new corpus files, 416 floating-corpus files, 286 integer-corpus files and
+20 original integer still/composition fixtures regenerate byte-identically with libjxl 0.12.0.

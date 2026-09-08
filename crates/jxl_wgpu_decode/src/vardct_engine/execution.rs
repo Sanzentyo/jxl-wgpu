@@ -14,12 +14,12 @@ use jxl_wgpu::{
 };
 use wgpu::util::DeviceExt;
 
+use crate::color_output::{ColorOutputInputs, ColorOutputPlane, ColorOutputScratch};
 use crate::progressive_dc::{
     ProgressiveDcGpuError, ProgressiveDcPackInputs, ProgressiveDcXybPlanes,
 };
 use crate::vardct_artifact::{GpuVarDctArtifactStatus, HfMetadataLoweringBuffers};
 use crate::vardct_lf::{AdaptiveLfBuffers, AdaptiveLfParams};
-use crate::vardct_output::{VarDctOutputInputs, VarDctOutputPlane, VarDctOutputScratch};
 use crate::vardct_packet::{
     GpuVarDctPacketStatus, VarDctModularParams, VarDctPacketBuffers, VarDctPacketControl,
     VarDctPacketValidation,
@@ -538,7 +538,7 @@ struct PostTransformJobBuffers {
 
 enum FrameOutputScratch {
     Color {
-        _scratch: VarDctOutputScratch,
+        _scratch: ColorOutputScratch,
     },
     Extra {
         scratch: crate::modular_scalar_output::ModularScalarOutputScratch,
@@ -3325,7 +3325,7 @@ fn submit_vardct(
                                 image_height,
                                 padded_width,
                             )?,
-                            sigma,
+                            sigma: jxl_wgpu::ResidentEpfSigma::Plane(sigma),
                             parameters,
                         },
                     )?);
@@ -3396,14 +3396,14 @@ fn submit_vardct(
             let output_scratch = pipelines.output.encode(
                 device,
                 &mut commands,
-                VarDctOutputInputs {
+                ColorOutputInputs {
                     alpha: if source.surface.is_some() {
                         None
                     } else if let (Some(plan), Some(buffers)) =
                         (&source.extra_render, &rendered_extra)
                     {
                         let plane = plan.planes()[0];
-                        Some(crate::vardct_output::VarDctOutputAlpha {
+                        Some(crate::color_output::ColorOutputAlpha {
                             domain: crate::ModularSampleDomain::DecodedF32,
                             storage: resident_binding(&buffers.output)?,
                             width: plane.layout.width,
@@ -3420,19 +3420,19 @@ fn submit_vardct(
                             .transpose()?
                     },
                     planes: [
-                        VarDctOutputPlane {
+                        ColorOutputPlane {
                             storage: resident_binding(&presentation_planes[0])?,
                             width: presentation_geometry[0][0],
                             height: presentation_geometry[0][1],
                             stride: presentation_strides[0],
                         },
-                        VarDctOutputPlane {
+                        ColorOutputPlane {
                             storage: resident_binding(&presentation_planes[1])?,
                             width: presentation_geometry[1][0],
                             height: presentation_geometry[1][1],
                             stride: presentation_strides[1],
                         },
-                        VarDctOutputPlane {
+                        ColorOutputPlane {
                             storage: resident_binding(&presentation_planes[2])?,
                             width: presentation_geometry[2][0],
                             height: presentation_geometry[2][1],

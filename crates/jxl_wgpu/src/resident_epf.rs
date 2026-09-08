@@ -15,12 +15,20 @@ pub struct ResidentEpfParameters {
     pub channel_scale: [f32; 3],
 }
 
-/// Non-aliasing resident XYB inputs/outputs and a per-8x8-block inverse-sigma plane.
+/// Source of EPF inverse sigma: a VarDCT block grid or one Modular frame value.
+#[derive(Clone, Copy, Debug)]
+pub enum ResidentEpfSigma<'a> {
+    Plane(ResidentF32Plane<'a>),
+    /// The negative inverse-sigma coefficient, already including the normative numerator.
+    Constant(f32),
+}
+
+/// Non-aliasing resident color inputs/outputs and an explicit inverse-sigma source.
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentEpfInputs<'a> {
     pub inputs: [ResidentF32Plane<'a>; 3],
     pub outputs: [ResidentF32Plane<'a>; 3],
-    pub sigma: ResidentF32Plane<'a>,
+    pub sigma: ResidentEpfSigma<'a>,
     pub parameters: ResidentEpfParameters,
 }
 
@@ -71,6 +79,8 @@ pub enum ResidentEpfError {
         required_width: u32,
         required_height: u32,
     },
+    #[error("resident EPF constant inverse sigma is invalid: bits {bits:#010x}")]
+    InvalidConstantSigma { bits: u32 },
     #[error("resident EPF plane {plane} buffer is missing STORAGE usage")]
     MissingStorageUsage { plane: usize },
     #[error("resident EPF plane {plane} offset {offset} is not aligned to {alignment}")]
@@ -200,7 +210,13 @@ impl ResidentEpfPipeline {
                 storage_entry(0, inputs.inputs[0]),
                 storage_entry(1, inputs.inputs[1]),
                 storage_entry(2, inputs.inputs[2]),
-                storage_entry(3, inputs.sigma),
+                storage_entry(
+                    3,
+                    match inputs.sigma {
+                        ResidentEpfSigma::Plane(plane) => plane,
+                        ResidentEpfSigma::Constant(_) => inputs.inputs[0],
+                    },
+                ),
                 storage_entry(4, inputs.outputs[0]),
                 storage_entry(5, inputs.outputs[1]),
                 storage_entry(6, inputs.outputs[2]),
@@ -243,7 +259,8 @@ struct ResidentEpfUniform {
     channel_scale_y: f32,
     channel_scale_b: f32,
     min_sigma: f32,
-    _padding: [u32; 2],
+    constant_sigma: f32,
+    _padding: u32,
 }
 
 fn validate_inputs(
@@ -257,17 +274,31 @@ fn validate_inputs(
             return Err(ResidentEpfError::PlaneExtent { plane });
         }
     }
-    validate_plane(device, 6, inputs.sigma)?;
     let required_width = reference.width.div_ceil(8);
     let required_height = reference.height.div_ceil(8);
-    if inputs.sigma.width < required_width || inputs.sigma.height < required_height {
-        return Err(ResidentEpfError::SigmaExtent {
-            width: inputs.sigma.width,
-            height: inputs.sigma.height,
-            required_width,
-            required_height,
-        });
-    }
+    let (sigma_width, sigma_height, sigma_stride, sigma_is_plane, constant_sigma) =
+        match inputs.sigma {
+            ResidentEpfSigma::Plane(plane) => {
+                validate_plane(device, 6, plane)?;
+                if plane.width < required_width || plane.height < required_height {
+                    return Err(ResidentEpfError::SigmaExtent {
+                        width: plane.width,
+                        height: plane.height,
+                        required_width,
+                        required_height,
+                    });
+                }
+                (plane.width, plane.height, plane.effective_stride(), 1, 0.0)
+            }
+            ResidentEpfSigma::Constant(value) => {
+                if !value.is_finite() || value >= 0.0 {
+                    return Err(ResidentEpfError::InvalidConstantSigma {
+                        bits: value.to_bits(),
+                    });
+                }
+                (1, 1, 1, 2, value)
+            }
+        };
     let parameters = inputs.parameters;
     if [parameters.sigma_scale, parameters.border_sad_mul]
         .into_iter()
@@ -285,17 +316,18 @@ fn validate_inputs(
         output_stride_x: inputs.outputs[0].effective_stride(),
         output_stride_y: inputs.outputs[1].effective_stride(),
         output_stride_b: inputs.outputs[2].effective_stride(),
-        sigma_width: inputs.sigma.width,
-        sigma_height: inputs.sigma.height,
-        sigma_stride: inputs.sigma.effective_stride(),
-        sigma_is_plane: 1,
+        sigma_width,
+        sigma_height,
+        sigma_stride,
+        sigma_is_plane,
         sigma_scale: parameters.sigma_scale,
         border_sad_mul: parameters.border_sad_mul,
         channel_scale_x: parameters.channel_scale[0],
         channel_scale_y: parameters.channel_scale[1],
         channel_scale_b: parameters.channel_scale[2],
         min_sigma: -3.905_243,
-        _padding: [0; 2],
+        constant_sigma,
+        _padding: 0,
     })
 }
 
@@ -390,7 +422,8 @@ const _: () = {
     assert!(std::mem::offset_of!(ResidentEpfUniform, sigma_scale) == 48);
     assert!(std::mem::offset_of!(ResidentEpfUniform, channel_scale_x) == 56);
     assert!(std::mem::offset_of!(ResidentEpfUniform, min_sigma) == 68);
-    assert!(std::mem::offset_of!(ResidentEpfUniform, _padding) == 72);
+    assert!(std::mem::offset_of!(ResidentEpfUniform, constant_sigma) == 72);
+    assert!(std::mem::offset_of!(ResidentEpfUniform, _padding) == 76);
 };
 
 #[cfg(test)]

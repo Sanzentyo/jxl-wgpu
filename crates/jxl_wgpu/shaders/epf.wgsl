@@ -20,7 +20,7 @@ struct Params {
     channel_scale_y: f32,
     channel_scale_b: f32,
     min_sigma: f32,
-    _pad0: u32,
+    constant_sigma: f32,
     _pad1: u32,
 };
 
@@ -94,6 +94,7 @@ fn write_output(channel: u32, x: u32, y: u32, value: f32) {
 }
 
 fn sigma_at(x: u32, y: u32) -> f32 {
+    if params.sigma_is_plane == 2u { return params.constant_sigma; }
     if params.sigma_is_plane == 0u {
         return sigma_values[0u];
     }

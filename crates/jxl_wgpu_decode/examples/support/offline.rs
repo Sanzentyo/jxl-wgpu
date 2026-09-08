@@ -82,10 +82,11 @@ pub fn extra_references(source: &Path, output: &Path, temporary: &Path, mode: &s
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
             path.file_name().unwrap().to_str().is_some_and(|name| {
-                name.contains(if mode == "floating" {
-                    "_float_"
-                } else {
-                    "_integer_"
+                name.contains(match mode {
+                    "floating" => "_float_",
+                    "integer" => "_integer_",
+                    "lossy" => "_lossy_",
+                    _ => panic!("unknown corpus mode {mode}"),
                 }) && name.ends_with(".jxl.hex")
             })
         })

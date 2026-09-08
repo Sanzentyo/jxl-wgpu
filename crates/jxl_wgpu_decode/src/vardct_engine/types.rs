@@ -11,13 +11,13 @@ use jxl_wgpu::{
 use thiserror::Error;
 
 use crate::Error as DecodeError;
+use crate::color_output::ColorOutputError;
 use crate::progressive_dc::{ProgressiveDcGpuError, ProgressiveDcPackParams};
 use crate::vardct_artifact::{
     GpuVarDctArtifactStatus, GpuVarDctLoweringError, HfMetadataLoweringParams, VarDctArtifactError,
 };
 use crate::vardct_epf::{EpfSigmaError, EpfSigmaMemoryPlan};
 use crate::vardct_lf::AdaptiveLfParams;
-use crate::vardct_output::VarDctOutputError;
 use crate::vardct_packet::{
     BoundedVarDctPacketError, BoundedVarDctPacketPlan, GpuVarDctPacketError, GpuVarDctPacketStatus,
     VarDctModularParams, VarDctPacketControl, packet_execution_state_bytes,
@@ -94,8 +94,8 @@ pub enum VarDctDecodeError {
     InvalidOrientation { orientation: u32 },
     #[error("the bounded VarDCT engine requires the standard sRGB D65 presentation encoding")]
     UnsupportedColorEncoding,
-    #[error("the VarDCT frame declares invalid EPF iteration count {iterations}")]
-    InvalidEpfIterations { iterations: u32 },
+    #[error(transparent)]
+    Restoration(#[from] crate::RestorationError),
     #[error("the VarDCT frame declares invalid {channel} quant-matrix scale {scale}")]
     InvalidQuantMatrixScale { channel: &'static str, scale: u32 },
     #[error("the XYB image header does not contain an inverse opsin matrix")]
@@ -131,7 +131,7 @@ pub enum VarDctDecodeError {
     #[error(transparent)]
     EpfSigma(#[from] EpfSigmaError),
     #[error(transparent)]
-    Output(#[from] VarDctOutputError),
+    Output(#[from] ColorOutputError),
     #[error(transparent)]
     ProgressiveDc(#[from] ProgressiveDcGpuError),
     #[error(transparent)]

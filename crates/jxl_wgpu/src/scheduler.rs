@@ -869,7 +869,8 @@ struct EpfUniform {
     channel_scale_y: f32,
     channel_scale_b: f32,
     min_sigma: f32,
-    _padding: [u32; 2],
+    constant_sigma: f32,
+    _padding: u32,
 }
 
 #[repr(C)]

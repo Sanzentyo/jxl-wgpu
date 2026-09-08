@@ -10,12 +10,12 @@ use jxl_wgpu::{
     ResidentVarDctRenderer, WgpuBackend,
 };
 
+use crate::color_output::ColorOutputPacker;
 use crate::modular_scalar_output::ModularScalarOutputPipeline;
 use crate::progressive_dc::ProgressiveDcPipeline;
 use crate::vardct_artifact::HfMetadataLoweringPipeline;
 use crate::vardct_epf::EpfSigmaPipeline;
 use crate::vardct_lf::AdaptiveLfPipeline;
-use crate::vardct_output::VarDctOutputPacker;
 use crate::vardct_packet::VarDctPacketPipeline;
 use crate::vardct_pass_group::HfCoefficientPipeline;
 use crate::vardct_resource::VarDctResourcePipeline;
@@ -42,7 +42,7 @@ pub(super) struct VarDctPipelines {
     pub(super) gaborish: ResidentGaborishPipeline,
     pub(super) epf_sigma: EpfSigmaPipeline,
     pub(super) epf: ResidentEpfPipeline,
-    pub(super) output: VarDctOutputPacker,
+    pub(super) output: ColorOutputPacker,
     pub(super) scalar_output: ModularScalarOutputPipeline,
     pub(super) modular_render: crate::modular_render::ModularRenderPipeline,
     pub(super) progressive_dc: ProgressiveDcPipeline,
@@ -55,7 +55,7 @@ impl VarDctPipelines {
         let resource_variant =
             resolve_kernel_variant(backend, "vardct_resource", KernelVariant::Lanes64)?;
         let output_variant =
-            resolve_kernel_variant(backend, "vardct_output", KernelVariant::Lanes256)?;
+            resolve_kernel_variant(backend, "color_output", KernelVariant::Lanes256)?;
         let gaborish_variant =
             resolve_kernel_variant(backend, "vardct_gaborish", KernelVariant::Tile16x16)?;
         let chroma_upsample_variant =
@@ -89,7 +89,7 @@ impl VarDctPipelines {
             gaborish: ResidentGaborishPipeline::with_variant(device, gaborish_variant)?,
             epf_sigma: EpfSigmaPipeline::with_variant(device, epf_sigma_variant)?,
             epf: ResidentEpfPipeline::with_variant(device, epf_variant)?,
-            output: VarDctOutputPacker::with_variant(device, output_variant)?,
+            output: ColorOutputPacker::with_variant(device, output_variant)?,
             scalar_output: ModularScalarOutputPipeline::new(device, output_variant),
             modular_render: crate::modular_render::ModularRenderPipeline::new(device)?,
             progressive_dc: ProgressiveDcPipeline::with_policy(device, backend.kernel_policy())?,

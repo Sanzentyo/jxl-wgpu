@@ -1,6 +1,6 @@
 /*__JXL_MODULAR_SAMPLE__*/
 
-struct VarDctSourceParams {
+struct ColorSourceParams {
     plane_geometry: array<vec4<u32>, 3>,
     alpha_geometry: vec4<u32>,
     matrix_r: vec4<f32>,
@@ -14,7 +14,7 @@ struct VarDctSourceParams {
     _pad1: u32,
 };
 
-@group(0) @binding(5) var<uniform> source_params: VarDctSourceParams;
+@group(0) @binding(5) var<uniform> source_params: ColorSourceParams;
 @group(0) @binding(6) var<storage, read> source_alpha: array<u32>;
 
 fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
@@ -89,6 +89,7 @@ fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
     let x = plane_value(0u, column, row);
     let y = plane_value(1u, column, row);
     let b = plane_value(2u, column, row);
+    if source_params.mode == 2u { return vec3<f32>(x, y, b); }
 
     // This is deliberately identical to jxl_wgpu's XYB inverse contract:
     // reconstruct biased LMS, apply the sign-preserving cube, then the

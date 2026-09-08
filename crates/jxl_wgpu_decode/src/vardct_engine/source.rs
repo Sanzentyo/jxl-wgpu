@@ -8,20 +8,20 @@ use jxl_wgpu::{
     ResidentVarDctMemoryPlan, WgpuBackend,
 };
 
+use crate::color_output::ColorOutputMemoryPlan;
 use crate::entropy_window::MIN_STREAM_WINDOW_BYTES;
 use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_output::VarDctOutputMemoryPlan;
 use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
 use crate::{GpuCodestream, GpuOutputRequest};
 
 use super::output::{VarDctFrameOutput, VarDctPresentation, prepare_presentation};
-use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier, restoration_config};
+use super::restoration::{VarDctEpfPlan, dequant_matrix_multiplier};
 use super::types::{
     ADAPTIVE_LF_WORKGROUP_BYTES, DeferredHfCoefficientLayout, PACKET_STATUS_BYTES,
     VarDctDecodeError, VarDctDecodeMemoryInputs, VarDctDecodeMemoryStats,
@@ -30,6 +30,7 @@ use super::window_plan::{
     AdaptiveStreamLimitDecision, CombinedPacketWindowExecutionPlan, LfPacketWindowExecutionPlan,
     VarDctEntropyPlanSelection, select_budget_adaptive_stream_limit,
 };
+use crate::restoration::restoration_config;
 
 pub(super) struct VarDctSource {
     pub(super) codestream: GpuCodestream,
@@ -742,11 +743,11 @@ fn validate_device_limits(
         ),
         (
             "shared output uniform",
-            VarDctOutputMemoryPlan::UNIFORM_BINDING_BYTES[0],
+            ColorOutputMemoryPlan::UNIFORM_BINDING_BYTES[0],
         ),
         (
             "VarDCT source uniform",
-            VarDctOutputMemoryPlan::UNIFORM_BINDING_BYTES[1],
+            ColorOutputMemoryPlan::UNIFORM_BINDING_BYTES[1],
         ),
         (
             "frame upsample uniform",

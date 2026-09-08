@@ -89,7 +89,7 @@ pub use resident_chroma_upsample::{
 };
 pub use resident_epf::{
     ResidentEpfError, ResidentEpfInputs, ResidentEpfMemoryPlan, ResidentEpfParameters,
-    ResidentEpfPipeline,
+    ResidentEpfPipeline, ResidentEpfSigma,
 };
 pub use resident_gaborish::{
     ResidentGaborishError, ResidentGaborishInputs, ResidentGaborishMemoryPlan,

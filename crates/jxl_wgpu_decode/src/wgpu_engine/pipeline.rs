@@ -456,13 +456,18 @@ impl WgpuSubmissionEngine {
             .iter()
             .map(|&index| profile.channel_upsampling[index])
             .collect();
-        if factors.iter().any(|&factor| factor != 1) {
+        let color_render = request
+            .extra_channel()
+            .is_none()
+            .then_some(profile.color_render.clone())
+            .flatten();
+        if factors.iter().any(|&factor| factor != 1) || color_render.is_some() {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
                 &frame.inverse_plan
             } else {
                 &profile.resident_entropy_plans[0].inverse_plan
             };
-            output.render = Some(crate::modular_render::ModularRenderPlan::new(
+            let render = crate::modular_render::ModularRenderPlan::new(
                 extent,
                 output
                     .source_channels
@@ -470,7 +475,16 @@ impl WgpuSubmissionEngine {
                 factors,
                 &profile.upsampling_weights,
                 &self.backend.device().limits(),
-            )?);
+            )?;
+            output.render = Some(if let Some(config) = color_render {
+                render.with_color(
+                    config,
+                    output.layout.format.color_spec,
+                    &self.backend.device().limits(),
+                )?
+            } else {
+                render
+            });
         }
 
         let output_write_path = if generalized_channels {

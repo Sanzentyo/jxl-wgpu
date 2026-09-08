@@ -1,11 +1,9 @@
 //! Color presentation and independently selected scalar output share frame validation.
-use super::restoration::restoration_config;
 use super::types::VarDctDecodeError;
+use crate::color_output::{ColorOutputConfig, ColorOutputPlan, ColorOutputTransform, InverseOpsin};
 use crate::modular_scalar_output::{ModularScalarOutputConfig, ModularScalarOutputPlan};
+use crate::restoration::restoration_config;
 use crate::vardct_frontend::VarDctColorTransform;
-use crate::vardct_output::{
-    VarDctInverseOpsin, VarDctOutputConfig, VarDctOutputPlan, VarDctOutputTransform,
-};
 use crate::{GpuOutputMapping, GpuOutputRequest};
 use jxl_gpu_bitstream::{
     ColourEncodingInventory, ColourSpaceInventory, PrimariesInventory, TransferFunctionInventory,
@@ -19,8 +17,8 @@ use std::sync::Arc;
 #[derive(Clone, Copy)]
 pub(super) enum VarDctFrameOutput {
     Color {
-        config: VarDctOutputConfig,
-        plan: VarDctOutputPlan,
+        config: ColorOutputConfig,
+        plan: ColorOutputPlan,
     },
     Extra {
         index: u32,
@@ -134,34 +132,12 @@ pub(super) fn prepare_presentation(
                 .image_header
                 .opsin_inverse_matrix
                 .ok_or(VarDctDecodeError::MissingInverseOpsin)?;
-            let matrix = opsin
-                .inverse_matrix
-                .map(|row| row.map(|value| value.to_f32()));
-            // Gray is reconstructed from linear sRGB luminance before applying the transfer
-            // function. Folding that projection into the inverse matrix makes all output
-            // channels identical, including when quantization leaves chromatic XYB residuals.
-            let inverse_opsin_matrix = if inventory.image_header.grayscale {
-                let luma = std::array::from_fn(|column| {
-                    [0.2126_f64, 0.7152, 0.0722]
-                        .into_iter()
-                        .zip(matrix)
-                        .map(|(weight, row)| weight * f64::from(row[column]))
-                        .sum::<f64>() as f32
-                });
-                [luma; 3]
-            } else {
-                matrix
-            };
+            // Gray projection and stream-selected inverse opsin are shared with Modular.
             (
-                VarDctOutputTransform::Xyb(VarDctInverseOpsin {
-                    opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
-                    inverse_opsin_matrix,
-                    intensity_target: inventory
-                        .image_header
-                        .tone_mapping
-                        .intensity_target
-                        .to_f32(),
-                }),
+                ColorOutputTransform::Xyb(
+                    InverseOpsin::from_image(&inventory.image_header)
+                        .ok_or(VarDctDecodeError::MissingInverseOpsin)?,
+                ),
                 [
                     opsin.quant_bias[0].to_f32(),
                     opsin.quant_bias[1].to_f32(),
@@ -171,7 +147,7 @@ pub(super) fn prepare_presentation(
             )
         }
         VarDctColorTransform::Ycbcr => (
-            VarDctOutputTransform::Ycbcr {
+            ColorOutputTransform::Ycbcr {
                 channel_shifts: if gaborish.is_some() || epf.is_some() || profile.upsampling != 1 {
                     [Default::default(); 3]
                 } else {
@@ -189,7 +165,7 @@ pub(super) fn prepare_presentation(
             ],
         ),
     };
-    let output_config = VarDctOutputConfig {
+    let output_config = ColorOutputConfig {
         extent: Extent2d::new(profile.output_width, profile.output_height),
         orientation,
         transform: output_transform,
@@ -213,7 +189,7 @@ pub(super) fn prepare_presentation(
     };
     output_config.validate_layout(&layout)?;
     let output_plan =
-        VarDctOutputPlan::for_limits_with_variant(&layout, &backend.device().limits(), variant)?;
+        ColorOutputPlan::for_limits_with_variant(&layout, &backend.device().limits(), variant)?;
     Ok(VarDctPresentation {
         output: VarDctFrameOutput::Color {
             config: output_config,

@@ -12,6 +12,7 @@
 #include "integer_samples.h"
 
 static int floating;
+static int lossy;
 static int wide_integer;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
@@ -43,7 +44,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
   if (floating) info.exponent_bits_per_sample = floating_exponent(bits);
   info.num_color_channels = colors; info.num_extra_channels = extras;
-  info.uses_original_profile = !vardct; info.orientation = (JxlOrientation)orientation;
+  info.uses_original_profile = !vardct && !lossy; info.orientation = (JxlOrientation)orientation;
   info.have_animation = JXL_TRUE;
   info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
   info.animation.num_loops = 2; info.animation.have_timecodes = JXL_TRUE;
@@ -93,7 +94,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     if (responsive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, 1));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESAMPLING, resampling ? 2 : 1));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EXTRA_CHANNEL_RESAMPLING, resampling ? 8 : 1));
-    if (vardct) check(JxlEncoderSetFrameDistance(settings, 2));
+    if (vardct || lossy) check(JxlEncoderSetFrameDistance(settings, 2));
     else check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
     for (uint32_t c = 0; c < extras; ++c) check(JxlEncoderSetExtraChannelDistance(settings, c, 0));
     JxlFrameHeader header; JxlEncoderInitFrameHeader(&header);
@@ -155,6 +156,15 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--lossy")) {
+    lossy = 1;
+    generate(argv[1], "lossy_rgb", 37, 17, 3, 12, 9, 6, 0, 0, 0, 0);
+    generate(argv[1], "lossy_gray", 37, 17, 1, 16, 9, 8, 0, 0, 0, 0);
+    generate(argv[1], "lossy_resampled", 37, 17, 3, 16, 9, 2, 0, 0, 1, 0);
+    floating = 1;
+    generate(argv[1], "lossy_float", 37, 17, 3, 32, 9, 3, 0, 0, 0, 0);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--integer")) {
     wide_integer = 1;
     generate(argv[1], "integer_rgb", 37, 17, 3, 24, 9, 6, 0, 0, 0, 0);

@@ -56,7 +56,13 @@ fn color() -> GpuOutputRequest {
 fn compare(name: &str, actual: &[u32], expected: &[u32], color: bool, unpremultiplied: bool) {
     assert_eq!(actual.len(), expected.len(), "{name}");
     let tolerance = if color {
-        if name.contains("vardct") { 0.003 } else { 2e-5 }
+        if name.contains("vardct") {
+            0.003
+        } else if name.contains("_lossy_") {
+            1e-4
+        } else {
+            2e-5
+        }
     } else {
         2e-6
     };

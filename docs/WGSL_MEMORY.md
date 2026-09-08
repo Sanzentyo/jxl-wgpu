@@ -81,7 +81,7 @@ name shown in parentheses.
 | `jxl_wgpu/chroma_2d.wgsl` | `Chroma2dUniform` or `ResidentChromaUpsampleParams` / `Params` | `input_width, input_height, output_width, output_height, input_stride, output_stride, _pad0, _pad1` | 32 | 4 / 16 | uniform |
 | `jxl_wgpu/gaborish.wgsl` | `GaborishUniform` / `Params` | `width, height, input_stride, output_stride, weight0, weight1, weight2, _pad0` | 32 | 4 | uniform |
 | `jxl_wgpu/gaborish_rgb.wgsl` | `GaborishRgbUniform` or `ResidentGaborishParams` / `Params` | dimensions/6 strides, then four values for each of X, Y and B: `weight0, weight1, weight2, pad` | 80 | 4 / 16 | uniform |
-| `jxl_wgpu/epf.wgsl` | `EpfUniform` or `ResidentEpfUniform` / `Params` | dimensions/6 image strides, sigma dimensions/stride/kind, 6 filter floats, `_pad0, _pad1` | 80 | 4 / 16 | uniform |
+| `jxl_wgpu/epf.wgsl` | `EpfUniform` or `ResidentEpfUniform` / `Params` | dimensions/6 image strides, sigma dimensions/stride/kind, 6 filter floats, constant inverse sigma, one pad | 80 | 4 / 16 | uniform |
 | `jxl_wgpu_decode/vardct_epf.wgsl` | `EpfSigmaUniform` / `Params` | LF-group block/task/sharpness geometry, full-image block-grid extent plus group destination origin, artifact status/task offsets, global scale, quant multiplier, two four-value sharpness LUT rows | 80 | 16 | uniform |
 | `jxl_wgpu_decode/modular_squeeze` | `ModularSqueezeParams` / `Params` | average, residual, and output `width,height,row_stride,word_offset` records, then direction and 3 reserved words | 64 | 16 | uniform |
 | `jxl_wgpu_decode/modular_rct` | `ModularRctParams` / `Params` | three in-place plane `width,height,row_stride,word_offset` records, then RCT type and 3 reserved words | 64 | 16 | uniform |
@@ -104,7 +104,7 @@ name shown in parentheses.
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, X LF stride, 3 pads, `quant_biases[4]`, then Y/B LF bases and strides | 144 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry, three source channel extents/bases, three destination stride/origin/base records, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 144 | 16 | uniform |
-| `jxl_wgpu_decode/vardct_output.wgsl` | `VarDctSourceParams` | 3 component stride/extent/shift records; alpha offset/stride/maximum/enabled; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 160 | 16 | uniform binding 5; shared 192-byte output parameters occupy binding 4 |
+| `jxl_wgpu_decode/color_output.wgsl` | `ColorSourceParams` | 3 component stride/extent/shift records; alpha offset/stride/maximum/enabled; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 160 | 16 | uniform binding 5; shared 192-byte output parameters occupy binding 4 |
 | `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, three channel shift/LF-base/stride records, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 288 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
@@ -256,7 +256,7 @@ The table below states the default workgroup configuration for each entry point:
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
 | `vardct_large_encoder::quantize_blocks` | source/params RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid axes and source/artifact ranges; 1,024 bytes workgroup storage |
 | `vardct_large_encoder::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
-| `vardct_output` (decoder) | X/Y/B or Cb/Y/Cr planes and integer alpha RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 192-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
+| `color_output` (decoder) | X/Y/B, Cb/Y/Cr or R/G/B planes and opacity RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 192-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
@@ -332,7 +332,7 @@ The following shaders declare `var<workgroup>` memory:
 | encoder `vardct_encode_quantize` | `array<vec3<f32>, 64>` XYB block | 1,024 | selected variant and bytes checked before pipeline creation |
 
 Other parameterized image kernels use zero explicit workgroup-local bytes. Default invocation counts are 256
-(`16x16` tiled 2D kernels and `256x1` linear kernels `rgb_to_image` / `vardct_output`), 64
+(`16x16` tiled 2D kernels and `256x1` linear kernels `rgb_to_image` / `color_output`), 64
 (`vardct_resource`, decoder `lossless_gray8`, encoder scalable VarDCT quantization at `64x1`, and fixed VarDCT DCT8 at `8x8`), and one (encoder control/modular passes).
 Planner and pipeline creation validate selected `KernelVariant` dimensions and invocation counts
 against device limits prior to pipeline compilation and dispatch recording.
@@ -398,7 +398,7 @@ orientation at 112, source/target transfer at 116/120, identity-color flag at 12
 primary-matrix rows at 128/144/160. Alpha conversion is at byte 176, followed by three reserved
 words. The identity flag bypasses a redundant EOTF/OETF round trip when both transfer and primaries
 match.
-The codec source fragment adds a 160-byte, 16-byte-aligned `VarDctSourceParams` at binding 5:
+The codec source fragment adds a 160-byte, 16-byte-aligned `ColorSourceParams` at binding 5:
 component geometry starts at 0, alpha offset/stride/maximum/enabled at 48, inverse matrix rows at
 64/80/96, cube-root/scaled biases at 112/128, intensity scale at 144, and transform mode at 148.
 The two uniform bindings are individually limit-checked; `output_uniform_bytes` and transient
@@ -758,3 +758,27 @@ at byte 44 for the same conversion; its 64-byte ABI adds planar source addressin
 and preserves output word ownership.
 All references keep the source association, independent of the caller's output policy. Enlarged
 common-output uniforms are charged through the existing size-derived admission and lifetime paths.
+
+### Modular color and restoration integration
+
+`modular_render/color.wgsl` consumes the inverse-Modular arena and three decoded F32 output
+planes with one 80-byte aligned `NormalizeColorParams` uniform. Its three source records retain
+width, height, stride and word offset; a fourth vector carries sample encodings and the XYB flag;
+a fifth carries LF multipliers. The 16×16 dispatch has checked extents and storage ranges. XYB
+working-word addition precedes conversion to F32; source precision metadata does not normalize XYB.
+
+Color normalization owns three coded-resolution planes. Gaborish/EPF add one reusable three-plane
+ping-pong set; color resampling adds three presentation-resolution planes only when needed. Extras
+reuse one separately sized normalization scratch buffer. The common `color_output` packer writes
+into the existing aligned all-channel render arena; its 192/160-byte uniforms and each 80-byte
+Gaborish/EPF or 32-byte upsampling uniform are included exactly once. A 37×17, factor-2 color plan
+with Gaborish and two EPF passes accounts 11,652 working-plane bytes and 768 uniform bytes,
+separately from the final render arena and shared weights.
+
+`ResidentEpfSigma::Constant` stores the negative inverse sigma in byte 72 of the existing 80-byte
+EPF uniform, with mode 2 and one remaining padding word. It binds an existing read-only source
+for the unused sigma binding and allocates no sigma image. Modes 0/1 retain the generic scalar
+buffer and VarDCT block-plane contracts. The scheduler and resident Rust records share the WGSL
+field order; ABI reflection and actual GPU filtering validate this boundary. Invalid constants,
+Modular sigma below 1e-8, mismatched grids and device limits are typed errors. Every temporary
+allocation is included in `ModularRenderPlan::total_bytes` and the shared decoder reservation.

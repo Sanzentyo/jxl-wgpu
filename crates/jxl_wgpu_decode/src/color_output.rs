@@ -17,18 +17,18 @@ const OUTPUT_WORD_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 const WORKGROUP_SIZE: u32 = 256;
 const DEFAULT_VARIANT: KernelVariant = KernelVariant::Lanes256;
 
-/// WGSL source for the fused VarDCT output kernel.
-pub fn vardct_output_shader() -> String {
+/// WGSL source for the fused reconstructed output kernel.
+pub fn color_output_shader() -> String {
     format!(
         "{}\n{}",
         jxl_wgpu::IMAGE_OUTPUT_SHADER,
-        crate::modular_sample::shader(include_str!("vardct_output.wgsl"))
+        crate::modular_sample::shader(include_str!("color_output.wgsl"))
     )
 }
 
-/// One GPU-resident F32 XYB or JPEG component plane.
+/// One GPU-resident F32 XYB, JPEG component, or RGB plane.
 #[derive(Clone, Copy, Debug)]
-pub struct VarDctOutputPlane<'a> {
+pub struct ColorOutputPlane<'a> {
     /// Checked storage-buffer subrange containing row-major F32 samples.
     pub storage: ResidentStorageBinding<'a>,
     /// Available logical samples in each row.
@@ -39,7 +39,7 @@ pub struct VarDctOutputPlane<'a> {
     pub stride: u32,
 }
 
-impl VarDctOutputPlane<'_> {
+impl ColorOutputPlane<'_> {
     const fn effective_stride(self) -> u32 {
         if self.stride == 0 {
             self.width
@@ -51,9 +51,11 @@ impl VarDctOutputPlane<'_> {
 
 /// Color transform fused into the final packed color kernel.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum VarDctOutputTransform {
+pub enum ColorOutputTransform {
+    /// Reconstructed original color with an explicit transfer and primary contract.
+    Rgb(RgbColorEncoding),
     /// JPEG XL XYB inverse into linear BT.709; the shared output applies the requested transfer.
-    Xyb(VarDctInverseOpsin),
+    Xyb(InverseOpsin),
     /// JPEG reconstruction's encoded YCbCr, including component upsampling.
     Ycbcr {
         channel_shifts: [VarDctChannelShift; 3],
@@ -62,7 +64,7 @@ pub enum VarDctOutputTransform {
 
 /// JPEG XL inverse-opsin fields used by the fused output kernel.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VarDctInverseOpsin {
+pub struct InverseOpsin {
     /// Per-LMS opsin biases from the codestream image metadata.
     pub opsin_bias: [f32; 3],
     /// Row-major matrix mapping reconstructed LMS into linear RGB.
@@ -71,7 +73,7 @@ pub struct VarDctInverseOpsin {
     pub intensity_target: f32,
 }
 
-impl From<&XybParams> for VarDctInverseOpsin {
+impl From<&XybParams> for InverseOpsin {
     fn from(value: &XybParams) -> Self {
         Self {
             opsin_bias: value.opsin_bias,
@@ -81,26 +83,52 @@ impl From<&XybParams> for VarDctInverseOpsin {
     }
 }
 
-/// Host-known geometry and inverse-opsin metadata for one packed output.
+impl InverseOpsin {
+    pub(crate) fn from_image(image: &jxl_gpu_bitstream::ImageHeaderInventory) -> Option<Self> {
+        let opsin = image.opsin_inverse_matrix?;
+        let matrix = opsin
+            .inverse_matrix
+            .map(|row| row.map(|value| value.to_f32()));
+        let inverse_opsin_matrix = if image.grayscale {
+            let luma = std::array::from_fn(|column| {
+                [0.2126_f64, 0.7152, 0.0722]
+                    .into_iter()
+                    .zip(matrix)
+                    .map(|(weight, row)| weight * f64::from(row[column]))
+                    .sum::<f64>() as f32
+            });
+            [luma; 3]
+        } else {
+            matrix
+        };
+        Some(Self {
+            opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
+            inverse_opsin_matrix,
+            intensity_target: image.tone_mapping.intensity_target.to_f32(),
+        })
+    }
+}
+
+/// Host-known geometry and source color transform for one packed output.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VarDctOutputConfig {
+pub struct ColorOutputConfig {
     /// Logical image extent after resampling, before orientation.
     pub extent: Extent2d,
     /// Maps input coordinates into the display-oriented packed output.
     pub orientation: OutputOrientation,
-    pub transform: VarDctOutputTransform,
+    pub transform: ColorOutputTransform,
     /// Conversion in the requested RGB encoding, after reconstruction and color conversion.
     pub alpha_conversion: jxl_wgpu::AlphaConversion,
 }
 
-impl VarDctOutputConfig {
+impl ColorOutputConfig {
     /// Extent of the packed output, including transposition for orientations 5–8.
     pub const fn output_extent(self) -> Extent2d {
         self.orientation.map_extent(self.extent)
     }
 
     /// Validates target color, geometry, and packing before allocation or submission.
-    pub fn validate_layout(self, layout: &ImageLayout) -> Result<(), VarDctOutputError> {
+    pub fn validate_layout(self, layout: &ImageLayout) -> Result<(), ColorOutputError> {
         self.image_params(layout, [self.extent.width; 3], 1)
             .map(|_| ())
     }
@@ -110,10 +138,10 @@ impl VarDctOutputConfig {
         layout: &ImageLayout,
         strides: [u32; 3],
         dispatch_width: u32,
-    ) -> Result<ImageOutputParams, VarDctOutputError> {
+    ) -> Result<ImageOutputParams, ColorOutputError> {
         if matches!(layout.format.color_spec, ColorSpecification::Defined(color) if matches!(color.transfer, TransferFunction::Pq | TransferFunction::Hlg))
         {
-            return Err(VarDctOutputError::HdrLuminanceMappingRequired);
+            return Err(ColorOutputError::HdrLuminanceMappingRequired);
         }
         Ok(ImageOutputParams::new(
             layout,
@@ -122,8 +150,9 @@ impl VarDctOutputConfig {
                 orientation: self.orientation,
                 strides,
                 encoding: match self.transform {
-                    VarDctOutputTransform::Xyb(_) => RgbColorEncoding::LINEAR_BT709,
-                    VarDctOutputTransform::Ycbcr { .. } => RgbColorEncoding::SRGB_BT709,
+                    ColorOutputTransform::Rgb(encoding) => encoding,
+                    ColorOutputTransform::Xyb(_) => RgbColorEncoding::LINEAR_BT709,
+                    ColorOutputTransform::Ycbcr { .. } => RgbColorEncoding::SRGB_BT709,
                 },
             },
             dispatch_width,
@@ -132,25 +161,25 @@ impl VarDctOutputConfig {
     }
 }
 
-/// GPU bindings consumed by [`VarDctOutputPacker::encode`].
+/// GPU bindings consumed by [`ColorOutputPacker::encode`].
 #[derive(Clone, Copy, Debug)]
-pub struct VarDctOutputInputs<'a> {
-    /// X, Y, and B F32 planes, in that order.
-    pub planes: [VarDctOutputPlane<'a>; 3],
+pub struct ColorOutputInputs<'a> {
+    /// X/Y/B, Cb/Y/Cr, or R/G/B F32 planes, according to the configured transform.
+    pub planes: [ColorOutputPlane<'a>; 3],
     /// Optional full-resolution Modular alpha, decoded using its independently declared precision.
-    pub alpha: Option<VarDctOutputAlpha<'a>>,
+    pub alpha: Option<ColorOutputAlpha<'a>>,
     /// Output storage for the requested pitch-linear layout;
     /// its allocated/bound length is rounded up to four bytes.
     pub output: ResidentStorageBinding<'a>,
     /// Exact target layout, including oriented extent, plane offsets, and row pitches.
     pub layout: &'a ImageLayout,
-    /// Output geometry and inverse-opsin metadata.
-    pub config: VarDctOutputConfig,
+    /// Output geometry and source color transform.
+    pub config: ColorOutputConfig,
 }
 
 /// An opacity plane in an encoded Modular or decoded F32 arena, one word per sample.
 #[derive(Clone, Copy, Debug)]
-pub struct VarDctOutputAlpha<'a> {
+pub struct ColorOutputAlpha<'a> {
     pub domain: crate::ModularSampleDomain,
     pub storage: ResidentStorageBinding<'a>,
     pub width: u32,
@@ -163,7 +192,7 @@ pub struct VarDctOutputAlpha<'a> {
 
 /// Exact byte counts for one fused output operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VarDctOutputMemoryPlan {
+pub struct ColorOutputMemoryPlan {
     /// Externally visible bytes, including row padding and alignment between planes.
     pub logical_output_bytes: u64,
     /// GPU storage allocation/binding requirement, rounded up to a `u32`.
@@ -176,11 +205,11 @@ pub struct VarDctOutputMemoryPlan {
     pub total_bytes: u64,
 }
 
-impl VarDctOutputMemoryPlan {
+impl ColorOutputMemoryPlan {
     /// Independent shared-output and codec-source uniform bindings.
     pub const UNIFORM_BINDING_BYTES: [u64; 2] = [
         std::mem::size_of::<ImageOutputParams>() as u64,
-        std::mem::size_of::<VarDctSourceParams>() as u64,
+        std::mem::size_of::<ColorSourceParams>() as u64,
     ];
 
     /// Computes exact output and transient buffer bytes without a device.
@@ -189,13 +218,13 @@ impl VarDctOutputMemoryPlan {
     ///
     /// Returns a typed error for empty geometry, arithmetic overflow, or an
     /// image whose packed addressing cannot be represented by WGSL `u32`.
-    pub fn new(layout: &ImageLayout) -> Result<Self, VarDctOutputError> {
+    pub fn new(layout: &ImageLayout) -> Result<Self, ColorOutputError> {
         let (logical_output_bytes, output_storage_bytes) = packed_geometry(layout)?;
         let uniform_bytes = Self::UNIFORM_BINDING_BYTES.into_iter().sum();
         let transient_bytes = uniform_bytes;
         let total_bytes = output_storage_bytes.checked_add(transient_bytes).ok_or(
-            VarDctOutputError::ArithmeticOverflow {
-                field: "VarDCT output total bytes",
+            ColorOutputError::ArithmeticOverflow {
+                field: "reconstructed output total bytes",
             },
         )?;
         Ok(Self {
@@ -210,9 +239,9 @@ impl VarDctOutputMemoryPlan {
 
 /// Linear work distribution and byte accounting validated against one device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VarDctOutputPlan {
+pub struct ColorOutputPlan {
     /// Exact byte accounting.
-    pub memory: VarDctOutputMemoryPlan,
+    pub memory: ColorOutputMemoryPlan,
     /// Number of `u32` records written by the kernel.
     pub output_words: u32,
     /// Number of X workgroups.
@@ -223,7 +252,7 @@ pub struct VarDctOutputPlan {
     pub dispatch_width: u32,
 }
 
-impl VarDctOutputPlan {
+impl ColorOutputPlan {
     /// Plans a portable two-dimensional dispatch from device limits.
     ///
     /// # Errors
@@ -233,7 +262,7 @@ impl VarDctOutputPlan {
     pub fn for_limits(
         layout: &ImageLayout,
         limits: &wgpu::Limits,
-    ) -> Result<Self, VarDctOutputError> {
+    ) -> Result<Self, ColorOutputError> {
         Self::for_limits_with_variant(layout, limits, DEFAULT_VARIANT)
     }
 
@@ -242,19 +271,19 @@ impl VarDctOutputPlan {
         layout: &ImageLayout,
         limits: &wgpu::Limits,
         variant: KernelVariant,
-    ) -> Result<Self, VarDctOutputError> {
+    ) -> Result<Self, ColorOutputError> {
         validate_storage_bindings(limits)?;
-        let memory = VarDctOutputMemoryPlan::new(layout)?;
+        let memory = ColorOutputMemoryPlan::new(layout)?;
         validate_required_buffer(
             "packed color output",
             memory.output_storage_bytes,
             limits,
             true,
         )?;
-        let [output_uniform, source_uniform] = VarDctOutputMemoryPlan::UNIFORM_BINDING_BYTES;
+        let [output_uniform, source_uniform] = ColorOutputMemoryPlan::UNIFORM_BINDING_BYTES;
         let largest_uniform = output_uniform.max(source_uniform);
         if largest_uniform > limits.max_uniform_buffer_binding_size {
-            return Err(VarDctOutputError::UniformBindingLimit {
+            return Err(ColorOutputError::UniformBindingLimit {
                 required: largest_uniform,
                 available: limits.max_uniform_buffer_binding_size,
             });
@@ -263,14 +292,14 @@ impl VarDctOutputPlan {
 
         let output_words_u64 = memory.output_storage_bytes / OUTPUT_WORD_BYTES;
         let output_words =
-            u32::try_from(output_words_u64).map_err(|_| VarDctOutputError::ShaderAddressSpace {
+            u32::try_from(output_words_u64).map_err(|_| ColorOutputError::ShaderAddressSpace {
                 field: "packed color words",
                 required: output_words_u64,
                 available: u64::from(u32::MAX),
             })?;
         let limit = limits.max_compute_workgroups_per_dimension;
         if limit == 0 {
-            return Err(VarDctOutputError::DispatchLimit {
+            return Err(ColorOutputError::DispatchLimit {
                 required_y: 1,
                 available: 0,
             });
@@ -281,13 +310,13 @@ impl VarDctOutputPlan {
         let dispatch_width =
             workgroups_x
                 .checked_mul(workgroup_x)
-                .ok_or(VarDctOutputError::ArithmeticOverflow {
-                    field: "VarDCT output dispatch width",
+                .ok_or(ColorOutputError::ArithmeticOverflow {
+                    field: "reconstructed output dispatch width",
                 })?;
         let required_y = output_words.div_ceil(dispatch_width);
         let workgroups_y = required_y.div_ceil(workgroup_y);
         if workgroups_y > limit {
-            return Err(VarDctOutputError::DispatchLimit {
+            return Err(ColorOutputError::DispatchLimit {
                 required_y: workgroups_y,
                 available: limit,
             });
@@ -305,22 +334,22 @@ impl VarDctOutputPlan {
 fn validate_workgroup_variant(
     variant: KernelVariant,
     limits: &wgpu::Limits,
-) -> Result<(), VarDctOutputError> {
+) -> Result<(), ColorOutputError> {
     if !variant.is_linear() {
-        return Err(VarDctOutputError::WorkgroupShape { variant });
+        return Err(ColorOutputError::WorkgroupShape { variant });
     }
     variant
-        .validate_for("vardct_output", limits, 0)
-        .map_err(|_| VarDctOutputError::WorkgroupSizeLimit {
+        .validate_for("color_output", limits, 0)
+        .map_err(|_| ColorOutputError::WorkgroupSizeLimit {
             required: variant.invocations(),
             max_invocations: limits.max_compute_invocations_per_workgroup,
             max_size_x: limits.max_compute_workgroup_size_x,
         })
 }
 
-fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), VarDctOutputError> {
+fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), ColorOutputError> {
     if limits.max_storage_buffers_per_shader_stage < 5 {
-        return Err(VarDctOutputError::StorageBindingCount {
+        return Err(ColorOutputError::StorageBindingCount {
             available: limits.max_storage_buffers_per_shader_stage,
         });
     }
@@ -329,38 +358,38 @@ fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), VarDctOutputEr
 
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
-pub struct VarDctOutputScratch {
+pub struct ColorOutputScratch {
     /// The shared 192-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
     /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
     /// Exact output/transient accounting and dispatch geometry.
-    pub plan: VarDctOutputPlan,
+    pub plan: ColorOutputPlan,
 }
 
-/// Typed validation errors for GPU-resident VarDCT color output.
+/// Typed validation errors for GPU-resident reconstructed color output.
 #[derive(Debug, thiserror::Error)]
-pub enum VarDctOutputError {
-    #[error("VarDCT output needs five storage bindings, device permits {available}")]
+pub enum ColorOutputError {
+    #[error("reconstructed output needs five storage bindings, device permits {available}")]
     StorageBindingCount { available: u32 },
-    #[error("VarDCT alpha has invalid sample precision {depth:?}")]
+    #[error("reconstructed alpha has invalid sample precision {depth:?}")]
     InvalidAlphaBitDepth {
         depth: jxl_gpu_bitstream::SampleBitDepth,
     },
-    #[error("VarDCT alpha conversion requires an alpha input plane")]
+    #[error("reconstructed alpha conversion requires an alpha input plane")]
     MissingAlphaPlane,
     /// The common output contract rejected color or layout metadata.
     #[error(transparent)]
     ImageOutput(#[from] jxl_wgpu::Error),
     /// Relative SDR values cannot be relabeled as absolute PQ or scene-linear HLG.
-    #[error("VarDCT HDR output requires an explicit luminance mapping")]
+    #[error("reconstructed HDR output requires an explicit luminance mapping")]
     HdrLuminanceMappingRequired,
     /// Checked size arithmetic overflowed.
-    #[error("VarDCT color output arithmetic overflow while computing {field}")]
+    #[error("reconstructed color output arithmetic overflow while computing {field}")]
     ArithmeticOverflow { field: &'static str },
     /// A value cannot be addressed by WGSL's `u32` indices.
     #[error(
-        "VarDCT color output {field} needs {required} addressable values, WGSL permits {available}"
+        "reconstructed color output {field} needs {required} addressable values, WGSL permits {available}"
     )]
     ShaderAddressSpace {
         field: &'static str,
@@ -368,7 +397,9 @@ pub enum VarDctOutputError {
         available: u64,
     },
     /// One F32 plane has a row stride shorter than its width.
-    #[error("VarDCT color input plane {plane} stride {stride} is shorter than width {width}")]
+    #[error(
+        "reconstructed color input plane {plane} stride {stride} is shorter than width {width}"
+    )]
     InputStride {
         plane: usize,
         stride: u32,
@@ -376,7 +407,7 @@ pub enum VarDctOutputError {
     },
     /// One input plane does not cover the component extent required by the color transform.
     #[error(
-        "VarDCT color input plane {plane} extent {width}x{height} is smaller than required {required_width}x{required_height}"
+        "reconstructed color input plane {plane} extent {width}x{height} is smaller than required {required_width}x{required_height}"
     )]
     InputExtent {
         plane: usize,
@@ -386,33 +417,33 @@ pub enum VarDctOutputError {
         required_height: u32,
     },
     /// JPEG component shifts are limited to the one-bit factors defined by the codestream.
-    #[error("VarDCT color JPEG channel {channel} has invalid shift {horizontal}x{vertical}")]
+    #[error("reconstructed color JPEG channel {channel} has invalid shift {horizontal}x{vertical}")]
     InvalidJpegShift {
         channel: usize,
         horizontal: u32,
         vertical: u32,
     },
     /// An inverse-opsin field is non-finite.
-    #[error("VarDCT color inverse-opsin field {field} must be finite")]
+    #[error("reconstructed color inverse-opsin field {field} must be finite")]
     NonFiniteParameter { field: &'static str },
     /// The intensity target is finite but not positive.
-    #[error("VarDCT color intensity target must be positive")]
+    #[error("reconstructed color intensity target must be positive")]
     InvalidIntensityTarget,
     /// A buffer does not carry STORAGE usage.
-    #[error("VarDCT color {role} buffer is missing STORAGE usage")]
+    #[error("reconstructed color {role} buffer is missing STORAGE usage")]
     MissingStorageUsage { role: &'static str },
     /// A binding starts at an invalid device-specific offset.
-    #[error("VarDCT color {role} offset {offset} is not aligned to {alignment}")]
+    #[error("reconstructed color {role} offset {offset} is not aligned to {alignment}")]
     BindingOffsetAlignment {
         role: &'static str,
         offset: u64,
         alignment: u64,
     },
     /// A typed array binding does not end at a whole 32-bit word.
-    #[error("VarDCT color {role} binding size {size} is not four-byte aligned")]
+    #[error("reconstructed color {role} binding size {size} is not four-byte aligned")]
     BindingSizeAlignment { role: &'static str, size: u64 },
     /// A subrange exceeds its backing buffer.
-    #[error("VarDCT color {role} range {offset}..{end} exceeds buffer size {available}")]
+    #[error("reconstructed color {role} range {offset}..{end} exceeds buffer size {available}")]
     BindingRange {
         role: &'static str,
         offset: u64,
@@ -420,35 +451,41 @@ pub enum VarDctOutputError {
         available: u64,
     },
     /// A subrange is smaller than its image geometry requires.
-    #[error("VarDCT color {role} binding needs {required} bytes, has {available}")]
+    #[error("reconstructed color {role} binding needs {required} bytes, has {available}")]
     BindingSize {
         role: &'static str,
         required: u64,
         available: u64,
     },
     /// A required allocation exceeds a device buffer limit.
-    #[error("VarDCT color {role} needs {required} bytes, device buffer limit is {available}")]
+    #[error(
+        "reconstructed color {role} needs {required} bytes, device buffer limit is {available}"
+    )]
     BufferLimit {
         role: &'static str,
         required: u64,
         available: u64,
     },
     /// A required storage binding exceeds the device binding limit.
-    #[error("VarDCT color {role} needs {required} bytes, storage binding limit is {available}")]
+    #[error(
+        "reconstructed color {role} needs {required} bytes, storage binding limit is {available}"
+    )]
     StorageBindingLimit {
         role: &'static str,
         required: u64,
         available: u64,
     },
     /// The 192-byte uniform exceeds an unusual device limit.
-    #[error("VarDCT color uniform needs {required} bytes, uniform binding limit is {available}")]
+    #[error(
+        "reconstructed color uniform needs {required} bytes, uniform binding limit is {available}"
+    )]
     UniformBindingLimit { required: u64, available: u64 },
     /// Output packing requires a one-dimensional workgroup.
-    #[error("VarDCT color output requires a linear workgroup, got {variant:?}")]
+    #[error("reconstructed color output requires a linear workgroup, got {variant:?}")]
     WorkgroupShape { variant: KernelVariant },
     /// The selected output workgroup cannot run on the device.
     #[error(
-        "VarDCT color workgroup needs {required} X invocations, device permits {max_invocations} total and {max_size_x} in X"
+        "reconstructed color workgroup needs {required} X invocations, device permits {max_invocations} total and {max_size_x} in X"
     )]
     WorkgroupSizeLimit {
         required: u32,
@@ -456,19 +493,21 @@ pub enum VarDctOutputError {
         max_size_x: u32,
     },
     /// A two-dimensional linearization still exceeds the device's Y limit.
-    #[error("VarDCT color dispatch needs {required_y} Y workgroups, device permits {available}")]
+    #[error(
+        "reconstructed color dispatch needs {required_y} Y workgroups, device permits {available}"
+    )]
     DispatchLimit { required_y: u32, available: u32 },
 }
 
 /// Reusable fused XYB/YCbCr reconstruction and pitch-linear color output pipeline.
-pub struct VarDctOutputPacker {
+pub struct ColorOutputPacker {
     pipeline: wgpu::ComputePipeline,
     variant: KernelVariant,
 }
 
-impl VarDctOutputPacker {
+impl ColorOutputPacker {
     /// Compiles the output shader with the portable default workgroup.
-    pub fn new(device: &wgpu::Device) -> Result<Self, VarDctOutputError> {
+    pub fn new(device: &wgpu::Device) -> Result<Self, ColorOutputError> {
         Self::with_variant(device, DEFAULT_VARIANT)
     }
 
@@ -476,12 +515,12 @@ impl VarDctOutputPacker {
     pub fn with_variant(
         device: &wgpu::Device,
         variant: KernelVariant,
-    ) -> Result<Self, VarDctOutputError> {
+    ) -> Result<Self, ColorOutputError> {
         validate_storage_bindings(&device.limits())?;
         validate_workgroup_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed color"),
-            source: wgpu::ShaderSource::Wgsl(vardct_output_shader().into()),
+            label: Some("jxl-wgpu decode reconstructed packed color"),
+            source: wgpu::ShaderSource::Wgsl(color_output_shader().into()),
         });
         let (workgroup_x, workgroup_y) = variant.workgroup_size();
         let constants = [
@@ -489,7 +528,7 @@ impl VarDctOutputPacker {
             ("wg_y", f64::from(workgroup_y)),
         ];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed color"),
+            label: Some("jxl-wgpu decode reconstructed packed color"),
             layout: None,
             module: &module,
             entry_point: Some("main"),
@@ -516,21 +555,21 @@ impl VarDctOutputPacker {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        inputs: VarDctOutputInputs<'_>,
-    ) -> Result<VarDctOutputScratch, VarDctOutputError> {
+        inputs: ColorOutputInputs<'_>,
+    ) -> Result<ColorOutputScratch, ColorOutputError> {
         let (source_params, params, plan) = validate_inputs(device, inputs, self.variant)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed color params"),
+            label: Some("jxl-wgpu decode reconstructed packed color params"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let source_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("jxl-wgpu decode VarDCT source params"),
+            label: Some("jxl-wgpu decode reconstructed source params"),
             contents: bytemuck::bytes_of(&source_params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed color bindings"),
+            label: Some("jxl-wgpu decode reconstructed packed color bindings"),
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[
                 binding_entry(0, inputs.planes[0].storage),
@@ -554,14 +593,14 @@ impl VarDctOutputPacker {
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("jxl-wgpu decode VarDCT packed color"),
+            label: Some("jxl-wgpu decode reconstructed packed color"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(plan.workgroups_x, plan.workgroups_y, 1);
         drop(pass);
-        Ok(VarDctOutputScratch {
+        Ok(ColorOutputScratch {
             uniform,
             source_uniform,
             plan,
@@ -571,7 +610,7 @@ impl VarDctOutputPacker {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct VarDctSourceParams {
+struct ColorSourceParams {
     plane_geometry: [[u32; 4]; 3],
     alpha_geometry: [u32; 4],
     matrix_r: [f32; 4],
@@ -586,33 +625,33 @@ struct VarDctSourceParams {
 
 fn validate_inputs(
     device: &wgpu::Device,
-    inputs: VarDctOutputInputs<'_>,
+    inputs: ColorOutputInputs<'_>,
     variant: KernelVariant,
-) -> Result<(VarDctSourceParams, ImageOutputParams, VarDctOutputPlan), VarDctOutputError> {
-    if let VarDctOutputTransform::Xyb(inverse) = inputs.config.transform {
+) -> Result<(ColorSourceParams, ImageOutputParams, ColorOutputPlan), ColorOutputError> {
+    if let ColorOutputTransform::Xyb(inverse) = inputs.config.transform {
         validate_inverse_opsin(inverse)?;
     }
     if inputs.config.alpha_conversion != jxl_wgpu::AlphaConversion::Preserve
         && inputs.alpha.is_none()
     {
-        return Err(VarDctOutputError::MissingAlphaPlane);
+        return Err(ColorOutputError::MissingAlphaPlane);
     }
-    let plan = VarDctOutputPlan::for_limits_with_variant(inputs.layout, &device.limits(), variant)?;
+    let plan = ColorOutputPlan::for_limits_with_variant(inputs.layout, &device.limits(), variant)?;
     let output_params = inputs.config.image_params(
         inputs.layout,
-        inputs.planes.map(VarDctOutputPlane::effective_stride),
+        inputs.planes.map(ColorOutputPlane::effective_stride),
         plan.dispatch_width,
     )?;
 
     let required_extents = match inputs.config.transform {
-        VarDctOutputTransform::Xyb(_) => {
+        ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
             [[inputs.config.extent.width, inputs.config.extent.height]; 3]
         }
-        VarDctOutputTransform::Ycbcr { channel_shifts } => {
+        ColorOutputTransform::Ycbcr { channel_shifts } => {
             let mut extents = [[0; 2]; 3];
             for (channel, shift) in channel_shifts.into_iter().enumerate() {
                 if shift.horizontal > 1 || shift.vertical > 1 {
-                    return Err(VarDctOutputError::InvalidJpegShift {
+                    return Err(ColorOutputError::InvalidJpegShift {
                         channel,
                         horizontal: shift.horizontal,
                         vertical: shift.vertical,
@@ -630,7 +669,7 @@ fn validate_inputs(
     for (plane, input) in inputs.planes.into_iter().enumerate() {
         let [required_width, required_height] = required_extents[plane];
         if input.width < required_width || input.height < required_height {
-            return Err(VarDctOutputError::InputExtent {
+            return Err(ColorOutputError::InputExtent {
                 plane,
                 width: input.width,
                 height: input.height,
@@ -640,7 +679,7 @@ fn validate_inputs(
         }
         let stride = input.effective_stride();
         if stride < input.width {
-            return Err(VarDctOutputError::InputStride {
+            return Err(ColorOutputError::InputStride {
                 plane,
                 stride,
                 width: input.width,
@@ -649,11 +688,11 @@ fn validate_inputs(
         let required_scalars = u64::from(required_height - 1)
             .checked_mul(u64::from(stride))
             .and_then(|value| value.checked_add(u64::from(required_width)))
-            .ok_or(VarDctOutputError::ArithmeticOverflow {
-                field: "VarDCT input plane scalars",
+            .ok_or(ColorOutputError::ArithmeticOverflow {
+                field: "reconstructed input plane scalars",
             })?;
         if required_scalars > u64::from(u32::MAX) {
-            return Err(VarDctOutputError::ShaderAddressSpace {
+            return Err(ColorOutputError::ShaderAddressSpace {
                 field: "input plane scalars",
                 required: required_scalars,
                 available: u64::from(u32::MAX),
@@ -662,8 +701,8 @@ fn validate_inputs(
         let required_bytes =
             required_scalars
                 .checked_mul(4)
-                .ok_or(VarDctOutputError::ArithmeticOverflow {
-                    field: "VarDCT input plane bytes",
+                .ok_or(ColorOutputError::ArithmeticOverflow {
+                    field: "reconstructed input plane bytes",
                 })?;
         let role = match plane {
             0 => "X input",
@@ -672,8 +711,10 @@ fn validate_inputs(
         };
         validate_binding(device, role, input.storage, required_bytes)?;
         let shift = match inputs.config.transform {
-            VarDctOutputTransform::Xyb(_) => VarDctChannelShift::default(),
-            VarDctOutputTransform::Ycbcr { channel_shifts } => channel_shifts[plane],
+            ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
+                VarDctChannelShift::default()
+            }
+            ColorOutputTransform::Ycbcr { channel_shifts } => channel_shifts[plane],
         };
         plane_geometry[plane] = [
             stride,
@@ -691,11 +732,11 @@ fn validate_inputs(
 
     let alpha_geometry = if let Some(alpha) = inputs.alpha {
         let encoding = crate::modular_sample::ModularSampleEncoding::new(alpha.sample_bit_depth)
-            .ok_or(VarDctOutputError::InvalidAlphaBitDepth {
+            .ok_or(ColorOutputError::InvalidAlphaBitDepth {
                 depth: alpha.sample_bit_depth,
             })?;
         if alpha.width < inputs.config.extent.width || alpha.height < inputs.config.extent.height {
-            return Err(VarDctOutputError::InputExtent {
+            return Err(ColorOutputError::InputExtent {
                 plane: 3,
                 width: alpha.width,
                 height: alpha.height,
@@ -704,7 +745,7 @@ fn validate_inputs(
             });
         }
         if alpha.stride < alpha.width {
-            return Err(VarDctOutputError::InputStride {
+            return Err(ColorOutputError::InputStride {
                 plane: 3,
                 stride: alpha.stride,
                 width: alpha.width,
@@ -714,11 +755,11 @@ fn validate_inputs(
             .checked_mul(u64::from(alpha.stride))
             .and_then(|value| value.checked_add(u64::from(alpha.word_offset)))
             .and_then(|value| value.checked_add(u64::from(inputs.config.extent.width)))
-            .ok_or(VarDctOutputError::ArithmeticOverflow {
+            .ok_or(ColorOutputError::ArithmeticOverflow {
                 field: "alpha addressing",
             })?;
         if end > u64::from(u32::MAX) {
-            return Err(VarDctOutputError::ShaderAddressSpace {
+            return Err(ColorOutputError::ShaderAddressSpace {
                 field: "alpha plane scalars",
                 required: end,
                 available: u64::from(u32::MAX),
@@ -736,7 +777,7 @@ fn validate_inputs(
     };
 
     let (mode, matrix, bias_cbrt, scaled_bias, intensity_scale) = match inputs.config.transform {
-        VarDctOutputTransform::Xyb(inverse) => {
+        ColorOutputTransform::Xyb(inverse) => {
             let intensity_scale = 255.0 / inverse.intensity_target;
             (
                 0,
@@ -746,10 +787,11 @@ fn validate_inputs(
                 intensity_scale,
             )
         }
-        VarDctOutputTransform::Ycbcr { .. } => (1, [[0.0; 3]; 3], [0.0; 3], [0.0; 3], 0.0),
+        ColorOutputTransform::Ycbcr { .. } => (1, [[0.0; 3]; 3], [0.0; 3], [0.0; 3], 0.0),
+        ColorOutputTransform::Rgb(_) => (2, [[0.0; 3]; 3], [0.0; 3], [0.0; 3], 0.0),
     };
     Ok((
-        VarDctSourceParams {
+        ColorSourceParams {
             plane_geometry,
             alpha_geometry,
             matrix_r: matrix_row(matrix[0]),
@@ -766,18 +808,18 @@ fn validate_inputs(
     ))
 }
 
-fn validate_inverse_opsin(inverse: VarDctInverseOpsin) -> Result<(), VarDctOutputError> {
+fn validate_inverse_opsin(inverse: InverseOpsin) -> Result<(), ColorOutputError> {
     if !inverse.intensity_target.is_finite() {
-        return Err(VarDctOutputError::NonFiniteParameter {
+        return Err(ColorOutputError::NonFiniteParameter {
             field: "intensity_target",
         });
     }
     if inverse.intensity_target <= 0.0 {
-        return Err(VarDctOutputError::InvalidIntensityTarget);
+        return Err(ColorOutputError::InvalidIntensityTarget);
     }
     for (index, value) in inverse.opsin_bias.into_iter().enumerate() {
         if !value.is_finite() {
-            return Err(VarDctOutputError::NonFiniteParameter {
+            return Err(ColorOutputError::NonFiniteParameter {
                 field: ["opsin_bias[0]", "opsin_bias[1]", "opsin_bias[2]"][index],
             });
         }
@@ -785,7 +827,7 @@ fn validate_inverse_opsin(inverse: VarDctInverseOpsin) -> Result<(), VarDctOutpu
     for (row, matrix_row) in inverse.inverse_opsin_matrix.into_iter().enumerate() {
         for (column, value) in matrix_row.into_iter().enumerate() {
             if !value.is_finite() {
-                return Err(VarDctOutputError::NonFiniteParameter {
+                return Err(ColorOutputError::NonFiniteParameter {
                     field: [
                         ["matrix[0][0]", "matrix[0][1]", "matrix[0][2]"],
                         ["matrix[1][0]", "matrix[1][1]", "matrix[1][2]"],
@@ -798,19 +840,19 @@ fn validate_inverse_opsin(inverse: VarDctInverseOpsin) -> Result<(), VarDctOutpu
     Ok(())
 }
 
-fn packed_geometry(layout: &ImageLayout) -> Result<(u64, u64), VarDctOutputError> {
+fn packed_geometry(layout: &ImageLayout) -> Result<(u64, u64), ColorOutputError> {
     let validated =
         ImageLayout::from_planes(layout.extent, layout.format.clone(), layout.planes.clone())
             .map_err(jxl_wgpu::Error::from)?;
     if validated.logical_size != layout.logical_size {
         return Err(jxl_wgpu::Error::InvalidPayload(
-            "VarDCT output logical size disagrees with its planes".into(),
+            "reconstructed output logical size disagrees with its planes".into(),
         )
         .into());
     }
     let logical_output_bytes = layout.logical_size;
     if logical_output_bytes > u64::from(u32::MAX) {
-        return Err(VarDctOutputError::ShaderAddressSpace {
+        return Err(ColorOutputError::ShaderAddressSpace {
             field: "logical output bytes",
             required: logical_output_bytes,
             available: u64::from(u32::MAX),
@@ -827,16 +869,16 @@ fn validate_required_buffer(
     required: u64,
     limits: &wgpu::Limits,
     storage: bool,
-) -> Result<(), VarDctOutputError> {
+) -> Result<(), ColorOutputError> {
     if required > limits.max_buffer_size {
-        return Err(VarDctOutputError::BufferLimit {
+        return Err(ColorOutputError::BufferLimit {
             role,
             required,
             available: limits.max_buffer_size,
         });
     }
     if storage && required > limits.max_storage_buffer_binding_size {
-        return Err(VarDctOutputError::StorageBindingLimit {
+        return Err(ColorOutputError::StorageBindingLimit {
             role,
             required,
             available: limits.max_storage_buffer_binding_size,
@@ -850,14 +892,14 @@ fn validate_binding(
     role: &'static str,
     binding: ResidentStorageBinding<'_>,
     required: u64,
-) -> Result<(), VarDctOutputError> {
+) -> Result<(), ColorOutputError> {
     if !binding.buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
-        return Err(VarDctOutputError::MissingStorageUsage { role });
+        return Err(ColorOutputError::MissingStorageUsage { role });
     }
     let limits = device.limits();
     let alignment = u64::from(limits.min_storage_buffer_offset_alignment).max(4);
     if !binding.offset.is_multiple_of(alignment) {
-        return Err(VarDctOutputError::BindingOffsetAlignment {
+        return Err(ColorOutputError::BindingOffsetAlignment {
             role,
             offset: binding.offset,
             alignment,
@@ -865,16 +907,16 @@ fn validate_binding(
     }
     let size = binding.size.get();
     if !size.is_multiple_of(OUTPUT_WORD_BYTES) {
-        return Err(VarDctOutputError::BindingSizeAlignment { role, size });
+        return Err(ColorOutputError::BindingSizeAlignment { role, size });
     }
     let end = binding
         .offset
         .checked_add(size)
-        .ok_or(VarDctOutputError::ArithmeticOverflow {
-            field: "VarDCT storage binding range",
+        .ok_or(ColorOutputError::ArithmeticOverflow {
+            field: "reconstructed storage binding range",
         })?;
     if end > binding.buffer.size() {
-        return Err(VarDctOutputError::BindingRange {
+        return Err(ColorOutputError::BindingRange {
             role,
             offset: binding.offset,
             end,
@@ -882,7 +924,7 @@ fn validate_binding(
         });
     }
     if size < required {
-        return Err(VarDctOutputError::BindingSize {
+        return Err(ColorOutputError::BindingSize {
             role,
             required,
             available: size,
@@ -907,10 +949,10 @@ const fn matrix_row(row: [f32; 3]) -> [f32; 4] {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<VarDctSourceParams>() == 160);
-    assert!(std::mem::align_of::<VarDctSourceParams>() == 16);
-    assert!(std::mem::offset_of!(VarDctSourceParams, mode) == 148);
-    assert!(std::mem::offset_of!(VarDctSourceParams, plane_geometry) == 0);
+    assert!(std::mem::size_of::<ColorSourceParams>() == 160);
+    assert!(std::mem::align_of::<ColorSourceParams>() == 16);
+    assert!(std::mem::offset_of!(ColorSourceParams, mode) == 148);
+    assert!(std::mem::offset_of!(ColorSourceParams, plane_geometry) == 0);
 };
 
 #[cfg(test)]
@@ -937,8 +979,8 @@ mod tests {
         }
     }
 
-    fn inverse_opsin() -> VarDctInverseOpsin {
-        VarDctInverseOpsin {
+    fn inverse_opsin() -> InverseOpsin {
+        InverseOpsin {
             opsin_bias: [-0.003_793_073_4; 3],
             inverse_opsin_matrix: [
                 [11.031_567, -9.866_944, -0.164_622_99],
@@ -952,18 +994,18 @@ mod tests {
     #[test]
     fn wgsl_and_uniform_abi_validate() {
         fn assert_pod<T: Pod>() {}
-        assert_pod::<VarDctSourceParams>();
-        assert_eq!(std::mem::size_of::<VarDctSourceParams>(), 160);
-        assert_eq!(std::mem::align_of::<VarDctSourceParams>(), 16);
+        assert_pod::<ColorSourceParams>();
+        assert_eq!(std::mem::size_of::<ColorSourceParams>(), 160);
+        assert_eq!(std::mem::align_of::<ColorSourceParams>(), 16);
 
-        let module = naga::front::wgsl::parse_str(&vardct_output_shader())
-            .expect("VarDCT output WGSL parses");
+        let module = naga::front::wgsl::parse_str(&color_output_shader())
+            .expect("reconstructed output WGSL parses");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
         )
         .validate(&module)
-        .expect("VarDCT output WGSL validates with portable capabilities");
+        .expect("reconstructed output WGSL validates with portable capabilities");
         assert_eq!(
             module
                 .global_variables
@@ -978,21 +1020,21 @@ mod tests {
         let mut limits = generous_limits();
         limits.max_storage_buffers_per_shader_stage = 4;
         assert!(matches!(
-            VarDctOutputPlan::for_limits(&rgb_layout(5, 3), &limits),
-            Err(VarDctOutputError::StorageBindingCount { available: 4 })
+            ColorOutputPlan::for_limits(&rgb_layout(5, 3), &limits),
+            Err(ColorOutputError::StorageBindingCount { available: 4 })
         ));
     }
 
     #[test]
     fn memory_plan_separates_logical_storage_and_transient_bytes() {
-        let memory = VarDctOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
+        let memory = ColorOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
         assert_eq!(memory.uniform_bytes, 352);
         assert_eq!(memory.transient_bytes, 352);
         assert_eq!(memory.total_bytes, 400);
 
-        let plan = VarDctOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
+        let plan = ColorOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
         assert_eq!((plan.workgroups_x, plan.workgroups_y), (1, 1));
         assert_eq!(plan.dispatch_width, WORKGROUP_SIZE);
@@ -1001,7 +1043,7 @@ mod tests {
     #[test]
     fn sixteen_k_output_is_split_across_dispatch_rows() {
         let plan =
-            VarDctOutputPlan::for_limits(&rgb_layout(16_384, 16_384), &generous_limits()).unwrap();
+            ColorOutputPlan::for_limits(&rgb_layout(16_384, 16_384), &generous_limits()).unwrap();
         assert_eq!(plan.memory.logical_output_bytes, 805_306_368);
         assert_eq!(plan.output_words, 201_326_592);
         assert_eq!(plan.workgroups_x, 65_535);
@@ -1018,25 +1060,25 @@ mod tests {
         let mut layout = rgb_layout(1, 7);
         layout.extent.width = 0;
         assert!(matches!(
-            VarDctOutputMemoryPlan::new(&layout),
-            Err(VarDctOutputError::ImageOutput(
-                jxl_wgpu::Error::ImageLayout(jxl_gpu_formats::LayoutError::EmptyExtent)
-            ))
+            ColorOutputMemoryPlan::new(&layout),
+            Err(ColorOutputError::ImageOutput(jxl_wgpu::Error::ImageLayout(
+                jxl_gpu_formats::LayoutError::EmptyExtent
+            )))
         ));
         let mut invalid = inverse_opsin();
         invalid.intensity_target = 0.0;
         assert!(matches!(
             validate_inverse_opsin(invalid).unwrap_err(),
-            VarDctOutputError::InvalidIntensityTarget
+            ColorOutputError::InvalidIntensityTarget
         ));
         assert!(matches!(
-            VarDctOutputPlan::for_limits_with_variant(
+            ColorOutputPlan::for_limits_with_variant(
                 &rgb_layout(1, 1),
                 &wgpu::Limits::default(),
                 KernelVariant::Tile8x8,
             )
             .unwrap_err(),
-            VarDctOutputError::WorkgroupShape {
+            ColorOutputError::WorkgroupShape {
                 variant: KernelVariant::Tile8x8,
             }
         ));
@@ -1044,7 +1086,7 @@ mod tests {
         invalid.inverse_opsin_matrix[2][1] = f32::NAN;
         assert!(matches!(
             validate_inverse_opsin(invalid).unwrap_err(),
-            VarDctOutputError::NonFiniteParameter {
+            ColorOutputError::NonFiniteParameter {
                 field: "matrix[2][1]"
             }
         ));
@@ -1058,7 +1100,7 @@ mod tests {
             inverse_opsin_matrix: inverse.inverse_opsin_matrix,
             intensity_target: inverse.intensity_target,
         };
-        assert_eq!(VarDctInverseOpsin::from(&protocol), inverse);
+        assert_eq!(InverseOpsin::from(&protocol), inverse);
         assert_eq!(255.0 / inverse.intensity_target, 1.0);
         let cube_root = inverse.opsin_bias[0].cbrt();
         assert!((cube_root * cube_root * cube_root - inverse.opsin_bias[0]).abs() < 1.0e-8);
@@ -1066,17 +1108,17 @@ mod tests {
 
     #[test]
     fn output_contract_rejects_inconsistent_layout_and_unmapped_hdr() {
-        let config = VarDctOutputConfig {
+        let config = ColorOutputConfig {
             extent: Extent2d::new(5, 3),
             orientation: OutputOrientation::from_exif_value(6).unwrap(),
-            transform: VarDctOutputTransform::Xyb(inverse_opsin()),
+            transform: ColorOutputTransform::Xyb(inverse_opsin()),
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         };
         let layout = rgb_layout(3, 5);
         config.validate_layout(&layout).unwrap();
         assert!(matches!(
             config.validate_layout(&rgb_layout(5, 3)),
-            Err(VarDctOutputError::ImageOutput(
+            Err(ColorOutputError::ImageOutput(
                 jxl_wgpu::Error::InvalidPayload(_)
             ))
         ));
@@ -1084,7 +1126,7 @@ mod tests {
         wrong_size.logical_size -= 1;
         assert!(matches!(
             config.validate_layout(&wrong_size),
-            Err(VarDctOutputError::ImageOutput(
+            Err(ColorOutputError::ImageOutput(
                 jxl_wgpu::Error::InvalidPayload(_)
             ))
         ));
@@ -1096,7 +1138,7 @@ mod tests {
             color.transfer = transfer;
             assert!(matches!(
                 config.validate_layout(&hdr),
-                Err(VarDctOutputError::HdrLuminanceMappingRequired)
+                Err(ColorOutputError::HdrLuminanceMappingRequired)
             ));
         }
         let mut limited_rgb = layout;
@@ -1106,9 +1148,9 @@ mod tests {
         color.range = jxl_gpu_formats::ColorRange::Limited;
         assert!(matches!(
             config.validate_layout(&limited_rgb),
-            Err(VarDctOutputError::ImageOutput(
-                jxl_wgpu::Error::Unsupported(_)
-            ))
+            Err(ColorOutputError::ImageOutput(jxl_wgpu::Error::Unsupported(
+                _
+            )))
         ));
     }
 
@@ -1127,12 +1169,12 @@ mod tests {
                 apply_limit_buckets: false,
             }))
         else {
-            eprintln!("skipping VarDCT color packer GPU test: no adapter");
+            eprintln!("skipping reconstructed color packer GPU test: no adapter");
             return;
         };
         let Ok((device, queue)) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("jxl-wgpu VarDCT color packer test"),
+                label: Some("jxl-wgpu reconstructed color packer test"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -1140,7 +1182,7 @@ mod tests {
                 trace: wgpu::Trace::Off,
             }))
         else {
-            eprintln!("skipping VarDCT color packer GPU test: device request failed");
+            eprintln!("skipping reconstructed color packer GPU test: device request failed");
             return;
         };
         let storage_plane = |label, samples: &[f32]| {
@@ -1150,24 +1192,27 @@ mod tests {
                 usage: wgpu::BufferUsages::STORAGE,
             })
         };
-        let x = storage_plane("VarDCT color test X", &[0.028_100_073, -0.015_386_105, 0.0]);
+        let x = storage_plane(
+            "reconstructed color test X",
+            &[0.028_100_073, -0.015_386_105, 0.0],
+        );
         let y = storage_plane(
-            "VarDCT color test Y",
+            "reconstructed color test Y",
             &[0.488_188_2, 0.714_781_34, 0.278_128_2],
         );
         let b = storage_plane(
-            "VarDCT color test B",
+            "reconstructed color test B",
             &[0.471_659, 0.437_076_93, 0.666_139_84],
         );
         // Modular reconstruction is signed and can overshoot the declared sample range.
         // F32 output preserves it; integer output clamps during final quantization.
         let alpha = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("VarDCT signed alpha with prefix"),
+            label: Some("reconstructed signed alpha with prefix"),
             contents: bytemuck::cast_slice(&[99_i32, 99, -7, 17, 40]),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("VarDCT color test output"),
+            label: Some("reconstructed color test output"),
             size: 128,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -1175,7 +1220,7 @@ mod tests {
             mapped_at_creation: false,
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("VarDCT color test staging"),
+            label: Some("reconstructed color test staging"),
             size: 128,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -1187,7 +1232,7 @@ mod tests {
                 size: NonZeroU64::new(buffer.size()).unwrap(),
             }
         }
-        let packer = VarDctOutputPacker::new(&device).unwrap();
+        let packer = ColorOutputPacker::new(&device).unwrap();
         for extent in [Extent2d::new(3, 1), Extent2d::new(1, 3)] {
             for value in 1..=8 {
                 let orientation = OutputOrientation::from_exif_value(value).unwrap();
@@ -1223,10 +1268,10 @@ mod tests {
                     queue.write_buffer(&output, 0, &[0xa5; 128]);
                     let mut encoder =
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("VarDCT color test commands"),
+                            label: Some("reconstructed color test commands"),
                         });
-                    let inputs = VarDctOutputInputs {
-                        alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
+                    let inputs = ColorOutputInputs {
+                        alpha: matches!(layout_kind, 2 | 4).then_some(ColorOutputAlpha {
                             domain: crate::ModularSampleDomain::Encoded,
                             storage: binding(&alpha),
                             width: extent.width,
@@ -1238,19 +1283,19 @@ mod tests {
                             },
                         }),
                         planes: [
-                            VarDctOutputPlane {
+                            ColorOutputPlane {
                                 storage: binding(&x),
                                 width: extent.width,
                                 height: extent.height,
                                 stride: extent.width,
                             },
-                            VarDctOutputPlane {
+                            ColorOutputPlane {
                                 storage: binding(&y),
                                 width: extent.width,
                                 height: extent.height,
                                 stride: extent.width,
                             },
-                            VarDctOutputPlane {
+                            ColorOutputPlane {
                                 storage: binding(&b),
                                 width: extent.width,
                                 height: extent.height,
@@ -1259,10 +1304,10 @@ mod tests {
                         ],
                         output: binding(&output),
                         layout: &layout,
-                        config: VarDctOutputConfig {
+                        config: ColorOutputConfig {
                             extent,
                             orientation,
-                            transform: VarDctOutputTransform::Xyb(inverse_opsin()),
+                            transform: ColorOutputTransform::Xyb(inverse_opsin()),
                             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
                         },
                     };
@@ -1275,13 +1320,13 @@ mod tests {
                             converted.config.alpha_conversion = conversion;
                             assert!(matches!(
                                 packer.encode(&device, &mut encoder, converted),
-                                Err(VarDctOutputError::MissingAlphaPlane)
+                                Err(ColorOutputError::MissingAlphaPlane)
                             ));
                         }
                     }
                     let scratch = packer
                         .encode(&device, &mut encoder, inputs)
-                        .expect("record fused VarDCT color output");
+                        .expect("record fused reconstructed color output");
                     assert_eq!(
                         scratch.plan.memory.logical_output_bytes,
                         layout.logical_size
@@ -1305,15 +1350,15 @@ mod tests {
                             submission_index: Some(submission),
                             timeout: None,
                         })
-                        .expect("poll fused VarDCT color output");
+                        .expect("poll fused reconstructed color output");
                     receiver
                         .recv()
-                        .expect("VarDCT color map callback")
-                        .expect("map VarDCT color output");
+                        .expect("reconstructed color map callback")
+                        .expect("map reconstructed color output");
                     let mapped = staging
                         .slice(..)
                         .get_mapped_range()
-                        .expect("mapped VarDCT color output");
+                        .expect("mapped reconstructed color output");
                     // These gold sequences use the physical row/column direction of each orientation,
                     // independently of the shader's inverse-coordinate mapping.
                     let reversed = if extent.width == 3 {

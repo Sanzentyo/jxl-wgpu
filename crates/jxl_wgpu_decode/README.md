@@ -324,21 +324,43 @@ the complete logical reconstruction workspace and finalize through the generic o
 `ModularPredictionProfile::MetaAdaptive` with exact node/decision/leaf counts, maximum depth, and
 self-correcting usage; custom synthetic engines use the distinct `Fixed` variant.
 
-For the lossless-Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
+For the Modular `WgpuSubmissionEngine`, the complete transform wire grammar and resulting
 channel topology are parsed, local MA trees select per-stream metadata bases, and resident
 RCT/Palette/Squeeze stacks execute for single- and multi-group streams. Multi-group DC-global
 Palette/Squeeze sample data is reconstructed in a frame arena. LF-group streams own exactly the
 channels whose horizontal and vertical transformed shifts are both at least three; pass groups own
 the remaining channels, including asymmetric shifts. LF streams execute before nonempty pass
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
-one global inverse/finalizer runs after assembly. One through three passes produce an exact final
-image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular,
-patches, splines, and noise remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+one global inverse/finalizer runs after assembly. One through three passes produce a complete final
+image; intermediate pass presentation is not yet exposed. Patches, splines, noise and broader
+original color profiles remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.
 
 ### Frame execution and animation
+
+Lossy Modular color now enters this executor after frame-wide inverse transforms. XYB words are
+stored as Y/X/(B-Y); GPU normalization reorders them, restores B in the working integer domain and
+applies the LF dequantization multipliers independently of source bit-depth metadata. Original
+RGB/gray uses its declared integer or floating sample interpretation. Gaborish and all three EPF
+passes operate before color upsampling; extra planes retain their separate normalization and
+upsampling paths. Modular EPF uses a validated frame-constant inverse sigma without a sigma image.
+
+`color_output::{ColorOutputPacker, ColorOutputConfig, ColorOutputTransform}` is the common public
+RGB/XYB/JPEG color boundary, replacing the former `vardct::output` API. It preserves the stream's
+inverse opsin matrix, biases, intensity target and grayscale projection. The Modular finalizer
+does not reapply the transfer already performed by this packer. Unreferenced XYB presentations
+retain linear RGB so spot colors are applied before transfer conversion; referenced/blended
+frames retain original sRGB. All temporary color/filter/upsampling planes and uniforms participate
+in `modular_render_bytes` and the backend's shared memory reservation.
+
+`tests/lossy_modular.rs` checks 19 libjxl streams, all delivered extra planes and presentations,
+whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quantization and
+reservation release. Fifteen stills and the initial Replace presentation of four animations also
+match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
+clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
+color management, pre-transform references, patches, splines and noise remain separate work.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers, the four reference-slot versions before each frame, save-before/after
@@ -458,7 +480,7 @@ RGB or grayscale presentation encoding, no ICC profile or extra channel, and no 
 unsupported frame feature. Cropped/blended animations and layered stills enter through the frame
 executor above; the low-level standalone VarDCT entry point remains an uncropped still API.
 
-All image orientations 1–8 are normalized before target chroma subsampling and packing. `VarDctOutputConfig` explicitly
+All image orientations 1–8 are normalized before target chroma subsampling and packing. `ColorOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
 Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
 in codestream coordinates. The shared 192-byte output uniform carries geometry and orientation,
@@ -698,7 +720,7 @@ Unassociated/Preserve/Associated output policy.
 The codec source fragment reconstructs unclipped linear BT.709 from XYB, or encoded sRGB from
 JPEG components, inside the render backend's shared word-owned output shader. Chroma sampling
 therefore follows orientation and full-precision reconstruction before one final quantization.
-`VarDctOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
+`ColorOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
 byte length and four-byte storage rounding. Separate 192-byte output and 160-byte source uniforms
 cost 352 bytes in total and are checked individually against binding limits. Padded rows, unaligned
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.

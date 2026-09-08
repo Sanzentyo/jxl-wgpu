@@ -28,6 +28,7 @@ compile_error!(
 mod buffer_pool;
 mod codec_engine;
 mod codestream_data;
+pub mod color_output;
 mod entropy;
 mod entropy_window;
 mod error;
@@ -53,6 +54,7 @@ mod modular_transform;
 mod modular_tree;
 mod profile;
 mod progressive_dc;
+mod restoration;
 mod session;
 mod vardct_artifact;
 mod vardct_engine;
@@ -60,7 +62,6 @@ mod vardct_epf;
 mod vardct_extra;
 mod vardct_frontend;
 mod vardct_lf;
-mod vardct_output;
 mod vardct_packet;
 mod vardct_pass_group;
 mod vardct_resource;
@@ -105,6 +106,7 @@ pub use modular_palette::ModularPaletteError;
 pub use modular_render::{ModularRenderError, ModularSampleDomain};
 pub use modular_scalar_output::ModularScalarOutputError;
 pub use progressive_dc::ProgressiveDcGpuError;
+pub use restoration::RestorationError;
 pub use session::{
     GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,
     GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure,

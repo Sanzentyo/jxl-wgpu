@@ -57,8 +57,9 @@ impl ModularGroup {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StandardModularProfile {
+    pub color_render: Option<crate::modular_render::ModularColorConfig>,
     pub output_width: u32,
     pub output_height: u32,
     pub channel_upsampling: Vec<u32>,
@@ -157,7 +158,7 @@ fn validate_image_header(
             value: image.orientation,
         },
     )?;
-    let colour_space = if channels.color_count() == 1 {
+    let colour_space = if image.grayscale {
         ColourSpaceInventory::Grey
     } else {
         ColourSpaceInventory::Rgb
@@ -224,7 +225,7 @@ fn parse_modular_profile(
 ) -> Result<StandardModularProfile> {
     let image = &inventory.image_header;
     if image.width == 0 || image.height == 0 {
-        return unsupported("the lossless Modular GPU profile requires a non-empty image");
+        return unsupported("the Modular GPU profile requires a non-empty image");
     }
     let sample_encoding = match ModularSampleEncoding::new(image.bit_depth) {
         Some(encoding) => encoding,
@@ -256,9 +257,6 @@ fn parse_modular_profile(
     }
     let orientation = match purpose {
         ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
-            if image.xyb_encoded {
-                return unsupported("the lossless Modular GPU profile does not use XYB metadata");
-            }
             validate_image_header(image, channels)?
         }
         ModularProfilePurpose::ProgressiveDc => {
@@ -283,13 +281,14 @@ fn parse_modular_profile(
             .extra_channel_upsampling
             .iter()
             .any(|&factor| !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling)
-        || !matches!(
-            frame.restoration_filter,
-            RestorationFilterInventory::Custom {
-                gaborish: GaborishInventory::Disabled,
-                epf: EdgePreservingFilterInventory::Disabled,
-            }
-        )
+        || (purpose == ModularProfilePurpose::ProgressiveDc
+            && !matches!(
+                frame.restoration_filter,
+                RestorationFilterInventory::Custom {
+                    gaborish: GaborishInventory::Disabled,
+                    epf: EdgePreservingFilterInventory::Disabled,
+                }
+            ))
         || frame.group_size_shift > 3
         || (purpose == ModularProfilePurpose::Presentation
             && (frame.have_crop
@@ -329,10 +328,10 @@ fn parse_modular_profile(
     if shared_frame_is_invalid || role_is_invalid {
         return unsupported(match purpose {
             ModularProfilePurpose::Presentation => {
-                "the lossless Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references"
+                "the Modular GPU profile requires one final uncropped regular frame with canonical grouping, replace blending, and no references"
             }
             ModularProfilePurpose::Frame => {
-                "the Modular frame producer requires one regular, skip-progressive, or reference-only frame with canonical grouping and no restoration or frame features"
+                "the Modular frame producer requires one regular, skip-progressive, or reference-only frame with canonical grouping and no unsupported frame features"
             }
             ModularProfilePurpose::ProgressiveDc => {
                 "the progressive-DC Modular GPU profile requires one uncropped root LF frame with canonical grouping and XYB reference retention"
@@ -342,9 +341,7 @@ fn parse_modular_profile(
     if !(1..=MAX_MODULAR_PASSES).contains(&frame.num_passes) {
         return Err(UnsupportedProfile::new(
             UnsupportedCodestreamFeature::MultiplePasses,
-            format!(
-                "the lossless Modular GPU frontend accepts one through {MAX_MODULAR_PASSES} passes"
-            ),
+            format!("the Modular GPU frontend accepts one through {MAX_MODULAR_PASSES} passes"),
         )
         .into());
     }
@@ -389,6 +386,15 @@ fn parse_modular_profile(
     let mut reader = codestream.reader();
     reader.skip_bits(dc_global.bits.offset)?;
     let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
+    let color_render = if purpose == ModularProfilePurpose::ProgressiveDc {
+        None
+    } else {
+        crate::modular_render::ModularColorConfig::new(
+            image,
+            frame,
+            lf_dequantization.map(FiniteF16::to_f32),
+        )?
+    };
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
             &mut reader,
@@ -452,6 +458,7 @@ fn parse_modular_profile(
         // A multi-entry frame may keep every sample in DC-global even without transforms.
         // Those channels have no pass-group arena and must survive in the frame allocation.
         let requires_frame_arena = global_channel_count != 0
+            || color_render.is_some()
             || resampling
             || transform_plan
                 .transforms
@@ -849,6 +856,7 @@ fn parse_modular_profile(
             )
             && image.extra_channels[0].bit_depth == image.bit_depth);
     let generalized_channels = sample_encoding.is_float()
+        || color_render.is_some()
         || sample_encoding.bits() > 16
         || resampling
         || !conventional_alpha
@@ -922,6 +930,7 @@ fn parse_modular_profile(
     });
 
     Ok(StandardModularProfile {
+        color_render,
         frame_name: String::from_utf8(frame.name_bytes.clone()).map_err(|_| {
             Error::FramePlan(crate::FramePlanError::InvalidFrame {
                 frame_index: frame.frame_index,
@@ -1256,9 +1265,7 @@ fn validate_modular_section_structure(
                 .end()
                 .ok_or_else(|| unsupported_error("Modular section bit range overflow"))?;
             if !codestream.bits_are_zero(section.bits.offset, end)? {
-                return unsupported(
-                    "the lossless Modular profile requires an empty HF-global section",
-                );
+                return unsupported("the Modular profile requires an empty HF-global section");
             }
         }
     }
@@ -1308,6 +1315,122 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn lossy_modular_profiles_preserve_real_color_and_filter_topologies() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/lossy_modular");
+        let mut seen_epf = [false; 4];
+        let mut files = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".jxl.hex"))
+            else {
+                continue;
+            };
+            files += 1;
+            let data = fixture(&std::fs::read_to_string(&path).unwrap());
+            let parsed = parse(&data, Default::default()).unwrap();
+            let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+            let source = GpuCodestream::from_spans([(
+                0,
+                StreamSlice::from_shared(Arc::from(parsed.codestream())),
+            )])
+            .unwrap();
+            assert_eq!(
+                inventory.image_header.xyb_encoded,
+                name != "extras_lossy_original",
+                "{name}"
+            );
+            for frame in &inventory.frames {
+                assert_eq!(frame.encoding, FrameEncoding::Modular, "{name}");
+                let mut single = inventory.clone();
+                single.frames = vec![frame.clone()];
+                let profile = parse_modular_frame_profile(&source, &single).unwrap();
+                assert!(profile.color_render.is_some(), "{name}");
+                assert!(profile.generalized_channels, "{name}");
+                if profile.groups.len() > 1 {
+                    assert!(profile.resident_frame_plan.is_some(), "{name}");
+                }
+                if name == "extras_lossy_distributed" {
+                    assert!(profile.groups.len() > 1);
+                    assert!(
+                        profile
+                            .resident_frame_plan
+                            .as_ref()
+                            .unwrap()
+                            .inverse_plan
+                            .jobs()
+                            .iter()
+                            .any(|job| matches!(
+                                job,
+                                crate::modular_inverse::ModularInverseJob::Squeeze { .. }
+                            ))
+                    );
+                }
+                if let Some(iteration) = name.strip_prefix("extras_lossy_epf") {
+                    let iteration = iteration.parse::<usize>().unwrap();
+                    let RestorationFilterInventory::Custom { epf, .. } = frame.restoration_filter
+                    else {
+                        panic!("explicit filter");
+                    };
+                    assert!(
+                        matches!(
+                            (iteration, epf),
+                            (0, EdgePreservingFilterInventory::Disabled)
+                        ) || matches!(epf, EdgePreservingFilterInventory::Enabled { iterations, .. } if iterations as usize == iteration)
+                    );
+                    seen_epf[iteration] = true;
+                }
+            }
+        }
+        assert_eq!(files, 19);
+        assert_eq!(seen_epf, [true; 4]);
+    }
+
+    #[test]
+    fn invalid_modular_render_metadata_is_rejected_before_submission() {
+        let data = fixture(include_str!(
+            "../test-data/lossy_modular/extras_lossy_epf2.jxl.hex"
+        ));
+        let parsed = parse(&data, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let source = GpuCodestream::from_spans([(
+            0,
+            StreamSlice::from_shared(Arc::from(parsed.codestream())),
+        )])
+        .unwrap();
+        let mut invalid = inventory.clone();
+        invalid.frames[0].restoration_filter = RestorationFilterInventory::Custom {
+            gaborish: GaborishInventory::Disabled,
+            epf: EdgePreservingFilterInventory::Enabled {
+                iterations: 2,
+                sharp_lut: None,
+                weights: None,
+                sigma: None,
+                sigma_for_modular: Some(FiniteF16::from_bits(0).unwrap()),
+            },
+        };
+        assert!(matches!(
+            parse_standard_modular_profile(&source, &invalid),
+            Err(Error::ModularRender(
+                crate::ModularRenderError::Restoration(
+                    crate::RestorationError::InvalidModularSigma { value: 0.0 }
+                )
+            ))
+        ));
+        invalid = inventory;
+        invalid.image_header.opsin_inverse_matrix = None;
+        assert!(matches!(
+            parse_standard_modular_profile(&source, &invalid),
+            Err(Error::ModularRender(crate::ModularRenderError::Invalid {
+                reason: "XYB inverse opsin metadata is missing"
+            }))
+        ));
+    }
 
     #[test]
     fn wide_integer_fixtures_execute_real_rct_squeeze_and_multiple_groups() {
@@ -1494,7 +1617,12 @@ mod tests {
         assert!(parse_standard_modular_profile(&source, &inventory).is_err());
         inventory.frames[0].extra_channel_upsampling = vec![1];
         inventory.frames[0].restoration_filter = RestorationFilterInventory::Default;
-        assert!(parse_standard_modular_profile(&source, &inventory).is_err());
+        assert!(
+            parse_standard_modular_profile(&source, &inventory)
+                .unwrap()
+                .color_render
+                .is_some()
+        );
     }
 
     #[test]

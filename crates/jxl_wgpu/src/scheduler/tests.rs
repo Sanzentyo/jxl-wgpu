@@ -306,7 +306,8 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
         channel_scale_y: f32::from_bits(16),
         channel_scale_b: f32::from_bits(17),
         min_sigma: f32::from_bits(18),
-        _padding: [19, 20],
+        constant_sigma: f32::from_bits(19),
+        _padding: 20,
     });
     assert_wgsl_fields(
         include_str!("../../shaders/epf.wgsl"),
@@ -330,7 +331,7 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
             "channel_scale_y",
             "channel_scale_b",
             "min_sigma",
-            "_pad0",
+            "constant_sigma",
             "_pad1",
         ],
     );

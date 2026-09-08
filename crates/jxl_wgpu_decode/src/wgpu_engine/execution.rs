@@ -960,14 +960,19 @@ fn build_modular_finalizers(
     } else {
         planes
     };
-    let color = ModularFinalizeParams::new(
-        region,
-        color_planes,
-        arena_words,
-        modular_finalize_output(output)?,
-    )?
-    .with_source_domain(domain)
-    .with_alpha_conversion(output.source_channels.alpha_conversion);
+    let mut color_output = modular_finalize_output(output)?;
+    if output
+        .render
+        .as_ref()
+        .is_some_and(|render| render.color_converted())
+    {
+        // The common color packer has already applied the requested transfer. The finalizer
+        // only delivers these words and converts alpha association at that same boundary.
+        color_output.transfer = 0;
+    }
+    let color = ModularFinalizeParams::new(region, color_planes, arena_words, color_output)?
+        .with_source_domain(domain)
+        .with_alpha_conversion(output.source_channels.alpha_conversion);
     let mut result = vec![color];
     if let Some(surface) = &output.surface {
         if planes.len() != 3 + surface.extras.len() {
