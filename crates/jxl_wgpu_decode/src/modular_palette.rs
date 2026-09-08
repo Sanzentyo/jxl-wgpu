@@ -139,7 +139,7 @@ impl ModularPaletteJob {
     }
 
     fn validate(self) -> Result<(), ModularPaletteError> {
-        if self.predictor >= 14 || !(1..=24).contains(&self.bit_depth) {
+        if self.predictor >= 14 || !(1..=32).contains(&self.bit_depth) {
             return Err(ModularPaletteError::InvalidParams {
                 reason: "predictor or bit depth is outside the JPEG XL domain",
             });
@@ -352,7 +352,7 @@ impl ModularPalettePipeline {
         validate_variant(variant, &device.limits())?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jxl-wgpu decode resident Modular Palette"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::modular_predict::shader(SHADER).into()),
         });
         let constants = [("wg_x", f64::from(variant.workgroup_size().0))];
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(std::mem::align_of::<ModularPaletteParams>(), 16);
         fn assert_pod<T: Pod>() {}
         assert_pod::<ModularPaletteParams>();
-        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
+        let module = naga::front::wgsl::parse_str(&crate::modular_predict::shader(SHADER)).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -802,17 +802,21 @@ mod tests {
         let width = 9u32;
         let height = 5u32;
         let samples = width * height;
-        let palette_values = [-3i32, 5, 40, 180];
+        let palette_values = [i32::MIN, i32::MAX, 0x7fc0_0000, -180];
         let indices = (0..samples)
             .map(|index| i32::try_from((index * 7 + index / width * 3) % 4).unwrap())
             .collect::<Vec<_>>();
         let palette_offset = 0u32;
         let index_offset = palette_values.len() as u32;
         let output_start = index_offset + samples;
-        let implicit_indices = [-1i32, -2, -3, -4, 0, 3, 63, 64, 68];
+        let implicit_indices = [-1i32, -2, -3, -4, 0, 3, 63, 64, 68, 188, 189, i32::MAX];
+        let implicit_cases = (1..=32)
+            .flat_map(|bits| (0..4).map(move |channel| (bits, channel)))
+            .collect::<Vec<_>>();
         let implicit_index_offset = output_start + samples * predictors.len() as u32;
         let implicit_output_offset = implicit_index_offset + implicit_indices.len() as u32;
-        let arena_words = implicit_output_offset + implicit_indices.len() as u32;
+        let arena_words =
+            implicit_output_offset + (implicit_indices.len() * implicit_cases.len()) as u32;
         let mut initial = vec![0i32; arena_words as usize];
         initial[..palette_values.len()].copy_from_slice(&palette_values);
         initial[index_offset as usize..(index_offset + samples) as usize].copy_from_slice(&indices);
@@ -887,48 +891,51 @@ mod tests {
                     .unwrap(),
             );
         }
-        uniforms.extend(
-            pipeline
-                .encode(
-                    &device,
-                    &mut encoder,
-                    binding,
-                    ModularPaletteJob::new(
-                        ModularPalettePlane {
-                            width: 0,
-                            height: 1,
-                            stride: 0,
-                            offset_words: 0,
-                        },
-                        ModularPalettePlane {
-                            width: implicit_indices.len() as u32,
-                            height: 1,
-                            stride: implicit_indices.len() as u32,
-                            offset_words: implicit_index_offset,
-                        },
-                        ModularPalettePlane {
-                            width: implicit_indices.len() as u32,
-                            height: 1,
-                            stride: implicit_indices.len() as u32,
-                            offset_words: implicit_output_offset,
-                        },
-                        ModularPaletteMetadata {
-                            palette_channel: 0,
-                            color_count: 0,
-                            delta_count: 0,
-                            predictor: 0,
-                            bit_depth: 8,
-                        },
-                        ModularPaletteScratch {
-                            offset_words: 0,
-                            words: 0,
-                        },
+        for (case_index, &(bit_depth, channel)) in implicit_cases.iter().enumerate() {
+            uniforms.extend(
+                pipeline
+                    .encode(
+                        &device,
+                        &mut encoder,
+                        binding,
+                        ModularPaletteJob::new(
+                            ModularPalettePlane {
+                                width: 0,
+                                height: 4,
+                                stride: 0,
+                                offset_words: 0,
+                            },
+                            ModularPalettePlane {
+                                width: implicit_indices.len() as u32,
+                                height: 1,
+                                stride: implicit_indices.len() as u32,
+                                offset_words: implicit_index_offset,
+                            },
+                            ModularPalettePlane {
+                                width: implicit_indices.len() as u32,
+                                height: 1,
+                                stride: implicit_indices.len() as u32,
+                                offset_words: implicit_output_offset
+                                    + (case_index * implicit_indices.len()) as u32,
+                            },
+                            ModularPaletteMetadata {
+                                palette_channel: channel,
+                                color_count: 0,
+                                delta_count: 0,
+                                predictor: 0,
+                                bit_depth,
+                            },
+                            ModularPaletteScratch {
+                                offset_words: 0,
+                                words: 0,
+                            },
+                        )
+                        .unwrap(),
+                        ModularPaletteWeightedParams::from(WpHeaderIr::default()),
                     )
                     .unwrap(),
-                    ModularPaletteWeightedParams::from(WpHeaderIr::default()),
-                )
-                .unwrap(),
-        );
+            );
+        }
         encoder.copy_buffer_to_buffer(&arena, 0, &staging, 0, arena.size());
         queue.submit([encoder.finish()]);
         drop(uniforms);
@@ -948,11 +955,32 @@ mod tests {
             let start = (output_start + job_index as u32 * samples) as usize;
             assert_eq!(&actual[start..start + samples as usize], expected);
         }
-        assert_eq!(
-            &actual[implicit_output_offset as usize
-                ..implicit_output_offset as usize + implicit_indices.len()],
-            &[0, 4, -4, 11, 32, 223, 223, 0, 255]
-        );
+        for (case_index, &(bits, channel)) in implicit_cases.iter().enumerate() {
+            let expected = implicit_indices.map(|index| {
+                if channel >= 3 {
+                    return 0;
+                }
+                if index < 0 {
+                    let values = [[0; 3], [4; 3], [-4; 3], [11, 0, 0]];
+                    return values[(-index - 1) as usize][channel as usize]
+                        << (bits.clamp(8, 24) - 8);
+                }
+                let maximum = (1u64 << bits) - 1;
+                if index < 64 {
+                    let digit = (index as u64 >> (channel * 2)) % 4;
+                    (digit * maximum / 4 + (1 << (bits.max(3) - 3))) as i32
+                } else {
+                    let digit = ((index as u64 - 64) / 5u64.pow(channel)) % 5;
+                    (digit * maximum / 4) as i32
+                }
+            });
+            let start = implicit_output_offset as usize + case_index * implicit_indices.len();
+            assert_eq!(
+                &actual[start..start + implicit_indices.len()],
+                &expected,
+                "implicit Palette: {bits} bits, channel {channel}"
+            );
+        }
         drop(mapped);
         staging.unmap();
     }

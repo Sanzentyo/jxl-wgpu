@@ -42,6 +42,13 @@ other driver-private allocations cannot be measured portably and are not include
   read-write resources. The kernel uses no workgroup storage; each invocation serially owns one row
   or column and therefore needs no inter-invocation barrier. Smooth tendency uses two-word integer
   temporaries because portable WGSL has no `i64`.
+- Entropy and Palette reconstruction share `modular_predict.wgsl`. Its signed 64-bit predictions,
+  averages, corrections, and weighted products use the low/high `u32` pair in
+  `modular_int64.wgsl`; those temporaries add no storage binding or allocation. Committed true
+  errors remain `i32`, and absolute subprediction errors remain `u32`, including their specified
+  narrowing and wrapping sums. The five-word-per-column weighted row state and existing resume
+  tails are unchanged. Implicit Palette scaling also uses the shared wide product through a
+  32-bit working depth, while negative delta scaling still caps at 24 bits.
 - `ModularRctParams` is another 64-byte, 16-byte-aligned `Pod` uniform with three
   `width,height,row_stride,word_offset` records and an RCT type plus three reserved words. The three
   footprints are pairwise non-overlapping views of one read-write arena binding. Every invocation

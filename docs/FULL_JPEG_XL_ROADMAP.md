@@ -142,6 +142,14 @@ correctness. Dependencies name other item IDs in this document.
 | `VDCT-D06` | P1 | **Partial** | Spectral and quantized progressive AC passes now accumulate on GPU before dequantization/restoration; only the validated final frame is published. A checked-in three-frame recursive DC plus quantized-AC stream also executes its global-only Modular root, intermediate VarDCT frame, and final AC passes without pixel readback. Eleven descriptor passes and shifts 0–3 have bounded parser/truncated-tail coverage. Completion requires exposing DC/LF/pass progression, comparing every intermediate level with libjxl, and full conformance precision evidence. | `VDCT-D03`, `API-03` |
 | `VDCT-D07` | P1 | **Partial** | The public VarDCT decoder executes JPEG reconstruction's 4:4:4, 4:2:2, 4:4:0, and 4:2:0 component layouts with normative quarter/three-quarter weights and replicated odd borders inside the resident output pass. The same horizontal/vertical kernels, with a fused two-axis form, now expand shifted components before a signaled full-resolution restoration sequence without readback. Ordinary VarDCT frames now use their encoded sample grid for entropy/restoration and the exact presented grid for 2×/4×/8× resampling. Standard and custom compact weights expand into one shared phase-major kernel, with three resident 5×5 filter dispatches before color conversion. Seven checked libjxl fixtures cover all factors, nearest-neighbor weights, spectral AC plus 4× resampling, odd extents, one-sample axes, and a 4111×17 two-LF-group output; whole and bounded async results differ from Rust jxl and djxl by at most one RGB8 code on Apple M5. Exact plane/weight/uniform costs share the frame budget, and an undersized budget is rejected before submission. Completion requires a valid subsampled-restoration interoperability fixture, uncommon asymmetric JPEG layouts, and broader conformance precision. | `MOD-D05`, `RENDER-01` |
 
+Modular predictor arithmetic for `MOD-D02/03` now covers the full signed 32-bit working-word domain.
+Entropy and Palette share all 14 predictors with portable 64-bit intermediate arithmetic, while
+committed error rows and bounded-input resume layouts retain their normative 32-bit storage.
+Implicit Palette color scaling supports all working depths through 32 bits. Direct GPU comparisons
+cover arithmetic boundaries, binary32 bit patterns, all predictor outputs and error updates, and
+all implicit color components at every depth. Source floating-point interpretation and delivery
+remain separate unfinished requirements in `MOD-D01` and `IO-01`.
+
 Progressive-DC checkpoint for `MOD-D03/04` and `VDCT-D01`: a recursive coarse-to-fine plan and one
 logical blocking/poll/Future pending state are implemented. The Modular producer's final signed
 planes become three resident F32 XYB buffers using the exact LF binary16 multipliers divided by

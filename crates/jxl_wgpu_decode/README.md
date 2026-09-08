@@ -182,6 +182,14 @@ Its portable WGSL emulates the required signed 64-bit smooth-tendency intermedia
 words, then applies the specified wrapping `i32` reconstruction. Actual-adapter tests compare odd,
 even, one-dimensional, and extreme-value cases to an independent scalar oracle. The stock decoder
 feeds transformed entropy output directly into this arena.
+Entropy reconstruction and inverse Palette share one implementation of all 14 Modular predictors.
+Their averaging, self-correcting predictions, and weighted sums use portable signed 64-bit
+intermediates represented by two GPU words. Persistent predictor errors retain the specified
+`i32`/`u32` storage, so bounded-input and Palette continuation layouts remain unchanged. Implicit
+Palette entries use a wide product for every 1–32-bit working depth; negative delta entries retain
+the normative 24-bit scaling cap. Direct GPU tests cover signed extremes, binary32 bit patterns,
+all implicit color components, and every predictor against a native-`i64` scalar oracle. This
+working-word support does not change source-sample admission or imply floating-point delivery.
 A standalone `ModularRctPipeline` applies every one of the 42 normative operation/permutation
 combinations in place to three equal-size, non-overlapping views of that same arena. Each invocation
 loads all three signed words before writing any permutation, while explicit unsigned add/sub helpers

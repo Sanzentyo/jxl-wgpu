@@ -3049,10 +3049,12 @@ pub fn vardct_packet_shader_source() -> String {
 }
 
 fn shader_source() -> String {
-    SHADER_TEMPLATE
-        .replace(ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI)
-        .replace(ENTROPY_MARKER, MODULAR_ENTROPY)
-        .replace(RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT)
+    crate::modular_predict::shader(
+        &SHADER_TEMPLATE
+            .replace(ENTROPY_ABI_MARKER, MODULAR_ENTROPY_ABI)
+            .replace(ENTROPY_MARKER, MODULAR_ENTROPY)
+            .replace(RECONSTRUCT_MARKER, MODULAR_RECONSTRUCT),
+    )
 }
 
 const fn transform_id(transform: TransformKind) -> u32 {

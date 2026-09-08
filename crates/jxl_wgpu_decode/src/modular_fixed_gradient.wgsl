@@ -6,9 +6,9 @@
 //! omits MA traversal, Weighted prediction, unused neighbors, predictor dispatch, and per-sample
 //! division/modulo. It provides the same `decode_adaptive_channel()` entry as the generic fragment.
 
+/*__JXL_MODULAR_INTEGER__*/
 fn fixed_gradient_i32(north: i32, west: i32, north_west: i32) -> i32 {
-    let gradient = north + west - north_west;
-    return clamp(gradient, min(north, west), max(north, west));
+    return mi_gradient(north, west, north_west);
 }
 
 // The specialized path derives every predictor neighbor from the resident sample rows, so the

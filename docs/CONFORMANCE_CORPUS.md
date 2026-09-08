@@ -123,6 +123,15 @@ channels, leading 8×8/4×4/4×4 planes, no RCT, and a sample count equal to the
 planes. Reverse-topology tests recover data- and meta-Palette selections plus odd Squeeze sources;
 an explicit work-limit case prevents repeated transforms from turning bounded channel metadata into
 unbounded quadratic planning.
+The shared Modular predictor tests execute ten portable wide-arithmetic operations over signed
+boundary values and deterministic random inputs, including shifts at 0, 31, 32, 63, and 64 bits.
+A native-`i64` oracle checks all 14 predictors, wide self-correcting intermediates, and committed
+32-bit errors for 512 cases containing extreme integers and binary32 bit patterns. The Palette
+execution gate also covers all implicit color components at every 1–32-bit working depth and
+explicit delta reconstruction with signed extremes. Existing whole/bounded entropy and chunked
+Palette tests verify the shared predictor's storage callbacks and continuation state. These gates
+establish working-word arithmetic; floating sample conversion and codestream delivery have their
+own unfinished conformance requirements.
 The inverse-Squeeze kernel has separate semantic and execution gates. Naga parses and validates the
 WGSL module without inspecting source substrings. An actual adapter compares horizontal and vertical
 odd extents plus single-pixel axes against a scalar oracle containing `i32::MIN`, `i32::MAX`, smooth

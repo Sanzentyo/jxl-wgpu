@@ -41,6 +41,7 @@ mod modular_geometry;
 mod modular_grouping;
 mod modular_inverse;
 mod modular_palette;
+mod modular_predict;
 pub mod modular_rct;
 mod modular_render;
 mod modular_scalar_output;

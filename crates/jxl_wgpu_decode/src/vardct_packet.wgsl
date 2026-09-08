@@ -331,7 +331,7 @@ fn decode_channel(
         if y >= 2u { nn = target_load(decoded - 2u * width); }
         var ww = w;
         if x >= 2u { ww = target_load(decoded - 2u); }
-        var weighted = WeightedPrediction(0i, 0i, array<i32, 4>(0i, 0i, 0i, 0i));
+        var weighted = WeightedPrediction();
         if params.needs_self_correcting != 0u {
             weighted = weighted_predict(n, nw, ne, w, nn);
         }

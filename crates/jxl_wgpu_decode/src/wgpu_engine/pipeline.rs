@@ -924,7 +924,7 @@ pub(super) fn shader_source(
         .replace(OUTPUT_WORDS_TYPE_MARKER, output_words_type)
         .replace(WRITE_BYTE_WORD_MARKER, write_byte_word)
         .replace(WRITE_FULL_WORD_MARKER, write_full_word);
-    format!("{}\n{source}", jxl_wgpu::IMAGE_ORIENTATION_SHADER)
+    crate::modular_predict::shader(&format!("{}\n{source}", jxl_wgpu::IMAGE_ORIENTATION_SHADER))
 }
 
 pub(super) fn create_decode_pipeline(
