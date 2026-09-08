@@ -2091,7 +2091,7 @@ fn libjxl_mixed_strategies_and_capacity_strided_metadata_match_reference_on_gpu(
     let extent = Extent2d::new(plan.profile.width, plan.profile.height);
     assert_eq!(extent, Extent2d::new(257, 257));
     assert_eq!(plan.groups.len(), 1);
-    assert_eq!(plan.groups[0].extra_precision, 1);
+    assert_eq!(plan.groups[0].extra_precision(), 1);
     assert_eq!(plan.groups[0].task_capacity, 33 * 33);
     let hf = plan.hf_coefficients.as_ref().unwrap();
     assert_eq!(hf.num_block_clusters, 3);

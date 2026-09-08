@@ -3,13 +3,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void check(JxlEncoderStatus status) {
   if (status != JXL_ENC_SUCCESS) abort();
 }
 
 static void generate(const char* directory, const char* name, uint32_t width,
-                     uint32_t height, int modular, uint32_t extras) {
+                     uint32_t height, int modular, uint32_t extras, int responsive) {
   JxlEncoder* encoder = JxlEncoderCreate(NULL);
   JxlBasicInfo info; JxlEncoderInitBasicInfo(&info);
   info.xsize = width; info.ysize = height; info.bits_per_sample = 8;
@@ -26,6 +27,8 @@ static void generate(const char* directory, const char* name, uint32_t width,
   check(JxlEncoderSetColorEncoding(encoder, &color));
   JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(encoder, NULL);
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, modular));
+  if (responsive >= 0)
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, responsive));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, 7));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EPF, 0));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_GABORISH, 0));
@@ -57,22 +60,33 @@ static void generate(const char* directory, const char* name, uint32_t width,
   }
   free(pixels);
   JxlEncoderCloseInput(encoder);
-  uint8_t output[65536]; uint8_t* next = output; size_t available = sizeof(output);
-  check(JxlEncoderProcessOutput(encoder, &next, &available));
   char path[4096];
   if (snprintf(path, sizeof(path), "%s/%s.jxl", directory, name) >= (int)sizeof(path)) abort();
   FILE* file = fopen(path, "wb"); if (!file) abort();
-  if (fwrite(output, 1, sizeof(output) - available, file) != sizeof(output) - available) abort();
+  JxlEncoderStatus status;
+  do {
+    uint8_t output[16384]; uint8_t* next = output; size_t available = sizeof(output);
+    status = JxlEncoderProcessOutput(encoder, &next, &available);
+    if (status != JXL_ENC_SUCCESS && status != JXL_ENC_NEED_MORE_OUTPUT) abort();
+    const size_t size = sizeof(output) - available;
+    if (fwrite(output, 1, size, file) != size) abort();
+  } while (status == JXL_ENC_NEED_MORE_OUTPUT);
   if (fclose(file)) abort();
   JxlEncoderDestroy(encoder);
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--distributed")) {
+    generate(argv[1], "modular_root", 257, 5, 1, 2, 0);
+    generate(argv[1], "vardct_root", 257, 5, 0, 2, 0);
+    generate(argv[1], "extras", 2051, 33, 0, 2, 1);
+    return 0;
+  }
   if (argc != 2) return 2;
-  generate(argv[1], "modular_root", 9, 5, 1, 2);
-  generate(argv[1], "vardct_root", 9, 5, 0, 2);
-  generate(argv[1], "modular_root2", 2, 1, 1, 2);
-  generate(argv[1], "vardct_root2", 2, 1, 0, 2);
-  generate(argv[1], "extras", 65, 33, 0, 2);
+  generate(argv[1], "modular_root", 9, 5, 1, 2, -1);
+  generate(argv[1], "vardct_root", 9, 5, 0, 2, -1);
+  generate(argv[1], "modular_root2", 2, 1, 1, 2, -1);
+  generate(argv[1], "vardct_root2", 2, 1, 0, 2, -1);
+  generate(argv[1], "extras", 65, 33, 0, 2, -1);
   return 0;
 }

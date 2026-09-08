@@ -20,6 +20,8 @@ use jxl_wgpu_encode::{
 
 #[path = "support/offline/hex.rs"]
 mod hex;
+#[path = "support/lf_extra.rs"]
+mod lf_extra;
 
 fn run(command: &mut Command) -> Vec<u8> {
     let result = command.output().expect("offline libjxl tool");
@@ -167,8 +169,6 @@ fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8
         .unwrap();
     assert_eq!(inventory.frames.len(), 1);
     let frame = &inventory.frames[0];
-    assert_eq!(frame.sections.len(), 1);
-    assert_eq!(frame.sections[0].kind, FrameSectionKind::Single);
     assert_eq!(frame.num_passes, 1);
     assert_eq!(frame.flags, 0);
     assert_eq!(inventory.image_header.extra_channels.len(), 2);
@@ -211,24 +211,16 @@ fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8
     header.write_bits(0, 2).unwrap(); // EPF off
     header.write_bits(0, 4).unwrap(); // restoration/frame extensions
     let header_bits = header.bit_len();
-    let (lf_coefficients, end) = boundaries(data, frame);
-    let mut packet = BitWriter::new();
-    let start = frame.sections[0].bits.offset;
-    if uses_lf {
-        copy_bits(&mut packet, data, start..lf_coefficients.start);
-        copy_bits(&mut packet, data, lf_coefficients.end..end);
-    } else {
-        copy_bits(&mut packet, data, start..end);
-    }
-    packet.align_to_byte().unwrap();
     assemble_frame(
         FramePacketSet::new(
             BitFragment::new(header.into_bytes(), header_bits).unwrap(),
-            FrameGroupLayout::new(1, 1, 1).unwrap(),
-            [GroupPacket::new(
-                GroupPacketKind::Single,
-                packet.into_bytes(),
-            )],
+            FrameGroupLayout::new(
+                frame.low_frequency_group_count.try_into().unwrap(),
+                frame.group_count.try_into().unwrap(),
+                1,
+            )
+            .unwrap(),
+            lf_extra::packets(data, frame, uses_lf),
         )
         .unwrap(),
     )
@@ -237,6 +229,10 @@ fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8
 }
 
 fn main() {
+    let distributed = std::env::args().nth(2).is_some_and(|option| {
+        assert_eq!(option, "--distributed");
+        true
+    });
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
     let output = PathBuf::from(std::env::args_os().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output).unwrap();
@@ -248,7 +244,12 @@ fn main() {
         &generator,
         &["libjxl"],
     );
-    run(Command::new(generator).arg(&temporary));
+    let mut generate = Command::new(generator);
+    generate.arg(&temporary);
+    if distributed {
+        generate.arg("--distributed");
+    }
+    run(&mut generate);
     let decoder = temporary.join("decode");
     compile(
         &source.join("decode_extra_channels.c"),
@@ -261,26 +262,40 @@ fn main() {
         .codestream_inventory(Default::default())
         .unwrap();
     let consumer = physical(&seed, 0, true, false);
-    let middle = physical(
-        &std::fs::read(temporary.join("vardct_root.jxl")).unwrap(),
-        1,
-        true,
-        true,
-    );
+    let middle = (!distributed).then(|| {
+        physical(
+            &std::fs::read(temporary.join("vardct_root.jxl")).unwrap(),
+            1,
+            true,
+            true,
+        )
+    });
     for (root, nested) in [
         ("modular", false),
         ("vardct", false),
         ("modular", true),
         ("vardct", true),
-    ] {
+    ]
+    .into_iter()
+    .filter(|&(_, nested)| !distributed || !nested)
+    {
         let seed_root = std::fs::read(
             temporary.join(format!("{root}_root{}.jxl", if nested { "2" } else { "" })),
         )
         .unwrap();
-        for gaborish in [false, true].into_iter().filter(|&gab| !nested || gab) {
+        for gaborish in [false, true]
+            .into_iter()
+            .filter(|&gab| !(nested || distributed) || gab)
+        {
             let name = format!(
                 "{}{root}_gab{}",
-                if nested { "nested_" } else { "" },
+                if distributed {
+                    "distributed_"
+                } else if nested {
+                    "nested_"
+                } else {
+                    ""
+                },
                 u8::from(gaborish)
             );
             let mut stream = seed[..inventory.frames[0].header_bits.offset as usize / 8].to_vec();
@@ -291,13 +306,19 @@ fn main() {
                 gaborish,
             ));
             if nested {
-                stream.extend_from_slice(&middle);
+                stream.extend_from_slice(middle.as_ref().unwrap());
             }
             stream.extend_from_slice(&consumer);
             let encoded = temporary.join("oracle.jxl");
             std::fs::write(&encoded, &stream).unwrap();
             let reference = run(Command::new(&decoder).arg(&encoded));
-            assert_eq!(reference.len(), 65 * 33 * 6 * 4);
+            assert_eq!(
+                reference.len(),
+                inventory.image_header.width as usize
+                    * inventory.image_header.height as usize
+                    * 6
+                    * 4
+            );
             std::fs::write(output.join(format!("{name}.jxl.hex")), hex::hex(&stream)).unwrap();
             assert_eq!(hex::unhex(&hex::hex(&stream)), stream);
             // Binary32 RGBA followed by alpha and depth, all in the reference's sRGB domain.

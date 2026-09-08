@@ -935,7 +935,7 @@ all shared input/GPU reservations return to zero. The independent allocation tes
 that each of 32 reconstruction configurations retains exactly three 37×17 F32 allocations after
 producer scratch is dropped, including odd/even restoration passes and all upsampling factors.
 
-`lf_extra_channels/` contains six independent 65×33 XYB streams with 8-bit alpha and depth.
+`lf_extra_channels/` contains six independent 65×33 and two 2051×33 XYB streams with 8-bit alpha and depth.
 The libjxl 0.12.0 public encoder disables progressive DC whenever extras exist. The offline
 generator therefore encodes ordinary 65×33 VarDCT and 9×5/2×1 Modular/VarDCT images, all with
 distance 1, effort 7, no restoration, no resampling, and lossless extras. It replaces physical
@@ -947,6 +947,7 @@ The public decoder does no CPU entropy or pixel reconstruction.
 
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- /tmp/lf_extra_channels
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- /tmp/lf_extra_channels --distributed
 diff -ru crates/jxl_wgpu_decode/test-data/lf_extra_channels /tmp/lf_extra_channels
 ```
 
@@ -958,6 +959,8 @@ diff -ru crates/jxl_wgpu_decode/test-data/lf_extra_channels /tmp/lf_extra_channe
 | `vardct_gab1.jxl.hex` | 2794 | `a1ab69ea8b956eaba2e67e90bec6a9cdb140e9a67d57677629c8b91018daacdf` |
 | `nested_modular_gab1.jxl.hex` | 2822 | `2ba8e21885a18716c606dca8f40eb160292a49031b8b6979c27e0cd6998c9bf2` |
 | `nested_vardct_gab1.jxl.hex` | 2848 | `fa79341168e3161325ef8470e641f777c2e7a4dbaac28ba9ed064513e82e3c80` |
+| `distributed_modular_gab1.jxl.hex` | 76058 | `2aed3855a6083c4063fad6b15caf820b658004afba96627aecc95072d893c0d7` |
+| `distributed_vardct_gab1.jxl.hex` | 75865 | `56b76cff204399a5fa476ee105b45d156744ce31be51790026e42eecd5674439` |
 
 Direct variants use LF1→presentation; nested variants use LF2→LF1→presentation and enable
 default Gaborish in both LF stages. The 8-bit source planes are R=`13*x+7*y`,
@@ -969,14 +972,19 @@ stored references within `2e-6`. Truncating the last global extra's entropy in a
 root or in the consumer rebuilds valid TOC sizes, then fails specifically in GPU entropy
 validation even when that channel is unselected. Cancellation at early, middle and late stages
 with 128-byte windows releases every GPU and incremental-input reservation after callbacks.
-The corpus covers global extras; LF-consumer extras distributed into LF groups remain a typed
-unsupported feature requiring a separate pre-HF cursor stage.
+The distributed variants use 257×5 LF roots and a responsive 2051×33 consumer, with two real LF
+extra subimages and nine pass groups. The offline generator removes coefficients independently in
+each LF packet while preserving extra and HF entropy bit-for-bit. An independent parser asserts
+both nonempty LF subimages in public tests. Truncating either one's entropy preserves its descriptor
+and valid TOC sizes, then fails with `ExtraModularStatus` for RGBA, alpha and depth requests through
+whole and bounded input. The whole and bounded successful outputs are bit-identical; both LF
+producer modes also participate in early/middle/late cancellation checks.
 
-LF-extra checkpoint on 2026-09-08 Apple M5/Metal: 733 workspace tests pass across 32 targets,
-with one existing manual benchmark ignored. This includes all 55 VarDCT and 56 common/Modular
-GPU tests, the three new LF-extra tests, and all 60 encoder tests. Formatting, workspace check,
+LF-extra checkpoint on 2026-09-09 Apple M5/Metal: 734 workspace tests pass across 32 targets,
+with one existing manual benchmark ignored. This includes all 55 VarDCT and 57 common/Modular
+GPU tests, the four LF-extra tests, and all 60 encoder tests. Formatting, workspace check,
 warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal
-harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All six streams and their native
+harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All eight streams and their native
 references regenerate byte-for-byte. Full JPEG XL and the remaining roadmap gates stay active.
 
 Modular LF reconstruction checkpoint on 2026-09-08 Apple M5/Metal: all 730 workspace tests pass

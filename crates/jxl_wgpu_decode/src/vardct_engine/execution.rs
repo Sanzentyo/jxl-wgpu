@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -285,6 +286,10 @@ enum PostLfCommands {
 }
 
 enum VarDctPendingContinuation {
+    LfExtras {
+        source: Box<VarDctSource>,
+        commands: PostLfCommands,
+    },
     AcExtra {
         source: Box<VarDctSource>,
     },
@@ -619,6 +624,11 @@ pub struct FramePendingFrame {
 }
 
 enum VarDctPendingStage {
+    LfExtras {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+        commands: Option<PostLfCommands>,
+    },
     LocalLf {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
@@ -658,6 +668,7 @@ impl std::fmt::Debug for FramePendingFrame {
             .field(
                 "stage",
                 &match &self.stage {
+                    VarDctPendingStage::LfExtras { .. } => "lf-extras",
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
                     VarDctPendingStage::HfGlobal { .. } => "hf-global",
                     VarDctPendingStage::RawHfDequant { .. } => "raw-hf-dequant",
@@ -713,7 +724,8 @@ impl FramePendingFrame {
 
     fn stage_completion(&self) -> Arc<MapCompletion> {
         match &self.stage {
-            VarDctPendingStage::LocalLf { completion, .. }
+            VarDctPendingStage::LfExtras { completion, .. }
+            | VarDctPendingStage::LocalLf { completion, .. }
             | VarDctPendingStage::HfGlobal { completion, .. }
             | VarDctPendingStage::RawHfDequant { completion, .. }
             | VarDctPendingStage::AcExtra { completion, .. }
@@ -728,6 +740,13 @@ impl FramePendingFrame {
         };
         let stage = std::mem::replace(&mut self.stage, placeholder);
         match stage {
+            VarDctPendingStage::LfExtras {
+                source,
+                mut commands,
+                ..
+            } => commands
+                .take()
+                .map(|commands| VarDctPendingContinuation::LfExtras { source, commands }),
             VarDctPendingStage::LocalLf {
                 source,
                 mut commands,
@@ -760,6 +779,25 @@ impl FramePendingFrame {
 
     fn advance_staged_packet(&mut self, mapping: Result<(), String>) -> DecodeResult<bool> {
         match self.take_staged_packet() {
+            Some(VarDctPendingContinuation::LfExtras { source, commands }) => {
+                mapping.map_err(DecodeError::backend)?;
+                let lifetime = self
+                    .lifetime
+                    .as_ref()
+                    .ok_or(VarDctDecodeError::CompletionConsumed)?;
+                // This mapping fences initial arena copies, not a nonexistent LF decode. The
+                // section starts are known without consulting a GPU coefficient status record.
+                lifetime.status_staging.unmap();
+                lifetime.status_mapped.store(false, Ordering::Release);
+                let cursors = source
+                    .packet
+                    .groups
+                    .iter()
+                    .map(|group| group.entry.bit_offset())
+                    .collect();
+                self.start_lf_extras(source, commands, cursors)?;
+                Ok(true)
+            }
             Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
                 self.submit_hf_stage(mapping, source, commands)?;
                 Ok(true)
@@ -2054,6 +2092,7 @@ fn submit_vardct(
         source.memory.codestream_bytes,
     )?;
     let staged_lf = source.packet.requires_lf_staging();
+    let staged_lf_extras = source.packet.requires_lf_extra_staging();
     let staged_hf_global =
         source.packet.requires_hf_global_staging() && source.combined_packet_windows.is_none();
     let group_specific_metadata = staged_lf || source.packet.profile.uses_lf_frame;
@@ -2062,10 +2101,11 @@ fn submit_vardct(
             .packet
             .groups
             .iter()
-            .map(|group| {
+            .filter_map(|group| group.entry.modular())
+            .map(|modular| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("jxl-wgpu VarDCT LF-local Modular metadata"),
-                    contents: bytemuck::cast_slice(&group.lf_modular.metadata),
+                    contents: bytemuck::cast_slice(&modular.metadata),
                     usage: wgpu::BufferUsages::STORAGE,
                 })
             })
@@ -2089,23 +2129,14 @@ fn submit_vardct(
     };
     let extra_frame =
         extra::prepare_frame_arena(backend, &mut source, permits.extra).map_err(map_extra_error)?;
-    let packet_stream_window_bytes = source
-        .lf_packet_windows
-        .as_ref()
-        .map(|plan| plan.stream_bytes)
-        .or_else(|| {
-            source
-                .combined_packet_windows
-                .as_ref()
-                .map(|plan| plan.stream_bytes)
+    let packet_stream_window =
+        NonZeroU64::new(source.memory.packet_stream_window_bytes).map(|bytes| {
+            storage(
+                "jxl-wgpu reusable packet entropy stream window",
+                bytes.get(),
+                wgpu::BufferUsages::COPY_DST,
+            )
         });
-    let packet_stream_window = packet_stream_window_bytes.map(|bytes| {
-        storage(
-            "jxl-wgpu reusable packet entropy stream window",
-            bytes,
-            wgpu::BufferUsages::COPY_DST,
-        )
-    });
     if source.groups.len() != source.packet.groups.len() {
         return Err(VarDctDecodeError::GroupPlanCount {
             component: "packet source",
@@ -2126,7 +2157,8 @@ fn submit_vardct(
     for (index, (packet_group, group)) in
         source.packet.groups.iter().zip(&source.groups).enumerate()
     {
-        let predictor_capacity = source.packet.needs_self_correcting || group_specific_metadata;
+        let predictor_capacity =
+            source.packet.needs_self_correcting || source.packet.requires_hf_metadata_staging();
         let reconstructed_bytes = u64::from(packet_group.reconstructed_words(predictor_capacity)?)
             .checked_mul(4)
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -2188,15 +2220,15 @@ fn submit_vardct(
             contents: bytemuck::bytes_of(&group.control),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let modular = &packet_group.lf_modular;
+        let modular = packet_group.entry.modular();
         let params = VarDctModularParams::default()
             .with_lz77_window(if group_specific_metadata {
-                modular.lz77_window_words
+                modular.map_or(0, |plan| plan.lz77_window_words)
             } else {
                 packet_group.lz77_window_words
             })
             .with_self_correcting(if group_specific_metadata {
-                modular.needs_self_correcting
+                modular.is_some_and(|plan| plan.needs_self_correcting)
             } else {
                 source.packet.needs_self_correcting
             });
@@ -2403,9 +2435,16 @@ fn submit_vardct(
     if let Some(sigma) = &epf_sigma {
         packet_commands.clear_buffer(sigma, 0, None);
     }
-    let (packet_stage_commands, combined_packet_batches, mut commands) = if let Some(plan) =
-        &source.lf_packet_windows
-    {
+    let (packet_stage_commands, combined_packet_batches, mut commands) = if staged_lf_extras {
+        packet_commands.clear_buffer(&status_staging, 0, None);
+        (
+            Some(LfPacketCommands::Whole(packet_commands.finish())),
+            None,
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu VarDCT downstream after LF extras"),
+            }),
+        )
+    } else if let Some(plan) = &source.lf_packet_windows {
         if !staged_lf {
             return Err(VarDctDecodeError::EntropyWindowContract {
                 detail: "LF packet windows require staged local trees",
@@ -3531,7 +3570,7 @@ fn submit_vardct(
             task_capacity: group.task_capacity,
             expected_global_scale: source.packet.global_scale,
             expected_quant_lf: source.packet.quant_lf,
-            expected_extra_precision: group.extra_precision,
+            expected_extra_precision: group.extra_precision(),
         });
     }
     let expected_hf = source
@@ -3588,7 +3627,7 @@ fn submit_vardct(
             let submission =
                 submit_lf_packet_commands(backend.queue(), packet_stage_commands, &lifetime)?;
             if staged_hf_global || source.packet.pending_raw_hf_dequant_side_image().is_some() {
-                if source.packet.profile.uses_lf_frame {
+                if source.packet.profile.uses_lf_frame && !staged_lf_extras {
                     (submission, None, deferred_commands)
                 } else {
                     let deferred = deferred_commands.ok_or(VarDctDecodeError::EngineContract {
@@ -3629,7 +3668,9 @@ fn submit_vardct(
     arm_status_map(
         &lifetime,
         &completion,
-        if staged_lf {
+        if staged_lf_extras {
+            "VarDCT LF-extra arena mapping"
+        } else if staged_lf {
             "VarDCT LF cursor mapping"
         } else if staged_hf_global {
             "VarDCT HF-global cursor mapping"
@@ -3644,10 +3685,18 @@ fn submit_vardct(
         completion.complete(Err(format!("VarDCT GPU poll registration failed: {error}")));
     }
     pending.stage = if let Some(commands) = local_commands {
-        VarDctPendingStage::LocalLf {
-            completion,
-            source: Box::new(source),
-            commands: Some(commands),
+        if staged_lf_extras {
+            VarDctPendingStage::LfExtras {
+                completion,
+                source: Box::new(source),
+                commands: Some(commands),
+            }
+        } else {
+            VarDctPendingStage::LocalLf {
+                completion,
+                source: Box::new(source),
+                commands: Some(commands),
+            }
         }
     } else if let Some(commands) = deferred_commands {
         VarDctPendingStage::HfGlobal {

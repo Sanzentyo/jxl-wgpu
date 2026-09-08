@@ -218,7 +218,7 @@ fn gpu_decodes_fixed_standard_packet_entropy_and_validates_zero_ac() {
             task_capacity: group.task_capacity,
             expected_global_scale: plan.global_scale,
             expected_quant_lf: plan.quant_lf,
-            expected_extra_precision: group.extra_precision,
+            expected_extra_precision: group.extra_precision(),
         })
         .unwrap();
     assert_eq!(status.coefficient_words, group.coefficient_words());
@@ -302,7 +302,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
     for (index, (group, buffers)) in plan.groups.iter().zip(&groups).enumerate() {
         let metadata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("local-tree LF MA metadata"),
-            contents: bytemuck::cast_slice(&group.lf_modular.metadata),
+            contents: bytemuck::cast_slice(&group.entry.modular().unwrap().metadata),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let control = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -314,8 +314,8 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
             label: Some("local-tree LF Modular params"),
             contents: bytemuck::bytes_of(
                 &VarDctModularParams::default()
-                    .with_lz77_window(group.lf_modular.lz77_window_words)
-                    .with_self_correcting(group.lf_modular.needs_self_correcting),
+                    .with_lz77_window(group.entry.modular().unwrap().lz77_window_words)
+                    .with_self_correcting(group.entry.modular().unwrap().needs_self_correcting),
             ),
             usage: wgpu::BufferUsages::STORAGE,
         });
@@ -353,7 +353,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
                     block_count * 3,
                     plan.global_scale,
                     plan.quant_lf,
-                    group.extra_precision,
+                    group.extra_precision(),
                 )
                 .unwrap();
             plan.parse_hf_continuation(&stream_bytes, group, cursor)
@@ -427,7 +427,7 @@ fn gpu_stages_cjxl_local_ma_trees_without_host_image_entropy() {
                 task_capacity: group.task_capacity,
                 expected_global_scale: plan.global_scale,
                 expected_quant_lf: plan.quant_lf,
-                expected_extra_precision: group.extra_precision,
+                expected_extra_precision: group.extra_precision(),
             })
             .unwrap();
         assert_eq!(status.first_blocks, continuation.block_count);

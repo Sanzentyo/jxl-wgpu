@@ -561,8 +561,13 @@ frames can first decode global Modular extras through bounded GPU cursor stages,
 source planes and their existing reservations until the final consumer submission. Six independent
 alpha/depth fixtures cover both LF roots, optional Gaborish, and LF2→LF1→presentation chains; RGB,
 alpha and depth agree with libjxl and Rust `jxl` through whole and fragmented async decoding.
-LF consumers whose extra-channel entropy resides in LF groups still return the typed
-`LfFrameWithLfGroupExtras` unsupported feature before entropy submission.
+Two additional 2051×33 streams distribute Squeeze extras into two LF groups. The typed
+`BoundedVarDctGroupEntry` distinguishes coefficient entropy, preceding LF extras, and directly
+known HF metadata. LF-extra consumers fence initial arena copies, decode each extra subimage on
+GPU, then parse HF descriptors at validated cursors. They reserve conservative HF history,
+predictor state and bounded upload capacity before submission, and admit exact descriptor bytes
+when discovered. No placeholder LF descriptor or fabricated LF-success status is used. Every
+group validates even for unselected channels; canceled stages retain their leases through callbacks.
 Its default/custom Gaborish, EPF1/2/3, custom sigma, and 2×/4×/8× LF variants match both independent
 decoders. `modular_render_bytes` includes the full reconstruction footprint; LF plane/uniform
 counters are subsets of that total. Final planes retain their exact byte permits while intermediate

@@ -15,7 +15,9 @@ use crate::vardct_artifact::{
     HfMetadataArtifactConfig, HfMetadataLoweringParams, VarDctArtifactDeviceLimits,
     VarDctArtifactLayout,
 };
-use crate::vardct_packet::{BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl};
+use crate::vardct_packet::{
+    BoundedVarDctGroupEntry, BoundedVarDctPacketPlan, VarDctModularParams, VarDctPacketControl,
+};
 use crate::vardct_pass_group::{HfCoefficientExecutionPlan, HfCoefficientGroupExecutionPlan};
 use crate::vardct_resource::{VarDctResourceConfig, VarDctResourceLayout, VarDctResourceParams};
 use crate::{GpuCodestream, GpuOutputRequest};
@@ -61,7 +63,7 @@ pub(super) struct VarDctSource {
 
 impl VarDctSource {
     pub(super) fn staged_lf_submission_count(&self) -> usize {
-        if self.packet.profile.uses_lf_frame {
+        if self.packet.profile.uses_lf_frame && !self.packet.requires_lf_extra_staging() {
             0
         } else {
             self.lf_packet_windows
@@ -73,13 +75,13 @@ impl VarDctSource {
     pub(super) fn submissions_per_frame(&self) -> usize {
         if self.deferred_hf.is_some() {
             if self.packet.pending_raw_hf_dequant_side_image().is_some()
-                && !self.packet.requires_lf_staging()
+                && !self.packet.requires_hf_metadata_staging()
             {
                 // The final AC/render submission is known up front. Each raw side image adds its
                 // own submission as the resumable HF-global parser discovers it.
                 return 1;
             }
-            if self.packet.profile.uses_lf_frame {
+            if self.packet.profile.uses_lf_frame && !self.packet.requires_lf_extra_staging() {
                 return 2;
             }
             let coefficient_batches = self.hf_coefficients.as_ref().map_or(0, |coefficients| {
@@ -94,7 +96,7 @@ impl VarDctSource {
                 .saturating_add(coefficient_batches)
                 .saturating_add(2);
         }
-        let local_lf = if self.packet.requires_lf_staging() {
+        let local_lf = if self.packet.requires_hf_metadata_staging() {
             self.lf_packet_windows
                 .as_ref()
                 .map_or(1, LfPacketWindowExecutionPlan::batch_count)
@@ -214,7 +216,8 @@ pub(super) fn prepare_packet_source(
     let mut quant_offset = resource_layout.quant_offset;
     let mut groups = Vec::with_capacity(packet.groups.len());
     for packet_group in &packet.groups {
-        let control = if let Some(continuation) = &packet_group.external_lf_hf {
+        let control = if let BoundedVarDctGroupEntry::HfMetadata(continuation) = &packet_group.entry
+        {
             packet_group.hf_stage_control(&packet, continuation)?
         } else if staged_lf {
             packet_group.lf_stage_control(&packet)?
@@ -239,7 +242,7 @@ pub(super) fn prepare_packet_source(
             quant_lf: packet.quant_lf,
             lf_dequantization: packet.lf_dequantization.multipliers,
             lf_correlation: packet.lf_correlation.lf_slopes(),
-            extra_precision: packet_group.extra_precision,
+            extra_precision: packet_group.extra_precision(),
         })?;
         let group_correlation_width = packet_group.rect.width.div_ceil(64);
         let group_correlation_height = packet_group.rect.height.div_ceil(64);
@@ -547,7 +550,7 @@ fn validate_device_limits(
             actual: 0,
         });
     }
-    let predictor_capacity = packet.needs_self_correcting || packet.requires_lf_staging();
+    let predictor_capacity = packet.needs_self_correcting || packet.requires_hf_metadata_staging();
     let mut reconstruction_storage_bytes = 0_u64;
     for (index, group) in packet.groups.iter().enumerate() {
         let reconstruction = u64::from(group.reconstructed_words(predictor_capacity)?)
@@ -606,7 +609,8 @@ fn validate_device_limits(
             packet
                 .groups
                 .iter()
-                .map(|group| group.lf_modular.metadata.len() as u64 * 4)
+                .filter_map(|group| group.entry.modular())
+                .map(|modular| modular.metadata.len() as u64 * 4)
                 .max()
                 .unwrap_or(0)
         } else {

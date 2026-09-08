@@ -1953,12 +1953,10 @@ mod tests {
                 expected_extent
             );
             assert!(packet.profile.uses_lf_frame);
-            assert!(
-                packet
-                    .groups
-                    .iter()
-                    .all(|group| group.external_lf_hf.is_some())
-            );
+            assert!(packet.groups.iter().all(|group| matches!(
+                group.entry,
+                crate::vardct_packet::BoundedVarDctGroupEntry::HfMetadata(_)
+            )));
         }
     }
 

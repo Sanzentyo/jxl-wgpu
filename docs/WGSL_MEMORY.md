@@ -314,6 +314,16 @@ and HF decoded counts, first-block count, and extra precision. Their range begin
 header, needs no intermediate map, and only the final window validates ANS/padding plus the fixed
 packet tail before sharing the first downstream submission.
 
+When an external LF image removes coefficient entropy but LF-group extras remain, the initial
+submission only clears/copies frame arenas. Its map fences that setup and is never interpreted as
+an LF-success status. The common Modular subimage executor supplies each group's validated extra
+end cursor before HF descriptors are parsed. Admission reserves conservative HF LZ history and
+128-byte packet-state capacity, plus one bounded upload if an enclosing LF packet exceeds the
+stream limit; no initial LF/HF entropy metadata buffer is allocated. Exact late HF descriptor bytes
+reserve a separate permit. Known HF-only entries use their actual generic/weighted state capacity
+consistently in allocation, accounting and device validation. Source XYB leases, extra arenas and
+all discovered tables remain owned by the frame/callback until completion or canceled-map retirement.
+
 Display source buffers are now also checked for the usage needed by the operation: `STORAGE` for
 shader conversion and `COPY_SRC` for direct RGBA8 buffer-to-texture copies. A multi-row direct
 buffer-to-texture copy requires `bytes_per_row` to be a multiple of 256.

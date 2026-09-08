@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::entropy_window::{
-    GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES, StreamBatch,
-    build_stream_batches_for_len,
+    EntropyStreamWindows, GroupEntropyRange, GroupStreamSegment, MIN_STREAM_WINDOW_BYTES,
+    StreamBatch, build_stream_batches_for_len,
 };
 use crate::vardct_packet::{
     BoundedHfMetadataContinuation, BoundedVarDctPacketPlan, VarDctModularParams,
@@ -206,7 +206,7 @@ impl LfPacketWindowExecutionPlan {
                             field: "LF packet stream end",
                         })?;
                 Ok(GroupEntropyRange {
-                    token_bit_offset: u64::from(group.lf_entropy_bit_offset),
+                    token_bit_offset: u64::from(group.entry.bit_offset()),
                     token_bit_end,
                 })
             })
@@ -231,11 +231,18 @@ impl LfPacketWindowExecutionPlan {
             // descriptor is discovered only after this stage. The LF state itself records only
             // the predictor fields selected by its parsed tree.
             let state_offset = group.packet_execution_state_offset_words(true)?;
+            let modular =
+                group
+                    .entry
+                    .modular()
+                    .ok_or(VarDctDecodeError::EntropyWindowContract {
+                        detail: "LF coefficient window has no initial entropy metadata",
+                    })?;
             segment_params.push(
                 VarDctModularParams::default()
-                    .with_lz77_window(group.lf_modular.lz77_window_words)
-                    .with_self_correcting(group.lf_modular.needs_self_correcting)
-                    .with_stream_segment(segment, group.lf_entropy_bit_offset, state_offset),
+                    .with_lz77_window(modular.lz77_window_words)
+                    .with_self_correcting(modular.needs_self_correcting)
+                    .with_stream_segment(segment, group.entry.bit_offset(), state_offset),
             );
         }
         Ok(Some(Self {
@@ -249,6 +256,37 @@ impl LfPacketWindowExecutionPlan {
     pub(super) fn batch_count(&self) -> usize {
         self.stream_batches.len()
     }
+}
+
+/// Reserve a bounded upload for an HF descriptor hidden behind extra-channel entropy. The
+/// enclosing packet is a conservative range: the eventual HF stream is always a suffix of it.
+pub(super) fn deferred_hf_stream_window_bytes(
+    codestream_bytes: u64,
+    packet: &BoundedVarDctPacketPlan,
+    stream_limit: u64,
+) -> Result<u64, VarDctDecodeError> {
+    if !packet.requires_lf_extra_staging() {
+        return Ok(0);
+    }
+    let mut bytes = 0;
+    for group in &packet.groups {
+        let range = GroupEntropyRange {
+            token_bit_offset: u64::from(group.entry.bit_offset()),
+            token_bit_end: group
+                .lf_group
+                .end()
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF packet stream end",
+                })?,
+        };
+        // Capacity planning needs only the range geometry, never a table of its future windows.
+        let windows = EntropyStreamWindows::new(codestream_bytes, range, stream_limit)
+            .map_err(map_packet_window_plan_error)?;
+        if windows.len() > 1 {
+            bytes = stream_limit & !3;
+        }
+    }
+    Ok(bytes)
 }
 
 impl CombinedPacketWindowExecutionPlan {

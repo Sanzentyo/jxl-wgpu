@@ -378,10 +378,14 @@ impl VarDctDecodeMemoryStats {
         let modular_metadata_words = if packet.requires_lf_staging() || packet.profile.uses_lf_frame
         {
             packet.groups.iter().try_fold(0_u64, |total, group| {
-                let words = u64::try_from(group.lf_modular.metadata.len()).map_err(|_| {
-                    VarDctDecodeError::ArithmeticOverflow {
-                        field: "LF-local Modular metadata length",
-                    }
+                let words = u64::try_from(
+                    group
+                        .entry
+                        .modular()
+                        .map_or(0, |modular| modular.metadata.len()),
+                )
+                .map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                    field: "LF-local Modular metadata length",
                 })?;
                 total
                     .checked_add(words)
@@ -398,7 +402,8 @@ impl VarDctDecodeMemoryStats {
         };
         let modular_metadata_bytes =
             checked_words(modular_metadata_words, "Modular metadata bytes")?;
-        let predictor_capacity = packet.needs_self_correcting || packet.requires_lf_staging();
+        let predictor_capacity =
+            packet.needs_self_correcting || packet.requires_hf_metadata_staging();
         let mut reconstructed_words = Vec::with_capacity(packet.groups.len());
         for group in &packet.groups {
             reconstructed_words.push(u64::from(group.reconstructed_words(predictor_capacity)?));
@@ -524,7 +529,11 @@ impl VarDctDecodeMemoryStats {
         let packet_stream_window_bytes = lf_packet_windows
             .map(|plan| plan.stream_bytes)
             .or_else(|| combined_packet_windows.map(|plan| plan.stream_bytes))
-            .unwrap_or(0);
+            .unwrap_or(super::window_plan::deferred_hf_stream_window_bytes(
+                codestream_bytes,
+                packet,
+                stream_limit,
+            )?);
         let packet_stream_batch_count = lf_packet_windows
             .map(LfPacketWindowExecutionPlan::batch_count)
             .or_else(|| combined_packet_windows.map(CombinedPacketWindowExecutionPlan::batch_count))
@@ -534,7 +543,7 @@ impl VarDctDecodeMemoryStats {
             .iter()
             .try_fold(0_u64, |total, _| {
                 total.checked_add(packet_execution_state_bytes(
-                    packet.needs_self_correcting || packet.requires_lf_staging(),
+                    packet.needs_self_correcting || packet.requires_hf_metadata_staging(),
                 ))
             })
             .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -773,7 +782,7 @@ impl VarDctDecodeMemoryStats {
             resolved_stream_window_limit_bytes: stream_limit,
             codestream_bytes,
             modular_metadata_bytes,
-            deferred_hf_modular_metadata: packet.requires_lf_staging(),
+            deferred_hf_modular_metadata: packet.requires_hf_metadata_staging(),
             deferred_hf_coefficients: deferred_hf.is_some(),
             reconstructed_bytes,
             raw_metadata_bytes,

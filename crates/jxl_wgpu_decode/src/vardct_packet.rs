@@ -40,10 +40,6 @@ pub(crate) const WEIGHTED_PACKET_EXECUTION_STATE_BYTES: u64 = 128;
 /// A standard feature excluded from the deliberately bounded VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnsupportedVarDctPacketFeature {
-    #[error(
-        "LF-frame consumers with extra-channel entropy in LF groups need a preceding GPU cursor stage"
-    )]
-    LfFrameWithLfGroupExtras,
     #[error("the combined one-entry VarDCT packet cannot address multiple LF groups")]
     CombinedPacketMultipleLfGroups,
     #[error(
@@ -172,12 +168,50 @@ pub struct BoundedModularEntropyPlan {
     pub lz77_window_words: u32,
 }
 
-/// Host metadata discovered after the first GPU stage returns the LF entropy cursor.
+/// Host metadata at the cursor following LF coefficient or extra-channel entropy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedHfMetadataContinuation {
     pub token_bit_offset: u32,
     pub block_count: u32,
     pub modular: BoundedModularEntropyPlan,
+}
+
+/// First stream present in an LF-group packet. A referenced LF image removes the coefficient
+/// stream, but leaves any distributed extra-channel subimage before HF metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundedVarDctGroupEntry {
+    LfCoefficients {
+        token_bit_offset: u32,
+        modular: BoundedModularEntropyPlan,
+        extra_precision: u8,
+    },
+    LfExtras {
+        bit_offset: u32,
+    },
+    HfMetadata(BoundedHfMetadataContinuation),
+}
+
+impl BoundedVarDctGroupEntry {
+    #[must_use]
+    pub fn bit_offset(&self) -> u32 {
+        match self {
+            Self::LfCoefficients {
+                token_bit_offset, ..
+            } => *token_bit_offset,
+            Self::LfExtras { bit_offset } => *bit_offset,
+            Self::HfMetadata(hf) => hf.token_bit_offset,
+        }
+    }
+
+    /// Entropy metadata known before the first GPU submission, if any.
+    #[must_use]
+    pub fn modular(&self) -> Option<&BoundedModularEntropyPlan> {
+        match self {
+            Self::LfCoefficients { modular, .. } => Some(modular),
+            Self::HfMetadata(hf) => Some(&hf.modular),
+            Self::LfExtras { .. } => None,
+        }
+    }
 }
 
 /// One LF group's packet geometry and persistent decode contract.
@@ -196,15 +230,10 @@ pub struct BoundedVarDctGroupPlan {
     pub lf_group: BitRange,
     pub lf_stream_index: u32,
     pub hf_stream_index: u32,
-    /// First LF image-entropy bit, after either the selected global tree header or this group's
-    /// local MA descriptor.
-    pub lf_entropy_bit_offset: u32,
-    pub lf_modular: BoundedModularEntropyPlan,
-    /// Physical power-of-two history ring reused by the group's two sequential Modular streams.
+    pub entry: BoundedVarDctGroupEntry,
+    /// Physical power-of-two history capacity for the coefficient/HF packet stages. Extra-channel
+    /// subimages use their own independently admitted Modular scratch.
     pub lz77_window_words: u32,
-    pub extra_precision: u8,
-    /// HF metadata parsed directly when a progressive-DC producer replaces this group's LF stream.
-    pub external_lf_hf: Option<BoundedHfMetadataContinuation>,
 }
 
 /// Shared HF-global metadata and independently coded AC passes.
@@ -583,13 +612,28 @@ impl VarDctPacketPrefix {
                     .ok_or(BoundedVarDctPacketError::ArithmeticOverflow {
                         field: "LF-group LF decoded symbol limit",
                     })?;
-                let (
-                    lf_token_bit_offset,
-                    lf_modular,
-                    lz77_window_words,
-                    extra_precision,
-                    external_lf_hf,
-                ) = if profile.uses_lf_frame {
+                let deferred_hf_window = || {
+                    hf_decoded_symbol_limit.checked_next_power_of_two().ok_or(
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF-group deferred HF LZ77 window",
+                        },
+                    )
+                };
+                let (entry, lz77_window_words) = if profile.uses_lf_frame
+                    && extra_channels.as_ref().is_some_and(|plan| plan.has_lf())
+                {
+                    let bit_offset = u32::try_from(lf_group_start).map_err(|_| {
+                        BoundedVarDctPacketError::ArithmeticOverflow {
+                            field: "LF extra-channel bit offset",
+                        }
+                    })?;
+                    // The GPU must decode the extra subimage before the host can locate the HF
+                    // descriptor. Reserve its worst-case history without assuming a global tree.
+                    (
+                        BoundedVarDctGroupEntry::LfExtras { bit_offset },
+                        deferred_hf_window()?,
+                    )
+                } else if profile.uses_lf_frame {
                     let mut hf_reader = source_reader_at(source, lf_group_start)?;
                     let hf_header = parse_hf_metadata_header_reader(
                         &mut hf_reader,
@@ -616,6 +660,7 @@ impl VarDctPacketPrefix {
                         block_count.max(blocks_x).max(1),
                         hf_decoded_symbol_limit,
                     )?;
+                    let lz77_window_words = hf_modular.lz77_window_words;
                     let continuation = BoundedHfMetadataContinuation {
                         token_bit_offset: u32::try_from(hf_token_bit_offset).map_err(|_| {
                             BoundedVarDctPacketError::ArithmeticOverflow {
@@ -623,14 +668,11 @@ impl VarDctPacketPrefix {
                             }
                         })?,
                         block_count: hf_header.block_count,
-                        modular: hf_modular.clone(),
+                        modular: hf_modular,
                     };
                     (
-                        hf_token_bit_offset,
-                        hf_modular.clone(),
-                        hf_modular.lz77_window_words,
-                        0,
-                        Some(continuation),
+                        BoundedVarDctGroupEntry::HfMetadata(continuation),
+                        lz77_window_words,
                     )
                 } else {
                     let mut lf_reader = source_reader_at(source, lf_group_start)?;
@@ -662,18 +704,20 @@ impl VarDctPacketPrefix {
                                 BoundedVarDctPacketError::ModularTree(error.to_string())
                             })?
                     } else {
-                        hf_decoded_symbol_limit.checked_next_power_of_two().ok_or(
-                            BoundedVarDctPacketError::ArithmeticOverflow {
-                                field: "LF-group deferred HF LZ77 window",
-                            },
-                        )?
+                        deferred_hf_window()?
                     };
+                    let lz77_window_words = lf_modular.lz77_window_words.max(hf_window_words);
                     (
-                        lf_token_bit_offset,
-                        lf_modular.clone(),
-                        lf_modular.lz77_window_words.max(hf_window_words),
-                        lf_header.extra_precision,
-                        None,
+                        BoundedVarDctGroupEntry::LfCoefficients {
+                            token_bit_offset: u32::try_from(lf_token_bit_offset).map_err(|_| {
+                                BoundedVarDctPacketError::ArithmeticOverflow {
+                                    field: "LF image-entropy bit offset",
+                                }
+                            })?,
+                            modular: lf_modular,
+                            extra_precision: lf_header.extra_precision,
+                        },
+                        lz77_window_words,
                     )
                 };
                 Ok(BoundedVarDctGroupPlan {
@@ -685,15 +729,8 @@ impl VarDctPacketPrefix {
                     lf_group,
                     lf_stream_index: profile.lf_quant_stream_index(u64::from(index))?,
                     hf_stream_index: profile.hf_metadata_stream_index(u64::from(index))?,
-                    lf_entropy_bit_offset: u32::try_from(lf_token_bit_offset).map_err(|_| {
-                        BoundedVarDctPacketError::ArithmeticOverflow {
-                            field: "LF image-entropy bit offset",
-                        }
-                    })?,
-                    lf_modular,
+                    entry,
                     lz77_window_words,
-                    extra_precision,
-                    external_lf_hf,
                 })
             })
             .collect::<Result<Vec<_>, BoundedVarDctPacketError>>()?;
@@ -739,7 +776,8 @@ impl VarDctPacketPrefix {
         let needs_self_correcting = if profile.uses_lf_frame {
             groups
                 .iter()
-                .any(|group| group.lf_modular.needs_self_correcting)
+                .filter_map(|group| group.entry.modular())
+                .any(|modular| modular.needs_self_correcting)
         } else {
             global_ma_config
                 .as_ref()
@@ -931,9 +969,6 @@ impl BoundedVarDctPacketPlan {
                 &inventory.frames[0].progressive_passes,
             )
             .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-            if profile.uses_lf_frame && extras.has_lf() {
-                return Err(UnsupportedVarDctPacketFeature::LfFrameWithLfGroupExtras.into());
-            }
             let image = extras
                 .parse_global(
                     &mut reader,
@@ -1012,6 +1047,20 @@ impl BoundedVarDctPacketPlan {
                     .extra_channels
                     .as_ref()
                     .is_some_and(|plan| plan.has_lf()))
+    }
+
+    /// A referenced LF image leaves extras as the first stream in each LF-group packet.
+    #[must_use]
+    pub fn requires_lf_extra_staging(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| matches!(group.entry, BoundedVarDctGroupEntry::LfExtras { .. }))
+    }
+
+    /// HF metadata cannot be parsed until preceding coefficient or extra-channel entropy ends.
+    #[must_use]
+    pub fn requires_hf_metadata_staging(&self) -> bool {
+        self.requires_lf_staging() || self.requires_lf_extra_staging()
     }
 
     pub(crate) fn parse_extra_subimage_source(
@@ -1099,7 +1148,7 @@ impl BoundedVarDctPacketPlan {
     }
 
     /// Parses only the HF scalar header and its selected MA descriptor after the GPU reports the
-    /// LF entropy end cursor. No image symbol is decoded on the host.
+    /// coefficient/extra entropy end cursor. No image symbol is decoded on the host.
     pub fn parse_hf_continuation(
         &self,
         codestream: &[u8],
@@ -1125,10 +1174,10 @@ impl BoundedVarDctPacketPlan {
         group: &BoundedVarDctGroupPlan,
         lf_entropy_end: u32,
     ) -> Result<BoundedHfMetadataContinuation, BoundedVarDctPacketError> {
-        if lf_entropy_end < group.lf_entropy_bit_offset {
+        if lf_entropy_end < group.entry.bit_offset() {
             return Err(BoundedVarDctPacketError::HfContinuationBeforeLf {
                 cursor: lf_entropy_end,
-                lf_start: group.lf_entropy_bit_offset,
+                lf_start: group.entry.bit_offset(),
             });
         }
         let packet_end =
@@ -1354,6 +1403,16 @@ impl BoundedVarDctPacketPlan {
 
 impl BoundedVarDctGroupPlan {
     #[must_use]
+    pub fn extra_precision(&self) -> u8 {
+        match self.entry {
+            BoundedVarDctGroupEntry::LfCoefficients {
+                extra_precision, ..
+            } => extra_precision,
+            _ => 0,
+        }
+    }
+
+    #[must_use]
     pub const fn coefficient_words(&self) -> u32 {
         self.coefficient_words
     }
@@ -1517,7 +1576,7 @@ impl BoundedVarDctGroupPlan {
             quantization: [
                 packet.global_scale,
                 packet.quant_lf,
-                u32::from(self.extra_precision),
+                u32::from(self.extra_precision()),
                 0,
             ],
             streams: [
@@ -1547,7 +1606,7 @@ impl BoundedVarDctGroupPlan {
         packet: &BoundedVarDctPacketPlan,
     ) -> Result<VarDctPacketControl, BoundedVarDctPacketError> {
         let mut control = self.packet_control(packet)?;
-        control.section_bits[0] = self.lf_entropy_bit_offset;
+        control.section_bits[0] = self.entry.bit_offset();
         control.quantization[3] = 0;
         Ok(control)
     }
