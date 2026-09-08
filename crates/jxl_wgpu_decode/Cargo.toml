@@ -26,6 +26,7 @@ jxl-frame.workspace = true
 jxl-grid.workspace = true
 jxl-image.workspace = true
 jxl-modular.workspace = true
+jxl-oxide.workspace = true
 jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
 jxl_wgpu_encode.workspace = true
 naga = { version = "30.0.1", features = ["wgsl-in"] }

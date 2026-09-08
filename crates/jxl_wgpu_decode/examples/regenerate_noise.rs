@@ -8,6 +8,8 @@ use jxl_modular::{MaConfig, MaConfigParams};
 use jxl_oxide_common::Bundle;
 use jxl_wgpu_decode::vardct::frontend::LfGlobalPrefix;
 
+#[path = "support/noise_frames.rs"]
+mod noise_frames;
 #[allow(dead_code)]
 #[path = "support/offline.rs"]
 mod offline;
@@ -214,6 +216,7 @@ fn main() {
     offline::compile(&source.join("generate_noise.c"), &generator, &["libjxl"]);
     offline::run(Command::new(generator).arg(&output));
     jpeg_noise(&output, &temporary);
+    noise_frames::generate(&source, &output);
     offline::compile(
         &source.join("decode_extra_channels.c"),
         &temporary.join("oracle"),

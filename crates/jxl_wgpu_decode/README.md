@@ -380,8 +380,15 @@ admission retry and cancellation cleanup cover both XYB and original color, incl
 normalization allocations introduced by nonzero Modular noise. Subsampled VarDCT allocates padded
 full-resolution destinations only for shifted components before noise; output conversion derives
 its sampling geometry from those actual planes, avoiding a second interpolation. Zero models
-retain the fused component-upsampling/output path. Preview, LF/reference-only and patch/spline
-combinations need further conformance coverage.
+retain the fused component-upsampling/output path. `tests/noise_combinations.rs` adds 27 streams:
+20 JPEG streams with Gaborish/active EPF 1–3, and seven LF chains with both root encodings,
+independent nested models, progressive AC and alpha/depth preservation. Every output is identical
+under whole and bounded fragmented delivery; cancellation checks intermediate LF ownership.
+A pinned, development-only jxl-oxide oracle and independent scalar Gaborish calculation cover
+vertical-subsampling defects in the other references. LF color uses the existing Rust sRGB and
+native sRGB/linear tolerances; scalar extras remain exact. See the conformance corpus for the
+reference selection and observed errors. Preview/reference-only, patch/spline combinations and
+broader LF filter/resampling combinations need further coverage.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after
@@ -560,13 +567,15 @@ the GPU reads and validates the actual strategy map. This intentionally trades t
 shortcut for complete metadata handling. Each entropy stage retains bounded windows and shares one
 logical pending frame and byte budget.
 
-Subsampled YCbCr still rejects adaptive LF smoothing because that LF-domain step needs
-component-aware scheduling. Gaborish and EPF are connected: shifted components use a fused
+Subsampled YCbCr with adaptive LF smoothing still returns a typed unsupported-stage error.
+libjxl 0.12 also rejects this signaling combination; its validity and error classification need
+conformance validation. Gaborish and EPF are connected: shifted components use a fused
 horizontal/vertical quarter/three-quarter resident upsample before the full-resolution restoration
 cursor, while unshifted component buffers are reused directly. All destination planes and 32-byte
 `Pod` uniforms are included in the shared byte budget. The interpolation primitive is actual-GPU
-tested on horizontal, vertical, two-axis, odd-edge cases; a valid subsampled-restoration codestream
-fixture is still needed for end-to-end libjxl conformance. The common frame executor accepts
+tested on horizontal, vertical, two-axis and odd-edge cases. Twenty additional JPEG codestreams
+verify Gaborish and effective EPF before noise, including vertical subsampling with documented
+native/Rust reference exceptions and an independent scalar Gaborish check. The common frame executor accepts
 recursive progressive-DC dependencies, including VarDCT roots without an LF source and
 LF-dependent SkipProgressive frames. These stills expose `DecodeProfile::FrameSequence` and
 `WgpuDecodeSubmissionSession::Sequence`. It keeps three F32 XYB planes resident, uses shared 80-byte Modular normalization and 48-byte LF-pack `Pod` uniforms, validates every
@@ -922,8 +931,8 @@ apply them; the GPU formula follows those executed references rather than invent
 operation.
 
 This is not full VarDCT coverage. Explicitly published
-progressive intermediates, larger/transformed raw-matrix conformance, subsampled adaptive LF and
-valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
+progressive intermediates, larger/transformed raw-matrix conformance, subsampled adaptive-LF signal validation,
+uncommon asymmetric JPEG component layouts and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping,
 and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed

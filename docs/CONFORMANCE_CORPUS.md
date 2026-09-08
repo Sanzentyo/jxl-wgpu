@@ -89,9 +89,9 @@ The reusable pre-restoration component primitive has a separate actual-adapter d
 executes horizontal, vertical, and fused two-axis interpolation into an odd 5x3 output and compares
 every F32 sample with a scalar quarter/three-quarter, replicated-edge oracle. Naga also validates
 both WGSL modules semantically, and compile-time plus unit checks fix the shared 32-byte,
-16-byte-aligned resident `Pod` uniform. This proves the primitive and its odd-edge geometry; the
-corpus still lacks a valid JPEG XL codestream that combines component subsampling with signaled
-Gaborish or EPF, so it is not yet end-to-end subsampled-restoration conformance evidence.
+16-byte-aligned resident `Pod` uniform. The later [noise/restoration corpus](#lf-noise-and-subsampled-restoration)
+adds 20 valid codestreams combining every ordinary sampling layout with Gaborish and effective
+EPF, so component expansion now also has end-to-end restoration evidence.
 The Modular consumer separately parses the stock lossless profile through one checked logical span
 table at every possible byte split and requires identical MA-tree, histogram, hybrid-integer, and
 group-range results. Its range-copy tests cross every split, reject gaps/overlaps/truncation, and
@@ -2115,7 +2115,7 @@ Regenerate all 37 codestreams and four linear references with libjxl 0.12.0, `cj
 ```sh
 cargo run -p jxl_wgpu_decode --example regenerate_noise -- \
   crates/jxl_wgpu_decode/test-data/noise
-cargo test -p jxl_wgpu_decode --test noise -- --test-threads=1
+cargo test -p jxl_wgpu_decode --test noise --test noise_combinations -- --test-threads=1
 cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
 ```
 
@@ -2172,8 +2172,8 @@ Modular corpus still runs both oracles (observed maxima below 0.000001). The thi
 and JPEG VarDCT cases have observed maxima below 0.0000006 against Rust and 0.0000343 against
 native libjxl, including the zero-model controls.
 
-Preview, LF/reference-only frames,
-patch/spline combinations, and the full 18181-3 precision corpus remain open conformance gates.
+Preview/reference-only frames, broader LF filter/resampling and patch/spline combinations,
+and the full 18181-3 precision corpus remain open conformance gates.
 No production CPU image codec, random-plane upload or intermediate image readback is introduced.
 
 The six expanded noise integration tests cover Apple M5/Metal, exact whole/fragmented output,
@@ -2186,3 +2186,82 @@ check, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass.
 Metal harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All 37 codestreams and
 four linear F32 references regenerate byte-identically with libjxl 0.12.0 and cjpeg. The preceding
 24 codestreams and four references are unchanged.
+
+### LF noise and subsampled restoration
+
+`examples/support/noise_frames.rs`, called by `regenerate_noise`, adds 27 codestreams without
+decoding or re-encoding their image entropy. It rewrites explicit frame headers and TOC sizes,
+then reparses the result and requires every original section payload to remain byte-identical
+(after an inserted ten-byte LF noise model where applicable). Image metadata, component geometry,
+physical noise seeds and LF dependencies are preserved. The corpus now contains 64 codestreams
+and the four preceding linear references; all 41 preceding files remain unchanged.
+
+| Added fixture in `noise/` | Presented size | Coverage |
+|---|---:|---|
+| `jpeg_{444,422,440,420,gray}_{gab,epf1,gab_epf2,gab_epf3}.jxl.hex` | 257×17 | Twenty combinations of component expansion, Gaborish, effective EPF 1–3 and noise |
+| `lf_{modular,vardct}_gab{0,1}.jxl.hex` | 65×33 | Both LF root encodings at 9×5, optional Gaborish, alpha and depth |
+| `lf_nested_{modular,vardct}_gab1.jxl.hex` | 65×33 | Both root encodings at LF2 (2×1), VarDCT at LF1 (9×5), Gaborish, alpha and depth |
+| `lf_progressive_ac.jxl.hex` | 1024×128 | Modular LF2 (16×2), VarDCT LF1 (128×16), final progressive AC |
+
+JPEG recompression's sharpness index zero normally disables EPF through the default LUT.
+The added EPF streams explicitly store all eight sharpness entries as 1, quantization multiplier
+8, and half-precision pass/border parameters `3b33`, `4680`, `3955`. Every EPF output must differ
+from its corresponding unfiltered or Gaborish-only reference by more than 0.01 in at least one
+F32 sample. Merely dispatching an identity filter cannot pass. Every stream also has a zero-noise
+control, and noise must independently change the output.
+
+`tests/noise_combinations.rs` compares the four color sampling layouts against a pinned,
+development-only jxl-oxide 0.12.6 decoder, below maxAE 1e-5. For 4:4:4, 4:2:2 and gray it also
+uses Rust jxl below 1e-5. Live libjxl remains a reference at the existing 1/1024 bound for those
+layouts and for vertically subsampled EPF1/Gaborish+EPF2. Gray uses the two pixel-format oracles:
+jxl-oxide's explicit Gray-to-RGB encoding conversion instead replicates/converts one gray
+channel, which differs from their three noisy YCbCr components exposed as RGBA.
+
+The vertical-subsampling reference exceptions have an independent check. The
+[default Gaborish weights](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/loop_filter.cc)
+are identical across components, and its
+[normalized nine-tap kernel](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_gaborish.cc)
+commutes with affine YCbCr-to-RGB conversion. A separate scalar f64 convolution of the zero-noise,
+unfiltered Rust RGB output therefore checks the GPU without a filtered CPU decoder. All five
+layouts must match below 1e-5. Native libjxl 0.12's fast renderer fails this property for 4:4:0 and
+4:2:0 (observed zero-model maxAE about 0.094895 and 0.089554); Gaborish+EPF3 also differs.
+Rust jxl 0.6 has additional vertical EPF differences. These results are retained as documented
+oracle limitations, not accepted by widening pixel tolerances.
+
+The LF generator prepends ten-bit LUT entries `[16,24,32,48,64,80,96,112]` to each LF global
+packet and enables its Noise flag. libjxl's encoder normally clears that flag on LF frames;
+its decoder accepts these streams. Each model is toggled independently, so two-level chains
+exercise all four masks. Physical seeds are `[0,1]`, `[0,2]`, then `[1,0]`; the final regular
+frame has no noise. Each LF model must visibly affect the final image through the resident
+dependency slot, while alpha and selected alpha/depth planes remain bit-identical across masks.
+The tests check reduced LF sample extents and exact source versions, with Rust color error below
+0.0001 and native color below 1/1024. Extras are exact on the tested adapter (required below 1e-6).
+
+The high-contrast progressive-AC source additionally compares GPU/native linear RGB at the same
+1/1024 bound, while retaining the tight GPU/Rust sRGB comparison for every mask. This avoids
+amplifying native transform rounding near black: the mask with only LF2 noise reaches sRGB
+GPU/native maxAE 0.0009854; linear comparisons across all masks stay below 0.0001147.
+jxl-oxide is not selected as an LF-noise oracle: its noise allocation uses unreduced frame-header
+dimensions, and an offline check differs from native by about 0.4944 for the two-level source.
+
+All outputs, including selected extras and the additional linear output, must be bit-identical
+between whole input and 43-byte transport chunks under a 256-byte GPU window cap. Every completed
+decode releases both the GPU and incremental-input budgets. Cancellation is exercised after the
+first, middle and penultimate submissions of all three nested chains; checks wait for the
+asynchronous poller to retire submitted work, then require all reservations and source spans
+to be released.
+
+Observed on Apple M5/Metal: JPEG maxAE is 0.0000005961 against jxl-oxide, 0.0000008494 against
+Rust jxl, 0.00003219 against the selected native references, and 0.0000002981 against scalar
+Gaborish. LF color is below 0.00004977 against Rust, 0.00007035 against the selected native sRGB
+references, and 0.0001147 against native linear; both extras remain exact. The three additional
+integration tests pass. No production CPU pixel codec, shader ABI or allocation lifetime changes
+are introduced. The shared jxl-bitstream pin is 1.1.0, whose reader is unchanged and whose added
+signature constants are required by the development oracle.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+752 tests across 35 targets, with one existing manual benchmark ignored. Formatting, workspace
+check, warning-free Clippy/rustdoc, the Rust 1.89 all-target/all-feature check and the six-crate
+WASM check pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU readback
+passes. All 64 codestreams and four linear F32 references regenerate byte-identically, and the
+41 preceding files remain unchanged. Full JPEG XL conformance remains open.

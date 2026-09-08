@@ -9,44 +9,9 @@ use jxl_gpu_formats::{PixelFormat, RgbChannelOrder};
 use jxl_wgpu::{WgpuBackend, WgpuBackendConfig};
 use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, WgpuDecodeEngine};
 
-fn encoded(name: &str) -> Vec<u8> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("test-data/noise/{name}.jxl.hex"));
-    let text: String = std::fs::read_to_string(path)
-        .unwrap()
-        .split_whitespace()
-        .collect();
-    text.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect()
-}
-
-fn zero_noise(bytes: &[u8], inventory: &jxl_gpu_bitstream::CodestreamInventory) -> Vec<u8> {
-    // Inventory ranges address the logical codestream, including for container-wrapped fixtures.
-    let mut bytes = jxl_gpu_bitstream::parse(bytes, Default::default())
-        .unwrap()
-        .codestream()
-        .to_vec();
-    for frame in &inventory.frames {
-        assert_eq!(frame.flags & (1 | 2 | 16), 1);
-        let section = frame
-            .sections
-            .iter()
-            .find(|section| {
-                matches!(
-                    section.kind,
-                    jxl_gpu_bitstream::FrameSectionKind::Single
-                        | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
-                )
-            })
-            .unwrap();
-        assert_eq!(section.bits.offset % 8, 0);
-        let start = section.bytes.offset as usize;
-        bytes[start..start + 10].fill(0);
-    }
-    bytes
-}
+#[path = "support/noise.rs"]
+mod fixtures;
+use fixtures::{encoded, zero_noise};
 
 fn planned_bytes(
     backend: &WgpuBackend,
@@ -124,7 +89,7 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap();
-        let zero = zero_noise(&bytes, &inventory);
+        let zero = zero_noise(&bytes, &inventory, None);
         let mut empty = decoder.open(&zero, request.clone()).unwrap();
         let empty_bytes = planned_bytes(&backend, &mut empty);
         let component_extent = match name {
@@ -409,7 +374,7 @@ fn check_cases(names: &[&str], reference: Reference) {
         let mut noisy_words = None;
         for zero_model in [false, true] {
             let bytes = if zero_model {
-                zero_noise(&bytes, &inventory)
+                zero_noise(&bytes, &inventory, None)
             } else {
                 bytes.clone()
             };

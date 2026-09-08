@@ -8,7 +8,7 @@ readme = "README.md"
 rust-version.workspace = true
 
 [dependencies]
-jxl-bitstream = "=1.0.0"
+jxl-bitstream.workspace = true
 jxl-coding = "=1.0.1"
 jxl-color = "=0.11.0"
 jxl-image = "=0.13.0"
