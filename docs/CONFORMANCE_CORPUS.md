@@ -2064,10 +2064,15 @@ pixels. Larger/transformed raw images and broader cross-feature conformance rema
 
 ## GPU noise synthesis
 
-`crates/jxl_wgpu_decode/test-data/generate_noise.c` generates nine small XYB streams with
+`crates/jxl_wgpu_decode/test-data/generate_noise.c` generates 22 small streams with
 libjxl 0.12.0. It uses distance 2, effort 1, disabled patches/dots/progressive DC, explicitly
-enabled noise and photon ISO 800. Source RGB8 samples are
+enabled noise and photon ISO 800. Source RGB8 (or single-channel gray) samples are
 `32 + ((x * (c + 2) + y * (7 - c) + frame * 11) % 192)` for channels 0 through 2.
+The original-color corpus declares D65 sRGB and disables channel palettes except in the dedicated
+palette case. `examples/regenerate_noise.rs` also replaces the default LF-global correlation
+bundle in the original VarDCT fixture, rewrites section padding/TOC sizes, and generates two
+custom-correlation codestreams plus noisy/zero-model native linear F32 references. No image
+entropy is re-encoded by this Rust generator.
 
 | Fixture | Geometry | Coding and rendering |
 |---|---|---|
@@ -2075,13 +2080,18 @@ enabled noise and photon ISO 800. Source RGB8 samples are
 | `noise/modular_257x17.jxl.hex` | 257×17 | Modular, no filtering or resampling |
 | `noise/{vardct,modular}_up{2,4,8}.jxl.hex` | 259×33 | Both modes at every factor, Gaborish and EPF2 |
 | `noise/mixed_frames.jxl.hex` | 37×19 | Five alternating VarDCT/Modular physical frames; durations 2/0/0/3/0, three presentations |
+| `noise/modular_{xyb,rgb}_group{128,256,512,1024}.jxl.hex` | (group dimension + 1)×17 | XYB and original-sRGB, every group size, partial second group |
+| `noise/modular_gray.jxl.hex` | 257×17 | Original gray, 128×128 groups |
+| `noise/modular_rgb_up{2,4,8}.jxl.hex` | 259×33 | Original-sRGB with Gaborish, EPF2 and every upsampling factor |
+| `noise/modular_rgb_palette.jxl.hex` | 129×17 | Original-sRGB with a lossy single-channel palette and implicit indices |
+| `noise/vardct_lf_correlation.jxl.hex` | 257×17 | Base correlation [0, 1], color factor 84, nonzero LF factors [12, −19] |
+| `noise/vardct_base_correlation.jxl.hex` | 257×17 | Custom base correlation [0.125, 0.875], color factor 84, zero LF factors |
 
-Regenerate into an existing output directory with:
+Regenerate all 24 codestreams and four linear references with:
 
 ```sh
-cc crates/jxl_wgpu_decode/test-data/generate_noise.c \
-  $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-generate-noise
-/tmp/jxl-generate-noise crates/jxl_wgpu_decode/test-data/noise
+cargo run -p jxl_wgpu_decode --example regenerate_noise -- \
+  crates/jxl_wgpu_decode/test-data/noise
 cargo test -p jxl_wgpu_decode --test noise -- --test-threads=1
 cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
 ```
@@ -2089,8 +2099,8 @@ cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
 `tests/noise.rs` parses the real signaled model and also clears exactly its ten bytes to compare
 the same entropy with a zero model. Every noisy result must differ from its zero-model result.
 Whole input and 43-byte source chunks under a 256-byte GPU window cap must produce bit-identical
-F32 RGBA output for every presentation. Both variants are compared against independent Rust jxl
-and optional live libjxl: maximum absolute error must stay below 0.0001 and 1/1024 respectively.
+F32 RGBA output for every presentation. For 21 cases, both variants are compared against independent
+Rust jxl and optional live libjxl: maximum absolute error must stay below 0.0001 and 1/1024 respectively.
 The latter is a quarter of one RGB8 code; noise-free upsampled controls exhibit the same native
 transform-rounding scale (observed maximum 0.0002591). Noise does not justify relaxing this bound.
 The mixed stream explicitly checks seeds `[1,0], [1,1], [1,2], [2,0], [3,0]` and complete output
@@ -2104,20 +2114,44 @@ including endpoint clipping. Fused convolution/addition must match the scalar re
 2e-6 without changing row padding. Portable Naga validation and invalid geometry/model/address
 limits are checked. The metadata unit test exercises every truncated length of a skewed 80-bit
 model, preserving the following packet data. Public admission tests compare zero/nonzero memory,
-force a one-byte capacity shortfall, retry and abandon submitted work.
+force a one-byte capacity shortfall, retry and abandon submitted work. XYB 257×17 adds 52,524
+bytes for the random planes and uniform. Unfiltered original RGB and gray also need normalization
+and aligned render destinations; at the tested 256-byte storage-offset alignment their complete
+increase is 158,376 bytes. All allocations join the initial admission and callback lifetime.
 
 Production noise uses base X/B correlation, following
 [libjxl's noise stage](https://github.com/libjxl/libjxl/blob/main/lib/jxl/render_pipeline/stage_noise.cc)
 and [jxl-oxide's noise implementation](https://github.com/tirr-c/jxl-oxide/blob/main/crates/jxl-render/src/features/noise.rs).
-Rust jxl 0.6 instead uses LF-adjusted correlation in its noise stage; that distinction still
-requires a custom-correlation codestream fixture and should not be resolved by loosening oracle
-tolerances. Non-XYB noise remains typed unsupported. Preview, LF/reference-only frames,
+Rust jxl 0.6 instead uses LF-adjusted correlation in its noise stage. The nonzero-LF fixture now
+exposes that difference: Rust/native noisy sRGB differs by about 0.02259. Both custom fixtures
+are tested against checked native linear F32 output and optional live linear output, below the
+same 1/1024 bound. Observed GPU/native linear maxima are 0.000085235 (LF factors) and 0.000120640
+(base correlation). Linear output avoids extended-range sRGB approximation differences: the
+LF fixture's zero-model red reaches about 2.07 in sRGB, where the CPU approximations differ from
+the GPU's mathematical transfer by about 0.00136. The tests verify the actual base/LF metadata
+and use independent noisy and zero-model references. An offline jxl-oxide 0.12.6 linear-output
+cross-check agrees with native within 0.000085116 and 0.000115872 respectively.
+
+The single-channel palette case is an explicit oracle exception. ISO/IEC 18181-1:2024 H.6.4
+applies implicit entries regardless of channel count. The GPU, Rust jxl 0.6 and an offline
+jxl-oxide 0.12.6 cross-check agree; zero-model green starts at 4/255 then 0. However,
+[libjxl's single-channel inverse palette](https://github.com/libjxl/libjxl/blob/main/lib/jxl/modular/transform/palette.cc)
+clamps indices when the delta count is zero and the predictor is Zero, yielding 32/255 at both
+positions. The native zero-model maxAE is 0.74117655. The dedicated test retains the original
+stream, checks these normative samples and requires the usual 0.0001 GPU/Rust bound; it does
+not use the clamping native implementation as its pixel oracle. The rest of the original-color
+corpus still runs both oracles (observed maxima below 0.000001).
+
+Non-XYB VarDCT noise remains typed unsupported. Preview, LF/reference-only frames,
 patch/spline combinations, and the full 18181-3 precision corpus remain open conformance gates.
 No production CPU image codec, random-plane upload or intermediate image readback is introduced.
 
+The four expanded noise integration tests pass on Apple M5/Metal, including exact whole/fragmented
+output, every group size, both original-color admission cases and the oracle exceptions above.
+
 Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
-745 tests across 33 targets, with one existing manual benchmark ignored. Both noise integration
-tests also pass after adding explicit finite-sample assertions. Formatting, workspace check,
-warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal
-harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All nine fixtures regenerate
-byte-identically with the checked generator and libjxl 0.12.0.
+747 tests across 34 targets, with one existing manual benchmark ignored. Formatting, workspace
+check, warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and
+Metal harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All 24 codestreams and
+four linear F32 references regenerate byte-identically with libjxl 0.12.0; the original nine
+codestreams are unchanged.

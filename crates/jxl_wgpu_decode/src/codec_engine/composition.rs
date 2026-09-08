@@ -80,6 +80,7 @@ pub(super) fn needs_surface(
             frame.encoding == jxl_gpu_bitstream::FrameEncoding::Modular
                 && frame.lf_level == 0
                 && (image.xyb_encoded
+                    || frame.flags & 1 != 0
                     || frame.restoration_filter
                         != jxl_gpu_bitstream::RestorationFilterInventory::Custom {
                             gaborish: jxl_gpu_bitstream::GaborishInventory::Disabled,

@@ -362,17 +362,22 @@ match Rust `jxl`; subsequent reference chains use libjxl because of the document
 clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
 color management, pre-transform references, patches and splines remain separate work.
 
-Both XYB coding modes parse the bounded 80-bit `NoiseModel` and use the shared
-`jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before color conversion.
+Both XYB coding modes and original-sRGB Modular RGB/gray parse the bounded 80-bit `NoiseModel` and
+use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before
+color conversion.
 `FrameInventory::noise_seed` preserves the visible/nonvisible counters when a physical frame is
 projected into a producer. SplitMix64/Xorshift128Plus execute as portable WGSL u32 pairs; no CPU
 random image is uploaded. Three random F32 planes and one 96-byte uniform join the same frame
-reservation and callback lifetime. An all-zero model allocates and dispatches nothing.
-`tests/noise.rs` compares nine libjxl fixtures and their zero-model variants against Rust jxl and
-optional live libjxl F32 output, including 2×/4×/8× upsampling and five mixed physical frames with
-three presentations. It requires exact whole/256-byte-window output agreement, admission retry
-and cancellation cleanup. Non-XYB noise is still rejected; preview, LF/reference-only and
-patch/spline combinations and custom correlation need further conformance coverage.
+reservation and callback lifetime. An all-zero model skips noise allocation and dispatch.
+`tests/noise.rs` covers 24 fixtures and their zero-model variants, including all four Modular
+group sizes, 2×/4×/8× upsampling and five mixed physical frames with three presentations. Twenty-one
+use Rust jxl and optional live libjxl F32 references. Two custom base/LF correlation fixtures use
+checked native linear RGB references, avoiding Rust jxl 0.6's LF-slope noise error and extended-range
+sRGB approximations. A single-channel implicit palette case follows H.6.4 and Rust jxl;
+libjxl 0.12 incorrectly clamps those indices. Exact whole/256-byte-window output agreement,
+admission retry and cancellation cleanup cover both XYB and original color, including the
+normalization allocations introduced by nonzero noise. Non-XYB VarDCT noise, preview,
+LF/reference-only and patch/spline combinations need further conformance coverage.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after

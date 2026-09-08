@@ -80,7 +80,12 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
     };
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format()).unwrap();
-    for name in ["vardct_257x17", "modular_257x17"] {
+    for name in [
+        "vardct_257x17",
+        "modular_257x17",
+        "modular_rgb_group256",
+        "modular_gray",
+    ] {
         let bytes = encoded(name);
         let inventory = jxl_gpu_bitstream::parse(&bytes, Default::default())
             .unwrap()
@@ -96,7 +101,25 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
         let required = planned_bytes(&backend, &mut pending);
         assert_eq!(
             required - empty_bytes,
-            257 * 17 * 12 + jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES
+            257 * 17 * 12
+                + jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES
+                + if inventory.image_header.xyb_encoded {
+                    0
+                } else {
+                    // Noise introduces the color renderer for unfiltered original color:
+                    // three normalized planes, three aligned render destinations, and packing.
+                    let alignment = u64::from(
+                        backend
+                            .device()
+                            .limits()
+                            .min_storage_buffer_offset_alignment,
+                    )
+                    .max(4);
+                    257 * 17 * 12
+                        + (257_u64 * 17 * 4).div_ceil(alignment) * alignment * 3
+                        + 80
+                        + 352
+                }
         );
         let budget = backend.transient_memory_budget();
         assert_eq!(budget.snapshot().reserved_bytes, 0);
@@ -131,6 +154,60 @@ fn noise_scratch_is_admitted_before_submission_and_released_on_retry_and_cancell
 
 #[test]
 fn both_coding_modes_synthesize_signaled_noise_on_gpu_from_whole_and_bounded_input() {
+    check_cases(
+        &[
+            "vardct_257x17",
+            "modular_257x17",
+            "vardct_up2",
+            "vardct_up4",
+            "vardct_up8",
+            "modular_up2",
+            "modular_up4",
+            "modular_up8",
+            "mixed_frames",
+            "modular_xyb_group128",
+            "modular_xyb_group256",
+            "modular_xyb_group512",
+            "modular_xyb_group1024",
+            "modular_rgb_group128",
+            "modular_rgb_group256",
+            "modular_rgb_group512",
+            "modular_rgb_group1024",
+            "modular_gray",
+            "modular_rgb_up2",
+            "modular_rgb_up4",
+            "modular_rgb_up8",
+        ],
+        Reference::Srgb,
+    );
+}
+
+#[test]
+fn noise_uses_base_correlations_independently_of_lf_slopes() {
+    check_cases(
+        &["vardct_lf_correlation", "vardct_base_correlation"],
+        Reference::LinearCorrelation,
+    );
+}
+
+#[test]
+fn original_rgb_noise_preserves_single_channel_implicit_palette_values() {
+    check_cases(&["modular_rgb_palette"], Reference::ImplicitPalette);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reference {
+    Srgb,
+    // Native linear output avoids extended-range sRGB approximation error; checked snapshots
+    // make this regression mandatory even without libjxl installed. Rust jxl 0.6 incorrectly
+    // uses LF-adjusted correlations for noise, so it is not an oracle for the LF-slope case.
+    LinearCorrelation,
+    // ISO/IEC 18181-1 H.6.4 applies implicit entries to single-channel palettes too.
+    // libjxl 0.12 clamps these indices in its single-channel, zero-delta, Zero-predictor path.
+    ImplicitPalette,
+}
+
+fn check_cases(names: &[&str], reference: Reference) {
     let backend = match pollster::block_on(WgpuBackend::request_default(WgpuBackendConfig {
         enable_timestamps: false,
         ..Default::default()
@@ -145,17 +222,7 @@ fn both_coding_modes_synthesize_signaled_noise_on_gpu_from_whole_and_bounded_inp
             .unwrap()
             .with_stream_window_limit(std::num::NonZeroU64::new(256).unwrap()),
     );
-    for name in [
-        "vardct_257x17",
-        "modular_257x17",
-        "vardct_up2",
-        "vardct_up4",
-        "vardct_up8",
-        "modular_up2",
-        "modular_up4",
-        "modular_up8",
-        "mixed_frames",
-    ] {
+    for &name in names {
         let bytes = encoded(name);
         let inventory = jxl_gpu_bitstream::parse(&bytes, Default::default())
             .unwrap()
@@ -163,6 +230,29 @@ fn both_coding_modes_synthesize_signaled_noise_on_gpu_from_whole_and_bounded_inp
             .unwrap();
         assert!(inventory.frames.iter().all(|frame| frame.flags & 1 != 0));
         assert_eq!(inventory.frames[0].noise_seed, [1, 0]);
+        if let Some((_, dimension)) = name.rsplit_once("_group") {
+            let dimension: u32 = dimension.parse().unwrap();
+            assert_eq!(128 << inventory.frames[0].group_size_shift, dimension);
+            assert_eq!(inventory.image_header.width, dimension + 1);
+        }
+        if name.starts_with("modular_rgb_") || name == "modular_gray" {
+            assert!(!inventory.image_header.xyb_encoded);
+        }
+        if reference == Reference::LinearCorrelation {
+            let mut range = inventory.frames[0].sections[0].bits;
+            range.offset += 80;
+            range.length -= 80;
+            let prefix =
+                jxl_wgpu_decode::vardct::frontend::LfGlobalPrefix::parse(&bytes, range).unwrap();
+            assert_eq!(prefix.lf_correlation.colour_factor, 84);
+            let (base, factors) = if name == "vardct_lf_correlation" {
+                ([0.0, 1.0], [12, -19])
+            } else {
+                ([0.125, 0.875], [0, 0])
+            };
+            assert_eq!(prefix.lf_correlation.base, base);
+            assert_eq!(prefix.lf_correlation.lf_factors, factors);
+        }
         if name == "mixed_frames" {
             assert_eq!(
                 inventory
@@ -197,29 +287,54 @@ fn both_coding_modes_synthesize_signaled_noise_on_gpu_from_whole_and_bounded_inp
             }
             let pixels =
                 inventory.image_header.width as usize * inventory.image_header.height as usize;
-            let rust_frames = if name == "mixed_frames" {
-                oracle::rust_frame_planes(&bytes)
-            } else {
-                vec![oracle::rust_planes(&bytes)]
-            };
-            let rust: Vec<f32> = rust_frames
-                .into_iter()
-                .flat_map(|(rgb, extras)| {
-                    assert!(extras.is_empty());
-                    rgb
-                })
-                .collect();
-            let native = if name == "mixed_frames" {
+            let rust = (reference != Reference::LinearCorrelation).then(|| {
+                let frames = if name == "mixed_frames" {
+                    oracle::rust_frame_planes(&bytes)
+                } else {
+                    vec![oracle::rust_planes(&bytes)]
+                };
+                frames
+                    .into_iter()
+                    .flat_map(|(rgb, extras)| {
+                        assert!(extras.is_empty());
+                        rgb
+                    })
+                    .collect::<Vec<f32>>()
+            });
+            let snapshot = (reference == Reference::LinearCorrelation).then(|| {
+                let suffix = if zero_model { "zero.linear" } else { "linear" };
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("test-data/noise/{name}.{suffix}.f32.hex"));
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|word| f32::from_bits(u32::from_str_radix(word, 16).unwrap()))
+                    .collect::<Vec<_>>()
+            });
+            let native = if reference == Reference::ImplicitPalette {
+                None
+            } else if reference == Reference::LinearCorrelation {
+                oracle::libjxl_output(&bytes, &["--linear"])
+            } else if name == "mixed_frames" {
                 oracle::libjxl_output(&bytes, &[])
             } else {
                 oracle::libjxl_planes(&bytes, pixels, 0).map(|(rgb, _)| rgb)
             };
-            let request = GpuOutputRequest::color(PixelFormat::rgb_f32(
-                RgbChannelOrder::Rgba,
-                false,
-                jxl_wgpu_decode::vardct_rgb8_format().color_spec,
-            ))
-            .unwrap();
+            if reference == Reference::ImplicitPalette && zero_model {
+                let rust = rust.as_ref().unwrap();
+                assert_eq!(&rust[..4], &[35.0 / 255.0, 4.0 / 255.0, 39.0 / 255.0, 1.0]);
+                assert_eq!(rust[5], 0.0);
+            }
+            let mut color = jxl_wgpu_decode::vardct_rgb8_format().color_spec;
+            if reference == Reference::LinearCorrelation {
+                let jxl_gpu_formats::ColorSpecification::Defined(ref mut defined) = color else {
+                    panic!("defined RGB color");
+                };
+                defined.transfer = jxl_gpu_formats::TransferFunction::Linear;
+            }
+            let request =
+                GpuOutputRequest::color(PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color))
+                    .unwrap();
             let mut expected_words = None;
             for fragmented in [false, true] {
                 let mut session = if fragmented {
@@ -238,7 +353,11 @@ fn both_coding_modes_synthesize_signaled_noise_on_gpu_from_whole_and_bounded_inp
                 if let Some(expected) = &expected_words {
                     assert_eq!(&words, expected, "{name}");
                 }
-                for (reference, label) in std::iter::once((&rust, "Rust"))
+                for (reference, label) in rust
+                    .as_ref()
+                    .map(|data| (data, "Rust"))
+                    .into_iter()
+                    .chain(snapshot.as_ref().map(|data| (data, "snapshot")))
                     .chain(native.as_ref().map(|data| (data, "libjxl")))
                 {
                     assert_eq!(reference.len(), words.len());

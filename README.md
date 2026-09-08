@@ -274,13 +274,14 @@ blend modes against four resident post-transform reference slots. Intermediate p
 presentation, arbitrary ICC transforms, patches and splines still require production integration
 and conformance.
 
-XYB Modular and VarDCT now synthesize the signaled noise model on the GPU after restoration and
-frame upsampling, before color conversion. A shared portable shader generates deterministic
-random planes from physical-frame counters, applies the mirrored convolution and adds
-luma-dependent noise. Nine libjxl fixtures cover both coding modes, 2×/4×/8× upsampling and mixed
-visible/nonvisible frames under whole and bounded fragmented input. Zero-model allocation,
-admission retry and cancellation are checked. Non-XYB noise and broader LF/reference/render-feature
-combinations remain conformance work.
+XYB Modular/VarDCT and original-sRGB Modular now synthesize the signaled noise model on the GPU
+after restoration and frame upsampling, before color conversion. A shared portable shader generates
+deterministic random planes from physical-frame counters, applies the mirrored convolution and adds
+luma-dependent noise. Twenty-four fixtures cover both coding modes, RGB/gray, all four Modular
+group sizes, 2×/4×/8× upsampling, custom base/LF correlation, single-channel implicit palettes and
+mixed visible/nonvisible frames under whole and bounded fragmented input. Zero-model allocation,
+admission retry and cancellation are checked. Non-XYB VarDCT noise and broader
+LF/reference/render-feature combinations remain conformance work.
 
 Independent Replace presentations validate each overwritten color/extra layer before returning
 the final producer's native output. LF sequences execute every physical node once, retain only

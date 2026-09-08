@@ -60,13 +60,16 @@ impl ModularColorConfig {
         } else {
             None
         };
+        let noise = noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0]));
         Ok(
-            (xyb.is_some() || gaborish.is_some() || epf.is_some()).then(|| Self {
-                noise: noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0])),
-                xyb,
-                gaborish,
-                epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
-                inverse_sigma: -1.171_572_9 / sigma,
+            (xyb.is_some() || gaborish.is_some() || epf.is_some() || noise.is_some()).then(|| {
+                Self {
+                    noise,
+                    xyb,
+                    gaborish,
+                    epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
+                    inverse_sigma: -1.171_572_9 / sigma,
+                }
             }),
         )
     }

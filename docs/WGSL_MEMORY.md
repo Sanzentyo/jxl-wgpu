@@ -862,7 +862,10 @@ the same plan in reconstruction storage/uniform totals and `modular_render_bytes
 the complete footprint before the first queue submission and retain buffers/uniforms through
 their existing callback-owned job lifetime. The noise integration test observes admission through
 the public executor, including Modular's composition producer: nonzero versus zero models add
-exactly 52,524 bytes for 257×17, one byte below the required capacity leaves no partial permit,
+exactly 52,524 bytes for 257×17 XYB. Unfiltered original-sRGB RGB/gray additionally needs three
+normalized F32 planes, three render destinations aligned to the device's storage-offset alignment,
+an 80-byte normalization uniform and 352 bytes for packing. The tested 256-byte alignment makes
+that total increase 158,376 bytes. One byte below the required capacity leaves no partial permit,
 retry succeeds after release, and abandoning a submitted fragmented session releases all permits
 after completion callbacks run. All-zero models consume their 80 metadata bits but allocate no
 noise resources.

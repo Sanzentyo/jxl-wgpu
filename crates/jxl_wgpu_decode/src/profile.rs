@@ -285,7 +285,6 @@ fn parse_modular_profile(
     let shared_frame_is_invalid = frame.is_preview
         || frame.encoding != FrameEncoding::Modular
         || frame.flags & !1 != 0
-        || (frame.flags & 1 != 0 && !image.xyb_encoded)
         || frame.do_ycbcr
         || frame.jpeg_upsampling != [0; 3]
         || !matches!(frame.upsampling, 1 | 2 | 4 | 8)
