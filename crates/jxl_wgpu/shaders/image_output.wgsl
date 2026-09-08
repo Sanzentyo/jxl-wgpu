@@ -37,6 +37,7 @@ struct Params {
     primaries_r: vec4<f32>,
     primaries_g: vec4<f32>,
     primaries_b: vec4<f32>,
+    alpha: vec4<u32>, // association conversion, reserved
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -76,6 +77,11 @@ fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
             magnitude * magnitude / 3.0,
             magnitude <= 0.5,
         );
+    } else if transfer == 5u {
+        let alpha = 1.09929682680944;
+        let beta = 0.018053968510807;
+        linear = select(pow((magnitude + alpha - 1.0) / alpha, 1.0 / 0.45), magnitude / 4.5,
+            magnitude < 4.5 * beta);
     }
     return select(linear, -linear, value < 0.0);
 }
@@ -126,7 +132,7 @@ fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
     );
 }
 
-fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
     if params.identity_color_transform != 0u { return source_rgb_at(x, y); }
     let linear = target_linear_rgb_at(x, y);
     return vec3<f32>(
@@ -134,6 +140,18 @@ fn rgb_at(x: u32, y: u32) -> vec3<f32> {
         transfer_from_linear(linear.g, params.target_transfer),
         transfer_from_linear(linear.b, params.target_transfer),
     );
+}
+
+fn rgb_at(x: u32, y: u32) -> vec3<f32> {
+    let color = target_rgb_at(x, y);
+    if params.alpha.x == 0u { return color; }
+    return color * output_alpha_multiplier_at(x, y);
+}
+
+fn output_alpha_multiplier_at(x: u32, y: u32) -> f32 {
+    // Packed 4:2:2 duplicates the final luma at odd widths. Its alpha must use that same
+    // clamped output coordinate before orientation, including on a one-pixel axis.
+    return image_alpha_multiplier(source_alpha_at(min(x, params.width - 1u), min(y, params.height - 1u)), params.alpha.x);
 }
 
 fn coefficients() -> vec2<f32> {
@@ -161,12 +179,20 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
     if params.matrix != 3u {
         return rgb_to_yuv(rgb_at(x, y));
     }
-    let linear = target_linear_rgb_at(x, y);
-    let encoded = vec3<f32>(
+    var linear = target_linear_rgb_at(x, y);
+    var encoded = vec3<f32>(
         transfer_from_linear(linear.r, params.target_transfer),
         transfer_from_linear(linear.g, params.target_transfer),
         transfer_from_linear(linear.b, params.target_transfer),
     );
+    if params.alpha.x != 0u {
+        encoded *= output_alpha_multiplier_at(x, y);
+        linear = vec3<f32>(
+            transfer_to_linear(encoded.r, params.target_transfer),
+            transfer_to_linear(encoded.g, params.target_transfer),
+            transfer_to_linear(encoded.b, params.target_transfer),
+        );
+    }
     let coefficient = coefficients();
     let kr = coefficient.x;
     let kb = coefficient.y;

@@ -89,6 +89,8 @@ pub struct VarDctOutputConfig {
     /// Maps input coordinates into the display-oriented packed output.
     pub orientation: OutputOrientation,
     pub transform: VarDctOutputTransform,
+    /// Conversion in the requested RGB encoding, after reconstruction and color conversion.
+    pub alpha_conversion: jxl_wgpu::AlphaConversion,
 }
 
 impl VarDctOutputConfig {
@@ -125,7 +127,8 @@ impl VarDctOutputConfig {
                 },
             },
             dispatch_width,
-        )?)
+        )?
+        .with_alpha_conversion(self.alpha_conversion))
     }
 }
 
@@ -134,7 +137,7 @@ impl VarDctOutputConfig {
 pub struct VarDctOutputInputs<'a> {
     /// X, Y, and B F32 planes, in that order.
     pub planes: [VarDctOutputPlane<'a>; 3],
-    /// Optional full-resolution, unassociated integer alpha reconstructed by Modular.
+    /// Optional full-resolution alpha reconstructed by Modular, independently normalized.
     pub alpha: Option<VarDctOutputAlpha<'a>>,
     /// Output storage for the requested pitch-linear layout;
     /// its allocated/bound length is rounded up to four bytes.
@@ -326,7 +329,7 @@ fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), VarDctOutputEr
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct VarDctOutputScratch {
-    /// The shared 176-byte color/layout parameter buffer.
+    /// The shared 192-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
     /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
@@ -341,6 +344,8 @@ pub enum VarDctOutputError {
     StorageBindingCount { available: u32 },
     #[error("VarDCT alpha requires 1–16-bit integer samples, got {bits}")]
     InvalidAlphaBitDepth { bits: u32 },
+    #[error("VarDCT alpha conversion requires an alpha input plane")]
+    MissingAlphaPlane,
     /// The common output contract rejected color or layout metadata.
     #[error(transparent)]
     ImageOutput(#[from] jxl_wgpu::Error),
@@ -432,7 +437,7 @@ pub enum VarDctOutputError {
         required: u64,
         available: u64,
     },
-    /// The 176-byte uniform exceeds an unusual device limit.
+    /// The 192-byte uniform exceeds an unusual device limit.
     #[error("VarDCT color uniform needs {required} bytes, uniform binding limit is {available}")]
     UniformBindingLimit { required: u64, available: u64 },
     /// Output packing requires a one-dimensional workgroup.
@@ -583,6 +588,11 @@ fn validate_inputs(
 ) -> Result<(VarDctSourceParams, ImageOutputParams, VarDctOutputPlan), VarDctOutputError> {
     if let VarDctOutputTransform::Xyb(inverse) = inputs.config.transform {
         validate_inverse_opsin(inverse)?;
+    }
+    if inputs.config.alpha_conversion != jxl_wgpu::AlphaConversion::Preserve
+        && inputs.alpha.is_none()
+    {
+        return Err(VarDctOutputError::MissingAlphaPlane);
     }
     let plan = VarDctOutputPlan::for_limits_with_variant(inputs.layout, &device.limits(), variant)?;
     let output_params = inputs.config.image_params(
@@ -976,9 +986,9 @@ mod tests {
         let memory = VarDctOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 336);
-        assert_eq!(memory.transient_bytes, 336);
-        assert_eq!(memory.total_bytes, 384);
+        assert_eq!(memory.uniform_bytes, 352);
+        assert_eq!(memory.transient_bytes, 352);
+        assert_eq!(memory.total_bytes, 400);
 
         let plan = VarDctOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -1058,6 +1068,7 @@ mod tests {
             extent: Extent2d::new(5, 3),
             orientation: OutputOrientation::from_exif_value(6).unwrap(),
             transform: VarDctOutputTransform::Xyb(inverse_opsin()),
+            alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         };
         let layout = rgb_layout(3, 5);
         config.validate_layout(&layout).unwrap();
@@ -1212,49 +1223,60 @@ mod tests {
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("VarDCT color test commands"),
                         });
-                    let scratch = packer
-                        .encode(
-                            &device,
-                            &mut encoder,
-                            VarDctOutputInputs {
-                                alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
-                                    domain: crate::ModularSampleDomain::SignedInteger,
-                                    storage: binding(&alpha),
-                                    width: extent.width,
-                                    height: extent.height,
-                                    stride: extent.width,
-                                    word_offset: 2,
-                                    bits_per_sample: 5,
-                                }),
-                                planes: [
-                                    VarDctOutputPlane {
-                                        storage: binding(&x),
-                                        width: extent.width,
-                                        height: extent.height,
-                                        stride: extent.width,
-                                    },
-                                    VarDctOutputPlane {
-                                        storage: binding(&y),
-                                        width: extent.width,
-                                        height: extent.height,
-                                        stride: extent.width,
-                                    },
-                                    VarDctOutputPlane {
-                                        storage: binding(&b),
-                                        width: extent.width,
-                                        height: extent.height,
-                                        stride: extent.width,
-                                    },
-                                ],
-                                output: binding(&output),
-                                layout: &layout,
-                                config: VarDctOutputConfig {
-                                    extent,
-                                    orientation,
-                                    transform: VarDctOutputTransform::Xyb(inverse_opsin()),
-                                },
+                    let inputs = VarDctOutputInputs {
+                        alpha: matches!(layout_kind, 2 | 4).then_some(VarDctOutputAlpha {
+                            domain: crate::ModularSampleDomain::SignedInteger,
+                            storage: binding(&alpha),
+                            width: extent.width,
+                            height: extent.height,
+                            stride: extent.width,
+                            word_offset: 2,
+                            bits_per_sample: 5,
+                        }),
+                        planes: [
+                            VarDctOutputPlane {
+                                storage: binding(&x),
+                                width: extent.width,
+                                height: extent.height,
+                                stride: extent.width,
                             },
-                        )
+                            VarDctOutputPlane {
+                                storage: binding(&y),
+                                width: extent.width,
+                                height: extent.height,
+                                stride: extent.width,
+                            },
+                            VarDctOutputPlane {
+                                storage: binding(&b),
+                                width: extent.width,
+                                height: extent.height,
+                                stride: extent.width,
+                            },
+                        ],
+                        output: binding(&output),
+                        layout: &layout,
+                        config: VarDctOutputConfig {
+                            extent,
+                            orientation,
+                            transform: VarDctOutputTransform::Xyb(inverse_opsin()),
+                            alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
+                        },
+                    };
+                    if inputs.alpha.is_none() {
+                        for conversion in [
+                            jxl_wgpu::AlphaConversion::Unpremultiply,
+                            jxl_wgpu::AlphaConversion::Premultiply,
+                        ] {
+                            let mut converted = inputs;
+                            converted.config.alpha_conversion = conversion;
+                            assert!(matches!(
+                                packer.encode(&device, &mut encoder, converted),
+                                Err(VarDctOutputError::MissingAlphaPlane)
+                            ));
+                        }
+                    }
+                    let scratch = packer
+                        .encode(&device, &mut encoder, inputs)
                         .expect("record fused VarDCT color output");
                     assert_eq!(
                         scratch.plan.memory.logical_output_bytes,
@@ -1264,7 +1286,7 @@ mod tests {
                         scratch.plan.memory.output_storage_bytes,
                         layout.logical_size.div_ceil(4) * 4
                     );
-                    assert_eq!(scratch.uniform.size(), 176);
+                    assert_eq!(scratch.uniform.size(), 192);
                     assert_eq!(scratch.source_uniform.size(), 160);
                     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);

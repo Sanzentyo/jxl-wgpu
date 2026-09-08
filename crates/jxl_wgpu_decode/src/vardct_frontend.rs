@@ -1284,10 +1284,6 @@ fn validate_image(
                     bits_per_sample: 1..=16
                 }
             ) || extra.dimension_shift > 3
-                || matches!(
-                    extra.channel_type,
-                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: true }
-                )
         })
     {
         return unsupported(UnsupportedVarDctFeature::ExtraChannels);

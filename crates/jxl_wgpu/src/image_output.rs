@@ -22,6 +22,7 @@ use jxl_gpu_protocol::{
 /// and linear `source_alpha_at(x: u32, y: u32) -> f32`, both in oriented coordinates.
 pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
+    include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
 );
 
@@ -31,6 +32,7 @@ pub const IMAGE_ORIENTATION_SHADER: &str = include_str!("../shaders/image_orient
 
 pub(crate) const RGB_TO_IMAGE_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
+    include_str!("../shaders/alpha_output.wgsl"),
     include_str!("../shaders/image_output.wgsl"),
     include_str!("../shaders/rgb_to_image.wgsl"),
 );
@@ -45,7 +47,21 @@ pub struct ImageOutputSource {
     pub encoding: RgbColorEncoding,
 }
 
-/// Fixed 176-byte uniform for the shared output shader.
+/// Shared output association helper. Conversion follows the requested color transfer and
+/// precedes quantization; the alpha value itself is unchanged.
+pub const ALPHA_OUTPUT_SHADER: &str = include_str!("../shaders/alpha_output.wgsl");
+
+/// Resolved conversion between source and output alpha association.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaConversion {
+    #[default]
+    Preserve = 0,
+    Unpremultiply = 1,
+    Premultiply = 2,
+}
+
+/// Fixed 192-byte uniform for the shared output shader.
 /// Construct it with [`Self::new`] to validate geometry, color, and packed addressing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -85,6 +101,7 @@ pub struct ImageOutputParams {
     pub(crate) primaries_r: [f32; 4],
     pub(crate) primaries_g: [f32; 4],
     pub(crate) primaries_b: [f32; 4],
+    pub(crate) alpha: [u32; 4],
 }
 impl ImageOutputParams {
     /// Lowers the requested layout and source metadata before any GPU submission.
@@ -142,7 +159,16 @@ impl ImageOutputParams {
             primaries_r: color.primaries[0],
             primaries_g: color.primaries[1],
             primaries_b: color.primaries[2],
+            alpha: [0; 4],
         })
+    }
+
+    /// Adjusts RGB association after color conversion, including when the output omits alpha.
+    /// The producer must supply the matching alpha plane through `source_alpha_at`.
+    #[must_use]
+    pub const fn with_alpha_conversion(mut self, conversion: AlphaConversion) -> Self {
+        self.alpha[0] = conversion as u32;
+        self
     }
 }
 
@@ -482,9 +508,10 @@ fn to_shader_u32(value: u64) -> Result<u32> {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ImageOutputParams>() == 176);
+    assert!(std::mem::size_of::<ImageOutputParams>() == 192);
     assert!(std::mem::align_of::<ImageOutputParams>() == 4);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_g) == 144);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_b) == 160);
+    assert!(std::mem::offset_of!(ImageOutputParams, alpha) == 176);
 };

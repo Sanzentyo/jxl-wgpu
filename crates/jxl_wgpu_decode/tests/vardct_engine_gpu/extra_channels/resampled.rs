@@ -1,6 +1,6 @@
 use super::*;
 
-fn fragmented(
+pub(super) fn fragmented(
     decoder: &GpuDecoder<WgpuDecodeEngine>,
     data: &[u8],
     request: GpuOutputRequest,

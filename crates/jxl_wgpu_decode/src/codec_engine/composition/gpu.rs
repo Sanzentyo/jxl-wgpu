@@ -71,7 +71,7 @@ enum Packing {
 pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
-    has_alpha: bool,
+    alpha_associated: Option<bool>,
     blend: wgpu::ComputePipeline,
     pack: wgpu::ComputePipeline,
     packing: Packing,
@@ -84,7 +84,7 @@ impl Compositor {
     pub(super) fn new(
         backend: WgpuBackend,
         canvas: Extent2d,
-        has_alpha: bool,
+        alpha_associated: Option<bool>,
         grayscale: bool,
         orientation: OutputOrientation,
         request: &GpuOutputRequest,
@@ -97,6 +97,11 @@ impl Compositor {
         validate_size(device, output_size)?;
         let blend_dispatch = dispatch(device, u64::from(canvas.width) * u64::from(canvas.height))?;
         let output_dispatch = dispatch(device, output_size / 4)?;
+        let alpha_conversion = if request.mapping() == crate::GpuOutputMapping::Color {
+            request.alpha_output_policy().conversion(alpha_associated)
+        } else {
+            jxl_wgpu::AlphaConversion::Preserve
+        };
         let (packing, source) = if let Some(native) =
             crate::model::native_modular_format(request.format())
         {
@@ -123,26 +128,30 @@ impl Compositor {
                         u32::try_from(layout.logical_size).map_err(|_| address_error())?,
                         output_dispatch[0] * 64,
                         orientation.to_exif_value() - 1,
-                        0,
+                        alpha_conversion as u32,
                     ],
                 }),
                 format!(
-                    "{IMAGE_ORIENTATION_SHADER}\n{}",
+                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{}",
+                    jxl_wgpu::ALPHA_OUTPUT_SHADER,
                     include_str!("native.wgsl")
                 ),
             )
         } else {
             (
-                Packing::Color(Box::new(ImageOutputParams::new(
-                    &layout,
-                    ImageOutputSource {
-                        extent: canvas,
-                        orientation,
-                        strides: [canvas.width * 4; 3],
-                        encoding: RgbColorEncoding::SRGB_BT709,
-                    },
-                    output_dispatch[0] * 64,
-                )?)),
+                Packing::Color(Box::new(
+                    ImageOutputParams::new(
+                        &layout,
+                        ImageOutputSource {
+                            extent: canvas,
+                            orientation,
+                            strides: [canvas.width * 4; 3],
+                            encoding: RgbColorEncoding::SRGB_BT709,
+                        },
+                        output_dispatch[0] * 64,
+                    )?
+                    .with_alpha_conversion(alpha_conversion),
+                )),
                 format!("{IMAGE_OUTPUT_SHADER}\n{}", include_str!("output.wgsl")),
             )
         };
@@ -161,7 +170,7 @@ impl Compositor {
         Ok(Self {
             backend,
             canvas,
-            has_alpha,
+            alpha_associated,
             blend,
             pack,
             packing,
@@ -214,10 +223,10 @@ impl Compositor {
                 u32::from(ec.clamp),
             ],
             flags: [
-                u32::from(self.has_alpha),
+                u32::from(self.alpha_associated.is_some()),
                 u32::from(color.is_some()),
                 u32::from(alpha.is_some()),
-                0,
+                u32::from(self.alpha_associated == Some(true)),
             ],
         };
         let size = surface_bytes(self.canvas)?;

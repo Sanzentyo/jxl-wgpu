@@ -1,6 +1,6 @@
 /* Offline libjxl 0.12.0 interoperability fixtures; never linked by production.
  * cc generate_frame_composition.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-composition
- * /tmp/jxl-composition OUTPUT_DIRECTORY [259x17_RGB_JPEG]
+ * /tmp/jxl-composition OUTPUT_DIRECTORY [259x17_RGB_JPEG|--associated]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
@@ -12,6 +12,7 @@
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static uint8_t* jpeg;
 static size_t jpeg_size;
+static int associated;
 
 typedef struct {
   int x, y;
@@ -26,12 +27,13 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   JxlBasicInfo info;
   JxlEncoderInitBasicInfo(&info);
   info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
-  int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0;
+  int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0 || associated;
   uint32_t color_channels = channels <= 2 ? 1 : 3;
   int has_alpha = channels != color_channels;
   uint32_t alpha_bits = has_alpha ? (different_alpha ? 5 : bits) : 0;
   info.num_color_channels = color_channels;
   info.num_extra_channels = has_alpha; info.alpha_bits = alpha_bits;
+  info.alpha_premultiplied = associated;
   info.uses_original_profile = vardct <= 0; info.orientation = (JxlOrientation)orientation;
   info.have_animation = !still;
   info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
@@ -77,6 +79,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, dc ? 4 : 1));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, vardct <= 0 && !jpeg_frame));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
+    if (associated) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1));
     if (vardct > 0) {
       check(JxlEncoderSetFrameDistance(settings, 2));
       check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
@@ -136,6 +139,13 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--associated")) {
+    associated = 1;
+    generate(argv[1], "associated_rgb", 259, 17, 4, 12, 6, 0, 0, 0);
+    generate(argv[1], "associated_gray", 37, 9, 2, 16, 8, 0, 0, 0);
+    generate(argv[1], "associated_vardct", 259, 17, 4, 12, 5, 1, 0, 0);
+    return 0;
+  }
   if (argc != 2 && argc != 3) return 2;
   generate(argv[1], "gray_alpha", 259, 17, 2, 16, 8, 0, 0, 0);
   generate(argv[1], "rgba_mixed_depth", 33, 7, 4, 12, 6, 0, 0, 0);

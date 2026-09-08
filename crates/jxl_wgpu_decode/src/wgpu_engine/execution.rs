@@ -884,6 +884,7 @@ pub(super) fn modular_finalize_params(
         resident.inverse_plan.arena_words(),
         finalize_output,
     )
+    .map(|params| params.with_alpha_conversion(selection.alpha_conversion))
     .map_err(Error::from)
 }
 
@@ -917,6 +918,7 @@ pub(super) fn modular_frame_finalize_params(
         frame_plan.inverse_plan.arena_words(),
         modular_finalize_output(output)?,
     )
+    .map(|params| params.with_alpha_conversion(selection.alpha_conversion))
     .map_err(Error::from)
 }
 
@@ -942,7 +944,8 @@ fn modular_render_finalize_params(
         (render.output_bytes / 4) as u32,
         modular_finalize_output(output)?,
     )?
-    .with_source_domain(crate::ModularSampleDomain::NormalizedF32))
+    .with_source_domain(crate::ModularSampleDomain::NormalizedF32)
+    .with_alpha_conversion(output.source_channels.alpha_conversion))
 }
 
 pub(super) fn modular_finalize_output(output: &OutputPlan) -> Result<ModularFinalizeOutput> {

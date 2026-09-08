@@ -13,6 +13,18 @@ pub fn libjxl_planes(
     pixels: usize,
     extras: usize,
 ) -> Option<(Vec<f32>, Vec<Vec<f32>>)> {
+    let values = libjxl_output(data, &[])?;
+    assert_eq!(values.len(), pixels * (4 + extras));
+    Some((
+        values[..pixels * 4].to_vec(),
+        values[pixels * 4..]
+            .chunks_exact(pixels)
+            .map(<[f32]>::to_vec)
+            .collect(),
+    ))
+}
+
+pub fn libjxl_output(data: &[u8], options: &[&str]) -> Option<Vec<f32>> {
     use std::sync::{
         OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -22,7 +34,7 @@ pub fn libjxl_planes(
     let binary = BINARY
         .get_or_init(|| {
             let flags = Command::new("pkg-config")
-                .args(["--cflags", "--libs", "libjxl"])
+                .args(["--cflags", "--libs", "libjxl", "libjxl_cms"])
                 .output()
                 .ok()?;
             if !flags.status.success() {
@@ -58,22 +70,18 @@ pub fn libjxl_planes(
         INPUT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&path, data).unwrap();
-    let decoded = Command::new(binary).arg(&path).output().unwrap();
+    let decoded = Command::new(binary)
+        .arg(&path)
+        .args(options)
+        .output()
+        .unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(
         decoded.status.success(),
         "libjxl extra oracle: {}",
         String::from_utf8_lossy(&decoded.stderr)
     );
-    assert_eq!(decoded.stdout.len(), pixels * (4 + extras) * 4);
-    let values = floats(&decoded.stdout);
-    Some((
-        values[..pixels * 4].to_vec(),
-        values[pixels * 4..]
-            .chunks_exact(pixels)
-            .map(<[f32]>::to_vec)
-            .collect(),
-    ))
+    Some(floats(&decoded.stdout))
 }
 
 use jxl::api::{
@@ -81,7 +89,15 @@ use jxl::api::{
     JxlPixelFormat, ProcessingResult, states,
 };
 
-pub fn rust_planes(encoded: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
+pub type FloatPlanes = (Vec<f32>, Vec<Vec<f32>>);
+
+pub fn rust_planes(encoded: &[u8]) -> FloatPlanes {
+    let mut frames = rust_frame_planes(encoded);
+    assert_eq!(frames.len(), 1);
+    frames.remove(0)
+}
+
+pub fn rust_frame_planes(encoded: &[u8]) -> Vec<FloatPlanes> {
     let mut input = encoded;
     let mut options = JxlDecoderOptions::default();
     options.render_spot_colors = false;
@@ -107,24 +123,32 @@ pub fn rust_planes(encoded: &[u8]) -> (Vec<f32>, Vec<Vec<f32>>) {
             count
         ],
     });
-    let ProcessingResult::Complete { result: frame } = decoder.process(&mut input, None).unwrap()
-    else {
-        panic!("complete frame")
-    };
-    let mut color = vec![0u8; size.0 * size.1 * 16];
-    let mut extras = vec![vec![0u8; size.0 * size.1 * 4]; count];
-    let mut outputs = vec![JxlOutputBuffer::new(&mut color, size.1, size.0 * 16)];
-    outputs.extend(
-        extras
-            .iter_mut()
-            .map(|plane| JxlOutputBuffer::new(plane, size.1, size.0 * 4)),
-    );
-    assert!(matches!(
-        frame.process(&mut input, &mut outputs, None).unwrap(),
-        ProcessingResult::Complete { .. }
-    ));
-    drop(outputs);
-    let color = floats(&color);
-    let extras: Vec<_> = extras.iter().map(|p| floats(p)).collect();
-    (color, extras)
+    let mut frames = Vec::new();
+    loop {
+        let ProcessingResult::Complete { result: frame } =
+            decoder.process(&mut input, None).unwrap()
+        else {
+            panic!("complete frame")
+        };
+        let mut color = vec![0u8; size.0 * size.1 * 16];
+        let mut extras = vec![vec![0u8; size.0 * size.1 * 4]; count];
+        let mut outputs = vec![JxlOutputBuffer::new(&mut color, size.1, size.0 * 16)];
+        outputs.extend(
+            extras
+                .iter_mut()
+                .map(|plane| JxlOutputBuffer::new(plane, size.1, size.0 * 4)),
+        );
+        let ProcessingResult::Complete { result } =
+            frame.process(&mut input, &mut outputs, None).unwrap()
+        else {
+            panic!("complete pixels")
+        };
+        decoder = result;
+        drop(outputs);
+        frames.push((floats(&color), extras.iter().map(|p| floats(p)).collect()));
+        if !decoder.has_more_frames() {
+            break;
+        }
+    }
+    frames
 }

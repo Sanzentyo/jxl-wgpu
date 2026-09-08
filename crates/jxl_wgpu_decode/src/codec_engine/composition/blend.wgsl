@@ -3,7 +3,7 @@ struct Params {
     intersection: vec4<u32>, // destination x, y, width, height
     source: vec4<u32>, // source x, y, color-reference stride, alpha-reference stride
     blend: vec4<u32>, // color mode, alpha mode, color clamp, alpha clamp
-    flags: vec4<u32>, // has alpha, has color reference, has alpha reference, reserved
+    flags: vec4<u32>, // has alpha, has color reference, has alpha reference, associated alpha
 };
 @group(0) @binding(0) var<storage, read> foreground: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> background_color: array<vec4<f32>>;
@@ -40,10 +40,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             case 2u: {
                 result = vec4<f32>(top.rgb, result.a);
                 if params.flags.x != 0u {
-                    let merged_alpha = alpha_over(base.a, alpha);
-                    result = vec4<f32>(0.0, 0.0, 0.0, result.a);
-                    if merged_alpha > 0.0 {
-                        result = vec4<f32>((top.rgb * alpha + base.rgb * base.a * (1.0 - alpha)) / merged_alpha, result.a);
+                    if params.flags.w != 0u {
+                        result = vec4<f32>(top.rgb + base.rgb * (1.0 - alpha), result.a);
+                    } else {
+                        let merged_alpha = alpha_over(base.a, alpha);
+                        result = vec4<f32>(0.0, 0.0, 0.0, result.a);
+                        if merged_alpha > 0.0 {
+                            result = vec4<f32>((top.rgb * alpha + base.rgb * base.a * (1.0 - alpha)) / merged_alpha, result.a);
+                        }
                     }
                 }
             }

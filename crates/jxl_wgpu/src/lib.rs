@@ -61,7 +61,8 @@ pub use display::{
 };
 pub use error::{Error, Result};
 pub use image_output::{
-    IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER, ImageOutputParams, ImageOutputSource,
+    ALPHA_OUTPUT_SHADER, AlphaConversion, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
+    ImageOutputParams, ImageOutputSource,
 };
 pub use jxl_gpu_formats::{
     ByteOrder, Channel, ChromaLocation, ChromaLocation2d, ChromaOrder, ChromaSubsampling,

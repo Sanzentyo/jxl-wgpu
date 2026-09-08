@@ -149,8 +149,11 @@ subsampling footprint; cosited output uses the top-left luma position. Numeric r
 matrix, range, and siting are never inferred from an ambiguous descriptor.
 
 The render graph and VarDCT decoder share `ImageOutputParams`, `ImageOutputSource`, and
-`IMAGE_OUTPUT_SHADER`. The fixed 176-byte uniform validates target layout, source coordinates,
-color conversion, and WGSL addressing. Producers supply `source_rgb_at` and linear `source_alpha_at`
+`IMAGE_OUTPUT_SHADER`. The fixed 192-byte uniform validates target layout, source coordinates,
+color conversion, and WGSL addressing. `with_alpha_conversion` selects an explicit
+association adjustment after color conversion and before quantization or chroma subsampling.
+The common `ALPHA_OUTPUT_SHADER` uses the JPEG XL finite `2^-26` alpha floor; it never transforms
+the alpha component through an RGB transfer. Producers supply `source_rgb_at` and linear `source_alpha_at`
 shader functions in oriented coordinates, so
 VarDCT can fuse XYB/JPEG reconstruction directly into the same word-owned packing entry point.
 Its extra source uniform is separately budgeted; no intermediate RGB image is required. Every

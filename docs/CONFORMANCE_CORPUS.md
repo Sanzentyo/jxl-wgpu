@@ -504,7 +504,7 @@ and explicit-sRGB `djxl` PFM is independently converted by the development-only 
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
 
 Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
-cap. Exact layout metadata, shared 336-byte output/source uniform accounting, four-byte-rounded
+cap. Exact layout metadata, shared 352-byte output/source uniform accounting, four-byte-rounded
 output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
 budget release are required. Comparisons operate on stored sample codes rather than individual
 bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
@@ -1376,3 +1376,100 @@ and Metal harnesses each pass all 18 cases, and indexed GPU decode with CPU read
 | `vardct_extras_shifted.jxl.hex` | 801 | `20e154cdb46cac67b7580709f5e10a39403df8cdd87e8058cf3c548935457516` |
 | `vardct_extras_shifted4.jxl.hex` | 324 | `20b89f55f2c160095ab84fab8e7d2c6f2c445af4033f40f37db9ffcbe31d5bb4` |
 | `vardct_extras_shifted8.jxl.hex` | 27420 | `8eb30fc3415876b82453dc922445e1763cf9c3a72441f6860a7c5b7a36c73641` |
+
+## Associated integer alpha and output association
+
+`generate_extra_channels.c OUTPUT_DIR --associated` and
+`generate_frame_composition.c OUTPUT_DIR --associated` generate 17 additional fixtures with
+libjxl 0.12.0. These offline tools are never linked by the production decoder. The still source
+uses the preceding extra-channel formula, except color is code 23 at `x % 11 == 0` on odd rows:
+those positions deliberately have zero alpha and nonzero invisible color. Only the first alpha
+is associated; the second alpha in `associated_data` remains unassociated. Lossy fixtures enable
+KEEP_INVISIBLE and use distance 1; Modular is lossless before requested downsampling. Source
+precision is independent of alpha precision.
+
+| Still suffix, in both `extras_` and `vardct_extras_` form | Original extent | Color/alpha | Color/extra factors | Dimension shift | Orientation |
+|---|---|---|---|---:|---:|
+| `associated_same` | 33×7 | RGB8 / Alpha8 | 1/1 | 0 | 4 |
+| `associated_rgb` | 259×9 | RGB8 / Alpha5 | 1/1 | 0 | 6 |
+| `associated_gray` | 17×257 | Gray16 / Alpha5 | 1/1 | 0 | 8 |
+| `associated_data` | 33×7 | RGB12 / nine extras, first alpha at index 2 with depth 7 | 1/1 | 0 | 5 |
+| `associated_thin` | 1×9 | RGB16 / Alpha5 | 1/1 | 0 | 2 |
+| `associated_resampled` | 259×17 | RGB12 / Alpha5 | 2/8 | 1 | 7 |
+| `associated_squeeze` | 2051×17 | RGB12 / Alpha5, effort 7 responsive/progressive | 1/1 | 0 | 3 |
+
+The three composition fixtures use nine physical layers and six coalesced presentations. They
+cover Replace/Add/Blend/Mul/MulAdd, separate RGB/alpha background slots, clamping, hidden layers,
+negative/oversized/off-canvas crops, extended values and reference replacement. Their source is
+the earlier composition formula, with associated Alpha5 and KEEP_INVISIBLE enabled.
+
+| Composition file | Original canvas | Coding/color precision | Orientation |
+|---|---|---|---:|
+| `composition_associated_rgb.jxl.hex` | 259×17 | Modular RGB12 + Alpha5 | 6 |
+| `composition_associated_gray.jxl.hex` | 37×9 | Modular Gray16 + Alpha5 | 8 |
+| `composition_associated_vardct.jxl.hex` | 259×17 | VarDCT RGB12 + Alpha5, distance 2, progressive AC | 5 |
+
+`tests/vardct_engine_gpu/extra_channels/associated.rs` exercises all three public policies:
+Unassociated (default), Preserve and Associated. Whole blocking and 43-byte fragmented async input
+with 1024-byte entropy windows must return identical bytes. Tests cover source declarations,
+independent first-alpha selection, native RGB/RGBA (including omitted alpha), interleaved RGBA and
+planar BGRA F32, original sRGB and linear output, Apply/Keep orientation, and zero reservations
+after final output/session release. Scalar native/F32 selection of every extra ignores the alpha
+policy and agrees with libjxl; unresampled codes remain exact. Equal-depth Preserve also exercises
+the direct Modular kernel, while conversion retains the alpha view and selects the general packer.
+
+Rust `jxl` 0.6 returns the source association, so the test applies the requested final conversion to
+that reference. Explicitly shifted stills retain the earlier libjxl-only oracle rule. The optional
+C oracle now links `libjxl` and `libjxl_cms`, exposes Preserve/linear/Keep controls, and writes each
+coalesced frame followed by its extras. Associated source-over and the finite `2^-26` output floor
+follow [libjxl alpha operations](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/alpha.cc),
+[output packing](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_write.cc)
+and [render stage order](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc).
+
+For unpremultiplied RGB, the comparison scales error by `max(alpha, 2^-26)` before applying the
+existing reconstruction tolerance, then divides by `max(1, abs(scaled_reference))`. Alpha error
+is below `4e-7`. Still color limits are `3e-6` for Modular, `3e-4` against Rust VarDCT and `2e-3`
+against libjxl VarDCT. Native packing agrees with the corresponding F32 rounding within one code.
+Composed color uses `8e-6` for Modular and `3e-3` for VarDCT. Linear output is also compared with
+analytic sign-preserving sRGB conversion of the independently decoded original-encoding result.
+This checks extended/invisible values even outside the unit RGB cube. The direct CMS check uses
+`1e-4` within that cube: its extended-value approximation is not substituted for the analytic
+contract. libjxl 0.12's [blending stage](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_blending.cc)
+rejects non-original output encoding for coalesced XYB frames; their linear output is validated
+against the original-encoding dual-oracle result followed by the analytic transfer.
+
+An independent f64 BT.2020 constant-luminance reference additionally checks P010 after association,
+including inverse/forward BT.2020 transfer, centered chroma averaging and limited-range 10-bit
+packing; NV12 and odd-width YUYV/UYVY use the shared scalar layout oracle, including replicated
+final-luma alpha. Both compare within one stored code and check zero padding bits. Low-level output
+tests reject association conversion without an alpha
+binding before allocation, while existing ABI tests parse and validate the enlarged common
+192-byte uniform. Production still has no CPU image-domain fallback. Floating source samples,
+general extra-channel composition and associated/resampled composition cross-products remain
+separate completion gates.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `composition_associated_gray.jxl.hex` | 5135 | `4ac183404328fcb3169041eecba8f9b1a6b75f5a86d15f5c84549e873bd6f1e5` |
+| `composition_associated_rgb.jxl.hex` | 85045 | `df122abd5caf4191f45badc796433357702d064e582056451686f4160c032fb2` |
+| `composition_associated_vardct.jxl.hex` | 25884 | `96edfc878b2639a464442d45f297b7ce3bb03f70a3b0e7eb800fca05936f9842` |
+| `extras_associated_data.jxl.hex` | 2887 | `d45882bd1fb9b5dd02fce31fddcfd2cc643f180ca7c75a9fab3be0c5b034317a` |
+| `extras_associated_gray.jxl.hex` | 6844 | `617fdbb0d3b41990aa63da8bdd87b25191642707ea2bdc207334c5219fa2ab6a` |
+| `extras_associated_resampled.jxl.hex` | 3786 | `6799e9bfe11708713aecc507f63d7d0c1d1d850f6104adc08b3a917234b228aa` |
+| `extras_associated_rgb.jxl.hex` | 8450 | `e6b049c567566249d382bf01e3b301fd094a6e05f4ac8c4ef0e1de40d8d2155a` |
+| `extras_associated_same.jxl.hex` | 891 | `762dc36f6c9fd0b5d8c5b8bfadaa19598c08ba870ac555f3a8427dc3ff2a873b` |
+| `extras_associated_squeeze.jxl.hex` | 108755 | `485d026a13c0027fbd5b60ba5600cdcda0f9d1087637d0d93e4b9cfa52fe99fd` |
+| `extras_associated_thin.jxl.hex` | 104 | `a8f20037d134ab63b663ec1593ce9d0a9a757396d08ffc88a98a59f9a6f73cb6` |
+| `vardct_extras_associated_data.jxl.hex` | 2637 | `fbe3df1bc46d0996cf3cb035ffae692025a55af8b9d3ede7b87632a4f3dc30ff` |
+| `vardct_extras_associated_gray.jxl.hex` | 3277 | `303f9cfa65590dfa75bdfb9cdd56fd4674d84bd67cc7f60f3f46bdcfdcc96d48` |
+| `vardct_extras_associated_resampled.jxl.hex` | 2162 | `021b546e4d6a857a0703cd774141948b542388aa692531d45ee505c51ffef315` |
+| `vardct_extras_associated_rgb.jxl.hex` | 5508 | `5a3e64018ea8e19e980ae40ffaf81283bc54148ea99ea4bb306ea110967bee2d` |
+| `vardct_extras_associated_same.jxl.hex` | 734 | `d9da713bb4ab9d81c763f94cd468f3d110adef62e829c577958115026fce8336` |
+| `vardct_extras_associated_squeeze.jxl.hex` | 52991 | `6dcbda1a99115d148530cee75dfeddf630b960324849f9aa5cc1cdda9e112da6` |
+| `vardct_extras_associated_thin.jxl.hex` | 83 | `c6b744e09e7345970152b41c14ac65113c7f99118f530977bc9d729f15784e95` |
+
+Validation on 2026-09-08 Apple M5/Metal: the serial full workspace passes 686 tests with one
+existing manual benchmark ignored. Formatting, all-target/all-feature checks, warning-free Clippy
+and rustdoc, Rust 1.89, and the six-crate `wasm32-unknown-unknown` compile check pass. The reference
+and Metal verification harnesses each pass all 18 cases; indexed Gray8 decoding to U8 CPU readback
+also passes. All 17 new fixture lengths and SHA-256 values match the table above.

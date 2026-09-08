@@ -5,7 +5,7 @@ override wg_x: u32 = 64u;
 struct Params {
     // width, height, source channel count, source bit depth
     extent: vec4<u32>,
-    // output x/y origin, status record index, reserved
+    // output x/y origin, status record index, source sample domain
     region: vec4<u32>,
     source_offsets: vec4<u32>,
     source_strides: vec4<u32>,
@@ -18,7 +18,7 @@ struct Params {
     plane01: vec4<u32>,
     // plane 2 offset/stride, plane 3 offset/stride (bytes)
     plane23: vec4<u32>,
-    // logical output bytes, chroma width, chroma height, reserved
+    // logical output bytes, chroma width, chroma height, alpha conversion
     bounds: vec4<u32>,
     // codestream canvas width/height, oriented output width, zero-based orientation
     canvas: vec4<u32>,
@@ -91,6 +91,11 @@ fn source_sample(channel: u32, x: u32, y: u32) -> u32 {
     return u32(raw);
 }
 
+fn alpha_multiplier(x: u32, y: u32) -> f32 {
+    if params.bounds.w == 0u { return 1.0; }
+    return image_alpha_multiplier(source_normalized(3u, x, y), params.bounds.w);
+}
+
 fn write_stored_code(offset: u32, value: u32) {
     if params.format.z == 8u {
         write_byte(offset, value);
@@ -109,7 +114,11 @@ fn write_native_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
         var value = source_mask();
         if channel < 3u || params.extent.z == 4u {
             let source_channel = select(channel, 0u, params.extent.z == 1u && channel < 3u);
-            if params.region.w == 1u {
+            if channel < 3u && params.bounds.w != 0u {
+                let normalized = source_normalized(source_channel, source_x, source_y)
+                    * alpha_multiplier(source_x, source_y);
+                value = u32(floor(clamp(normalized, 0.0, 1.0) * f32(source_mask()) + 0.5));
+            } else if params.region.w == 1u {
                 let normalized = source_normalized(source_channel, source_x, source_y);
                 if !(normalized >= 0.0 && normalized <= 1.0) { reject_output_mapping(); value = 0u; }
                 else { value = u32(floor(normalized * f32(source_mask()) + 0.5)); }
@@ -255,7 +264,8 @@ fn write_float_rgb_pixel(source_x: u32, source_y: u32, x: u32, y: u32) {
         var value = 1.0;
         if canonical < 3u {
             let channel = select(canonical, 0u, params.extent.z == 1u);
-            value = target_nonlinear(source_normalized(channel, source_x, source_y));
+            value = target_nonlinear(source_normalized(channel, source_x, source_y))
+                * alpha_multiplier(source_x, source_y);
         } else if params.extent.z == 4u {
             value = source_normalized(3u, source_x, source_y);
         }

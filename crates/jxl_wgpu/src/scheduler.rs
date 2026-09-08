@@ -1024,7 +1024,7 @@ const _: () = {
     assert!(std::mem::align_of::<ExtendUniform>() == 4);
     assert!(std::mem::size_of::<SaveUniform>() == 32);
     assert!(std::mem::align_of::<SaveUniform>() == 4);
-    assert!(std::mem::size_of::<ImageOutputUniform>() == 176);
+    assert!(std::mem::size_of::<ImageOutputUniform>() == 192);
     assert!(std::mem::align_of::<ImageOutputUniform>() == 4);
     assert!(std::mem::offset_of!(ImageOutputUniform, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputUniform, primaries_g) == 144);

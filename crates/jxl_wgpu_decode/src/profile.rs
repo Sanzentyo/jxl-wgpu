@@ -184,15 +184,11 @@ fn validate_image_header(
                     bits_per_sample: 1..=16
                 }
             ) || extra.dimension_shift > 3
-                || matches!(
-                    extra.channel_type,
-                    ExtraChannelTypeInventory::Alpha { associated: true }
-                )
         })
     {
         return Err(UnsupportedProfile::new(
             UnsupportedCodestreamFeature::ExtraChannels,
-            "Modular extra channels require full-resolution 1–16-bit integer samples; associated alpha is not yet connected",
+            "Modular extra channels require 1–16-bit integer samples and dimension shifts at most three",
         ).into());
     }
     Ok(orientation)
@@ -848,8 +844,10 @@ fn parse_modular_profile(
 
     let conventional_alpha = image.extra_channels.is_empty()
         || (image.extra_channels.len() == 1
-            && image.extra_channels[0].channel_type
-                == (ExtraChannelTypeInventory::Alpha { associated: false })
+            && matches!(
+                image.extra_channels[0].channel_type,
+                ExtraChannelTypeInventory::Alpha { .. }
+            )
             && image.extra_channels[0].bit_depth == image.bit_depth);
     let generalized_channels = resampling
         || !conventional_alpha
@@ -1347,11 +1345,10 @@ mod tests {
         );
         image.colour_encoding = encoding;
         let alpha = image.extra_channels[0].clone();
+        image.extra_channels[0].channel_type =
+            ExtraChannelTypeInventory::Alpha { associated: true };
+        validate_image_header(image, ModularChannels::Rgba.into()).unwrap();
         for invalid in [
-            jxl_gpu_bitstream::ExtraChannelInventory {
-                channel_type: ExtraChannelTypeInventory::Alpha { associated: true },
-                ..alpha.clone()
-            },
             jxl_gpu_bitstream::ExtraChannelInventory {
                 dimension_shift: 4,
                 ..alpha.clone()

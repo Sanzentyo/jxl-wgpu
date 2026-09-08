@@ -1,6 +1,6 @@
 /* Offline libjxl 0.12 fixture generator; production never links this CPU codec.
  * cc generate_extra_channels.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-extras
- * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed|--resampled]
+ * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed|--resampled|--associated]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
@@ -14,6 +14,8 @@ static int responsive;
 static int resampling = 1;
 static int ec_resampling = 1;
 static int dimension_shift;
+static int associated;
+static uint32_t alpha_depth = 5;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
 static const JxlExtraChannelType types[] = {
@@ -40,8 +42,9 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
     JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : types[c], &ec);
-    ec.bits_per_sample = alpha_only ? 5 : depths[c];
+    ec.bits_per_sample = alpha_only ? alpha_depth : depths[c];
     ec.dim_shift = dimension_shift;
+    ec.alpha_premultiplied = associated && (alpha_only || c == 2);
     ec.spot_color[0] = 0.25f; ec.spot_color[1] = 0.5f; ec.spot_color[2] = 0.75f; ec.spot_color[3] = 0.5f;
     ec.cfa_channel = 3;
     check(JxlEncoderSetExtraChannelInfo(enc, c, &ec));
@@ -54,6 +57,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, effort));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, !vardct));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
+  if (associated) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1));
   if (progressive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
   if (responsive) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, 1));
   if (vardct) {
@@ -66,11 +70,11 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   float* data = malloc(pixels * colors * sizeof(float));
   if (!data) exit(2);
   for (uint32_t y=0; y<height; ++y) for (uint32_t x=0; x<width; ++x) for (uint32_t c=0; c<colors; ++c)
-    data[((size_t)y*width+x)*colors+c] = (float)code(x,y,c,bits) / (float)((1u<<bits)-1);
+    data[((size_t)y*width+x)*colors+c] = (float)(associated && x % 11 == 0 && y % 2 ? 23 : code(x,y,c,bits)) / (float)((1u<<bits)-1);
   JxlPixelFormat format = {colors, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
   check(JxlEncoderAddImageFrame(settings, &format, data, pixels * colors * sizeof(float)));
   for (uint32_t c=0; c<extras; ++c) {
-    uint32_t depth = alpha_only ? 5 : depths[c];
+    uint32_t depth = alpha_only ? alpha_depth : depths[c];
     for (uint32_t y=0; y<height; ++y) for (uint32_t x=0; x<width; ++x)
       data[(size_t)y*width+x] = (float)code(x,y,colors+c,depth) / (float)((1u<<depth)-1);
     check(JxlEncoderSetExtraChannelBuffer(settings, &format, data, pixels * sizeof(float), c));
@@ -95,6 +99,24 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--associated")) {
+    associated = 1;
+    for (vardct = 0; vardct <= 1; ++vardct) {
+      resampling = ec_resampling = 1; dimension_shift = responsive = 0;
+      alpha_depth = 8;
+      generate(argv[1], "associated_same", 33, 7, 3, 8, 1, 4, 1, 1, 0);
+      alpha_depth = 5;
+      generate(argv[1], "associated_rgb", 259, 9, 3, 8, 1, 6, 1, 1, 0);
+      generate(argv[1], "associated_gray", 17, 257, 1, 16, 1, 8, 1, 1, 0);
+      generate(argv[1], "associated_data", 33, 7, 3, 12, 9, 5, 1, 0, 0);
+      generate(argv[1], "associated_thin", 1, 9, 3, 16, 1, 2, 1, 1, 0);
+      resampling = 2; ec_resampling = 8; dimension_shift = 1;
+      generate(argv[1], "associated_resampled", 259, 17, 3, 12, 1, 7, 1, 1, 0);
+      resampling = ec_resampling = 1; dimension_shift = 0; responsive = 1;
+      generate(argv[1], "associated_squeeze", 2051, 17, 3, 12, 1, 3, 7, 1, 1);
+    }
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--resampled")) {
     for (vardct = 0; vardct <= 1; ++vardct) {
       ec_resampling = 2;

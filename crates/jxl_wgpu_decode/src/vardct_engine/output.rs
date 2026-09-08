@@ -191,6 +191,7 @@ pub(super) fn prepare_presentation(
         extent: Extent2d::new(profile.output_width, profile.output_height),
         orientation,
         transform: output_transform,
+        alpha_conversion: request.alpha_conversion(&inventory.image_header.extra_channels),
     };
     let layout = ImageLayout::packed(output_config.output_extent(), request.format().clone())?;
     output_config.validate_layout(&layout)?;

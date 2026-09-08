@@ -66,7 +66,7 @@ impl CompositionSession {
             || inventory.image_header.extra_channels.iter().any(|extra| {
                 !matches!(
                     extra.channel_type,
-                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: false }
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
                 )
             })
         {
@@ -84,11 +84,17 @@ impl CompositionSession {
             crate::vardct_rgb8_format().color_spec,
         ))?
         .with_orientation_policy(OrientationPolicy::Keep)
+        .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve)
         .with_max_frame_slots(request.max_frame_slots());
         let compositor = Arc::new(Compositor::new(
             engine.backend().clone(),
             Extent2d::new(image.width, image.height),
-            !image.extra_channels.is_empty(),
+            image.extra_channels.first().map(|extra| {
+                matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated: true }
+                )
+            }),
             image.grayscale,
             OutputOrientation::from_exif_value(image.orientation).ok_or(
                 Error::InvalidImageOrientation {

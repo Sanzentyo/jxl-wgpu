@@ -13,6 +13,7 @@ pub(super) struct OutputChannels {
     pub(super) depths: Vec<u8>,
     pub(super) format_channels: ModularChannels,
     pub(super) bits: u8,
+    pub(super) alpha_conversion: jxl_wgpu::AlphaConversion,
 }
 
 impl OutputChannels {
@@ -22,6 +23,7 @@ impl OutputChannels {
             depths: vec![bits; channels.count() as usize],
             format_channels: channels,
             bits,
+            alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         }
     }
 
@@ -44,6 +46,7 @@ impl OutputChannels {
                 depths: vec![bits],
                 format_channels: ModularChannels::Gray,
                 bits,
+                alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
             });
         }
         let color_count = profile.channels.color_count() as usize;
@@ -78,6 +81,7 @@ impl OutputChannels {
                     .then_some((color_count + index, extra.bit_depth))
             });
         let native = native_modular_format(request.format());
+        let alpha_conversion = request.alpha_conversion(&profile.extra_channels);
         if native.is_some_and(|native| native.channels == ModularChannels::Gray) && color_count != 1
         {
             return Err(Error::UnsupportedOutputFormat(
@@ -105,8 +109,10 @@ impl OutputChannels {
                     depths.truncate(1);
                 }
                 ModularChannels::Rgb => {
-                    indices.truncate(3);
-                    depths.truncate(3);
+                    if alpha_conversion == jxl_wgpu::AlphaConversion::Preserve {
+                        indices.truncate(3);
+                        depths.truncate(3);
+                    }
                 }
                 ModularChannels::Rgba => {}
             }
@@ -124,11 +130,13 @@ impl OutputChannels {
             depths,
             format_channels,
             bits: profile.bits_per_sample,
+            alpha_conversion,
         })
     }
 
     pub(super) fn direct(&self, profile: &StandardModularProfile) -> bool {
-        self.indices.len() == profile.channels.count() as usize
+        self.alpha_conversion == jxl_wgpu::AlphaConversion::Preserve
+            && self.indices.len() == profile.channels.count() as usize
             && self.indices.iter().copied().eq(0..self.indices.len())
             && self
                 .depths

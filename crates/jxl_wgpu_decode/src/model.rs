@@ -349,6 +349,34 @@ pub struct GpuOutputRequest {
     orientation: OrientationPolicy,
     extra_channel: Option<u32>,
     spot_colors: SpotColorPolicy,
+    alpha: AlphaOutputPolicy,
+}
+
+/// Association of the first alpha channel and color output. Numeric requests, including selected
+/// extra channels, always preserve their sample semantics and ignore this policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaOutputPolicy {
+    /// Return straight color. Associated sources are divided by alpha after the requested color
+    /// conversion and before quantization, using a finite `2^-26` denominator floor.
+    /// This also applies when the output format omits alpha.
+    #[default]
+    Unassociated,
+    /// Keep the association declared in stream metadata, including invisible color values.
+    Preserve,
+    /// Return associated color. Unassociated sources are multiplied by alpha after the requested
+    /// color conversion, with the same finite floor used by unpremultiplication.
+    Associated,
+}
+
+impl AlphaOutputPolicy {
+    pub(crate) fn conversion(self, associated: Option<bool>) -> jxl_wgpu::AlphaConversion {
+        use jxl_wgpu::AlphaConversion;
+        match (self, associated) {
+            (Self::Unassociated, Some(true)) => AlphaConversion::Unpremultiply,
+            (Self::Associated, Some(false)) => AlphaConversion::Premultiply,
+            _ => AlphaConversion::Preserve,
+        }
+    }
 }
 
 /// Whether spot inks are rendered into color output or preserved as independent channels.
@@ -450,6 +478,7 @@ impl GpuOutputRequest {
             orientation: OrientationPolicy::Apply,
             extra_channel: None,
             spot_colors: SpotColorPolicy::Render,
+            alpha: AlphaOutputPolicy::default(),
         }
     }
 
@@ -461,6 +490,31 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn mapping(&self) -> GpuOutputMapping {
         self.mapping
+    }
+
+    #[must_use]
+    pub const fn alpha_output_policy(&self) -> AlphaOutputPolicy {
+        self.alpha
+    }
+
+    #[must_use]
+    pub const fn with_alpha_output_policy(mut self, policy: AlphaOutputPolicy) -> Self {
+        self.alpha = policy;
+        self
+    }
+
+    pub(crate) fn alpha_conversion(
+        &self,
+        extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
+    ) -> jxl_wgpu::AlphaConversion {
+        if self.mapping != GpuOutputMapping::Color {
+            return jxl_wgpu::AlphaConversion::Preserve;
+        }
+        let associated = extras.iter().find_map(|extra| match extra.channel_type {
+            jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { associated } => Some(associated),
+            _ => None,
+        });
+        self.alpha.conversion(associated)
     }
 
     /// Selects one extra channel by its index in the stream metadata. The result is a scalar

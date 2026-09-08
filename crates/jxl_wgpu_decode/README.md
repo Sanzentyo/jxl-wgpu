@@ -21,7 +21,7 @@ The low-level `WgpuSubmissionEngine` implements a standards-only integer Modular
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
   entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
 - shared DC-global RCT/Palette/Squeeze and per-LF/pass-subimage RCT/Palette/Squeeze stacks, including
-  nonempty DC-global sample channels and group-edge geometry; alpha must be unassociated,
+  nonempty DC-global sample channels and group-edge geometry; straight and associated alpha are accepted,
   and restoration filters and references remain outside this low-level still engine.
 
 Presentation normalizes all eight image orientations in the GPU writer. The source canvas and
@@ -91,10 +91,29 @@ Six checked-in libjxl fixtures cover eight extra-channel types, multiple alpha p
 topology, independent depths, a one-leaf MA tree, and transformed multi-group streams. Native
 planes match source codes exactly, and F32 matches Rust `jxl` and the optional libjxl C oracle.
 
+`GpuOutputRequest::with_alpha_output_policy(AlphaOutputPolicy::Unassociated)` is the default for
+color output. `Preserve` keeps the first alpha declaration's association; `Associated` requests
+premultiplied color. RGB conversion runs first, then association changes, then integer rounding or
+F32 packing. The same policy applies when RGB output omits the alpha component. Unpremultiplication
+uses `max(alpha, 2^-26)` as its denominator; multiplication uses the same floor. Alpha itself is
+unchanged, and F32 retains finite negative, extended and invisible color values. Integer color
+output clips only at final packing. Numeric mappings and selected extra channels ignore this policy
+and retain their existing exact-code/normalization contracts. Metadata always describes the source.
+
+Composition keeps unrounded original-encoding RGBA and its declared association in every reference
+slot. Associated source-over computes `top + bottom * (1 - top_alpha)`; unassociated source-over
+retains its alpha-weighted normalization. Conversion requested by the caller occurs only after all
+layers contributing to a presentation, including when RGB and alpha use different background slots.
+Fourteen associated still fixtures cover equal/independent depths, Gray+alpha, a first alpha after
+other extras, zero alpha with nonzero color, one-pixel axes, shifted resampling, multi-group Squeeze
+and progressive AC. Three nine-layer sequences add all five blend modes, extended reference values,
+crops and slot replacement in both coding modes. Native RGB/RGBA, planar/interleaved F32, Apply/Keep,
+NV12, odd-width YUYV/UYVY and BT.2020 constant-luminance P010 exercise final packing under whole and bounded input.
+
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
 all orientations, intrinsic-size hints, and named channel declarations can use the supported
-reconstruction path. Unsupported ICC/color, associated alpha, and Modular restoration remain
+reconstruction path. Unsupported ICC/color and Modular restoration remain
 rejected. Unknown image,
 frame, and restoration extension selectors are typed inventory errors before any GPU work.
 Twenty-three checked-in libjxl fixtures compare exact native samples with their deterministic
@@ -221,7 +240,6 @@ the remaining channels, including asymmetric shifts. LF streams execute before n
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through three passes produce an exact final
 image; intermediate pass presentation is not yet exposed. Global/LF/HF image streams, lossy/XYB Modular,
-associated alpha,
 patches, splines, and noise remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -287,8 +305,7 @@ uses linear-light/alpha error divided by `max(1, abs(reference))`: below `3e-6` 
 `1e-4` for VarDCT-containing sequences. A separate Multiply-clamp case verifies extended reference
 values analytically and against `djxl`; Rust `jxl` 0.6.0 clamps the wrong operand for that condition.
 Re-serialized reference-only variants independently pass both decoders and exercise slot 3.
-Post-transform composition rejects pre-transform reference domains before submission. Associated
-alpha, general extra-channel composition, resampled composition conformance, pre-transform patch execution, non-sRGB/ICC composition,
+Post-transform composition rejects pre-transform reference domains before submission. General extra-channel composition, resampled composition conformance, pre-transform patch execution, non-sRGB/ICC composition,
 and non-coalesced/progressive delivery remain required for full JPEG XL.
 
 ### Bounded standard VarDCT engine
@@ -349,8 +366,8 @@ executor above; the low-level standalone VarDCT entry point remains an uncropped
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `VarDctOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
 Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
-in codestream coordinates. The shared 176-byte output uniform carries geometry and orientation,
-while a 144-byte source uniform describes XYB/JPEG reconstruction. No intermediate RGB image or
+in codestream coordinates. The shared 192-byte output uniform carries geometry and orientation,
+while a 160-byte source uniform describes XYB/JPEG reconstruction and independent alpha. No intermediate RGB image or
 additional submission is needed. Odd 257×17 three-pass fixtures cover
 every orientation; the packer also checks both one-pixel axes and zero tail padding.
 
@@ -436,7 +453,7 @@ conversion. The 256-byte entropy ABI, 16-byte status and 64-byte matrix overlay 
 The public VarDCT producer now executes global Modular extras as an initial GPU stage. A checked
 16-byte status supplies the exact next LF bit position, or validates padding at the end of an
 independent LF-global section. Only then is the frame allocation/dispatch plan constructed.
-The first unassociated alpha plane stays in its original signed integer arena through the final
+The first declared alpha plane stays in its original signed integer arena through the final
 color submission; the packer uses its own bit depth and applies orientation without a plane copy.
 `GpuOutputRequest::with_extra_channel` can instead select any declared extra plane as
 native unsigned or normalized scalar F32 output, including non-alpha and multiple-alpha images.
@@ -476,7 +493,7 @@ The scalar tail reserves a 64-byte uniform, a four-byte range status and four mo
 existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
 public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
 corrupting a later AC section still fails the scalar request after the global stream succeeds.
-Associated alpha and floating-point source samples remain gaps. Raw matrix side images still need window continuation.
+Floating-point source samples remain a gap. Raw matrix side images still need window continuation.
 
 For LF/AC distribution, Modular headers and transform topology now parse separately from MA and
 image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
@@ -578,15 +595,15 @@ families: all 20 color VPI pitch-linear layouts; planar/interleaved U8 or F32 RG
 planar or semiplanar 4:4:4/4:2:2/4:2:0 YCbCr at 8/10/12/16 bits; and packed YUYV/UYVY. Primary
 conversion supports D65 BT.709, BT.2020, and Display-P3; transfers are Linear, sRGB/SYCC, BT.709,
 and BT.2020. Output YCbCr selects BT.601/709/2020 NCL or BT.2020 constant luminance, full/limited
-range, and supported centered/cosited chroma locations. RGB requires full range, and alpha is
-opaque because extra-channel input remains unsupported.
+range, and supported centered/cosited chroma locations. RGB requires full range; the first alpha is reconstructed at its independent depth, with explicit
+Unassociated/Preserve/Associated output policy.
 
 The codec source fragment reconstructs unclipped linear BT.709 from XYB, or encoded sRGB from
 JPEG components, inside the render backend's shared word-owned output shader. Chroma sampling
 therefore follows orientation and full-precision reconstruction before one final quantization.
 `VarDctOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
-byte length and four-byte storage rounding. Separate 176-byte output and 144-byte source uniforms
-cost 320 bytes in total and are checked individually against binding limits. Padded rows, unaligned
+byte length and four-byte storage rounding. Separate 192-byte output and 160-byte source uniforms
+cost 352 bytes in total and are checked individually against binding limits. Padded rows, unaligned
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
 Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`

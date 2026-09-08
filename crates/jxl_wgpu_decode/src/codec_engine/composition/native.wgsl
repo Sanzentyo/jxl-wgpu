@@ -1,7 +1,7 @@
 struct Params {
     extent: vec4<u32>, // output width/height, source width/height
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
-    output: vec4<u32>, // logical bytes, dispatch width, orientation, reserved
+    output: vec4<u32>, // logical bytes, dispatch width, orientation, alpha conversion
 };
 @group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> destination: array<u32>;
@@ -13,7 +13,10 @@ fn output_byte(offset: u32) -> u32 {
     let in_row = offset % params.format.w;
     let sample = in_row / params.format.z;
     let p = image_source_coordinate(vec2<u32>(sample / params.format.x, row), params.extent.zw, params.output.z);
-    let value = source[p.y * params.extent.z + p.x][sample % params.format.x];
+    let rgba = source[p.y * params.extent.z + p.x];
+    let channel = sample % params.format.x;
+    var value = rgba[channel];
+    if channel < 3u { value *= image_alpha_multiplier(rgba.a, params.output.w); }
     let mask = (1u << params.format.y) - 1u;
     let code = u32(floor(clamp(value, 0.0, 1.0) * f32(mask) + 0.5));
     return (code >> ((in_row % params.format.z) * 8u)) & 255u;

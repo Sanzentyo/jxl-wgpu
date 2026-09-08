@@ -103,6 +103,10 @@ const _: () = {
 };
 
 impl ModularFinalizeParams {
+    pub(crate) fn with_alpha_conversion(mut self, conversion: jxl_wgpu::AlphaConversion) -> Self {
+        self.bounds[3] = conversion as u32;
+        self
+    }
     pub(crate) fn with_source_domain(mut self, domain: crate::ModularSampleDomain) -> Self {
         self.region[3] = domain as u32;
         self
@@ -606,7 +610,11 @@ fn shader_source(path: ModularFinalizeF64Path) -> String {
     let source = SHADER
         .replace(F64_BINDING_MARKER, binding)
         .replace(F64_OUTPUT_MARKER, output);
-    format!("{}\n{source}", jxl_wgpu::IMAGE_ORIENTATION_SHADER)
+    format!(
+        "{}\n{}\n{source}",
+        jxl_wgpu::IMAGE_ORIENTATION_SHADER,
+        jxl_wgpu::ALPHA_OUTPUT_SHADER
+    )
 }
 
 fn validate_variant(
