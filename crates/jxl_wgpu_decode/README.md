@@ -86,7 +86,12 @@ All source channels still pass through GPU entropy decoding and inverse transfor
 selection. Selected resampled planes normalize and interpolate in resident F32 storage. Unknown
 non-optional extras cannot silently be omitted from color interpretation. Spot-color data can be
 selected like other extras; `with_spot_color_policy(SpotColorPolicy::Preserve)` explicitly returns
-the base color. Default `Render` rejects spot images until the spot rendering stage is connected.
+the base color. Default `Render` presents all spots in declaration order on the GPU through
+`GpuDecoder::wgpu`, including single-frame images and post-transform composition. Spot rendering
+uses the retained normalized plane after extra-channel resampling/blending and precedes requested
+color conversion, alpha association, orientation-aware packing and target chroma subsampling.
+References retain untinted color and every extra plane. Each mix is
+`solidity * sample * ink_rgb + (1 - solidity * sample) * rgb`, without intermediate clamping.
 Six checked-in libjxl fixtures cover eight extra-channel types, multiple alpha planes, a Gray+alpha
 topology, independent depths, a one-leaf MA tree, and transformed multi-group streams. Native
 planes match source codes exactly, and F32 matches Rust `jxl` and the optional libjxl C oracle.
@@ -116,10 +121,20 @@ Multiple alpha declarations may use different association and depth; color Blend
 selected alpha, while presentation uses the first declared alpha. Raw F32 extra output preserves
 the composed normalized result, including extended values. Native composed extra output requires
 the declaration's depth and clamps/rounds the final result to that unsigned range; the exact-code
-contract for unresampled stills is unchanged. Spot data remains selectable with the same explicit
-base-color policy. Seven nine-layer fixtures exercise all nine extra declarations, independent
+contract for unresampled stills is unchanged. Numeric spot selection is unchanged by the spot or
+alpha output policy. Seven nine-layer fixtures exercise all nine extra declarations, independent
 reference chains, Gray/RGB, both coding modes, distributed groups, shifted resampling and six
 presentations. Admission retries and cancellation release every hidden plane and its shared lease.
+
+The private frame surface records its RGB domain explicitly. Unreferenced XYB presentations keep
+linear RGB; blending and post-transform reference storage use the original sRGB encoding. Spots
+execute in that stage's domain, matching libjxl's pipeline ordering. This avoids a transfer round
+trip before standalone VarDCT presentation. Ten deterministic multi-spot stills additionally cover
+five inks, independent 1/4/6/10/12-bit coverage, negative/extended RGB and solidity, two alpha planes,
+Gray/RGB, oriented thin axes, shifted resampling, responsive distributed transforms, native 8/12/16-bit
+RGB/RGBA, F32 RGB/BGRA, NV12, packed 4:2:2 and BT.2020 constant-luminance P010. The spot table costs
+32 accounted bytes per ink and exists only for rendered color output. Floating source channels,
+general original color encodings and HDR luminance mapping remain separate roadmap gates.
 
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 sRGB Gray/RGB, integer extras,
@@ -475,8 +490,10 @@ restoration, resampling and resident color image buffers are omitted from that f
 One word-owned packing dispatch reads the selected plane in its original arena and applies the
 requested orientation. Native unsigned output preserves representable codes exactly and rejects
 out-of-range samples; scalar F32 preserves signed normalization without clipping or color transfer.
-Explicit `SpotColorPolicy::Preserve` requests base color; default spot rendering and unknown
-non-optional channel interpretation return typed errors.
+Explicit `SpotColorPolicy::Preserve` requests base color from the physical producer. The common
+`WgpuDecodeEngine` adds spot presentation over retained all-channel surfaces; calling a physical
+Modular/VarDCT engine directly with Render returns a typed routing diagnostic. Unknown non-optional
+channel interpretation remains unsupported.
 
 `VarDctDecodeSession::memory_stats()` returns `Option<VarDctDecodeMemoryStats>`: the frame
 plan is absent until the global cursor validates. `global_modular_memory_stats()` reports exact

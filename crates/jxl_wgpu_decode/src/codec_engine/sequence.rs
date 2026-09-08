@@ -27,7 +27,8 @@ impl WgpuDecodeEngine {
         plan: FrameExecutionPlan,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         validate_codestream_limit(codestream.logical_bytes(), self.parse_limits())?;
-        if plan.nodes.iter().any(|node| node.needs_composition)
+        if request.renders_spot_colors(&inventory.image_header.extra_channels)
+            || plan.nodes.iter().any(|node| node.needs_composition)
             || inventory
                 .frames
                 .iter()
@@ -57,6 +58,7 @@ impl WgpuDecodeEngine {
             codestream,
             inventory: inventory.clone(),
             request: request.clone(),
+            surface_encodings: None,
         };
         let prepared = source.prepare(&plan, 0)?;
         let slots = prepared
@@ -87,6 +89,7 @@ pub(super) struct SequenceSource {
     pub(super) codestream: Arc<GpuCodestream>,
     pub(super) inventory: CodestreamInventory,
     pub(super) request: GpuOutputRequest,
+    pub(super) surface_encodings: Option<Arc<[crate::frame_surface::FrameSurfaceEncoding]>>,
 }
 
 impl SequenceSource {
@@ -114,10 +117,14 @@ impl SequenceSource {
         index: usize,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         let frame_index = self.inventory.frames[index].frame_index;
+        let request = self.surface_encodings.as_ref().map_or_else(
+            || self.request.clone(),
+            |encodings| self.request.clone().for_frame_surface(encodings[index]),
+        );
         if let Some(dc) = ProgressiveDcPlan::for_frame(&self.inventory, frame_index)? {
             self.engine.open_progressive_dc(
                 Arc::clone(&self.codestream),
-                &self.request,
+                &request,
                 &self.inventory,
                 dc,
             )
@@ -127,14 +134,14 @@ impl SequenceSource {
                 FrameEncoding::Modular => {
                     map_modular(self.engine.modular.open_frame_with_inventory_data(
                         Arc::clone(&self.codestream),
-                        &self.request,
+                        &request,
                         &projected,
                     )?)
                 }
                 FrameEncoding::VarDct => {
                     map_vardct(self.engine.vardct.open_frame_with_inventory_data(
                         (*self.codestream).clone(),
-                        &self.request,
+                        &request,
                         &projected,
                     )?)
                 }

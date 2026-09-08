@@ -2,11 +2,19 @@ struct Params {
     extent: vec4<u32>, // output width/height, source width/height
     format: vec4<u32>, // channels, valid bits, bytes per sample, row bytes
     output: vec4<u32>, // logical bytes, dispatch width, orientation, alpha conversion
-    source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, F32 output
+    source: vec4<u32>, // plane stride, first alpha plane, selected scalar plane, flags (F32, linear RGB)
 };
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read_write> destination: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
+
+fn surface_value(word: u32) -> f32 { return source[word]; }
+fn original_rgb(rgb: vec3<f32>) -> vec3<f32> {
+    if (params.source.w & 2u) == 0u { return rgb; }
+    let magnitude = abs(rgb);
+    return sign(rgb) * select(1.055 * pow(magnitude, vec3<f32>(1.0 / 2.4)) - 0.055,
+        12.92 * magnitude, magnitude <= vec3<f32>(0.0031308));
+}
 
 fn output_byte(offset: u32) -> u32 {
     if offset >= params.output.x { return 0u; }
@@ -20,9 +28,15 @@ fn output_byte(offset: u32) -> u32 {
     var alpha = 1.0;
     if params.source.y != 0xffffffffu { alpha = source[params.source.y * params.source.x + position]; }
     var value = alpha;
-    if channel != 3u { value = source[source_channel * params.source.x + position]; }
-    if channel < 3u { value *= image_alpha_multiplier(alpha, params.output.w); }
-    if params.source.w != 0u {
+    if channel != 3u {
+        value = source[source_channel * params.source.x + position];
+        if source_channel < 3u {
+            let rgb = original_rgb(present_rgb(vec3<f32>(source[position], source[params.source.x + position],
+                source[2u * params.source.x + position]), position));
+            value = rgb[source_channel] * image_alpha_multiplier(alpha, params.output.w);
+        }
+    }
+    if (params.source.w & 1u) != 0u {
         return (bitcast<u32>(value) >> ((in_row % params.format.z) * 8u)) & 255u;
     }
     let mask = (1u << params.format.y) - 1u;

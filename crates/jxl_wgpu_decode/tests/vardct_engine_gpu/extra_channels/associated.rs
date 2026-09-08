@@ -510,7 +510,7 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
     }
 }
 
-fn p010_cl(
+pub(super) fn p010_cl(
     values: &[f32],
     extent: Extent2d,
     format: &PixelFormat,

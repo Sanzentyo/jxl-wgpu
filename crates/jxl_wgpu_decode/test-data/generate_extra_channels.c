@@ -1,6 +1,6 @@
 /* Offline libjxl 0.12 fixture generator; production never links this CPU codec.
  * cc generate_extra_channels.c $(pkg-config --cflags --libs libjxl) -o /tmp/jxl-extras
- * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed|--resampled|--associated]
+ * /tmp/jxl-extras OUTPUT_DIRECTORY [--vardct|--vardct-distributed|--resampled|--associated|--spots]
  */
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
@@ -15,6 +15,7 @@ static int resampling = 1;
 static int ec_resampling = 1;
 static int dimension_shift;
 static int associated;
+static int spots;
 static uint32_t alpha_depth = 5;
 
 static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit(1); }
@@ -24,6 +25,17 @@ static const JxlExtraChannelType types[] = {
   JXL_CHANNEL_BLACK, JXL_CHANNEL_OPTIONAL, JXL_CHANNEL_ALPHA,
 };
 static const uint32_t depths[] = {16, 1, 7, 12, 4, 8, 6, 10, 15};
+static const JxlExtraChannelType spot_types[] = {
+  JXL_CHANNEL_DEPTH, JXL_CHANNEL_SPOT_COLOR, JXL_CHANNEL_ALPHA,
+  JXL_CHANNEL_SPOT_COLOR, JXL_CHANNEL_SPOT_COLOR, JXL_CHANNEL_THERMAL,
+  JXL_CHANNEL_SPOT_COLOR, JXL_CHANNEL_SPOT_COLOR, JXL_CHANNEL_ALPHA,
+};
+/* Includes a transparent ink, extended colors/solidity, and an opaque ink. */
+static const float spot_rgba[9][4] = {
+  {0}, {0.75f, 0.125f, 0.25f, 0}, {0}, {0.25f, 0.5f, 0.75f, 0.5f},
+  {1.5f, -0.25f, 0.125f, 1.25f}, {0}, {-0.125f, 1, 0.375f, -0.5f},
+  {0.5f, 0.25f, 1, 1}, {0},
+};
 
 static uint32_t code(uint32_t x, uint32_t y, uint32_t c, uint32_t bits) {
   uint32_t mask = (1u << bits) - 1;
@@ -41,11 +53,12 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   info.uses_original_profile = !vardct; info.orientation = (JxlOrientation)orientation;
   check(JxlEncoderSetBasicInfo(enc, &info));
   for (uint32_t c = 0; c < extras; ++c) {
-    JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : types[c], &ec);
+    JxlExtraChannelInfo ec; JxlEncoderInitExtraChannelInfo(alpha_only ? JXL_CHANNEL_ALPHA : (spots ? spot_types[c] : types[c]), &ec);
     ec.bits_per_sample = alpha_only ? alpha_depth : depths[c];
     ec.dim_shift = dimension_shift;
     ec.alpha_premultiplied = associated && (alpha_only || c == 2);
     ec.spot_color[0] = 0.25f; ec.spot_color[1] = 0.5f; ec.spot_color[2] = 0.75f; ec.spot_color[3] = 0.5f;
+    if (spots) memcpy(ec.spot_color, spot_rgba[c], sizeof(ec.spot_color));
     ec.cfa_channel = 3;
     check(JxlEncoderSetExtraChannelInfo(enc, c, &ec));
     char name[64]; int length = snprintf(name, sizeof(name), "plane-%u-depth-%u", c, ec.bits_per_sample);
@@ -99,6 +112,21 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--spots")) {
+    spots = 1;
+    for (vardct = 0; vardct <= 1; ++vardct) {
+      resampling = ec_resampling = 1; dimension_shift = responsive = associated = 0;
+      generate(argv[1], "spots_rgb", 33, 7, 3, 12, 9, 6, 1, 0, 0);
+      generate(argv[1], "spots_gray", 17, 9, 1, 16, 9, 8, 1, 0, 0);
+      associated = 1;
+      generate(argv[1], "spots_thin", 1, 9, 3, 8, 9, 5, 1, 0, 0);
+      resampling = 2; ec_resampling = 8; dimension_shift = 1;
+      generate(argv[1], "spots_resampled", 37, 17, 3, 12, 9, 7, 1, 0, 0);
+      resampling = ec_resampling = 1; dimension_shift = associated = 0; responsive = 1;
+      generate(argv[1], "spots_distributed", 257, 9, 3, 12, 9, 3, 7, 0, 1);
+    }
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--associated")) {
     associated = 1;
     for (vardct = 0; vardct <= 1; ++vardct) {

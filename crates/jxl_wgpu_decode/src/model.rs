@@ -383,6 +383,8 @@ impl AlphaOutputPolicy {
 /// Whether spot inks are rendered into color output or preserved as independent channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SpotColorPolicy {
+    /// Mix declared spot inks in order at presentation, after reference storage and before
+    /// target color conversion, alpha association, and output quantization.
     #[default]
     Render,
     /// Return the base color and keep spot declarations available in stream metadata.
@@ -499,8 +501,12 @@ impl GpuOutputRequest {
         self.alpha
     }
 
-    pub(crate) fn for_frame_surface(mut self) -> Self {
+    pub(crate) fn for_frame_surface(
+        mut self,
+        encoding: crate::frame_surface::FrameSurfaceEncoding,
+    ) -> Self {
         self.frame_surface = true;
+        self.format = encoding.format();
         self.alpha = AlphaOutputPolicy::Preserve;
         self.spot_colors = SpotColorPolicy::Preserve;
         self.orientation = OrientationPolicy::Keep;
@@ -509,6 +515,25 @@ impl GpuOutputRequest {
 
     pub(crate) const fn retains_frame_surface(&self) -> bool {
         self.frame_surface
+    }
+
+    pub(crate) fn frame_surface_encoding(&self) -> crate::frame_surface::FrameSurfaceEncoding {
+        crate::frame_surface::FrameSurfaceEncoding::from_format(&self.format)
+            .expect("private frame-surface request has a canonical color format")
+    }
+
+    pub(crate) fn renders_spot_colors(
+        &self,
+        extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
+    ) -> bool {
+        self.mapping == GpuOutputMapping::Color
+            && self.spot_colors == SpotColorPolicy::Render
+            && extras.iter().any(|extra| {
+                matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::SpotColour { .. }
+                )
+            })
     }
 
     #[must_use]

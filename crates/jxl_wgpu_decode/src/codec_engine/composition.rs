@@ -21,6 +21,7 @@ use jxl_wgpu::{
 
 use super::sequence::{SequenceSource, submission_counter};
 use super::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
+use crate::frame_surface::FrameSurfaceEncoding;
 use crate::{
     Error, FrameExecutionPlan, FrameMetadata, FramePlanError, GpuCodestream, GpuOutputRequest,
     GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
@@ -29,6 +30,7 @@ use crate::{
 
 mod blend;
 mod gpu;
+mod spot;
 mod submission;
 use gpu::{Compositor, Surface};
 use submission::GpuWork;
@@ -66,12 +68,24 @@ impl CompositionSession {
     ) -> Result<Self> {
         validate(inventory, plan)?;
         let image = &inventory.image_header;
+        if inventory
+            .frames
+            .iter()
+            .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct)
+            && matches!(request.format().color_spec, jxl_gpu_formats::ColorSpecification::Defined(color)
+                if matches!(color.transfer, jxl_gpu_formats::TransferFunction::Pq | jxl_gpu_formats::TransferFunction::Hlg))
+        {
+            return Err(crate::VarDctDecodeError::Output(
+                crate::vardct_output::VarDctOutputError::HdrLuminanceMappingRequired,
+            )
+            .into());
+        }
         let working = GpuOutputRequest::color(PixelFormat::rgb_f32(
             RgbChannelOrder::Rgb,
             true,
             crate::vardct_rgb8_format().color_spec,
         ))?
-        .for_frame_surface()
+        .for_frame_surface(FrameSurfaceEncoding::Srgb)
         .with_max_frame_slots(request.max_frame_slots());
         let compositor = Arc::new(Compositor::new(
             engine.backend().clone(),
@@ -90,6 +104,24 @@ impl CompositionSession {
             codestream,
             inventory: inventory.clone(),
             request: working,
+            surface_encodings: Some(
+                plan.nodes
+                    .iter()
+                    .zip(&inventory.frames)
+                    .map(|(node, frame)| {
+                        if frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct
+                            && image.xyb_encoded
+                            && !frame.do_ycbcr
+                            && !node.needs_composition
+                            && (node.save_reference.is_none() || frame.save_before_color_transform)
+                        {
+                            FrameSurfaceEncoding::Linear
+                        } else {
+                            FrameSurfaceEncoding::Srgb
+                        }
+                    })
+                    .collect(),
+            ),
         };
         // Initial metadata and output negotiation is performed at open, like the still engines.
         // Subsequent physical producers are prepared one at a time while their pending frame runs.

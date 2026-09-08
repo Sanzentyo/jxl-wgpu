@@ -15,6 +15,8 @@ mod oracle;
 mod resampled;
 #[path = "extra_channels/scalar.rs"]
 mod scalar;
+#[path = "extra_channels/spot.rs"]
+mod spot;
 
 fn fixtures() -> [(&'static str, &'static str); 7] {
     [

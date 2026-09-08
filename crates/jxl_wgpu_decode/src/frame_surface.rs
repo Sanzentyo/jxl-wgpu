@@ -5,6 +5,39 @@ use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, Sample
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region};
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
+/// The color domain at the post-reconstruction boundary. References and blending use the
+/// original encoding; an unreferenced XYB presentation can retain linear RGB until output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameSurfaceEncoding {
+    Srgb,
+    Linear,
+}
+
+impl FrameSurfaceEncoding {
+    pub(crate) fn format(self) -> PixelFormat {
+        let mut color = crate::vardct_rgb8_format().color_spec;
+        if self == Self::Linear
+            && let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color
+        {
+            color.transfer = jxl_gpu_formats::TransferFunction::Linear;
+        }
+        PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
+    }
+
+    pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
+        [Self::Srgb, Self::Linear]
+            .into_iter()
+            .find(|encoding| *format == encoding.format())
+    }
+
+    pub(crate) const fn rgb_encoding(self) -> jxl_gpu_protocol::RgbColorEncoding {
+        match self {
+            Self::Srgb => jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709,
+            Self::Linear => jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrameSurfaceError {
     #[error(transparent)]
@@ -31,11 +64,16 @@ impl FrameSurfaceLayout {
         extra_count: usize,
         limits: &wgpu::Limits,
     ) -> Result<Self, FrameSurfaceError> {
-        let format = PixelFormat::rgb_f32(
-            RgbChannelOrder::Rgb,
-            true,
-            crate::vardct_rgb8_format().color_spec,
-        );
+        Self::with_encoding(extent, extra_count, FrameSurfaceEncoding::Srgb, limits)
+    }
+
+    pub(crate) fn with_encoding(
+        extent: Extent2d,
+        extra_count: usize,
+        encoding: FrameSurfaceEncoding,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, FrameSurfaceError> {
+        let format = encoding.format();
         let color = ImageLayout::packed(extent, format)?;
         let scalar_bytes = color.planes[0].end_offset()?;
         let alignment = u64::from(limits.min_storage_buffer_offset_alignment).max(4);

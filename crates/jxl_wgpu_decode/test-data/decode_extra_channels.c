@@ -1,7 +1,7 @@
 /* Offline differential oracle, linked only by optional native interoperability tests.
  * Prints each coalesced frame as little-endian F32 RGBA then full-resolution extra planes.
  * cc decode_extra_channels.c $(pkg-config --cflags --libs libjxl libjxl_cms) -o /tmp/jxl-extra-oracle
- * /tmp/jxl-extra-oracle INPUT.jxl [--preserve-alpha] [--linear] [--keep-orientation] > CHANNELS.f32
+ * /tmp/jxl-extra-oracle INPUT.jxl [--preserve-alpha] [--linear] [--keep-orientation] [--render-spots] > CHANNELS.f32
  */
 #include <jxl/decode.h>
 #include <jxl/encode.h>
@@ -14,11 +14,12 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) return 2;
-  int unpremultiply = 1, linear = 0, keep_orientation = 0;
+  int unpremultiply = 1, linear = 0, keep_orientation = 0, render_spots = 0;
   for (int i=2; i<argc; ++i) {
     if (!strcmp(argv[i], "--preserve-alpha")) unpremultiply = 0;
     else if (!strcmp(argv[i], "--linear")) linear = 1;
     else if (!strcmp(argv[i], "--keep-orientation")) keep_orientation = 1;
+    else if (!strcmp(argv[i], "--render-spots")) render_spots = 1;
     else return 2;
   }
   FILE* in = fopen(argv[1], "rb"); if (!in) return 2;
@@ -31,7 +32,7 @@ int main(int argc, char** argv) {
   JxlDecoder* dec = JxlDecoderCreate(NULL);
   if (linear && dec) JxlDecoderSetCms(dec, *JxlGetDefaultCms());
   if (!dec || JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS
-      || JxlDecoderSetRenderSpotcolors(dec, JXL_FALSE) != JXL_DEC_SUCCESS
+      || JxlDecoderSetRenderSpotcolors(dec, render_spots) != JXL_DEC_SUCCESS
       || JxlDecoderSetUnpremultiplyAlpha(dec, unpremultiply) != JXL_DEC_SUCCESS
       || JxlDecoderSetKeepOrientation(dec, keep_orientation) != JXL_DEC_SUCCESS
       || JxlDecoderSetInput(dec, data, (size_t)length) != JXL_DEC_SUCCESS) return 3;

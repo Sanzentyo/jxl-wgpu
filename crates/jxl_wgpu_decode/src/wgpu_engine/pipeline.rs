@@ -435,9 +435,10 @@ impl WgpuSubmissionEngine {
         )?;
         output.source_channels = output_channels;
         if request.retains_frame_surface() {
-            let surface = crate::frame_surface::FrameSurfaceLayout::new(
+            let surface = crate::frame_surface::FrameSurfaceLayout::with_encoding(
                 extent,
                 profile.extra_channels.len(),
+                request.frame_surface_encoding(),
                 &self.backend.device().limits(),
             )?;
             output.layout = surface.color.clone();

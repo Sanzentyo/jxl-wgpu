@@ -129,8 +129,12 @@ Modular reconstructs integer extra channels with independent 1–16-bit precisio
 `AnimationMetadata::extra_channels` retains each declaration. `GpuOutputRequest::with_extra_channel`
 selects one plane for native unsigned or normalized scalar F32 output. Color output uses the first
 alpha declaration, expands gray when needed, and rescales alpha independently. Spot planes remain
-available as data; `SpotColorPolicy::Preserve` explicitly requests base color, while default spot
-rendering is still unsupported. Six libjxl fixtures cover multiple alpha, depth, selection mask,
+available as data; `SpotColorPolicy::Preserve` explicitly requests base color. Default Render mixes
+all declared spots on the GPU after reference storage, before target color/alpha conversion and
+packing. Both coding modes share this presentation stage, including composed/resampled frames.
+Ten additional libjxl fixtures cover five ordered inks with zero, negative and extended solidity,
+independent depths, associated alpha, Gray/RGB, thin axes and distributed transforms.
+Six original libjxl fixtures cover multiple alpha, depth, selection mask,
 spot color, CFA, thermal, black, and optional planes, including transformed multi-group input.
 
 VarDCT now reconstructs global Modular extra-channel streams before parsing the following LF

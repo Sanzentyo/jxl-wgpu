@@ -84,7 +84,7 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
     });
     let metadata_buffer = metadata.map(|(_, bytes)| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("JPEG XL per-channel blend operations"),
+            label: Some("JPEG XL presentation channel metadata"),
             contents: bytes,
             usage: wgpu::BufferUsages::STORAGE,
         })

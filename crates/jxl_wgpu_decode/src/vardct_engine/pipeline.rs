@@ -253,7 +253,7 @@ impl VarDctSubmissionEngine {
             })
         {
             return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
-                "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
+                "physical VarDCT output cannot interpret non-optional extras or present spots; spot presentation requires the common WgpuDecodeEngine").into());
         }
         let options = VarDctPrepareOptions {
             output_variant: self.pipelines.output_variant,

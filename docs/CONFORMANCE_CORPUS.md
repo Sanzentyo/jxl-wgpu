@@ -1080,8 +1080,9 @@ Color tests explicitly preserve spot data and request base RGBA as F32 and nativ
 image depth. F32 matches both decoders within `2e-7`; native samples exactly match once-quantized
 Rust F32. This covers first-alpha selection at extra index 2, additional alpha planes, Gray+alpha
 expansion, independent alpha normalization/rescaling, and opaque virtual alpha for data-only extras.
-Default spot rendering remains a typed unsupported result; `SpotColorPolicy::Preserve` explicitly
-selects base color, and individual spot planes remain available through scalar data requests.
+This initial checkpoint used a typed unsupported result for default spot rendering;
+`SpotColorPolicy::Preserve` selects base color, and scalar requests expose individual spot planes.
+The later GPU spot-color presentation checkpoint below enables default Render in the common decoder.
 
 The pinned Rust `jxl` 0.6.0 exposes `adjust_orientation` but does not consume that option in its
 render pipeline. For Keep-coordinate reference values, the test inverts the returned oriented
@@ -1568,3 +1569,84 @@ expectation update. Formatting, all-target/all-feature checks, warning-free Clip
 Rust 1.89 and six-crate WASM compilation pass. Reference and Metal harnesses each pass 18 cases;
 indexed Gray8 U8 CPU readback passes. Regenerating all seven fixtures with the checked-in C source
 produces byte-identical codestreams and matching lengths/SHA-256 values.
+
+## GPU spot-color presentation
+
+The common decoder now renders every supported integer spot plane at presentation. The private
+all-channel surface records its RGB transfer explicitly: standalone XYB retains linear RGB;
+blending and post-transform reference storage use original encoded RGB. In either case spots run
+after reference storage and before output color conversion/association. Declaration order and
+`mix = solidity * normalized_spot_sample` follow libjxl 0.12's
+[spot stage](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_spot.cc)
+and [render-pipeline ordering](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc).
+Only RGB changes, without clamping; raw extras and stored references remain untinted. The metadata
+header describes ink RGB as linear, but the reference stage's placement makes its working domain
+depend on prior blending/reference storage. That distinction is explicit rather than hidden in a
+conversion round trip. Physical Modular/VarDCT engines export preserved planes; `GpuDecoder::wgpu`
+routes Render through the common presentation stage, including a sequence containing one still.
+
+`generate_extra_channels.c OUTPUT_DIR --spots` generates ten additional fixtures with libjxl 0.12.0.
+The existing generator's other modes are unchanged. All contain nine declarations: Depth16,
+SpotColour1, Alpha7, SpotColour12, SpotColour4, Thermal8, SpotColour6, SpotColour10 and Alpha15.
+The five inks, in that order, use RGBA `(0.75,0.125,0.25,0)`, `(0.25,0.5,0.75,0.5)`,
+`(1.5,-0.25,0.125,1.25)`, `(-0.125,1,0.375,-0.5)` and `(0.5,0.25,1,1)`. The original deterministic
+integer-code formula and zero/full-coverage columns are retained. This exercises zero, unit,
+negative and greater-than-one solidity, extended RGB, non-leading alpha and noncommuting inks.
+Both source coding modes are generated for each suffix; extra-channel distance is zero.
+
+| Suffix in `[vardct_]extras_spots_*.jxl.hex` | Canvas | Color | Orientation | Special case |
+|---|---|---|---:|---|
+| `rgb` | 33×7 | RGB12 | 6 | two unassociated alpha planes |
+| `gray` | 17×9 | Gray16 | 8 | colored ink on gray |
+| `thin` | 1×9 | RGB8 | 5 | associated first alpha, preserved invisible color |
+| `resampled` | 37×17 | RGB12 | 7 | associated first alpha, color factor 2, extras factor 8, dimension shift 1 |
+| `distributed` | 257×9 | RGB12 | 3 | effort 7 responsive and progressive AC |
+
+Four integration tests in `tests/vardct_engine_gpu/extra_channels/spot.rs` and `spot_output.rs`
+cover all ten new files, four existing single-spot stills and all seven extra-composition sequences
+(the data-only sequence is a no-spot control). They check declaration-order RGB, associated and
+unassociated alpha, linear output, planar BGRA, Apply/Keep, native RGB/RGBA at 8/12/16 bits, NV12,
+odd packed 4:2:2, and BT.2020 constant-luminance P010. Whole and 43-byte fragmented async inputs
+with a 1024-byte entropy window are byte-identical. Numeric native/F32 selection is identical
+under Render/Preserve; VarDCT PQ/HLG still returns the explicit luminance-mapping error.
+
+The optional test-only C decoder adds `--render-spots`. Direct rendered libjxl output checks the
+original stills and each coalesced presentation. Gray-to-linear CMS discards colored spot channels,
+and its transfer approximation for extended composed samples differs from the analytic sRGB
+curve, so those linear comparisons independently transform libjxl's rendered sRGB channels.
+Multiple-ink expectations independently apply the declared formula to libjxl's untinted color and
+extra planes in the appropriate stage domain. Rust jxl 0.6 places output transfer before standalone
+XYB spots, so it is not the numeric authority for that mode. The single-spot sequence relative-error
+limit is `5e-4`; the multiple-spot formula uses `3e-6` for Modular and `2e-3` for VarDCT, with near-zero
+alpha scaling removed before comparison. Native outputs use one code of Modular tolerance and
+`ceil(max_code * 5e-5)` for the VarDCT resampled fixture. Target YUV comparison permits one code
+and checks high-depth padding. No production CPU codec or image readback was introduced.
+
+A GPU unit test independently isolates the packer: output admission succeeds with one byte less
+than the required uniform+ink metadata, then metadata admission fails with exactly 352 bytes for
+five inks or 192 bytes for Preserve. Repeating failure rolls back output reservations; releasing
+pressure allows retry. Dropping pending work retains all inputs and metadata until GPU completion,
+then only a caller-held output lease remains. `SpotColor` has compile-time 32-byte size, 16-byte
+alignment and byte-16 RGBA offset checks. Preserve allocates no dummy table.
+
+| File | Encoded bytes after hex decoding | SHA-256 of encoded file |
+|---|---:|---|
+| `extras_spots_distributed.jxl.hex` | 20860 | `c88cb37c2a9bcd3ff6fac41debe371821405477ed2f86fc09b56e71dfbc2182c` |
+| `extras_spots_gray.jxl.hex` | 2009 | `84c3327e79e646489f7c64421f3dfdcb7529d1b5fc3f9b3a4df1fb63a790a070` |
+| `extras_spots_resampled.jxl.hex` | 1012 | `49451e16a3a0c1b9656ed0bc7466edbc449933a4d25c56cca4e737c2fbc41156` |
+| `extras_spots_rgb.jxl.hex` | 2903 | `843d6a5c7d356d2e77aab251bf84081aa0bc30c2e4656c69d16f1fafd1195e30` |
+| `extras_spots_thin.jxl.hex` | 297 | `400c56f4482ed6e8c92407136b4803e49c679927c18ab1dfcd2e8a51f52cbd00` |
+| `vardct_extras_spots_distributed.jxl.hex` | 22185 | `067778acdf2313bb98521ffb430776703b10537f53b49ddf68c10d5f59cb2eab` |
+| `vardct_extras_spots_gray.jxl.hex` | 1866 | `15e251d85c8580ffeda5c7dadffc8977d6bbc2e54d2f6b62876b85ec3f28a610` |
+| `vardct_extras_spots_resampled.jxl.hex` | 874 | `2f3ca859da87bc668c0cbd6ee33d1736c280a25d9a4f81af63712cbc5e4d74cf` |
+| `vardct_extras_spots_rgb.jxl.hex` | 2666 | `3eb296c6251f7fe99f0f1830bd08729d159f364e197433c86cfb93eec38d8822` |
+| `vardct_extras_spots_thin.jxl.hex` | 344 | `1756771316316c2ce46efc89ba071a9545be8ff521262a77f52751e36ec83d63` |
+
+Validation on 2026-09-08 Apple M5/Metal: one serial all-target/all-feature workspace run passes
+697 tests across all 24 targets, with one existing manual benchmark ignored and no failures.
+Formatting, warning-free Clippy/rustdoc, all-target/all-feature checking, Rust 1.89 and the six-crate
+WASM compile gate pass. Reference and Metal harnesses each pass 18 cases; indexed Gray8 U8 CPU
+readback passes. Regenerating all ten new fixtures and the thirteen original stills with the same
+C generator produces byte-identical files; the ten new lengths and SHA-256 values match above.
+Floating source samples, remaining original color domains and pre-transform patch references
+remain open full-JPEG-XL roadmap gates.

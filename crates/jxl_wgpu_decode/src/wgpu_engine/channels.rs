@@ -91,7 +91,7 @@ impl OutputChannels {
             })
         {
             return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
-                "spot-color rendering is not yet connected; preserve the spot planes to inspect base color").into());
+                "spot presentation requires the common WgpuDecodeEngine; physical Modular output can preserve the spot planes").into());
         }
         let alpha = profile
             .extra_channels

@@ -298,7 +298,7 @@ fn gray_alpha_and_multiple_extras_select_color_and_first_alpha_without_colorizin
 
 #[test]
 fn extra_channel_selection_validates_indices_and_preserves_retry_and_cancellation_ownership() {
-    use jxl_wgpu_decode::{Error, SpotColorPolicy, UnsupportedCodestreamFeature};
+    use jxl_wgpu_decode::{Error, SpotColorPolicy};
     let Some(backend) = backend() else { return };
     let data = encoded(include_str!("../../test-data/extras_rgb12.jxl.hex"));
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
@@ -344,10 +344,9 @@ fn extra_channel_selection_validates_indices_and_preserves_retry_and_cancellatio
         color.clone().with_extra_channel(0),
         Err(Error::UnsupportedOutputFormat(_))
     ));
-    assert!(
-        matches!(decoder.open(&data, color.clone()), Err(Error::UnsupportedProfile(ref e))
-        if e.feature == UnsupportedCodestreamFeature::ExtraChannels)
-    );
+    let mut rendered = decoder.open(&data, color.clone()).unwrap();
+    assert!(rendered.next_frame().unwrap().is_some());
+    drop(rendered);
     assert!(
         decoder
             .open(

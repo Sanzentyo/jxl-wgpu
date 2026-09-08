@@ -199,9 +199,10 @@ pub(super) fn prepare_presentation(
     let surface = request
         .retains_frame_surface()
         .then(|| {
-            crate::frame_surface::FrameSurfaceLayout::new(
+            crate::frame_surface::FrameSurfaceLayout::with_encoding(
                 output_config.output_extent(),
                 inventory.image_header.extra_channels.len(),
+                request.frame_surface_encoding(),
                 &backend.device().limits(),
             )
             .map(Arc::new)

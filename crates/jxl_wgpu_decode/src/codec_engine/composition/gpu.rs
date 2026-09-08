@@ -5,23 +5,29 @@ use jxl_gpu_bitstream::{
     ExtraChannelInventory, ExtraChannelTypeInventory, FrameInventory, SampleBitDepth,
 };
 use jxl_gpu_formats::ImageLayout;
-use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding};
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{
     GpuBufferLease, GpuImageOutput, IMAGE_ORIENTATION_SHADER, IMAGE_OUTPUT_SHADER,
     ImageOutputParams, ImageOutputSource, WgpuBackend,
 };
 
 use super::blend::{BlendParams, blend_channels, intersection};
+use super::spot::{SpotColor, shader as spot_shader, spot_colors};
 use super::submission::{GpuWork, Submission, submit, validate_size};
-use crate::frame_surface::FrameSurfaceLayout;
+use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, GpuOutputRequest, Result};
 
-/// Unrounded original-encoding RGB followed by independently normalized extra planes.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "gpu_tests.rs"]
+mod tests;
+
+/// Unrounded RGB in an explicit domain, followed by independently normalized extra planes.
 #[derive(Clone, Debug)]
 pub(super) struct Surface {
     pub(super) buffer: GpuBufferLease,
     pub(super) extent: Extent2d,
     plane_words: u32,
+    encoding: FrameSurfaceEncoding,
 }
 
 #[repr(C, align(16))]
@@ -39,7 +45,7 @@ const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 48);
 
 #[derive(Debug)]
 enum Packing {
-    Color(Box<ImageOutputParams>),
+    Color(Box<[ImageOutputParams; 2]>),
     Native(NativeParams),
 }
 
@@ -52,6 +58,7 @@ pub(super) struct Compositor {
     blend: wgpu::ComputePipeline,
     pack: wgpu::ComputePipeline,
     packing: Packing,
+    spots: Vec<SpotColor>,
     pub(super) layout: ImageLayout,
     blend_dispatch: [u32; 2],
     output_dispatch: [u32; 2],
@@ -137,18 +144,25 @@ impl Compositor {
             })
             .transpose()?;
         if request.mapping() == crate::GpuOutputMapping::Color
-            && extras.iter().any(|extra| {
-                extra.channel_type == ExtraChannelTypeInventory::NonOptional
-                    || (request.spot_color_policy() == crate::SpotColorPolicy::Render
-                        && matches!(
-                            extra.channel_type,
-                            ExtraChannelTypeInventory::SpotColour { .. }
-                        ))
-            })
+            && extras
+                .iter()
+                .any(|extra| extra.channel_type == ExtraChannelTypeInventory::NonOptional)
         {
-            return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
-                "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
+            return Err(crate::UnsupportedProfile::new(
+                crate::UnsupportedCodestreamFeature::ExtraChannels,
+                "non-optional extra-channel interpretation is not yet connected",
+            )
+            .into());
         }
+        let spots = if request.renders_spot_colors(extras) {
+            spot_colors(extras, (surface.plane_bytes / 4) as u32)
+        } else {
+            Vec::new()
+        };
+        if !spots.is_empty() {
+            validate_size(device, std::mem::size_of_val(spots.as_slice()) as u64)?;
+        }
+        let spot_source = spot_shader(!spots.is_empty());
         let native = crate::model::native_modular_format(request.format());
         let scalar_float = matches!(
             request.mapping(),
@@ -208,7 +222,7 @@ impl Compositor {
                     ],
                 }),
                 format!(
-                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{}",
+                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{spot_source}\n{}",
                     jxl_wgpu::ALPHA_OUTPUT_SHADER,
                     include_str!("native.wgsl")
                 ),
@@ -217,21 +231,28 @@ impl Compositor {
             if request.mapping() != crate::GpuOutputMapping::Color {
                 return Err(Error::UnsupportedOutputFormat("composed numeric samples require matching native unsigned or scalar normalized F32 output".into()));
             }
+            let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
+                Ok(ImageOutputParams::new(
+                    &layout,
+                    ImageOutputSource {
+                        extent: canvas,
+                        orientation,
+                        strides: [canvas.width; 3],
+                        encoding: encoding.rgb_encoding(),
+                    },
+                    output_dispatch[0] * 64,
+                )?
+                .with_alpha_conversion(alpha_conversion))
+            };
             (
-                Packing::Color(Box::new(
-                    ImageOutputParams::new(
-                        &layout,
-                        ImageOutputSource {
-                            extent: canvas,
-                            orientation,
-                            strides: [canvas.width; 3],
-                            encoding: RgbColorEncoding::SRGB_BT709,
-                        },
-                        output_dispatch[0] * 64,
-                    )?
-                    .with_alpha_conversion(alpha_conversion),
-                )),
-                format!("{IMAGE_OUTPUT_SHADER}\n{}", include_str!("output.wgsl")),
+                Packing::Color(Box::new([
+                    params(FrameSurfaceEncoding::Srgb)?,
+                    params(FrameSurfaceEncoding::Linear)?,
+                ])),
+                format!(
+                    "{IMAGE_OUTPUT_SHADER}\n{spot_source}\n{}",
+                    include_str!("output.wgsl")
+                ),
             )
         };
         let blend = pipeline(
@@ -259,6 +280,7 @@ impl Compositor {
             blend,
             pack,
             packing,
+            spots,
             layout,
             blend_dispatch,
             output_dispatch,
@@ -270,8 +292,15 @@ impl Compositor {
             "physical producer returned no surface",
         ))?;
         let extent = first.layout.extent;
-        let expected =
-            FrameSurfaceLayout::new(extent, self.extras.len(), &self.backend.device().limits())?;
+        let encoding = FrameSurfaceEncoding::from_format(&first.layout.format).ok_or(
+            Error::EngineContract("physical producer returned an unknown RGB surface encoding"),
+        )?;
+        let expected = FrameSurfaceLayout::with_encoding(
+            extent,
+            self.extras.len(),
+            encoding,
+            &self.backend.device().limits(),
+        )?;
         if outputs.len() != 1 + self.extras.len()
             || outputs.iter().zip(expected.layouts()).enumerate().any(
                 |(index, (output, layout))| {
@@ -290,6 +319,7 @@ impl Compositor {
             buffer: outputs.remove(0).buffer,
             extent,
             plane_words: (expected.plane_bytes / 4) as u32,
+            encoding,
         })
     }
 
@@ -298,6 +328,7 @@ impl Compositor {
             buffer,
             extent: self.canvas,
             plane_words: (self.surface.plane_bytes / 4) as u32,
+            encoding: FrameSurfaceEncoding::Srgb,
         }
     }
 
@@ -307,6 +338,16 @@ impl Compositor {
         references: &[Option<Surface>; 4],
         frame: &FrameInventory,
     ) -> Result<GpuWork> {
+        if foreground.encoding != FrameSurfaceEncoding::Srgb
+            || references
+                .iter()
+                .flatten()
+                .any(|base| base.encoding != FrameSurfaceEncoding::Srgb)
+        {
+            return Err(Error::EngineContract(
+                "blending requires original-encoding RGB surfaces",
+            ));
+        }
         if foreground.extent != Extent2d::new(frame.width, frame.height)
             || references.iter().flatten().any(|base| {
                 base.extent.width < self.canvas.width || base.extent.height < self.canvas.height
@@ -375,9 +416,20 @@ impl Compositor {
                 "presentation canvas has the wrong extent or plane stride",
             ));
         }
+        let mut native;
         let (params, output_binding, uniform_binding): (&[u8], _, _) = match &self.packing {
-            Packing::Color(params) => (bytemuck::bytes_of(params.as_ref()), 3, 4),
-            Packing::Native(params) => (bytemuck::bytes_of(params), 1, 2),
+            Packing::Color(params) => (
+                bytemuck::bytes_of(
+                    &params[usize::from(source.encoding == FrameSurfaceEncoding::Linear)],
+                ),
+                3,
+                4,
+            ),
+            Packing::Native(params) => {
+                native = *params;
+                native.source[3] |= u32::from(source.encoding == FrameSurfaceEncoding::Linear) << 1;
+                (bytemuck::bytes_of(&native), 1, 2)
+            }
         };
         submit(
             &self.backend,
@@ -385,7 +437,7 @@ impl Compositor {
                 pipeline: &self.pack,
                 params,
                 inputs: &[(0, &source.buffer)],
-                metadata: None,
+                metadata: (!self.spots.is_empty()).then(|| (7, bytemuck::cast_slice(&self.spots))),
                 output_binding,
                 uniform_binding,
                 size: aligned(self.layout.logical_size)?,

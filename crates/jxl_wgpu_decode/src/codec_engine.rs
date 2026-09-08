@@ -279,7 +279,8 @@ impl WgpuDecodeEngine {
             inventory,
             request.orientation_policy(),
         )?;
-        if inventory.image_header.animation.is_some()
+        if request.renders_spot_colors(&inventory.image_header.extra_channels)
+            || inventory.image_header.animation.is_some()
             || plan.presentations.len() != 1
             || plan.nodes.iter().any(|node| node.needs_composition)
             || inventory.frames.iter().any(|frame| {
