@@ -263,11 +263,7 @@ impl PrefixHistogramIr {
         if nonzero_count != 1 && accumulator != 32 {
             return invalid_entropy("incomplete code-length histogram");
         }
-        let code_length_entries = if nonzero_count == 1 {
-            PrefixHistogramIr::single(nonzero_symbol)?.entries
-        } else {
-            canonical_entries(&code_length_lengths)?
-        };
+        let code_length_entries = canonical_entries(&code_length_lengths)?;
 
         let mut lengths = vec![0u8; alphabet_size];
         let mut accumulator = 0u32;
@@ -281,7 +277,14 @@ impl PrefixHistogramIr {
                 repeat_count -= 1;
                 *length = repeat_length;
             } else {
-                let symbol = u8::try_from(read_prefix_symbol(reader, &code_length_entries)?)
+                // A one-symbol code-length alphabet is a zero-bit code even when its
+                // sole symbol is nonzero. Preserve that identity instead of discarding it.
+                let symbol = if nonzero_count == 1 {
+                    nonzero_symbol as u32
+                } else {
+                    read_prefix_symbol(reader, &code_length_entries)?
+                };
+                let symbol = u8::try_from(symbol)
                     .map_err(|_| invalid_entropy_error("code-length symbol exceeds u8"))?;
                 match symbol {
                     0 => *length = 0,
@@ -2064,6 +2067,57 @@ mod tests {
         MetadataEntropyCursor, PackedModularMetadata, PrefixHistogramIr, add_log2_ceil,
         unpack_signed, validate_tree_property,
     };
+
+    #[test]
+    fn complex_prefix_single_code_length_symbol_consumes_no_payload_bits() {
+        use jxl_gpu_bitstream::{BitReader, BitWriter};
+        const ORDER: [usize; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        for length in 1..=15_u8 {
+            for skip in [0, 2, 3] {
+                if !ORDER[skip..].contains(&usize::from(length)) {
+                    continue;
+                }
+                let mut writer = BitWriter::new();
+                writer.write_bits(skip as u64, 2).unwrap();
+                for &symbol in &ORDER[skip..] {
+                    if symbol == usize::from(length) {
+                        writer.write_bits(7, 4).unwrap(); // Code length 1 in the fixed meta-code.
+                    } else {
+                        writer.write_bits(0, 2).unwrap();
+                    }
+                }
+                let end = writer.bit_len();
+                let bytes = writer.into_bytes();
+                let mut reader = BitReader::new(&bytes);
+                let histogram = PrefixHistogramIr::parse(&mut reader, 1 << length).unwrap();
+                assert_eq!(
+                    reader.bit_offset(),
+                    end as u64,
+                    "length {length}, skip {skip}"
+                );
+                assert_eq!(histogram.entries.len(), 1 << length);
+                assert!(histogram.single_symbol.is_none());
+                for (symbol, entry) in histogram.entries.iter().enumerate() {
+                    assert_eq!(entry.bit_len, length);
+                    assert_eq!(entry.bits, (symbol as u16).reverse_bits() >> (16 - length));
+                }
+                // Too few symbols cannot complete this otherwise legal code-length alphabet.
+                if length > 1 {
+                    assert!(
+                        PrefixHistogramIr::parse(&mut BitReader::new(&bytes), (1 << length) - 1)
+                            .is_err()
+                    );
+                }
+                assert!(
+                    PrefixHistogramIr::parse(
+                        &mut BitReader::new(&bytes[..bytes.len() - 1]),
+                        1 << length
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn packed_metadata_append_rebases_only_internal_offsets() {

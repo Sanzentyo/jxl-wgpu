@@ -50,6 +50,8 @@ pub(super) struct VarDctSource {
     pub(super) memory: VarDctDecodeMemoryStats,
     pub(super) external_lf: Option<ProgressiveDcXybPlanes>,
     pub(super) extra_plane: Option<super::staging::ResidentModularPlane>,
+    pub(super) extra_declarations: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
+    pub(super) global_extra_prefix: Option<jxl_wgpu::GpuBufferLease>,
 }
 
 impl VarDctSource {
@@ -455,6 +457,8 @@ pub(super) fn prepare_packet_source(
         memory,
         external_lf: None,
         extra_plane: None,
+        extra_declarations: inventory.image_header.extra_channels.clone(),
+        global_extra_prefix: None,
     })
 }
 
@@ -545,6 +549,11 @@ fn validate_device_limits(
     for (resource, required, storage) in [
         ("codestream upload", memory.codestream_bytes, true),
         ("Modular metadata", modular_metadata_binding_bytes, true),
+        (
+            "Modular extra-channel frame arena",
+            memory.extra_arena_bytes,
+            true,
+        ),
         (
             "LF reconstruction and HF LZ77 storage",
             reconstruction_storage_bytes,

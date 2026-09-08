@@ -1,7 +1,9 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, atomic::AtomicUsize};
 
-use jxl_gpu_bitstream::{CodestreamInventory, InventoryLimits, ParseLimits};
+use jxl_gpu_bitstream::{
+    CodestreamInventory, ExtraChannelTypeInventory, InventoryLimits, ParseLimits,
+};
 use jxl_wgpu::{
     KernelVariant, MemoryBudget, MemoryBudgetSnapshot, ResidentChromaUpsamplePipeline,
     ResidentEpfPipeline, ResidentGaborishPipeline, ResidentUpsamplePipeline,
@@ -19,8 +21,8 @@ use crate::vardct_pass_group::HfCoefficientPipeline;
 use crate::vardct_resource::VarDctResourcePipeline;
 use crate::wgpu_engine::RawHfDequantSideImagePipeline;
 use crate::{
-    AnimationMetadata, DecodeProfile, GpuCodestream, GpuOutputRequest, GpuSubmissionEngine,
-    PreparedGpuSession, Result as DecodeResult,
+    AnimationMetadata, DecodeProfile, GpuCodestream, GpuOutputMapping, GpuOutputRequest,
+    GpuSubmissionEngine, PreparedGpuSession, Result as DecodeResult, SpotColorPolicy,
 };
 
 use super::execution::{FrameDecodeSession, VarDctRuntimeStats};
@@ -237,6 +239,18 @@ impl VarDctSubmissionEngine {
         inventory: &CodestreamInventory,
         role: crate::vardct_frontend::VarDctFrameRole,
     ) -> DecodeResult<PreparedGpuSession<VarDctDecodeSession>> {
+        if inventory.image_header.extra_channels.iter().any(|extra| {
+            extra.channel_type == ExtraChannelTypeInventory::NonOptional
+                || (request.mapping() == GpuOutputMapping::Color
+                    && request.spot_color_policy() == SpotColorPolicy::Render
+                    && matches!(
+                        extra.channel_type,
+                        ExtraChannelTypeInventory::SpotColour { .. }
+                    ))
+        }) {
+            return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
+                "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
+        }
         let options = VarDctPrepareOptions {
             output_variant: self.pipelines.output_variant,
             stream_window_limit: self.stream_window_limit,
@@ -278,9 +292,11 @@ impl VarDctSubmissionEngine {
             submissions_per_frame: Arc::new(AtomicUsize::new(submissions_per_frame)),
             hf_packet_stream_batch_count: AtomicUsize::new(0),
         });
+        let mut metadata = AnimationMetadata::still(extent);
+        metadata.extra_channels = source.extra_declarations.clone();
         Ok(PreparedGpuSession::new(
             profile,
-            AnimationMetadata::still(extent),
+            metadata,
             VarDctDecodeSession::ready(FrameDecodeSession {
                 backend: self.backend.clone(),
                 pipelines: Arc::clone(&self.pipelines),

@@ -305,28 +305,6 @@ impl ModularSideImagePipeline {
                 entry(7, &control),
             ],
         });
-        let needs_palette = plan
-            .inverse_plan
-            .jobs()
-            .iter()
-            .any(|job| matches!(job, ModularInverseJob::Palette { .. }));
-        let needs_squeeze = plan
-            .inverse_plan
-            .jobs()
-            .iter()
-            .any(|job| matches!(job, ModularInverseJob::Squeeze { .. }));
-        let needs_rct = plan
-            .inverse_plan
-            .jobs()
-            .iter()
-            .any(|job| matches!(job, ModularInverseJob::Rct { .. }));
-        let inverse = self.inverse.get(
-            backend,
-            F64OutputPath::ExactF32Widening,
-            needs_palette,
-            needs_squeeze,
-            needs_rct,
-        )?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu Modular side-image stage"),
         });
@@ -361,19 +339,12 @@ impl ModularSideImagePipeline {
             })
         });
         let inverse_encoder = deferred_inverse.as_mut().unwrap_or(&mut encoder);
-        let inverse_uniforms = encode_modular_inverse_jobs(
-            device,
+        let inverse_uniforms = self.encode_inverse(
+            backend,
             inverse_encoder,
-            ResidentStorageBinding {
-                buffer: &arena,
-                offset: 0,
-                size: NonZeroU64::new(plan.inverse_plan.arena_bytes()).ok_or(
-                    Error::EngineContract("Modular side image inverse arena is empty"),
-                )?,
-            },
+            &arena,
             &plan.inverse_plan,
             plan.wp_header,
-            &inverse,
         )?;
         let inverse_commands = deferred_inverse.map(|mut encoder| {
             encoder.copy_buffer_to_buffer(
@@ -416,6 +387,42 @@ impl ModularSideImagePipeline {
         frame_bytes(plan, metadata.len(), workspace.bytes, stream.bytes)
     }
 
+    pub(crate) fn encode_inverse(
+        &self,
+        backend: &WgpuBackend,
+        encoder: &mut wgpu::CommandEncoder,
+        arena: &wgpu::Buffer,
+        plan: &crate::modular_inverse::ModularInversePlan,
+        wp_header: crate::modular_tree::WpHeaderIr,
+    ) -> Result<Vec<wgpu::Buffer>> {
+        let inverse = self.inverse.get(
+            backend,
+            F64OutputPath::ExactF32Widening,
+            plan.jobs()
+                .iter()
+                .any(|job| matches!(job, ModularInverseJob::Palette { .. })),
+            plan.jobs()
+                .iter()
+                .any(|job| matches!(job, ModularInverseJob::Squeeze { .. })),
+            plan.jobs()
+                .iter()
+                .any(|job| matches!(job, ModularInverseJob::Rct { .. })),
+        )?;
+        encode_modular_inverse_jobs(
+            backend.device(),
+            encoder,
+            ResidentStorageBinding {
+                buffer: arena,
+                offset: 0,
+                size: NonZeroU64::new(plan.arena_bytes())
+                    .ok_or(Error::EngineContract("Modular inverse arena is empty"))?,
+            },
+            plan,
+            wp_header,
+            &inverse,
+        )
+    }
+
     pub(crate) fn arena_bytes(plan: &ModularSideImagePlan) -> Result<u64> {
         Ok(workspace(plan)?.bytes)
     }
@@ -448,6 +455,9 @@ pub(crate) struct ModularSideImageJob {
 }
 
 impl ModularSideImageJob {
+    pub(crate) fn encode_status_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(&self.status, 0, &self.status_staging, 0, 16);
+    }
     /// Called only after the preceding status map has completed and been unmapped.
     pub(crate) fn record_next_window(
         &self,
@@ -705,24 +715,7 @@ fn frame_bytes(
         .ok()
         .and_then(|words| words.checked_mul(4))
         .ok_or_else(|| Error::backend("Modular side image metadata byte size overflow"))?;
-    let inverse_uniform_bytes = plan
-        .inverse_plan
-        .jobs()
-        .iter()
-        .try_fold(0_u64, |total, job| {
-            let bytes = match *job {
-                ModularInverseJob::Squeeze { .. } => {
-                    std::mem::size_of::<crate::modular_squeeze::ModularSqueezeParams>() as u64
-                }
-                ModularInverseJob::Rct { .. } => {
-                    std::mem::size_of::<crate::modular_rct::ModularRctParams>() as u64
-                }
-                ModularInverseJob::Palette { job } => job.uniform_bytes(),
-            };
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| Error::backend("Modular side image inverse uniform overflow"))
-        })?;
+    let inverse_uniform_bytes = plan.inverse_plan.uniform_bytes()?;
     [
         stream_bytes,
         metadata_bytes,

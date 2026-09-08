@@ -48,6 +48,28 @@ fn align4(value: u64) -> Result<u64, VarDctDecodeError> {
 /// Typed production-path failure for GPU-resident VarDCT decode.
 #[derive(Debug, Error)]
 pub enum VarDctDecodeError {
+    #[error("VarDCT Modular extra-channel processing failed")]
+    ModularExtra {
+        #[source]
+        source: Box<DecodeError>,
+    },
+    #[error(
+        "Modular extra stream {stream} failed with code {code}, {decoded_samples}/{expected_samples} samples at bit {cursor}/{packet_end}"
+    )]
+    ExtraModularStatus {
+        stream: u32,
+        code: u32,
+        decoded_samples: u32,
+        expected_samples: u32,
+        cursor: u32,
+        packet_end: u32,
+    },
+    #[error("Modular extra stream {stream} leaves trailing bits at {cursor}/{packet_end}")]
+    ExtraModularTrailingBits {
+        stream: u32,
+        cursor: u32,
+        packet_end: u32,
+    },
     #[error(
         "global Modular entropy failed with code {code}, {decoded_samples}/{expected_samples} samples at bit {cursor}/{packet_end}"
     )]
@@ -294,6 +316,10 @@ pub struct VarDctDecodeMemoryStats {
     pub output_uniform_bytes: u64,
     /// Scalar sample-range status, included again as a four-byte aggregate staging tail.
     pub output_status_bytes: u64,
+    /// Full transformed/inverse arena for distributed Modular extra channels.
+    pub extra_arena_bytes: u64,
+    /// Global inverse uniforms, executed after all distributed subimages validate.
+    pub extra_inverse_uniform_bytes: u64,
     /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
     /// All non-output GPU buffers retained through status validation.
@@ -667,6 +693,17 @@ impl VarDctDecodeMemoryStats {
         let output_uniform_bytes = output.uniform_bytes;
         let output_status_bytes = output.status_bytes;
         let output_lease_bytes = output.storage_bytes;
+        let extra_arena_bytes = packet
+            .extra_channels
+            .as_ref()
+            .map_or(0, |plan| plan.inverse.arena_bytes());
+        let extra_inverse_uniform_bytes = packet
+            .extra_channels
+            .as_ref()
+            .map(|plan| plan.inverse.uniform_bytes())
+            .transpose()
+            .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?
+            .unwrap_or(0);
         let transient_bytes = [
             codestream_bytes,
             modular_metadata_bytes,
@@ -708,6 +745,8 @@ impl VarDctDecodeMemoryStats {
             resident_transient_bytes,
             output_uniform_bytes,
             output_status_bytes,
+            extra_arena_bytes,
+            extra_inverse_uniform_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, |total, value| {
@@ -773,6 +812,8 @@ impl VarDctDecodeMemoryStats {
             output_lease_bytes,
             transient_bytes,
             total_frame_bytes,
+            extra_arena_bytes,
+            extra_inverse_uniform_bytes,
         })
     }
 }

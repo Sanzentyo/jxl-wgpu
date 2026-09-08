@@ -60,8 +60,6 @@ pub enum UnsupportedVarDctPacketFeature {
 pub enum BoundedVarDctPacketError {
     #[error("global Modular image entropy requires GPU cursor continuation before LF parsing")]
     GlobalModularRequiresGpu,
-    #[error("VarDCT extra-channel LF/AC group distribution is not yet connected")]
-    DistributedModularExtras,
     #[error("VarDCT extra-channel resampling and LF-frame reuse are not yet connected")]
     GlobalModularGeometry,
     #[error("global Modular entropy leaves non-padding data in LF-global")]
@@ -161,6 +159,7 @@ pub struct BoundedVarDctPacketPlan {
     hf_block_context: HfBlockContextIr,
     global_ma_config: Option<MaConfigIr>,
     pending_hf_global: Option<PendingHfGlobalParse>,
+    pub(crate) extra_channels: Option<crate::vardct_extra::VarDctExtraPlan>,
 }
 
 /// One host-packed MA tree/histogram bundle and its exact GPU reconstruction requirements.
@@ -440,6 +439,7 @@ struct VarDctPacketPrefix {
     lf_global: LfGlobalPrefix,
     global_ma_config: Option<MaConfigIr>,
     lf_global_end: u64,
+    extra_channels: Option<crate::vardct_extra::VarDctExtraPlan>,
 }
 
 pub(crate) struct PendingGlobalModular {
@@ -448,6 +448,9 @@ pub(crate) struct PendingGlobalModular {
 }
 
 impl PendingGlobalModular {
+    pub(crate) fn has_distributed_extras(&self) -> bool {
+        self.prefix.extra_channels.is_some()
+    }
     pub(crate) fn profile(&self) -> &StandardVarDctProfile {
         &self.prefix.profile
     }
@@ -498,6 +501,7 @@ impl VarDctPacketPrefix {
             lf_global,
             global_ma_config,
             lf_global_end: _,
+            extra_channels,
         } = self;
         let descriptor_end = modular_end;
         let words = global_ma_config
@@ -755,6 +759,7 @@ impl VarDctPacketPrefix {
             hf_block_context: lf_global.hf_block_context,
             global_ma_config,
             pending_hf_global,
+            extra_channels,
         })
     }
 }
@@ -882,7 +887,7 @@ impl BoundedVarDctPacketPlan {
             }
             .into());
         }
-        let prefix = VarDctPacketPrefix {
+        let mut prefix = VarDctPacketPrefix {
             profile,
             lf_global_packet,
             lf_group_packets,
@@ -891,6 +896,7 @@ impl BoundedVarDctPacketPlan {
             lf_global,
             global_ma_config,
             lf_global_end,
+            extra_channels: None,
         };
         if inventory.image_header.extra_channels.is_empty() {
             return prefix
@@ -914,21 +920,46 @@ impl BoundedVarDctPacketPlan {
         let header =
             crate::modular_side_image::ModularSideImageHeader::parse(&mut reader, topology)
                 .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
-        if crate::modular_grouping::global_subimage_channel_count(
+        let image = if crate::modular_grouping::global_subimage_channel_count(
             &header.transforms.topology,
             profile.group_dimension,
         ) != header.transforms.topology.channels().len()
         {
-            return Err(BoundedVarDctPacketError::DistributedModularExtras);
-        }
-        let image = header
-            .finish(
-                &mut reader,
-                profile.bits_per_sample,
-                0,
-                prefix.global_ma_config.as_ref(),
+            let extras = crate::vardct_extra::VarDctExtraPlan::new(
+                &header,
+                profile,
+                &inventory.frames[0].progressive_passes,
             )
             .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+            let image = extras
+                .parse_global(
+                    &mut reader,
+                    header,
+                    profile.bits_per_sample,
+                    prefix.global_ma_config.as_ref(),
+                )
+                .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+            prefix.extra_channels = Some(extras);
+            image
+        } else {
+            Some(
+                header
+                    .finish(
+                        &mut reader,
+                        profile.bits_per_sample,
+                        0,
+                        prefix.global_ma_config.as_ref(),
+                    )
+                    .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?,
+            )
+        };
+        let Some(image) = image else {
+            // An empty global image consumes only its header. Independent TOC entries may
+            // contain unused encoder bytes; they do not belong to a Modular entropy stream.
+            return prefix
+                .finish(source, reader.bit_offset())
+                .map(|packet| VarDctPacketPreparation::Ready(Box::new(packet)));
+        };
         if u64::from(image.token_bit_offset) > lf_global_end {
             return Err(VarDctPacketError::PacketBoundary {
                 cursor: u64::from(image.token_bit_offset),
@@ -980,9 +1011,68 @@ impl BoundedVarDctPacketPlan {
     /// Single-entry packets always stage their general HF-global/AC tail; sectioned packets
     /// need this boundary when their LF/HF consumers carry local MA trees.
     #[must_use]
-    pub const fn requires_lf_staging(&self) -> bool {
+    pub fn requires_lf_staging(&self) -> bool {
         !self.profile.uses_lf_frame
-            && (self.global_ma_config.is_none() || self.requires_hf_global_staging())
+            && (self.global_ma_config.is_none()
+                || self.requires_hf_global_staging()
+                || self
+                    .extra_channels
+                    .as_ref()
+                    .is_some_and(|plan| plan.has_lf()))
+    }
+
+    pub(crate) fn parse_extra_subimage_source(
+        &self,
+        source: &GpuCodestream,
+        pass: Option<usize>,
+        group: u32,
+        cursor: u32,
+    ) -> crate::Result<Option<crate::vardct_extra::VarDctExtraSubimage>> {
+        let extras = self
+            .extra_channels
+            .as_ref()
+            .ok_or(crate::Error::EngineContract(
+                "VarDCT extra subimage has no frame assembly plan",
+            ))?;
+        let (topology, targets, stream_index) = extras.subimage(&self.profile, pass, group)?;
+        if topology.sample_count() == Some(0) {
+            return Ok(None);
+        }
+        let range = if let Some(pass) = pass {
+            self.hf_coefficients
+                .as_ref()
+                .and_then(|entropy| entropy.passes.get(pass))
+                .and_then(|pass| pass.pass_groups.get(group as usize))
+                .copied()
+        } else {
+            self.groups.get(group as usize).map(|group| group.lf_group)
+        }
+        .ok_or(crate::Error::EngineContract(
+            "extra subimage has no packet range",
+        ))?;
+        let end = range.end().and_then(|end| u32::try_from(end).ok()).ok_or(
+            crate::Error::EngineContract("extra subimage packet end exceeds WGSL u32"),
+        )?;
+        if u64::from(cursor) < range.offset || cursor > end {
+            return Err(crate::Error::EngineContract(
+                "extra subimage cursor exceeds its packet",
+            ));
+        }
+        let mut reader = source_reader_at(PacketSource::Spans(source), u64::from(cursor))
+            .map_err(crate::vardct_engine::VarDctDecodeError::from)?;
+        let mut reader = BoundedBitInput::new(&mut reader, u64::from(end));
+        let image = crate::modular_side_image::ModularSideImagePlan::parse(
+            &mut reader,
+            topology,
+            self.profile.bits_per_sample,
+            stream_index,
+            self.global_ma_config.as_ref(),
+        )?;
+        Ok(Some(crate::vardct_extra::VarDctExtraSubimage {
+            image,
+            targets,
+            packet_end: end,
+        }))
     }
 
     /// Whether HF metadata must stop at a GPU-discovered HF-global boundary in a single packet.
@@ -3150,20 +3240,33 @@ mod tests {
                 profile.low_frequency_group_count > 1,
                 matches!(name, "wide" | "squeeze")
             );
-            assert!(matches!(
-                BoundedVarDctPacketPlan::parse(parsed.codestream(), &inventory),
-                Err(BoundedVarDctPacketError::DistributedModularExtras)
-            ));
-            // Admission is based on channel ownership. A global subimage with no samples has
-            // no MA/entropy descriptor to parse, even when its use_global_tree bit is false.
-            let mut corrupt = parsed.codestream().to_vec();
-            for bit in reader.bit_offset()..lf_global.end().unwrap() {
-                corrupt[bit as usize / 8] |= 1 << (bit % 8);
+            let prepared = BoundedVarDctPacketPlan::begin_inner(
+                PacketSource::Slice(parsed.codestream()),
+                &inventory,
+                crate::vardct_frontend::VarDctFrameRole::Frame,
+            )
+            .unwrap();
+            match prepared {
+                VarDctPacketPreparation::Ready(packet) => {
+                    assert_eq!(global, 0, "{name}");
+                    assert!(packet.extra_channels.is_some());
+                    // An empty global image consumes neither MA descriptors nor entropy.
+                    let mut corrupt = parsed.codestream().to_vec();
+                    for bit in reader.bit_offset()..lf_global.end().unwrap() {
+                        corrupt[bit as usize / 8] |= 1 << (bit % 8);
+                    }
+                    assert_eq!(
+                        BoundedVarDctPacketPlan::parse(&corrupt, &inventory).unwrap(),
+                        *packet
+                    );
+                }
+                VarDctPacketPreparation::GlobalModular(pending) => {
+                    assert!(global > 0, "{name}");
+                    assert!(pending.has_distributed_extras());
+                    assert_eq!(pending.image.final_planes.len(), global);
+                    assert!(pending.image.inverse_plan.jobs().is_empty());
+                }
             }
-            assert!(matches!(
-                BoundedVarDctPacketPlan::parse(&corrupt, &inventory),
-                Err(BoundedVarDctPacketError::DistributedModularExtras)
-            ));
         }
     }
 

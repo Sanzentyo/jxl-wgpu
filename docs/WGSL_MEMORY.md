@@ -431,8 +431,10 @@ validates the terminal ANS state and leaves the cursor unaligned for the next co
 that finishes in a nonfinal input window can return success immediately. The 32-byte status and
 464-byte resume ABI remain unchanged. Host continuation validation checks group identity and
 both bounds against its packet plan, including the reported token end. Changing a logical pass
-group's mode updates both whole-range and window-resume parameter records. Standard public
-frame execution continues to use exact packet mode until distributed extra scheduling is connected.
+group's mode updates both whole-range and window-resume parameter records. Public distributed
+extra execution selects continuation only for AC groups with nonempty Modular subimages, while
+all other groups retain exact packet termination. Host validation rebases bounded cursors against
+the original packet range; no input buffer contents are treated as authoritative bounds.
 
 A Modular frame containing only DC-global image samples uses its admitted frame arena and zero
 subimage lanes. The otherwise-unused reconstruction binding retains a counted four-byte placeholder.
@@ -488,7 +490,7 @@ Seven public fixtures cover single/multi-entry TOCs, multiple AC passes, indepen
 Apply/Keep and fragmented input. Entropy failure never exposes a color frame; cancellation,
 initial admission/retry, middle-window cancellation, budget-driven upload reduction and undersized
 window/budget rejection have actual-adapter tests. Internal
-plane readback remains test-only. LF/AC-distributed extras need further integration.
+plane readback remains test-only. Distributed LF/AC extras now use the same executor.
 
 Scalar VarDCT output retains complete LF/HF/AC validation and its coefficient/metadata resources,
 but allocates no resident color planes, inverse-transform scratch, restoration or color-resampling
@@ -498,6 +500,21 @@ range failures become `ModularScalarOutputError::SampleOutOfRange` before valida
 The packer reads the retained integer view directly, writes each output word once (including zero
 padding), and uses shared orientation helpers. No extra submission or intermediate color image
 is introduced. The same seven public fixtures select all 32 extra planes in both output modes.
+
+Distributed VarDCT extras reserve their full transformed/inverse arena separately from the remaining
+frame transient buffers. `extra_arena_bytes` and `extra_inverse_uniform_bytes` are included in
+`total_frame_bytes`; a retained nonempty global-prefix arena is separate and shares the same budget.
+Each LF/AC subimage is admitted after its descriptor is known. Its reusable input can shrink to
+available capacity; all image workspace, metadata, uniforms and 16-byte status/staging buffers
+remain charged until its callback releases them. Dynamic subimage bytes appear in the live budget,
+not the immutable base-frame plan. The callback also retains the frame lifetime.
+
+After validated local entropy, any deferred local inverse precedes checked GPU row copies into
+the frame arena. A status copy after those copies fences their completion before releasing the
+local reservation. LF completion resumes HF metadata; AC completion checks padding to the TOC
+boundary. Once all required subimages finish, a retained command buffer runs the global inverse
+and output. The frame exposes no unvalidated output before this tail is submitted. All stages
+use the existing entropy/status/parameter ABIs; no pixel or coefficient readback is introduced.
 
 For cross-group DC-global Palette/Squeeze, the Gray8 decoder additionally charges one
 `frame_modular_arena_bytes` allocation containing transformed samples plus its optional LZ77,

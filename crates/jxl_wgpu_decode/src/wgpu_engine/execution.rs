@@ -2524,51 +2524,13 @@ pub(super) fn encode_subimage_plane_copies(
         .ok()
         .and_then(|lane| lane.checked_mul(source.dispatch_layout.reconstruction_lane_stride))
         .ok_or_else(|| Error::backend("Modular subimage copy lane offset overflow"))?;
-    for copy in copies {
-        if copy.source.width != copy.destination.width
-            || copy.source.height != copy.destination.height
-            || copy.source.bit_depth != copy.destination.bit_depth
-        {
-            return Err(Error::EngineContract(
-                "Modular subimage source and frame-arena destination geometries disagree",
-            ));
-        }
-        let row_bytes = u64::from(copy.source.width)
-            .checked_mul(4)
-            .ok_or_else(|| Error::backend("Modular subimage copy row size overflow"))?;
-        for row in 0..copy.source.height {
-            let source_offset = u64::from(copy.source.word_offset)
-                .checked_add(u64::from(row) * u64::from(copy.source.row_stride_words))
-                .and_then(|words| words.checked_mul(4))
-                .and_then(|bytes| lane_offset.checked_add(bytes))
-                .ok_or_else(|| Error::backend("Modular subimage copy source offset overflow"))?;
-            let destination_offset = u64::from(copy.destination.word_offset)
-                .checked_add(u64::from(row) * u64::from(copy.destination.row_stride_words))
-                .and_then(|words| words.checked_mul(4))
-                .ok_or_else(|| {
-                    Error::backend("Modular subimage copy destination offset overflow")
-                })?;
-            if source_offset
-                .checked_add(row_bytes)
-                .is_none_or(|end| end > group_arena.size())
-                || destination_offset
-                    .checked_add(row_bytes)
-                    .is_none_or(|end| end > frame_arena.size())
-            {
-                return Err(Error::EngineContract(
-                    "Modular subimage plane copy exceeds a resident GPU arena",
-                ));
-            }
-            encoder.copy_buffer_to_buffer(
-                group_arena,
-                source_offset,
-                frame_arena,
-                destination_offset,
-                row_bytes,
-            );
-        }
-    }
-    Ok(())
+    crate::modular_assembly::encode_plane_copies(
+        encoder,
+        group_arena,
+        frame_arena,
+        lane_offset,
+        copies.iter().map(|copy| (copy.source, copy.destination)),
+    )
 }
 
 pub(super) fn encode_modular_finalize(

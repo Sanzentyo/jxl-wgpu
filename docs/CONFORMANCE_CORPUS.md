@@ -1162,7 +1162,7 @@ without consuming the source, canceled callback ownership after multiple windows
 fixture zeroes only entropy bits 885..3436 of `rgba`, preserving both descriptors and later color
 data; GPU status rejects it before a color plan or frame is exposed. Color planning remains absent
 until global cursor validation; later LF/HF descriptors retain their separately admitted dynamic
-bytes. LF/AC-distributed or shifted samples and associated alpha
+bytes. Shifted samples and associated alpha
 remain gaps. No production picture data or entropy token crosses to a CPU decoder.
 
 `tests/vardct_engine_gpu/extra_channels/scalar.rs` selects all 32 extra planes in those seven
@@ -1225,10 +1225,11 @@ six-crate WASM, both 18-case reference/Metal harnesses and indexed codec/readbac
 | `vardct_extras_transformed.jxl.hex` | 81790 | `c5af1524af32e6ec9d87bc66118d37551a51615a6c22c902c41a05f61742359f` |
 | `vardct_extras_rgba_progressive.jxl.hex` | 1531 | `5151de6b5f7826080cc0f520b3e9ef6d469043463db26d1bf2ae91b73d7bcf81` |
 
-### VarDCT distributed extra-channel boundaries (2026-09-08)
+### VarDCT distributed extra channels (2026-09-08)
 
 `generate_extra_channels.c OUTPUT_DIRECTORY --vardct-distributed`, built against libjxl 0.12.0,
-adds five descriptor/partition fixtures. Their color/extra sample formula is the same as the
+adds five descriptor/partition and public decode fixtures. Their color/extra sample formula is
+the same as the
 preceding global-extra fixtures; every extra channel is encoded at distance zero.
 
 | Fixture suffix | Source | Extra declarations | Global/coded channel count | Group coverage |
@@ -1241,10 +1242,11 @@ preceding global-extra fixtures; every extra channel is encoded at distance zero
 
 The partition test marks the full transformed arena and requires exactly one owner for every
 coded sample. It covers global-prefix ordering, LF versus asymmetric pass shifts, progressive
-brackets and clipped zero-size channels. Additional regression cases cover a downsampling boundary on the final pass: it must retain the preceding maximum shift and force its minimum to zero, rather than dropping unassigned resolutions. These fixtures still receive the explicit public
-`DistributedModularExtras` rejection; this checkpoint does not claim public distributed pixel
-output. Corrupting the bytes following the global header preserves that admission result, proving
-that empty or distributed global subimages are identified before parsing image entropy.
+brackets and clipped zero-size channels. Additional regression cases cover a downsampling boundary
+on the final pass: it retains the preceding maximum shift and forces its minimum to zero,
+preserving unassigned resolutions. These fixtures now decode through the public GPU frame
+scheduler. Empty global subimages skip
+MA/entropy parsing; corrupting only their unused section suffix preserves the prepared plan.
 The header/entropy split follows [libjxl ModularDecode](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/modular/encoding/encoding.cc),
 and omission of clipped empty frame channels before local transforms follows
 [libjxl DecodeGroup](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_modular.cc).
@@ -1270,10 +1272,26 @@ Naga verifies the unchanged 160-byte parameter ABI and the new final word at byt
 | `vardct_extras_distributed_squeeze.jxl.hex` | 598421 | `692211f95f0e7f35228f035232a52c90af854eb950cdbaa85b76bb9cc16f98c8` |
 | `vardct_extras_distributed_wide.jxl.hex` | 15992 | `8cc1e8c0f0a43b7d3e6f94f30ab1c68028c400434fd8723075673756967e12fe` |
 
-Validation on Apple M5/Metal: the serial full-workspace run passes 670 tests with one manual
-allocation benchmark ignored. After the final-pass correction, all 156 decoder library tests and
-the public 2051×259 progressive Squeeze GPU regression pass, covering 671 distinct workspace tests
-in total (281 decoder tests and 390 elsewhere). Final formatting, workspace check, warning-free
-Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal harnesses each pass
-18 cases; indexed GPU decode with CPU readback also passes. Public distributed-extra frame output
-is still outside this checkpoint.
+`tests/vardct_engine_gpu/extra_channels/distributed.rs` reconstructs all 13 extra planes as
+exact native integer codes and normalized F32, and color/first-alpha output against Rust `jxl`
+and libjxl. Whole blocking input and 347-byte fragmented async input with a 1024-byte cap cover
+empty global prefixes, local MA trees, Palette metadata, progressive pass assignment, clipped
+edges, multiple LF groups and the 2051×259 Squeeze image. Scalar output allocates no color planes.
+Normalized extras/alpha agree within 2e-7; color tolerances are 0.0003 against Rust and 0.002 against
+libjxl. A separate 128-byte-window test verifies initial memory backpressure/retry, cancellation
+during a Modular subimage, complete permit retirement, and late exhaustion without output.
+Clearing only the final four bytes of `alpha`'s last AC section preserves its color AC stream but
+fails extra entropy validation, for both color and scalar requests under whole and bounded input.
+
+The tiny second LF group of `wide` uses a degenerate complex Huffman code-length alphabet. The
+shared descriptor parser now preserves its sole nonzero symbol as a zero-bit code. Regression
+tests cover lengths 1–15 and every applicable skip form, exact header consumption, incomplete
+alphabets and truncation. The interpretation follows
+[libjxl's Huffman descriptor reader](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_huffman.cc).
+
+Validation on Apple M5/Metal: the serial full workspace passes 675 tests with one existing manual
+allocation benchmark ignored. The strengthened late-admission assertion also passes in a focused
+GPU rerun. Final formatting, workspace check, warning-free Clippy/rustdoc, Rust 1.89 and the
+six-crate WASM check pass. Reference and Metal harnesses each pass all 18 cases, and indexed GPU
+decode with CPU readback passes. This closes the distributed full-resolution integer-extra path;
+shifted/resampled/floating extras, associated alpha and broader cross-feature conformance remain.

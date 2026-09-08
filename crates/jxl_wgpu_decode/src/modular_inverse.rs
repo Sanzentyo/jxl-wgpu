@@ -120,6 +120,21 @@ impl ModularInversePlan {
         &self.jobs
     }
 
+    pub(crate) fn uniform_bytes(&self) -> Result<u64> {
+        self.jobs.iter().try_fold(0_u64, |total, job| {
+            let bytes = match *job {
+                ModularInverseJob::Squeeze { .. } => {
+                    std::mem::size_of::<ModularSqueezeParams>() as u64
+                }
+                ModularInverseJob::Rct { .. } => std::mem::size_of::<ModularRctParams>() as u64,
+                ModularInverseJob::Palette { job } => job.uniform_bytes(),
+            };
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| crate::Error::backend("Modular inverse uniform size overflow"))
+        })
+    }
+
     pub(crate) fn final_planes(&self) -> &[ModularArenaPlane] {
         &self.final_planes
     }

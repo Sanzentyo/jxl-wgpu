@@ -22,9 +22,8 @@ use crate::wgpu_engine::{
     ModularSideImageJob, ModularSideImagePipeline, ModularSideImageStreamPlan,
 };
 use crate::{
-    AnimationMetadata, DecodeProfile, Error, GpuCodestream, GpuOutputMapping, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionSession, PreparedGpuSession, Result, SpotColorPolicy,
-    SubmittedGpuFrame,
+    AnimationMetadata, DecodeProfile, Error, GpuCodestream, GpuOutputRequest, GpuPendingFrame,
+    GpuSubmissionSession, PreparedGpuSession, Result, SubmittedGpuFrame,
 };
 
 use super::execution::{FrameDecodeSession, FramePendingFrame, MapCompletion, VarDctRuntimeStats};
@@ -115,18 +114,6 @@ impl VarDctDecodeSession {
         let backend = engine.backend.clone();
         let memory = engine.memory.clone();
         let pipelines = Arc::clone(&engine.pipelines);
-        if inventory.image_header.extra_channels.iter().any(|extra| {
-            extra.channel_type == ExtraChannelTypeInventory::NonOptional
-                || (request.mapping() == GpuOutputMapping::Color
-                    && request.spot_color_policy() == SpotColorPolicy::Render
-                    && matches!(
-                        extra.channel_type,
-                        ExtraChannelTypeInventory::SpotColour { .. }
-                    ))
-        }) {
-            return Err(crate::UnsupportedProfile::new(crate::UnsupportedCodestreamFeature::ExtraChannels,
-                "non-optional extra-channel interpretation and spot rendering are not yet connected").into());
-        }
         let profile = packet.profile();
         let presentation = super::output::prepare_presentation(
             &backend,
@@ -485,6 +472,8 @@ impl VarDctPendingFrame {
             };
             return Ok(());
         }
+        let distributed = source.packet.has_distributed_extras();
+        let global_extra_prefix = distributed.then(|| lifetime.arena.clone());
         let extra_index = source
             .request
             .extra_channel()
@@ -499,7 +488,7 @@ impl VarDctPendingFrame {
                         matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. })
                     })
             });
-        let extra_plane = extra_index.map(|index| {
+        let extra_plane = extra_index.filter(|_| !distributed).map(|index| {
             let SampleBitDepth::Integer { bits_per_sample } =
                 source.inventory.image_header.extra_channels[index].bit_depth
             else {
@@ -515,9 +504,12 @@ impl VarDctPendingFrame {
         drop(lifetime);
         let mut options = source.options;
         options.memory_limit_bytes = options.memory_limit_bytes.saturating_sub(
-            extra_plane
+            global_extra_prefix
                 .as_ref()
-                .map_or(0, |plane| plane.arena.reserved_bytes()),
+                .map_or(0, GpuBufferLease::reserved_bytes)
+                + extra_plane
+                    .as_ref()
+                    .map_or(0, |plane| plane.arena.reserved_bytes()),
         );
         let packet = source
             .packet
@@ -532,6 +524,7 @@ impl VarDctPendingFrame {
             packet,
         )?;
         frame.extra_plane = extra_plane;
+        frame.global_extra_prefix = global_extra_prefix;
         *self
             .frame_memory
             .lock()

@@ -50,6 +50,9 @@ use super::window_plan::{
     HfPacketWindowExecutionPlan, copy_stream_segment, map_codestream_source_error,
 };
 
+mod extra;
+use extra::{ExtraLifetime, ExtraWork, HfValidation, map_extra_error};
+
 /// One-frame submission state for [`crate::VarDctSubmissionEngine`].
 pub struct FrameDecodeSession {
     pub(super) backend: WgpuBackend,
@@ -125,7 +128,12 @@ impl GpuSubmissionSession for FrameDecodeSession {
             .try_reserve()
             .map_err(DecodeError::PollBackpressure)?;
         let output_permit = self.memory.try_reserve(source.memory.output_lease_bytes)?;
-        let transient_permit = self.memory.try_reserve(source.memory.transient_bytes)?;
+        let extra_permit = (source.memory.extra_arena_bytes != 0)
+            .then(|| self.memory.try_reserve(source.memory.extra_arena_bytes))
+            .transpose()?;
+        let transient_permit = self
+            .memory
+            .try_reserve(source.memory.transient_bytes - source.memory.extra_arena_bytes)?;
         let source = self
             .source
             .take()
@@ -139,6 +147,7 @@ impl GpuSubmissionSession for FrameDecodeSession {
             VarDctMemoryPermits {
                 output: output_permit,
                 transient: transient_permit,
+                extra: extra_permit,
             },
             poll_permit,
         )?;
@@ -149,6 +158,7 @@ impl GpuSubmissionSession for FrameDecodeSession {
 struct VarDctMemoryPermits {
     output: MemoryPermit,
     transient: MemoryPermit,
+    extra: Option<MemoryPermit>,
 }
 
 struct HfCoefficientJobBuffers {
@@ -290,6 +300,13 @@ enum PostLfCommands {
 }
 
 enum VarDctPendingContinuation {
+    AcExtra {
+        source: Box<VarDctSource>,
+    },
+    ModularExtra {
+        work: Box<ExtraWork>,
+        lifetime: Arc<ExtraLifetime>,
+    },
     LocalLf {
         source: Box<VarDctSource>,
         commands: PostLfCommands,
@@ -568,6 +585,9 @@ struct VarDctJobLifetime {
     _progressive_dc_uniform: Option<wgpu::Buffer>,
     _external_lf: Option<ProgressiveDcXybPlanes>,
     _extra_plane: Option<super::staging::ResidentModularPlane>,
+    extra_frame: Option<GpuBufferLease>,
+    _extra_prefix: Option<GpuBufferLease>,
+    _extra_uniforms: Vec<wgpu::Buffer>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: Option<[wgpu::Buffer; 3]>,
     _post_transform: PostTransformJobBuffers,
@@ -607,7 +627,8 @@ pub struct FramePendingFrame {
     layout: ImageLayout,
     frame_name: String,
     expected_groups: Vec<VarDctGroupValidation>,
-    expected_hf_group_indices: Vec<u32>,
+    expected_hf: Vec<HfValidation>,
+    extra_output_commands: Option<wgpu::CommandBuffer>,
     deferred_hf_global: bool,
     progressive_dc_extent: Extent2d,
     progressive_dc_stride: u32,
@@ -631,6 +652,15 @@ enum VarDctPendingStage {
         job: Option<Box<RawHfDequantSideImageJob>>,
         permit: Option<MemoryPermit>,
     },
+    AcExtra {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+    },
+    ModularExtra {
+        completion: Arc<MapCompletion>,
+        work: Box<ExtraWork>,
+        lifetime: Arc<ExtraLifetime>,
+    },
     Final {
         completion: Arc<MapCompletion>,
     },
@@ -649,6 +679,8 @@ impl std::fmt::Debug for FramePendingFrame {
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
                     VarDctPendingStage::HfGlobal { .. } => "hf-global",
                     VarDctPendingStage::RawHfDequant { .. } => "raw-hf-dequant",
+                    VarDctPendingStage::AcExtra { .. } => "ac-extra",
+                    VarDctPendingStage::ModularExtra { .. } => "modular-extra",
                     VarDctPendingStage::Final { .. } => "final",
                 },
             )
@@ -665,12 +697,7 @@ impl FramePendingFrame {
     pub(crate) fn progressive_dc_planes(
         &self,
     ) -> Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
-        if matches!(
-            self.stage,
-            VarDctPendingStage::LocalLf { .. }
-                | VarDctPendingStage::HfGlobal { .. }
-                | VarDctPendingStage::RawHfDequant { .. }
-        ) {
+        if !self.dependency_submission_ready() {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted);
         }
         let lifetime = self
@@ -691,12 +718,7 @@ impl FramePendingFrame {
 
     /// Same-queue, budget-tracked access before packet/artifact status becomes authoritative.
     pub fn unvalidated_gpu_frame(&self) -> DecodeResult<UnvalidatedGpuImageFrame> {
-        if matches!(
-            self.stage,
-            VarDctPendingStage::LocalLf { .. }
-                | VarDctPendingStage::HfGlobal { .. }
-                | VarDctPendingStage::RawHfDequant { .. }
-        ) {
+        if !self.dependency_submission_ready() {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted.into());
         }
         let lifetime = self
@@ -718,6 +740,8 @@ impl FramePendingFrame {
             VarDctPendingStage::LocalLf { completion, .. }
             | VarDctPendingStage::HfGlobal { completion, .. }
             | VarDctPendingStage::RawHfDequant { completion, .. }
+            | VarDctPendingStage::AcExtra { completion, .. }
+            | VarDctPendingStage::ModularExtra { completion, .. }
             | VarDctPendingStage::Final { completion } => Arc::clone(completion),
         }
     }
@@ -756,6 +780,12 @@ impl FramePendingFrame {
                     permit,
                 },
             ),
+            VarDctPendingStage::AcExtra { source, .. } => {
+                Some(VarDctPendingContinuation::AcExtra { source })
+            }
+            VarDctPendingStage::ModularExtra { work, lifetime, .. } => {
+                Some(VarDctPendingContinuation::ModularExtra { work, lifetime })
+            }
             final_stage @ VarDctPendingStage::Final { .. } => {
                 self.stage = final_stage;
                 None
@@ -780,6 +810,14 @@ impl FramePendingFrame {
                 permit,
             }) => {
                 self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)?;
+                Ok(true)
+            }
+            Some(VarDctPendingContinuation::AcExtra { source }) => {
+                self.finish_ac_extra(mapping, source)?;
+                Ok(true)
+            }
+            Some(VarDctPendingContinuation::ModularExtra { work, lifetime }) => {
+                self.finish_extra_subimage(mapping, work, lifetime)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -864,6 +902,28 @@ impl FramePendingFrame {
         lifetime.status_staging.unmap();
         lifetime.status_mapped.store(false, Ordering::Release);
 
+        if source
+            .packet
+            .extra_channels
+            .as_ref()
+            .is_some_and(|plan| plan.has_lf())
+        {
+            self.start_lf_extras(source, post_lf, cursors)
+        } else {
+            self.submit_hf_from_cursors(source, post_lf, cursors)
+        }
+    }
+
+    fn submit_hf_from_cursors(
+        &mut self,
+        source: Box<VarDctSource>,
+        post_lf: PostLfCommands,
+        cursors: Vec<u32>,
+    ) -> DecodeResult<()> {
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
         let continuations = source
             .packet
             .groups
@@ -1216,7 +1276,7 @@ impl FramePendingFrame {
                 commands: Some(commands),
             }
         } else {
-            VarDctPendingStage::Final { completion }
+            self.after_coefficients_stage(completion, source)
         };
         Ok(())
     }
@@ -1742,11 +1802,7 @@ impl FramePendingFrame {
             }
             .into());
         }
-        self.expected_hf_group_indices = plan
-            .groups
-            .iter()
-            .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
-            .collect();
+        self.expected_hf = HfValidation::plan(&source, &plan).map_err(map_extra_error)?;
         {
             let mut retained = lock_unpoisoned(&lifetime._hf_coefficients);
             if retained.is_some() {
@@ -1852,7 +1908,7 @@ impl FramePendingFrame {
                 "VarDCT deferred HF GPU poll registration failed: {error}"
             )));
         }
-        self.stage = VarDctPendingStage::Final { completion };
+        self.stage = self.after_coefficients_stage(completion, source);
         Ok(())
     }
 
@@ -1968,18 +2024,14 @@ impl FramePendingFrame {
             .map_err(|_| VarDctDecodeError::StatusAbi {
             status: "HF coefficient",
         })?;
-        if hf_statuses.len() != self.expected_hf_group_indices.len() {
+        if hf_statuses.len() != self.expected_hf.len() {
             return Err(VarDctDecodeError::StatusAbi {
                 status: "HF coefficient count",
             }
             .into());
         }
-        for (&group, status) in self
-            .expected_hf_group_indices
-            .iter()
-            .zip(hf_statuses.iter().copied())
-        {
-            status.validate(group).map_err(VarDctDecodeError::from)?;
+        for (expected, status) in self.expected_hf.iter().zip(hf_statuses.iter().copied()) {
+            expected.validate(status)?;
         }
         if matches!(lifetime._output_scratch, FrameOutputScratch::Extra { .. }) {
             crate::modular_scalar_output::ModularScalarOutputScratch::validate_status(
@@ -2022,30 +2074,17 @@ impl FramePendingFrame {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl GpuPendingFrame for FramePendingFrame {
     type Frame = GpuImageFrame;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
         loop {
             let mapping = self.stage_completion().wait();
-            match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
-                    self.submit_hf_stage(mapping, source, commands)?;
-                }
-                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
-                    self.submit_hf_global_stage(mapping, source, commands)?;
-                }
-                Some(VarDctPendingContinuation::RawHfDequant {
-                    source,
-                    commands,
-                    job,
-                    permit,
-                }) => {
-                    self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)?;
-                }
-                None => return self.finish(mapping),
+            if self.dependency_submission_ready() {
+                return self.finish(mapping);
             }
+            self.advance_staged_packet(mapping)?;
         }
     }
 
@@ -2053,83 +2092,21 @@ impl GpuPendingFrame for FramePendingFrame {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
-        loop {
-            if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
-                return Poll::Ready(Err(DecodeError::backend(error)));
-            }
-            let Some(mapping) = self.stage_completion().poll(context) else {
-                return Poll::Pending;
-            };
-            match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
-                    if let Err(error) = self.submit_hf_stage(mapping, source, commands) {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
-                    if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                Some(VarDctPendingContinuation::RawHfDequant {
-                    source,
-                    commands,
-                    job,
-                    permit,
-                }) => {
-                    if let Err(error) =
-                        self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)
-                    {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                None => return Poll::Ready(self.finish(mapping)),
-            }
+        if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
+            return Poll::Ready(Err(DecodeError::backend(error)));
         }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl GpuPendingFrame for FramePendingFrame {
-    type Frame = GpuImageFrame;
-
-    fn poll_complete(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<DecodeResult<SubmittedGpuFrame<Self::Frame>>> {
-        loop {
-            if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
-                return Poll::Ready(Err(DecodeError::backend(error)));
-            }
-            let Some(mapping) = self.stage_completion().poll(context) else {
-                return Poll::Pending;
-            };
-            match self.take_staged_packet() {
-                Some(VarDctPendingContinuation::LocalLf { source, commands }) => {
-                    if let Err(error) = self.submit_hf_stage(mapping, source, commands) {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                Some(VarDctPendingContinuation::HfGlobal { source, commands }) => {
-                    if let Err(error) = self.submit_hf_global_stage(mapping, source, commands) {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                Some(VarDctPendingContinuation::RawHfDequant {
-                    source,
-                    commands,
-                    job,
-                    permit,
-                }) => {
-                    if let Err(error) =
-                        self.finish_raw_hf_dequant_stage(mapping, source, commands, job, permit)
-                    {
-                        return Poll::Ready(Err(error));
-                    }
-                }
-                None => return Poll::Ready(self.finish(mapping)),
-            }
+        let Some(mapping) = self.stage_completion().poll(context) else {
+            return Poll::Pending;
+        };
+        if self.dependency_submission_ready() {
+            return Poll::Ready(self.finish(mapping));
         }
+        if let Err(error) = self.advance_staged_packet(mapping) {
+            return Poll::Ready(Err(error));
+        }
+        // Yield at every descriptor boundary so cancellation stays responsive in browsers.
+        context.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -2298,6 +2275,8 @@ fn submit_vardct(
             mapped_at_creation: false,
         })
     };
+    let extra_frame =
+        extra::prepare_frame_arena(backend, &mut source, permits.extra).map_err(map_extra_error)?;
     let packet_stream_window_bytes = source
         .lf_packet_windows
         .as_ref()
@@ -2566,6 +2545,23 @@ fn submit_vardct(
     let mut packet_commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("jxl-wgpu bounded VarDCT packet stage"),
     });
+    if let (Some(plan), Some(prefix), Some(arena)) = (
+        source.packet.extra_channels.as_ref(),
+        source.global_extra_prefix.as_ref(),
+        extra_frame.as_ref(),
+    ) {
+        crate::modular_assembly::encode_plane_copies(
+            &mut packet_commands,
+            prefix.as_wgpu_buffer(),
+            arena.as_wgpu_buffer(),
+            0,
+            plan.global_targets()
+                .iter()
+                .copied()
+                .map(|layout| (layout, layout)),
+        )
+        .map_err(map_extra_error)?;
+    }
     if let Some(lf_temporary) = &lf_temporary {
         packet_commands.clear_buffer(lf_temporary, 0, None);
     }
@@ -3117,6 +3113,31 @@ fn submit_vardct(
             }
         }
     }
+    let mut extra_coefficient_commands = extra_frame.as_ref().map(|_| {
+        std::mem::replace(
+            &mut commands,
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu assembled extra channels and frame output"),
+            }),
+        )
+    });
+    let extra_uniforms = if let (Some(plan), Some(arena)) =
+        (source.packet.extra_channels.as_ref(), extra_frame.as_ref())
+    {
+        pipelines
+            .raw_hf_dequant
+            .modular()
+            .encode_inverse(
+                backend,
+                &mut commands,
+                arena.as_wgpu_buffer(),
+                &plan.inverse,
+                plan.wp_header,
+            )
+            .map_err(map_extra_error)?
+    } else {
+        Vec::new()
+    };
     let padded_width = blocks_x
         .checked_mul(8)
         .ok_or(VarDctDecodeError::ArithmeticOverflow {
@@ -3470,6 +3491,9 @@ fn submit_vardct(
         for group in &buffers.groups {
             let status_bytes = group.status.size();
             commands.copy_buffer_to_buffer(&group.status, 0, &status_staging, offset, status_bytes);
+            if let Some(ac) = &mut extra_coefficient_commands {
+                ac.copy_buffer_to_buffer(&group.status, 0, &status_staging, offset, status_bytes);
+            }
             offset =
                 offset
                     .checked_add(status_bytes)
@@ -3484,7 +3508,9 @@ fn submit_vardct(
     }
     output_scratch.copy_status(&mut commands, &status_staging);
 
-    let after_coefficients = commands.finish();
+    let mut after_coefficients = commands.finish();
+    let extra_output_commands = extra_coefficient_commands
+        .map(|ac| std::mem::replace(&mut after_coefficients, ac.finish()));
     let (downstream_commands, mut deferred_commands) =
         if let Some(before_coefficients) = deferred_before_coefficients {
             debug_assert!(windowed_before_coefficients.is_none());
@@ -3524,6 +3550,9 @@ fn submit_vardct(
         _progressive_dc_uniform: progressive_dc_uniform,
         _external_lf: external_lf,
         _extra_plane: source.extra_plane.take(),
+        extra_frame,
+        _extra_prefix: source.global_extra_prefix.take(),
+        _extra_uniforms: extra_uniforms,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
         _post_transform: post_transform_buffers,
@@ -3572,12 +3601,13 @@ fn submit_vardct(
             expected_extra_precision: group.extra_precision,
         });
     }
-    let expected_hf_group_indices = source
+    let expected_hf = source
         .hf_coefficients
-        .iter()
-        .flat_map(|plan| &plan.groups)
-        .flat_map(HfCoefficientGroupExecutionPlan::global_group_indices)
-        .collect();
+        .as_ref()
+        .map(|plan| HfValidation::plan(&source, plan))
+        .transpose()
+        .map_err(map_extra_error)?
+        .unwrap_or_default();
     let layout = source.layout.clone();
     let frame_name = source.frame_name.clone();
     let progressive_dc_extent = Extent2d {
@@ -3597,7 +3627,8 @@ fn submit_vardct(
         layout,
         frame_name,
         expected_groups,
-        expected_hf_group_indices,
+        expected_hf,
+        extra_output_commands,
         deferred_hf_global: staged_hf_global,
         progressive_dc_extent,
         progressive_dc_stride: padded_width,
@@ -3697,7 +3728,7 @@ fn submit_vardct(
             commands: Some(commands),
         }
     } else {
-        VarDctPendingStage::Final { completion }
+        pending.after_coefficients_stage(completion, Box::new(source))
     };
     Ok(pending)
 }

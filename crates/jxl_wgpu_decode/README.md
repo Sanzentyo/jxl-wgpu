@@ -423,7 +423,7 @@ The public VarDCT producer now executes global Modular extras as an initial GPU 
 independent LF-global section. Only then is the frame allocation/dispatch plan constructed.
 The first unassociated alpha plane stays in its original signed integer arena through the final
 color submission; the packer uses its own bit depth and applies orientation without a plane copy.
-`GpuOutputRequest::with_extra_channel` can instead select any declared global extra plane as
+`GpuOutputRequest::with_extra_channel` can instead select any declared extra plane as
 native unsigned or normalized scalar F32 output, including non-alpha and multiple-alpha images.
 The complete LF/HF/AC stream still validates before delivery. Color inverse transforms,
 restoration, resampling and resident color image buffers are omitted from that frame plan.
@@ -461,15 +461,15 @@ The scalar tail reserves a 64-byte uniform, a four-byte range status and four mo
 existing aggregate status map. It adds no submission or pixel readback. All 32 planes in the seven
 public fixtures have exact native and dual-oracle F32 coverage under whole and bounded input;
 corrupting a later AC section still fails the scalar request after the global stream succeeds.
-Public LF/AC-group-distributed extras, associated alpha, and
-shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
+Associated alpha and shifted/resampled/float samples remain gaps. Raw matrix side images still need window continuation.
 
-For LF/AC integration, Modular headers and transform topology now parse separately from MA and
+For LF/AC distribution, Modular headers and transform topology now parse separately from MA and
 image entropy. Global ownership is a leading channel prefix; an empty global subimage has no local
 MA/entropy descriptor. The shared group planner clips transformed channels into LF/pass regions
-and validates progressive brackets, including boundaries on the final pass that must preserve all remaining resolutions. Five distributed libjxl fixtures assert that every coded
-sample belongs to exactly one global, LF or pass subimage. Public admission still reports
-`DistributedModularExtras`, before attempting to parse nonexistent global entropy.
+and validates progressive brackets, including final-pass boundaries that preserve all remaining
+resolutions. Five distributed libjxl fixtures assert that every coded
+sample belongs to exactly one global, LF or pass subimage. An empty global prefix proceeds directly
+to frame preparation; nonempty prefixes retain their transformed samples for later assembly.
 
 The low-level `HfCoefficientExecutionPlan::set_stream_end` selects `Packet` or `Continuation` per
 logical pass group and updates every bounded-window parameter. Packet mode retains exact
@@ -479,7 +479,27 @@ checks the result against host-owned group identity and packet bounds. Callers m
 validate the following stream before delivering a frame. Actual-GPU tests hand all eight bit
 alignments from zero-bit Prefix, nontrivial Prefix and ANS AC into a following Modular image,
 check its resident samples and cursor, and reject truncated/corrupt ANS endings. This boundary
-API does not yet connect distributed extras to the public VarDCT frame scheduler.
+API now drives the public frame scheduler. LF cursors first resume any Modular LF subimage,
+then the HF metadata parser. AC groups with nonempty extra subimages use continuation mode;
+empty ones retain exact packet validation. Each subimage parses bounded local metadata, performs
+GPU entropy and local inverses, and copies only its clipped rows into the frame arena. AC-side
+Modular completion additionally checks terminal padding. After every group validates, the global
+inverse runs once before the existing color/alpha or scalar output tail.
+
+The frame memory plan includes `extra_arena_bytes` and `extra_inverse_uniform_bytes`. Each
+subimage reserves its stream, metadata, predictor/LZ77 workspace and local inverse buffers only
+when its descriptor becomes known; the shared live-budget counter includes those dynamic bytes.
+A mapped completion retains both the subimage reservation and the frame arena through cancellation.
+Every async poll yields at a stage boundary, and no unvalidated output is available before the
+final frame tail is submitted. Resource exhaustion after decoding starts remains terminal.
+
+The five distributed fixtures cover all 13 extra planes as exact native unsigned codes and
+normalized F32, plus color and first alpha against Rust `jxl` and libjxl. Tests use whole blocking
+input and 347-byte fragmented async input with 1024-byte entropy windows, including the
+2051×259 LF/pass Squeeze case. Additional tests cancel a 128-byte window, retry initial admission,
+reject a budget exhausted by the base frame, and reject corrupted extra entropy for both outputs.
+A one-symbol code-length alphabet in the tiny second LF group also exposed and fixed a shared
+Huffman descriptor bug; lengths 1–15 and all applicable skip forms have regression coverage.
 
 A valid UTF-8 frame name is preserved in authoritative `FrameMetadata`; invalid bytes return a
 typed error. Container/codestream parsing is capped at 16 MiB and 32 boxes before any fragmented
@@ -661,7 +681,7 @@ This is not full VarDCT coverage. Explicitly published
 progressive intermediates, local-tree raw-matrix conformance, subsampled adaptive LF and
 valid-codestream restoration conformance, uncommon asymmetric JPEG component layouts and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping and float/greater-than-16-bit source metadata,
-distributed extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+shifted/resampled extra-channel output and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

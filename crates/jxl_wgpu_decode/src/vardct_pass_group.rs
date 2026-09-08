@@ -354,7 +354,18 @@ impl HfCoefficientExecutionPlan {
                         spatial_group_index: (local_y / packet.profile.group_dimension)
                             * blocks_per_row.div_ceil(packet.profile.group_dimension / 8)
                             + local_x / packet.profile.group_dimension,
-                        stream_end: HfCoefficientStreamEnd::Packet as u32,
+                        stream_end: packet
+                            .extra_channels
+                            .as_ref()
+                            .map(|extras| {
+                                extras.ac_stream_end(
+                                    &packet.profile,
+                                    pass_index,
+                                    global_group_index,
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or_default() as u32,
                         channel_shifts: packet.profile.channel_shifts.into_iter().enumerate().fold(
                             0u32,
                             |packed, (channel, shift)| {

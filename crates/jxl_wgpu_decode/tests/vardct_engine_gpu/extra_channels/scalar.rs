@@ -3,7 +3,7 @@ use jxl_gpu_formats::{Channel, SampleKind};
 use jxl_wgpu_decode::NumericSampleMapping;
 use jxl_wgpu_encode::LosslessModularFormat;
 
-fn scalar_request(index: u32, bits: u8, floating: bool) -> GpuOutputRequest {
+pub(super) fn scalar_request(index: u32, bits: u8, floating: bool) -> GpuOutputRequest {
     let (format, mapping) = if floating {
         (
             PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
