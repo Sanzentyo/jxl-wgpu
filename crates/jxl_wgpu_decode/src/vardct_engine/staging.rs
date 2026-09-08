@@ -75,6 +75,7 @@ struct GlobalSource {
     memory: VarDctGlobalModularMemoryStats,
     stream: ModularSideImageStreamPlan,
     next_window: usize,
+    external_lf: Option<ProgressiveDcXybPlanes>,
 }
 
 enum PreparedStage {
@@ -193,6 +194,7 @@ impl VarDctDecodeSession {
                 memory: global_memory,
                 stream,
                 next_window: 1,
+                external_lf: None,
             }))),
         };
         Ok(PreparedGpuSession::new(decode_profile, metadata, session)
@@ -233,6 +235,11 @@ impl VarDctDecodeSession {
     ) -> std::result::Result<(), VarDctDecodeError> {
         match self.prepared.as_mut() {
             Some(PreparedStage::Frame(session)) => session.set_progressive_dc_source(planes),
+            Some(PreparedStage::Global(source)) if source.packet.profile().uses_lf_frame => {
+                planes.validate_extent(source.packet.profile().block_extent())?;
+                source.external_lf = Some(planes);
+                Ok(())
+            }
             _ => Err(VarDctDecodeError::UnexpectedProgressiveDcSource),
         }
     }
@@ -478,6 +485,7 @@ impl VarDctPendingFrame {
         let extra_planes = super::output::selected_extra_indices(
             &source.request,
             &source.inventory.image_header.extra_channels,
+            source.packet.profile(),
         )
         .into_iter()
         .filter(|_| !distributed)
@@ -518,6 +526,9 @@ impl VarDctPendingFrame {
         )?;
         frame.extra_planes = extra_planes;
         frame.global_extra_prefix = global_extra_prefix;
+        // These leases already own the producer's reservations. Move them across all global
+        // cursor continuations without another allocation or reservation.
+        frame.external_lf = source.external_lf;
         *self
             .frame_memory
             .lock()

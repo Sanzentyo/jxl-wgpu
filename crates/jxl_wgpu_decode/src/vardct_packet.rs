@@ -40,6 +40,10 @@ pub(crate) const WEIGHTED_PACKET_EXECUTION_STATE_BYTES: u64 = 128;
 /// A standard feature excluded from the deliberately bounded VarDCT packet profile.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnsupportedVarDctPacketFeature {
+    #[error(
+        "LF-frame consumers with extra-channel entropy in LF groups need a preceding GPU cursor stage"
+    )]
+    LfFrameWithLfGroupExtras,
     #[error("the combined one-entry VarDCT packet cannot address multiple LF groups")]
     CombinedPacketMultipleLfGroups,
     #[error(
@@ -60,8 +64,6 @@ pub enum UnsupportedVarDctPacketFeature {
 pub enum BoundedVarDctPacketError {
     #[error("global Modular image entropy requires GPU cursor continuation before LF parsing")]
     GlobalModularRequiresGpu,
-    #[error("VarDCT extra-channel resampling and LF-frame reuse are not yet connected")]
-    GlobalModularGeometry,
     #[error("global Modular entropy leaves non-padding data in LF-global")]
     GlobalModularTrailingBits,
     #[error(transparent)]
@@ -907,9 +909,6 @@ impl BoundedVarDctPacketPlan {
                 .map(|packet| VarDctPacketPreparation::Ready(Box::new(packet)));
         }
         let profile = &prefix.profile;
-        if profile.lf_level != 0 || profile.uses_lf_frame {
-            return Err(BoundedVarDctPacketError::GlobalModularGeometry);
-        }
         let topology = crate::modular_geometry::source_topology(
             &inventory.image_header,
             &inventory.frames[0],
@@ -932,6 +931,9 @@ impl BoundedVarDctPacketPlan {
                 &inventory.frames[0].progressive_passes,
             )
             .map_err(|error| BoundedVarDctPacketError::ModularTree(error.to_string()))?;
+            if profile.uses_lf_frame && extras.has_lf() {
+                return Err(UnsupportedVarDctPacketFeature::LfFrameWithLfGroupExtras.into());
+            }
             let image = extras
                 .parse_global(
                     &mut reader,
@@ -975,17 +977,7 @@ impl BoundedVarDctPacketPlan {
 
     #[must_use]
     pub fn block_extent(&self) -> [u32; 2] {
-        let [horizontal_shift, vertical_shift] = self.profile.jpeg_block_alignment;
-        let horizontal_alignment = 1u32 << horizontal_shift;
-        let vertical_alignment = 1u32 << vertical_shift;
-        [
-            self.profile
-                .width
-                .div_ceil(8)
-                .div_ceil(horizontal_alignment)
-                * horizontal_alignment,
-            self.profile.height.div_ceil(8).div_ceil(vertical_alignment) * vertical_alignment,
-        ]
+        self.profile.block_extent()
     }
 
     pub fn total_task_capacity(&self) -> Result<u32, BoundedVarDctPacketError> {

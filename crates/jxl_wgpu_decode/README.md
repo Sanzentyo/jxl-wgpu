@@ -556,6 +556,13 @@ checks LF flags, levels, exact slot versions and sample/block extents before sub
 into a `GpuBufferLease` without readmission. Both Modular and VarDCT LF capture retain the final
 pre-color-transform planes after restoration and frame upsampling, with that output geometry and
 stride. Modular reuses the presentation reconstruction implementation and skips RGB conversion.
+Both producer modes validate additional channels while retaining only XYB. LF-consuming VarDCT
+frames can first decode global Modular extras through bounded GPU cursor stages, preserving the
+source planes and their existing reservations until the final consumer submission. Six independent
+alpha/depth fixtures cover both LF roots, optional Gaborish, and LF2→LF1→presentation chains; RGB,
+alpha and depth agree with libjxl and Rust `jxl` through whole and fragmented async decoding.
+LF consumers whose extra-channel entropy resides in LF groups still return the typed
+`LfFrameWithLfGroupExtras` unsupported feature before entropy submission.
 Its default/custom Gaborish, EPF1/2/3, custom sigma, and 2×/4×/8× LF variants match both independent
 decoders. `modular_render_bytes` includes the full reconstruction footprint; LF plane/uniform
 counters are subsets of that total. Final planes retain their exact byte permits while intermediate

@@ -336,8 +336,11 @@ pub(super) fn prepare_packet_source(
             &compact,
         )?)
     };
-    let extra_indices =
-        super::output::selected_extra_indices(request, &inventory.image_header.extra_channels);
+    let extra_indices = super::output::selected_extra_indices(
+        request,
+        &inventory.image_header.extra_channels,
+        &packet.profile,
+    );
     let extra_render = (!extra_indices.is_empty()
         && (surface.is_some()
             || extra_indices

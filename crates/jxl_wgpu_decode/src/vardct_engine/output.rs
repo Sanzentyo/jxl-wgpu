@@ -169,7 +169,11 @@ pub(super) fn prepare_presentation(
         extent: Extent2d::new(profile.output_width, profile.output_height),
         orientation,
         transform: output_transform,
-        alpha_conversion: request.alpha_conversion(&inventory.image_header.extra_channels),
+        alpha_conversion: if profile.lf_level != 0 {
+            jxl_wgpu::AlphaConversion::Preserve
+        } else {
+            request.alpha_conversion(&inventory.image_header.extra_channels)
+        },
     };
     let surface = request
         .retains_frame_surface()
@@ -204,7 +208,12 @@ pub(super) fn prepare_presentation(
 pub(super) fn selected_extra_indices(
     request: &GpuOutputRequest,
     extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
+    profile: &crate::vardct_frontend::StandardVarDctProfile,
 ) -> Vec<usize> {
+    // All LF extras must be decoded and validated, but only XYB feeds subsequent LF consumers.
+    if profile.lf_level != 0 {
+        return Vec::new();
+    }
     if request.retains_frame_surface() {
         return (0..extras.len()).collect();
     }

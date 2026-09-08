@@ -974,6 +974,17 @@ pub struct VarDctGroupRect {
 }
 
 impl StandardVarDctProfile {
+    /// LF dependency geometry, available before a global Modular GPU cursor is resolved.
+    pub(crate) fn block_extent(&self) -> [u32; 2] {
+        let [horizontal_shift, vertical_shift] = self.jpeg_block_alignment;
+        let horizontal_alignment = 1u32 << horizontal_shift;
+        let vertical_alignment = 1u32 << vertical_shift;
+        [
+            self.width.div_ceil(8).div_ceil(horizontal_alignment) * horizontal_alignment,
+            self.height.div_ceil(8).div_ceil(vertical_alignment) * vertical_alignment,
+        ]
+    }
+
     /// Original channel precision declared by the image header, independent of XYB working data.
     pub const fn bits_per_sample(&self) -> u32 {
         match self.sample_bit_depth {

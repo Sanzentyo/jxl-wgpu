@@ -77,7 +77,7 @@ fn rust_planes(encoded: &[u8], apply: bool) -> (Vec<f32>, Vec<Vec<f32>>) {
 }
 
 #[path = "../common/extra_channel_oracle.rs"]
-mod extra_channel_oracle;
+pub(super) mod extra_channel_oracle;
 use extra_channel_oracle::{floats, libjxl_planes};
 
 #[test]

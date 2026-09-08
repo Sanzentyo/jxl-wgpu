@@ -83,19 +83,7 @@ impl FrameDecodeSession {
         if !source.packet.profile.uses_lf_frame {
             return Err(VarDctDecodeError::UnexpectedProgressiveDcSource);
         }
-        let [expected_width, expected_height] = source.packet.block_extent();
-        for (plane, actual) in planes.planes.iter().enumerate() {
-            if actual.width != expected_width || actual.height != expected_height {
-                return Err(ProgressiveDcGpuError::PlaneExtent {
-                    plane,
-                    actual_width: actual.width,
-                    actual_height: actual.height,
-                    expected_width,
-                    expected_height,
-                }
-                .into());
-            }
-        }
+        planes.validate_extent(source.packet.block_extent())?;
         source.external_lf = Some(planes);
         Ok(())
     }

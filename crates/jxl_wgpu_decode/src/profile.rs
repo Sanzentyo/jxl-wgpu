@@ -181,6 +181,14 @@ fn validate_image_header(
         )
         .into());
     }
+    validate_extra_channels(image, channels)?;
+    Ok(orientation)
+}
+
+fn validate_extra_channels(
+    image: &ImageHeaderInventory,
+    channels: ModularChannelCounts,
+) -> Result<()> {
     if image.extra_channels.len() != channels.extra_count() as usize
         || image.extra_channel_count != channels.extra_count()
         || image.extra_channels.iter().any(|extra| {
@@ -192,7 +200,7 @@ fn validate_image_header(
             "Modular extra channels require supported integer or floating samples and dimension shifts at most three",
         ).into());
     }
-    Ok(orientation)
+    Ok(())
 }
 
 /// Lowers validated still-image metadata and bounded Modular entropy/transform descriptors.
@@ -263,11 +271,12 @@ fn parse_modular_profile(
             validate_image_header(image, channels)?
         }
         ModularProfilePurpose::ProgressiveDc => {
-            if !image.xyb_encoded || channels != ModularChannels::Rgb.into() {
+            if !image.xyb_encoded || channels.color_count() != 3 {
                 return unsupported(
                     "a progressive-DC Modular producer requires three XYB color channels",
                 );
             }
+            validate_extra_channels(image, channels)?;
             OutputOrientation::Identity
         }
     };

@@ -9,6 +9,8 @@ mod composition;
 mod independent;
 #[path = "frame_sequence/lf.rs"]
 mod lf;
+#[path = "frame_sequence/lf_extra.rs"]
+mod lf_extra;
 #[path = "frame_sequence/reference.rs"]
 mod reference;
 

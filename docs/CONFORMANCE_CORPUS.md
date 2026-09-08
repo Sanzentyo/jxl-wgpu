@@ -935,6 +935,50 @@ all shared input/GPU reservations return to zero. The independent allocation tes
 that each of 32 reconstruction configurations retains exactly three 37×17 F32 allocations after
 producer scratch is dropped, including odd/even restoration passes and all upsampling factors.
 
+`lf_extra_channels/` contains six independent 65×33 XYB streams with 8-bit alpha and depth.
+The libjxl 0.12.0 public encoder disables progressive DC whenever extras exist. The offline
+generator therefore encodes ordinary 65×33 VarDCT and 9×5/2×1 Modular/VarDCT images, all with
+distance 1, effort 7, no restoration, no resampling, and lossless extras. It replaces physical
+headers and removes only the LF coefficient substream in LF-consuming frames. All other entropy
+is preserved. Rust `jxl-frame`/`jxl-vardct` find exact decoded boundaries and assert empty HF LF
+thresholds, so removing LF coefficients cannot change HF entropy contexts. libjxl then accepts
+each assembled stream and independently renders RGBA plus both extra planes as binary32.
+The public decoder does no CPU entropy or pixel reconstruction.
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- /tmp/lf_extra_channels
+diff -ru crates/jxl_wgpu_decode/test-data/lf_extra_channels /tmp/lf_extra_channels
+```
+
+| LF-extra stream | Binary bytes | SHA-256 |
+|---|---:|---|
+| `modular_gab0.jxl.hex` | 2742 | `5516428e038ec17c31ec78532038a82867a05d776152a544d4aef6fc462310d0` |
+| `modular_gab1.jxl.hex` | 2742 | `601493f534ac63e435074116d24fc0d701e9ac69aa6c752d6b950f031d0fc44d` |
+| `vardct_gab0.jxl.hex` | 2794 | `c0026b10b469812dae72721e7833288c276172d712fbe744fafc147d5a81f50f` |
+| `vardct_gab1.jxl.hex` | 2794 | `a1ab69ea8b956eaba2e67e90bec6a9cdb140e9a67d57677629c8b91018daacdf` |
+| `nested_modular_gab1.jxl.hex` | 2822 | `2ba8e21885a18716c606dca8f40eb160292a49031b8b6979c27e0cd6998c9bf2` |
+| `nested_vardct_gab1.jxl.hex` | 2848 | `fa79341168e3161325ef8470e641f777c2e7a4dbaac28ba9ed064513e82e3c80` |
+
+Direct variants use LF1→presentation; nested variants use LF2→LF1→presentation and enable
+default Gaborish in both LF stages. The 8-bit source planes are R=`13*x+7*y`,
+G=`(3*x) XOR (11*y)`, B=`5*x+17*y`, alpha=`11*x+17*y`, and depth=`31*x+3*y`, modulo 256.
+`frame_sequence/lf_extra.rs` compares every final plane with the checked binary32 reference and
+Rust `jxl`, with absolute error at most `5e-4`. Whole blocking and 256-byte fragmented async
+paths agree; the latter must execute more submissions. Optional live libjxl also checks the
+stored references within `2e-6`. Truncating the last global extra's entropy in an overwritten LF
+root or in the consumer rebuilds valid TOC sizes, then fails specifically in GPU entropy
+validation even when that channel is unselected. Cancellation at early, middle and late stages
+with 128-byte windows releases every GPU and incremental-input reservation after callbacks.
+The corpus covers global extras; LF-consumer extras distributed into LF groups remain a typed
+unsupported feature requiring a separate pre-HF cursor stage.
+
+LF-extra checkpoint on 2026-09-08 Apple M5/Metal: 733 workspace tests pass across 32 targets,
+with one existing manual benchmark ignored. This includes all 55 VarDCT and 56 common/Modular
+GPU tests, the three new LF-extra tests, and all 60 encoder tests. Formatting, workspace check,
+warning-free Clippy/rustdoc, Rust 1.89 and the six-crate WASM check pass. Reference and Metal
+harnesses each pass 18 cases; indexed Gray8 U8 readback passes. All six streams and their native
+references regenerate byte-for-byte. Full JPEG XL and the remaining roadmap gates stay active.
+
 Modular LF reconstruction checkpoint on 2026-09-08 Apple M5/Metal: all 730 workspace tests pass
 across 31 targets, with one existing manual benchmark ignored. All six LF tests, the 32-case
 allocation check, and the existing lossy Modular presentation corpus pass. Formatting, workspace

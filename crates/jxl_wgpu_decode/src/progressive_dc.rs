@@ -48,6 +48,24 @@ pub(crate) struct ProgressiveDcXybPlanes {
 }
 
 impl ProgressiveDcXybPlanes {
+    pub(crate) fn validate_extent(
+        &self,
+        [expected_width, expected_height]: [u32; 2],
+    ) -> Result<(), ProgressiveDcGpuError> {
+        for (plane, actual) in self.planes.iter().enumerate() {
+            if actual.width != expected_width || actual.height != expected_height {
+                return Err(ProgressiveDcGpuError::PlaneExtent {
+                    plane,
+                    actual_width: actual.width,
+                    actual_height: actual.height,
+                    expected_width,
+                    expected_height,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Wraps three already-created storage buffers in the owned XYB representation.
     ///
     /// Buffer usage, range, and device-limit checks are deferred to [`ProgressiveDcPipeline`] so

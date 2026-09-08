@@ -32,6 +32,14 @@ impl OutputChannels {
         profile: &StandardModularProfile,
         request: &GpuOutputRequest,
     ) -> Result<Self> {
+        // LF dependencies retain only pre-color-transform XYB. The full source topology still
+        // decodes and validates every extra, independent of presentation or alpha policy.
+        if profile.progressive_dc.is_some() {
+            return Ok(Self::identity(
+                ModularChannels::Rgb,
+                profile.sample_encoding,
+            ));
+        }
         if let Some(index) = request.extra_channel() {
             let extra =
                 profile

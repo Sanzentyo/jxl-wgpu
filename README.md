@@ -185,6 +185,12 @@ inverse transforms, restoration and color image buffers. Native output requires 
 codes; F32 preserves signed normalization without clipping. Integer extras also execute across
 global, LF and AC groups.
 
+LF roots in both coding modes now validate extras while retaining only reconstructed XYB planes.
+LF-consuming VarDCT frames preserve those tracked planes through global Modular cursor stages.
+Six independent alpha/depth fixtures cover direct and recursive LF chains, Gaborish, bounded
+fragmented input, ignored-extra corruption and cancellation. LF-consumer extras distributed into
+LF groups still require a separate cursor stage; full JPEG XL remains an active roadmap goal.
+
 Both decoders reconstruct extras with effective 2×/4×/8× upsampling, including image-header
 `dimension_shift`; Modular color planes also support all three factors. Selected integer planes
 normalize and interpolate on the GPU using the shared standard/custom 5×5 filter before orientation
