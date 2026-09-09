@@ -874,3 +874,28 @@ that total increase 158,376 bytes. One byte below the required capacity leaves n
 retry succeeds after release, and abandoning a submitted fragmented session releases all permits
 after completion callbacks run. All-zero models consume their 80 metadata bits but allocate no
 noise resources.
+
+### VarDCT intermediate pass outputs
+
+HF coefficient plans retain the 160-byte parameter and 32-byte status ABI. Each LF group keeps
+flat, pass-major parameters with original status indices, global logical IDs, LZ77 bases and
+464-byte resume-state offsets. Per-pass parameter slices and stream plans only change dispatch
+boundaries: all LF groups complete one pass before rendering or starting its successor. Bounded
+segments rebase their local lane through that pass's parameter range, never through another pass.
+
+`intermediate_output_bytes` adds one independently leased packed output per requested non-final
+AC pass. `intermediate_transient_bytes` adds each stage's inverse-transform scratch, interpolation
+and restoration uniforms, frame-resampling weights, noise buffer/uniform, output uniform and full
+validation map. Coefficients, LF/HF artifacts, resources, sigma and planar render destinations are
+shared; reconstruction overwrites these before each subsequent render. No returned image aliases
+those mutable destinations. Both totals participate in adaptive stream admission before source
+consumption, and each snapshot has its own completion-poller reservation.
+
+Each pass render copies packet/artifact/HF status into its own map before any later pass writes
+status. Validation checks all metadata and only the completed logical coefficient groups. A future
+pass is neither inferred complete nor validated from a zero record. Native map callbacks retain
+the associated storage/reservations through completion, including cancellation; tests wait for
+callback retirement after the device fence. Holding a returned image retains only its output
+bytes after the cancelled or completed job retires. Logical frame-slot permits are shared across
+one pending presentation and its intermediate/final leases, while output-byte quotas remain
+independent. Fatal update errors cancel the queued pending work without invalidating prior leases.

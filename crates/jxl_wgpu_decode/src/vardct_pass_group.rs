@@ -1,6 +1,7 @@
 //! Bounded GPU entropy decode and accumulation for VarDCT coefficient passes.
 
 use bytemuck::{Pod, Zeroable};
+use std::ops::Range;
 use thiserror::Error;
 
 use crate::entropy::EntropyStreamParams;
@@ -107,6 +108,14 @@ pub struct HfCoefficientGroupExecutionPlan {
     pub params: Vec<HfCoefficientPassParams>,
     pub sink_params: HfCoefficientSinkParams,
     pub lz77_scratch_words: u32,
+    pub(crate) passes: Vec<HfCoefficientPassExecutionPlan>,
+}
+
+/// One pass within an LF group. Parameter/status/state indices retain their original offsets;
+/// only the upload batches are confined to this pass's entropy ranges.
+#[derive(Clone, Debug)]
+pub(crate) struct HfCoefficientPassExecutionPlan {
+    pub(crate) parameter_range: Range<usize>,
     pub(crate) streams: EntropyStreamPlan,
 }
 
@@ -256,12 +265,14 @@ impl HfCoefficientExecutionPlan {
                 lf_group.reconstructed_words(packet.needs_self_correcting)?;
             let mut params = Vec::new();
             let mut stream_ranges = Vec::new();
+            let mut pass_ranges = Vec::with_capacity(entropy.passes.len());
             let mut lz77_scratch_words = 0u32;
             for (
                 pass_index,
                 (pass, &(metadata_base_words, context_map_offset_words, order_base_words)),
             ) in entropy.passes.iter().zip(&pass_tables).enumerate()
             {
+                let pass_start = params.len();
                 for (global_group_index, range) in pass.pass_groups.iter().copied().enumerate() {
                     let global_group_index = u32::try_from(global_group_index).map_err(|_| {
                         HfCoefficientPlanError::ArithmeticOverflow {
@@ -384,6 +395,7 @@ impl HfCoefficientExecutionPlan {
                         )?,
                     });
                 }
+                pass_ranges.push(pass_start..params.len());
             }
             let execution_state_base_words = lz77_scratch_base_words
                 .checked_add(lz77_scratch_words)
@@ -399,15 +411,26 @@ impl HfCoefficientExecutionPlan {
                         field: "HF execution-state offset",
                     })?;
             }
-            let streams = EntropyStreamPlan::new(
-                codestream_bytes,
-                &stream_ranges,
-                stream_limit,
-                params.len(),
-            )
-            .map_err(|error| HfCoefficientPlanError::EntropyWindow {
-                message: error.to_string(),
-            })?;
+            let passes = pass_ranges
+                .into_iter()
+                .map(|parameter_range| {
+                    let streams = EntropyStreamPlan::new(
+                        codestream_bytes,
+                        &stream_ranges[parameter_range.clone()],
+                        stream_limit,
+                        parameter_range.len(),
+                    )
+                    .map_err(|error| {
+                        HfCoefficientPlanError::EntropyWindow {
+                            message: error.to_string(),
+                        }
+                    })?;
+                    Ok(HfCoefficientPassExecutionPlan {
+                        parameter_range,
+                        streams,
+                    })
+                })
+                .collect::<Result<Vec<_>, HfCoefficientPlanError>>()?;
             groups.push(HfCoefficientGroupExecutionPlan {
                 lf_group_index: lf_group.index,
                 params,
@@ -420,7 +443,7 @@ impl HfCoefficientExecutionPlan {
                     _reserved: [0; 3],
                 },
                 lz77_scratch_words,
-                streams,
+                passes,
             });
         }
 
@@ -457,45 +480,63 @@ impl HfCoefficientExecutionPlan {
 
     #[must_use]
     pub fn uses_bounded_stream_windows(&self) -> bool {
-        self.groups.iter().any(|group| group.streams.uses_windows())
+        self.stream_plans().any(EntropyStreamPlan::uses_windows)
     }
 
     #[must_use]
     pub fn stream_window_bytes(&self) -> u64 {
-        self.groups
-            .iter()
-            .map(|group| group.streams.stream_bytes())
+        self.stream_plans()
+            .map(EntropyStreamPlan::stream_bytes)
             .max()
             .unwrap_or(0)
     }
 
     #[must_use]
     pub fn stream_batch_count(&self) -> usize {
-        self.groups
-            .iter()
-            .map(|group| group.streams.batch_count())
+        self.stream_plans()
+            .map(EntropyStreamPlan::batch_count)
             .sum()
     }
 
     #[must_use]
     pub fn reusable_params_bytes(&self) -> u64 {
-        self.groups
-            .iter()
-            .map(|group| {
-                group.streams.max_group_count() as u64
+        self.stream_plans()
+            .map(|streams| {
+                streams.max_group_count() as u64
                     * std::mem::size_of::<HfCoefficientPassParams>() as u64
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// Number of image-wide coefficient accumulation barriers.
+    #[must_use]
+    pub fn pass_count(&self) -> usize {
+        self.groups.first().map_or(0, |group| group.passes.len())
+    }
+
+    pub(crate) fn stream_plans(&self) -> impl Iterator<Item = &EntropyStreamPlan> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.passes.iter().map(|pass| &pass.streams))
     }
 }
 
 impl HfCoefficientGroupExecutionPlan {
     pub(crate) fn params_for_segment(
         &self,
+        pass_index: usize,
         segment: GroupStreamSegment,
     ) -> Option<HfCoefficientPassParams> {
-        let mut params = *self.params.get(segment.group_index)?;
+        let pass = self.passes.get(pass_index)?;
+        let index = pass
+            .parameter_range
+            .start
+            .checked_add(segment.group_index)?;
+        if index >= pass.parameter_range.end {
+            return None;
+        }
+        let mut params = *self.params.get(index)?;
         params.entropy.token_start = 0;
         params.entropy.token_end = segment.available_token_end;
         params.window_logical_start = segment.window_logical_start;

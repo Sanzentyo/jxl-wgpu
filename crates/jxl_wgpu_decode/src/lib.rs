@@ -115,9 +115,10 @@ pub use noise::NoiseModel;
 pub use progressive_dc::ProgressiveDcGpuError;
 pub use restoration::RestorationError;
 pub use session::{
-    GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder, GpuFrameLease,
-    GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame, PrefetchBackpressure,
-    PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession, SubmittedGpuFrame,
+    FrameProgression, GpuDecodeSession, GpuDecodeStream, GpuDecodeStreamStats, GpuDecoder,
+    GpuFrameLease, GpuPendingFrame, GpuSubmissionEngine, GpuSubmissionSession, NextGpuFrame,
+    NextGpuUpdate, PrefetchBackpressure, PrefetchGpuFrames, PrefetchProgress, PreparedGpuSession,
+    SubmittedGpuFrame, SubmittedGpuUpdate,
 };
 pub use vardct_engine::{
     VarDctDecodeError, VarDctDecodeMemoryStats, VarDctDecodeSession,

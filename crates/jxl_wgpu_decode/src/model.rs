@@ -351,6 +351,7 @@ pub enum GpuOutputMapping {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuOutputRequest {
     image: crate::ImageSelection,
+    progressive_output: bool,
     format: PixelFormat,
     mapping: GpuOutputMapping,
     max_frame_slots: NonZeroUsize,
@@ -493,6 +494,7 @@ impl GpuOutputRequest {
     fn from_parts(format: PixelFormat, mapping: GpuOutputMapping) -> Self {
         Self {
             image: crate::ImageSelection::Main,
+            progressive_output: false,
             format,
             mapping,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
@@ -519,6 +521,20 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn image_selection(&self) -> crate::ImageSelection {
         self.image
+    }
+
+    /// Requests intermediate images at supported, completely decoded pass boundaries. Consume
+    /// them with `GpuDecodeSession::next_update` or its async counterpart. Frames without a
+    /// supported intermediate boundary still return their final image.
+    #[must_use]
+    pub const fn with_progressive_output(mut self, enabled: bool) -> Self {
+        self.progressive_output = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn progressive_output(&self) -> bool {
+        self.progressive_output
     }
 
     #[must_use]

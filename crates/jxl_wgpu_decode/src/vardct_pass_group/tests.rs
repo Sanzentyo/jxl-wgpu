@@ -73,8 +73,7 @@ fn continuation_status_requires_host_bounds_and_the_expected_group() {
     assert_eq!(end.validate_cursor(7, 97, 143).unwrap(), 143);
 }
 
-#[test]
-fn a_pass_termination_change_reaches_every_window_without_changing_other_passes() {
+fn multilf_plan(stream_limit: u64) -> HfCoefficientExecutionPlan {
     use crate::vardct_artifact::{HfMetadataArtifactConfig, VarDctArtifactDeviceLimits};
     let digits = include_str!("../../test-data/testsrc_vardct_progressive_multilf.jxl.hex")
         .split_whitespace()
@@ -124,22 +123,32 @@ fn a_pass_termination_change_reaches_every_window_without_changing_other_passes(
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let mut plan = HfCoefficientExecutionPlan::new(
+    HfCoefficientExecutionPlan::new(
         &packet,
         packet.hf_coefficients.as_ref().unwrap(),
         &artifacts,
         parsed.codestream().len() as u64,
-        128,
+        stream_limit,
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn a_pass_termination_change_reaches_every_window_without_changing_other_passes() {
+    let mut plan = multilf_plan(128);
     assert!(plan.groups.len() > 1);
     let selected = plan.groups[0].params[0].global_group_index;
     let derived_params = |group: &HfCoefficientGroupExecutionPlan| {
         group
-            .streams
-            .batches()
-            .flat_map(|batch| batch.segments().to_vec())
-            .map(|segment| group.params_for_segment(segment).unwrap())
+            .passes
+            .iter()
+            .enumerate()
+            .flat_map(|(pass_index, pass)| {
+                pass.streams
+                    .batches()
+                    .flat_map(|batch| batch.segments().to_vec())
+                    .map(move |segment| group.params_for_segment(pass_index, segment).unwrap())
+            })
             .collect::<Vec<_>>()
     };
     assert!(
@@ -174,6 +183,76 @@ fn a_pass_termination_change_reaches_every_window_without_changing_other_passes(
             .chain(&segments)
             .all(|p| p.stream_end == 0)
     }));
+}
+
+#[test]
+fn image_wide_pass_barriers_keep_state_and_validation_offsets_in_every_window() {
+    let whole = multilf_plan(u64::MAX);
+    let windowed = multilf_plan(128);
+    assert_eq!(whole.pass_count(), 3);
+    assert_eq!(windowed.pass_count(), whole.pass_count());
+    assert!(whole.groups.len() > 1);
+    assert!(!whole.uses_bounded_stream_windows());
+    assert!(windowed.uses_bounded_stream_windows());
+    assert_eq!(whole.status_bytes(), windowed.status_bytes());
+    let spatial_groups = whole
+        .groups
+        .iter()
+        .map(|g| g.passes[0].parameter_range.len())
+        .sum::<usize>();
+    for plan in [&whole, &windowed] {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut batches = 0;
+        for pass_index in 0..plan.pass_count() {
+            let mut pass_groups = std::collections::BTreeSet::new();
+            for (lf, group) in plan.groups.iter().enumerate() {
+                let pass = &group.passes[pass_index];
+                let lane_count = group.passes[0].parameter_range.len();
+                assert_eq!(
+                    pass.parameter_range,
+                    pass_index * lane_count..(pass_index + 1) * lane_count
+                );
+                for batch in pass.streams.batches() {
+                    batches += 1;
+                    for &segment in batch.segments() {
+                        let derived = group.params_for_segment(pass_index, segment).unwrap();
+                        let original_index = pass.parameter_range.start + segment.group_index;
+                        let original = &whole.groups[lf].params[original_index];
+                        assert_eq!(
+                            derived.global_group_index as usize / spatial_groups,
+                            pass_index
+                        );
+                        assert_eq!(derived.status_index as usize, original_index);
+                        assert_eq!(derived.global_group_index, original.global_group_index);
+                        assert_eq!(
+                            derived.execution_state_base_words,
+                            original.execution_state_base_words
+                        );
+                        assert_eq!(
+                            derived.lz77_window_base_words,
+                            original.lz77_window_base_words
+                        );
+                        assert_eq!(derived.metadata_base_words, original.metadata_base_words);
+                        assert_eq!(derived.order_base_words, original.order_base_words);
+                        assert_eq!(derived.coeff_shift, original.coeff_shift);
+                        pass_groups.insert(derived.global_group_index);
+                        seen.insert(derived.global_group_index);
+                        let mut outside = segment;
+                        outside.group_index = lane_count;
+                        assert!(group.params_for_segment(pass_index, outside).is_none());
+                        assert!(
+                            group
+                                .params_for_segment(plan.pass_count(), segment)
+                                .is_none()
+                        );
+                    }
+                }
+            }
+            assert_eq!(pass_groups.len(), spatial_groups);
+        }
+        assert_eq!(seen.len(), spatial_groups * plan.pass_count());
+        assert_eq!(batches, plan.stream_batch_count());
+    }
 }
 
 fn descriptor(kind: u32) -> EntropyDecoderIr {

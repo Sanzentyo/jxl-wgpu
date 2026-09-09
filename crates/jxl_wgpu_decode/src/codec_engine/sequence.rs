@@ -88,10 +88,14 @@ impl SequenceSource {
         index: usize,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         let frame_index = self.inventory.frames[index].frame_index;
-        let request = self.surface_encodings.as_ref().map_or_else(
-            || self.request.clone(),
-            |encodings| self.request.clone().for_frame_surface(encodings[index]),
-        );
+        let request = self
+            .surface_encodings
+            .as_ref()
+            .map_or_else(
+                || self.request.clone(),
+                |encodings| self.request.clone().for_frame_surface(encodings[index]),
+            )
+            .with_progressive_output(false);
         let projected = project_frame_inventory(&self.inventory, frame_index)?;
         match projected.frames[0].encoding {
             FrameEncoding::Modular => {

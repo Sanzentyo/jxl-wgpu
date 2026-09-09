@@ -22,6 +22,8 @@ use jxl_wgpu_decode::{
 };
 
 mod common;
+#[path = "gpu_decode/updates.rs"]
+mod updates;
 
 use common::{basic as raw_still, fragmented_animation};
 

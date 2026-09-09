@@ -330,12 +330,61 @@ pub struct VarDctDecodeMemoryStats {
     pub extra_render_bytes: u64,
     /// Packed target storage retained until the final [`jxl_wgpu::GpuBufferLease`] clone is dropped.
     pub output_lease_bytes: u64,
-    /// All non-output GPU buffers retained through status validation.
+    /// Base final-decode non-output buffers, excluding the separately reported intermediate work.
     pub transient_bytes: u64,
+    /// Additional immutable pass outputs; zero when no intermediate image is requested.
+    pub intermediate_output_bytes: u64,
+    /// Additional rendering scratch, uniforms, noise, and validation maps for those outputs.
+    /// Coefficients, LF/HF artifacts, and planar render destinations remain shared.
+    pub intermediate_transient_bytes: u64,
     pub total_frame_bytes: u64,
 }
 
 impl VarDctDecodeMemoryStats {
+    pub(super) fn with_intermediate_outputs(
+        mut self,
+        count: usize,
+    ) -> Result<Self, VarDctDecodeError> {
+        let count = u64::try_from(count).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+            field: "intermediate output count",
+        })?;
+        let transient = checked_sum(
+            [
+                self.resident_transient_bytes,
+                self.pre_restoration_upsample_uniform_bytes,
+                self.frame_upsample_weight_bytes,
+                self.frame_upsample_uniform_bytes,
+                self.gaborish_uniform_bytes,
+                self.epf_filter_uniform_bytes,
+                self.noise_bytes,
+                self.noise_uniform_bytes,
+                self.output_uniform_bytes,
+                self.validation_staging_bytes,
+            ],
+            "intermediate render bytes",
+        )?;
+        self.intermediate_output_bytes = self.output_lease_bytes.checked_mul(count).ok_or(
+            VarDctDecodeError::ArithmeticOverflow {
+                field: "intermediate output bytes",
+            },
+        )?;
+        self.intermediate_transient_bytes =
+            transient
+                .checked_mul(count)
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "intermediate transient bytes",
+                })?;
+        self.total_frame_bytes = checked_sum(
+            [
+                self.total_frame_bytes,
+                self.intermediate_output_bytes,
+                self.intermediate_transient_bytes,
+            ],
+            "progressive frame bytes",
+        )?;
+        Ok(self)
+    }
+
     pub(super) fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
         let VarDctDecodeMemoryInputs {
             noise,
@@ -357,16 +406,6 @@ impl VarDctDecodeMemoryStats {
             output,
             extra_render_bytes,
         } = inputs;
-        fn checked_sum(
-            values: impl IntoIterator<Item = u64>,
-            field: &'static str,
-        ) -> Result<u64, VarDctDecodeError> {
-            values.into_iter().try_fold(0_u64, |total, value| {
-                total
-                    .checked_add(value)
-                    .ok_or(VarDctDecodeError::ArithmeticOverflow { field })
-            })
-        }
         let checked_words = |words: u64, field: &'static str| {
             words
                 .checked_mul(4)
@@ -783,6 +822,8 @@ impl VarDctDecodeMemoryStats {
             },
         )?;
         Ok(Self {
+            intermediate_output_bytes: 0,
+            intermediate_transient_bytes: 0,
             noise_bytes,
             noise_uniform_bytes,
             resolved_stream_window_limit_bytes: stream_limit,
@@ -989,4 +1030,15 @@ impl DeferredHfCoefficientLayout {
                 })?,
         }))
     }
+}
+
+fn checked_sum(
+    values: impl IntoIterator<Item = u64>,
+    field: &'static str,
+) -> Result<u64, VarDctDecodeError> {
+    values.into_iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or(VarDctDecodeError::ArithmeticOverflow { field })
+    })
 }

@@ -76,6 +76,10 @@ pub(super) struct HfValidation {
 }
 
 impl HfValidation {
+    pub(super) fn is_completed_by(&self, passes: u8, spatial_groups: u64) -> bool {
+        u64::from(self.index) < u64::from(passes) * spatial_groups
+    }
+
     pub(super) fn plan(
         source: &VarDctSource,
         execution: &HfCoefficientExecutionPlan,

@@ -2479,3 +2479,45 @@ harnesses each pass 18 cases; indexed Gray8 U8 CPU readback passes with direct m
 221 logical bytes. The 48 fixture sources and their generator are unchanged. The full JPEG XL
 roadmap remains active, including intermediate progressive delivery and the remaining rendering,
 color, container, encoder and conformance requirements.
+
+### Image-wide VarDCT AC-pass updates
+
+`tests/vardct_engine_gpu/progression.rs` uses the existing spectral (257×129), quantized
+(515×259) and multiple-LF-group (2056×17) fixtures. Opt-in `next_update`/async output returns five
+non-final AC images and three final images per execution mode. Native `decode_progressive.c`
+subscribes to libjxl 0.12's `kPasses` progression and saves full-canvas RGBA F32 flushes. Its three
+additional DC snapshots are retained by the oracle but are not yet GPU output capabilities.
+
+Whole and 256-byte GPU-window stages are byte-identical; RGB8 transport is also delivered in
+37-byte fragments. Native intended detail agrees at each AC boundary. Maximum native linear-RGB
+errors on Apple M5 are 0.0000545 for spectral intermediates, 0.0001272 for quantized intermediates,
+and 0.0000470 for multiple-LF-group intermediates. The final maxima stay below 0.000093 and each
+final GPU buffer is byte-identical to independent final-only decoding. Every stage also meets the
+existing one-code RGB8 bound. F32 regression limits are 0.0002 for intermediate images and 0.0001
+for finals. An initial uniform 0.0001 limit exposed the quantized intermediate's larger difference;
+the diagnostic preserves that observation instead of claiming F32 bit identity with native libjxl.
+
+Native noisy fragmented input is not an oracle: 0.12.0 can increment its persistent noise-frame
+counters repeatedly while retrying incomplete headers/TOCs. The C helper uses whole input in these
+comparisons. Fragmented GPU parity is checked independently. Production uses no native image codec.
+
+The retained-image test re-reads every earlier output after the final pass and checks unchanged
+pixels and one shared logical frame slot. Corrupting the final pass still permits validation of
+the preceding image, then poisons the session. Its held output survives cancellation/error and
+retains only its own byte reservation after callbacks retire. Admission with one byte less than
+the complete output/scratch requirement leaves no partially consumed source or permits and is
+retryable. Cancellation before output and after a returned intermediate releases all other bytes.
+`tests/gpu_decode/updates.rs` separately checks synchronous/asynchronous timing, prefetched ordering,
+future cancellation, final-only engine adaptation, malformed progression and stable frame metadata.
+
+This checkpoint covers direct VarDCT color-only stills with prepared coefficient descriptors.
+DC/LF publication, deferred descriptors, extras, Modular, composition/animation updates and
+incomplete-frame input readiness remain on the full JPEG XL roadmap.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+787 tests across 40 targets (32 nonempty and eight empty example targets), with zero failures and
+one existing manual benchmark ignored. Formatting, workspace check, warning-free Clippy/rustdoc,
+Rust 1.89 all-target/all-feature check and the six-crate WASM check pass. Reference and Metal
+harnesses each pass 18 cases. Indexed Gray8 U8 CPU readback passes with direct mapping of all
+221 logical bytes and no staging allocation. The three new GPU progression tests run in the full
+suite, including the native libjxl flush oracle. Full JPEG XL remains an active implementation goal.

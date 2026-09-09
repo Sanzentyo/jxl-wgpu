@@ -19,6 +19,9 @@ use crate::{
     Result, codestream_data::CodestreamSpan,
 };
 
+mod update;
+pub use update::{FrameProgression, NextGpuUpdate, SubmittedGpuUpdate};
+
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
 #[derive(Debug)]
 pub struct SubmittedGpuFrame<F> {
@@ -85,6 +88,21 @@ pub trait GpuPendingFrame: Send + Unpin + 'static {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>>;
+
+    /// Returns the next validated refinement or the final frame. Engines without intermediate
+    /// output use the final-only default. Refinements must own immutable output allocations.
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuUpdate<Self::Frame>>> {
+        self.poll_complete(context)
+            .map(|result| result.map(SubmittedGpuUpdate::Complete))
+    }
+
+    /// Blocks for one update while retaining the pending physical frame for later refinements.
+    fn wait_next_update(&mut self) -> Result<SubmittedGpuUpdate<Self::Frame>> {
+        update::wait_next_update(self)
+    }
 }
 
 /// Browser WebGPU pending handles are main-thread-local and complete through the event loop.
@@ -96,6 +114,14 @@ pub trait GpuPendingFrame: Unpin + 'static {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>>;
+
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuUpdate<Self::Frame>>> {
+        self.poll_complete(context)
+            .map(|result| result.map(SubmittedGpuUpdate::Complete))
+    }
 }
 
 /// Per-codestream GPU submission state. `submit_next` records queue work only and never waits for
@@ -701,20 +727,33 @@ impl<E: GpuSubmissionEngine + fmt::Debug> fmt::Debug for GpuDecodeStream<E> {
 
 /// Bounded ownership wrapper for one GPU-resident output.
 ///
-/// This wrapper alone owns the session's frame-slot permit. Borrowing `output` and cloning a nested
+/// A pending frame and its returned refinements share one logical frame-slot permit. Each output
+/// allocation has its own byte reservation. Borrowing `output` and cloning a nested
 /// GPU handle does not retain that count slot. The stock wgpu frame/output containers are
 /// intentionally non-cloneable; custom submission engines must apply the same distinction to
 /// their own output types.
 pub struct GpuFrameLease<F> {
     pub metadata: FrameMetadata,
     output: F,
-    _permit: InFlightPermit,
+    progression: Option<FrameProgression>,
+    _permit: Arc<InFlightPermit>,
 }
 
 impl<F> GpuFrameLease<F> {
     #[must_use]
     pub fn output(&self) -> &F {
         &self.output
+    }
+
+    /// `None` denotes a fully decoded presentation; `Some` describes an intermediate image.
+    #[must_use]
+    pub const fn progression(&self) -> Option<FrameProgression> {
+        self.progression
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.progression.is_none()
     }
 }
 
@@ -723,6 +762,7 @@ impl<F: fmt::Debug> fmt::Debug for GpuFrameLease<F> {
         formatter
             .debug_struct("GpuFrameLease")
             .field("metadata", &self.metadata)
+            .field("progression", &self.progression)
             .field("output", &self.output)
             .finish()
     }
@@ -735,10 +775,11 @@ pub struct GpuDecodeSession<S: GpuSubmissionSession> {
     profile: DecodeProfile,
     metadata: AnimationMetadata,
     limiter: InFlightLimiter,
-    pending: VecDeque<(InFlightPermit, S::Pending)>,
+    pending: VecDeque<(Arc<InFlightPermit>, S::Pending)>,
     submitted_count: usize,
     next_index: usize,
     next_presentation_ticks: u64,
+    last_progression: Option<(FrameMetadata, FrameProgression)>,
     engine_end_reached: bool,
     finished: bool,
     failed: bool,
@@ -766,6 +807,7 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
             submitted_count: 0,
             next_index: 0,
             next_presentation_ticks: 0,
+            last_progression: None,
             engine_end_reached: false,
             finished: false,
             failed: false,
@@ -1014,7 +1056,7 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         match self.engine.submit_next() {
             Ok(Some(pending)) => {
                 self.submitted_count = next_submitted_count;
-                self.pending.push_back((permit, pending));
+                self.pending.push_back((Arc::new(permit), pending));
                 Ok(None)
             }
             Ok(None) => {
@@ -1074,54 +1116,77 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
 
     fn finish_frame(
         &mut self,
-        permit: InFlightPermit,
+        permit: Arc<InFlightPermit>,
         submitted: SubmittedGpuFrame<S::Frame>,
     ) -> Result<GpuFrameLease<S::Frame>> {
-        if submitted.metadata.index != self.next_index {
+        self.validate_frame_metadata(&submitted.metadata)?;
+        self.finish_validated_frame(permit, submitted)
+    }
+
+    fn validate_frame_metadata(&mut self, metadata: &FrameMetadata) -> Result<()> {
+        if let Some((previous, _)) = &self.last_progression
+            && metadata != previous
+        {
+            self.failed = true;
+            return Err(Error::EngineContract(
+                "frame metadata changed between progressive updates",
+            ));
+        }
+        self.validate_presentation_metadata(metadata)
+    }
+
+    fn validate_presentation_metadata(&mut self, metadata: &FrameMetadata) -> Result<()> {
+        if metadata.index != self.next_index {
             self.failed = true;
             return Err(Error::UnexpectedFrameIndex {
                 expected: self.next_index,
-                actual: submitted.metadata.index,
+                actual: metadata.index,
             });
         }
-        if submitted.metadata.duration.timebase != self.metadata.timebase {
+        if metadata.duration.timebase != self.metadata.timebase {
             self.failed = true;
             return Err(Error::FrameTimebaseMismatch {
-                index: submitted.metadata.index,
+                index: metadata.index,
             });
         }
-        if self.metadata.timebase.is_none() && submitted.metadata.duration.ticks != 0 {
+        if self.metadata.timebase.is_none() && metadata.duration.ticks != 0 {
             self.failed = true;
             return Err(Error::FrameTimebaseMismatch {
-                index: submitted.metadata.index,
+                index: metadata.index,
             });
         }
-        if submitted.metadata.presentation_ticks != self.next_presentation_ticks {
+        if metadata.presentation_ticks != self.next_presentation_ticks {
             self.failed = true;
             return Err(Error::FramePresentationTicksMismatch {
-                index: submitted.metadata.index,
+                index: metadata.index,
                 expected: self.next_presentation_ticks,
-                actual: submitted.metadata.presentation_ticks,
+                actual: metadata.presentation_ticks,
             });
         }
         let stream_has_timecodes = self.metadata.has_timecodes.unwrap_or(false);
-        let frame_has_timecode = submitted.metadata.timecode.is_some();
+        let frame_has_timecode = metadata.timecode.is_some();
         if frame_has_timecode != stream_has_timecodes {
             self.failed = true;
             return Err(Error::FrameTimecodePresenceMismatch {
-                index: submitted.metadata.index,
+                index: metadata.index,
                 stream_has_timecodes,
                 frame_has_timecode,
             });
         }
-        if self.metadata.timebase.is_none()
-            && (submitted.metadata.index != 0 || !submitted.metadata.is_last)
-        {
+        if self.metadata.timebase.is_none() && (metadata.index != 0 || !metadata.is_last) {
             self.failed = true;
             return Err(Error::EngineContract(
                 "still-image metadata requires exactly one final visible frame",
             ));
         }
+        Ok(())
+    }
+
+    fn finish_validated_frame(
+        &mut self,
+        permit: Arc<InFlightPermit>,
+        submitted: SubmittedGpuFrame<S::Frame>,
+    ) -> Result<GpuFrameLease<S::Frame>> {
         let Some(next_index) = self.next_index.checked_add(1) else {
             self.failed = true;
             return Err(Error::EngineContract("visible frame index overflow"));
@@ -1150,6 +1215,7 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
                 "submission engine queued visible frames after the final frame",
             ));
         }
+        self.last_progression = None;
         self.next_index = next_index;
         self.next_presentation_ticks = next_presentation_ticks;
         self.finished = submitted.metadata.is_last;
@@ -1159,6 +1225,7 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         Ok(GpuFrameLease {
             metadata: submitted.metadata,
             output: submitted.output,
+            progression: None,
             _permit: permit,
         })
     }

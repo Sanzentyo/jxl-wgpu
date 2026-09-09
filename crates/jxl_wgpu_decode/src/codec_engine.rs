@@ -341,6 +341,17 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
         }
     }
 
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<crate::SubmittedGpuUpdate<Self::Frame>>> {
+        match self.get_mut() {
+            Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
+            Self::Modular(pending) => Pin::new(pending).poll_next_update(context),
+            Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
+        }
+    }
+
     fn poll_complete(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -356,6 +367,17 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
 #[cfg(target_arch = "wasm32")]
 impl GpuPendingFrame for WgpuDecodePendingFrame {
     type Frame = GpuImageFrame;
+
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<crate::SubmittedGpuUpdate<Self::Frame>>> {
+        match self.get_mut() {
+            Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
+            Self::Modular(pending) => Pin::new(pending).poll_next_update(context),
+            Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
+        }
+    }
 
     fn poll_complete(
         self: Pin<&mut Self>,

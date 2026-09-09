@@ -107,6 +107,48 @@ payload preservation, prefix clipping, delayed takes, admission retry and indepe
 `cargo run -p jxl_wgpu_decode --example regenerate_previews` reproduces the corpus with offline
 libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced.
 
+### Intermediate pass images
+
+`GpuOutputRequest::with_progressive_output(true)` enables intermediate AC-pass images for direct
+VarDCT stills whose coefficient descriptors are available during preparation and which have no
+extra channels or LF/reference/composition dependencies. Other paths currently return final images.
+Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
+embedded-preview delivery.
+
+```rust,no_run
+use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, vardct_rgb8_format};
+
+# async fn example(backend: jxl_wgpu::WgpuBackend, encoded: &[u8]) -> jxl_wgpu_decode::Result<()> {
+let decoder = GpuDecoder::wgpu(backend)?;
+let request = GpuOutputRequest::color(vardct_rgb8_format())?
+    .with_progressive_output(true);
+let mut session = decoder.open(encoded, request)?;
+while let Some(image) = session.next_update_async().await? {
+    // Present image.output(). Intermediate and final storage have the same full canvas extent.
+    if let Some(progress) = image.progression() {
+        // Every group in progress.completed_passes is decoded.
+        // progress.intended_downsampling describes detail, not buffer dimensions.
+    }
+    // image.is_complete() distinguishes the final reconstruction from a refinement.
+}
+# Ok(())
+# }
+```
+
+`next_update`, `poll_next_update` and `next_update_async` retain the pending frame after a
+refinement. All updates share its exact presentation metadata and one logical frame slot; each
+immutable output owns its GPU byte reservation. Only the final update advances frame number,
+animation time and session completion. `next_frame` and its async counterpart continue to return
+only final images. Custom engines can implement `GpuPendingFrame::poll_next_update`; its default
+adapts their existing final-only completion.
+
+Pass barriers span every LF group in both whole-buffer and bounded-window execution. Each update
+captures independent packet/artifact/coefficient validation evidence, validates only completed
+passes, and remains valid if a later pass fails. Spectral, quantized and multiple-LF-group fixtures
+match native libjxl flushes within one RGB8 code; all final GPU bytes match final-only decoding.
+The remaining progressive work includes DC/LF images, deferred descriptors, Modular and extra
+channels, composed/animated updates, and incomplete-frame input readiness.
+
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 
 - a raw codestream, ordinary `jxlc` container, or reconstructed `jxlp` container with no private

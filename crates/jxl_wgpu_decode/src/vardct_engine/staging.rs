@@ -645,4 +645,29 @@ impl GpuPendingFrame for VarDctPendingFrame {
             _ => Poll::Ready(Err(VarDctDecodeError::CompletionConsumed.into())),
         }
     }
+    fn poll_next_update(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<crate::SubmittedGpuUpdate<Self::Frame>>> {
+        if let PendingStage::Global { completion, .. } = &self.state {
+            self.backend
+                .device()
+                .poll(wgpu::PollType::Poll)
+                .map_err(Error::backend)?;
+            let Some(mapping) = completion.poll(context) else {
+                return Poll::Pending;
+            };
+            self.resume_global(mapping)?;
+            // Yield between windows even if a fast adapter already completed the next map.
+            // This keeps cancellation responsive and avoids monopolizing a browser executor.
+            if matches!(self.state, PendingStage::Global { .. }) {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+        match &mut self.state {
+            PendingStage::Frame(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
+            _ => Poll::Ready(Err(VarDctDecodeError::CompletionConsumed.into())),
+        }
+    }
 }
