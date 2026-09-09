@@ -29,8 +29,10 @@ let frame = preview.next_frame()?.expect("one preview presentation");
 ```
 
 The frontend creates a `SelectedImageInventory` once, before the `GpuSubmissionEngine::open`
-boundary. `source_inventory()` preserves the original metadata; `reconstruction_inventory()`
-contains only the selected image domain. A preview becomes one final still with its own
+boundary. `source_inventory()` returns `ImageSourceInventory::Complete` or `PreviewPrefix`,
+preserving original metadata and distinguishing complete transport/header inventory from a completely
+received preview. `complete_inventory()` returns `Some` only for the former.
+`reconstruction_inventory()` contains only the selected image domain. A preview becomes one final still with its own
 dimensions and no intrinsic-size override, duration or animation timecode. An encoded
 `is_last=false` preview still ends after exactly one physical frame. Main selection excludes
 that frame and retains all main LF/reference dependencies and presentation timing.
@@ -47,14 +49,61 @@ All eight orientation values, Apply/Keep, supported color and scalar-extra deliv
 output ownership apply to both selections. A missing preview returns
 `Error::ImageSelection(ImageSelectionError::MissingPreview)` before engine admission.
 Whole `open` and fragmented `stream(...).finish()` both require complete transport and frame
-inventory; a preview alone does not validate an incomplete main image. Early preview delivery
-while main input is still arriving is not yet exposed.
+inventory; a preview alone does not validate an incomplete main image.
+
+For early delivery, feed the same stream and call `take_preview` after `is_preview_ready()`:
+
+```rust,no_run
+use jxl_gpu_bitstream::ContainerStreamEvent;
+use jxl_wgpu_decode::{GpuDecoder, GpuOutputRequest, vardct_rgb8_format};
+
+# async fn example(
+#     backend: jxl_wgpu::WgpuBackend,
+#     events: impl IntoIterator<Item = ContainerStreamEvent>,
+# ) -> jxl_wgpu_decode::Result<()> {
+let decoder = GpuDecoder::wgpu(backend)?;
+let output = GpuOutputRequest::color(vardct_rgb8_format())?;
+let mut stream = decoder.stream(output.clone())?;
+let mut displayed_preview = None;
+for event in events {
+    stream.push_transport_event(&event)?;
+    if stream.is_preview_ready() {
+        let mut preview = stream.take_preview(output.clone())?.expect("ready preview");
+        displayed_preview = preview.next_frame_async().await?;
+        // The GPU frame can be displayed while the same stream receives main input.
+    }
+}
+let mut main = stream.finish()?; // Requires the transport scanner's authoritative End.
+let main_frame = main.next_frame_async().await?;
+# drop((main_frame, displayed_preview));
+# Ok(())
+# }
+```
+
+`take_preview` returns `None` until its complete header/TOC and every section byte have arrived.
+A known absent preview returns `MissingPreview`; a second successful take returns
+`PreviewAlreadyTaken`. Opening errors leave the stream and take state unchanged. The method
+selects Preview and leaves the original stream request intact, so orientation, color, numeric
+extra-channel selection and frame leases are independent. Entropy validation occurs in the GPU
+session; malformed later main input or transport cannot invalidate a previously validated preview.
+
+A prefix keeps original byte offsets and ends exactly after the preview's final section.
+`GpuCodestream::is_container()` is `None` for that prefix and `Some(bool)` after authoritative
+transport completion. Each admitted transport range owns one shared immutable budget token;
+preview and main never double-charge shared ranges, and preview never retains subsequently
+received ranges. A final range crossing into main keeps its entire original charge while shared.
+The budget counts logical retained ranges, not allocator capacity or unrelated bytes within a
+caller allocation. `IncrementalInputBudget::with_limits` bounds both bytes and span count;
+`new` defaults to 1,048,576 spans. Either admission failure leaves its input event retryable.
 
 `tests/preview.rs` checks 48 reproducible streams against native libjxl's preview API and
 independent main-image controls, with byte-identical whole/bounded output. It includes all
 16 dimension encodings in both modes, alpha, JPEG sampling, floating samples, resampling,
 non-final preview headers, main animations and recursive LF, syntax/entropy failures,
-one-byte inventory delivery, admission retry and cancellation.
+one-byte inventory delivery, admission retry and cancellation. All 48 streams also produce GPU
+preview before any main frame bytes arrive, then finish every main presentation with the preview
+lease still live. `tests/stream_preview.rs` audits every raw/jxlc/jxlp two-chunk split, auxiliary
+payload preservation, prefix clipping, delayed takes, admission retry and independent source lifetimes.
 `cargo run -p jxl_wgpu_decode --example regenerate_previews` reproduces the corpus with offline
 libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced.
 

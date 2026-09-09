@@ -10,13 +10,13 @@ use std::task::{Context, Poll};
 use jxl_gpu_bitstream::{
     CodestreamInventory, CodestreamInventoryEvent, CodestreamStreamLimits, CodestreamStreamScanner,
     CodestreamStreamStats, ContainerStreamEvent, ContainerStreamLimits, FrameInventory,
-    ImageHeaderInventory, InventoryLimits, ParseLimits, StreamSlice,
+    ImageHeaderInventory, InventoryLimits, ParseLimits,
 };
 
 use crate::{
     AnimationMetadata, DecodeProfile, Error, FrameMetadata, GpuCodestream, GpuOutputRequest,
     InFlightLimiter, InFlightPermit, IncrementalInputBudget, IncrementalInputBudgetSnapshot,
-    Result, input_budget::IncrementalInputPermit,
+    Result, codestream_data::CodestreamSpan,
 };
 
 /// GPU-resident frame returned by an engine before bounded lease wrapping.
@@ -405,6 +405,8 @@ pub struct GpuDecodeStreamStats {
     pub retained_spans: usize,
     pub completed_frames: u32,
     pub authoritative_end: bool,
+    pub preview_ready: bool,
+    pub preview_taken: bool,
     pub input_budget: IncrementalInputBudgetSnapshot,
 }
 
@@ -413,18 +415,19 @@ pub struct GpuDecodeStreamStats {
 /// Feed borrowed events from [`jxl_gpu_bitstream::ContainerStreamScanner`] in order. A
 /// `CodestreamChunk` is admitted against the decoder's shared [`IncrementalInputBudget`] before
 /// either scanner state or retained ownership changes, so budget exhaustion is retryable. The
-/// final source and its one growable permit move into the codec engine and are released when that
-/// engine no longer needs compressed bytes or when the stream/session is cancelled.
+/// final source moves into the codec engine. Each range shares one immutable admission token
+/// between its owners, including an independently opened preview. Bytes are released after the
+/// last owner no longer needs that range or is cancelled.
 pub struct GpuDecodeStream<E: GpuSubmissionEngine> {
     engine: Arc<E>,
     request: GpuOutputRequest,
     scanner: CodestreamStreamScanner,
-    spans: Vec<(u64, StreamSlice)>,
+    spans: Vec<CodestreamSpan>,
     image_header: Option<Arc<ImageHeaderInventory>>,
     frames: Vec<Arc<FrameInventory>>,
     completed_frames: u32,
     transport_end: Option<(u64, bool)>,
-    retained_input: Option<IncrementalInputPermit>,
+    preview_taken: bool,
     input_budget: IncrementalInputBudget,
     failed: bool,
 }
@@ -451,7 +454,7 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
             frames: Vec::new(),
             completed_frames: 0,
             transport_end: None,
-            retained_input: Some(decoder.incremental_input_budget.reserve_empty()),
+            preview_taken: false,
             input_budget: decoder.incremental_input_budget.clone(),
             failed: false,
         }
@@ -461,13 +464,16 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
     pub fn stats(&self) -> GpuDecodeStreamStats {
         GpuDecodeStreamStats {
             codestream: self.scanner.stats(),
-            retained_codestream_bytes: self
-                .retained_input
-                .as_ref()
-                .map_or(0, IncrementalInputPermit::bytes),
+            retained_codestream_bytes: if self.failed {
+                0
+            } else {
+                self.scanner.stats().codestream_bytes_received
+            },
             retained_spans: self.spans.len(),
             completed_frames: self.completed_frames,
             authoritative_end: self.transport_end.is_some(),
+            preview_ready: self.is_preview_ready(),
+            preview_taken: self.preview_taken,
             input_budget: self.input_budget.snapshot(),
         }
     }
@@ -475,6 +481,61 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
     #[must_use]
     pub const fn is_ready(&self) -> bool {
         self.transport_end.is_some() && !self.failed
+    }
+
+    /// Whether a complete embedded preview can be taken independently of the main image.
+    #[must_use]
+    pub fn is_preview_ready(&self) -> bool {
+        !self.failed
+            && !self.preview_taken
+            && self.completed_frames > 0
+            && self.frames.first().is_some_and(|frame| frame.is_preview)
+    }
+
+    /// Opens the embedded preview as soon as all its declared section bytes have arrived.
+    ///
+    /// Returns `None` while its header or sections are incomplete. A known absent preview and a
+    /// second successful take are typed image-selection errors. This method selects Preview;
+    /// all other output options are independent of the main stream's request.
+    ///
+    /// The returned session validates preview entropy on GPU. It does not validate future main
+    /// image bytes or transport completion. Continue feeding this stream and call [`Self::finish`]
+    /// to require whole-file completion. Failure here leaves the stream and take state unchanged,
+    /// so admission errors can be retried. The source shares only ranges intersecting the prefix;
+    /// a final range crossing into the main image retains that entire range's admission charge.
+    pub fn take_preview(
+        &mut self,
+        request: GpuOutputRequest,
+    ) -> Result<Option<GpuDecodeSession<E::Session>>> {
+        if self.failed {
+            return Err(Error::IncrementalInputPoisoned);
+        }
+        if self.preview_taken {
+            return Err(crate::ImageSelectionError::PreviewAlreadyTaken.into());
+        }
+        let Some(header) = self.image_header.as_ref() else {
+            return Ok(None);
+        };
+        if header.preview_size.is_none() {
+            return Err(crate::ImageSelectionError::MissingPreview.into());
+        }
+        if !self.is_preview_ready() {
+            return Ok(None);
+        }
+        let request = request.with_image_selection(crate::ImageSelection::Preview);
+        request.format().validate()?;
+        let inventory = crate::SelectedImageInventory::from_preview_prefix(
+            Arc::clone(header),
+            Arc::clone(&self.frames[0]),
+        )?;
+        let codestream = GpuCodestream::preview_prefix(
+            &self.spans,
+            inventory.reconstruction_inventory().codestream_bytes,
+        )?;
+        let prepared = self.engine.open(codestream, &request, inventory)?;
+        let session = GpuDecodeSession::new(prepared, request)?;
+        self.preview_taken = true;
+        Ok(Some(session))
     }
 
     /// Observes one transport event without taking ownership of auxiliary-box data.
@@ -493,6 +554,9 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
             } if !bytes.is_empty() => Some((*logical_offset, bytes.clone())),
             _ => None,
         };
+        let chunk = chunk
+            .map(|(offset, bytes)| CodestreamSpan::admitted(offset, bytes, &self.input_budget))
+            .transpose()?;
         if chunk.is_some()
             && let Err(error) = self.spans.try_reserve(1)
         {
@@ -500,17 +564,6 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
                 "incremental codestream span-table allocation failed: {error}"
             )));
         }
-        if let Some((_, bytes)) = &chunk {
-            let additional = u64::try_from(bytes.len())
-                .map_err(|_| Error::backend("incremental codestream span exceeds u64"))?;
-            self.retained_input
-                .as_ref()
-                .ok_or(Error::EngineContract(
-                    "incremental input permit is absent before stream finish",
-                ))?
-                .try_grow(additional)?;
-        }
-
         let inventory_events = match self.scanner.push_transport_event(event) {
             Ok(events) => events,
             Err(error) => return self.fail(error.into()),
@@ -550,11 +603,7 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
                 .map(|frame| (*frame).clone())
                 .collect(),
         });
-        let retained_input = self.retained_input.take().ok_or(Error::EngineContract(
-            "incremental input permit was consumed before stream finish",
-        ))?;
-        let codestream =
-            GpuCodestream::from_stream_spans(self.spans.drain(..), is_container, retained_input)?;
+        let codestream = GpuCodestream::from_stream_spans(self.spans.drain(..), is_container)?;
         if codestream.logical_bytes() != codestream_bytes {
             return Err(Error::EngineContract(
                 "incremental source length differs from authoritative transport end",
@@ -635,7 +684,6 @@ impl<E: GpuSubmissionEngine> GpuDecodeStream<E> {
         self.spans.clear();
         self.frames.clear();
         self.image_header = None;
-        self.retained_input = None;
         Err(error)
     }
 }

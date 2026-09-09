@@ -1,8 +1,10 @@
 //! Byte-weighted admission for compressed input retained by incremental decoders.
 
-use std::num::NonZeroU64;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::{Arc, Mutex};
+
+/// Default bound on independently retained transport ranges across incremental streams.
+pub const DEFAULT_INCREMENTAL_INPUT_SPANS: usize = 1 << 20;
 
 /// A point-in-time view of shared incremental-input retention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,11 +12,21 @@ pub struct IncrementalInputBudgetSnapshot {
     pub limit_bytes: u64,
     pub reserved_bytes: u64,
     pub available_bytes: u64,
+    pub limit_spans: usize,
+    pub reserved_spans: usize,
+    pub available_spans: usize,
 }
 
-/// Failure to retain another compressed-input range without blocking.
+/// Failure to retain another compressed-input range without waiting for capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IncrementalInputBudgetError {
+    #[error(
+        "incremental decode input has {reserved_spans}/{limit_spans} transport spans already retained"
+    )]
+    SpanLimit {
+        reserved_spans: usize,
+        limit_spans: usize,
+    },
     #[error(
         "incremental decode input needs {requested_bytes} more bytes with {reserved_bytes}/{limit_bytes} bytes already retained"
     )]
@@ -34,7 +46,14 @@ pub enum IncrementalInputBudgetError {
 
 struct IncrementalInputBudgetInner {
     limit_bytes: u64,
-    reserved_bytes: AtomicU64,
+    limit_spans: usize,
+    reserved: Mutex<RetainedInput>,
+}
+
+#[derive(Default)]
+struct RetainedInput {
+    bytes: u64,
+    spans: usize,
 }
 
 /// Cloneable, runtime-independent budget shared by incremental decoder instances.
@@ -50,30 +69,78 @@ pub struct IncrementalInputBudget {
 impl IncrementalInputBudget {
     #[must_use]
     pub fn new(limit_bytes: NonZeroU64) -> Self {
+        Self::with_limits(
+            limit_bytes,
+            NonZeroUsize::new(DEFAULT_INCREMENTAL_INPUT_SPANS).expect("nonzero default span limit"),
+        )
+    }
+
+    /// Bounds logical compressed bytes and the number of independently retained input ranges.
+    #[must_use]
+    pub fn with_limits(limit_bytes: NonZeroU64, limit_spans: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(IncrementalInputBudgetInner {
                 limit_bytes: limit_bytes.get(),
-                reserved_bytes: AtomicU64::new(0),
+                limit_spans: limit_spans.get(),
+                reserved: Mutex::new(RetainedInput::default()),
             }),
         }
     }
 
-    pub(crate) fn reserve_empty(&self) -> IncrementalInputPermit {
-        IncrementalInputPermit {
+    pub(crate) fn try_reserve(
+        &self,
+        bytes: u64,
+    ) -> Result<IncrementalInputPermit, IncrementalInputBudgetError> {
+        let mut reserved = self
+            .inner
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next =
+            reserved
+                .bytes
+                .checked_add(bytes)
+                .ok_or(IncrementalInputBudgetError::Overflow {
+                    requested_bytes: bytes,
+                    reserved_bytes: reserved.bytes,
+                })?;
+        if next > self.inner.limit_bytes {
+            return Err(IncrementalInputBudgetError::Exhausted {
+                requested_bytes: bytes,
+                reserved_bytes: reserved.bytes,
+                limit_bytes: self.inner.limit_bytes,
+            });
+        }
+        if reserved.spans == self.inner.limit_spans {
+            return Err(IncrementalInputBudgetError::SpanLimit {
+                reserved_spans: reserved.spans,
+                limit_spans: self.inner.limit_spans,
+            });
+        }
+        reserved.bytes = next;
+        reserved.spans += 1;
+        Ok(IncrementalInputPermit {
             reservation: Arc::new(IncrementalInputReservation {
                 budget: Arc::clone(&self.inner),
-                bytes: AtomicU64::new(0),
+                bytes,
             }),
-        }
+        })
     }
 
     #[must_use]
     pub fn snapshot(&self) -> IncrementalInputBudgetSnapshot {
-        let reserved_bytes = self.inner.reserved_bytes.load(Ordering::Acquire);
+        let reserved = self
+            .inner
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         IncrementalInputBudgetSnapshot {
             limit_bytes: self.inner.limit_bytes,
-            reserved_bytes,
-            available_bytes: self.inner.limit_bytes.saturating_sub(reserved_bytes),
+            reserved_bytes: reserved.bytes,
+            available_bytes: self.inner.limit_bytes - reserved.bytes,
+            limit_spans: self.inner.limit_spans,
+            reserved_spans: reserved.spans,
+            available_spans: self.inner.limit_spans - reserved.spans,
         }
     }
 }
@@ -89,69 +156,30 @@ impl std::fmt::Debug for IncrementalInputBudget {
 
 struct IncrementalInputReservation {
     budget: Arc<IncrementalInputBudgetInner>,
-    bytes: AtomicU64,
+    bytes: u64,
 }
 
 impl Drop for IncrementalInputReservation {
     fn drop(&mut self) {
-        let bytes = self.bytes.load(Ordering::Acquire);
-        let previous = self
+        let mut reserved = self
             .budget
-            .reserved_bytes
-            .fetch_sub(bytes, Ordering::AcqRel);
-        debug_assert!(previous >= bytes, "incremental input accounting underflow");
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reserved.bytes -= self.bytes;
+        reserved.spans -= 1;
     }
 }
 
-/// Shared ownership token for one incrementally retained codestream.
+/// Immutable shared ownership token for one admitted transport span.
 #[derive(Clone)]
 pub(crate) struct IncrementalInputPermit {
     reservation: Arc<IncrementalInputReservation>,
 }
 
 impl IncrementalInputPermit {
-    pub(crate) fn try_grow(
-        &self,
-        additional_bytes: u64,
-    ) -> Result<(), IncrementalInputBudgetError> {
-        let mut reserved = self
-            .reservation
-            .budget
-            .reserved_bytes
-            .load(Ordering::Acquire);
-        loop {
-            let next = reserved.checked_add(additional_bytes).ok_or(
-                IncrementalInputBudgetError::Overflow {
-                    requested_bytes: additional_bytes,
-                    reserved_bytes: reserved,
-                },
-            )?;
-            if next > self.reservation.budget.limit_bytes {
-                return Err(IncrementalInputBudgetError::Exhausted {
-                    requested_bytes: additional_bytes,
-                    reserved_bytes: reserved,
-                    limit_bytes: self.reservation.budget.limit_bytes,
-                });
-            }
-            match self
-                .reservation
-                .budget
-                .reserved_bytes
-                .compare_exchange_weak(reserved, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    self.reservation
-                        .bytes
-                        .fetch_add(additional_bytes, Ordering::AcqRel);
-                    return Ok(());
-                }
-                Err(actual) => reserved = actual,
-            }
-        }
-    }
-
     pub(crate) fn bytes(&self) -> u64 {
-        self.reservation.bytes.load(Ordering::Acquire)
+        self.reservation.bytes
     }
 }
 
@@ -171,28 +199,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_growable_permit_tracks_exact_bytes_and_clone_lifetime() {
-        let budget = IncrementalInputBudget::new(NonZeroU64::new(10).unwrap());
-        let permit = budget.reserve_empty();
-        permit.try_grow(3).unwrap();
-        permit.try_grow(4).unwrap();
-        assert_eq!(permit.bytes(), 7);
+    fn immutable_span_permits_share_charges_without_retaining_future_input() {
+        let budget = IncrementalInputBudget::with_limits(
+            NonZeroU64::new(10).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let first = budget.try_reserve(3).unwrap();
+        let preview = first.clone();
+        let second = budget.try_reserve(4).unwrap();
+        assert_eq!(preview.bytes(), 3);
         assert_eq!(budget.snapshot().reserved_bytes, 7);
-
-        let clone = permit.clone();
-        drop(permit);
-        assert_eq!(budget.snapshot().reserved_bytes, 7);
+        assert_eq!(budget.snapshot().reserved_spans, 2);
         assert!(matches!(
-            clone.try_grow(4),
-            Err(IncrementalInputBudgetError::Exhausted {
-                requested_bytes: 4,
-                reserved_bytes: 7,
-                limit_bytes: 10,
-            })
+            budget.try_reserve(4),
+            Err(IncrementalInputBudgetError::Exhausted { .. })
+        ));
+        assert!(matches!(
+            budget.try_reserve(1),
+            Err(IncrementalInputBudgetError::SpanLimit { .. })
         ));
         assert_eq!(budget.snapshot().reserved_bytes, 7);
-        drop(clone);
+        drop(first);
+        drop(second);
+        assert_eq!(budget.snapshot().reserved_bytes, 3);
+        assert_eq!(budget.snapshot().reserved_spans, 1);
+        let retry = budget.try_reserve(7).unwrap();
+        drop(preview);
+        assert_eq!(budget.snapshot().reserved_bytes, 7);
+        drop(retry);
         assert_eq!(budget.snapshot().reserved_bytes, 0);
+        assert_eq!(budget.snapshot().reserved_spans, 0);
     }
 
     #[test]
@@ -201,10 +237,7 @@ mod tests {
         let threads = (0..32)
             .map(|_| {
                 let budget = budget.clone();
-                thread::spawn(move || {
-                    let permit = budget.reserve_empty();
-                    permit.try_grow(16).ok().map(|()| permit)
-                })
+                thread::spawn(move || budget.try_reserve(16).ok())
             })
             .collect::<Vec<_>>();
         let permits = threads

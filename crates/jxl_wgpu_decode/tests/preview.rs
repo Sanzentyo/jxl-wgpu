@@ -418,7 +418,10 @@ fn selected_image_lowering_preserves_physical_ids_ranges_and_dependency_versions
         for selection in [ImageSelection::Preview, ImageSelection::Main] {
             let selected = SelectedImageInventory::new(Arc::clone(&source), selection).unwrap();
             assert_eq!(selected.selection(), selection);
-            assert_eq!(selected.source_inventory(), &original);
+            assert_eq!(
+                selected.source_inventory().complete_inventory(),
+                Some(&original)
+            );
             let lowered = selected.reconstruction_inventory();
             assert!(lowered.image_header.preview_size.is_none());
             let retained = if selection == ImageSelection::Preview {
@@ -742,5 +745,375 @@ fn entropy_errors_are_confined_to_the_selected_image_and_release_its_resources()
             }
             renderer.released();
         }
+    }
+}
+
+#[test]
+fn complete_preview_is_delivered_before_main_input_and_keeps_independent_output_ownership() {
+    let Some(renderer) = Renderer::new() else {
+        return;
+    };
+    for (name, _) in cases() {
+        let data = fixture(&name);
+        let parsed = inventory(&data);
+        let preview_end = parsed.frames[0]
+            .sections
+            .last()
+            .unwrap()
+            .bytes
+            .end()
+            .unwrap() as usize;
+        let expected_preview = renderer.decode(&data, request(ImageSelection::Preview), false);
+        let expected_main = renderer.decode(&data, request(ImageSelection::Main), false);
+        let mut stream = renderer
+            .bounded
+            .stream(request(ImageSelection::Main))
+            .unwrap();
+        let mut transport = jxl_gpu_bitstream::ContainerStreamScanner::new(
+            renderer.bounded.container_stream_limits(),
+        );
+        assert!(
+            stream
+                .take_preview(request(ImageSelection::Main))
+                .unwrap()
+                .is_none()
+        );
+        for chunk in data[..preview_end - 1].chunks(43) {
+            for event in transport.push_chunk(Arc::from(chunk)).unwrap() {
+                stream.push_transport_event(&event).unwrap();
+            }
+            assert!(!stream.is_preview_ready());
+        }
+        assert!(
+            stream
+                .take_preview(request(ImageSelection::Main))
+                .unwrap()
+                .is_none()
+        );
+        for event in transport
+            .push_chunk(Arc::from(&data[preview_end - 1..preview_end]))
+            .unwrap()
+        {
+            stream.push_transport_event(&event).unwrap();
+        }
+        assert_eq!(stream.stats().completed_frames, 1, "{name}");
+        assert_eq!(stream.stats().codestream.frames_started, 1, "{name}");
+        assert!(!stream.is_ready());
+        assert!(stream.is_preview_ready());
+        let before = stream.stats().input_budget;
+        // The method selects Preview without changing this frontend's Main request.
+        let mut preview = stream
+            .take_preview(request(ImageSelection::Main))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stream.stats().input_budget,
+            before,
+            "preview double charges input: {name}"
+        );
+        assert!(stream.stats().preview_taken);
+        assert!(!stream.is_preview_ready());
+        assert!(matches!(
+            stream.take_preview(request(ImageSelection::Preview)),
+            Err(jxl_wgpu_decode::Error::ImageSelection(
+                ImageSelectionError::PreviewAlreadyTaken
+            ))
+        ));
+        assert_eq!(preview.metadata(), &expected_preview.0, "{name}");
+        let preview_frame = pollster::block_on(preview.next_frame_async())
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview_frame.metadata, expected_preview.1[0].0, "{name}");
+        assert!(
+            pollster::block_on(preview.next_frame_async())
+                .unwrap()
+                .is_none()
+        );
+        for chunk in data[preview_end..].chunks(43) {
+            for event in transport.push_chunk(Arc::from(chunk)).unwrap() {
+                stream.push_transport_event(&event).unwrap();
+            }
+        }
+        for event in transport.finish_input().unwrap() {
+            stream.push_transport_event(&event).unwrap();
+        }
+        assert!(stream.is_ready());
+        let mut main = stream.finish().unwrap();
+        assert_eq!(main.metadata(), &expected_main.0, "{name}");
+        let mut frames = Vec::new();
+        while let Some(frame) = pollster::block_on(main.next_frame_async()).unwrap() {
+            frames.push((
+                frame.metadata.clone(),
+                planes::read(&renderer.backend, &frame.output().outputs[0]),
+            ));
+        }
+        assert_eq!(frames, expected_main.1, "{name}");
+        drop(main);
+        // Caller can continue displaying this preview after all main presentations finish.
+        assert_eq!(
+            planes::read(&renderer.backend, &preview_frame.output().outputs[0]),
+            expected_preview.1[0].1,
+            "{name}"
+        );
+        assert!(
+            renderer
+                .bounded
+                .incremental_input_budget()
+                .snapshot()
+                .reserved_bytes
+                <= preview_end as u64,
+            "preview retained later main input: {name}"
+        );
+        drop(preview);
+        drop(preview_frame);
+        renderer.released();
+    }
+}
+
+fn feed_raw(
+    stream: &mut jxl_wgpu_decode::GpuDecodeStream<WgpuDecodeEngine>,
+    data: &[u8],
+    offset: usize,
+) {
+    stream
+        .push_transport_event(&jxl_gpu_bitstream::ContainerStreamEvent::CodestreamChunk {
+            logical_offset: offset as u64,
+            bytes: jxl_gpu_bitstream::StreamSlice::from_shared(Arc::from(data)),
+        })
+        .unwrap();
+}
+
+fn end_raw(stream: &mut jxl_wgpu_decode::GpuDecodeStream<WgpuDecodeEngine>, length: usize) {
+    stream
+        .push_transport_event(&jxl_gpu_bitstream::ContainerStreamEvent::End {
+            codestream_bytes: length as u64,
+            is_container: false,
+        })
+        .unwrap();
+}
+
+#[test]
+fn early_preview_and_main_cancel_independently_before_during_and_after_gpu_submission() {
+    let Some(renderer) = Renderer::new() else {
+        return;
+    };
+    for mode in ["modular", "vardct"] {
+        let data = fixture(mode);
+        let end = inventory(&data).frames[0]
+            .sections
+            .last()
+            .unwrap()
+            .bytes
+            .end()
+            .unwrap() as usize;
+        let expected_preview = renderer.decode(&data, request(ImageSelection::Preview), false);
+        let expected_main = renderer.decode(&data, request(ImageSelection::Main), false);
+        for cancel_main in [false, true] {
+            for stage in 0..3 {
+                let mut stream = renderer
+                    .bounded
+                    .stream(request(ImageSelection::Main))
+                    .unwrap();
+                feed_raw(&mut stream, &data[..end], 0);
+                let mut preview = stream
+                    .take_preview(request(ImageSelection::Preview))
+                    .unwrap()
+                    .unwrap();
+                let gpu_budget = renderer.backend.transient_memory_budget();
+                let held = gpu_budget
+                    .try_reserve(gpu_budget.snapshot().limit_bytes)
+                    .unwrap();
+                let progress = preview.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
+                assert_eq!(progress.submitted, 0);
+                assert!(matches!(
+                    progress.backpressure,
+                    Some(jxl_wgpu_decode::PrefetchBackpressure::Memory(_))
+                ));
+                drop(held);
+                if stage > 0 {
+                    assert_eq!(
+                        preview
+                            .prefetch(NonZeroUsize::new(1).unwrap())
+                            .unwrap()
+                            .submitted,
+                        1
+                    );
+                }
+                let mut frame = if stage == 2 {
+                    Some(
+                        pollster::block_on(preview.next_frame_async())
+                            .unwrap()
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                if cancel_main {
+                    drop(stream);
+                    if frame.is_none() {
+                        frame = Some(
+                            pollster::block_on(preview.next_frame_async())
+                                .unwrap()
+                                .unwrap(),
+                        );
+                    }
+                    assert_eq!(
+                        planes::read(
+                            &renderer.backend,
+                            &frame.as_ref().unwrap().output().outputs[0]
+                        ),
+                        expected_preview.1[0].1
+                    );
+                    drop(preview);
+                    drop(frame);
+                } else {
+                    drop(preview);
+                    drop(frame);
+                    feed_raw(&mut stream, &data[end..], end);
+                    end_raw(&mut stream, data.len());
+                    let mut main = stream.finish().unwrap();
+                    let main_frame = pollster::block_on(main.next_frame_async())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(main_frame.metadata, expected_main.1[0].0);
+                    assert_eq!(
+                        planes::read(&renderer.backend, &main_frame.output().outputs[0]),
+                        expected_main.1[0].1
+                    );
+                    drop(main_frame);
+                    drop(main);
+                }
+                renderer.released();
+            }
+        }
+    }
+}
+
+#[test]
+fn early_gpu_preview_and_later_main_entropy_failures_remain_independent() {
+    let Some(renderer) = Renderer::new() else {
+        return;
+    };
+    for mode in ["modular", "vardct"] {
+        let data = fixture(mode);
+        let info = inventory(&data);
+        let end = info.frames[0].sections.last().unwrap().bytes.end().unwrap() as usize;
+        for physical in 0..2 {
+            let expected = renderer.decode(
+                &data,
+                request(if physical == 0 {
+                    ImageSelection::Main
+                } else {
+                    ImageSelection::Preview
+                }),
+                false,
+            );
+            let mut damaged = data.clone();
+            for section in &info.frames[physical].sections {
+                damaged[section.bytes.offset as usize..section.bytes.end().unwrap() as usize]
+                    .fill(0xff);
+            }
+            let mut stream = renderer
+                .bounded
+                .stream(request(ImageSelection::Main))
+                .unwrap();
+            feed_raw(&mut stream, &damaged[..end], 0);
+            if physical == 0 {
+                if let Ok(Some(mut preview)) = stream.take_preview(request(ImageSelection::Preview))
+                {
+                    assert!(pollster::block_on(preview.next_frame_async()).is_err());
+                }
+                feed_raw(&mut stream, &damaged[end..], end);
+                end_raw(&mut stream, damaged.len());
+                let mut main = stream.finish().unwrap();
+                let frame = pollster::block_on(main.next_frame_async())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    planes::read(&renderer.backend, &frame.output().outputs[0]),
+                    expected.1[0].1
+                );
+                drop(frame);
+                drop(main);
+            } else {
+                let mut preview = stream
+                    .take_preview(request(ImageSelection::Preview))
+                    .unwrap()
+                    .unwrap();
+                let frame = pollster::block_on(preview.next_frame_async())
+                    .unwrap()
+                    .unwrap();
+                feed_raw(&mut stream, &damaged[end..], end);
+                end_raw(&mut stream, damaged.len());
+                if let Ok(mut main) = stream.finish() {
+                    assert!(pollster::block_on(main.next_frame_async()).is_err());
+                }
+                assert_eq!(
+                    planes::read(&renderer.backend, &frame.output().outputs[0]),
+                    expected.1[0].1
+                );
+                drop(frame);
+                drop(preview);
+            }
+            renderer.released();
+        }
+    }
+}
+
+#[test]
+fn early_preview_scalar_orientation_request_is_independent_of_main_color_request() {
+    let Some(renderer) = Renderer::new() else {
+        return;
+    };
+    for name in ["alpha_modular", "alpha_vardct"] {
+        let data = fixtures::orient(&fixture(name), 6);
+        let end = inventory(&data).frames[0]
+            .sections
+            .last()
+            .unwrap()
+            .bytes
+            .end()
+            .unwrap() as usize;
+        let output = GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+            NumericSampleMapping::NormalizedUnsigned,
+        )
+        .unwrap()
+        .with_extra_channel(0)
+        .unwrap()
+        .with_orientation_policy(OrientationPolicy::Keep)
+        .with_image_selection(ImageSelection::Preview);
+        let expected_preview = renderer.decode(&data, output.clone(), false);
+        let expected_main = renderer.decode(&data, request(ImageSelection::Main), false);
+        let mut stream = renderer
+            .bounded
+            .stream(request(ImageSelection::Main))
+            .unwrap();
+        feed_raw(&mut stream, &data[..end], 0);
+        let mut preview = stream.take_preview(output).unwrap().unwrap();
+        assert_eq!(preview.metadata(), &expected_preview.0);
+        let frame = pollster::block_on(preview.next_frame_async())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            planes::read(&renderer.backend, &frame.output().outputs[0]),
+            expected_preview.1[0].1
+        );
+        drop(frame);
+        drop(preview);
+        feed_raw(&mut stream, &data[end..], end);
+        end_raw(&mut stream, data.len());
+        let mut main = stream.finish().unwrap();
+        assert_eq!(main.metadata(), &expected_main.0);
+        let frame = pollster::block_on(main.next_frame_async())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            planes::read(&renderer.backend, &frame.output().outputs[0]),
+            expected_main.1[0].1
+        );
+        drop(frame);
+        drop(main);
+        renderer.released();
     }
 }

@@ -754,7 +754,7 @@ impl GpuSubmissionEngine for TypedRejectEngine {
         _request: &GpuOutputRequest,
         _inventory: jxl_wgpu_decode::SelectedImageInventory,
     ) -> Result<PreparedGpuSession<Self::Session>> {
-        assert_eq!(codestream.is_container(), self.expected_container);
+        assert_eq!(codestream.is_container(), Some(self.expected_container));
         assert_jxl_signature(&codestream);
         if self.unsupported {
             return Err(UnsupportedProfile::new(
@@ -835,9 +835,13 @@ impl GpuSubmissionEngine for CapturingEngine {
             logical_bytes: codestream.logical_bytes(),
             spans: codestream.span_count(),
             retained_input_bytes: codestream.retained_input_bytes(),
-            is_container: codestream.is_container(),
+            is_container: codestream.is_container().unwrap(),
             is_contiguous: codestream.contiguous_bytes().is_some(),
-            inventory: inventory.source_inventory().clone(),
+            inventory: inventory
+                .source_inventory()
+                .complete_inventory()
+                .unwrap()
+                .clone(),
         });
         Ok(PreparedGpuSession::new(
             fixed_profile(8, ModularPredictor::Zero),

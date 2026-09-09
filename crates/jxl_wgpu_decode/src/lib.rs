@@ -90,10 +90,13 @@ pub use frame_plan::{
     FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,
 };
 pub use frame_surface::FrameSurfaceError;
-pub use image_selection::{ImageSelection, ImageSelectionError, SelectedImageInventory};
+pub use image_selection::{
+    ImageSelection, ImageSelectionError, ImageSourceInventory, SelectedImageInventory,
+};
 pub use inflight::{Acquire, InFlightLimiter, InFlightPermit};
 pub use input_budget::{
-    IncrementalInputBudget, IncrementalInputBudgetError, IncrementalInputBudgetSnapshot,
+    DEFAULT_INCREMENTAL_INPUT_SPANS, IncrementalInputBudget, IncrementalInputBudgetError,
+    IncrementalInputBudgetSnapshot,
 };
 pub use jxl_gpu_bitstream::ParseLimits;
 pub use jxl_gpu_formats::{ImageLayout, PixelFormat};

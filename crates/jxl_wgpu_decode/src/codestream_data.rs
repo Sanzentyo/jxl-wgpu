@@ -8,21 +8,40 @@ use jxl_gpu_bitstream::StreamSlice;
 use crate::{Error, Result, input_budget::IncrementalInputPermit, modular_tree::BitInput};
 
 #[derive(Clone, Debug)]
-struct CodestreamSpan {
+pub(crate) struct CodestreamSpan {
     logical_offset: u64,
     bytes: StreamSlice,
+    retained_input: Option<IncrementalInputPermit>,
 }
 
-/// A validated, logically contiguous codestream whose physical bytes may live in shared chunks.
+impl CodestreamSpan {
+    pub(crate) fn admitted(
+        logical_offset: u64,
+        bytes: StreamSlice,
+        budget: &crate::IncrementalInputBudget,
+    ) -> Result<Self> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| Error::backend("codestream span length exceeds u64"))?;
+        Ok(Self {
+            logical_offset,
+            bytes,
+            retained_input: Some(budget.try_reserve(length)?),
+        })
+    }
+}
+
+/// A logically contiguous codestream or complete preview prefix in shared chunks.
 ///
 /// The span table owns only shared ranges. It never assembles the complete codestream into a new
 /// allocation; engines copy just the bounded metadata or GPU-upload range they are consuming.
+/// Metadata and declared section extents are checked before handoff; entropy validation belongs
+/// to the GPU session. [`Self::is_container`] distinguishes a prefix from completed transport.
 #[derive(Clone, Debug)]
 pub struct GpuCodestream {
     spans: Arc<[CodestreamSpan]>,
     logical_bytes: u64,
-    container: bool,
-    retained_input: Option<IncrementalInputPermit>,
+    container: Option<bool>,
+    retained_input_bytes: u64,
 }
 
 impl GpuCodestream {
@@ -34,51 +53,96 @@ impl GpuCodestream {
         let bytes = StreamSlice::from_shared_range(storage, byte_range).ok_or(
             Error::EngineContract("GPU codestream range is outside its shared storage"),
         )?;
-        Self::from_spans_inner([(0, bytes)], container, None)
+        Self::from_spans_inner(
+            [Ok(CodestreamSpan {
+                logical_offset: 0,
+                bytes,
+                retained_input: None,
+            })],
+            Some(container),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn from_spans(spans: impl IntoIterator<Item = (u64, StreamSlice)>) -> Result<Self> {
-        Self::from_spans_inner(spans, false, None)
+        Self::from_spans_inner(
+            spans.into_iter().map(|(logical_offset, bytes)| {
+                Ok(CodestreamSpan {
+                    logical_offset,
+                    bytes,
+                    retained_input: None,
+                })
+            }),
+            Some(false),
+        )
     }
 
     pub(crate) fn from_stream_spans(
-        spans: impl IntoIterator<Item = (u64, StreamSlice)>,
+        spans: impl IntoIterator<Item = CodestreamSpan>,
         container: bool,
-        retained_input: IncrementalInputPermit,
     ) -> Result<Self> {
-        Self::from_spans_inner(spans, container, Some(retained_input))
+        Self::from_spans_inner(spans.into_iter().map(Ok), Some(container))
+    }
+
+    /// Shares only spans intersecting the prefix. A clipped final span still owns its entire
+    /// admission charge, because its backing transport allocation remains shared.
+    pub(crate) fn preview_prefix(spans: &[CodestreamSpan], end: u64) -> Result<Self> {
+        let prefix = spans
+            .iter()
+            .take_while(|span| span.logical_offset < end)
+            .map(|span| {
+                let mut span = span.clone();
+                let length =
+                    usize::try_from((end - span.logical_offset).min(span.bytes.len() as u64))
+                        .map_err(|_| Error::backend("preview span length exceeds host space"))?;
+                span.bytes = span.bytes.slice(0..length).ok_or(Error::EngineContract(
+                    "preview prefix slice is outside its span",
+                ))?;
+                Ok(span)
+            });
+        let source = Self::from_spans_inner(prefix, None)?;
+        if source.logical_bytes != end {
+            return Err(Error::EngineContract(
+                "preview source does not cover its frame",
+            ));
+        }
+        Ok(source)
     }
 
     fn from_spans_inner(
-        spans: impl IntoIterator<Item = (u64, StreamSlice)>,
-        container: bool,
-        retained_input: Option<IncrementalInputPermit>,
+        spans: impl IntoIterator<Item = Result<CodestreamSpan>>,
+        container: Option<bool>,
     ) -> Result<Self> {
         let mut expected_offset = 0u64;
+        let mut retained_input_bytes = 0u64;
         let mut collected = Vec::new();
-        for (logical_offset, bytes) in spans {
-            if logical_offset != expected_offset {
+        for span in spans {
+            let span = span?;
+            if span.logical_offset != expected_offset {
                 return Err(Error::EngineContract(
                     "codestream spans are not logically contiguous",
                 ));
             }
-            if bytes.is_empty() {
+            if span.bytes.is_empty() {
                 continue;
             }
             expected_offset = expected_offset
                 .checked_add(
-                    u64::try_from(bytes.len())
+                    u64::try_from(span.bytes.len())
                         .map_err(|_| Error::backend("codestream span length exceeds u64"))?,
                 )
                 .ok_or_else(|| Error::backend("codestream span offset overflow"))?;
             collected
                 .try_reserve(1)
                 .map_err(|_| Error::backend("codestream span table allocation failed"))?;
-            collected.push(CodestreamSpan {
-                logical_offset,
-                bytes,
-            });
+            retained_input_bytes = retained_input_bytes
+                .checked_add(
+                    span.retained_input
+                        .as_ref()
+                        .map_or(0, IncrementalInputPermit::bytes),
+                )
+                .ok_or_else(|| Error::backend("retained input byte count overflow"))?;
+            collected.push(span);
         }
         if collected.is_empty() {
             return Err(Error::EngineContract("codestream span source is empty"));
@@ -87,7 +151,7 @@ impl GpuCodestream {
             spans: collected.into(),
             logical_bytes: expected_offset,
             container,
-            retained_input,
+            retained_input_bytes,
         })
     }
 
@@ -102,7 +166,9 @@ impl GpuCodestream {
     }
 
     #[must_use]
-    pub const fn is_container(&self) -> bool {
+    /// Authoritative transport kind, or `None` for an independently decodable preview prefix.
+    /// A prefix never claims that the remaining main image or container has been validated.
+    pub const fn is_container(&self) -> Option<bool> {
         self.container
     }
 
@@ -116,9 +182,7 @@ impl GpuCodestream {
     /// Bytes admitted by the incremental-input budget and retained by this source.
     #[must_use]
     pub fn retained_input_bytes(&self) -> u64 {
-        self.retained_input
-            .as_ref()
-            .map_or(0, IncrementalInputPermit::bytes)
+        self.retained_input_bytes
     }
 
     pub(crate) fn logical_bits(&self) -> Result<u64> {

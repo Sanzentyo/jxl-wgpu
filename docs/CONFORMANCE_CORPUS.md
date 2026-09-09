@@ -2423,9 +2423,10 @@ that corruption fails negotiation or validation without returning a frame. Full-
 is retryable, caller leases retain output after session drop, and pending cancellation returns
 both GPU and incremental-input reservations to zero.
 
-The production shader ABI and GPU allocation lifetimes are unchanged. Sessions still open only
-after authoritative end-of-input; early preview delivery, intermediate progressive output,
-encoder preview emission and full 18181-3 conformance remain open.
+At this complete-input selection checkpoint (`a2300be`), the shader ABI and GPU allocation
+lifetimes were unchanged. Sessions opened only after authoritative end-of-input; the following
+checkpoint adds early preview delivery. Intermediate progressive output, encoder preview emission
+and full 18181-3 conformance remain open.
 
 Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
 770 tests across 39 targets, with zero failures and one existing manual benchmark ignored.
@@ -2433,3 +2434,48 @@ Formatting, workspace check, warning-free Clippy/rustdoc, Rust 1.89 all-target/a
 and the six-crate WASM check pass. The reference and Metal harnesses each pass 18 cases;
 indexed Gray8 U8 CPU readback passes with direct mapping. All 48 preview codestreams reproduce
 byte-identically. The full JPEG XL goal remains active.
+
+### Preview delivery before main input completion
+
+`GpuDecodeStream::take_preview` now opens a separate GPU session immediately after the preview's
+FrameEnd, with no main frame bytes or transport End required. `ImageSourceInventory::PreviewPrefix`
+contains only the original image header, physical preview frame and exact available prefix length;
+it cannot be mistaken for a complete main-frame inventory. Reconstruction keeps physical IDs,
+sections and noise seeds, with the same preview presentation lowering as complete-input selection.
+The frontend continues to main input and `finish` still requires authoritative transport completion.
+A successful preview presentation makes no claim about future main entropy or container validity.
+
+The existing 48 fixtures need no entropy or fixture changes. All 48 early previews and all subsequent
+main presentations are bit-identical to the complete-input paths, including main LF chains and
+animations. Tests retain preview output across main completion. Separate GPU tests cover independent
+numeric-alpha/Keep-orientation versus main-color/Apply requests, full-budget backpressure and retry,
+cancellation before/during/after submission in both directions, and corrupt preview/main entropy
+without invalidating the other image. No host pixel codec or shader ABI change is introduced.
+
+`tests/stream_preview.rs` audits both coding modes at every two-chunk split of raw, jxlc and
+fragmented jxlp transports with auxiliary payloads. It checks original prefix bytes and physical
+metadata, final main inventory, incomplete readiness, single successful take, engine-open retry,
+missing previews, incomplete finish and poisoned later input. Delayed takes and chunks crossing
+the preview boundary verify exact source retention; the prefix cannot expose bytes beyond its
+last section or acquire ownership of later ranges.
+
+Each admitted nonempty range owns an immutable shared reservation. Main and preview share it
+without double charging; a clipped final range keeps its complete original admission charge until
+the final owner releases it. Later ranges have separate lifetimes. The shared budget now reserves
+logical bytes and span count atomically, with a caller-configurable span limit (1,048,576 by default)
+to bound metadata growth under byte-drip input. Either quota rejects before scanner mutation, and
+the same borrowed input event can be retried after another owner releases capacity. Allocator
+capacity, unrelated bytes inside a caller allocation, auxiliary payloads and collection metadata
+remain outside the logical byte counter; span count separately bounds per-range bookkeeping.
+`GpuCodestream::is_container()` returns `None` for a preview prefix and `Some(bool)` only for
+completed transport. Tests check that cancellation and failures release both counters after the
+last source owner, including preview that outlives its receiving frontend.
+
+Validation on 2026-09-09 Apple M5/Metal: the serial all-target/all-feature workspace run passes
+779 tests across 40 targets (32 nonempty and eight empty example targets), with zero failures and
+one existing manual benchmark ignored. Formatting, workspace check, warning-free Clippy/rustdoc,
+Rust 1.89 all-target/all-feature check and the six-crate WASM check pass. Reference and Metal
+harnesses each pass 18 cases; indexed Gray8 U8 CPU readback passes with direct mapping of all
+221 logical bytes. The 48 fixture sources and their generator are unchanged. The full JPEG XL
+roadmap remains active, including intermediate progressive delivery and the remaining rendering,
+color, container, encoder and conformance requirements.

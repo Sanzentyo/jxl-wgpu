@@ -33,8 +33,10 @@ and presentation clock while preserving physical frame IDs, entropy ranges and n
 The 48-stream preview corpus covers both coding modes, all preview aspect encodings, non-final
 preview headers, alpha, original RGB, JPEG sampling, floating samples, resampling and main
 LF/animation dependencies. Whole and bounded fragmented input produce identical output.
-Both entry points currently validate complete input before opening a session; early preview
-delivery and intermediate progressive output remain separate work.
+`GpuDecodeStream::take_preview` opens a complete embedded preview before any main frame bytes or
+transport End arrive. The same frontend continues receiving the main image and `finish` requires
+its authoritative completion. Preview and main have independent output requests and leases;
+intermediate progressive output remains separate work.
 
 The Modular decoder also reconstructs lossy XYB and original-sRGB color on the GPU. A shared
 color-output module serves both coding modes; Modular joins Gaborish, EPF, resampling, alpha,
@@ -62,12 +64,14 @@ image header and each frame header/TOC, emits frame inventories before their phy
 routes ordered section ranges without retaining the whole codestream. `GpuDecoder::stream` consumes
 those borrowed transport events, builds one checked logical span table without joining it, and
 hands the same inventory/source pair to the stock coding-mode selector used by `open`. Its shared,
-non-blocking incremental-input budget admits a `CodestreamChunk` before scanner state changes, so a
-rejected event is retryable across concurrent streams. `GpuDecoder::container_stream_limits`
-provides matching hard limits for the caller's transport scanner. The one growable ownership
-permit follows
-the source into the selected engine: Modular releases it after submission, staged local-tree
-VarDCT retains it through cursor-dependent HF submission, and cancellation releases it immediately.
+incremental-input budget admits a `CodestreamChunk` against byte and span limits before scanner
+state changes, so a rejected event is retryable across concurrent streams.
+`GpuDecoder::container_stream_limits` provides matching hard limits for the caller's transport
+scanner. Each retained range shares one immutable ownership token between the frontend and any
+preview source. Preview excludes subsequent ranges; a range crossing its end keeps its full
+charge until the last owner releases it. Modular releases source ownership after submission,
+while staged local-tree VarDCT retains it through cursor-dependent HF submission. Cancellation
+releases ownership when the corresponding source-using work no longer needs it.
 Both engines copy bounded GPU upload ranges across physical chunk boundaries; VarDCT also
 initializes its temporary whole-codestream GPU buffer directly from those spans without a second
 host-sized `Vec`. All Modular and VarDCT scalar metadata bit parsing is span-native, including
