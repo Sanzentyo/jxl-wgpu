@@ -464,8 +464,15 @@ impl FramePendingFrame {
                 },
                 GpuImageFrame {
                     token: self.token,
-                    outputs: crate::frame_surface::outputs(&self.layout, None, &frame.output),
-                    changed: crate::frame_surface::changed_regions(&self.layout, None),
+                    outputs: crate::frame_surface::outputs(
+                        &self.layout,
+                        self.surface.as_deref(),
+                        &frame.output,
+                    ),
+                    changed: crate::frame_surface::changed_regions(
+                        &self.layout,
+                        self.surface.as_deref(),
+                    ),
                 },
             ),
         }))

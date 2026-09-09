@@ -13,7 +13,7 @@ use jxl_wgpu::{GpuImageFrame, UnvalidatedGpuImageFrame};
 use super::{SequenceSource, submission_counter};
 use crate::{
     Error, FrameExecutionPlan, FrameMetadata, GpuPendingFrame, GpuSubmissionSession,
-    PreparedGpuSession, Result, SubmittedGpuFrame, WgpuDecodePendingFrame,
+    PreparedGpuSession, Result, SubmittedGpuFrame, SubmittedGpuUpdate, WgpuDecodePendingFrame,
     WgpuDecodeSubmissionSession,
 };
 
@@ -21,8 +21,9 @@ fn prepare(
     source: &SequenceSource,
     index: usize,
     extent: Extent2d,
+    progressive: bool,
 ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
-    let prepared = source.prepare_physical(index, false)?;
+    let prepared = source.prepare_physical(index, progressive)?;
     if prepared.metadata.extent != extent {
         return Err(Error::EngineContract(
             "frame producer disagrees with the presentation extent",
@@ -45,7 +46,7 @@ impl IndependentSession {
     ) -> Result<(Self, NonZeroUsize)> {
         let range = &plan.presentations[0].physical_frames;
         let first = range.start;
-        let prepared = prepare(&source, first, plan.metadata.extent)?;
+        let prepared = prepare(&source, first, plan.metadata.extent, first + 1 == range.end)?;
         let slots = prepared
             .resolved_frame_slots()
             .unwrap_or(source.request.max_frame_slots());
@@ -79,7 +80,15 @@ impl IndependentSession {
         let range = &presentation.physical_frames;
         let physical = range.start;
         if self.prepared.is_none() {
-            self.prepared = Some(prepare(source, physical, plan.metadata.extent)?.session);
+            self.prepared = Some(
+                prepare(
+                    source,
+                    physical,
+                    plan.metadata.extent,
+                    physical + 1 == range.end,
+                )?
+                .session,
+            );
         }
         let producer = self.prepared.as_mut().expect("physical producer prepared");
         // Admission failure leaves this producer and its presentation available for retry.
@@ -162,7 +171,13 @@ impl IndependentPending {
             "independent presentation lost its source",
         ))?;
         self.physical += 1;
-        let mut producer = prepare(source, self.physical, self.extent)?.session;
+        let mut producer = prepare(
+            source,
+            self.physical,
+            self.extent,
+            self.physical + 1 == self.end,
+        )?
+        .session;
         let pending = producer
             .submit_next()?
             .ok_or(Error::EngineContract("physical producer returned no frame"))?;
@@ -176,19 +191,52 @@ impl IndependentPending {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
+        self.poll_update(context, false)
+            .map(|result| match result? {
+                SubmittedGpuUpdate::Complete(frame) => Ok(frame),
+                SubmittedGpuUpdate::Intermediate { .. } => Err(Error::EngineContract(
+                    "final-only completion returned an intermediate",
+                )),
+            })
+    }
+
+    pub(super) fn poll_update(
+        &mut self,
+        context: &mut Context<'_>,
+        emit_intermediates: bool,
+    ) -> Poll<Result<SubmittedGpuUpdate<GpuImageFrame>>> {
         loop {
             let pending = self.pending.as_mut().ok_or(Error::EngineContract(
                 "independent presentation was consumed",
             ))?;
-            let result = Pin::new(pending.as_mut()).poll_complete(context);
+            let result = if emit_intermediates && self.physical + 1 == self.end {
+                Pin::new(pending.as_mut()).poll_next_update(context)
+            } else {
+                Pin::new(pending.as_mut())
+                    .poll_complete(context)
+                    .map(|result| result.map(SubmittedGpuUpdate::Complete))
+            };
             self.update_count()?;
-            let frame = match result {
+            let update = match result {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result?,
             };
+            let frame = match update {
+                SubmittedGpuUpdate::Complete(frame) => frame,
+                SubmittedGpuUpdate::Intermediate {
+                    mut frame,
+                    progression,
+                } => {
+                    frame.metadata = self.metadata.clone();
+                    return Poll::Ready(Ok(SubmittedGpuUpdate::Intermediate {
+                        frame,
+                        progression,
+                    }));
+                }
+            };
             self.pending = None;
             if let Some(frame) = self.decoded(frame)? {
-                return Poll::Ready(Ok(frame));
+                return Poll::Ready(Ok(SubmittedGpuUpdate::Complete(frame)));
             }
         }
     }

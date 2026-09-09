@@ -941,3 +941,25 @@ LF render work and drain already submitted renders before advancing. Existing sh
 unchanged. Scalar-oracle GPU tests cover LF1–LF4, exact odd grids, poisoned source padding, custom
 weights, and exact rendering admission; sequence tests cover callback retirement and held images
 after corruption, cancellation and late pressure.
+
+### Animated and composed coefficient updates
+
+Only the terminal physical producer in a presentation reserves DC/AC snapshots. Hidden or
+superseded producers complete and validate before the terminal producer begins. Surface-producing
+VarDCT uses the same snapshot accounting with the exact canonical planar surface layout. Each
+snapshot is imported as immutable storage; the compositor reads committed reference versions,
+records a separately admitted blend when required, and packs an independently leased output.
+Reference slots are updated only by final physical reconstruction, never by a refinement.
+
+The `Refinement` state retains the physical decoder across the extra blend/pack submissions. Their
+completion jobs retain all source/reference leases and transient permits. Submission counters
+include every render. Final-only polling and waiting drain any already submitted render, skip a
+pack which has not started, and resume the same producer. Cancellation can drop this state while
+work is queued; callbacks retire resources before their byte reservations become available. A
+failed later blend/pack poisons the presentation while keeping earlier output leases valid.
+
+Actual-adapter tests stop deterministically at direct-pack, blend and post-blend-pack boundaries,
+then cancel or switch to blocking/poll final completion. Public tests additionally cover initial
+admission retry, cancellation before DC/after DC/after AC, fragmented input, later-AC rejection and
+late composition pressure. Only retained output bytes survive session/callback retirement, and
+retained images are byte-identical after later work. No shader ABI or CPU pixel fallback is added.

@@ -2641,3 +2641,55 @@ check, Clippy and rustdoc with warnings denied, MSRV 1.89.0, and the six-crate a
 WebAssembly check pass. Reference and Metal harnesses each pass 18/18 cases; the reference run
 uses no adapter. Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and
 zero staging bytes. The full JPEG XL goal and the remaining precision/conformance gates stay open.
+
+### Animated and composed VarDCT coefficient updates
+
+`tests/vardct_engine_gpu/progression/sequence.rs` covers seven existing animation families:
+`sequence_vardct_rgb`, `sequence_vardct_gray`, `sequence_vardct_dc`,
+`sequence_mixed_jpeg_modular`, `composition_vardct`, `composition_vardct_gray`, and
+`composition_vardct_dc`. Each runs with Apply/Keep orientation and whole/40-byte GPU windows plus
+fragmented asynchronous transport. All terminal VarDCT producers publish DC and every nonfinal AC
+pass with the original physical ID, complete-pass count, intended detail and exact presentation
+clock, duration, timecode and finality. Hidden and overwritten producers validate first. Completed
+Modular color frames remain final-only; direct LF dependencies retain their typed LF updates.
+
+libjxl 0.12.0 cannot flush an unfinalized crop/blend frame (`FrameDecoder::Flush` explicitly rejects
+it), and requesting linear output for the composed animation fails after its first final. The
+new offline header generator keeps compact standalone image/frame headers in
+`test-data/progressive_composition`. Test support inserts the original entropy unchanged, rebuilds
+the TOC, and asserts that every entropy-interpretation field and color/restoration declaration
+survives. Native sRGB layer flushes are then composed independently in F64, with clipped signed
+origins, Replace/Add/Multiply behavior, missing-reference backgrounds and final-only reference
+updates. Every scalar final must also match native coalesced final output within 0.00001 normalized
+linear error. Signed sRGB conversion and independent orientation mapping produce the requested
+linear RGBA oracle. Native mixed non-XYB output explicitly installs libjxl's default CMS before
+selecting linear sRGB; the helper now links both `libjxl` and `libjxl_cms`.
+
+Maximum normalized linear errors on Apple M5 are 0.000126 for independent RGB/LF, 0.000033 for
+grayscale and 0.000048 for mixed coding. Direct DC keeps its 0.00001 bound; other direct updates
+stay below 0.0002. Composed RGB, gray and LF maxima are respectively 0.000581, 0.000060 and 0.000721
+under an explicit 0.001 regression bound. Extended reference values amplify differences also
+present in final-only decoding; this bound is not ISO precision evidence. Every final GPU output
+is byte-identical to final-only output and whole/bounded images are identical. Retained snapshots
+are re-read after all presentations; none may change.
+
+Public lifecycle tests cover admission retry, cancellation before DC/after DC/after AC, switching
+to synchronous or asynchronous final-only completion without changing the next presentation's
+clock or pixels, later-AC corruption, and late blend/pack admission failure. Earlier complete and
+intermediate images survive errors; the session is poisoned and only held output bytes survive
+callback retirement. Private tests stop real submitted work at direct-pack, blend and
+post-blend-pack boundaries before cancellation or final-only waiting/polling. Existing overwritten
+Modular/VarDCT/LF corruption tests now request progressive output, ensuring no hidden-layer error
+is bypassed to publish a refinement; LF slot-reuse tests also check coefficient IDs and counts.
+
+The full JPEG XL goal remains active. Composed LF previews, Modular/extra-channel refinements,
+selective regions, incomplete-frame readiness, broader color domains and independent precision/
+conformance requirements remain open.
+
+Local final validation passes 802 tests across all 42 all-feature workspace targets on Apple M5/
+Metal; the existing manual release-mode allocation benchmark remains ignored. Formatting,
+workspace check, Clippy and rustdoc with warnings denied, MSRV 1.89.0, and the six-crate all-feature
+WebAssembly check pass. Reference and Metal harnesses each pass 18/18 cases; reference uses no
+adapter. Gray8 U8 CPU readback passes with 221 logical bytes, direct mapping and zero staging
+bytes. All 27 standalone header fragments (1,908 bytes total) regenerate exactly, and the C
+generator's normal mode reproduces all 11 original composition fixtures unchanged.

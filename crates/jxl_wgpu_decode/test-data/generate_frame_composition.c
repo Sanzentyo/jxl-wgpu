@@ -13,6 +13,8 @@ static void check(JxlEncoderStatus status) { if (status != JXL_ENC_SUCCESS) exit
 static uint8_t* jpeg;
 static size_t jpeg_size;
 static int associated;
+/* Offline standalone headers for testing progressive composition without FlushImage blending. */
+static int isolated_layer = -1;
 
 typedef struct {
   int x, y;
@@ -23,25 +25,6 @@ typedef struct {
 
 static void generate(const char* dir, const char* name, uint32_t width, uint32_t height,
     uint32_t channels, uint32_t bits, int orientation, int vardct, int dc, int still) {
-  JxlEncoder* enc = JxlEncoderCreate(NULL);
-  JxlBasicInfo info;
-  JxlEncoderInitBasicInfo(&info);
-  info.xsize = width; info.ysize = height; info.bits_per_sample = bits;
-  int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0 || associated;
-  uint32_t color_channels = channels <= 2 ? 1 : 3;
-  int has_alpha = channels != color_channels;
-  uint32_t alpha_bits = has_alpha ? (different_alpha ? 5 : bits) : 0;
-  info.num_color_channels = color_channels;
-  info.num_extra_channels = has_alpha; info.alpha_bits = alpha_bits;
-  info.alpha_premultiplied = associated;
-  info.uses_original_profile = vardct <= 0; info.orientation = (JxlOrientation)orientation;
-  info.have_animation = !still;
-  info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
-  info.animation.num_loops = 2; info.animation.have_timecodes = !still;
-  check(JxlEncoderSetBasicInfo(enc, &info));
-  JxlColorEncoding color;
-  JxlColorEncodingSetToSRGB(&color, color_channels == 1);
-  check(JxlEncoderSetColorEncoding(enc, &color));
   const Layer layers[] = {
     {0, 0, width, height, 1, 1, 0, 0, JXL_BLEND_REPLACE, JXL_BLEND_REPLACE, 0},
     {-2, 3, 20, 12, 0, 2, 1, 1, JXL_BLEND_BLEND, JXL_BLEND_REPLACE, 1},
@@ -53,7 +36,27 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     {2, 1, 11, 7, 0, 2, 0, 3, JXL_BLEND_ADD, JXL_BLEND_ADD, 0},
     {15, 8, 23, 17, 2, 0, 2, 1, JXL_BLEND_MUL, JXL_BLEND_BLEND, 1},
   };
+  JxlEncoder* enc = JxlEncoderCreate(NULL);
+  JxlBasicInfo info;
+  JxlEncoderInitBasicInfo(&info);
+  info.xsize = isolated_layer < 0 ? width : layers[isolated_layer].width; info.ysize = isolated_layer < 0 ? height : layers[isolated_layer].height; info.bits_per_sample = bits;
+  int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0 || associated;
+  uint32_t color_channels = channels <= 2 ? 1 : 3;
+  int has_alpha = channels != color_channels;
+  uint32_t alpha_bits = has_alpha ? (different_alpha ? 5 : bits) : 0;
+  info.num_color_channels = color_channels;
+  info.num_extra_channels = has_alpha; info.alpha_bits = alpha_bits;
+  info.alpha_premultiplied = associated;
+  info.uses_original_profile = vardct <= 0; info.orientation = (JxlOrientation)orientation;
+  info.have_animation = !still && isolated_layer < 0;
+  info.animation.tps_numerator = 30000; info.animation.tps_denominator = 1001;
+  info.animation.num_loops = 2; info.animation.have_timecodes = !still && isolated_layer < 0;
+  check(JxlEncoderSetBasicInfo(enc, &info));
+  JxlColorEncoding color;
+  JxlColorEncodingSetToSRGB(&color, color_channels == 1);
+  check(JxlEncoderSetColorEncoding(enc, &color));
   for (uint32_t frame = 0; frame < sizeof(layers)/sizeof(*layers); ++frame) {
+    if (isolated_layer >= 0 && frame != (uint32_t)isolated_layer) continue;
     const Layer* layer = &layers[frame];
     size_t bytes = (size_t)layer->width * layer->height * channels * (different_alpha ? 4 : bits > 8 ? 2 : 1);
     void* pixels = malloc(bytes);
@@ -105,6 +108,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     header.layer_info.blend_info.source = layer->color_source;
     header.layer_info.blend_info.alpha = 0; header.layer_info.blend_info.clamp = layer->clamp;
     if (frame == 3 && strcmp(name, "gray_clamp") == 0) header.layer_info.blend_info.clamp = JXL_TRUE;
+    if (isolated_layer >= 0) JxlEncoderInitFrameHeader(&header);
     check(JxlEncoderSetFrameHeader(settings, &header));
     if (has_alpha) {
       JxlBlendInfo alpha = header.layer_info.blend_info;
@@ -121,6 +125,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   }
   JxlEncoderCloseInput(enc);
   char path[1024]; snprintf(path, sizeof(path), "%s/composition_%s.jxl.hex", dir, name);
+  if (isolated_layer >= 0) snprintf(path, sizeof(path), "%s/composition_%s_layer%d.jxl.hex", dir, name, isolated_layer);
   FILE* out = fopen(path, "w"); if (!out) exit(2);
   JxlEncoderStatus status; size_t written = 0;
   do {
@@ -139,6 +144,14 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--progressive-layers")) {
+    for (isolated_layer = 0; isolated_layer < 9; ++isolated_layer) {
+      generate(argv[1], "vardct", 259, 17, 3, 8, 1, 1, 0, 1);
+      generate(argv[1], "vardct_gray", 37, 13, 1, 8, 1, 1, 0, 1);
+      generate(argv[1], "vardct_dc", 1024, 128, 3, 8, 1, 1, 2, 1);
+    }
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--associated")) {
     associated = 1;
     generate(argv[1], "associated_rgb", 259, 17, 4, 12, 6, 0, 0, 0);

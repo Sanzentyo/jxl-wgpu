@@ -229,9 +229,7 @@ impl FrameSequencePending {
     ) -> Poll<Result<SubmittedGpuUpdate<GpuImageFrame>>> {
         match &mut self.inner {
             SequencePending::Dependent(pending) => pending.poll_update(context, true),
-            SequencePending::Independent(pending) => pending
-                .poll(context)
-                .map(|r| r.map(SubmittedGpuUpdate::Complete)),
+            SequencePending::Independent(pending) => pending.poll_update(context, true),
         }
     }
 }

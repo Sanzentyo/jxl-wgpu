@@ -133,6 +133,8 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
             u64::from(width.div_ceil(8) * 8) * u64::from(height.div_ceil(8) * 8) * 4 * 3;
         for (index, (_, oracle)) in expected.iter().enumerate() {
             let mut updates = 0;
+            let mut coefficients = 0;
+            let physical = &inventory.frames[plan.presentations[index].physical_frames.end - 1];
             let frame = loop {
                 let frame = if progressive && bounded {
                     pollster::block_on(session.next_update_async())
@@ -151,11 +153,20 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
                 if frame.is_complete() {
                     break frame;
                 }
-                assert!(matches!(
-                    frame.progression(),
-                    Some(jxl_wgpu_decode::FrameProgression::LowFrequency { .. })
-                ));
-                updates += 1;
+                match frame.progression().unwrap() {
+                    jxl_wgpu_decode::FrameProgression::LowFrequency { .. } => updates += 1,
+                    jxl_wgpu_decode::FrameProgression::Coefficients {
+                        physical_frame_index,
+                        completed_passes,
+                        total_passes,
+                        ..
+                    } => {
+                        assert_eq!(physical_frame_index, physical.frame_index);
+                        assert_eq!(u32::from(completed_passes), coefficients);
+                        assert_eq!(u32::from(total_passes), physical.num_passes);
+                        coefficients += 1;
+                    }
+                }
             };
             assert_eq!(
                 updates,
@@ -164,6 +175,10 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
                 } else {
                     0
                 }
+            );
+            assert_eq!(
+                coefficients,
+                if progressive { physical.num_passes } else { 0 }
             );
             assert_eq!(frame.metadata, plan.presentations[index].metadata);
             let pixels = samples(

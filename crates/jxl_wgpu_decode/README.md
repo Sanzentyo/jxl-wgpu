@@ -110,10 +110,13 @@ libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced
 ### Intermediate LF and pass images
 
 `GpuOutputRequest::with_progressive_output(true)` enables DC and intermediate AC-pass images for
-direct VarDCT stills with no extra channels or reference/composition dependencies. It includes
-single-entry and raw-matrix streams with deferred coefficient descriptors. Other paths currently
-return final images, except that direct color-only LF-dependent presentations can also publish
-their completed Modular/VarDCT LF dependencies.
+VarDCT color output without extra channels, including deferred descriptors, animations and composed
+presentations. Each presentation validates all overwritten/hidden producers before publishing
+refinements from its final Regular physical frame. The compositor blends each immutable producer
+snapshot against the committed reference versions and then applies output color conversion and
+orientation. Only complete physical frames update reference slots. Modular color frames and
+SkipProgressive frames continue to return final images. Direct color-only LF-dependent
+presentations can additionally publish their completed Modular/VarDCT LF dependencies.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
 embedded-preview delivery.
 
@@ -169,8 +172,16 @@ ownership through GPU completion and cancellation.
 Level 1 output matches the Rust decoder's LF flush, while native libjxl validates the following
 DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
 scalar-oracle adapter test validates expansion through LF4, custom weights and odd/one-sample axes.
-The remaining progressive work includes broader LF conformance, Modular and extra channels,
-composed/animated refinements, and incomplete-frame input readiness.
+Seven animation families cover RGB/gray, mixed JPEG/Modular, recursive LF, negative/off-canvas
+crops and reference blends with exact clocks and physical IDs. Apply/Keep orientation and whole/
+40-byte fragmented input return identical immutable updates; finals equal final-only decoding.
+Native libjxl cannot flush blended layers, so test-only standalone headers preserve every original
+entropy byte and decoding field; independent F64 composition of its layer flushes is checked
+against native coalesced finals before comparing GPU updates. No production CPU codec is used.
+
+The remaining progressive work includes broader LF conformance, LF previews within composed
+presentations, Modular and extra-channel refinements, selective regions, and incomplete-frame
+input readiness. Native-comparison precision remains a separate conformance gate.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 

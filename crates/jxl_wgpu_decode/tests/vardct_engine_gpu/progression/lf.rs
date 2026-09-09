@@ -1,18 +1,6 @@
 use super::*;
 use jxl_wgpu_decode::FrameProgression;
 
-fn read(backend: &WgpuBackend, frame: &jxl_wgpu::GpuImageFrame) -> Vec<u8> {
-    ImageReadbackPipeline::new(backend)
-        .submit(frame)
-        .unwrap()
-        .wait()
-        .unwrap()
-        .frame
-        .outputs[0]
-        .bytes
-        .clone()
-}
-
 fn lf1_rust_pixels(encoded: &[u8], inventory: &jxl_gpu_bitstream::CodestreamInventory) -> Vec<u8> {
     let last_lf = inventory
         .frames

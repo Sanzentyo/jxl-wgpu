@@ -177,9 +177,15 @@ fn overwritten_modular_vardct_and_lf_entropy_is_validated_before_presentation() 
                     engine
                 });
                 let mut session = if bounded {
-                    incremental(&decoder, &invalid, request(&case))
+                    incremental(
+                        &decoder,
+                        &invalid,
+                        request(&case).with_progressive_output(true),
+                    )
                 } else {
-                    decoder.open(&invalid, request(&case)).unwrap()
+                    decoder
+                        .open(&invalid, request(&case).with_progressive_output(true))
+                        .unwrap()
                 };
                 session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
                 assert!(matches!(
@@ -190,9 +196,9 @@ fn overwritten_modular_vardct_and_lf_entropy_is_validated_before_presentation() 
                     Err(Error::UnvalidatedOutputNotSubmitted)
                 ));
                 let result = if bounded {
-                    pollster::block_on(session.next_frame_async())
+                    pollster::block_on(session.next_update_async())
                 } else {
-                    session.next_frame()
+                    session.next_update()
                 };
                 assert!(
                     matches!(
@@ -206,7 +212,7 @@ fn overwritten_modular_vardct_and_lf_entropy_is_validated_before_presentation() 
                     "{} physical {index}: {result:?}",
                     case.name
                 );
-                assert!(matches!(session.next_frame(), Err(Error::SessionPoisoned)));
+                assert!(matches!(session.next_update(), Err(Error::SessionPoisoned)));
                 drop(session);
                 retired(&backend);
                 assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
@@ -264,11 +270,11 @@ fn native_31_bit_layers_reuse_one_producer_budget_and_count_every_submission() {
                 .unwrap();
             // All remaining layers must fit in exactly the first producer's admitted footprint.
             let frame = if bounded {
-                pollster::block_on(session.next_frame_async())
+                pollster::block_on(session.next_update_async())
                     .unwrap()
                     .unwrap()
             } else {
-                session.next_frame().unwrap().unwrap()
+                session.next_update().unwrap().unwrap()
             };
             assert_eq!(
                 session.submission_session().submissions_per_frame(),
@@ -285,7 +291,7 @@ fn native_31_bit_layers_reuse_one_producer_budget_and_count_every_submission() {
             );
             drop(frame);
             drop(blocker);
-            assert!(session.next_frame().unwrap().is_none());
+            assert!(session.next_update().unwrap().is_none());
             drop(session);
             retired(&backend);
             assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
