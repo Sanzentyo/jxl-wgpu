@@ -3,7 +3,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::{KernelVariant, ResidentF32Plane};
+use crate::{KernelVariant, ResidentF32Plane, ResidentStorageBinding};
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ResidentUpsampleError {
@@ -122,8 +122,33 @@ pub struct ResidentUpsampleWeights {
     buffer: wgpu::Buffer,
 }
 
+/// A scalar view into planar or interleaved F32 storage. All addressing is in scalar words,
+/// relative to the storage binding. The filter validates the complete view before recording work.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidentUpsampleSource<'a> {
+    pub storage: ResidentStorageBinding<'a>,
+    pub width: u32,
+    pub height: u32,
+    pub offset: u32,
+    pub row_stride: u32,
+    pub sample_stride: u32,
+}
+
+impl<'a> From<ResidentF32Plane<'a>> for ResidentUpsampleSource<'a> {
+    fn from(plane: ResidentF32Plane<'a>) -> Self {
+        Self {
+            storage: plane.storage,
+            width: plane.width,
+            height: plane.height,
+            offset: 0,
+            row_stride: plane.effective_stride(),
+            sample_stride: 1,
+        }
+    }
+}
+
 pub struct ResidentUpsampleInputs<'a> {
-    pub input: ResidentF32Plane<'a>,
+    pub input: ResidentUpsampleSource<'a>,
     /// A distinct destination, optionally cropped at the right/bottom edge.
     pub output: ResidentF32Plane<'a>,
     pub weights: &'a ResidentUpsampleWeights,
@@ -136,7 +161,7 @@ pub struct ResidentUpsamplePipeline {
 }
 
 impl ResidentUpsamplePipeline {
-    pub const UNIFORM_BYTES: u64 = std::mem::size_of::<UpsampleParams>() as u64;
+    pub const UNIFORM_BYTES: u64 = std::mem::size_of::<UpsampleUniform>() as u64;
 
     pub fn new(device: &wgpu::Device) -> Result<Self, ResidentUpsampleError> {
         Self::with_variant(device, KernelVariant::Tile16x16)
@@ -181,8 +206,8 @@ impl ResidentUpsamplePipeline {
         encoder: &mut wgpu::CommandEncoder,
         inputs: ResidentUpsampleInputs<'_>,
     ) -> Result<wgpu::Buffer, ResidentUpsampleError> {
-        validate_plane(device, "input", inputs.input)?;
-        validate_plane(device, "output", inputs.output)?;
+        validate_source(device, "input", inputs.input)?;
+        validate_source(device, "output", inputs.output.into())?;
         let factor = inputs.weights.factor;
         if inputs.output.width.div_ceil(factor) != inputs.input.width
             || inputs.output.height.div_ceil(factor) != inputs.input.height
@@ -195,15 +220,17 @@ impl ResidentUpsamplePipeline {
         let maximum = u64::from(device.limits().max_compute_workgroups_per_dimension);
         check_limit("X workgroups", u64::from(dispatch_x), maximum)?;
         check_limit("Y workgroups", u64::from(dispatch_y), maximum)?;
-        let params = UpsampleParams {
+        let params = UpsampleUniform {
             input_width: inputs.input.width,
             input_height: inputs.input.height,
             output_width: inputs.output.width,
             output_height: inputs.output.height,
-            input_stride: inputs.input.effective_stride(),
+            input_stride: inputs.input.row_stride,
             output_stride: inputs.output.effective_stride(),
             factor,
-            _padding: 0,
+            input_offset: inputs.input.offset,
+            input_sample_stride: inputs.input.sample_stride,
+            _padding: [0; 3],
         };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu resident frame upsampling params"),
@@ -243,15 +270,17 @@ impl ResidentUpsamplePipeline {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct UpsampleParams {
-    input_width: u32,
-    input_height: u32,
-    output_width: u32,
-    output_height: u32,
-    input_stride: u32,
-    output_stride: u32,
-    factor: u32,
-    _padding: u32,
+pub(crate) struct UpsampleUniform {
+    pub(crate) input_width: u32,
+    pub(crate) input_height: u32,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+    pub(crate) input_stride: u32,
+    pub(crate) output_stride: u32,
+    pub(crate) factor: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) input_sample_stride: u32,
+    pub(crate) _padding: [u32; 3],
 }
 
 fn check_limit(
@@ -269,24 +298,31 @@ fn check_limit(
     Ok(())
 }
 
-fn validate_plane(
+fn validate_source(
     device: &wgpu::Device,
     role: &'static str,
-    plane: ResidentF32Plane<'_>,
+    plane: ResidentUpsampleSource<'_>,
 ) -> Result<(), ResidentUpsampleError> {
     let invalid = || ResidentUpsampleError::PlaneGeometry { role };
-    let stride = plane.effective_stride();
     if plane.width == 0
         || plane.height == 0
-        || stride < plane.width
+        || plane.sample_stride == 0
         || plane.width > i32::MAX as u32 / 2
         || plane.height > i32::MAX as u32 / 2
     {
         return Err(invalid());
     }
+    let row_words = (plane.width - 1)
+        .checked_mul(plane.sample_stride)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(invalid)?;
+    if plane.row_stride < row_words {
+        return Err(invalid());
+    }
     let words = (plane.height - 1)
-        .checked_mul(stride)
-        .and_then(|v| v.checked_add(plane.width))
+        .checked_mul(plane.row_stride)
+        .and_then(|v| v.checked_add(row_words))
+        .and_then(|v| v.checked_add(plane.offset))
         .ok_or_else(invalid)?;
     let required = u64::from(words) * 4;
     let storage = plane.storage;
@@ -312,8 +348,10 @@ fn validate_plane(
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<UpsampleParams>() == 32);
-    assert!(std::mem::align_of::<UpsampleParams>() == 16);
+    assert!(std::mem::size_of::<UpsampleUniform>() == 48);
+    assert!(std::mem::align_of::<UpsampleUniform>() == 16);
+    assert!(std::mem::offset_of!(UpsampleUniform, input_offset) == 28);
+    assert!(std::mem::offset_of!(UpsampleUniform, input_sample_stride) == 32);
 };
 
 #[cfg(test)]

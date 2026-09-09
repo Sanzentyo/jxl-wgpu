@@ -12,6 +12,7 @@ pub(super) struct IntermediateFrame {
     output: GpuBufferLease,
     status: wgpu::Buffer,
     mapped: AtomicBool,
+    submitted: AtomicBool,
     completion: Arc<MapCompletion>,
     progression: crate::FrameProgression,
     spatial_groups: u64,
@@ -28,7 +29,8 @@ impl Drop for IntermediateFrame {
 }
 
 pub(super) struct IntermediateCommands {
-    commands: wgpu::CommandBuffer,
+    commands: Vec<wgpu::CommandBuffer>,
+    needs_hf_status: bool,
     poll: SubmissionPollPermit,
 }
 
@@ -53,7 +55,7 @@ pub(super) fn record_intermediates(
     permits: Vec<IntermediatePermits>,
 ) -> Result<(Vec<Arc<IntermediateFrame>>, Vec<IntermediateCommands>), VarDctDecodeError> {
     let source = inputs.source;
-    if permits.len() != source.intermediate_passes.len() {
+    if permits.len() != source.intermediate_outputs.len() {
         return Err(VarDctDecodeError::EngineContract {
             detail: "intermediate output admission differs from the pass schedule",
         });
@@ -61,10 +63,8 @@ pub(super) fn record_intermediates(
     let device = backend.device();
     let mut frames = Vec::with_capacity(permits.len());
     let mut recordings = Vec::with_capacity(permits.len());
-    for (progression, mut permits) in source.intermediate_passes.iter().copied().zip(permits) {
-        let hf = inputs.hf.ok_or(VarDctDecodeError::EngineContract {
-            detail: "intermediate pass image has no coefficient buffers",
-        })?;
+    for (plan, mut permits) in source.intermediate_outputs.iter().zip(permits) {
+        let progression = plan.progression;
         let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         if backend.direct_readback_enabled() {
             usage |= wgpu::BufferUsages::MAP_READ;
@@ -77,7 +77,9 @@ pub(super) fn record_intermediates(
         });
         let status = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jxl-wgpu intermediate validation snapshot"),
-            size: source.memory.validation_staging_bytes,
+            size: source
+                .memory
+                .intermediate_validation_bytes(&plan.reconstruction)?,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -90,6 +92,7 @@ pub(super) fn record_intermediates(
             pipelines,
             render::FrameRenderInputs {
                 source,
+                reconstruction: &plan.reconstruction,
                 group_buffers: inputs.groups,
                 resources: inputs.resources,
                 output: &output,
@@ -127,12 +130,18 @@ pub(super) fn record_intermediates(
                 ARTIFACT_STATUS_BYTES,
             );
         }
-        let mut offset = packet_bytes + inputs.groups.len() as u64 * ARTIFACT_STATUS_BYTES;
-        for group in &hf.groups {
-            commands.copy_buffer_to_buffer(&group.status, 0, &status, offset, group.status.size());
-            offset += group.status.size();
+        let offset = packet_bytes + inputs.groups.len() as u64 * ARTIFACT_STATUS_BYTES;
+        let needs_hf_status = progression.completed_passes != 0 && inputs.hf.is_none();
+        if progression.completed_passes != 0 {
+            if let Some(hf) = inputs.hf {
+                copy_hf_status(&mut commands, hf, &status, offset)?;
+            }
+        } else if offset != status.size() {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "DC validation size changed",
+            });
         }
-        if offset != status.size() || rendered.lf_planes.is_some() {
+        if rendered.lf_planes.is_some() {
             return Err(VarDctDecodeError::EngineContract {
                 detail: "intermediate image requires color-only main-frame validation",
             });
@@ -141,6 +150,7 @@ pub(super) fn record_intermediates(
             output: GpuBufferLease::from_tracked(output, permits.output),
             status,
             mapped: AtomicBool::new(false),
+            submitted: AtomicBool::new(false),
             completion: Arc::new(MapCompletion::default()),
             progression,
             spatial_groups: source.packet.profile.group_count,
@@ -148,7 +158,8 @@ pub(super) fn record_intermediates(
             _transient: permits.transient,
         }));
         recordings.push(IntermediateCommands {
-            commands: commands.finish(),
+            commands: vec![commands.finish()],
+            needs_hf_status,
             poll: permits.poll,
         });
     }
@@ -159,7 +170,9 @@ fn arm_snapshot(
     frame: &Arc<IntermediateFrame>,
     poll: SubmissionPollPermit,
     submission: wgpu::SubmissionIndex,
+    retained_job: Option<Arc<VarDctJobLifetime>>,
 ) {
+    frame.submitted.store(true, Ordering::Release);
     let callback_frame = Arc::clone(frame);
     frame
         .status
@@ -167,6 +180,9 @@ fn arm_snapshot(
             if result.is_ok() {
                 callback_frame.mapped.store(true, Ordering::Release);
             }
+            // Deferred DC can be the last queued work when its consumer cancels. Preserve the
+            // common reconstruction buffers and their permits until that submission completes.
+            drop(retained_job);
             callback_frame
                 .completion
                 .complete(result.map_err(|error| error.to_string()));
@@ -179,66 +195,186 @@ fn arm_snapshot(
     }
 }
 
+fn copy_hf_status(
+    commands: &mut wgpu::CommandEncoder,
+    hf: &HfCoefficientJobBuffers,
+    status: &wgpu::Buffer,
+    mut offset: u64,
+) -> Result<(), VarDctDecodeError> {
+    for group in &hf.groups {
+        commands.copy_buffer_to_buffer(&group.status, 0, status, offset, group.status.size());
+        offset += group.status.size();
+    }
+    if offset != status.size() {
+        return Err(VarDctDecodeError::EngineContract {
+            detail: "intermediate HF validation size changed",
+        });
+    }
+    Ok(())
+}
+
+impl IntermediateFrame {
+    pub(super) fn is_submitted(&self) -> bool {
+        self.submitted.load(Ordering::Acquire)
+    }
+}
+
+/// DC has no coefficient dependency; publish it before parsing any deferred HF-global tail.
+pub(super) fn submit_dc(
+    queue: &wgpu::Queue,
+    lifetime: &Arc<VarDctJobLifetime>,
+    recording: IntermediateCommands,
+    prefix: Option<wgpu::CommandBuffer>,
+) -> Result<(), VarDctDecodeError> {
+    let frame = lifetime
+        .intermediates
+        .first()
+        .ok_or(VarDctDecodeError::EngineContract {
+            detail: "deferred DC has no admitted image",
+        })?;
+    if frame.progression.completed_passes != 0 || recording.needs_hf_status || frame.is_submitted()
+    {
+        return Err(VarDctDecodeError::EngineContract {
+            detail: "invalid deferred DC boundary",
+        });
+    }
+    let submission = queue.submit(prefix.into_iter().chain(recording.commands));
+    arm_snapshot(
+        frame,
+        recording.poll,
+        submission,
+        Some(Arc::clone(lifetime)),
+    );
+    Ok(())
+}
+
+/// Descriptor-dependent status buffers become available only after the DC image was submitted.
+pub(super) fn attach_hf_status(
+    device: &wgpu::Device,
+    lifetime: &VarDctJobLifetime,
+    first: usize,
+    hf: &HfCoefficientJobBuffers,
+    recordings: &mut [IntermediateCommands],
+) -> Result<(), VarDctDecodeError> {
+    let frames = lifetime
+        .intermediates
+        .get(first..)
+        .ok_or(VarDctDecodeError::EngineContract {
+            detail: "deferred intermediate start is out of range",
+        })?;
+    if frames.len() != recordings.len() {
+        return Err(VarDctDecodeError::EngineContract {
+            detail: "deferred intermediate count changed",
+        });
+    }
+    let offset = lifetime._groups.len() as u64 * (PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES);
+    for (frame, recording) in frames.iter().zip(recordings) {
+        if !recording.needs_hf_status {
+            continue;
+        }
+        let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("jxl-wgpu deferred intermediate coefficient status"),
+        });
+        copy_hf_status(&mut commands, hf, &frame.status, offset)?;
+        recording.commands.push(commands.finish());
+        recording.needs_hf_status = false;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_passes(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &VarDctPipelines,
     lifetime: &VarDctJobLifetime,
+    first_intermediate: usize,
     coefficients: PassCommands,
     intermediate_commands: Vec<IntermediateCommands>,
     mut prefix: Vec<wgpu::CommandBuffer>,
-    after: wgpu::CommandBuffer,
+    after: Vec<wgpu::CommandBuffer>,
 ) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
-    if intermediate_commands.len() != lifetime.intermediates.len() {
+    let frames = lifetime.intermediates.get(first_intermediate..).ok_or(
+        VarDctDecodeError::EngineContract {
+            detail: "intermediate submission start is out of range",
+        },
+    )?;
+    let total_passes = match &coefficients {
+        PassCommands::Whole(passes) => passes.len(),
+        PassCommands::Windowed(windows) => windows.pass_count(),
+    };
+    let mut previous = None;
+    for frame in frames {
+        let completed = usize::from(frame.progression.completed_passes);
+        if usize::from(frame.progression.total_passes) != total_passes
+            || completed >= total_passes
+            || previous.is_some_and(|previous| completed <= previous)
+        {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "invalid intermediate pass schedule",
+            });
+        }
+        previous = Some(completed);
+    }
+    if intermediate_commands.len() != frames.len()
+        || intermediate_commands
+            .iter()
+            .any(|commands| commands.needs_hf_status)
+    {
         return Err(VarDctDecodeError::EngineContract {
-            detail: "intermediate submissions lost a render stage",
+            detail: "intermediate submissions lost a validation stage",
         });
     }
     match coefficients {
         PassCommands::Whole(passes) => {
-            if passes.len() != intermediate_commands.len() + 1 {
-                return Err(VarDctDecodeError::EngineContract {
-                    detail: "whole coefficient pass count changed",
-                });
-            }
             let mut passes = passes.into_iter();
-            for (frame, recording) in lifetime.intermediates.iter().zip(intermediate_commands) {
-                prefix.push(passes.next().expect("pass count was checked"));
-                prefix.push(recording.commands);
+            let mut completed = 0;
+            for (frame, recording) in frames.iter().zip(intermediate_commands) {
+                let target = usize::from(frame.progression.completed_passes);
+                for _ in completed..target {
+                    prefix.push(passes.next().ok_or(VarDctDecodeError::EngineContract {
+                        detail: "intermediate image exceeds available coefficient passes",
+                    })?);
+                }
+                completed = target;
+                prefix.extend(recording.commands);
                 let submission = queue.submit(std::mem::take(&mut prefix));
-                arm_snapshot(frame, recording.poll, submission);
+                arm_snapshot(frame, recording.poll, submission, None);
             }
-            prefix.push(passes.next().expect("one final pass remains"));
-            prefix.push(after);
+            prefix.extend(passes);
+            prefix.extend(after);
             Ok(queue.submit(prefix))
         }
         PassCommands::Windowed(windows) => {
-            queue.submit(prefix);
+            if !prefix.is_empty() {
+                queue.submit(prefix);
+            }
             let retained = lock_unpoisoned(&lifetime._hf_coefficients);
             let hf = retained.as_ref().ok_or(VarDctDecodeError::EngineContract {
                 detail: "intermediate stream lost coefficient buffers",
             })?;
-            for (pass, (frame, recording)) in lifetime
-                .intermediates
-                .iter()
-                .zip(intermediate_commands)
-                .enumerate()
-            {
-                windows.submit_pass(device, queue, pipelines, hf, &lifetime._groups, pass, None)?;
-                let submission = queue.submit([recording.commands]);
-                arm_snapshot(frame, recording.poll, submission);
+            let mut completed = 0;
+            for (frame, recording) in frames.iter().zip(intermediate_commands) {
+                let target = usize::from(frame.progression.completed_passes);
+                for pass in completed..target {
+                    windows.submit_pass(
+                        device,
+                        queue,
+                        pipelines,
+                        hf,
+                        &lifetime._groups,
+                        pass,
+                        None,
+                    )?;
+                }
+                completed = target;
+                let submission = queue.submit(recording.commands);
+                arm_snapshot(frame, recording.poll, submission, None);
             }
-            windows.submit_pass(
-                device,
-                queue,
-                pipelines,
-                hf,
-                &lifetime._groups,
-                lifetime.intermediates.len(),
-                None,
-            )?;
-            Ok(queue.submit([after]))
+            for pass in completed..windows.pass_count() {
+                windows.submit_pass(device, queue, pipelines, hf, &lifetime._groups, pass, None)?;
+            }
+            Ok(queue.submit(after))
         }
     }
 }

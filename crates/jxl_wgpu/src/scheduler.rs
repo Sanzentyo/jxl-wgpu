@@ -33,6 +33,7 @@ mod validation;
 use crate::image_output::ImageOutputParams as ImageOutputUniform;
 #[cfg(test)]
 use crate::image_output::prepare_image_output;
+use crate::resident_upsample::UpsampleUniform;
 use pipeline::PipelineFactory;
 #[cfg(test)]
 use validation::transient_bytes;
@@ -875,19 +876,6 @@ struct EpfUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct UpsampleUniform {
-    input_width: u32,
-    input_height: u32,
-    output_width: u32,
-    output_height: u32,
-    input_stride: u32,
-    output_stride: u32,
-    factor: u32,
-    _padding: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct YcbcrUniform {
     width: u32,
     height: u32,
@@ -1009,8 +997,8 @@ const _: () = {
     assert!(std::mem::align_of::<GaborishRgbUniform>() == 4);
     assert!(std::mem::size_of::<EpfUniform>() == 80);
     assert!(std::mem::align_of::<EpfUniform>() == 4);
-    assert!(std::mem::size_of::<UpsampleUniform>() == 32);
-    assert!(std::mem::align_of::<UpsampleUniform>() == 4);
+    assert!(std::mem::size_of::<UpsampleUniform>() == 48);
+    assert!(std::mem::align_of::<UpsampleUniform>() == 16);
     assert!(std::mem::size_of::<YcbcrUniform>() == 32);
     assert!(std::mem::align_of::<YcbcrUniform>() == 4);
     assert!(std::mem::size_of::<XybUniform>() == 128);

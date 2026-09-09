@@ -83,7 +83,7 @@ fn uniform_abi_sizes_are_explicit_and_naturally_aligned() {
         ("GaborishUniform", size_of::<GaborishUniform>(), 32),
         ("GaborishRgbUniform", size_of::<GaborishRgbUniform>(), 80),
         ("EpfUniform", size_of::<EpfUniform>(), 80),
-        ("UpsampleUniform", size_of::<UpsampleUniform>(), 32),
+        ("UpsampleUniform", size_of::<UpsampleUniform>(), 48),
         ("YcbcrUniform", size_of::<YcbcrUniform>(), 32),
         ("XybUniform", size_of::<XybUniform>(), 128),
         ("TransferUniform", size_of::<TransferUniform>(), 64),
@@ -95,6 +95,7 @@ fn uniform_abi_sizes_are_explicit_and_naturally_aligned() {
         assert_eq!(actual, expected, "Rust/WGSL ABI size drift for {name}");
         assert_eq!(actual % 16, 0, "uniform {name} is not 16-byte sized");
     }
+    assert_eq!(align_of::<UpsampleUniform>(), 16);
     for (name, alignment) in [
         ("CopyParams", align_of::<CopyParams>()),
         ("ModularParams", align_of::<ModularParams>()),
@@ -103,7 +104,6 @@ fn uniform_abi_sizes_are_explicit_and_naturally_aligned() {
         ("GaborishUniform", align_of::<GaborishUniform>()),
         ("GaborishRgbUniform", align_of::<GaborishRgbUniform>()),
         ("EpfUniform", align_of::<EpfUniform>()),
-        ("UpsampleUniform", align_of::<UpsampleUniform>()),
         ("YcbcrUniform", align_of::<YcbcrUniform>()),
         ("XybUniform", align_of::<XybUniform>()),
         ("TransferUniform", align_of::<TransferUniform>()),
@@ -344,7 +344,9 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
         input_stride: 5,
         output_stride: 6,
         factor: 7,
-        _padding: 8,
+        input_offset: 8,
+        input_sample_stride: 9,
+        _padding: [10, 11, 12],
     });
     assert_wgsl_fields(
         include_str!("../../shaders/upsample.wgsl"),
@@ -357,7 +359,11 @@ fn uniform_rust_word_order_matches_wgsl_field_order() {
             "input_stride",
             "output_stride",
             "factor",
+            "input_offset",
+            "input_sample_stride",
             "_pad0",
+            "_pad1",
+            "_pad2",
         ],
     );
 

@@ -104,7 +104,7 @@ pub use resident_noise::{
 };
 pub use resident_upsample::{
     ResidentUpsampleError, ResidentUpsampleInputs, ResidentUpsampleKernel,
-    ResidentUpsamplePipeline, ResidentUpsampleWeights,
+    ResidentUpsamplePipeline, ResidentUpsampleSource, ResidentUpsampleWeights,
 };
 pub use resident_vardct::{
     ResidentF32Plane, ResidentStorageBinding, ResidentVarDctError, ResidentVarDctInputs,

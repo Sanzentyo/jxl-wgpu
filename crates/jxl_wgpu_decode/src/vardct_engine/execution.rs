@@ -36,7 +36,7 @@ use crate::{
 use super::output::VarDctFrameOutput;
 use super::pipeline::VarDctPipelines;
 use super::restoration::RestorationCursor;
-use super::source::{VarDctSource, check_limit};
+use super::source::{VarDctReconstruction, VarDctSource, check_limit};
 use super::types::{
     ARTIFACT_STATUS_BYTES, PACKET_STATUS_BYTES, VarDctDecodeError, VarDctDecodeMemoryStats,
 };
@@ -45,6 +45,7 @@ use super::window_plan::{PacketStage, PacketWindowExecutionPlan, map_codestream_
 mod coefficients;
 use coefficients::{
     HfCoefficientPassBuffers, HfCoefficientWindowCommands, encode_hf_pass, prepare_hf_windows,
+    record_hf_passes,
 };
 mod extra;
 mod packet;
@@ -128,14 +129,15 @@ impl GpuSubmissionSession for FrameDecodeSession {
             .memory
             .try_reserve(source.memory.transient_bytes - source.memory.extra_arena_bytes)?;
         let intermediate_permits = source
-            .intermediate_passes
+            .intermediate_outputs
             .iter()
-            .map(|_| {
+            .map(|output| {
                 Ok::<_, DecodeError>(progression::IntermediatePermits {
                     output: self.memory.try_reserve(source.memory.output_lease_bytes)?,
                     transient: self.memory.try_reserve(
-                        source.memory.intermediate_transient_bytes
-                            / source.intermediate_passes.len() as u64,
+                        source
+                            .memory
+                            .intermediate_render_bytes(&output.reconstruction)?,
                     )?,
                     poll: self
                         .backend
@@ -268,6 +270,7 @@ enum PacketCommands {
 enum HfCoefficientCommands {
     Whole(wgpu::CommandBuffer),
     Windowed(HfCoefficientWindowCommands),
+    Progressive(progression::PassCommands),
 }
 
 enum VarDctDownstreamCommands {
@@ -292,6 +295,13 @@ enum VarDctDownstreamCommands {
 struct DeferredHfGlobalCommands {
     before_coefficients: Option<wgpu::CommandBuffer>,
     after_coefficients: wgpu::CommandBuffer,
+    intermediate_commands: Vec<progression::IntermediateCommands>,
+    first_intermediate: usize,
+}
+
+enum DeferredHfResume {
+    Header(u32),
+    Raw(Option<SubmissionPollPermit>),
 }
 
 enum PostLfCommands {
@@ -375,10 +385,11 @@ fn submit_vardct_downstream(
                 queue,
                 &pipelines,
                 lifetime,
+                0,
                 coefficients,
                 intermediate_commands,
                 prefix,
-                after_coefficients,
+                vec![after_coefficients],
             )
         }
     }
@@ -513,6 +524,11 @@ pub struct FramePendingFrame {
 }
 
 enum VarDctPendingStage {
+    AfterDc {
+        source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
+        resume: DeferredHfResume,
+    },
     LfExtras {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
@@ -557,6 +573,7 @@ impl std::fmt::Debug for FramePendingFrame {
             .field(
                 "stage",
                 &match &self.stage {
+                    VarDctPendingStage::AfterDc { .. } => "after-dc",
                     VarDctPendingStage::LfExtras { .. } => "lf-extras",
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
                     VarDctPendingStage::HfGlobal { .. } => "hf-global",
@@ -611,15 +628,16 @@ impl FramePendingFrame {
         })
     }
 
-    fn stage_completion(&self) -> Arc<MapCompletion> {
+    fn stage_completion(&self) -> Option<Arc<MapCompletion>> {
         match &self.stage {
+            VarDctPendingStage::AfterDc { .. } => None,
             VarDctPendingStage::LfExtras { completion, .. }
             | VarDctPendingStage::LocalLf { completion, .. }
             | VarDctPendingStage::HfGlobal { completion, .. }
             | VarDctPendingStage::RawHfDequant { completion, .. }
             | VarDctPendingStage::AcExtra { completion, .. }
             | VarDctPendingStage::ModularExtra { completion, .. }
-            | VarDctPendingStage::Final { completion } => Arc::clone(completion),
+            | VarDctPendingStage::Final { completion } => Some(Arc::clone(completion)),
         }
     }
 
@@ -629,6 +647,10 @@ impl FramePendingFrame {
         };
         let stage = std::mem::replace(&mut self.stage, placeholder);
         match stage {
+            stage @ VarDctPendingStage::AfterDc { .. } => {
+                self.stage = stage;
+                None
+            }
             VarDctPendingStage::LfExtras {
                 source,
                 mut commands,
@@ -714,7 +736,11 @@ impl FramePendingFrame {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn wait_until_dependency_submitted(&mut self) -> DecodeResult<()> {
         while !matches!(self.stage, VarDctPendingStage::Final { .. }) {
-            let mapping = self.stage_completion().wait();
+            let Some(completion) = self.stage_completion() else {
+                self.resume_after_dc()?;
+                continue;
+            };
+            let mapping = completion.wait();
             if !self.advance_staged_packet(mapping)? {
                 return Err(VarDctDecodeError::EngineContract {
                     detail: "VarDCT dependency stage made no progress",
@@ -736,7 +762,12 @@ impl FramePendingFrame {
             if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
                 return Poll::Ready(Err(DecodeError::backend(error)));
             }
-            let Some(mapping) = self.stage_completion().poll(context) else {
+            let Some(completion) = self.stage_completion() else {
+                self.resume_after_dc()?;
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            };
+            let Some(mapping) = completion.poll(context) else {
                 return Poll::Pending;
             };
             if let Err(error) = self.advance_staged_packet(mapping) {
@@ -1079,10 +1110,90 @@ impl FramePendingFrame {
         Ok(())
     }
 
+    fn defer_hf_after_dc(
+        &mut self,
+        source: Box<VarDctSource>,
+        mut commands: DeferredHfGlobalCommands,
+        resume: DeferredHfResume,
+    ) -> Result<(), VarDctDecodeError> {
+        let lifetime = self
+            .lifetime
+            .as_ref()
+            .ok_or(VarDctDecodeError::CompletionConsumed)?;
+        if commands.first_intermediate != 0 || commands.intermediate_commands.is_empty() {
+            return Err(VarDctDecodeError::EngineContract {
+                detail: "deferred DC lost its command boundary",
+            });
+        }
+        let recording = commands.intermediate_commands.remove(0);
+        progression::submit_dc(
+            self.backend.queue(),
+            lifetime,
+            recording,
+            commands.before_coefficients.take(),
+        )?;
+        commands.first_intermediate = 1;
+        self.stage = VarDctPendingStage::AfterDc {
+            source,
+            commands,
+            resume,
+        };
+        Ok(())
+    }
+
+    fn resume_after_dc(&mut self) -> DecodeResult<()> {
+        let stage = std::mem::replace(
+            &mut self.stage,
+            VarDctPendingStage::Final {
+                completion: Arc::new(MapCompletion::default()),
+            },
+        );
+        match stage {
+            VarDctPendingStage::AfterDc {
+                source,
+                commands,
+                resume,
+            } => self.resume_deferred_hf(source, commands, resume),
+            stage => {
+                self.stage = stage;
+                Err(VarDctDecodeError::EngineContract {
+                    detail: "no deferred work after DC",
+                }
+                .into())
+            }
+        }
+    }
+
+    fn resume_deferred_hf(
+        &mut self,
+        mut source: Box<VarDctSource>,
+        commands: DeferredHfGlobalCommands,
+        resume: DeferredHfResume,
+    ) -> DecodeResult<()> {
+        match resume {
+            DeferredHfResume::Raw(poll) => {
+                self.start_raw_hf_dequant_stage(source, commands, poll)?;
+                Ok(())
+            }
+            DeferredHfResume::Header(cursor) => {
+                source
+                    .packet
+                    .parse_single_hf_global_continuation_source(&source.codestream, cursor)
+                    .map_err(VarDctDecodeError::from)?;
+                if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+                    self.start_raw_hf_dequant_stage(source, commands, None)?;
+                    Ok(())
+                } else {
+                    self.submit_deferred_hf_coefficients(source, commands)
+                }
+            }
+        }
+    }
+
     fn submit_hf_global_stage(
         &mut self,
         mapping: Result<(), String>,
-        mut source: Box<VarDctSource>,
+        source: Box<VarDctSource>,
         commands: DeferredHfGlobalCommands,
     ) -> DecodeResult<()> {
         mapping.map_err(DecodeError::backend)?;
@@ -1127,27 +1238,25 @@ impl FramePendingFrame {
         lifetime.status_staging.unmap();
         lifetime.status_mapped.store(false, Ordering::Release);
 
-        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
-            self.start_raw_hf_dequant_stage(source, commands, None)?;
-            return Ok(());
-        }
-        let [cursor] = cursors.as_slice() else {
-            return Err(VarDctDecodeError::GroupPlanCount {
-                component: "single-entry progressive-DC packet",
-                expected: 1,
-                actual: cursors.len(),
-            }
-            .into());
+        let resume = if source.packet.pending_raw_hf_dequant_side_image().is_some() {
+            DeferredHfResume::Raw(None)
+        } else {
+            let [cursor] = cursors.as_slice() else {
+                return Err(VarDctDecodeError::GroupPlanCount {
+                    component: "single-entry progressive-DC packet",
+                    expected: 1,
+                    actual: cursors.len(),
+                }
+                .into());
+            };
+            DeferredHfResume::Header(*cursor)
         };
-        source
-            .packet
-            .parse_single_hf_global_continuation_source(&source.codestream, *cursor)
-            .map_err(VarDctDecodeError::from)?;
-        if source.packet.pending_raw_hf_dequant_side_image().is_some() {
-            self.start_raw_hf_dequant_stage(source, commands, None)?;
-            return Ok(());
+        if source.intermediate_outputs.is_empty() {
+            self.resume_deferred_hf(source, commands, resume)
+        } else {
+            self.defer_hf_after_dc(source, commands, resume)?;
+            Ok(())
         }
-        self.submit_deferred_hf_coefficients(source, commands)
     }
 
     fn submit_deferred_hf_coefficients(
@@ -1313,7 +1422,30 @@ impl FramePendingFrame {
             .map_err(DecodeError::PollBackpressure)?;
         let device = self.backend.device();
         let buffers = create_hf_coefficient_job_buffers(device, &plan);
-        let coefficient_commands = if plan.uses_bounded_stream_windows() {
+        let coefficient_commands = if !source.intermediate_outputs.is_empty() {
+            progression::attach_hf_status(
+                device,
+                lifetime,
+                commands.first_intermediate,
+                &buffers,
+                &mut commands.intermediate_commands,
+            )?;
+            let passes = if plan.uses_bounded_stream_windows() {
+                progression::PassCommands::Windowed(prepare_hf_windows(&source.codestream, &plan)?)
+            } else {
+                progression::PassCommands::Whole(record_hf_passes(
+                    device,
+                    &self.pipelines,
+                    HfCoefficientPassBuffers {
+                        source: &lifetime._codestream,
+                        plan: &plan,
+                        jobs: &buffers,
+                        groups: &lifetime._groups,
+                    },
+                )?)
+            };
+            HfCoefficientCommands::Progressive(passes)
+        } else if plan.uses_bounded_stream_windows() {
             HfCoefficientCommands::Windowed(prepare_hf_windows(&source.codestream, &plan)?)
         } else {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1385,7 +1517,33 @@ impl FramePendingFrame {
         }
         lock_unpoisoned(&lifetime._transient_permits).push(dynamic_permit);
 
+        // Each coefficient window adds one submission. Fixed stage/image submissions were
+        // already admitted before the descriptor-dependent execution plan was available.
+        if plan.uses_bounded_stream_windows() {
+            let total_submissions = self
+                .runtime_stats
+                .submissions_per_frame
+                .load(Ordering::Acquire)
+                .checked_add(plan.stream_batch_count())
+                .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                    field: "deferred HF submission count",
+                })?;
+            self.runtime_stats
+                .submissions_per_frame
+                .store(total_submissions, Ordering::Release);
+        }
         let submission = match coefficient_commands {
+            HfCoefficientCommands::Progressive(passes) => progression::submit_passes(
+                device,
+                self.backend.queue(),
+                &self.pipelines,
+                lifetime,
+                commands.first_intermediate,
+                passes,
+                commands.intermediate_commands,
+                commands.before_coefficients.take().into_iter().collect(),
+                vec![commands.after_coefficients, status_commands.finish()],
+            )?,
             HfCoefficientCommands::Whole(whole_coefficients) => {
                 let mut submissions = Vec::with_capacity(4);
                 if let Some(before_coefficients) = commands.before_coefficients.take() {
@@ -1403,7 +1561,7 @@ impl FramePendingFrame {
                 let buffers = retained.as_ref().ok_or(VarDctDecodeError::EngineContract {
                     detail: "deferred HF coefficient buffers disappeared before submission",
                 })?;
-                let batch_count = windows.submit(
+                windows.submit(
                     device,
                     self.backend.queue(),
                     &self.pipelines,
@@ -1411,19 +1569,6 @@ impl FramePendingFrame {
                     &lifetime._groups,
                     commands.before_coefficients.take(),
                 )?;
-                // The known count already includes LF/HF packets and any preceding Modular
-                // stages. Each newly discovered coefficient batch adds one queue submission.
-                let total_submissions = self
-                    .runtime_stats
-                    .submissions_per_frame
-                    .load(Ordering::Acquire)
-                    .checked_add(batch_count)
-                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                        field: "deferred HF submission count",
-                    })?;
-                self.runtime_stats
-                    .submissions_per_frame
-                    .store(total_submissions, Ordering::Release);
                 drop(retained);
                 self.backend
                     .queue()
@@ -1541,6 +1686,9 @@ impl FramePendingFrame {
                 }
             }
         }
+        if matches!(completed_passes, Some((0, _))) {
+            return Ok(());
+        }
         let hf_end = mapped.len() - lifetime._output_scratch.status_bytes() as usize;
         let hf_status_bytes =
             mapped
@@ -1623,11 +1771,11 @@ impl GpuPendingFrame for FramePendingFrame {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<DecodeResult<crate::SubmittedGpuUpdate<Self::Frame>>> {
-        if self.dependency_submission_ready()
-            && self
-                .lifetime
-                .as_ref()
-                .is_some_and(|life| self.next_intermediate < life.intermediates.len())
+        if self
+            .lifetime
+            .as_ref()
+            .and_then(|life| life.intermediates.get(self.next_intermediate))
+            .is_some_and(|frame| frame.is_submitted())
         {
             self.backend
                 .device()
@@ -1643,7 +1791,11 @@ impl GpuPendingFrame for FramePendingFrame {
     #[cfg(not(target_arch = "wasm32"))]
     fn wait(mut self) -> DecodeResult<SubmittedGpuFrame<Self::Frame>> {
         loop {
-            let mapping = self.stage_completion().wait();
+            let Some(completion) = self.stage_completion() else {
+                self.resume_after_dc()?;
+                continue;
+            };
+            let mapping = completion.wait();
             if self.dependency_submission_ready() {
                 return self.finish(mapping);
             }
@@ -1658,7 +1810,12 @@ impl GpuPendingFrame for FramePendingFrame {
         if let Err(error) = self.backend.device().poll(wgpu::PollType::Poll) {
             return Poll::Ready(Err(DecodeError::backend(error)));
         }
-        let Some(mapping) = self.stage_completion().poll(context) else {
+        let Some(completion) = self.stage_completion() else {
+            self.resume_after_dc()?;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        };
+        let Some(mapping) = completion.poll(context) else {
             return Poll::Pending;
         };
         if self.dependency_submission_ready() {
@@ -2381,7 +2538,7 @@ fn submit_vardct(
         source.hf_coefficients.as_ref(),
         hf_coefficient_buffers.as_ref(),
     ) {
-        if !source.intermediate_passes.is_empty() {
+        if !source.intermediate_outputs.is_empty() {
             let before = commands.finish();
             commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jxl-wgpu final progressive frame render"),
@@ -2389,26 +2546,16 @@ fn submit_vardct(
             let coefficients = if plan.uses_bounded_stream_windows() {
                 progression::PassCommands::Windowed(prepare_hf_windows(&source.codestream, plan)?)
             } else {
-                let mut passes = Vec::with_capacity(plan.pass_count());
-                for pass_index in 0..plan.pass_count() {
-                    let mut pass = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("jxl-wgpu image-wide HF coefficient pass"),
-                    });
-                    encode_hf_pass(
-                        device,
-                        &mut pass,
-                        &pipelines,
-                        HfCoefficientPassBuffers {
-                            source: &codestream_buffer,
-                            plan,
-                            jobs: buffers,
-                            groups: &group_buffers,
-                        },
-                        pass_index,
-                    )?;
-                    passes.push(pass.finish());
-                }
-                progression::PassCommands::Whole(passes)
+                progression::PassCommands::Whole(record_hf_passes(
+                    device,
+                    &pipelines,
+                    HfCoefficientPassBuffers {
+                        source: &codestream_buffer,
+                        plan,
+                        jobs: buffers,
+                        groups: &group_buffers,
+                    },
+                )?)
             };
             progressive_coefficients = Some((before, coefficients));
         } else if plan.uses_bounded_stream_windows() {
@@ -2518,12 +2665,14 @@ fn submit_vardct(
         post_transform_buffers,
         lf_planes,
         resident_scratch,
+        ..
     } = render::encode_frame_render(
         device,
         &mut commands,
         &pipelines,
         render::FrameRenderInputs {
             source: &source,
+            reconstruction: &VarDctReconstruction::Coefficients,
             group_buffers: &group_buffers,
             resources: &resources,
             output: &output,
@@ -2617,6 +2766,8 @@ fn submit_vardct(
                 Some(DeferredHfGlobalCommands {
                     before_coefficients: Some(before_coefficients),
                     after_coefficients,
+                    intermediate_commands,
+                    first_intermediate: 0,
                 }),
             )
         } else {
@@ -2750,7 +2901,15 @@ fn submit_vardct(
             .ok_or(VarDctDecodeError::EngineContract {
                 detail: "raw HF dequant side image has no deferred coefficient commands",
             })?;
-        pending.start_raw_hf_dequant_stage(Box::new(source), commands, Some(poll_permit))?;
+        if source.intermediate_outputs.is_empty() {
+            pending.start_raw_hf_dequant_stage(Box::new(source), commands, Some(poll_permit))?;
+        } else {
+            pending.defer_hf_after_dc(
+                Box::new(source),
+                commands,
+                DeferredHfResume::Raw(Some(poll_permit)),
+            )?;
+        }
         return Ok(pending);
     }
     let completion = Arc::new(MapCompletion::default());

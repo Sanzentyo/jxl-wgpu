@@ -239,7 +239,7 @@ The table below states the default workgroup configuration for each entry point:
 | `gaborish_rgb` | X/Y/B RO, X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked common extent and per-plane strides |
 | `epf0`, `epf1`, `epf2` | X/Y/B/sigma RO, X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked common extent, sigma shape and all strides |
 | `upsample` | input/weights RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked factor, output extent, weights and strides |
-| `vardct_frame_upsample` (decoder, `upsample`) | restored component/phase weights RO, full output component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one immutable expanded kernel shared by three channel dispatches; exact encoded/output extents, mirrored 5×5 neighborhoods, range clamping, and odd-edge cropping; planes, weights, and 32-byte uniforms share the frame budget |
+| `vardct_frame_upsample` (decoder, `upsample`) | restored component/phase weights RO, full output component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one immutable expanded kernel shared by three channel dispatches; exact encoded/output extents, mirrored 5×5 neighborhoods, range clamping, and odd-edge cropping; planes, weights, and 48-byte uniforms share the frame budget |
 | `ycbcr_to_rgb` | Cb/Y/Cr RO, output RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one checked dispatch per output component |
 | `xyb_to_rgb` | X/Y/B RO, R/G/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one dispatch; checked common F32 extent, per-plane strides, finite inverse-opsin parameters and positive intensity target |
 | `transfer_function` | R/G/B RO, R/G/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one dispatch; checked common F32 extent and Linear/sRGB/BT.709/Gamma/PQ/HLG parameters |
@@ -396,11 +396,12 @@ against device limits prior to pipeline compilation and dispatch recording.
 | Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
 
 Ordinary VarDCT 2×/4×/8× frame resampling uses the scheduler's existing `upsample.wgsl` through
-`ResidentUpsamplePipeline`. Its 32-byte, 16-byte-aligned `Pod` stores input/output dimensions at
-offsets 0/8, strides at 16/20, factor at 24, and padding at 28. Each of three dispatches retains
+`ResidentUpsamplePipeline`. Its shared 48-byte, 16-byte-aligned `Pod` stores input/output dimensions
+at offsets 0/8, row strides at 16/20, factor at 24, scalar source offset at 28, scalar sample stride
+at 32, and three padding words at 36. Scheduler planes use source offset zero and sample stride one. Each of three dispatches retains
 one uniform. `frame_upsample_bytes` charges exactly `output_width * output_height * 12` for three
 F32 planes; `frame_upsample_weight_bytes` charges `factor * factor * 25 * 4` for the single shared
-phase-major kernel; `frame_upsample_uniform_bytes` is 96. The frontend expands only the bounded
+phase-major kernel; `frame_upsample_uniform_bytes` is 144. The frontend expands only the bounded
 15/55/210 scalar header weights. Restoration uses the encoded extent; upsampling mirrors full-frame
 borders and crops right/bottom output edges before color conversion. These allocations remain in
 the pending job until final validation, and are checked against device limits and the same
@@ -568,7 +569,7 @@ Selected resampled integer and floating channels use `ModularRenderPlan` in both
 It allocates one aligned F32 destination arena, one reusable low-resolution normalization plane
 large enough for the largest selected resampled input, and one weight table per distinct factor.
 Destination view offsets satisfy the adapter's storage alignment. Each selected source has a
-32-byte normalization uniform; each factor above one adds the existing 32-byte upsampling uniform.
+32-byte normalization uniform; each factor above one adds the shared 48-byte upsampling uniform.
 The source representation is decoded before interpolation, so packing performs no intermediate integer
 quantization. Only bounded scalar weight expansion runs on the host.
 
@@ -823,8 +824,8 @@ Color normalization owns three coded-resolution planes. Gaborish/EPF add one reu
 ping-pong set; color resampling adds three presentation-resolution planes only when needed. Extras
 reuse one separately sized normalization scratch buffer. The common `color_output` packer writes
 into the existing aligned all-channel render arena; its 192/160-byte uniforms and each 80-byte
-Gaborish/EPF or 32-byte upsampling uniform are included exactly once. A 37×17, factor-2 color plan
-with Gaborish and two EPF passes accounts 11,652 working-plane bytes and 768 uniform bytes,
+Gaborish/EPF or 48-byte upsampling uniform are included exactly once. A 37×17, factor-2 color plan
+with Gaborish and two EPF passes accounts 11,652 working-plane bytes and 816 uniform bytes,
 separately from the final render arena and shared weights.
 
 `ResidentEpfSigma::Constant` stores the negative inverse sigma in byte 72 of the existing 80-byte
@@ -883,10 +884,12 @@ flat, pass-major parameters with original status indices, global logical IDs, LZ
 boundaries: all LF groups complete one pass before rendering or starting its successor. Bounded
 segments rebase their local lane through that pass's parameter range, never through another pass.
 
-`intermediate_output_bytes` adds one independently leased packed output per requested non-final
-AC pass. `intermediate_transient_bytes` adds each stage's inverse-transform scratch, interpolation
-and restoration uniforms, frame-resampling weights, noise buffer/uniform, output uniform and full
-validation map. Coefficients, LF/HF artifacts, resources, sigma and planar render destinations are
+`intermediate_output_bytes` adds one independently leased packed DC output and one output per
+requested non-final AC pass. `intermediate_transient_bytes` sums each stage's exact cost: DC
+reconstruction uses one expanded 8× kernel (6,400 bytes), three 48-byte interpolation uniforms and
+a packet/artifact-only validation map. AC uses inverse-transform scratch and the full validation
+map. Both add their interpolation/restoration uniforms, frame-resampling weights, noise
+buffer/uniform and output uniform. Coefficients, LF/HF artifacts, resources, sigma and planar render destinations are
 shared; reconstruction overwrites these before each subsequent render. No returned image aliases
 those mutable destinations. Both totals participate in adaptive stream admission before source
 consumption, and each snapshot has its own completion-poller reservation.
@@ -899,3 +902,18 @@ callback retirement after the device fence. Holding a returned image retains onl
 bytes after the cancelled or completed job retires. Logical frame-slot permits are shared across
 one pending presentation and its intermediate/final leases, while output-byte quotas remain
 independent. Fatal update errors cancel the queued pending work without invalidating prior leases.
+
+DC interpolation reads channel-specific LF origins/extents/row strides directly from the vec4
+resource atlas through scalar offset `lf_offset * 4 + channel` and sample stride four. The complete
+MCU-padded LF extent is interpolated into each padded resident component before ordinary cropping,
+restoration, frame upsampling, color conversion and orientation. No gathered image or host pixel
+copy is allocated. Tests cover padded/unaligned scalar origins inside aligned bindings, poisoned
+unused interleaved lanes, all factors, cropped/one-sample axes, and invalid addressing.
+
+Deferred HF work retains the remaining immutable image recordings and poll reservations in the
+pending state. DC submits the LF/resource/artifact prefix and enters an explicit host continuation;
+there is no synthetic completed map. Its callback retains the common job and reservations until
+completion even if the consumer cancels before the first update. The next poll resumes HF-global
+metadata/raw-matrix work. Descriptor-dependent AC status buffers are then attached to the recorded
+images before the ordinary pass schedule runs. DC validation never depends on those later buffers.
+Final-only consumers drive the same continuation without returning intermediate images.

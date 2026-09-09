@@ -34,8 +34,18 @@ use super::window_plan::{
 };
 use crate::restoration::restoration_config;
 
+pub(super) enum VarDctReconstruction {
+    Coefficients,
+    Dc(ResidentUpsampleKernel),
+}
+
+pub(super) struct VarDctIntermediateOutput {
+    pub(super) progression: crate::FrameProgression,
+    pub(super) reconstruction: VarDctReconstruction,
+}
+
 pub(super) struct VarDctSource {
-    pub(super) intermediate_passes: Vec<crate::FrameProgression>,
+    pub(super) intermediate_outputs: Vec<VarDctIntermediateOutput>,
     pub(super) noise: Option<jxl_wgpu::ResidentNoisePlan>,
     pub(super) codestream: GpuCodestream,
     pub(super) packet: BoundedVarDctPacketPlan,
@@ -82,7 +92,7 @@ impl VarDctSource {
     }
 
     pub(super) fn submissions_per_frame(&self) -> usize {
-        self.final_submissions_per_frame() + self.intermediate_passes.len()
+        self.final_submissions_per_frame() + self.intermediate_outputs.len()
     }
 
     fn final_submissions_per_frame(&self) -> usize {
@@ -416,7 +426,7 @@ pub(super) fn prepare_packet_source(
         .filter(|_| render_color)
         .map(|group| ResidentVarDctMemoryPlan::new(group.coefficient_words()))
         .collect::<Result<Vec<_>, _>>()?;
-    let intermediate_passes: Vec<crate::FrameProgression> = if request.progressive_output()
+    let intermediate_outputs = if request.progressive_output()
         && output.is_color()
         && surface.is_none()
         && inventory.image_header.animation.is_none()
@@ -424,25 +434,42 @@ pub(super) fn prepare_packet_source(
         && frame.frame_type == jxl_gpu_bitstream::FrameType::Regular
         && frame.is_last
         && !packet.profile.uses_lf_frame
-        && packet.hf_coefficients.is_some()
     {
-        (1..frame.num_passes)
-            .map(|completed| {
-                let intended_downsampling = frame
-                    .progressive_passes
-                    .last_pass
-                    .iter()
-                    .zip(&frame.progressive_passes.downsampling)
-                    .filter(|(last, _)| completed > **last)
-                    .fold(8, |divisor, (_, &target)| divisor.min(target));
-                crate::FrameProgression {
-                    physical_frame_index: frame.frame_index,
-                    completed_passes: completed as u8,
-                    total_passes: frame.num_passes as u8,
-                    intended_downsampling,
-                }
-            })
-            .collect()
+        let progression = |completed| {
+            let intended_downsampling = frame
+                .progressive_passes
+                .last_pass
+                .iter()
+                .zip(&frame.progressive_passes.downsampling)
+                .filter(|(last, _)| completed > **last)
+                .fold(8, |divisor, (_, &target)| divisor.min(target));
+            crate::FrameProgression {
+                physical_frame_index: frame.frame_index,
+                completed_passes: completed as u8,
+                total_passes: frame.num_passes as u8,
+                intended_downsampling,
+            }
+        };
+        let compact = inventory
+            .image_header
+            .upsampling_weights
+            .up8
+            .iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>();
+        let mut outputs = vec![VarDctIntermediateOutput {
+            progression: progression(0),
+            reconstruction: VarDctReconstruction::Dc(ResidentUpsampleKernel::from_compact(
+                8, &compact,
+            )?),
+        }];
+        outputs.extend(
+            (1..frame.num_passes).map(|completed| VarDctIntermediateOutput {
+                progression: progression(completed),
+                reconstruction: VarDctReconstruction::Coefficients,
+            }),
+        );
+        outputs
     } else {
         Vec::new()
     };
@@ -497,7 +524,7 @@ pub(super) fn prepare_packet_source(
                 },
                 extra_render_bytes: extra_render.as_ref().map_or(0, |plan| plan.total_bytes()),
             })?
-            .with_intermediate_outputs(intermediate_passes.len())?;
+            .with_intermediate_outputs(&intermediate_outputs)?;
             Ok(VarDctEntropyPlanSelection {
                 stream_limit,
                 packet_windows,
@@ -548,7 +575,7 @@ pub(super) fn prepare_packet_source(
     )?;
     let frame_name = packet.profile.frame_name.clone();
     Ok(VarDctSource {
-        intermediate_passes,
+        intermediate_outputs,
         codestream,
         packet,
         groups,

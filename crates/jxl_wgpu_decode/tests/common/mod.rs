@@ -387,3 +387,58 @@ pub fn vardct_depth_combined(name: &str) -> Vec<u8> {
         _ => panic!("unknown integer-depth fixture: {name}"),
     })
 }
+
+pub fn with_custom_upsampling_weights(data: &[u8]) -> Vec<u8> {
+    use jxl_gpu_bitstream::BitWriter;
+    let parsed = jxl_gpu_bitstream::parse(data, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let codestream = parsed.codestream();
+    let data: &[u8] = codestream;
+    let end = inventory.image_header.bit_range.end().unwrap() as usize;
+    let default_transform = data[(end - 1) / 8] & (1 << ((end - 1) % 8)) != 0;
+    let prefix_end = end - if default_transform { 1 } else { 3 };
+    if !default_transform {
+        for bit in prefix_end..end {
+            assert_eq!(
+                (data[bit / 8] >> (bit % 8)) & 1,
+                0,
+                "fixture has no custom weights"
+            );
+        }
+    }
+    let mut writer = BitWriter::new();
+    for bit in 0..prefix_end {
+        writer
+            .write_bits(u64::from((data[bit / 8] >> (bit % 8)) & 1), 1)
+            .unwrap();
+    }
+    if default_transform {
+        writer.write_bits(0, 1).unwrap(); // Explicit transform data.
+        if inventory.image_header.xyb_encoded {
+            writer.write_bits(1, 1).unwrap();
+        } // Default opsin matrix.
+    }
+    writer.write_bits(7, 3).unwrap(); // All three custom kernels.
+    for _ in 0..15 + 55 + 210 {
+        writer.write_bits(0x2800, 16).unwrap();
+    } // Exact binary16 1/32.
+    writer.align_to_byte().unwrap();
+    let mut result = writer.into_bytes();
+    result.extend_from_slice(&data[end.div_ceil(8)..]);
+    result
+}
+
+pub fn vardct_progressive_raw_matrix() -> Vec<u8> {
+    decode_hex(include_str!(
+        "../../test-data/testsrc_vardct_progressive_raw_matrix.jxl.hex"
+    ))
+}
+
+pub fn jpeg_dc_edge_case(selectors: &str) -> Vec<u8> {
+    decode_hex(match selectors {
+        "003" => include_str!("../../test-data/jpeg_sampling/odd_003.jxl.hex"),
+        "321" => include_str!("../../test-data/jpeg_sampling/odd_321.jxl.hex"),
+        "111" => include_str!("../../test-data/jpeg_sampling/odd_111.jxl.hex"),
+        _ => panic!("unknown DC sampling edge fixture: {selectors}"),
+    })
+}

@@ -556,7 +556,7 @@ impl ReconstructionPipeline {
                     device,
                     encoder,
                     ResidentUpsampleInputs {
-                        input,
+                        input: input.into(),
                         output,
                         weights,
                     },
@@ -770,7 +770,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.storage_bytes, 6 * 19 * 9 * 4 + 3 * 37 * 17 * 4);
-        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 32 + 352);
+        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 48 + 352);
         assert_eq!(
             plan.layout
                 .planes

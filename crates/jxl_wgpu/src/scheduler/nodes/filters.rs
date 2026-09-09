@@ -568,7 +568,9 @@ pub(in crate::scheduler) fn encode_upsample(
         input_stride: stride(&input.desc),
         output_stride: stride(&output.desc),
         factor,
-        _padding: 0,
+        input_offset: 0,
+        input_sample_stride: 1,
+        _padding: [0; 3],
     };
     let uniform = create_uniform(device, "jxl-wgpu upsample params", &params);
     let pipeline = create_pipeline(

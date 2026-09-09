@@ -7,11 +7,28 @@ use crate::vardct_pass_group::{
     HfCoefficientPassParams,
 };
 
+#[derive(Clone, Copy)]
 pub(super) struct HfCoefficientPassBuffers<'a> {
     pub(super) source: &'a wgpu::Buffer,
     pub(super) plan: &'a HfCoefficientExecutionPlan,
     pub(super) jobs: &'a HfCoefficientJobBuffers,
     pub(super) groups: &'a [VarDctGroupJobBuffers],
+}
+
+pub(super) fn record_hf_passes(
+    device: &wgpu::Device,
+    pipelines: &VarDctPipelines,
+    inputs: HfCoefficientPassBuffers<'_>,
+) -> Result<Vec<wgpu::CommandBuffer>, VarDctDecodeError> {
+    (0..inputs.plan.pass_count())
+        .map(|pass| {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jxl-wgpu image-wide HF coefficient pass"),
+            });
+            encode_hf_pass(device, &mut encoder, pipelines, inputs, pass)?;
+            Ok(encoder.finish())
+        })
+        .collect()
 }
 
 /// One image-wide accumulation stage, with original per-group validation/state offsets.
@@ -119,6 +136,10 @@ pub(super) fn prepare_hf_windows(
 }
 
 impl HfCoefficientWindowCommands {
+    pub(super) fn pass_count(&self) -> usize {
+        self.pass_count
+    }
+
     pub(super) fn submit(
         self,
         device: &wgpu::Device,

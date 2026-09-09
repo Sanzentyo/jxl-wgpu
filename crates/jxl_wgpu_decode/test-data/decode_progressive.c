@@ -1,17 +1,21 @@
-/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX]].
+/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear]]].
  * Production decoding does not link to this helper. Use whole input for noisy
  * images: libjxl 0.12.0 retries incomplete frame headers without rolling back
  * its persistent noise-frame counters. GPU fragmented input is tested separately.
  */
 #include <jxl/decode.h>
+#include <jxl/encode.h>
 #include <jxl/color_encoding.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 4) return 2;
+  if (argc < 2 || argc > 5) return 2;
+  int linear = argc == 5 && strcmp(argv[4], "linear") == 0;
+  if (argc == 5 && !linear) return 2;
   FILE *input = fopen(argv[1], "rb");
   if (!input || fseek(input, 0, SEEK_END)) return 2;
   long length = ftell(input);
@@ -24,7 +28,7 @@ int main(int argc, char **argv) {
   if (!quantum) return 2;
   size_t delivered = quantum < (size_t)length ? quantum : (size_t)length;
   JxlDecoder *decoder = JxlDecoderCreate(NULL);
-  if (!decoder || JxlDecoderSubscribeEvents(decoder, JXL_DEC_BASIC_INFO | JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE | JXL_DEC_FRAME_PROGRESSION) != JXL_DEC_SUCCESS || JxlDecoderSetProgressiveDetail(decoder, kPasses) != JXL_DEC_SUCCESS || JxlDecoderSetInput(decoder, bytes, delivered) != JXL_DEC_SUCCESS) return 3;
+  if (!decoder || JxlDecoderSubscribeEvents(decoder, JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE | JXL_DEC_FRAME_PROGRESSION) != JXL_DEC_SUCCESS || JxlDecoderSetProgressiveDetail(decoder, kPasses) != JXL_DEC_SUCCESS || JxlDecoderSetInput(decoder, bytes, delivered) != JXL_DEC_SUCCESS) return 3;
   JxlBasicInfo info;
   const JxlPixelFormat format = {4, JXL_TYPE_FLOAT, JXL_LITTLE_ENDIAN, 0};
   float *pixels = NULL;
@@ -35,6 +39,12 @@ int main(int argc, char **argv) {
     if (status == JXL_DEC_BASIC_INFO) {
       if (JxlDecoderGetBasicInfo(decoder, &info) != JXL_DEC_SUCCESS) return 3;
       printf("image,%u,%u,%u,%u\n", info.xsize, info.ysize, info.num_extra_channels, info.have_animation);
+    } else if (status == JXL_DEC_COLOR_ENCODING) {
+      if (linear) {
+        JxlColorEncoding color;
+        JxlColorEncodingSetToLinearSRGB(&color, info.num_color_channels == 1);
+        if (JxlDecoderSetPreferredColorProfile(decoder, &color) != JXL_DEC_SUCCESS) return 3;
+      }
     } else if (status == JXL_DEC_FRAME) {
       step = 0;
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {

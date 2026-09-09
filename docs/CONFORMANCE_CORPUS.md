@@ -2521,3 +2521,72 @@ Rust 1.89 all-target/all-feature check and the six-crate WASM check pass. Refere
 harnesses each pass 18 cases. Indexed Gray8 U8 CPU readback passes with direct mapping of all
 221 logical bytes and no staging allocation. The three new GPU progression tests run in the full
 suite, including the native libjxl flush oracle. Full JPEG XL remains an active implementation goal.
+
+### VarDCT DC images and deferred progressive coefficients
+
+This extends the preceding AC checkpoint. `progression.rs` compares twenty-three direct color-only
+VarDCT stills with native libjxl DC/pass flushes: spectral and quantized passes, multiple LF groups,
+4:4:4/4:2:2/4:4:0 JPEG, three raw 4:2:0 matrix descriptor forms, three noisy odd-edge sampling
+variants, grayscale, orientation, ordinary
+2×/4×/8× frame upsampling, two nondefault custom-kernel variants, and deferred raw-matrix spectral
+passes. DC has `completed_passes = 0` and intended detail ratio 8, including frames with their own
+resampling factor. Whole and 256-byte GPU windows produce identical full-canvas bytes; RGB8
+progression also uses 37-byte fragmented async input. All retained outputs stay immutable through
+later reconstruction, share one logical frame slot, and preserve exact final-only GPU bytes.
+
+`regenerate_raw_matrix` now also reproduces `testsrc_vardct_progressive_raw_matrix.jxl.hex`
+(18,739 encoded bytes, SHA-256 `7a635a8457e3ff9ff9a44b1e497d6ec483d69b55011f8e9455d6be20f3e5d460`).
+It copies the self-contained local raw-matrix set from the existing JPEG fixture into the
+257×129 spectral stream, locates exact syntax ends with the offline Rust oracle, repads HF-global,
+and rewrites the logical TOC. LF and all three coefficient entropy streams remain unchanged.
+This exercises DC publication before raw-matrix work, then attachment of descriptor-dependent
+status buffers for both non-final AC images. Other fixture files are unchanged; custom 4×/8×
+cases use the shared runtime header rewriter with exact binary16 1/32 weights.
+
+Native DC linear-RGB maxAE stays below 0.0000032; every DC uses a 0.00001 regression bound.
+The previous ordinary AC/final bounds remain 0.0002/0.0001. Every stage is within one RGB8 code.
+The transplanted raw matrix deliberately produces large signed/overshooting values. Inverting
+libjxl's approximate sRGB output misleadingly reported up to 1.232 linear error. The C oracle now
+has an optional `linear` argument that requests linear sRGB directly at the color-encoding event;
+this stress case uses matching linear GPU output. Its measured maxima are 0.000151, 0.000463 and
+0.001915 for AC1, AC2 and final, with final normalized error 0.000676 using
+`abs(error) / max(1, abs(reference))`. It retains a separate 0.002 native regression bound.
+Final-only GPU decoding has exactly the same pixels and discrepancy. This records an outstanding
+extended-range precision item for `VDCT-D04`, not ISO conformance evidence or a relaxed DC bound.
+
+Six additional single-entry cases cover custom nearest-neighbor 8× weights, thin and one-sample
+axes, gray, gray JPEG and oriented 4:2:0 JPEG. Their native decoder exposes only a final event, so
+no native DC comparison is claimed for them. GPU DC/final bytes match under whole and 40-byte
+windows; final-only blocking/async consumers drive deferred continuations correctly. Corrupting
+the last HF byte still returns the same DC before a typed error poisons the session, and the
+held image survives failure with only its output bytes retained.
+
+Internal raw-matrix tests cover global/local packet paths, a DC image preceding unaffordable late
+admission, raw entropy corruption after DC, cancellation at the queued DC boundary and every raw
+entropy/finalization continuation, and exact callback retirement. The final-only budget error
+remains its original `MemoryBackpressure` variant. Strided interpolation adapter tests compare
+all 2×/4×/8× factors against tightly packed GPU filtering, including poisoned unused lanes,
+nonzero scalar origins in aligned sub-bindings, row padding, mirrored one-sample axes and cropped
+outputs. Zero/overflowing/out-of-range/undersized scalar views fail before recording GPU work.
+
+The three additional 257×17 JPEG sampling cases use selectors `003`, `321` and `111` from the
+existing sampling corpus. They cover asymmetric components and equal 2×2 factors with a 34×4
+MCU-padded LF grid, including noise. Native DC linear maxAE is at most 0.00000012, with exact
+whole/bounded/fragmented GPU parity.
+
+The shared upsampling uniform is now 48 bytes with explicit scalar origin and sample stride;
+three frame-upsampling uniforms therefore consume 144 bytes. DC directly interpolates the
+complete vec4 LF atlas with the image's normative 8× weights and preserves MCU-padded neighbors.
+It uses only packet/artifact validation until HF work is available. LF dependency images, extras,
+Modular progression, composed/animated updates and incomplete-frame readiness remain unfinished.
+
+Validation on 2026-09-09 Apple M5/Metal: all 793 workspace tests pass across 41 targets
+(33 nonempty, eight empty), with zero failures and one existing manual allocation benchmark
+ignored. The initial run found two obsolete 32-byte upsampling-uniform expectations; correcting
+them to the new 48-byte ABI restored the exact Modular memory checks. After adding the three
+odd-edge JPEG cases, all four progression integration tests pass again with 23 native cases.
+Formatting, all-target/all-feature workspace check, warning-free Clippy/rustdoc, Rust 1.89 and
+the six-crate WebAssembly check pass. Reference and Metal harnesses each pass 18 cases, and
+Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and zero staging bytes.
+The full JPEG XL goal remains active; the remaining progressive and precision gates above are
+not marked complete.

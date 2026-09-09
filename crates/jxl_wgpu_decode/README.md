@@ -109,9 +109,10 @@ libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced
 
 ### Intermediate pass images
 
-`GpuOutputRequest::with_progressive_output(true)` enables intermediate AC-pass images for direct
-VarDCT stills whose coefficient descriptors are available during preparation and which have no
-extra channels or LF/reference/composition dependencies. Other paths currently return final images.
+`GpuOutputRequest::with_progressive_output(true)` enables DC and intermediate AC-pass images for
+direct VarDCT stills with no extra channels or LF/reference/composition dependencies. It includes
+single-entry and raw-matrix streams with deferred coefficient descriptors. Other paths currently
+return final images.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
 embedded-preview delivery.
 
@@ -126,7 +127,7 @@ let mut session = decoder.open(encoded, request)?;
 while let Some(image) = session.next_update_async().await? {
     // Present image.output(). Intermediate and final storage have the same full canvas extent.
     if let Some(progress) = image.progression() {
-        // Every group in progress.completed_passes is decoded.
+        // Zero completed passes identifies the DC image; positive counts identify AC refinements.
         // progress.intended_downsampling describes detail, not buffer dimensions.
     }
     // image.is_complete() distinguishes the final reconstruction from a refinement.
@@ -146,8 +147,13 @@ Pass barriers span every LF group in both whole-buffer and bounded-window execut
 captures independent packet/artifact/coefficient validation evidence, validates only completed
 passes, and remains valid if a later pass fails. Spectral, quantized and multiple-LF-group fixtures
 match native libjxl flushes within one RGB8 code; all final GPU bytes match final-only decoding.
-The remaining progressive work includes DC/LF images, deferred descriptors, Modular and extra
-channels, composed/animated updates, and incomplete-frame input readiness.
+DC uses the image-header 8× kernel over the complete LF atlas, including MCU padding and
+cross-group neighbors, followed by the normal restoration/resampling/color pipeline. Its detail
+ratio is 8 and its output has the same full canvas extent as the final image. Only packet/artifact
+evidence is needed at this stage. Deferred HF descriptors and raw matrices are parsed/executed
+after returning DC; later errors preserve that image. The remaining progressive work includes LF
+dependency images, Modular and extra channels, composed/animated updates, and incomplete-frame
+input readiness.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 
@@ -694,7 +700,7 @@ profile separates encoded `width`/`height` from presented `output_width`/`output
 coefficient and restoration work use the encoded grid. Three resident 5×5 filter dispatches then
 expand that grid before XYB conversion, with mirrored boundaries, normative range clamping, and
 right/bottom cropping to the exact output extent. One expanded weight buffer is shared by all
-channels. Output-sized F32 planes, weights, and three 32-byte uniforms are explicitly budgeted and
+channels. Output-sized F32 planes, weights, and three 48-byte uniforms are explicitly budgeted and
 retained through final validation. Checked-in libjxl fixtures cover all factors, custom nearest
 neighbor weights, spectral passes with 4× resampling, odd dimensions, single-sample axes, and a
 4111×17 output spanning two LF groups. Blocking and bounded-window async output matches Rust

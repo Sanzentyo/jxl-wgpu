@@ -484,25 +484,28 @@ impl ModularRenderPipeline {
                     .ok_or(ModularRenderError::Invalid {
                         reason: "missing upsampling weights",
                     })?;
-                uniforms.push(self.upsample.encode(
-                    device,
-                    encoder,
-                    ResidentUpsampleInputs {
-                        input: ResidentF32Plane {
-                            storage: normalized,
-                            width: source.width,
-                            height: source.height,
-                            stride: source.width,
+                uniforms.push(
+                    self.upsample.encode(
+                        device,
+                        encoder,
+                        ResidentUpsampleInputs {
+                            input: ResidentF32Plane {
+                                storage: normalized,
+                                width: source.width,
+                                height: source.height,
+                                stride: source.width,
+                            }
+                            .into(),
+                            output: ResidentF32Plane {
+                                storage: output_binding,
+                                width: plane.width,
+                                height: plane.height,
+                                stride: plane.row_stride_words,
+                            },
+                            weights: &buffers.weights[kernel_index],
                         },
-                        output: ResidentF32Plane {
-                            storage: output_binding,
-                            width: plane.width,
-                            height: plane.height,
-                            stride: plane.row_stride_words,
-                        },
-                        weights: &buffers.weights[kernel_index],
-                    },
-                )?);
+                    )?,
+                );
             }
         }
         Ok(uniforms)
@@ -583,7 +586,7 @@ mod tests {
         );
         assert_eq!(plan.scratch_bytes, 9 * 5 * 4);
         assert_eq!(plan.weight_bytes, (4 + 16 + 64) * 25 * 4);
-        assert_eq!(plan.uniform_bytes, 4 * 32 + 3 * 32);
+        assert_eq!(plan.uniform_bytes, 4 * 32 + 3 * 48);
         for (index, plane) in plan.planes().iter().enumerate() {
             assert_eq!(
                 (

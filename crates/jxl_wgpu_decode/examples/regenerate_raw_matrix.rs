@@ -4,6 +4,8 @@
 //! One variant embeds the MA descriptor in the raw image; another gives LF and HF metadata their
 //! own local descriptors and removes the global tree. Entropy tokens stay unchanged. The offline
 //! reference decoder locates LF/HF boundaries; production never performs this CPU image work.
+//! A third fixture transplants the local raw matrix into a spectral stream, preserving its three
+//! coefficient passes to exercise descriptor-dependent intermediate validation buffers.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -232,6 +234,110 @@ fn local_matrix(container: &[u8], local_packets: bool) -> Vec<u8> {
     output
 }
 
+// Combine unchanged spectral-pass entropy with the donor's self-contained raw matrices.
+// The offline oracle locates syntax ends so old byte padding cannot become extra entropy.
+fn progressive_raw_matrix(spectral: &[u8], donor: &[u8]) -> Vec<u8> {
+    use jxl_vardct::{
+        DequantMatrixSet, DequantMatrixSetParams, HfBlockContext, HfPass, HfPassParams,
+    };
+    let parse = |data: &[u8]| {
+        jxl_gpu_bitstream::parse(data, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap()
+    };
+    let inventory = parse(spectral);
+    let donor_inventory = parse(donor);
+    let frame = &inventory.frames[0];
+    let donor_frame = &donor_inventory.frames[0];
+    assert_eq!(
+        frame.low_frequency_group_count,
+        donor_frame.low_frequency_group_count
+    );
+    let hf_kind = FrameSectionKind::HighFrequencyGlobal;
+    let hf = frame
+        .sections
+        .iter()
+        .find(|section| section.kind == hf_kind)
+        .unwrap()
+        .bits;
+    let raw = donor_frame
+        .sections
+        .iter()
+        .find(|section| section.kind == hf_kind)
+        .unwrap()
+        .bits;
+    let lf = frame
+        .sections
+        .iter()
+        .find(|section| section.kind == FrameSectionKind::LowFrequencyGlobal)
+        .unwrap()
+        .bits;
+    let prefix = LfGlobalPrefix::parse(spectral, lf).unwrap();
+    let context = HfBlockContext {
+        qf_thresholds: prefix.hf_block_context.qf_thresholds,
+        lf_thresholds: prefix.hf_block_context.lf_thresholds,
+        block_ctx_map: prefix.hf_block_context.block_context_map,
+        num_block_clusters: prefix.hf_block_context.num_block_clusters,
+    };
+    let pool = jxl_threadpool::JxlThreadPool::none();
+    let mut raw_bits = Bitstream::new(donor);
+    raw_bits.skip_bits(raw.offset as usize).unwrap();
+    DequantMatrixSet::parse(
+        &mut raw_bits,
+        DequantMatrixSetParams::new(8, frame.low_frequency_group_count as u32, None, None, &pool),
+    )
+    .unwrap();
+    let raw_end = raw_bits.num_read_bits() as u64;
+    let mut bits = Bitstream::new(spectral);
+    bits.skip_bits(hf.offset as usize).unwrap();
+    assert!(bits.read_bool().unwrap()); // Source uses default matrices.
+    let preset_bits = frame.group_count.next_power_of_two().trailing_zeros();
+    let presets = bits.read_bits(preset_bits as usize).unwrap() + 1;
+    for _ in 0..frame.num_passes {
+        HfPass::parse(&mut bits, HfPassParams::new(&context, presets)).unwrap();
+    }
+    let syntax_end = bits.num_read_bits() as u64;
+    assert!(hf.end().unwrap() - syntax_end <= 7);
+    assert_eq!(
+        bits.read_bits((hf.end().unwrap() - syntax_end) as usize)
+            .unwrap(),
+        0
+    );
+    let mut replacement = BitWriter::new();
+    copy_bits(&mut replacement, donor, raw.offset..raw_end);
+    copy_bits(&mut replacement, spectral, hf.offset + 1..syntax_end);
+    replacement.align_to_byte().unwrap();
+    let replacement = replacement.into_bytes();
+    let mut sections = frame.sections.iter().collect::<Vec<_>>();
+    sections.sort_by_key(|section| section.toc_index);
+    let mut writer = BitWriter::new();
+    copy_bits(&mut writer, spectral, 0..frame.toc_bits.offset);
+    writer.write_bits(0, 1).unwrap();
+    writer.align_to_byte().unwrap();
+    for section in &sections {
+        toc_entry(
+            &mut writer,
+            if section.kind == hf_kind {
+                replacement.len() as u64
+            } else {
+                section.bytes.length
+            },
+        );
+    }
+    writer.align_to_byte().unwrap();
+    let mut output = writer.into_bytes();
+    for section in sections {
+        output.extend_from_slice(if section.kind == hf_kind {
+            &replacement
+        } else {
+            &spectral[section.bytes.offset as usize..section.bytes.end().unwrap() as usize]
+        });
+    }
+    assert_eq!(parse(&output).image_header, inventory.image_header);
+    output
+}
+
 fn main() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data");
     let output = std::env::args_os()
@@ -241,6 +347,16 @@ fn main() {
     let original = offline::unhex(
         &std::fs::read_to_string(source.join("jpeg_transcode_raw_matrix.jxl.hex")).unwrap(),
     );
+    let spectral = offline::unhex(
+        &std::fs::read_to_string(source.join("testsrc_vardct_progressive_spectral.jxl.hex"))
+            .unwrap(),
+    );
+    let progressive = progressive_raw_matrix(&spectral, &local_matrix(&original, false));
+    std::fs::write(
+        output.join("testsrc_vardct_progressive_raw_matrix.jxl.hex"),
+        offline::hex(&progressive),
+    )
+    .unwrap();
     for (suffix, local_packets) in [("local", false), ("local_packets", true)] {
         let generated = local_matrix(&original, local_packets);
         std::fs::write(

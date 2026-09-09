@@ -28,7 +28,7 @@ use crate::vardct_pass_group::{
 };
 use crate::vardct_resource::{VarDctResourceError, VarDctResourceLayout, VarDctResourceParams};
 
-use super::source::VarDctGroupSource;
+use super::source::{VarDctGroupSource, VarDctIntermediateOutput, VarDctReconstruction};
 use super::window_plan::PacketWindowExecutionPlan;
 
 pub(super) const PACKET_STATUS_BYTES: u64 = std::mem::size_of::<GpuVarDctPacketStatus>() as u64;
@@ -308,7 +308,7 @@ pub struct VarDctDecodeMemoryStats {
     pub frame_upsample_bytes: u64,
     /// One phase-major weight buffer shared by the three frame-resampling dispatches.
     pub frame_upsample_weight_bytes: u64,
-    /// Three 32-byte uniforms retained until aggregate validation completes.
+    /// Three 48-byte uniforms retained until aggregate validation completes.
     pub frame_upsample_uniform_bytes: u64,
     /// Three full-resolution ping-pong destinations shared by Gaborish and EPF.
     pub restoration_scratch_bytes: u64,
@@ -341,16 +341,40 @@ pub struct VarDctDecodeMemoryStats {
 }
 
 impl VarDctDecodeMemoryStats {
-    pub(super) fn with_intermediate_outputs(
-        mut self,
-        count: usize,
-    ) -> Result<Self, VarDctDecodeError> {
-        let count = u64::try_from(count).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
-            field: "intermediate output count",
-        })?;
-        let transient = checked_sum(
+    pub(super) fn intermediate_validation_bytes(
+        &self,
+        reconstruction: &VarDctReconstruction,
+    ) -> Result<u64, VarDctDecodeError> {
+        match reconstruction {
+            VarDctReconstruction::Coefficients => Ok(self.validation_staging_bytes),
+            VarDctReconstruction::Dc(_) => {
+                let groups = self.packet_status_bytes / PACKET_STATUS_BYTES;
+                groups
+                    .checked_mul(PACKET_STATUS_BYTES + ARTIFACT_STATUS_BYTES)
+                    .ok_or(VarDctDecodeError::ArithmeticOverflow {
+                        field: "DC validation bytes",
+                    })
+            }
+        }
+    }
+
+    pub(super) fn intermediate_render_bytes(
+        &self,
+        reconstruction: &VarDctReconstruction,
+    ) -> Result<u64, VarDctDecodeError> {
+        let reconstruction_bytes = match reconstruction {
+            VarDctReconstruction::Coefficients => self.resident_transient_bytes,
+            VarDctReconstruction::Dc(kernel) => checked_sum(
+                [
+                    kernel.weight_bytes(),
+                    3 * ResidentUpsamplePipeline::UNIFORM_BYTES,
+                ],
+                "DC reconstruction bytes",
+            )?,
+        };
+        checked_sum(
             [
-                self.resident_transient_bytes,
+                reconstruction_bytes,
                 self.pre_restoration_upsample_uniform_bytes,
                 self.frame_upsample_weight_bytes,
                 self.frame_upsample_uniform_bytes,
@@ -359,21 +383,34 @@ impl VarDctDecodeMemoryStats {
                 self.noise_bytes,
                 self.noise_uniform_bytes,
                 self.output_uniform_bytes,
-                self.validation_staging_bytes,
+                self.intermediate_validation_bytes(reconstruction)?,
             ],
             "intermediate render bytes",
-        )?;
+        )
+    }
+
+    pub(super) fn with_intermediate_outputs(
+        mut self,
+        outputs: &[VarDctIntermediateOutput],
+    ) -> Result<Self, VarDctDecodeError> {
+        let count =
+            u64::try_from(outputs.len()).map_err(|_| VarDctDecodeError::ArithmeticOverflow {
+                field: "intermediate output count",
+            })?;
         self.intermediate_output_bytes = self.output_lease_bytes.checked_mul(count).ok_or(
             VarDctDecodeError::ArithmeticOverflow {
                 field: "intermediate output bytes",
             },
         )?;
-        self.intermediate_transient_bytes =
-            transient
-                .checked_mul(count)
-                .ok_or(VarDctDecodeError::ArithmeticOverflow {
-                    field: "intermediate transient bytes",
-                })?;
+        self.intermediate_transient_bytes = outputs.iter().try_fold(0_u64, |total, output| {
+            checked_sum(
+                [
+                    total,
+                    self.intermediate_render_bytes(&output.reconstruction)?,
+                ],
+                "intermediate transient bytes",
+            )
+        })?;
         self.total_frame_bytes = checked_sum(
             [
                 self.total_frame_bytes,

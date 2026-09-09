@@ -543,7 +543,7 @@ fn frame_upsampling_uses_header_weights_and_presentation_extent_on_gpu() {
                 memory.frame_upsample_weight_bytes,
                 u64::from(factor * factor) * 25 * 4
             );
-            assert_eq!(memory.frame_upsample_uniform_bytes, 96);
+            assert_eq!(memory.frame_upsample_uniform_bytes, 144);
             if name == "2" && cap == 256 {
                 let budget =
                     MemoryBudget::new(NonZeroU64::new(memory.frame_upsample_bytes).unwrap());

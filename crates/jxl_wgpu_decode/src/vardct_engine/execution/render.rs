@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) struct FrameRenderInputs<'a> {
     pub(super) source: &'a VarDctSource,
+    pub(super) reconstruction: &'a VarDctReconstruction,
     pub(super) group_buffers: &'a [VarDctGroupJobBuffers],
     pub(super) resources: &'a wgpu::Buffer,
     pub(super) output: &'a wgpu::Buffer,
@@ -18,6 +19,7 @@ pub(super) struct FrameRenderResult {
     pub(super) post_transform_buffers: PostTransformJobBuffers,
     pub(super) lf_planes: Option<ProgressiveDcXybPlanes>,
     pub(super) resident_scratch: Vec<ResidentVarDctScratch>,
+    _dc_reconstruction: Option<(ResidentUpsampleWeights, Vec<wgpu::Buffer>)>,
 }
 
 pub(super) fn encode_frame_render(
@@ -28,6 +30,7 @@ pub(super) fn encode_frame_render(
 ) -> Result<FrameRenderResult, VarDctDecodeError> {
     let FrameRenderInputs {
         source,
+        reconstruction,
         group_buffers,
         resources,
         output,
@@ -52,6 +55,7 @@ pub(super) fn encode_frame_render(
             field: "padded output width",
         })?;
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
+    let mut dc_reconstruction = None;
     let (output_scratch, post_transform_buffers, lf_planes) = match source.output {
         VarDctFrameOutput::Color { mut config, plan } => {
             let resident_planes =
@@ -67,45 +71,60 @@ pub(super) fn encode_frame_render(
             let correlation_width = source.packet.profile.width.div_ceil(64);
             let correlation_height = source.packet.profile.height.div_ceil(64);
 
-            for ((packet_group, group), buffers) in source
-                .packet
-                .groups
-                .iter()
-                .zip(&source.groups)
-                .zip(group_buffers)
-            {
-                resident_scratch.push(pipelines.renderer.encode(
-                    device,
-                    commands,
-                    ResidentVarDctInputs {
-                        coefficients: resident_binding(&buffers.coefficients)?,
-                        artifact: resident_binding(&buffers.artifact)?,
-                        resources: resident_binding(resources)?,
-                        outputs: resident_shifted_image_planes(
-                            resident_planes,
-                            padded_width,
-                            padded_height,
-                            source.packet.profile.channel_shifts,
-                        )?,
-                        indirect: &buffers.artifact,
-                        indirect_base_offset: u64::from(
-                            group.artifact_layout.indirect_offset_words,
-                        ) * 4,
-                        config: ResidentVarDctRenderConfig {
-                            task_capacity: packet_group.task_capacity,
-                            scratch_scalars: packet_group.coefficient_words(),
-                            task_word_offset: group.artifact_layout.tasks_offset_words,
-                            bucket_word_offset: group.artifact_layout.buckets_offset_words,
-                            quant_offset: group.quant_offset,
-                            correlation_offset: source.resource_layout.correlation_offset,
-                            lf_offsets: source.resource_layout.lf_offsets,
-                            lf_strides: source.resource_layout.lf_strides,
-                            correlation_width,
-                            correlation_height,
-                            quant_biases: source.quant_biases,
-                        },
-                    },
-                )?);
+            match reconstruction {
+                VarDctReconstruction::Dc(kernel) => {
+                    dc_reconstruction = Some(encode_dc_image(
+                        device,
+                        commands,
+                        pipelines,
+                        source,
+                        resources,
+                        resident_planes,
+                        kernel,
+                    )?);
+                }
+                VarDctReconstruction::Coefficients => {
+                    for ((packet_group, group), buffers) in source
+                        .packet
+                        .groups
+                        .iter()
+                        .zip(&source.groups)
+                        .zip(group_buffers)
+                    {
+                        resident_scratch.push(pipelines.renderer.encode(
+                            device,
+                            commands,
+                            ResidentVarDctInputs {
+                                coefficients: resident_binding(&buffers.coefficients)?,
+                                artifact: resident_binding(&buffers.artifact)?,
+                                resources: resident_binding(resources)?,
+                                outputs: resident_shifted_image_planes(
+                                    resident_planes,
+                                    padded_width,
+                                    padded_height,
+                                    source.packet.profile.channel_shifts,
+                                )?,
+                                indirect: &buffers.artifact,
+                                indirect_base_offset: u64::from(
+                                    group.artifact_layout.indirect_offset_words,
+                                ) * 4,
+                                config: ResidentVarDctRenderConfig {
+                                    task_capacity: packet_group.task_capacity,
+                                    scratch_scalars: packet_group.coefficient_words(),
+                                    task_word_offset: group.artifact_layout.tasks_offset_words,
+                                    bucket_word_offset: group.artifact_layout.buckets_offset_words,
+                                    quant_offset: group.quant_offset,
+                                    correlation_offset: source.resource_layout.correlation_offset,
+                                    lf_offsets: source.resource_layout.lf_offsets,
+                                    lf_strides: source.resource_layout.lf_strides,
+                                    correlation_width,
+                                    correlation_height,
+                                    quant_biases: source.quant_biases,
+                                },
+                            },
+                        )?);
+                    }
+                }
             }
             let image_width = source.packet.profile.width;
             let image_height = source.packet.profile.height;
@@ -223,25 +242,28 @@ pub(super) fn encode_frame_render(
                 (&frame_upsample_planes, &frame_upsample_weights)
             {
                 for channel in 0..3 {
-                    frame_upsample_uniforms.push(pipelines.frame_upsample.encode(
-                        device,
-                        commands,
-                        ResidentUpsampleInputs {
-                            input: ResidentF32Plane {
-                                storage: resident_binding(&presentation_planes[channel])?,
-                                width: image_width,
-                                height: image_height,
-                                stride: padded_width,
+                    frame_upsample_uniforms.push(
+                        pipelines.frame_upsample.encode(
+                            device,
+                            commands,
+                            ResidentUpsampleInputs {
+                                input: ResidentF32Plane {
+                                    storage: resident_binding(&presentation_planes[channel])?,
+                                    width: image_width,
+                                    height: image_height,
+                                    stride: padded_width,
+                                }
+                                .into(),
+                                output: ResidentF32Plane {
+                                    storage: resident_binding(&upsampled[channel])?,
+                                    width: source.packet.profile.output_width,
+                                    height: source.packet.profile.output_height,
+                                    stride: source.packet.profile.output_width,
+                                },
+                                weights,
                             },
-                            output: ResidentF32Plane {
-                                storage: resident_binding(&upsampled[channel])?,
-                                width: source.packet.profile.output_width,
-                                height: source.packet.profile.output_height,
-                                stride: source.packet.profile.output_width,
-                            },
-                            weights,
-                        },
-                    )?);
+                        )?,
+                    );
                 }
             }
             let presentation_planes = frame_upsample_planes
@@ -488,5 +510,58 @@ pub(super) fn encode_frame_render(
         post_transform_buffers,
         lf_planes,
         resident_scratch,
+        _dc_reconstruction: dc_reconstruction,
     })
+}
+
+/// Interpolate every padded LF sample before cropping to the coded image in postprocessing.
+/// This also preserves encoded MCU padding and cross-group neighbors for subsampled components.
+fn encode_dc_image(
+    device: &wgpu::Device,
+    commands: &mut wgpu::CommandEncoder,
+    pipelines: &VarDctPipelines,
+    source: &VarDctSource,
+    resources: &wgpu::Buffer,
+    planes: &[wgpu::Buffer; 3],
+    kernel: &jxl_wgpu::ResidentUpsampleKernel,
+) -> Result<(ResidentUpsampleWeights, Vec<wgpu::Buffer>), VarDctDecodeError> {
+    let weights = kernel.upload(device)?;
+    let mut uniforms = Vec::with_capacity(3);
+    let overflow = || VarDctDecodeError::ArithmeticOverflow {
+        field: "DC interpolation addressing",
+    };
+    for (channel, plane) in planes.iter().enumerate() {
+        let [width, height] = source.resource_layout.lf_extents[channel];
+        let offset = source.resource_layout.lf_offsets[channel]
+            .checked_mul(4)
+            .and_then(|offset| offset.checked_add(channel as u32))
+            .ok_or_else(overflow)?;
+        let row_stride = source.resource_layout.lf_strides[channel]
+            .checked_mul(4)
+            .ok_or_else(overflow)?;
+        let output_width = width.checked_mul(8).ok_or_else(overflow)?;
+        let output_height = height.checked_mul(8).ok_or_else(overflow)?;
+        uniforms.push(pipelines.frame_upsample.encode(
+            device,
+            commands,
+            ResidentUpsampleInputs {
+                input: jxl_wgpu::ResidentUpsampleSource {
+                    storage: resident_binding(resources)?,
+                    width,
+                    height,
+                    offset,
+                    row_stride,
+                    sample_stride: 4,
+                },
+                output: ResidentF32Plane {
+                    storage: resident_binding(plane)?,
+                    width: output_width,
+                    height: output_height,
+                    stride: output_width,
+                },
+                weights: &weights,
+            },
+        )?);
+    }
+    Ok((weights, uniforms))
 }
