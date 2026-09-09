@@ -2,17 +2,102 @@
 
 use super::*;
 
-/// The completely decoded coefficient boundary represented by an intermediate image.
-/// Pixel storage keeps the requested full canvas extent; downsampling describes intended detail.
+/// The validated physical boundary represented by an intermediate image. Completing an LF
+/// dependency does not complete its presentation. Every image keeps the requested canvas extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameProgression {
-    /// Original physical frame index, including hidden and LF frames.
-    pub physical_frame_index: u32,
-    /// Zero denotes DC only. Otherwise all logical groups in these AC passes are complete.
-    pub completed_passes: u8,
-    pub total_passes: u8,
-    /// A nonzero power of two. This does not change the output buffer's dimensions.
-    pub intended_downsampling: u32,
+pub enum FrameProgression {
+    /// Zero completed passes denotes DC; otherwise every logical group in these passes is valid.
+    Coefficients {
+        physical_frame_index: u32,
+        completed_passes: u8,
+        total_passes: u8,
+        /// A nonzero power of two describing detail, not the output buffer's dimensions.
+        intended_downsampling: u32,
+    },
+    /// A completely decoded LF dependency, including its restoration and frame resampling.
+    LowFrequency {
+        physical_frame_index: u32,
+        /// JPEG XL LF level, from 1 through 4; intended downsampling is 8 to this power.
+        level: u8,
+    },
+}
+
+impl FrameProgression {
+    pub const fn physical_frame_index(self) -> u32 {
+        match self {
+            Self::Coefficients {
+                physical_frame_index,
+                ..
+            }
+            | Self::LowFrequency {
+                physical_frame_index,
+                ..
+            } => physical_frame_index,
+        }
+    }
+
+    /// Returns the intended detail divisor, or zero for an invalid LF level.
+    pub const fn intended_downsampling(self) -> u32 {
+        match self {
+            Self::Coefficients {
+                intended_downsampling,
+                ..
+            } => intended_downsampling,
+            Self::LowFrequency {
+                level: level @ 1..=4,
+                ..
+            } => 1 << (3 * level),
+            Self::LowFrequency { .. } => 0,
+        }
+    }
+
+    /// Completed coefficient passes; complete LF frames have no partial coefficient boundary.
+    pub const fn completed_passes(self) -> Option<u8> {
+        match self {
+            Self::Coefficients {
+                completed_passes, ..
+            } => Some(completed_passes),
+            Self::LowFrequency { .. } => None,
+        }
+    }
+
+    pub const fn total_passes(self) -> Option<u8> {
+        match self {
+            Self::Coefficients { total_passes, .. } => Some(total_passes),
+            Self::LowFrequency { .. } => None,
+        }
+    }
+
+    fn valid(self) -> bool {
+        match self {
+            Self::Coefficients {
+                completed_passes,
+                total_passes,
+                intended_downsampling,
+                ..
+            } => {
+                total_passes != 0
+                    && completed_passes < total_passes
+                    && intended_downsampling.is_power_of_two()
+            }
+            Self::LowFrequency { level, .. } => (1..=4).contains(&level),
+        }
+    }
+
+    fn follows(self, previous: Self) -> bool {
+        if self.physical_frame_index() < previous.physical_frame_index()
+            || self.intended_downsampling() > previous.intended_downsampling()
+        {
+            return false;
+        }
+        if self.physical_frame_index() != previous.physical_frame_index() {
+            return true;
+        }
+        matches!((previous, self),
+            (Self::Coefficients { completed_passes: before, total_passes: before_total, .. },
+             Self::Coefficients { completed_passes: after, total_passes: after_total, .. })
+                if after > before && after_total == before_total)
+    }
 }
 
 /// One update from a pending engine frame. Only `Complete` advances presentation state.
@@ -144,26 +229,17 @@ impl<S: GpuSubmissionSession> GpuDecodeSession<S> {
         progression: FrameProgression,
     ) -> Result<GpuFrameLease<S::Frame>> {
         self.validate_frame_metadata(&frame.metadata)?;
-        if progression.total_passes == 0
-            || progression.completed_passes >= progression.total_passes
-            || !progression.intended_downsampling.is_power_of_two()
-        {
+        if !progression.valid() {
             return Err(Error::EngineContract(
-                "invalid intermediate coefficient boundary",
+                "invalid intermediate physical boundary",
             ));
         }
-        if let Some((_, previous)) = &self.last_progression {
-            let same_source = progression.physical_frame_index == previous.physical_frame_index;
-            if progression.physical_frame_index < previous.physical_frame_index
-                || progression.intended_downsampling > previous.intended_downsampling
-                || (same_source
-                    && (progression.completed_passes <= previous.completed_passes
-                        || progression.total_passes != previous.total_passes))
-            {
-                return Err(Error::EngineContract(
-                    "progressive image updates are out of order",
-                ));
-            }
+        if let Some((_, previous)) = &self.last_progression
+            && !progression.follows(*previous)
+        {
+            return Err(Error::EngineContract(
+                "progressive image updates are out of order",
+            ));
         }
         let permit = self
             .pending
@@ -193,5 +269,66 @@ impl<S: GpuSubmissionSession> Future for NextGpuUpdate<'_, S> {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().session.poll_next_update(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameProgression;
+
+    #[test]
+    fn complete_lf_boundaries_have_real_levels_and_precede_coefficient_refinements() {
+        let lf = |physical_frame_index, level| FrameProgression::LowFrequency {
+            physical_frame_index,
+            level,
+        };
+        for level in 0..=u8::MAX {
+            let boundary = lf(5, level);
+            assert_eq!(boundary.valid(), (1..=4).contains(&level));
+            assert_eq!(boundary.completed_passes(), None);
+            assert_eq!(boundary.total_passes(), None);
+            assert_eq!(
+                boundary.intended_downsampling(),
+                if (1..=4).contains(&level) {
+                    8_u32.pow(u32::from(level))
+                } else {
+                    0
+                }
+            );
+        }
+        let levels = [
+            lf(5, 4),
+            lf(6, 3),
+            lf(7, 2),
+            lf(8, 1),
+            FrameProgression::Coefficients {
+                physical_frame_index: 9,
+                completed_passes: 0,
+                total_passes: 3,
+                intended_downsampling: 8,
+            },
+            FrameProgression::Coefficients {
+                physical_frame_index: 9,
+                completed_passes: 1,
+                total_passes: 3,
+                intended_downsampling: 2,
+            },
+        ];
+        for (index, current) in levels.iter().enumerate() {
+            assert!(current.valid());
+            assert!(!current.follows(*current), "duplicate boundary");
+            for prior in &levels[..index] {
+                assert!(current.follows(*prior));
+                assert!(!prior.follows(*current));
+            }
+        }
+        assert!(
+            !lf(8, 1).follows(lf(8, 2)),
+            "one physical LF cannot have two levels"
+        );
+        assert!(
+            !lf(9, 2).follows(lf(8, 1)),
+            "later LF may not reduce detail"
+        );
     }
 }

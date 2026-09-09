@@ -131,8 +131,16 @@ pub(super) fn record_intermediates(
             );
         }
         let offset = packet_bytes + inputs.groups.len() as u64 * ARTIFACT_STATUS_BYTES;
-        let needs_hf_status = progression.completed_passes != 0 && inputs.hf.is_none();
-        if progression.completed_passes != 0 {
+        let needs_hf_status = progression
+            .completed_passes()
+            .expect("coefficient boundary")
+            != 0
+            && inputs.hf.is_none();
+        if progression
+            .completed_passes()
+            .expect("coefficient boundary")
+            != 0
+        {
             if let Some(hf) = inputs.hf {
                 copy_hf_status(&mut commands, hf, &status, offset)?;
             }
@@ -232,7 +240,13 @@ pub(super) fn submit_dc(
         .ok_or(VarDctDecodeError::EngineContract {
             detail: "deferred DC has no admitted image",
         })?;
-    if frame.progression.completed_passes != 0 || recording.needs_hf_status || frame.is_submitted()
+    if frame
+        .progression
+        .completed_passes()
+        .expect("coefficient boundary")
+        != 0
+        || recording.needs_hf_status
+        || frame.is_submitted()
     {
         return Err(VarDctDecodeError::EngineContract {
             detail: "invalid deferred DC boundary",
@@ -305,8 +319,18 @@ pub(super) fn submit_passes(
     };
     let mut previous = None;
     for frame in frames {
-        let completed = usize::from(frame.progression.completed_passes);
-        if usize::from(frame.progression.total_passes) != total_passes
+        let completed = usize::from(
+            frame
+                .progression
+                .completed_passes()
+                .expect("coefficient boundary"),
+        );
+        if usize::from(
+            frame
+                .progression
+                .total_passes()
+                .expect("coefficient boundary"),
+        ) != total_passes
             || completed >= total_passes
             || previous.is_some_and(|previous| completed <= previous)
         {
@@ -330,7 +354,12 @@ pub(super) fn submit_passes(
             let mut passes = passes.into_iter();
             let mut completed = 0;
             for (frame, recording) in frames.iter().zip(intermediate_commands) {
-                let target = usize::from(frame.progression.completed_passes);
+                let target = usize::from(
+                    frame
+                        .progression
+                        .completed_passes()
+                        .expect("coefficient boundary"),
+                );
                 for _ in completed..target {
                     prefix.push(passes.next().ok_or(VarDctDecodeError::EngineContract {
                         detail: "intermediate image exceeds available coefficient passes",
@@ -355,7 +384,12 @@ pub(super) fn submit_passes(
             })?;
             let mut completed = 0;
             for (frame, recording) in frames.iter().zip(intermediate_commands) {
-                let target = usize::from(frame.progression.completed_passes);
+                let target = usize::from(
+                    frame
+                        .progression
+                        .completed_passes()
+                        .expect("coefficient boundary"),
+                );
                 for pass in completed..target {
                     windows.submit_pass(
                         device,
@@ -404,7 +438,13 @@ impl FramePendingFrame {
         self.validate_mapped_status(
             lifetime,
             &mapped,
-            Some((frame.progression.completed_passes, frame.spatial_groups)),
+            Some((
+                frame
+                    .progression
+                    .completed_passes()
+                    .expect("coefficient boundary"),
+                frame.spatial_groups,
+            )),
         )?;
         drop(mapped);
         frame.status.unmap();

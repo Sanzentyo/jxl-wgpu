@@ -24,16 +24,18 @@ use super::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSessio
 use crate::frame_surface::FrameSurfaceEncoding;
 use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{
-    Error, FrameExecutionPlan, FrameMetadata, FramePlanError, GpuCodestream, GpuOutputRequest,
-    GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame, UnsupportedCodestreamFeature,
-    UnsupportedProfile,
+    Error, FrameExecutionPlan, FrameMetadata, FramePlanError, FrameProgression, GpuCodestream,
+    GpuOutputRequest, GpuPendingFrame, GpuSubmissionSession, Result, SubmittedGpuFrame,
+    SubmittedGpuUpdate, UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 
 mod blend;
 mod gpu;
+mod progression;
 mod spot;
 mod submission;
 use gpu::{Compositor, Surface};
+use progression::LfPreview;
 use submission::GpuWork;
 
 /// Keep producer selection and sequence dispatch consistent about presentation-only conversion.
@@ -136,7 +138,14 @@ impl Carry {
         index: usize,
         node: &crate::FrameExecutionNode,
     ) -> Result<WgpuDecodeSubmissionSession> {
-        let mut session = self.source.prepare_physical(index)?.session;
+        let mut session = self
+            .source
+            .prepare_physical(
+                index,
+                self.source.surface_encodings.is_none()
+                    && self.source.inventory.frames[index].lf_level == 0,
+            )?
+            .session;
         if let Some(source) = node.lf_source_frame {
             let level = self.source.inventory.frames[index].lf_level;
             let planes = self
@@ -170,6 +179,7 @@ pub(super) struct DependentSession {
     shared: Arc<Mutex<Shared>>,
     output: Arc<Output>,
     submissions: Arc<AtomicUsize>,
+    lf_preview: Option<Arc<LfPreview>>,
 }
 
 impl DependentSession {
@@ -196,6 +206,20 @@ impl DependentSession {
                 Output::Native,
             )
         };
+        let lf_preview = if request.progressive_output()
+            && matches!(output, Output::Native)
+            && request.mapping() == crate::GpuOutputMapping::Color
+            && inventory.image_header.xyb_encoded
+            && inventory.image_header.extra_channels.is_empty()
+        {
+            Some(Arc::new(LfPreview::new(
+                source.engine.backend().clone(),
+                &inventory.image_header,
+                request,
+            )?))
+        } else {
+            None
+        };
         // Initial metadata and output negotiation is performed at open, like the still engines.
         // Subsequent physical producers are prepared one at a time while their pending frame runs.
         let first = plan.presentations[0].physical_frames.start;
@@ -214,6 +238,7 @@ impl DependentSession {
             })),
             output: Arc::new(output),
             submissions: Arc::new(AtomicUsize::new(0)),
+            lf_preview,
         })
     }
 
@@ -234,6 +259,20 @@ impl DependentSession {
             return Err(Error::FrameDependencyBackpressure { index });
         }
         let presentation = &plan.presentations[index];
+        let mut lf_updates = Vec::new();
+        let last = presentation.physical_frames.end - 1;
+        let mut dependency = plan.nodes[last].lf_source_frame;
+        while let Some(frame_index) = dependency {
+            lf_updates.push(frame_index);
+            dependency = plan
+                .nodes
+                .iter()
+                .find(|node| node.frame_index == frame_index)
+                .ok_or(Error::EngineContract(
+                    "LF presentation dependency is missing",
+                ))?
+                .lf_source_frame;
+        }
         let carry = shared
             .carry
             .as_mut()
@@ -270,6 +309,8 @@ impl DependentSession {
             submissions: Arc::clone(&self.submissions),
             completed_submissions: 0,
             finished: false,
+            lf_preview: self.lf_preview.clone(),
+            lf_updates,
         })
     }
 }
@@ -418,6 +459,11 @@ enum Stage {
     },
     Blend(GpuWork),
     Pack(GpuWork),
+    LfPreview {
+        work: GpuWork,
+        progression: FrameProgression,
+    },
+    Advance,
 }
 
 #[derive(Debug)]
@@ -434,6 +480,8 @@ pub(super) struct DependentPending {
     submissions: Arc<AtomicUsize>,
     completed_submissions: usize,
     finished: bool,
+    lf_preview: Option<Arc<LfPreview>>,
+    lf_updates: Vec<u32>,
 }
 
 impl DependentPending {
@@ -463,6 +511,7 @@ impl DependentPending {
         frame: SubmittedGpuFrame<GpuImageFrame>,
         count: &AtomicUsize,
         lf: Option<ProgressiveDcXybPlanes>,
+        emit_intermediates: bool,
     ) -> Result<Option<SubmittedGpuFrame<GpuImageFrame>>> {
         self.completed_submissions =
             update_count(self.completed_submissions, count, &self.submissions)?;
@@ -483,6 +532,11 @@ impl DependentPending {
             }
         }
         if header.frame_type == FrameType::LowFrequency {
+            let preview = emit_intermediates
+                && self.lf_updates.contains(&node.frame_index)
+                && self.lf_preview.is_some()
+                && carry.source.inventory.frames[self.end - 1].frame_type == FrameType::Regular;
+            let preview_planes = preview.then(|| lf.clone()).flatten();
             carry.lf[header.lf_level as usize - 1] = match node.lf_last_use {
                 Some(last_use) => Some(LfFrame {
                     frame_index: node.frame_index,
@@ -494,6 +548,23 @@ impl DependentPending {
                 None => None,
             };
             drop(frame);
+            if let Some(planes) = preview_planes {
+                let level = header.lf_level as u8;
+                self.stage = Some(Stage::LfPreview {
+                    work: self
+                        .lf_preview
+                        .as_ref()
+                        .expect("LF preview selected")
+                        .submit(&planes, level)?,
+                    progression: FrameProgression::LowFrequency {
+                        physical_frame_index: node.frame_index,
+                        level,
+                    },
+                });
+                self.submissions.fetch_add(1, Ordering::AcqRel);
+                self.completed_submissions += 1;
+                return Ok(None);
+            }
             self.advance()?;
             return Ok(None);
         }
@@ -608,6 +679,20 @@ impl DependentPending {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<SubmittedGpuFrame<GpuImageFrame>>> {
+        self.poll_update(context, false)
+            .map(|result| match result? {
+                SubmittedGpuUpdate::Complete(frame) => Ok(frame),
+                SubmittedGpuUpdate::Intermediate { .. } => Err(Error::EngineContract(
+                    "final-only completion returned an intermediate",
+                )),
+            })
+    }
+
+    pub(super) fn poll_update(
+        &mut self,
+        context: &mut Context<'_>,
+        emit_intermediates: bool,
+    ) -> Poll<Result<SubmittedGpuUpdate<GpuImageFrame>>> {
         loop {
             let stage = self
                 .stage
@@ -627,17 +712,36 @@ impl DependentPending {
                         }
                         *lf = Some(lf_planes(pending)?);
                     }
-                    let result = Pin::new(pending.as_mut()).poll_complete(context);
+                    let result = if emit_intermediates && self.physical + 1 == self.end {
+                        Pin::new(pending.as_mut()).poll_next_update(context)
+                    } else {
+                        Pin::new(pending.as_mut())
+                            .poll_complete(context)
+                            .map(|r| r.map(SubmittedGpuUpdate::Complete))
+                    };
                     update_count(self.completed_submissions, count, &self.submissions)?;
-                    let frame = match result {
+                    let update = match result {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result?,
+                    };
+                    let frame = match update {
+                        SubmittedGpuUpdate::Complete(frame) => frame,
+                        SubmittedGpuUpdate::Intermediate {
+                            mut frame,
+                            progression,
+                        } => {
+                            frame.metadata = self.metadata.clone();
+                            return Poll::Ready(Ok(SubmittedGpuUpdate::Intermediate {
+                                frame,
+                                progression,
+                            }));
+                        }
                     };
                     let Some(Stage::Decode { count, lf, .. }) = self.stage.take() else {
                         unreachable!()
                     };
-                    if let Some(frame) = self.decoded(frame, &count, lf)? {
-                        return Poll::Ready(Ok(frame));
+                    if let Some(frame) = self.decoded(frame, &count, lf, emit_intermediates)? {
+                        return Poll::Ready(Ok(SubmittedGpuUpdate::Complete(frame)));
                     }
                 }
                 Stage::Blend(work) => {
@@ -654,8 +758,20 @@ impl DependentPending {
                         Poll::Ready(result) => result?,
                     };
                     self.stage = None;
-                    return Poll::Ready(self.finish(buffer));
+                    return Poll::Ready(self.finish(buffer).map(SubmittedGpuUpdate::Complete));
                 }
+                Stage::LfPreview { work, progression } => {
+                    let buffer = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let progression = *progression;
+                    self.stage = Some(Stage::Advance);
+                    if emit_intermediates {
+                        return Poll::Ready(self.lf_update(buffer, progression));
+                    }
+                }
+                Stage::Advance => self.advance()?,
             }
         }
     }
@@ -680,7 +796,7 @@ impl DependentPending {
                         }
                         lf = Some(lf_planes(&pending)?);
                     }
-                    if let Some(frame) = self.decoded(pending.wait()?, &count, lf)? {
+                    if let Some(frame) = self.decoded(pending.wait()?, &count, lf, false)? {
                         return Ok(frame);
                     }
                 }
@@ -688,8 +804,47 @@ impl DependentPending {
                     self.record(self.output.compositor()?.completed_surface(work.wait()?))?;
                 }
                 Stage::Pack(work) => return self.finish(work.wait()?),
+                Stage::LfPreview { work, .. } => {
+                    drop(work.wait()?);
+                    self.advance()?;
+                }
+                Stage::Advance => self.advance()?,
             }
         }
+    }
+
+    fn lf_update(
+        &self,
+        buffer: jxl_wgpu::GpuBufferLease,
+        progression: FrameProgression,
+    ) -> Result<SubmittedGpuUpdate<GpuImageFrame>> {
+        let layout = self
+            .lf_preview
+            .as_ref()
+            .ok_or(Error::EngineContract("LF preview renderer was lost"))?
+            .layout
+            .clone();
+        let extent = layout.extent;
+        Ok(SubmittedGpuUpdate::Intermediate {
+            progression,
+            frame: SubmittedGpuFrame::new(
+                self.metadata.clone(),
+                GpuImageFrame {
+                    token: SubmissionToken(1),
+                    outputs: vec![GpuImageOutput {
+                        id: OutputId(0),
+                        layout,
+                        buffer,
+                    }],
+                    changed: ChangedRegions {
+                        outputs: BTreeMap::from([(
+                            OutputId(0),
+                            vec![Region::new(0, 0, extent.width, extent.height)],
+                        )]),
+                    },
+                },
+            ),
+        })
     }
 }
 

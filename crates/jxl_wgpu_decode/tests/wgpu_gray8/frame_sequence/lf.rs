@@ -50,8 +50,10 @@ fn overwritten_unused_lf_roots_are_validated_in_both_sequence_paths() {
         assert_eq!(rust_frames(&case, &valid), rust_frames(&case, &original));
         assert_eq!(djxl_frames(&case, &valid), djxl_frames(&case, &original));
         let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-        let mut session = decoder.open(&invalid, request(&case)).unwrap();
-        let result = session.next_frame();
+        let mut session = decoder
+            .open(&invalid, request(&case).with_progressive_output(true))
+            .unwrap();
+        let result = session.next_update();
         assert!(
             matches!(result, Err(Error::ModularEntropyRejected { .. })),
             "{result:?}"
@@ -102,7 +104,7 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
     let Some(backend) = backend() else {
         return;
     };
-    for bounded in [false, true] {
+    for (bounded, progressive) in [(false, false), (true, false), (false, true), (true, true)] {
         let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
         let decoder = GpuDecoder::new(if bounded {
             engine.with_stream_window_limit(NonZeroU64::new(4096).unwrap())
@@ -110,9 +112,15 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
             engine
         });
         let mut session = if bounded {
-            incremental(&decoder, &reused, request(&case))
+            incremental(
+                &decoder,
+                &reused,
+                request(&case).with_progressive_output(progressive),
+            )
         } else {
-            decoder.open(&reused, request(&case)).unwrap()
+            decoder
+                .open(&reused, request(&case).with_progressive_output(progressive))
+                .unwrap()
         };
         let progress = session.prefetch(NonZeroUsize::new(3).unwrap()).unwrap();
         assert_eq!(progress.queued, 1);
@@ -124,13 +132,39 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
         let retained_bytes =
             u64::from(width.div_ceil(8) * 8) * u64::from(height.div_ceil(8) * 8) * 4 * 3;
         for (index, (_, oracle)) in expected.iter().enumerate() {
-            let frame = if bounded {
-                pollster::block_on(session.next_frame_async())
-                    .unwrap()
-                    .unwrap()
-            } else {
-                session.next_frame().unwrap().unwrap()
+            let mut updates = 0;
+            let frame = loop {
+                let frame = if progressive && bounded {
+                    pollster::block_on(session.next_update_async())
+                        .unwrap()
+                        .unwrap()
+                } else if progressive {
+                    session.next_update().unwrap().unwrap()
+                } else if bounded {
+                    pollster::block_on(session.next_frame_async())
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    session.next_frame().unwrap().unwrap()
+                };
+                assert_eq!(frame.metadata, plan.presentations[index].metadata);
+                if frame.is_complete() {
+                    break frame;
+                }
+                assert!(matches!(
+                    frame.progression(),
+                    Some(jxl_wgpu_decode::FrameProgression::LowFrequency { .. })
+                ));
+                updates += 1;
             };
+            assert_eq!(
+                updates,
+                if progressive && index == 0 {
+                    first_color
+                } else {
+                    0
+                }
+            );
             assert_eq!(frame.metadata, plan.presentations[index].metadata);
             let pixels = samples(
                 &read_output(&backend, &frame.output().outputs[0]),
@@ -217,6 +251,93 @@ fn frame_plan_validates_lf_slot_versions_levels_modes_flags_and_extents() {
 }
 
 #[test]
+fn unused_lf_prefix_keeps_independent_final_coefficient_updates() {
+    let color = Case {
+        name: "unused_lf_progressive",
+        hex: include_str!("../../../test-data/lf_vardct_root_16x2.jxl.hex"),
+        format: LosslessModularFormat::Rgb,
+        bits: 8,
+        vardct: true,
+    };
+    let root = Case {
+        name: "unused_lf",
+        hex: include_str!("../../../test-data/lf_modular_root_2x1.jxl.hex"),
+        format: LosslessModularFormat::Rgb,
+        bits: 8,
+        vardct: false,
+    };
+    let original = encoded(&color);
+    let parsed = parse(&original, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let data = parsed.codestream();
+    let start = inventory.frames[0].header_bits.offset as usize / 8;
+    let mut modified = data[..start].to_vec();
+    modified.extend(lf_root(&root, false, 0, 1, false, 1));
+    modified.extend_from_slice(&data[start..]);
+    let plan = FrameExecutionPlan::negotiate(
+        &parse(&modified, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.nodes.len(), 2);
+    assert!(
+        plan.nodes
+            .iter()
+            .all(|node| node.lf_source_frame.is_none() && node.lf_last_use.is_none())
+    );
+    assert_eq!(
+        rust_frames(&color, &modified),
+        rust_frames(&color, &original)
+    );
+    assert_eq!(
+        djxl_frames(&color, &modified),
+        djxl_frames(&color, &original)
+    );
+    let Some(backend) = backend() else {
+        return;
+    };
+    for bounded in [false, true] {
+        let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+        let decoder = GpuDecoder::new(if bounded {
+            engine.with_stream_window_limit(NonZeroU64::new(40).unwrap())
+        } else {
+            engine
+        });
+        let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format())
+            .unwrap()
+            .with_progressive_output(true);
+        let mut session = if bounded {
+            incremental(&decoder, &modified, request)
+        } else {
+            decoder.open(&modified, request).unwrap()
+        };
+        let dc = session.next_update().unwrap().unwrap();
+        assert_eq!(
+            dc.progression(),
+            Some(jxl_wgpu_decode::FrameProgression::Coefficients {
+                physical_frame_index: 1,
+                completed_passes: 0,
+                total_passes: 1,
+                intended_downsampling: 8,
+            })
+        );
+        let frame = pollster::block_on(session.next_update_async())
+            .unwrap()
+            .unwrap();
+        assert!(frame.is_complete());
+        assert_eq!(frame.metadata, dc.metadata);
+        assert!(session.next_update().unwrap().is_none());
+        drop(frame);
+        drop(dc);
+        drop(session);
+        retired(&backend);
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+}
+
+#[test]
 fn cancelling_after_lf_validation_releases_tracked_planes_and_incremental_input() {
     use std::task::{Context, Poll, Waker};
     let Some(backend) = backend() else {
@@ -274,10 +395,17 @@ fn vardct_root(gaborish: bool, upsampling: u32) -> Vec<u8> {
         bits: 8,
         vardct: true,
     };
-    lf_root(&case, gaborish, 0, upsampling, false)
+    lf_root(&case, gaborish, 0, upsampling, false, 2)
 }
 
-fn lf_root(case: &Case, gaborish: bool, epf: u32, upsampling: u32, custom: bool) -> Vec<u8> {
+fn lf_root(
+    case: &Case,
+    gaborish: bool,
+    epf: u32,
+    upsampling: u32,
+    custom: bool,
+    level: u32,
+) -> Vec<u8> {
     use jxl_gpu_bitstream::{
         BitRange, BitWriter, EdgePreservingFilterInventory, GaborishInventory,
         RestorationFilterInventory,
@@ -295,10 +423,7 @@ fn lf_root(case: &Case, gaborish: bool, epf: u32, upsampling: u32, custom: bool)
         }
     );
     assert!(inventory.image_header.xyb_encoded);
-    assert_eq!(
-        frame.color_sample_extent(),
-        Some((16_u32.div_ceil(upsampling), 2_u32.div_ceil(upsampling)))
-    );
+    assert!((1..=4).contains(&level));
     assert_eq!(frame.upsampling, 1);
     assert_eq!(frame.num_passes, 1);
     assert!(matches!(frame.flags, 0 | 128));
@@ -331,7 +456,7 @@ fn lf_root(case: &Case, gaborish: bool, epf: u32, upsampling: u32, custom: bool)
             .unwrap();
     }
     header.write_bits(0, 2).unwrap(); // one pass
-    header.write_bits(1, 2).unwrap(); // LF level 2
+    header.write_bits(u64::from(level - 1), 2).unwrap();
     header.write_bits(0, 2).unwrap(); // empty name
     header.write_bits(0, 1).unwrap(); // custom restoration
     header.write_bits(u64::from(gaborish), 1).unwrap();
@@ -510,7 +635,7 @@ fn modular_lf_restoration_and_upsampling_match_both_reference_decoders() {
                 _ => unreachable!(),
             },
         };
-        let root = lf_root(&seed, gaborish, epf, upsampling, custom);
+        let root = lf_root(&seed, gaborish, epf, upsampling, custom, 2);
         let mut modified = data[..start].to_vec();
         modified.extend_from_slice(&root);
         modified.extend_from_slice(&data[end..]);

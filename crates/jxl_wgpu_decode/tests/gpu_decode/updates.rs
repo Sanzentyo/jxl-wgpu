@@ -87,24 +87,33 @@ impl GpuSubmissionEngine for UpdateEngine {
                     value
                 };
                 let mut second = make_frame(index as u64 * 10 + 1);
-                let mut progression = FrameProgression {
+                let mut progression = FrameProgression::Coefficients {
                     physical_frame_index: index as u32 + 3,
                     completed_passes: 1,
                     total_passes: 3,
                     intended_downsampling: 4,
                 };
+                let FrameProgression::Coefficients {
+                    physical_frame_index,
+                    completed_passes,
+                    total_passes,
+                    intended_downsampling,
+                } = &mut progression
+                else {
+                    unreachable!()
+                };
                 let mut last = make_frame(index as u64 * 10 + 2);
                 match self.fault {
-                    Some(0) => progression.completed_passes = 0,
-                    Some(1) => progression.total_passes = 0,
-                    Some(2) => progression.completed_passes = 3,
-                    Some(3) => progression.intended_downsampling = 0,
-                    Some(4) => progression.intended_downsampling = 3,
-                    Some(5) => progression.intended_downsampling = 16,
-                    Some(6) => progression.physical_frame_index = 0,
+                    Some(0) => *completed_passes = 0,
+                    Some(1) => *total_passes = 0,
+                    Some(2) => *completed_passes = 3,
+                    Some(3) => *intended_downsampling = 0,
+                    Some(4) => *intended_downsampling = 3,
+                    Some(5) => *intended_downsampling = 16,
+                    Some(6) => *physical_frame_index = 0,
                     Some(7) => second.metadata.presentation_ticks += 1,
                     Some(8) => last.metadata.name.push('!'),
-                    Some(9) => progression.total_passes = 2,
+                    Some(9) => *total_passes = 2,
                     _ => {}
                 }
                 let second = if self.fault == Some(10) {
@@ -119,7 +128,7 @@ impl GpuSubmissionEngine for UpdateEngine {
                     updates: VecDeque::from([
                         Ok(SubmittedGpuUpdate::Intermediate {
                             frame: make_frame(index as u64 * 10),
-                            progression: FrameProgression {
+                            progression: FrameProgression::Coefficients {
                                 physical_frame_index: index as u32 + 3,
                                 completed_passes: 0,
                                 total_passes: 3,
@@ -154,7 +163,7 @@ fn intermediate_leases_share_one_slot_and_do_not_advance_the_animation_clock() {
     let mut session = decoder.open(raw_still(), output_request(1)).unwrap();
     let dc = session.next_update().unwrap().unwrap();
     assert!(!dc.is_complete());
-    assert_eq!(dc.progression().unwrap().completed_passes, 0);
+    assert_eq!(dc.progression().unwrap().completed_passes().unwrap(), 0);
     assert_eq!(session.frames_submitted(), 1);
     assert_eq!(session.queued_frames(), 1);
     assert_eq!(session.active_frame_slots(), 1);

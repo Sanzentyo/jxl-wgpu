@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "progression/lf.rs"]
+mod lf;
+
 struct NativeUpdate {
     step: usize,
     ratio: u32,
@@ -201,7 +204,7 @@ fn gpu_dc_and_ac_images_match_native_libjxl_flushes() {
                 assert_eq!(expected.step, stage);
                 assert_eq!(frame.is_complete(), expected.complete);
                 if let Some(progress) = frame.progression() {
-                    assert_eq!(progress.intended_downsampling, expected.ratio);
+                    assert_eq!(progress.intended_downsampling(), expected.ratio);
                 }
                 let readback = ImageReadbackPipeline::new(&backend)
                     .submit(frame.output())
@@ -360,7 +363,11 @@ fn completed_gpu_passes_return_immutable_images_before_the_final_frame() {
                 assert_eq!(frame.metadata, held[0].metadata);
                 if index < count {
                     assert_eq!(
-                        frame.progression().unwrap().completed_passes as usize,
+                        frame
+                            .progression()
+                            .unwrap()
+                            .completed_passes()
+                            .expect("coefficient boundary") as usize,
                         index
                     );
                     assert!(!frame.is_complete());
@@ -491,7 +498,13 @@ fn pass_outputs_keep_validation_local_and_admission_and_cancellation_release_the
             .bytes
             .clone();
         let ac = broken.next_update().unwrap().unwrap();
-        assert_eq!(ac.progression().unwrap().completed_passes, 1);
+        assert_eq!(
+            ac.progression()
+                .unwrap()
+                .completed_passes()
+                .expect("coefficient boundary"),
+            1
+        );
         drop(ac);
         assert!(matches!(
             broken.next_update(),
@@ -618,8 +631,14 @@ fn single_entry_dc_survives_deferred_hf_and_final_only_consumers_skip_updates() 
             let dc = pollster::block_on(session.next_update_async())
                 .unwrap()
                 .unwrap();
-            assert_eq!(dc.progression().unwrap().completed_passes, 0);
-            assert_eq!(dc.progression().unwrap().intended_downsampling, 8);
+            assert_eq!(
+                dc.progression()
+                    .unwrap()
+                    .completed_passes()
+                    .expect("coefficient boundary"),
+                0
+            );
+            assert_eq!(dc.progression().unwrap().intended_downsampling(), 8);
             let dc_pixels = read(dc.output());
             let final_frame = session.next_frame().unwrap().unwrap();
             assert!(final_frame.is_complete());

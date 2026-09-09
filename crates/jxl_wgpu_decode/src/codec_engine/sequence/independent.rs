@@ -22,7 +22,7 @@ fn prepare(
     index: usize,
     extent: Extent2d,
 ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
-    let prepared = source.prepare_physical(index)?;
+    let prepared = source.prepare_physical(index, false)?;
     if prepared.metadata.extent != extent {
         return Err(Error::EngineContract(
             "frame producer disagrees with the presentation extent",

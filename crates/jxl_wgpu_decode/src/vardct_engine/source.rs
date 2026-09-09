@@ -433,7 +433,6 @@ pub(super) fn prepare_packet_source(
         && inventory.image_header.extra_channels.is_empty()
         && frame.frame_type == jxl_gpu_bitstream::FrameType::Regular
         && frame.is_last
-        && !packet.profile.uses_lf_frame
     {
         let progression = |completed| {
             let intended_downsampling = frame
@@ -443,7 +442,7 @@ pub(super) fn prepare_packet_source(
                 .zip(&frame.progressive_passes.downsampling)
                 .filter(|(last, _)| completed > **last)
                 .fold(8, |divisor, (_, &target)| divisor.min(target));
-            crate::FrameProgression {
+            crate::FrameProgression::Coefficients {
                 physical_frame_index: frame.frame_index,
                 completed_passes: completed as u8,
                 total_passes: frame.num_passes as u8,

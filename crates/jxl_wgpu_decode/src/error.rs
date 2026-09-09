@@ -219,6 +219,10 @@ pub enum Error {
     #[error(transparent)]
     ProgressiveDcGpu(#[from] crate::progressive_dc::ProgressiveDcGpuError),
     #[error(transparent)]
+    ColorOutput(#[from] crate::color_output::ColorOutputError),
+    #[error(transparent)]
+    FrameUpsample(#[from] jxl_wgpu::ResidentUpsampleError),
+    #[error(transparent)]
     ModularFinalize(#[from] crate::modular_finalize::ModularFinalizeError),
     #[error(transparent)]
     ModularRender(#[from] crate::ModularRenderError),

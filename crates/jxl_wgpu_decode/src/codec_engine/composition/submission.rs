@@ -1,7 +1,7 @@
 //! Accounted GPU submission and completion lifetime shared by blending and presentation.
 
 use crate::{Error, Result};
-use jxl_wgpu::{GpuBufferLease, MemoryPermit, WgpuBackend};
+use jxl_wgpu::{GpuBufferLease, MemoryPermit, SubmissionPollPermit, WgpuBackend};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use wgpu::util::DeviceExt;
@@ -47,10 +47,6 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
             + metadata.map_or(0, |(_, bytes)| bytes.len() as u64)
             + completion_fence_bytes(),
     )?;
-    let guards = inputs
-        .iter()
-        .map(|(_, lease)| lease.try_acquire_gpu_submission())
-        .collect::<jxl_wgpu::Result<Vec<_>>>()?;
     let output = GpuBufferLease::from_tracked(
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JPEG XL composed frame"),
@@ -115,13 +111,40 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(dispatch[0], dispatch[1], 1);
     }
+    submit_recorded(
+        backend,
+        encoder,
+        output,
+        inputs.iter().map(|(_, lease)| (*lease).clone()).collect(),
+        (uniform, metadata_buffer),
+        uniform_permit,
+        poll,
+    )
+}
+
+/// Completes a recorded render chain with the same accounted lifetime as frame composition.
+pub(super) fn submit_recorded<R: wgpu::WasmNotSendSync + 'static>(
+    backend: &WgpuBackend,
+    encoder: wgpu::CommandEncoder,
+    output: GpuBufferLease,
+    inputs: Vec<GpuBufferLease>,
+    resources: R,
+    permit: MemoryPermit,
+    poll: SubmissionPollPermit,
+) -> Result<GpuWork> {
+    let guards = inputs
+        .iter()
+        .map(GpuBufferLease::try_acquire_gpu_submission)
+        .collect::<jxl_wgpu::Result<Vec<_>>>()?;
     let completion = Arc::new(Completion::default());
+    #[cfg(target_arch = "wasm32")]
+    let mut encoder = encoder;
     // wgpu work-done callbacks require Send even on WebGPU. A tiny mapped completion fence
     // uses the browser-local map callback instead, retaining the non-Send WebGPU handles.
     // Its contents are never read; no image samples cross the CPU boundary.
     #[cfg(target_arch = "wasm32")]
     let completion_fence = {
-        let fence = device.create_buffer(&wgpu::BufferDescriptor {
+        let fence = backend.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("JPEG XL composition completion fence"),
             size: completion_fence_bytes(),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -131,14 +154,9 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
         fence
     };
     let lifetime = Arc::new(WorkLifetime {
-        _buffers: inputs
-            .iter()
-            .map(|(_, b)| (*b).clone())
-            .chain([output.clone()])
-            .collect(),
-        _uniform: uniform,
-        _metadata: metadata_buffer,
-        _permit: uniform_permit,
+        _buffers: inputs.iter().cloned().chain([output.clone()]).collect(),
+        _resources: resources,
+        _permit: permit,
         #[cfg(target_arch = "wasm32")]
         completion_fence,
     });
@@ -193,16 +211,15 @@ pub(super) fn validate_size(device: &wgpu::Device, size: u64) -> Result<()> {
     Ok(())
 }
 
-struct WorkLifetime {
+struct WorkLifetime<R> {
     _buffers: Vec<GpuBufferLease>,
-    _uniform: wgpu::Buffer,
-    _metadata: Option<wgpu::Buffer>,
+    _resources: R,
     _permit: MemoryPermit,
     #[cfg(target_arch = "wasm32")]
     completion_fence: wgpu::Buffer,
 }
 
-const fn completion_fence_bytes() -> u64 {
+pub(super) const fn completion_fence_bytes() -> u64 {
     if cfg!(target_arch = "wasm32") { 4 } else { 0 }
 }
 

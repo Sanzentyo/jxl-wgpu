@@ -8,7 +8,7 @@ use jxl_wgpu::{GpuImageFrame, UnvalidatedGpuImageFrame};
 
 use crate::{
     DecodeProfile, FrameExecutionPlan, GpuCodestream, GpuOutputRequest, GpuPendingFrame,
-    PreparedGpuSession, Result, SubmittedGpuFrame,
+    PreparedGpuSession, Result, SubmittedGpuFrame, SubmittedGpuUpdate,
 };
 
 use super::composition::{DependentPending, DependentSession};
@@ -86,6 +86,7 @@ impl SequenceSource {
     pub(super) fn prepare_physical(
         &self,
         index: usize,
+        progressive: bool,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         let frame_index = self.inventory.frames[index].frame_index;
         let request = self
@@ -95,7 +96,7 @@ impl SequenceSource {
                 || self.request.clone(),
                 |encodings| self.request.clone().for_frame_surface(encodings[index]),
             )
-            .with_progressive_output(false);
+            .with_progressive_output(progressive && self.request.progressive_output());
         let projected = project_frame_inventory(&self.inventory, frame_index)?;
         match projected.frames[0].encoding {
             FrameEncoding::Modular => {
@@ -221,11 +222,30 @@ impl FrameSequencePending {
             SequencePending::Independent(pending) => pending.poll(context),
         }
     }
+
+    fn poll_update(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuUpdate<GpuImageFrame>>> {
+        match &mut self.inner {
+            SequencePending::Dependent(pending) => pending.poll_update(context, true),
+            SequencePending::Independent(pending) => pending
+                .poll(context)
+                .map(|r| r.map(SubmittedGpuUpdate::Complete)),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl GpuPendingFrame for FrameSequencePending {
     type Frame = GpuImageFrame;
+
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuUpdate<Self::Frame>>> {
+        self.get_mut().poll_update(context)
+    }
 
     fn wait(self) -> Result<SubmittedGpuFrame<Self::Frame>> {
         match self.inner {
@@ -245,6 +265,13 @@ impl GpuPendingFrame for FrameSequencePending {
 #[cfg(target_arch = "wasm32")]
 impl GpuPendingFrame for FrameSequencePending {
     type Frame = GpuImageFrame;
+
+    fn poll_next_update(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<SubmittedGpuUpdate<Self::Frame>>> {
+        self.get_mut().poll_update(context)
+    }
 
     fn poll_complete(
         self: Pin<&mut Self>,

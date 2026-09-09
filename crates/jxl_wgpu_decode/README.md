@@ -107,12 +107,13 @@ payload preservation, prefix clipping, delayed takes, admission retry and indepe
 `cargo run -p jxl_wgpu_decode --example regenerate_previews` reproduces the corpus with offline
 libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced.
 
-### Intermediate pass images
+### Intermediate LF and pass images
 
 `GpuOutputRequest::with_progressive_output(true)` enables DC and intermediate AC-pass images for
-direct VarDCT stills with no extra channels or LF/reference/composition dependencies. It includes
+direct VarDCT stills with no extra channels or reference/composition dependencies. It includes
 single-entry and raw-matrix streams with deferred coefficient descriptors. Other paths currently
-return final images.
+return final images, except that direct color-only LF-dependent presentations can also publish
+their completed Modular/VarDCT LF dependencies.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
 embedded-preview delivery.
 
@@ -127,8 +128,9 @@ let mut session = decoder.open(encoded, request)?;
 while let Some(image) = session.next_update_async().await? {
     // Present image.output(). Intermediate and final storage have the same full canvas extent.
     if let Some(progress) = image.progression() {
-        // Zero completed passes identifies the DC image; positive counts identify AC refinements.
-        // progress.intended_downsampling describes detail, not buffer dimensions.
+        // FrameProgression::Coefficients carries completed/total passes (zero means DC).
+        // FrameProgression::LowFrequency identifies a complete physical LF frame and its level.
+        // progress.intended_downsampling() describes detail, not buffer dimensions.
     }
     // image.is_complete() distinguishes the final reconstruction from a refinement.
 }
@@ -151,9 +153,24 @@ DC uses the image-header 8× kernel over the complete LF atlas, including MCU pa
 cross-group neighbors, followed by the normal restoration/resampling/color pipeline. Its detail
 ratio is 8 and its output has the same full canvas extent as the final image. Only packet/artifact
 evidence is needed at this stage. Deferred HF descriptors and raw matrices are parsed/executed
-after returning DC; later errors preserve that image. The remaining progressive work includes LF
-dependency images, Modular and extra channels, composed/animated updates, and incomplete-frame
-input readiness.
+after returning DC; later errors preserve that image.
+
+LF publication reconstructs the exact dependency version used by the presentation, after the LF
+producer's restoration and frame resampling. Each level applies the image-header 8× kernel in XYB,
+clips to that level's exact grid, and only then converts color and applies output orientation.
+`LowFrequency { physical_frame_index, level }` carries intended detail `8^level`; it does not invent
+an unfinished coefficient pass for a completed Modular or VarDCT frame. Unused and overwritten LF
+versions still validate but do not become presentation updates. Reused LF slots are not decoded or
+published again in later presentations. The next physical producer is admitted on the next poll,
+after the immutable LF output has been delivered. Native and poll/async final-only completion skip
+these extra renders. Source planes, render scratch and packed output retain independent byte
+ownership through GPU completion and cancellation.
+
+Level 1 output matches the Rust decoder's LF flush, while native libjxl validates the following
+DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
+scalar-oracle adapter test validates expansion through LF4, custom weights and odd/one-sample axes.
+The remaining progressive work includes broader LF conformance, Modular and extra channels,
+composed/animated refinements, and incomplete-frame input readiness.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 
@@ -733,8 +750,9 @@ native/Rust reference exceptions and an independent scalar Gaborish check. The c
 recursive progressive-DC dependencies, including VarDCT roots without an LF source and
 LF-dependent SkipProgressive frames. These stills expose `DecodeProfile::FrameSequence` and
 `WgpuDecodeSubmissionSession::Sequence`. It keeps three F32 XYB planes resident, uses shared 80-byte Modular normalization and 48-byte LF-pack `Pod` uniforms, validates every
-hidden and visible status, and publishes only complete presentations. A physical LF node is
-decoded once, even when unused, overwritten, or shared across multiple presentations. The plan
+hidden and visible status, and publishes complete presentations plus opt-in validated LF updates.
+A physical LF node is decoded once, even when unused, overwritten, or shared across multiple
+presentations. The plan
 checks LF flags, levels, exact slot versions and sample/block extents before submission.
 `MemoryPermit::split_off` transfers each plane's actual byte reservation from producer scratch
 into a `GpuBufferLease` without readmission. Both Modular and VarDCT LF capture retain the final
@@ -1084,11 +1102,11 @@ and the Rust `jxl` implementation accept those parameters but their EPF weight f
 apply them; the GPU formula follows those executed references rather than inventing a threshold
 operation.
 
-This is not full VarDCT coverage. Explicitly published
-progressive intermediates, larger/transformed raw-matrix conformance, broader asymmetric JPEG
+This is not full VarDCT coverage. Broader progressive
+intermediates, larger/transformed raw-matrix conformance, broader asymmetric JPEG
 restoration/resampling combinations and other Modular side images,
 numeric color-channel output, ICC/HDR luminance mapping,
-and intermediate progressive presentation remain typed or unproven gaps. Crop/blend
+and complete progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.
 

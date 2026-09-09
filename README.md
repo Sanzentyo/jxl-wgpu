@@ -36,8 +36,10 @@ LF/animation dependencies. Whole and bounded fragmented input produce identical 
 `GpuDecodeStream::take_preview` opens a complete embedded preview before any main frame bytes or
 transport End arrive. The same frontend continues receiving the main image and `finish` requires
 its authoritative completion. Preview and main have independent output requests and leases.
-Opt-in VarDCT stills also return validated DC and intermediate AC images through `next_update` and its
-async counterpart. LF dependency images and updates from incomplete frame input remain in progress.
+Opt-in color-only VarDCT stills also return validated LF dependency images, DC and intermediate AC
+images through `next_update` and its async counterpart. LF updates retain the requested canvas
+extent and distinguish a complete physical LF frame from a complete presentation. Extra-channel,
+Modular pass, composed/animated refinement and incomplete-frame-input coverage remain in progress.
 
 The Modular decoder also reconstructs lossy XYB and original-sRGB color on the GPU. A shared
 color-output module serves both coding modes; Modular joins Gaborish, EPF, resampling, alpha,

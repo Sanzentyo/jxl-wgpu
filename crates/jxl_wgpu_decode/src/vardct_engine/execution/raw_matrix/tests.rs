@@ -196,7 +196,12 @@ fn deferred_dc_precedes_raw_matrix_admission_and_keeps_its_output_after_failure(
         let crate::SubmittedGpuUpdate::Intermediate { progression, frame } = dc else {
             panic!("DC missing")
         };
-        assert_eq!(progression.completed_passes, 0);
+        assert_eq!(
+            progression
+                .completed_passes()
+                .expect("coefficient boundary"),
+            0
+        );
         assert!(matches!(pending.stage, VarDctPendingStage::AfterDc { .. }));
         assert!(
             pending.expected_hf.is_empty(),
@@ -250,7 +255,12 @@ fn invalid_raw_matrix_entropy_cannot_invalidate_an_already_returned_dc_image() {
         let crate::SubmittedGpuUpdate::Intermediate { progression, frame } = dc else {
             panic!("DC missing")
         };
-        assert_eq!(progression.completed_passes, 0);
+        assert_eq!(
+            progression
+                .completed_passes()
+                .expect("coefficient boundary"),
+            0
+        );
         let read = || {
             jxl_wgpu::ImageReadbackPipeline::new(&backend)
                 .submit(&frame.output)

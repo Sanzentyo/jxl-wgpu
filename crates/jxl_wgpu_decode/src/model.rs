@@ -523,7 +523,7 @@ impl GpuOutputRequest {
         self.image
     }
 
-    /// Requests intermediate images at supported, completely decoded pass boundaries. Consume
+    /// Requests intermediate images at validated LF-frame and coefficient-pass boundaries. Consume
     /// them with `GpuDecodeSession::next_update` or its async counterpart. Frames without a
     /// supported intermediate boundary still return their final image.
     #[must_use]

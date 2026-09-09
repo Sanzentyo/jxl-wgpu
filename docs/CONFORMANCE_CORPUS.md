@@ -2590,3 +2590,54 @@ the six-crate WebAssembly check pass. Reference and Metal harnesses each pass 18
 Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and zero staging bytes.
 The full JPEG XL goal remains active; the remaining progressive and precision gates above are
 not marked complete.
+
+### LF dependency images and typed physical progression
+
+`FrameProgression` now distinguishes partial `Coefficients` from a complete `LowFrequency` physical
+frame. LF completion is a presentation refinement, never a fabricated unfinished AC pass. The
+public `next_update` path renders validated dependency planes after their restoration/resampling,
+using one image-header Up8 expansion per LF level and exact intermediate grids before color and
+orientation. The physical executor then pauses before admitting the next consumer. Unused LF
+versions validate without publication; slots reused in later animation presentations are not
+decoded or published a second time.
+
+`tests/vardct_engine_gpu/progression/lf.rs` exercises four existing three-frame LF2→LF1→color chains:
+`testsrc_vardct_progressive_dc_ac`, its oriented grayscale variant, the shared runtime custom-weight
+rewrite, and `noise/lf_progressive_ac`. LF1 RGB8 values match Rust `jxl` 0.6.0's `flush_pixels` on a
+prefix ending before the main physical header, within one code. LF2 has no native per-level oracle
+claim. The following DC/AC and final images are compared with libjxl 0.12.0 using direct linear RGB.
+Maximum errors remain below 0.0000060 for DC, 0.000160 for AC, and 0.000100 for final images, under
+unchanged respective bounds of 0.00001, 0.0002 and 0.0001. All samples must be finite. Inverting native
+sRGB output would raise the noisy final error to 0.000100315; direct linear output measures
+0.000099659. This is a measured regression gate, not ISO conformance evidence.
+
+Whole and 40-byte GPU windows with fragmented async input produce identical images at every
+boundary. Each retained image is re-read after the final decode, and final pixels equal final-only
+decoding exactly. Updates share one presentation identity, clock and logical frame slot. Corrupting
+the next LF or final AC tail preserves preceding LF images and poisons the session. Admission after
+each returned LF can fail independently; the already returned image survives. Cancellation before
+publication, after LF2 and after LF1 releases every input/scratch reservation after callback
+retirement, leaving only caller-held output bytes. Native and poll/async final-only completion
+skip unstarted LF rendering. Existing sequence tests also validate unused LF corruption and slot
+reuse across animation presentations with progressive output enabled.
+
+A further runtime stream prepends a valid, unused 2×1 Modular LF1 frame to the independent 16×2
+VarDCT root fixture. Both CPU decoders preserve its final image. The GPU validates the unused LF
+without publishing it, then returns DC and final updates with the color producer's physical ID 1
+under whole and 40-byte windows. A sequence wrapper must not suppress final coefficient updates
+merely because the presentation has no live LF dependency.
+
+The separate actual-adapter scalar oracle covers rendering levels 1–4 at 17×9, 1×33, 257×17,
+1025×9 and 8193×1, with both standard and custom Up8 weights. It evaluates the compact triangle and
+inverse opsin in F64 independently of GPU phase tables and buffer addressing; poisoned row padding
+must never enter the finite output. Max linear error stays below 0.00001. Exact whole-render
+admission fails and rolls back with one byte less than required; levels 0 and 5 are rejected.
+This is LF3/LF4 renderer evidence, not complete LF3/LF4 codestream conformance. Broader LF, extras,
+Modular pass, composed/animated refinements and incomplete-frame readiness remain open.
+
+Local validation on Apple M5/Metal passes 798 tests across all 41 all-feature workspace targets;
+the existing manual release-mode allocation benchmark remains ignored. Formatting, workspace
+check, Clippy and rustdoc with warnings denied, MSRV 1.89.0, and the six-crate all-feature
+WebAssembly check pass. Reference and Metal harnesses each pass 18/18 cases; the reference run
+uses no adapter. Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and
+zero staging bytes. The full JPEG XL goal and the remaining precision/conformance gates stay open.

@@ -917,3 +917,27 @@ completion even if the consumer cancels before the first update. The next poll r
 metadata/raw-matrix work. Descriptor-dependent AC status buffers are then attached to the recorded
 images before the ordinary pass schedule runs. DC validation never depends on those later buffers.
 Final-only consumers drive the same continuation without returning intermediate images.
+
+### LF dependency presentation
+
+An LF update is packed from validated, independently tracked XYB dependency planes. Publication
+does not transfer or mutate the four LF slot versions. A level-L render allocates three F32 planes
+at each exact grid `ceil(canvas / 8^k)`, for k=L-1 through zero, a shared 6,400-byte Up8 kernel,
+three 48-byte interpolation uniforms per level, and the color packer's 352-byte uniforms. The
+packed output is separately leased. A single atomic reservation covers this complete render cost;
+one-byte-short admission rolls back without creating GPU buffers or consuming LF ownership.
+
+Composition and LF rendering share one recorded-command completion lifetime. It retains every
+input lease, scratch/weight/uniform buffer, output clone, and transient permit until completion.
+Native uses work-done callbacks; WebGPU uses the existing four-byte mapped completion fence
+(included in admission), never a pixel map. Dropping a pending render cannot release resources
+still used by the queue. Only packed bytes survive in a returned update after the job retires.
+
+The physical executor pauses in an explicit `Advance` state after LF publication; next-producer
+admission and its possible error occur on the following poll. Initial producer admission remains
+retryable, while pressure after a staged presentation starts poisons that presentation. All LF,
+DC/AC and final outputs share one presentation slot and clock. Final-only callers skip unstarted
+LF render work and drain already submitted renders before advancing. Existing shader ABIs are
+unchanged. Scalar-oracle GPU tests cover LF1–LF4, exact odd grids, poisoned source padding, custom
+weights, and exact rendering admission; sequence tests cover callback retirement and held images
+after corruption, cancellation and late pressure.
