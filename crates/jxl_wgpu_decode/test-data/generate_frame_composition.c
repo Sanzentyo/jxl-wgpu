@@ -112,7 +112,9 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     check(JxlEncoderSetFrameHeader(settings, &header));
     if (has_alpha) {
       JxlBlendInfo alpha = header.layer_info.blend_info;
-      alpha.blendmode = layer->alpha; alpha.source = layer->alpha_source;
+      if (isolated_layer < 0) {
+        alpha.blendmode = layer->alpha; alpha.source = layer->alpha_source;
+      }
       check(JxlEncoderSetExtraChannelBlendInfo(settings, 0, &alpha));
     }
     char frame_name[64];
@@ -149,6 +151,9 @@ int main(int argc, char** argv) {
       generate(argv[1], "vardct", 259, 17, 3, 8, 1, 1, 0, 1);
       generate(argv[1], "vardct_gray", 37, 13, 1, 8, 1, 1, 0, 1);
       generate(argv[1], "vardct_dc", 1024, 128, 3, 8, 1, 1, 2, 1);
+      associated = 1;
+      generate(argv[1], "associated_vardct", 259, 17, 4, 12, 1, 1, 0, 1);
+      associated = 0;
     }
     return 0;
   }

@@ -324,7 +324,7 @@ pub struct VarDctDecodeMemoryStats {
     pub output_status_bytes: u64,
     /// Full transformed/inverse arena for distributed Modular extra channels.
     pub extra_arena_bytes: u64,
-    /// Global inverse uniforms, executed after all distributed subimages validate.
+    /// Global inverse uniforms for one reconstruction of the assembled extra channels.
     pub extra_inverse_uniform_bytes: u64,
     /// Normalization, full-resolution extra plane, filter weights and uniforms.
     pub extra_render_bytes: u64,
@@ -383,6 +383,9 @@ impl VarDctDecodeMemoryStats {
                 self.noise_bytes,
                 self.noise_uniform_bytes,
                 self.output_uniform_bytes,
+                self.extra_arena_bytes,
+                self.extra_inverse_uniform_bytes,
+                self.extra_render_bytes,
                 self.intermediate_validation_bytes(reconstruction)?,
             ],
             "intermediate render bytes",

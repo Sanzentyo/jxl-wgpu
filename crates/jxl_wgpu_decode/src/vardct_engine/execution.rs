@@ -310,6 +310,9 @@ enum PostLfCommands {
 }
 
 enum VarDctPendingContinuation {
+    ExtraImage {
+        source: Box<VarDctSource>,
+    },
     LfExtras {
         source: Box<VarDctSource>,
         commands: PostLfCommands,
@@ -339,7 +342,7 @@ fn submit_vardct_downstream(
     queue: &wgpu::Queue,
     mut prefix: Vec<wgpu::CommandBuffer>,
     downstream: VarDctDownstreamCommands,
-    lifetime: &VarDctJobLifetime,
+    lifetime: &Arc<VarDctJobLifetime>,
 ) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
     match downstream {
         VarDctDownstreamCommands::Whole(commands) => {
@@ -456,6 +459,7 @@ impl FrameOutputScratch {
 }
 
 struct VarDctJobLifetime {
+    progressive_extra: Mutex<Option<progression::ExtraProgression>>,
     intermediates: Vec<Arc<progression::IntermediateFrame>>,
     output: GpuBufferLease,
     status_staging: wgpu::Buffer,
@@ -524,6 +528,10 @@ pub struct FramePendingFrame {
 }
 
 enum VarDctPendingStage {
+    ExtraImage {
+        completion: Arc<MapCompletion>,
+        source: Box<VarDctSource>,
+    },
     AfterDc {
         source: Box<VarDctSource>,
         commands: DeferredHfGlobalCommands,
@@ -573,6 +581,7 @@ impl std::fmt::Debug for FramePendingFrame {
             .field(
                 "stage",
                 &match &self.stage {
+                    VarDctPendingStage::ExtraImage { .. } => "extra-image",
                     VarDctPendingStage::AfterDc { .. } => "after-dc",
                     VarDctPendingStage::LfExtras { .. } => "lf-extras",
                     VarDctPendingStage::LocalLf { .. } => "local-lf",
@@ -632,6 +641,7 @@ impl FramePendingFrame {
         match &self.stage {
             VarDctPendingStage::AfterDc { .. } => None,
             VarDctPendingStage::LfExtras { completion, .. }
+            | VarDctPendingStage::ExtraImage { completion, .. }
             | VarDctPendingStage::LocalLf { completion, .. }
             | VarDctPendingStage::HfGlobal { completion, .. }
             | VarDctPendingStage::RawHfDequant { completion, .. }
@@ -647,6 +657,9 @@ impl FramePendingFrame {
         };
         let stage = std::mem::replace(&mut self.stage, placeholder);
         match stage {
+            VarDctPendingStage::ExtraImage { source, .. } => {
+                Some(VarDctPendingContinuation::ExtraImage { source })
+            }
             stage @ VarDctPendingStage::AfterDc { .. } => {
                 self.stage = stage;
                 None
@@ -690,6 +703,10 @@ impl FramePendingFrame {
 
     fn advance_staged_packet(&mut self, mapping: Result<(), String>) -> DecodeResult<bool> {
         match self.take_staged_packet() {
+            Some(VarDctPendingContinuation::ExtraImage { source }) => {
+                self.finish_extra_image(mapping, source)?;
+                Ok(true)
+            }
             Some(VarDctPendingContinuation::LfExtras { source, commands }) => {
                 mapping.map_err(DecodeError::backend)?;
                 let lifetime = self
@@ -2656,6 +2673,7 @@ fn submit_vardct(
             hf: hf_coefficient_buffers.as_ref(),
             resources: &resources,
             planes: resident_planes.as_ref(),
+            extra_frame: extra_frame.as_ref(),
             post: &post_transform,
         },
         std::mem::take(&mut permits.intermediates),
@@ -2677,6 +2695,7 @@ fn submit_vardct(
             resources: &resources,
             output: &output,
             resident_planes: resident_planes.as_ref(),
+            extra_planes: &source.extra_planes,
             rendered_extra: rendered_extra.as_ref(),
             post_transform,
             transient_permit: &mut permits.transient,
@@ -2786,6 +2805,7 @@ fn submit_vardct(
             (Some(downstream), None)
         };
     let lifetime = Arc::new(VarDctJobLifetime {
+        progressive_extra: Mutex::new(None),
         intermediates,
         output: GpuBufferLease::from_tracked(output.as_ref().clone(), permits.output),
         status_staging,

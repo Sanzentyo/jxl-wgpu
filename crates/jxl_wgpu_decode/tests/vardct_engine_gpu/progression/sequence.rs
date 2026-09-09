@@ -6,15 +6,6 @@ mod lifecycle;
 use jxl_gpu_bitstream::{FrameEncoding, FrameType};
 use jxl_wgpu_decode::{FrameExecutionPlan, FrameProgression, OrientationPolicy};
 
-fn encoded(hex: &str) -> Vec<u8> {
-    let compact = hex.split_whitespace().collect::<String>();
-    compact
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect()
-}
-
 fn cases() -> [(&'static str, &'static str); 7] {
     [
         (
@@ -48,7 +39,7 @@ fn cases() -> [(&'static str, &'static str); 7] {
     ]
 }
 
-fn request(keep: bool) -> GpuOutputRequest {
+pub(super) fn request(keep: bool) -> GpuOutputRequest {
     let mut format = PixelFormat::rgb_f32(
         jxl_gpu_formats::RgbChannelOrder::Rgba,
         false,

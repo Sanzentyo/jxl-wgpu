@@ -110,8 +110,8 @@ libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced
 ### Intermediate LF and pass images
 
 `GpuOutputRequest::with_progressive_output(true)` enables DC and intermediate AC-pass images for
-VarDCT color output without extra channels, including deferred descriptors, animations and composed
-presentations. Each presentation validates all overwritten/hidden producers before publishing
+VarDCT color output with optional extra channels, including deferred descriptors, animations and
+composed presentations. Each presentation validates all overwritten/hidden producers before publishing
 refinements from its final Regular physical frame. The compositor blends each immutable producer
 snapshot against the committed reference versions and then applies output color conversion and
 orientation. Only complete physical frames update reference slots. Modular color frames and
@@ -187,9 +187,19 @@ hidden reference decoded between LF and its visible consumer. The maximum normal
 error is below 0.000285 under the existing 0.001 composition regression bound. LF2 has renderer and
 lifetime evidence without a native per-level pixel-oracle claim. No production CPU codec is used.
 
-The remaining progressive work includes broader LF conformance, Modular and extra-channel
-refinements, selective regions, and incomplete-frame input readiness. Native-comparison precision
-remains a separate conformance gate.
+Extra-channel snapshots decode and validate each pass's Modular subimages before copying the
+assembled channels for global inverse transforms, normalization and resampling. Future passes
+continue filling the original arena. Integer and floating alpha, spots, independent channel depths
+and associated-alpha composition share the ordinary final renderer. Each snapshot owns its output,
+inverse arena, uniforms, normalization buffers and byte permits. Whole and 40-byte fragmented
+input produce identical images; errors and cancellation preserve already returned output leases.
+libjxl disables progression events with extras, so tests flush logical codestream prefixes at
+physical pass boundaries; no CPU codec is added to production. Nine additional standalone header
+fragments provide independent alpha-composition oracles without duplicating entropy.
+
+The remaining progressive work includes broader LF conformance, LF previews with extra channels,
+numeric/Modular refinements, selective regions, and incomplete-frame input readiness.
+Native-comparison precision remains a separate conformance gate.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 

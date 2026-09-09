@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::{
     PacketCommands, VarDctDownstreamCommands, VarDctJobLifetime, VarDctPipelines, lock_unpoisoned,
     submit_vardct_downstream,
@@ -135,7 +137,7 @@ pub(super) fn submit_packet_commands(
     backend: &WgpuBackend,
     pipelines: &VarDctPipelines,
     commands: PacketCommands,
-    lifetime: &VarDctJobLifetime,
+    lifetime: &Arc<VarDctJobLifetime>,
 ) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
     match commands {
         PacketCommands::Whole(commands) => Ok(backend.queue().submit([commands])),
@@ -150,7 +152,7 @@ pub(super) fn submit_packet_windows(
     pipelines: &VarDctPipelines,
     mut windows: PacketWindowCommands,
     downstream: Option<VarDctDownstreamCommands>,
-    lifetime: &VarDctJobLifetime,
+    lifetime: &Arc<VarDctJobLifetime>,
 ) -> Result<wgpu::SubmissionIndex, VarDctDecodeError> {
     let stream = lifetime._packet_stream_window.as_ref().ok_or(
         VarDctDecodeError::EntropyWindowContract {

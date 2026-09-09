@@ -3,7 +3,8 @@
 Generate with `cargo run -p jxl_wgpu_decode --example regenerate_progressive_composition` and
 libjxl 0.12.0. The example compiles `../generate_frame_composition.c`, requests its
 `--progressive-layers` mode, and retains only the image/frame headers for each of the nine layers
-in the existing `composition_vardct`, `composition_vardct_gray` and `composition_vardct_dc` fixtures.
+in the existing `composition_vardct`, `composition_vardct_gray`, `composition_vardct_dc` and
+`composition_associated_vardct` fixtures.
 Each file contains an `image HEX` prefix followed by `frame BIT_LENGTH HEX` records. These are
 metadata fragments, not complete codestreams; LF-dependent layers include their LF headers.
 
@@ -24,3 +25,11 @@ consumer. A runtime fixture exercises this order by moving original physical fra
 frames 6 and 7; every header and entropy byte is unchanged. LF2 has no native per-level pixel-oracle
 claim. The existing 27 metadata fragments suffice for both orders and are not duplicated.
 Production does not link these offline tools or perform CPU pixel/entropy decoding.
+
+`associated_vardct_layer0..8.headers` add nine fragments (628 bytes) for the existing associated-alpha
+composition fixture. Standalone headers replace both color and extra-channel blend metadata; all
+entropy interpretation fields remain checked. Native logical-prefix flushes provide DC/AC layers,
+then an independent F64 compositor applies the original color/alpha reference selectors, clamps,
+alpha-over and alpha-weighted-add rules. Every scalar final is checked against native coalesced
+output. GPU tests cover both orientations and whole/40-byte fragmented delivery. The complete set
+now contains 36 fragments (2,536 bytes); the preceding 27 fragments are unchanged.

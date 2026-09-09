@@ -36,12 +36,13 @@ LF/animation dependencies. Whole and bounded fragmented input produce identical 
 `GpuDecodeStream::take_preview` opens a complete embedded preview before any main frame bytes or
 transport End arrive. The same frontend continues receiving the main image and `finish` requires
 its authoritative completion. Preview and main have independent output requests and leases.
-Opt-in color-only VarDCT stills, animations and composed presentations also return validated LF
-dependency images, DC and intermediate AC images through `next_update` and its async counterpart.
+Opt-in VarDCT stills, animations and composed presentations return validated DC and intermediate
+AC images, including extra channels, through `next_update` and its async counterpart. Color-only
+presentations can additionally return LF dependency images.
 LF updates retain the requested canvas extent and distinguish a complete physical LF frame from
 a complete presentation. Composed LF images wait for their exact background reference to validate.
-Broader LF conformance, extra-channel and Modular pass updates, and incomplete-frame-input
-coverage remain in progress.
+Broader LF conformance, LF previews with extra channels, Modular pass updates, and incomplete-frame
+input coverage remain in progress.
 
 The Modular decoder also reconstructs lossy XYB and original-sRGB color on the GPU. A shared
 color-output module serves both coding modes; Modular joins Gaborish, EPF, resampling, alpha,
@@ -131,15 +132,19 @@ orders, and shifts while accumulating into one resident coefficient set. Final o
 across every pass. Checked-in three-pass spectral, two-pass refinement, and recursive DC-plus-AC
 streams match Rust `jxl` and `djxl` within one RGB8 code on Apple M5, including bounded uploads and
 fragmented input. `with_progressive_output(true)` publishes LF, DC and complete image-wide AC-pass
-images for color-only stills, animations and composed presentations, including deferred coefficient
-descriptors. Each immutable output validates only completed entropy and shares one logical frame
-slot with its later updates. Presentation time advances only on the final image; `next_frame`
+images for stills, animations and composed presentations, including deferred coefficient
+descriptors. DC/AC snapshots include integer or floating extra channels, alpha and spot rendering;
+LF previews currently require color-only images. Each immutable output validates only completed
+entropy and shares one logical frame slot with its later updates. Presentation time advances only
+on the final image; `next_frame`
 remains final-only. Direct DC/pass flushes match native output within one RGB8 code; composed
 updates use independent layer flushes and scalar reference blending with a separate measured
 precision bound. Every final image preserves exact final-only GPU bytes. DC uses image-header 8×
 interpolation of the complete LF atlas before ordinary restoration and output. LF dependencies
-expand through their exact grids before composition and output conversion. Broader LF conformance,
-extras, Modular and incomplete-frame readiness remain.
+expand through their exact grids before composition and output conversion. Extra subimages validate
+at their coefficient pass boundary, then reconstruct from a separate copy of the assembled channels.
+Broader LF conformance, LF previews with extras, numeric/Modular updates and incomplete-frame
+readiness remain.
 
 VarDCT grayscale and RGB images now normalize all eight image orientations in the final GPU output
 pass. Grayscale XYB reconstructs linear luminance before the sRGB transfer function, including
@@ -285,7 +290,7 @@ The checked-in paths are interoperable but are not yet a complete JPEG XL implem
 | Direction | Stock `wgpu` implementation | Current limits |
 |---|---|---|
 | Encode | Standard lossless Modular Gray/RGB/RGBA at every integer depth from 1 through 16, multi-group stills with caller-selected shared-global or complete local-per-group MA/entropy descriptors, crops/references/blending animation, plus an experimental all-27-strategy VarDCT RGB8 still profile. VarDCT accepts validated exact-binary16 LF dequantization and LF/HF chroma-correlation metadata; the bounded DCT8 path transforms, quantizes, and serializes real AC coefficients on the GPU, while tiled DCT8 emits multiple LF and AC groups and accepts checked axes through 16K. | Modular uses one pass and the implemented predictor/entropy set; local mode currently repeats the frame-trained configuration in each pass group rather than training independent trees. VarDCT remains fixed at distance 25. Its bounded DCT8 AC policy uses natural order, one prefix cluster for all 495 coefficient contexts, no LZ77, and one pass. Scalable/tiled and non-DCT8 encoding remain zero-AC, with no mixed strategy selection or rate control. |
-| Decode | One public `GpuDecoder::wgpu` routes standard Modular or bounded VarDCT without caller mode knowledge. Modular keeps Prefix/ANS entropy, LZ77, every accepted MA predictor, RCT/Palette/Squeeze inversion, requested output conversion, and bounded resume on GPU. It supports 128/256/512/1024-pixel groups and one through three passes. Channels with both transformed shifts at least three execute through LF-group streams; the header's downsampling brackets assign every remaining channel to exactly one pass, empty sections are zero-validated without dispatch, and nonempty streams execute in pass/group order before one frame-wide inverse/finalizer. Integer extra channels retain independent depths and declarations, with native or scalar F32 selection and standard/custom 2×/4×/8× GPU resampling after complete inverse reconstruction. Packed `Pod` descriptors, reusable lanes, a frame-resident arena, and one aggregate status map share the backend byte budget. Actual-GPU coverage includes a byte-exact 2051×259 two-pass `cjxl` Squeeze stream with two LF groups, plus Palette, local transforms/MA trees, NV12, exact-widened F64, and 16K dispatch. VarDCT covers all 27 strategies, spectral/refinement AC accumulation with independent per-pass tables, optional validated LF/DC/AC images for color-only stills, animations and composed presentations including deferred descriptors, all 13 coefficient-order families, stream-defined contexts, default and parametric custom matrices, bounded raw mode-7 images with global or local MA descriptors and deferred inverse/overlay completion, LF/HF correlation and dequantization, multiple LF groups, Gaborish, one-to-three-iteration EPF, recursive GPU-resident progressive-DC dependencies, original-sRGB reconstruction, and public non-XYB 4:4:4/4:2:2/4:4:0/4:2:0 JPEG-reconstruction paths with resident component upsampling/YCbCr conversion. | Modular Global/LF/HF image streams, intermediate progressive presentation, broader original color metadata and full conformance remain. VarDCT larger/transformed raw-matrix combinations still need conformance fixtures; broader asymmetric JPEG restoration/resampling combinations, numeric color-channel output and HDR luminance mapping remain typed or unproven gaps. Broader LF conformance, extra-channel and Modular refinements, incomplete-frame readiness and pre-transform patch composition remain missing. Post-transform crop/blend/reference execution retains every supported integer extra channel with independent blend/alpha/reference selection, including Gray+alpha and resampled planes. |
+| Decode | One public `GpuDecoder::wgpu` routes standard Modular or bounded VarDCT without caller mode knowledge. Modular keeps Prefix/ANS entropy, LZ77, every accepted MA predictor, RCT/Palette/Squeeze inversion, requested output conversion, and bounded resume on GPU. It supports 128/256/512/1024-pixel groups and one through three passes. Channels with both transformed shifts at least three execute through LF-group streams; the header's downsampling brackets assign every remaining channel to exactly one pass, empty sections are zero-validated without dispatch, and nonempty streams execute in pass/group order before one frame-wide inverse/finalizer. Integer extra channels retain independent depths and declarations, with native or scalar F32 selection and standard/custom 2×/4×/8× GPU resampling after complete inverse reconstruction. Packed `Pod` descriptors, reusable lanes, a frame-resident arena, and one aggregate status map share the backend byte budget. Actual-GPU coverage includes a byte-exact 2051×259 two-pass `cjxl` Squeeze stream with two LF groups, plus Palette, local transforms/MA trees, NV12, exact-widened F64, and 16K dispatch. VarDCT covers all 27 strategies, spectral/refinement AC accumulation with independent per-pass tables, optional validated DC/AC images for stills, animations and composed presentations including extras and deferred descriptors, plus color-only LF previews, all 13 coefficient-order families, stream-defined contexts, default and parametric custom matrices, bounded raw mode-7 images with global or local MA descriptors and deferred inverse/overlay completion, LF/HF correlation and dequantization, multiple LF groups, Gaborish, one-to-three-iteration EPF, recursive GPU-resident progressive-DC dependencies, original-sRGB reconstruction, and public non-XYB 4:4:4/4:2:2/4:4:0/4:2:0 JPEG-reconstruction paths with resident component upsampling/YCbCr conversion. | Modular Global/LF/HF image streams, intermediate progressive presentation, broader original color metadata and full conformance remain. VarDCT larger/transformed raw-matrix combinations still need conformance fixtures; broader asymmetric JPEG restoration/resampling combinations, numeric color-channel output and HDR luminance mapping remain typed or unproven gaps. Broader LF conformance, LF previews with extra channels and numeric/Modular refinements, incomplete-frame readiness and pre-transform patch composition remain missing. Post-transform crop/blend/reference execution retains every supported integer extra channel with independent blend/alpha/reference selection, including Gray+alpha and resampled planes. |
 | Output | GPU-resident native integer Gray/RGB/RGBA plus all 30 portable VPI pitch-linear formats: 20 color layouts and 10 explicitly mapped numeric layouts. Generic color output performs D65 BT.709/BT.2020/Display-P3 primary conversion, Linear/sRGB/BT.709/PQ/HLG/BT.2020 transfer conversion, and BT.601/709/2020 NCL/2020 CL YCbCr packing. | numeric normalization is explicit; F64 requires a native-or-exact-widening precision policy; custom ICC/white-point adaptation and tone/gamut mapping remain |
 | Presentation | Same-queue buffer-to-linear-BT.709 RGBA8 SDR and RGBA16F wide-gamut/HDR display pipeline, including BT.2020/Display-P3, PQ/HLG, and BT.2020 constant-luminance input | no tone/gamut mapping or direct surface-format negotiation yet; explicit unvalidated handoff can enqueue display/readback/custom GPU work before final validation, and derived results are discarded if validation later fails |
 | CPU transport | Explicit mapped readback after GPU completion | transport only; it never selects a host codec |
@@ -306,9 +311,9 @@ through one mode-neutral frame plan, including mixed JPEG-VarDCT/Modular present
 and names, overwritten zero-duration layers, and recursive progressive-DC dependencies. Nine libjxl
 fixtures match Rust `jxl` and `djxl` exactly for Modular and within one RGB8 code for VarDCT under
 whole and bounded fragmented async input. The common executor also composes crops and all five
-blend modes against four resident post-transform reference slots. Composed intermediate
-presentation, arbitrary ICC transforms, patches and splines still require production integration
-and conformance.
+blend modes against four resident post-transform reference slots. Composed DC/AC images include
+independent alpha blending and retain committed references until final reconstruction. Arbitrary ICC
+transforms and pre-transform patch/spline composition still require integration and conformance.
 
 XYB and original-sRGB Modular/VarDCT, plus JPEG YCbCr VarDCT, synthesize the signaled noise model on the GPU
 after restoration and frame upsampling, before color conversion. A shared portable shader generates

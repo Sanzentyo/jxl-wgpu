@@ -1,4 +1,4 @@
-/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear] [keep]]].
+/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear] [keep] [prefix] [no-spots]]].
  * Production decoding does not link to this helper. Use whole input for noisy
  * images: libjxl 0.12.0 retries incomplete frame headers without rolling back
  * its persistent noise-frame counters. GPU fragmented input is tested separately.
@@ -14,11 +14,13 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 6) return 2;
-  int linear = 0, keep = 0;
+  if (argc < 2 || argc > 8) return 2;
+  int linear = 0, keep = 0, flush_prefix = 0, spots = 1;
   for (int arg = 4; arg < argc; ++arg) {
     if (strcmp(argv[arg], "linear") == 0) linear = 1;
     else if (strcmp(argv[arg], "keep") == 0) keep = 1;
+    else if (strcmp(argv[arg], "prefix") == 0) flush_prefix = 1;
+    else if (strcmp(argv[arg], "no-spots") == 0) spots = 0;
     else return 2;
   }
   FILE *input = fopen(argv[1], "rb");
@@ -36,6 +38,7 @@ int main(int argc, char **argv) {
   if (linear && decoder) JxlDecoderSetCms(decoder, *JxlGetDefaultCms());
   if (!decoder || JxlDecoderSubscribeEvents(decoder, JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE | JXL_DEC_FRAME_PROGRESSION) != JXL_DEC_SUCCESS || JxlDecoderSetProgressiveDetail(decoder, kPasses) != JXL_DEC_SUCCESS || JxlDecoderSetInput(decoder, bytes, delivered) != JXL_DEC_SUCCESS) return 3;
   if (JxlDecoderSetKeepOrientation(decoder, keep) != JXL_DEC_SUCCESS) return 3;
+  if (JxlDecoderSetRenderSpotcolors(decoder, spots) != JXL_DEC_SUCCESS) return 3;
   JxlBasicInfo info;
   const JxlPixelFormat format = {4, JXL_TYPE_FLOAT, JXL_LITTLE_ENDIAN, 0};
   float *pixels = NULL;
@@ -62,9 +65,14 @@ int main(int argc, char **argv) {
       free(pixels);
       pixels = calloc(1, output_bytes);
       if (!pixels || JxlDecoderSetImageOutBuffer(decoder, &format, pixels, output_bytes) != JXL_DEC_SUCCESS) return 3;
-    } else if (status == JXL_DEC_FRAME_PROGRESSION || status == JXL_DEC_FULL_IMAGE) {
+    } else if (status == JXL_DEC_FRAME_PROGRESSION || status == JXL_DEC_FULL_IMAGE ||
+               (flush_prefix && status == JXL_DEC_NEED_MORE_INPUT && delivered == (size_t)length)) {
       int final = status == JXL_DEC_FULL_IMAGE;
-      if (!final && JxlDecoderFlushImage(decoder) != JXL_DEC_SUCCESS) { printf("unavailable,%zu,%zu,%zu\n", frame, step, JxlDecoderGetIntendedDownsamplingRatio(decoder)); continue; }
+      int prefix_end = status == JXL_DEC_NEED_MORE_INPUT;
+      if (!final && JxlDecoderFlushImage(decoder) != JXL_DEC_SUCCESS) {
+        if (prefix_end) { fprintf(stderr, "prefix cannot be flushed\n"); return 3; }
+        printf("unavailable,%zu,%zu,%zu\n", frame, step, JxlDecoderGetIntendedDownsamplingRatio(decoder)); continue;
+      }
       uint64_t hash = UINT64_C(14695981039346656037);
       size_t nonfinite = 0;
       for (size_t i = 0; i < output_bytes / sizeof(float); ++i) if (!isfinite(pixels[i])) ++nonfinite;
@@ -80,6 +88,7 @@ int main(int argc, char **argv) {
         FILE *output = fopen(output_path, "wb");
         if (!output || fwrite(pixels, 1, output_bytes, output) != output_bytes || fclose(output)) return 2;
       }
+      if (prefix_end) break;
       if (final) ++frame;
     } else if (status == JXL_DEC_NEED_MORE_INPUT && !closed) {
       size_t remaining = JxlDecoderReleaseInput(decoder);

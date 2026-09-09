@@ -9,6 +9,7 @@ pub(super) struct FrameRenderInputs<'a> {
     pub(super) resources: &'a wgpu::Buffer,
     pub(super) output: &'a wgpu::Buffer,
     pub(super) resident_planes: Option<&'a [wgpu::Buffer; 3]>,
+    pub(super) extra_planes: &'a [super::super::staging::ResidentModularPlane],
     pub(super) rendered_extra: Option<&'a crate::modular_render::ModularRenderBuffers>,
     pub(super) post_transform: PostTransformJobBuffers,
     pub(super) transient_permit: &'a mut MemoryPermit,
@@ -35,6 +36,7 @@ pub(super) fn encode_frame_render(
         resources,
         output,
         resident_planes,
+        extra_planes,
         rendered_extra,
         post_transform,
         transient_permit,
@@ -353,8 +355,7 @@ pub(super) fn encode_frame_render(
                             sample_bit_depth: plane.encoding.depth(),
                         })
                     } else {
-                        source
-                            .extra_planes
+                        extra_planes
                             .first()
                             .map(super::super::staging::ResidentModularPlane::alpha_binding)
                             .transpose()?
@@ -430,13 +431,11 @@ pub(super) fn encode_frame_render(
             )
         }
         VarDctFrameOutput::Extra { index, plan } => {
-            let extra =
-                source
-                    .extra_planes
-                    .first()
-                    .ok_or(VarDctDecodeError::EntropyWindowContract {
-                        detail: "scalar output lacks its selected resident extra plane",
-                    })?;
+            let extra = extra_planes
+                .first()
+                .ok_or(VarDctDecodeError::EntropyWindowContract {
+                    detail: "scalar output lacks its selected resident extra plane",
+                })?;
             if plan.config.encoding != extra.encoding || index != extra.index {
                 return Err(VarDctDecodeError::EntropyWindowContract {
                     detail: "scalar output precision differs from the selected extra plane",

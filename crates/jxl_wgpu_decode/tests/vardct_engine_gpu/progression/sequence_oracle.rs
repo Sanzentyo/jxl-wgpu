@@ -6,9 +6,9 @@ use jxl_gpu_bitstream::{CodestreamInventory, FrameBlendMode, FrameType};
 
 #[allow(dead_code)]
 #[path = "../../common/progressive_layers.rs"]
-mod layers;
+pub(super) mod layers;
 
-fn present(pixels: &[f64], width: usize, height: usize, orientation: u32) -> Vec<u8> {
+pub(super) fn present(pixels: &[f64], width: usize, height: usize, orientation: u32) -> Vec<u8> {
     let mut output = vec![0; pixels.len() * 4];
     let stride = if orientation >= 5 { height } else { width };
     for y in 0..height {

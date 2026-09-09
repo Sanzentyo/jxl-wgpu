@@ -982,3 +982,28 @@ then cancel or switch to blocking/poll final completion. Public tests additional
 admission retry, cancellation before DC/after DC/after AC, fragmented input, later-AC rejection and
 late composition pressure. Only retained output bytes survive session/callback retirement, and
 retained images are byte-identical after later work. No shader ABI or CPU pixel fallback is added.
+
+### Coefficient updates with extra channels
+
+VarDCT reserves an independent inverse arena, inverse uniforms and normalization/resampling buffers
+for every intermediate image, in addition to its color render, status snapshot and output lease.
+After global and LF assembly, each coefficient pass is followed by validation of that pass's HF
+cursors and bounded Modular extra subimages. Only then may the corresponding image submit. Missing
+future residual channels remain zero. The entire assembly arena is copied before applying global
+inverse transforms: those transforms reuse entropy storage, so applying them to the shared arena
+would corrupt later passes. The copy retains a byte permit even when no extra plane is selected.
+Canonical outputs include `COPY_DST` for independently addressed normalized extra-plane copies.
+
+An explicit image/coefficient continuation retains unsubmitted pass/image recordings and resumes
+only on demand. Independent image status maps validate completed packet/artifact/HF records; extra
+subimage statuses have already validated on the host before the image submission. A four-byte copy
+within the existing aggregate status staging buffer fences each image before that staging buffer
+is reused for the next pass's cursors. Image callbacks retain the common lifetime until queued
+work completes. Dynamic subimage allocations and additional cursor submissions use the existing
+shared budget and submission counter. Final-only completion drains these continuations; no pixel
+or entropy data is read back to a CPU codec. No WGSL ABI changes are introduced.
+
+Public tests cover each pass's extra-payload corruption, cancellation before DC/after DC/after AC
+and during a bounded extra subimage, initial admission retry, late allocation failure, exact
+final-only output and retained-image immutability. Integer/floating multi-channel surfaces, alpha
+association, spot rendering, resampling and composed references share the final render path.

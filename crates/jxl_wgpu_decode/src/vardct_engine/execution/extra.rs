@@ -188,6 +188,22 @@ impl FramePendingFrame {
         completion: Arc<MapCompletion>,
         source: Box<VarDctSource>,
     ) -> VarDctPendingStage {
+        if let Some(progress) = self.lifetime.as_ref().and_then(|life| {
+            lock_unpoisoned(&life.progressive_extra)
+                .as_ref()
+                .map(|progress| (progress.phase, progress.completed, progress.total))
+        }) {
+            if progress.0 == progression::ExtraPhase::Image {
+                return VarDctPendingStage::ExtraImage { completion, source };
+            }
+            if progress.1 < progress.2 {
+                // The ordinary image and final submissions are already in the base plan. Each
+                // nonfinal extra pass adds one cursor fence before its separately recorded image.
+                self.runtime_stats
+                    .submissions_per_frame
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        }
         if self.extra_output_commands.is_some() {
             VarDctPendingStage::AcExtra { completion, source }
         } else {
@@ -243,7 +259,15 @@ impl FramePendingFrame {
                 }
             })?;
         let mut requests = VecDeque::new();
+        let progressive_pass = lock_unpoisoned(&frame.progressive_extra)
+            .as_ref()
+            .map(|progress| progress.completed - 1);
         for (expected, &status) in self.expected_hf.iter().zip(statuses) {
+            if progressive_pass.is_some_and(|pass| {
+                u64::from(expected.index) / source.packet.profile.group_count != pass as u64
+            }) {
+                continue;
+            }
             let cursor = expected.validate(status)?;
             if expected.continuation {
                 let groups = source.packet.profile.group_count;
@@ -342,7 +366,7 @@ impl FramePendingFrame {
             ExtraResume::Lf { commands, cursors } => {
                 self.submit_hf_from_cursors(source, commands, cursors)
             }
-            ExtraResume::Ac => self.submit_extra_output(),
+            ExtraResume::Ac => self.finish_extra_pass(source),
         }
     }
 
@@ -501,7 +525,7 @@ impl FramePendingFrame {
         };
     }
 
-    fn submit_extra_output(&mut self) -> DecodeResult<()> {
+    pub(super) fn submit_extra_output(&mut self) -> DecodeResult<()> {
         let poll = self
             .backend
             .submission_poller()

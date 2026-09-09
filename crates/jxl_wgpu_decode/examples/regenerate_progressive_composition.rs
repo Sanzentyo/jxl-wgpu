@@ -35,7 +35,7 @@ fn main() {
     run(Command::new(&binary)
         .arg(&temporary)
         .arg("--progressive-layers"));
-    for name in ["vardct", "vardct_gray", "vardct_dc"] {
+    for name in ["vardct", "vardct_gray", "vardct_dc", "associated_vardct"] {
         let source = hex::unhex(
             &std::fs::read_to_string(data.join(format!("composition_{name}.jxl.hex"))).unwrap(),
         );

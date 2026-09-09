@@ -1,11 +1,22 @@
 use super::*;
 
+#[path = "progression/extras.rs"]
+mod extras;
 #[path = "progression/lf.rs"]
 mod lf;
 #[path = "progression/sequence.rs"]
 mod sequence;
 #[path = "progression/sequence_oracle.rs"]
 mod sequence_oracle;
+
+fn encoded(hex: &str) -> Vec<u8> {
+    let compact = hex.split_whitespace().collect::<String>();
+    compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
 
 fn read(backend: &WgpuBackend, frame: &jxl_wgpu::GpuImageFrame) -> Vec<u8> {
     ImageReadbackPipeline::new(backend)
@@ -52,6 +63,25 @@ fn native_updates(encoded: &[u8], linear: bool) -> Option<Vec<NativeUpdate>> {
 }
 
 fn native_updates_oriented(encoded: &[u8], linear: bool, keep: bool) -> Option<Vec<NativeUpdate>> {
+    native_updates_options(encoded, linear, keep, false)
+}
+
+fn native_updates_options(
+    encoded: &[u8],
+    linear: bool,
+    keep: bool,
+    flush_prefix: bool,
+) -> Option<Vec<NativeUpdate>> {
+    native_updates_with_spots(encoded, linear, keep, flush_prefix, true)
+}
+
+fn native_updates_with_spots(
+    encoded: &[u8],
+    linear: bool,
+    keep: bool,
+    flush_prefix: bool,
+    render_spots: bool,
+) -> Option<Vec<NativeUpdate>> {
     use std::process::Command;
     static BINARY: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -108,6 +138,12 @@ fn native_updates_oriented(encoded: &[u8], linear: bool, keep: bool) -> Option<V
     }
     if keep {
         command.arg("keep");
+    }
+    if flush_prefix {
+        command.arg("prefix");
+    }
+    if !render_spots {
+        command.arg("no-spots");
     }
     let decoded = command.output().unwrap();
     assert!(

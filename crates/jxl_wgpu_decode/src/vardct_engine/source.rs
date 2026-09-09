@@ -428,7 +428,6 @@ pub(super) fn prepare_packet_source(
         .collect::<Result<Vec<_>, _>>()?;
     let intermediate_outputs = if request.progressive_output()
         && output.is_color()
-        && inventory.image_header.extra_channels.is_empty()
         && frame.frame_type == jxl_gpu_bitstream::FrameType::Regular
     {
         let progression = |completed| {

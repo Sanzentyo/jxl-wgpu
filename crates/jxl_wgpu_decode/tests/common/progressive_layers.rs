@@ -118,6 +118,9 @@ pub fn reframe(data: &[u8], frames: &[FrameInventory], headers: &str) -> Vec<u8>
         actual.y0 = source.y0;
         actual.have_crop = source.have_crop;
         actual.color_blend = source.color_blend;
+        actual
+            .extra_channel_blends
+            .clone_from(&source.extra_channel_blends);
         actual.duration_ticks = source.duration_ticks;
         actual.timecode = source.timecode;
         actual.is_last = source.is_last;

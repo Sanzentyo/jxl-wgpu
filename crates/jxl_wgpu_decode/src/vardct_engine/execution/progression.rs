@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod extra;
+pub(super) use extra::{ExtraPhase, ExtraProgression};
+
 pub(super) struct IntermediatePermits {
     pub(super) output: MemoryPermit,
     pub(super) transient: MemoryPermit,
@@ -17,6 +20,10 @@ pub(super) struct IntermediateFrame {
     progression: crate::FrameProgression,
     spatial_groups: u64,
     _render: render::FrameRenderResult,
+    _extra_planes: Vec<super::super::staging::ResidentModularPlane>,
+    _extra_arena: Option<GpuBufferLease>,
+    _extra_uniforms: Vec<wgpu::Buffer>,
+    _rendered_extra: Option<crate::modular_render::ModularRenderBuffers>,
     _transient: MemoryPermit,
 }
 
@@ -45,6 +52,7 @@ pub(super) struct IntermediateRenderInputs<'a> {
     pub(super) hf: Option<&'a HfCoefficientJobBuffers>,
     pub(super) resources: &'a wgpu::Buffer,
     pub(super) planes: Option<&'a [wgpu::Buffer; 3]>,
+    pub(super) extra_frame: Option<&'a GpuBufferLease>,
     pub(super) post: &'a PostTransformJobBuffers,
 }
 
@@ -65,7 +73,9 @@ pub(super) fn record_intermediates(
     let mut recordings = Vec::with_capacity(permits.len());
     for (plan, mut permits) in source.intermediate_outputs.iter().zip(permits) {
         let progression = plan.progression;
-        let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        let mut usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
         if backend.direct_readback_enabled() {
             usage |= wgpu::BufferUsages::MAP_READ;
         }
@@ -86,6 +96,93 @@ pub(super) fn record_intermediates(
         let mut commands = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("jxl-wgpu render a completed coefficient pass"),
         });
+        // Global inverse transforms reuse entropy storage. Never run an intermediate inverse on
+        // the assembly arena which later LF/pass groups must continue to fill.
+        let mut extra_uniforms = Vec::new();
+        let mut extra_snapshots = Vec::new();
+        let mut extra_arena = None;
+        if let Some(extra) = &source.packet.extra_channels {
+            let original = inputs
+                .extra_frame
+                .ok_or(VarDctDecodeError::EngineContract {
+                    detail: "intermediate extra reconstruction has no assembly arena",
+                })?;
+            let bytes = extra.inverse.arena_bytes();
+            let arena = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("jxl-wgpu intermediate extra inverse arena"),
+                size: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let permit = permits
+                .transient
+                .split_off(bytes)
+                .map_err(ProgressiveDcGpuError::from)?;
+            let arena = GpuBufferLease::from_tracked(arena, permit);
+            commands.copy_buffer_to_buffer(
+                original.as_wgpu_buffer(),
+                0,
+                arena.as_wgpu_buffer(),
+                0,
+                bytes,
+            );
+            extra_uniforms.extend(
+                pipelines
+                    .raw_hf_dequant
+                    .modular()
+                    .encode_inverse(
+                        backend,
+                        &mut commands,
+                        arena.as_wgpu_buffer(),
+                        &extra.inverse,
+                        extra.wp_header,
+                    )
+                    .map_err(map_extra_error)?,
+            );
+            extra_snapshots = source
+                .extra_planes
+                .iter()
+                .map(|plane| super::super::staging::ResidentModularPlane {
+                    index: plane.index,
+                    arena: arena.clone(),
+                    plane: plane.plane,
+                    encoding: plane.encoding,
+                })
+                .collect();
+            extra_arena = Some(arena);
+        }
+        let extra_planes = if inputs.extra_frame.is_some() {
+            &extra_snapshots
+        } else {
+            &source.extra_planes
+        };
+        let rendered_extra = source
+            .extra_render
+            .as_ref()
+            .map(|plan| {
+                let first = extra_planes
+                    .first()
+                    .ok_or(VarDctDecodeError::EngineContract {
+                        detail: "intermediate extra normalization has no source plane",
+                    })?;
+                let buffers = plan.allocate(device)?;
+                let planes = extra_planes
+                    .iter()
+                    .map(|plane| {
+                        crate::modular_sample::ModularOutputPlane::new(plane.plane, plane.encoding)
+                    })
+                    .collect::<Vec<_>>();
+                extra_uniforms.extend(pipelines.modular_render.encode(
+                    device,
+                    &mut commands,
+                    plan,
+                    &buffers,
+                    resident_binding(first.arena.as_wgpu_buffer())?,
+                    &planes,
+                )?);
+                Ok::<_, VarDctDecodeError>(buffers)
+            })
+            .transpose()?;
         let rendered = render::encode_frame_render(
             device,
             &mut commands,
@@ -97,7 +194,8 @@ pub(super) fn record_intermediates(
                 resources: inputs.resources,
                 output: &output,
                 resident_planes: inputs.planes,
-                rendered_extra: None,
+                extra_planes,
+                rendered_extra: rendered_extra.as_ref(),
                 post_transform: PostTransformJobBuffers {
                     _pre_restoration_planes: inputs.post._pre_restoration_planes.clone(),
                     _restoration_planes: inputs.post._restoration_planes.clone(),
@@ -151,7 +249,7 @@ pub(super) fn record_intermediates(
         }
         if rendered.lf_planes.is_some() {
             return Err(VarDctDecodeError::EngineContract {
-                detail: "intermediate image requires color-only main-frame validation",
+                detail: "coefficient images cannot produce LF dependencies",
             });
         }
         frames.push(Arc::new(IntermediateFrame {
@@ -163,6 +261,10 @@ pub(super) fn record_intermediates(
             progression,
             spatial_groups: source.packet.profile.group_count,
             _render: rendered,
+            _extra_planes: extra_snapshots,
+            _extra_arena: extra_arena,
+            _extra_uniforms: extra_uniforms,
+            _rendered_extra: rendered_extra,
             _transient: permits.transient,
         }));
         recordings.push(IntermediateCommands {
@@ -301,7 +403,7 @@ pub(super) fn submit_passes(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &VarDctPipelines,
-    lifetime: &VarDctJobLifetime,
+    lifetime: &Arc<VarDctJobLifetime>,
     first_intermediate: usize,
     coefficients: PassCommands,
     intermediate_commands: Vec<IntermediateCommands>,
@@ -348,6 +450,19 @@ pub(super) fn submit_passes(
         return Err(VarDctDecodeError::EngineContract {
             detail: "intermediate submissions lost a validation stage",
         });
+    }
+    if lifetime.extra_frame.is_some() {
+        return extra::start(
+            device,
+            queue,
+            pipelines,
+            lifetime,
+            first_intermediate,
+            coefficients,
+            intermediate_commands,
+            prefix,
+            after,
+        );
     }
     match coefficients {
         PassCommands::Whole(passes) => {

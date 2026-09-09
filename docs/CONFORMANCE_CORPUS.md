@@ -2741,3 +2741,74 @@ six-crate all-feature WebAssembly check pass. Reference and Metal harnesses each
 the reference run uses no adapter. Gray8 U8 CPU readback passes with all 221 logical bytes directly
 mapped and zero staging bytes. All 27 standalone header fragments (1,908 bytes total) regenerate
 exactly after the noncontiguous dependency mapping change.
+
+### VarDCT coefficient snapshots with extra channels (2026-09-10)
+
+Regular-frame DC/AC output now includes integer and floating extra channels. Each pass's HF cursor
+and Modular subimages validate before its image submits. Global inverse transforms operate on an
+independently owned copy of the assembled channels; later passes continue filling the original
+arena. Normalization, resampling, alpha association, spots and canonical all-channel composition
+reuse the final renderer. Snapshot arenas, uniforms, buffers, status maps and output leases are
+included in byte admission. No production CPU pixel/entropy codec or WGSL ABI is added.
+
+`progression/extras.rs` covers eight existing fixture families: global and distributed progressive
+RGBA, associated Squeeze, resampled Squeeze, transformed nine-channel integer data, gray/alpha,
+floating Squeeze with nine channels, and 31-bit integer data. Whole input and fragmented input with
+40-byte GPU windows return identical images. Every final equals final-only GPU decoding; every
+retained image and its metadata remain unchanged after subsequent work. Native sRGB F32 color
+error uses `abs(actual-reference)/max(1,abs(reference))`, bounded by 0.00002 for DC and 0.0006 for
+AC/final. The measured maximum across this matrix is 0.0005633286. Alpha is exactly equal in this
+matrix, under a 0.0000004 bound that also covers resampled output configurations. Samples must be
+finite. These are regression bounds, not a full ISO precision-conformance claim.
+
+libjxl 0.12.0 deliberately disables progression events when extra channels exist in
+[`SetPauseAtProgressive`](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.h).
+The offline helper therefore uses public `JxlDecoderFlushImage` on prefixes ending at physical
+pass boundaries. Inventory offsets address the logical codestream, so container payloads are
+unwrapped before slicing. Native alpha association is preserved explicitly by the GPU request;
+conversion policies are checked separately. The native intended-downsampling value stays at its
+non-paused setting and is not used as an oracle for coefficient-pass identity. Single-entry TOCs
+have no separate byte boundary for a DC flush and therefore have final/preservation/lifetime
+evidence without an independent native DC pixel-oracle claim. Native
+[`FinalizeDecoding`](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_modular.cc) also copies
+the assembled Modular image before global inverse transforms on a nonfinal flush.
+
+`extras_output.rs` checks 24 configurations across global RGBA, associated Squeeze, floating
+Squeeze and thin associated input. Apply/Keep orientation, interleaved RGBA/planar BGRA,
+sRGB/linear output, rendered/preserved spots and all three alpha policies share native prefix/final
+oracles and scalar association. Linear color uses a 0.0001 bound. Unassociation error is evaluated
+before the amplification by small alpha, using the declared finite denominator floor. All final
+bytes remain identical to final-only output, with retained-image and exact budget-release checks.
+
+`extras_lifecycle.rs` corrupts the payload tail in every coefficient pass. Global fixtures return
+`HfCoefficientGpu`; Squeeze fixtures reach and reject the targeted extra subimage with
+`ExtraModularStatus`. A failed pass returns no image, earlier images remain usable, and the session
+is poisoned. Tests cancel before DC, after DC/AC and inside a separately admitted bounded AC extra
+subimage. Initial allocation failure remains retryable; late pressure after DC is terminal.
+Switching to final-only completion still drives all required subimages. Only held output bytes
+survive retirement; input and other GPU reservations return to zero.
+
+Nine new `associated_vardct_layer0..8.headers` fragments add 628 bytes to the existing standalone
+header set. They replace color and extra blend metadata while preserving every entropy byte and
+checking all entropy interpretation fields. `extras_composition.rs` applies an independent F64
+associated-alpha compositor to native layer prefix flushes, using the original color/alpha
+reference selectors, five blend modes, clamps and crop geometry. Every scalar final is checked
+against libjxl's original coalesced animation below 0.000003 normalized linear error. GPU DC/AC
+images across nine physical layers and six presentations use the existing 0.001 composition bound.
+Apply/Keep, whole/40-byte fragmented input, exact physical/presentation IDs, final-only equality,
+committed reference versions, retained outputs and memory release are covered. The full metadata
+set is now 36 fragments / 2,536 bytes; the preceding 27 files are unchanged.
+
+The full JPEG XL goal remains active. LF previews with extra channels, numeric and Modular
+refinements, broader LF/source-color/precision conformance, selective regions and incomplete-frame
+input readiness remain open. The previously documented VDCT-D04 raw-JPEG precision gap is
+unchanged by this milestone.
+
+Local final validation passes 810 tests across all 42 all-feature workspace targets on Apple M5/
+Metal, with zero failures and the existing manual release-mode allocation benchmark ignored.
+All four new extra-progression tests also pass within that full run. Formatting, workspace check,
+Clippy and rustdoc with warnings denied, MSRV 1.89.0, and the six-crate all-feature WebAssembly
+check pass. Reference and Metal harnesses each pass 18/18 cases; the reference run uses no adapter.
+Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and zero staging bytes.
+All 36 standalone header fragments (2,536 bytes total) regenerate exactly, including the unchanged
+preceding 27 fragments.
