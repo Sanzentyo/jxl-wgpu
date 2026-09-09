@@ -1,7 +1,7 @@
 //! Serial physical-frame execution with resident reference versions and lazy producer admission.
-//! Caller-visible buffers are packed only after all zero-duration layers have been validated.
+//! Refinements read validated references; only complete physical frames commit new versions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,6 +31,8 @@ use crate::{
 
 mod blend;
 mod gpu;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lf_tests;
 mod progression;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod refinement_tests;
@@ -203,11 +205,22 @@ impl DependentSession {
             )
         };
         let lf_preview = if request.progressive_output()
-            && matches!(output, Output::Native)
             && request.mapping() == crate::GpuOutputMapping::Color
             && inventory.image_header.xyb_encoded
             && inventory.image_header.extra_channels.is_empty()
+            && inventory
+                .frames
+                .iter()
+                .any(|frame| frame.frame_type == FrameType::LowFrequency)
         {
+            let working;
+            let request = if matches!(output, Output::Composed(_)) {
+                working = GpuOutputRequest::color(FrameSurfaceEncoding::Srgb.format())?
+                    .with_orientation_policy(crate::OrientationPolicy::Keep);
+                &working
+            } else {
+                request
+            };
             Some(Arc::new(LfPreview::new(
                 source.engine.backend().clone(),
                 &inventory.image_header,
@@ -274,6 +287,21 @@ impl DependentSession {
             .carry
             .as_mut()
             .ok_or(Error::EngineContract("composition source was lost"))?;
+        let lf_preview = self
+            .lf_preview
+            .as_ref()
+            .filter(|_| !lf_updates.is_empty())
+            .map(|preview| {
+                if let Some(encodings) = &carry.source.surface_encodings {
+                    let frame = &carry.source.inventory.frames[last];
+                    preview
+                        .for_surface(Extent2d::new(frame.width, frame.height), encodings[last])
+                        .map(Arc::new)
+                } else {
+                    Ok(Arc::clone(preview))
+                }
+            })
+            .transpose()?;
         let physical = presentation.physical_frames.start;
         if carry.prepared.is_none() {
             carry.prepared =
@@ -307,8 +335,9 @@ impl DependentSession {
             submissions: Arc::clone(&self.submissions),
             completed_submissions: 0,
             finished: false,
-            lf_preview: self.lf_preview.clone(),
+            lf_preview,
             lf_updates,
+            lf_pending: VecDeque::new(),
         })
     }
 }
@@ -465,12 +494,33 @@ enum RefinementRender {
 }
 
 #[derive(Debug)]
+enum Resume {
+    Decode(PhysicalPending),
+    Advance,
+}
+
+impl Resume {
+    fn stage(self) -> Stage {
+        match self {
+            Self::Decode(decode) => Stage::Decode(decode),
+            Self::Advance => Stage::Advance,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LfUpdate {
+    planes: ProgressiveDcXybPlanes,
+    progression: FrameProgression,
+}
+
+#[derive(Debug)]
 enum Stage {
     Decode(PhysicalPending),
     Blend(GpuWork),
     Pack(GpuWork),
     Refinement {
-        decode: PhysicalPending,
+        resume: Resume,
         render: RefinementRender,
         progression: FrameProgression,
     },
@@ -497,6 +547,7 @@ pub(super) struct DependentPending {
     finished: bool,
     lf_preview: Option<Arc<LfPreview>>,
     lf_updates: Vec<u32>,
+    lf_pending: VecDeque<LfUpdate>,
 }
 
 impl DependentPending {
@@ -565,20 +616,13 @@ impl DependentPending {
             drop(frame);
             if let Some(planes) = preview_planes {
                 let level = header.lf_level as u8;
-                self.stage = Some(Stage::LfPreview {
-                    work: self
-                        .lf_preview
-                        .as_ref()
-                        .expect("LF preview selected")
-                        .submit(&planes, level)?,
+                self.lf_pending.push_back(LfUpdate {
+                    planes,
                     progression: FrameProgression::LowFrequency {
                         physical_frame_index: node.frame_index,
                         level,
                     },
                 });
-                self.submissions.fetch_add(1, Ordering::AcqRel);
-                self.completed_submissions += 1;
-                return Ok(None);
             }
             self.advance()?;
             return Ok(None);
@@ -610,6 +654,23 @@ impl DependentPending {
     }
 
     fn advance(&mut self) -> Result<()> {
+        if !self.lf_pending.is_empty() && self.lf_references_ready()? {
+            let update = self.lf_pending.pop_front().expect("nonempty LF updates");
+            let FrameProgression::LowFrequency { level, .. } = update.progression else {
+                unreachable!()
+            };
+            self.stage = Some(Stage::LfPreview {
+                work: self
+                    .lf_preview
+                    .as_ref()
+                    .expect("LF preview selected")
+                    .submit(&update.planes, level)?,
+                progression: update.progression,
+            });
+            self.submissions.fetch_add(1, Ordering::AcqRel);
+            self.completed_submissions += 1;
+            return Ok(());
+        }
         self.physical += 1;
         if self.physical >= self.end {
             return Err(Error::EngineContract(
@@ -698,6 +759,9 @@ impl DependentPending {
         context: &mut Context<'_>,
         emit_intermediates: bool,
     ) -> Poll<Result<SubmittedGpuUpdate<GpuImageFrame>>> {
+        if !emit_intermediates {
+            self.lf_pending.clear();
+        }
         loop {
             let stage = self
                 .stage
@@ -779,10 +843,10 @@ impl DependentPending {
                         Poll::Ready(result) => result?,
                     };
                     if !emit_intermediates {
-                        let Some(Stage::Refinement { decode, .. }) = self.stage.take() else {
+                        let Some(Stage::Refinement { resume, .. }) = self.stage.take() else {
                             unreachable!()
                         };
-                        self.stage = Some(Stage::Decode(decode));
+                        self.stage = Some(resume.stage());
                         continue;
                     }
                     let compositor = self.output.compositor()?;
@@ -803,14 +867,14 @@ impl DependentPending {
                         Poll::Ready(result) => result?,
                     };
                     let Some(Stage::Refinement {
-                        decode,
+                        resume,
                         progression,
                         ..
                     }) = self.stage.take()
                     else {
                         unreachable!()
                     };
-                    self.stage = Some(Stage::Decode(decode));
+                    self.stage = Some(resume.stage());
                     if emit_intermediates {
                         return Poll::Ready(Ok(self.update(
                             buffer,
@@ -833,6 +897,21 @@ impl DependentPending {
                             .ok_or(Error::EngineContract("LF preview renderer was lost"))?
                             .layout
                             .clone();
+                        if matches!(*self.output, Output::Composed(_)) {
+                            let surface =
+                                self.output.compositor()?.import(vec![GpuImageOutput {
+                                    id: OutputId(0),
+                                    layout,
+                                    buffer,
+                                }])?;
+                            self.render_refinement(
+                                surface,
+                                self.end - 1,
+                                Resume::Advance,
+                                progression,
+                            )?;
+                            continue;
+                        }
                         return Poll::Ready(Ok(self.update(buffer, layout, progression)));
                     }
                 }
@@ -843,6 +922,7 @@ impl DependentPending {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn wait(mut self) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
+        self.lf_pending.clear();
         loop {
             match self
                 .stage
@@ -869,12 +949,12 @@ impl DependentPending {
                     self.record(self.output.compositor()?.completed_surface(work.wait()?))?;
                 }
                 Stage::Pack(work) => return self.finish(work.wait()?),
-                Stage::Refinement { decode, render, .. } => {
-                    // Final-only completion drains the submitted render, then resumes the producer.
+                Stage::Refinement { resume, render, .. } => {
+                    // Final-only completion drains the render, then resumes physical execution.
                     // A blend which has not yet been packed needs no additional presentation work.
                     let (RefinementRender::Blend(work) | RefinementRender::Pack(work)) = render;
                     drop(work.wait()?);
-                    self.stage = Some(Stage::Decode(decode));
+                    self.stage = Some(resume.stage());
                 }
                 Stage::LfPreview { work, .. } => {
                     drop(work.wait()?);
@@ -889,32 +969,67 @@ impl DependentPending {
     fn refine(&mut self, frame: GpuImageFrame, progression: FrameProgression) -> Result<()> {
         let compositor = self.output.compositor()?;
         let surface = compositor.import(frame.outputs)?;
-        let carry = self
-            .carry
-            .as_ref()
-            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
-        let render = if self.nodes[self.physical - self.first].needs_composition {
-            RefinementRender::Blend(compositor.blend(
-                &surface,
-                &carry.references,
-                &carry.source.inventory.frames[self.physical],
-            )?)
-        } else {
-            RefinementRender::Pack(compositor.pack(&surface)?)
-        };
         let Some(Stage::Decode(decode)) = self.stage.take() else {
             return Err(Error::EngineContract(
                 "refinement has no pending physical producer",
             ));
         };
+        self.render_refinement(surface, self.physical, Resume::Decode(decode), progression)
+    }
+
+    fn render_refinement(
+        &mut self,
+        surface: Surface,
+        index: usize,
+        resume: Resume,
+        progression: FrameProgression,
+    ) -> Result<()> {
+        let compositor = self.output.compositor()?;
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
+        let render = if self.nodes[index - self.first].needs_composition {
+            RefinementRender::Blend(compositor.blend(
+                &surface,
+                &carry.references,
+                &carry.source.inventory.frames[index],
+            )?)
+        } else {
+            RefinementRender::Pack(compositor.pack(&surface)?)
+        };
         self.stage = Some(Stage::Refinement {
-            decode,
+            resume,
             render,
             progression,
         });
         self.submissions.fetch_add(1, Ordering::AcqRel);
         self.completed_submissions += 1;
         Ok(())
+    }
+
+    /// A newly decoded LF dependency may precede hidden layers which write the presentation's
+    /// background. Keep its planes until that exact reference version has completed validation.
+    fn lf_references_ready(&self) -> Result<bool> {
+        if matches!(*self.output, Output::Native) {
+            return Ok(true);
+        }
+        let node = self.nodes.last().ok_or(Error::EngineContract(
+            "presentation has no physical producer",
+        ))?;
+        if !node.needs_composition {
+            return Ok(true);
+        }
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
+        let source = carry.source.inventory.frames[self.end - 1]
+            .color_blend
+            .source as usize;
+        Ok(node.references[source].is_none_or(|reference| {
+            reference.frame_index <= self.nodes[self.physical - self.first].frame_index
+        }))
     }
 
     fn update(

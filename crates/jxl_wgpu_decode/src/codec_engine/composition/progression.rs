@@ -1,6 +1,7 @@
 //! Presentation of validated LF dependencies, independently of their retained prediction planes.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use jxl_gpu_bitstream::ImageHeaderInventory;
 use jxl_gpu_formats::ImageLayout;
@@ -21,14 +22,16 @@ use crate::{Error, GpuOutputRequest, Result};
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
+#[derive(Clone)]
 pub(super) struct LfPreview {
     backend: WgpuBackend,
     config: ColorOutputConfig,
     pub(super) layout: ImageLayout,
     output_plan: ColorOutputPlan,
-    kernel: ResidentUpsampleKernel,
-    upsample: ResidentUpsamplePipeline,
-    packer: ColorOutputPacker,
+    output_storage_bytes: u64,
+    kernel: Arc<ResidentUpsampleKernel>,
+    upsample: Arc<ResidentUpsamplePipeline>,
+    packer: Arc<ColorOutputPacker>,
 }
 
 impl std::fmt::Debug for LfPreview {
@@ -76,10 +79,40 @@ impl LfPreview {
             config,
             layout,
             output_plan,
-            kernel,
-            upsample: ResidentUpsamplePipeline::new(device)?,
-            packer: ColorOutputPacker::new(device)?,
+            output_storage_bytes: output_plan.memory.output_storage_bytes,
+            kernel: Arc::new(kernel),
+            upsample: Arc::new(ResidentUpsamplePipeline::new(device)?),
+            packer: Arc::new(ColorOutputPacker::new(device)?),
             backend,
+        })
+    }
+
+    /// Reuse the image's renderer for a physical layer in the compositor's canonical storage.
+    pub(super) fn for_surface(
+        &self,
+        extent: Extent2d,
+        encoding: crate::frame_surface::FrameSurfaceEncoding,
+    ) -> Result<Self> {
+        let surface = crate::frame_surface::FrameSurfaceLayout::with_encoding(
+            extent,
+            0,
+            encoding,
+            &self.backend.device().limits(),
+        )?;
+        let config = ColorOutputConfig {
+            extent,
+            orientation: OutputOrientation::Identity,
+            ..self.config
+        };
+        config.validate_layout(&surface.color)?;
+        let output_plan =
+            ColorOutputPlan::for_limits(&surface.color, &self.backend.device().limits())?;
+        Ok(Self {
+            config,
+            layout: surface.color,
+            output_plan,
+            output_storage_bytes: surface.storage_bytes,
+            ..self.clone()
         })
     }
 
@@ -119,14 +152,14 @@ impl LfPreview {
         let mut permit = self
             .backend
             .transient_memory_budget()
-            .try_reserve(transient_bytes + self.output_plan.memory.output_storage_bytes)?;
+            .try_reserve(transient_bytes + self.output_storage_bytes)?;
         let output_permit = permit
-            .split_off(self.output_plan.memory.output_storage_bytes)
+            .split_off(self.output_storage_bytes)
             .map_err(crate::progressive_dc::ProgressiveDcGpuError::from)?;
         let output = GpuBufferLease::from_tracked(
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("JPEG XL LF intermediate output"),
-                size: self.output_plan.memory.output_storage_bytes,
+                size: self.output_storage_bytes,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,

@@ -115,8 +115,8 @@ presentations. Each presentation validates all overwritten/hidden producers befo
 refinements from its final Regular physical frame. The compositor blends each immutable producer
 snapshot against the committed reference versions and then applies output color conversion and
 orientation. Only complete physical frames update reference slots. Modular color frames and
-SkipProgressive frames continue to return final images. Direct color-only LF-dependent
-presentations can additionally publish their completed Modular/VarDCT LF dependencies.
+SkipProgressive frames continue to return final images. Color-only LF-dependent presentations,
+including composed animations, can additionally publish their completed Modular/VarDCT LF dependencies.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
 embedded-preview delivery.
 
@@ -164,10 +164,14 @@ clips to that level's exact grid, and only then converts color and applies outpu
 `LowFrequency { physical_frame_index, level }` carries intended detail `8^level`; it does not invent
 an unfinished coefficient pass for a completed Modular or VarDCT frame. Unused and overwritten LF
 versions still validate but do not become presentation updates. Reused LF slots are not decoded or
-published again in later presentations. The next physical producer is admitted on the next poll,
-after the immutable LF output has been delivered. Native and poll/async final-only completion skip
-these extra renders. Source planes, render scratch and packed output retain independent byte
-ownership through GPU completion and cancellation.
+published again in later presentations. Composed LF updates use the terminal physical layer's
+geometry and color encoding, then read its exact committed background reference before output
+conversion and orientation. When a later hidden layer supplies that reference, the executor queues
+LF planes until the hidden layer validates; a failed reference cannot produce an LF image. The
+queue retains its own plane leases even if a predictor slot has expired. After each LF publication,
+the next physical producer is admitted on a later poll. Native and poll/async final-only completion
+discard unsubmitted LF updates and drain already submitted work. Source planes, render scratch
+and packed output retain independent byte ownership through GPU completion and cancellation.
 
 Level 1 output matches the Rust decoder's LF flush, while native libjxl validates the following
 DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
@@ -177,11 +181,15 @@ crops and reference blends with exact clocks and physical IDs. Apply/Keep orient
 40-byte fragmented input return identical immutable updates; finals equal final-only decoding.
 Native libjxl cannot flush blended layers, so test-only standalone headers preserve every original
 entropy byte and decoding field; independent F64 composition of its layer flushes is checked
-against native coalesced finals before comparing GPU updates. No production CPU codec is used.
+against native coalesced finals before comparing GPU updates. Composed LF1 images additionally use
+the Rust decoder's standalone LF flush and the same independent scalar composition, including a
+hidden reference decoded between LF and its visible consumer. The maximum normalized linear LF1
+error is below 0.000285 under the existing 0.001 composition regression bound. LF2 has renderer and
+lifetime evidence without a native per-level pixel-oracle claim. No production CPU codec is used.
 
-The remaining progressive work includes broader LF conformance, LF previews within composed
-presentations, Modular and extra-channel refinements, selective regions, and incomplete-frame
-input readiness. Native-comparison precision remains a separate conformance gate.
+The remaining progressive work includes broader LF conformance, Modular and extra-channel
+refinements, selective regions, and incomplete-frame input readiness. Native-comparison precision
+remains a separate conformance gate.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:
 

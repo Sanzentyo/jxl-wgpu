@@ -103,7 +103,9 @@ pub fn reframe(data: &[u8], frames: &[FrameInventory], headers: &str) -> Vec<u8>
     assert_eq!(standalone.frames.len(), frames.len());
     for (actual, source) in standalone.frames.iter().zip(frames) {
         assert_eq!(
-            actual.lf_source_frame.map(|id| id + frames[0].frame_index),
+            actual
+                .lf_source_frame
+                .map(|id| frames[id as usize].frame_index),
             source.lf_source_frame
         );
         let mut actual = actual.clone();

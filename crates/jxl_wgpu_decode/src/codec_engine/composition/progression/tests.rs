@@ -69,7 +69,7 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
         Err(error) => panic!("{error:?}"),
     };
     let memory = backend.transient_memory_budget();
-    for custom in [false, true] {
+    for (custom, surface) in [(false, false), (true, false), (false, true), (true, true)] {
         for (level, width, height) in [
             (1, 17, 9),
             (1, 1, 33),
@@ -95,12 +95,26 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 unreachable!()
             };
             color.transfer = TransferFunction::Linear;
-            let renderer = LfPreview::new(
+            let mut render_image = image.clone();
+            if surface {
+                render_image.width += 8;
+                render_image.height += 8;
+                render_image.orientation = 6;
+            }
+            let mut renderer = LfPreview::new(
                 backend.clone(),
-                &image,
+                &render_image,
                 &GpuOutputRequest::color(format).unwrap(),
             )
             .unwrap();
+            if surface {
+                renderer = renderer
+                    .for_surface(
+                        Extent2d::new(width, height),
+                        crate::frame_surface::FrameSurfaceEncoding::Linear,
+                    )
+                    .unwrap();
+            }
             let source = Extent2d::new(
                 width.div_ceil(1 << (3 * level)),
                 height.div_ceil(1 << (3 * level)),
@@ -141,7 +155,8 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 ProgressiveDcXybPlanes::from_leases(leases, source.width, source.height, stride)
                     .unwrap();
             let bytes = |w: u32, h: u32| u64::from(w) * u64::from(h) * 4;
-            let total = renderer.output_plan.memory.total_bytes
+            let total = renderer.output_storage_bytes
+                + renderer.output_plan.memory.transient_bytes
                 + renderer.kernel.weight_bytes()
                 + u64::from(level) * 3 * ResidentUpsamplePipeline::UNIFORM_BYTES
                 + (0..level)
@@ -208,17 +223,28 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 .outputs[0]
                 .bytes
                 .clone();
-            assert_eq!(actual.len(), expected.len() * 4);
-            let error = actual
-                .chunks_exact(4)
-                .zip(&expected)
-                .map(|(a, b)| {
-                    let actual = f32::from_le_bytes(a.try_into().unwrap());
+            let layout = &frame.outputs[0].layout;
+            assert_eq!(actual.len() as u64, layout.logical_size);
+            let error = expected
+                .iter()
+                .enumerate()
+                .map(|(index, expected)| {
+                    let pixel = index / 3;
+                    let channel = index % 3;
+                    let plane = &layout.planes[if surface { channel } else { 0 }];
+                    let offset = plane.offset as usize
+                        + pixel / width as usize * plane.row_stride as usize
+                        + pixel % width as usize * if surface { 4 } else { 12 }
+                        + if surface { 0 } else { channel * 4 };
+                    let actual = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
                     assert!(actual.is_finite());
-                    (f64::from(actual) - b).abs()
+                    (f64::from(actual) - expected).abs()
                 })
                 .fold(0_f64, f64::max);
-            assert!(error < 1e-5, "level {level} custom {custom}: {error}");
+            assert!(
+                error < 1e-5,
+                "level {level} custom {custom} surface {surface}: {error}"
+            );
             drop(frame);
             drop(planes);
             drop(renderer);

@@ -926,6 +926,10 @@ at each exact grid `ceil(canvas / 8^k)`, for k=L-1 through zero, a shared 6,400-
 three 48-byte interpolation uniforms per level, and the color packer's 352-byte uniforms. The
 packed output is separately leased. A single atomic reservation covers this complete render cost;
 one-byte-short admission rolls back without creating GPU buffers or consuming LF ownership.
+Composed LF rendering reuses immutable kernels and pipelines while retargeting the terminal
+physical layer's extent, identity orientation and original-encoding F32 surface. Its allocation
+and output permit cover the complete canonical surface, including alignment after the final plane;
+the logical color layout alone does not include that trailing padding.
 
 Composition and LF rendering share one recorded-command completion lifetime. It retains every
 input lease, scratch/weight/uniform buffer, output clone, and transient permit until completion.
@@ -941,6 +945,21 @@ LF render work and drain already submitted renders before advancing. Existing sh
 unchanged. Scalar-oracle GPU tests cover LF1–LF4, exact odd grids, poisoned source padding, custom
 weights, and exact rendering admission; sequence tests cover callback retirement and held images
 after corruption, cancellation and late pressure.
+
+For composed presentations, newly validated LF planes enter a bounded dependency queue until the
+terminal layer's exact background reference version has completed validation. A queue entry owns
+shared plane leases independently of the four predictor slots; expiring LF2 after LF1 cannot free
+planes still needed for a delayed LF2 presentation. No additional copy or double reservation is
+introduced. Before admitting another producer, the executor renders any ready queued LF update,
+then imports its canonical surface into the ordinary blend/pack path. Refinements never write
+reference slots. The shared `Refinement` state resumes either the suspended coefficient decoder
+or physical-frame advancement after an LF render. Final-only completion clears unsubmitted LF
+entries, drains active render/blend/pack work and skips any pack not yet submitted.
+
+Actual-adapter tests cover 21 cancellation/wait/poll cases at queued-LF, active LF render, blend
+and post-blend pack boundaries, including a later hidden layer that writes the required reference.
+Scalar tests additionally retarget renderer geometry/orientation and exercise the canonical padded
+surface allocation with exact and one-byte-short admission through LF4. No shader ABI changes.
 
 ### Animated and composed coefficient updates
 

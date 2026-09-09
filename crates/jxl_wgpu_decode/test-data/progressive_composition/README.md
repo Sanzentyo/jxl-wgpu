@@ -17,4 +17,10 @@ therefore flushes these standalone layers and independently composes them in int
 using committed reference slots, then converts to linear output and applies orientation. Every
 scalar final is also checked against native coalesced decoding of the original animation. This
 validates composed DC/AC updates without weakening the reference decoder or re-encoding entropy.
+For composed LF1 updates, Rust `jxl` 0.6.0 flushes a standalone prefix ending after LF1. The same
+independent scalar composition applies the terminal layer's committed references. LF dependencies
+are selected by exact physical IDs, allowing a hidden reference layer between LF1 and its visible
+consumer. A runtime fixture exercises this order by moving original physical frame 8 between
+frames 6 and 7; every header and entropy byte is unchanged. LF2 has no native per-level pixel-oracle
+claim. The existing 27 metadata fragments suffice for both orders and are not duplicated.
 Production does not link these offline tools or perform CPU pixel/entropy decoding.

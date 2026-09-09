@@ -129,7 +129,7 @@ fn submitted_composition_refinements_preserve_references_cancel_and_drain_final_
             );
             if boundary == 2 {
                 let Some(Stage::Refinement {
-                    decode,
+                    resume,
                     render: RefinementRender::Blend(work),
                     progression,
                 }) = pending.stage.take()
@@ -139,7 +139,7 @@ fn submitted_composition_refinements_preserve_references_cancel_and_drain_final_
                 let compositor = pending.output.compositor().unwrap();
                 let surface = compositor.completed_surface(work.wait().unwrap());
                 pending.stage = Some(Stage::Refinement {
-                    decode,
+                    resume,
                     render: RefinementRender::Pack(compositor.pack(&surface).unwrap()),
                     progression,
                 });

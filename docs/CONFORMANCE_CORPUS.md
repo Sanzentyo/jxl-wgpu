@@ -2693,3 +2693,51 @@ WebAssembly check pass. Reference and Metal harnesses each pass 18/18 cases; ref
 adapter. Gray8 U8 CPU readback passes with 221 logical bytes, direct mapping and zero staging
 bytes. All 27 standalone header fragments (1,908 bytes total) regenerate exactly, and the C
 generator's normal mode reproduces all 11 original composition fixtures unchanged.
+
+### Composed LF dependency images
+
+`tests/vardct_engine_gpu/progression/sequence_lf.rs` uses the existing 15-physical-frame,
+nine-layer, six-presentation `composition_vardct_dc` sequence. A second runtime order moves
+original zero-duration frame 8 between LF1 frame 6 and its visible consumer, original frame 7.
+The new physical frame 7 writes reference slot 1, which the new physical frame 8 reads. All
+original frame headers and entropy bytes remain unchanged. Both orders run with Apply/Keep
+orientation and whole/40-byte windows with fragmented async input: eight configurations in total.
+Each publishes exactly six LF updates, with LF2/LF1 in three presentations, preserving physical
+IDs, detail levels, clocks and finality. Updates must be byte-identical across input modes and
+remain unchanged when reread after all six final presentations.
+
+The oracle reconstructs standalone streams using the existing 27 metadata fragments and the exact
+LF dependency chain, allowing intervening physical frames. Rust `jxl` 0.6.0 flushes a prefix ending
+after each newly decoded LF1. An independent F64 compositor applies the terminal layer's committed
+reference version, then signed linear conversion and orientation. Every scalar final is also
+checked against native coalesced libjxl output before GPU comparison. Maximum normalized linear
+LF1 error is below 0.000068 in the original order and 0.000285 with the later hidden reference,
+under the unchanged 0.001 composition regression bound. Samples must be finite. LF2 has no native
+per-level pixel-oracle claim; LF3/LF4 full-codestream and ISO precision conformance remain open.
+
+A later hidden-reference AC corruption test requires a typed `HfCoefficientGpu` error before
+either queued LF image can be published, for whole and fragmented input. Previously returned
+final images remain unchanged. Public lifecycle tests cover cancellation and synchronous/async
+final-only switching before LF, after LF2 and after LF1, with exact final pixels and subsequent
+presentation clocks, and late memory pressure after either LF update. Errors poison the session;
+only retained output bytes survive source and callback retirement.
+
+`codec_engine::composition::lf_tests` adds 21 deterministic cancellation/wait/poll cases at the
+queued-LF, active LF render, blend and post-blend-pack boundaries. The deferred case keeps both
+queued LF images alive after LF2's predictor slot has expired, then validates the hidden reference
+before rendering. Refinements never update reference slots. The separate F64 scalar expansion
+oracle now covers 20 direct/canonical-surface cases through LF4, with default/custom kernels,
+retargeted extent and identity orientation, poisoned padding and exact/one-byte-short admission.
+Canonical surface accounting includes alignment beyond the last color plane.
+
+The full JPEG XL goal remains active. Broader LF conformance, Modular/extra-channel updates,
+selective regions, incomplete-frame readiness, source color domains and independent precision/
+conformance requirements remain open. This change adds no production CPU pixel/entropy codec.
+
+Local final validation passes 806 tests across all 42 all-feature workspace targets on Apple M5/
+Metal, with zero failures and the existing manual release-mode allocation benchmark ignored.
+Formatting, workspace check, Clippy and rustdoc with warnings denied, MSRV 1.89.0, and the
+six-crate all-feature WebAssembly check pass. Reference and Metal harnesses each pass 18/18 cases;
+the reference run uses no adapter. Gray8 U8 CPU readback passes with all 221 logical bytes directly
+mapped and zero staging bytes. All 27 standalone header fragments (1,908 bytes total) regenerate
+exactly after the noncontiguous dependency mapping change.

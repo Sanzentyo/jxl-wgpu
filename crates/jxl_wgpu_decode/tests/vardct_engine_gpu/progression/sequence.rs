@@ -1,4 +1,6 @@
 use super::*;
+#[path = "sequence_lf.rs"]
+mod lf;
 #[path = "sequence_lifecycle.rs"]
 mod lifecycle;
 use jxl_gpu_bitstream::{FrameEncoding, FrameType};
