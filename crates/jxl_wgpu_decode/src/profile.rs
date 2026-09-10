@@ -75,6 +75,7 @@ pub(crate) struct StandardModularProfile {
     pub channels: ModularChannelCounts,
     pub extra_channels: Vec<jxl_gpu_bitstream::ExtraChannelInventory>,
     pub pass_count: u32,
+    pub intermediate_passes: Vec<ModularPassBoundary>,
     pub group_columns: u32,
     pub group_rows: u32,
     /// Canvas pass groups exposed by the decoded frame profile.
@@ -88,6 +89,13 @@ pub(crate) struct StandardModularProfile {
     pub resident_entropy_plans: Vec<ResidentModularGroupPlan>,
     pub resident_frame_plan: Option<ResidentModularFramePlan>,
     pub progressive_dc: Option<ProgressiveDcModularProfile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModularPassBoundary {
+    pub progression: crate::FrameProgression,
+    /// Prefix of `entropy_groups` completed before reconstruction; global has its own record.
+    pub group_end: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -941,6 +949,42 @@ fn parse_modular_profile(
         token_bit_end: dc_end,
     });
 
+    let intermediate_passes = if frame.frame_type == FrameType::Regular && !single_entry {
+        (0..frame.num_passes)
+            .filter(|&completed| {
+                completed != 0
+                    || global_decoded_words != 0
+                    || low_frequency_entropy_group_count != 0
+            })
+            .map(|completed| {
+                let next_stream = modular_pass_stream_index(
+                    frame.low_frequency_group_count,
+                    expected_group_count,
+                    u64::from(completed),
+                    0,
+                )?;
+                Ok(ModularPassBoundary {
+                    progression: crate::FrameProgression::Modular {
+                        physical_frame_index: frame.frame_index,
+                        completed_passes: completed as u8,
+                        total_passes: frame.num_passes as u8,
+                        intended_downsampling: frame
+                            .progressive_passes
+                            .last_pass
+                            .iter()
+                            .zip(&frame.progressive_passes.downsampling)
+                            .filter(|(last, _)| completed > **last)
+                            .fold(8, |divisor, (_, &target)| divisor.min(target)),
+                    },
+                    group_end: entropy_groups
+                        .partition_point(|group| group.stream_index < next_stream),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
     Ok(StandardModularProfile {
         color_render,
         frame_name: String::from_utf8(frame.name_bytes.clone()).map_err(|_| {
@@ -971,6 +1015,7 @@ fn parse_modular_profile(
         channels,
         extra_channels: image.extra_channels.clone(),
         pass_count: frame.num_passes,
+        intermediate_passes,
         group_columns,
         group_rows,
         groups,

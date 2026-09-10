@@ -316,6 +316,9 @@ impl WgpuSubmissionEngine {
         request: &GpuOutputRequest,
         mut profile: StandardModularProfile,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        if !request.progressive_output() {
+            profile.intermediate_passes.clear();
+        }
         let output_channels = super::channels::OutputChannels::negotiate(&profile, request)?;
         profile.generalized_channels |= !output_channels.direct(&profile)
             || request.retains_frame_surface()
@@ -709,7 +712,7 @@ impl WgpuSubmissionEngine {
             WgpuDecodeSession {
                 backend: self.backend.clone(),
                 pipeline,
-                source: Some(DecodeSource {
+                source: Some(Arc::new(DecodeSource {
                     codestream,
                     profile,
                     dispatch_layout,
@@ -720,7 +723,7 @@ impl WgpuSubmissionEngine {
                     global_channel_layout_offset,
                     finalize_params,
                     output,
-                }),
+                })),
                 memory_stats,
                 memory_budget: self.memory.clone(),
                 buffers: Arc::clone(&self.buffers),

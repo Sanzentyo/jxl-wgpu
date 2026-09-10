@@ -114,9 +114,10 @@ VarDCT color output with optional extra channels, including deferred descriptors
 composed presentations. Each presentation validates all overwritten/hidden producers before publishing
 refinements from its final Regular physical frame. The compositor blends each immutable producer
 snapshot against the committed reference versions and then applies output color conversion and
-orientation. Only complete physical frames update reference slots. Modular color frames and
-SkipProgressive frames continue to return final images. Color-only LF-dependent presentations,
-including composed animations, can additionally publish their completed Modular/VarDCT LF dependencies.
+orientation. Only complete physical frames update reference slots. Modular color and numeric
+frames expose global/LF and residual-pass images; SkipProgressive frames return final images.
+Color-only LF-dependent presentations, including composed animations, can additionally publish their
+completed Modular/VarDCT LF dependencies.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
 embedded-preview delivery.
 
@@ -132,6 +133,7 @@ while let Some(image) = session.next_update_async().await? {
     // Present image.output(). Intermediate and final storage have the same full canvas extent.
     if let Some(progress) = image.progression() {
         // FrameProgression::Coefficients carries completed/total passes (zero means DC).
+        // FrameProgression::Modular carries completed/total residual passes.
         // FrameProgression::LowFrequency identifies a complete physical LF frame and its level.
         // progress.intended_downsampling() describes detail, not buffer dimensions.
     }
@@ -197,8 +199,22 @@ libjxl disables progression events with extras, so tests flush logical codestrea
 physical pass boundaries; no CPU codec is added to production. Nine additional standalone header
 fragments provide independent alpha-composition oracles without duplicating entropy.
 
+Modular updates copy the assembly arena before global inverses, then reuse the final image
+normalization, resampling and output writer. A pass covers every spatial group, including empty
+physical passes. Global/LF detail is published only when those streams contain samples. The next
+update request submits the next residual phase; cancellation leaves future phases unsubmitted.
+Each image owns separate output, inverse/render scratch and validation buffers, all admitted before
+the initial submission. `intermediate_output_bytes` and `intermediate_transient_bytes` report these
+costs; only retained image bytes survive completion. `unvalidated_gpu_frame` rejects the final output
+until its work is queued. Final-only requests preserve the existing submission path and byte cost.
+Tests compare native libjxl prefix flushes for integer/float/alpha/resampled extra output and verify
+40-byte windows, empty passes, multiple LF groups, numeric F32/F64, corruption, cancellation and
+exact-budget retry. Incomplete floating residuals may decode to nonfinite values even when the final
+image is finite; comparisons include matching NaN/infinity classes. No CPU codec runs in production.
+
 The remaining progressive work includes broader LF conformance, LF previews with extra channels,
-numeric/Modular refinements, selective regions, and incomplete-frame input readiness.
+composed numeric refinements, wider Modular pass/header combinations, selective regions, and
+incomplete-frame input readiness.
 Native-comparison precision remains a separate conformance gate.
 
 The low-level `WgpuSubmissionEngine` implements a standards-only Modular still profile:

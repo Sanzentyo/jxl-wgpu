@@ -98,7 +98,13 @@ pub struct WgpuDecodeMemoryStats {
     pub unique_ma_config_count: usize,
     /// Bytes that remain reserved with the caller-owned output buffer.
     pub output_lease_bytes: u64,
-    /// Per-frame bytes released when status readback completes.
+    /// Independently owned output buffers for all requested intermediate images.
+    pub intermediate_output_bytes: u64,
+    /// Inverse arenas, render buffers, uniforms and status maps for intermediate images.
+    pub intermediate_transient_bytes: u64,
+    /// Initial reservation outside the final output. This includes intermediate output permits,
+    /// which split into caller-owned leases; reconstruction and validation scratch retires as
+    /// each boundary completes.
     pub transient_bytes: u64,
     pub max_frame_slots: usize,
     /// Maximum exposure implied by `per_frame_bytes * max_frame_slots`.

@@ -442,3 +442,5 @@ pub fn jpeg_dc_edge_case(selectors: &str) -> Vec<u8> {
         _ => panic!("unknown DC sampling edge fixture: {selectors}"),
     })
 }
+
+pub mod progressive_oracle;

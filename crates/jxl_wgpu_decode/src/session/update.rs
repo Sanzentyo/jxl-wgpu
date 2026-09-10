@@ -14,6 +14,15 @@ pub enum FrameProgression {
         /// A nonzero power of two describing detail, not the output buffer's dimensions.
         intended_downsampling: u32,
     },
+    /// A Modular image reconstructed from global/LF data and completed residual passes.
+    /// Zero completed passes denotes the global/LF image when those streams contain samples.
+    Modular {
+        physical_frame_index: u32,
+        completed_passes: u8,
+        total_passes: u8,
+        /// Intended detail from the pass header; output dimensions remain unchanged.
+        intended_downsampling: u32,
+    },
     /// A completely decoded LF dependency, including its restoration and frame resampling.
     LowFrequency {
         physical_frame_index: u32,
@@ -26,6 +35,10 @@ impl FrameProgression {
     pub const fn physical_frame_index(self) -> u32 {
         match self {
             Self::Coefficients {
+                physical_frame_index,
+                ..
+            }
+            | Self::Modular {
                 physical_frame_index,
                 ..
             }
@@ -42,6 +55,10 @@ impl FrameProgression {
             Self::Coefficients {
                 intended_downsampling,
                 ..
+            }
+            | Self::Modular {
+                intended_downsampling,
+                ..
             } => intended_downsampling,
             Self::LowFrequency {
                 level: level @ 1..=4,
@@ -51,10 +68,13 @@ impl FrameProgression {
         }
     }
 
-    /// Completed coefficient passes; complete LF frames have no partial coefficient boundary.
+    /// Completed entropy passes; complete LF frames have no partial pass boundary.
     pub const fn completed_passes(self) -> Option<u8> {
         match self {
             Self::Coefficients {
+                completed_passes, ..
+            }
+            | Self::Modular {
                 completed_passes, ..
             } => Some(completed_passes),
             Self::LowFrequency { .. } => None,
@@ -63,7 +83,9 @@ impl FrameProgression {
 
     pub const fn total_passes(self) -> Option<u8> {
         match self {
-            Self::Coefficients { total_passes, .. } => Some(total_passes),
+            Self::Coefficients { total_passes, .. } | Self::Modular { total_passes, .. } => {
+                Some(total_passes)
+            }
             Self::LowFrequency { .. } => None,
         }
     }
@@ -71,6 +93,12 @@ impl FrameProgression {
     fn valid(self) -> bool {
         match self {
             Self::Coefficients {
+                completed_passes,
+                total_passes,
+                intended_downsampling,
+                ..
+            }
+            | Self::Modular {
                 completed_passes,
                 total_passes,
                 intended_downsampling,
@@ -96,6 +124,8 @@ impl FrameProgression {
         matches!((previous, self),
             (Self::Coefficients { completed_passes: before, total_passes: before_total, .. },
              Self::Coefficients { completed_passes: after, total_passes: after_total, .. })
+            | (Self::Modular { completed_passes: before, total_passes: before_total, .. },
+               Self::Modular { completed_passes: after, total_passes: after_total, .. })
                 if after > before && after_total == before_total)
     }
 }
@@ -275,6 +305,45 @@ impl<S: GpuSubmissionSession> Future for NextGpuUpdate<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::FrameProgression;
+
+    #[test]
+    fn modular_boundaries_preserve_pass_kind_count_and_monotonic_detail() {
+        let boundary =
+            |completed_passes, total_passes, intended_downsampling| FrameProgression::Modular {
+                physical_frame_index: 4,
+                completed_passes,
+                total_passes,
+                intended_downsampling,
+            };
+        for total in 0..=11 {
+            for completed in 0..=11 {
+                assert_eq!(boundary(completed, total, 2).valid(), completed < total);
+            }
+        }
+        assert!(!boundary(0, 2, 0).valid());
+        assert!(!boundary(0, 2, 3).valid());
+        let first = boundary(0, 3, 8);
+        let second = boundary(1, 3, 2);
+        let third = boundary(2, 3, 1);
+        assert!(second.follows(first));
+        assert!(third.follows(second));
+        assert!(!second.follows(second));
+        assert!(!first.follows(second));
+        assert!(!boundary(2, 4, 1).follows(second));
+        assert!(!boundary(2, 3, 4).follows(second));
+        let coefficients = FrameProgression::Coefficients {
+            physical_frame_index: 4,
+            completed_passes: 1,
+            total_passes: 3,
+            intended_downsampling: 2,
+        };
+        assert!(!coefficients.follows(first));
+        assert!(!third.follows(coefficients));
+        assert!(first.follows(FrameProgression::LowFrequency {
+            physical_frame_index: 3,
+            level: 1
+        }));
+    }
 
     #[test]
     fn complete_lf_boundaries_have_real_levels_and_precede_coefficient_refinements() {

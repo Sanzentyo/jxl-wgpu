@@ -155,6 +155,9 @@ fn lf_versions_are_reused_across_presentations_and_released_after_the_last_consu
                 }
                 match frame.progression().unwrap() {
                     jxl_wgpu_decode::FrameProgression::LowFrequency { .. } => updates += 1,
+                    jxl_wgpu_decode::FrameProgression::Modular { .. } => {
+                        panic!("the terminal producer is VarDCT")
+                    }
                     jxl_wgpu_decode::FrameProgression::Coefficients {
                         physical_frame_index,
                         completed_passes,

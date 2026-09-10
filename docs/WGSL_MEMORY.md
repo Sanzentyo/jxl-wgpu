@@ -1007,3 +1007,28 @@ Public tests cover each pass's extra-payload corruption, cancellation before DC/
 and during a bounded extra subimage, initial admission retry, late allocation failure, exact
 final-only output and retained-image immutability. Integer/floating multi-channel surfaces, alpha
 association, spot rendering, resampling and composed references share the final render path.
+
+### Modular residual-pass image ownership
+
+Opt-in Modular progression splits packed entropy batches at global/LF and residual-pass boundaries
+without expanding lazy stream windows. Each image is admitted with its own output plus two status
+buffers (GPU snapshot and mapped staging). Frame-wide inverse paths additionally admit a copy of
+the inverse arena, transform/finalizer uniforms, normalization/render scratch and any native-F64
+dummy binding. The original assembly arena is never inverse-transformed for an intermediate.
+Direct group writers instead copy the accumulated packed output. Existing WGSL layouts are reused.
+
+Only the current image phase is submitted. Its callback retains both the common job and snapshot
+until mapping retires; consuming the image releases its transient scratch while the returned output
+lease retains its byte permit. The next update request resumes bounded entropy execution. Cancellation
+releases unsubmitted images and source ownership immediately; already submitted common buffers stay
+owned until GPU completion. Recording errors after earlier submissions retain the common lifetime
+through a mapped status-copy fence, including on WebGPU. Final-only requests retain their existing
+batch/submission count. Progressive execution adds one submission per intermediate and one final boundary submission.
+The public memory total still equals output_lease_bytes + transient_bytes; intermediate output
+reservations are initially part of transient_bytes and split into independent leases on allocation.
+
+Completed-prefix status validation checks every decoded LF/pass stream and the separately indexed
+global stream. Each snapshot copies the status buffer before its output writer, so a temporary
+output-domain error cannot contaminate final entropy validation. Final-only completion drains
+remaining phases and validates all final statuses. The unvalidated final-output API rejects frames
+whose last phase has not yet been submitted.

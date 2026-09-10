@@ -2812,3 +2812,44 @@ check pass. Reference and Metal harnesses each pass 18/18 cases; the reference r
 Gray8 U8 CPU readback passes with all 221 logical bytes directly mapped and zero staging bytes.
 All 36 standalone header fragments (2,536 bytes total) regenerate exactly, including the unchanged
 preceding 27 fragments.
+
+### Modular global/LF and residual-pass images (2026-09-11)
+
+The Modular pending frame now returns typed immutable images at global/LF and residual-pass
+boundaries, then resumes only when its consumer requests another update. The same bounded entropy
+recorder and output renderer serve final-only and progressive requests. Intermediate inverses run
+on arena copies; status snapshots include exactly the completed stream prefix plus the global
+record. Every intermediate output and scratch allocation is admitted before initial submission.
+
+Four new tests in wgpu_gray8/progression.rs and progression_lifecycle.rs cover generated two-pass
+Gray8 Squeeze streams at 259×35, 2051×17 and 2051×259, including an empty physical pass, two LF groups,
+whole packets and 40-byte windows. Native libjxl prefix flushes validate each image; numeric native
+codes, F32, exact-widened F64 and signed two-component output share exact expected packing. Existing
+associated-alpha, resampled-alpha, floating Squeeze and floating-global fixtures additionally compare
+color and selected integer/floating extra planes against an independent native prefix oracle. The
+shared decode_extra_channels.c helper now accepts --prefix; production has no libjxl dependency.
+Floating residual prefixes can produce matching NaN/infinity classes even with finite final input
+samples, so comparisons check those classes as well as bounded finite error.
+
+Lifecycle tests cancel before the first read and after every image, corrupt each nonempty residual
+pass, verify earlier output leases remain byte-identical, refuse unsubmitted final-output handoff,
+switch to final-only completion, and retry initial admission at the exact byte limit. Only held
+output bytes survive retirement. Semantic entropy cuts and progression ordering have unit coverage.
+The native pass helper moved into common/progressive_oracle.rs for reuse by both coding modes.
+
+The full workspace run passes 816 tests across 42 targets, with zero failures and one existing
+ignored latency benchmark. After the final portable recording-error retirement change, the dedicated
+retirement unit and all four Modular progression tests pass again. The unit deliberately truncates
+a prepared private source after one submitted window, then verifies that mapping completion releases
+all reservations and pooled leases before a valid decode reuses them. Retirement and cancellation
+checks wait for the native poll worker's callbacks as well as GPU completion; the cancellation test
+also passes after that synchronization change. This gives 817 distinct passing tests for the milestone.
+Workspace Clippy with warnings denied, Rust 1.89, all-feature docs and the six-crate WebAssembly check
+pass. Reference and Apple M5/Metal harnesses each pass 18/18 cases; Reference creates no adapter.
+Gray8 U8 CPU readback directly maps all 221 logical bytes with zero staging bytes. No standalone
+header fixture changes in this milestone.
+
+The full JPEG XL goal remains active. Wider Modular pass/header combinations, progressive composition,
+composed numeric updates, LF previews with extras, broader source-color/precision conformance,
+selective regions and incomplete-frame readiness remain open. The VDCT-D04 raw-JPEG precision gap
+is unchanged. This milestone does not close any encoder syntax or encoder quality gate.

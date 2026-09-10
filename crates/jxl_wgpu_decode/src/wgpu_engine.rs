@@ -2,6 +2,8 @@ mod channels;
 mod execution;
 mod lifetime;
 mod pipeline;
+mod progression;
+mod render;
 mod session;
 mod side_image;
 #[cfg(test)]

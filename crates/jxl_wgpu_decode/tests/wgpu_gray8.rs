@@ -38,6 +38,8 @@ mod extra_channels;
 mod frame_sequence;
 #[path = "wgpu_gray8/orientation.rs"]
 mod orientation;
+#[path = "wgpu_gray8/progression.rs"]
+mod progression;
 
 use common::gpu_gray8_lossless as indexed_gray8;
 use common::testsrc_modular_weighted;

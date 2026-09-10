@@ -83,6 +83,31 @@ impl EntropyStreamPlan {
         stream_limit: u64,
         max_groups_per_batch: usize,
     ) -> Result<Self> {
+        Self::with_group_boundaries(
+            codestream_bytes,
+            groups,
+            stream_limit,
+            max_groups_per_batch,
+            &[],
+        )
+    }
+
+    /// Keeps completed semantic stages in distinct submissions without expanding lazy windows.
+    /// Boundaries are strictly increasing group indices inside the stream list.
+    pub(crate) fn with_group_boundaries(
+        codestream_bytes: u64,
+        groups: &[GroupEntropyRange],
+        stream_limit: u64,
+        max_groups_per_batch: usize,
+        boundaries: &[usize],
+    ) -> Result<Self> {
+        if boundaries
+            .iter()
+            .any(|&index| index == 0 || index >= groups.len())
+            || boundaries.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::EngineContract("invalid entropy group boundaries"));
+        }
         if max_groups_per_batch == 0 {
             return Err(Error::backend(
                 "bounded entropy stream batch has zero group lanes",
@@ -123,7 +148,17 @@ impl EntropyStreamPlan {
         };
         let mut packed = Vec::new();
         let mut upload_cursor = 0u64;
+        let mut boundaries = boundaries.iter().copied().peekable();
         for (group_index, range) in groups.iter().copied().enumerate() {
+            if boundaries.peek() == Some(&group_index) {
+                boundaries.next();
+                if !packed.is_empty() {
+                    push(BatchRunKind::Packed(
+                        std::mem::take(&mut packed).into_boxed_slice(),
+                    ))?;
+                }
+                upload_cursor = 0;
+            }
             let windows = EntropyStreamWindows::new(codestream_bytes, range, stream_limit)?;
             if windows.len() > 1 {
                 if !packed.is_empty() {
@@ -215,6 +250,45 @@ impl EntropyStreamPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_boundaries_split_packed_groups_without_splitting_entropy_streams() {
+        let groups = [0, 1, 17, 8192, 7, 3].map(|length| GroupEntropyRange {
+            token_bit_offset: 3,
+            token_bit_end: 3 + length,
+        });
+        for limit in [40, 64, 256, 4096] {
+            for boundaries in [&[1, 3, 4][..], &[2, 5][..], &[][..]] {
+                let plan =
+                    EntropyStreamPlan::with_group_boundaries(1025, &groups, limit, 8, boundaries)
+                        .unwrap();
+                let mut finals = [0; 6];
+                for (index, batch) in plan.batches().enumerate() {
+                    assert_eq!(plan.batch(index).unwrap().segments(), batch.segments());
+                    let first = batch.first_group();
+                    let end = first + batch.group_count();
+                    assert!(!boundaries.iter().any(|&cut| first < cut && cut < end));
+                    for segment in batch.segments() {
+                        if segment.flags & GroupStreamSegment::FINAL != 0 {
+                            finals[segment.group_index] += 1;
+                            assert_eq!(
+                                u64::from(segment.available_token_end),
+                                groups[segment.group_index].token_bit_end - 3,
+                            );
+                        }
+                    }
+                }
+                assert_eq!(finals, [1; 6]);
+                assert!(plan.stream_bytes() <= limit);
+                assert!(plan.runs.len() <= groups.len());
+            }
+        }
+        for boundaries in [&[0][..], &[6][..], &[2, 2][..], &[4, 1][..]] {
+            assert!(
+                EntropyStreamPlan::with_group_boundaries(1025, &groups, 40, 8, boundaries).is_err()
+            );
+        }
+    }
 
     #[test]
     fn mixed_batches_preserve_ranges_overlap_lanes_and_exact_peaks() {
