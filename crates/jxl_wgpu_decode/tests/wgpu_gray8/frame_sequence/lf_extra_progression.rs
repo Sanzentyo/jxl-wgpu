@@ -83,6 +83,15 @@ fn product(matrix: [[f64; 3]; 3], values: [f64; 3]) -> [f64; 3] {
 fn expected(name: &str, level: u8, image: &ImageHeaderInventory) -> [Vec<f64>; 5] {
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/lf_extra_channels");
+    expected_from(&directory, name, level, image)
+}
+
+fn expected_from(
+    directory: &std::path::Path,
+    name: &str,
+    level: u8,
+    image: &ImageHeaderInventory,
+) -> [Vec<f64>; 5] {
     let input =
         std::fs::read_to_string(directory.join(format!("{name}.lf{level}.jxl.hex"))).unwrap();
     let compact = input.split_whitespace().collect::<String>();
@@ -91,7 +100,7 @@ fn expected(name: &str, level: u8, image: &ImageHeaderInventory) -> [Vec<f64>; 5
         .chunks_exact(2)
         .map(|s| u8::from_str_radix(std::str::from_utf8(s).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
-    let original = fixture_file(name, "");
+    let original = read_fixture(&directory.join(format!("{name}.jxl.hex")));
     let source = parse(&original, Default::default())
         .unwrap()
         .codestream_inventory(Default::default())
@@ -100,10 +109,27 @@ fn expected(name: &str, level: u8, image: &ImageHeaderInventory) -> [Vec<f64>; 5
         .unwrap()
         .codestream_inventory(Default::default())
         .unwrap();
+    assert_eq!(
+        source.image_header.bit_depth,
+        standalone.image_header.bit_depth
+    );
+    assert_eq!(
+        source.image_header.extra_channels,
+        standalone.image_header.extra_channels
+    );
+    assert_eq!(
+        source.image_header.orientation,
+        standalone.image_header.orientation
+    );
+    assert_eq!(
+        source.image_header.grayscale,
+        standalone.image_header.grayscale
+    );
     for (from, to) in source.frames.iter().zip(&standalone.frames) {
         assert_eq!(from.color_sample_extent(), to.color_sample_extent());
         assert_eq!(from.encoding, to.encoding);
         assert_eq!(from.restoration_filter, to.restoration_filter);
+        assert_eq!(from.extra_channel_upsampling, to.extra_channel_upsampling);
         assert_eq!(from.sections.len(), to.sections.len());
         for (a, b) in from.sections.iter().zip(&to.sections) {
             assert_eq!(a.kind, b.kind);
@@ -187,6 +213,9 @@ fn expected(name: &str, level: u8, image: &ImageHeaderInventory) -> [Vec<f64>; 5
     }
     planes
 }
+
+#[path = "lf_conformance.rs"]
+mod conformance;
 
 #[test]
 fn lf_presentations_preserve_alpha_and_numeric_extras_and_final_bytes() {
@@ -298,6 +327,10 @@ fn fixture_file(name: &str, kind: &str) -> Vec<u8> {
                 format!(".{kind}")
             }
         ));
+    read_fixture(&path)
+}
+
+fn read_fixture(path: &std::path::Path) -> Vec<u8> {
     let text = std::fs::read_to_string(path)
         .unwrap()
         .split_whitespace()

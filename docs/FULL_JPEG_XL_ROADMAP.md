@@ -298,9 +298,15 @@ reconstruction in LF1 and recursive LF2 chains, including both LF producer modes
 bounded windows, unused-extra corruption and cancellation. Two 2051×33 Squeeze streams also
 validate LF-group extras before HF parsing, preserve every plane through the frame arena and
 reject either truncated group even for scalar selection. Conservative HF history/predictor/upload
-capacity and exact late descriptor permits share the byte budget. These rows remain **Partial**:
-broader LF color domains and explicitly publishable intermediate output still require implementation
-and conformance. Embedded preview/main selection is covered by the checkpoint above.
+capacity and exact late descriptor permits share the byte budget. Ten additional native-accepted
+chains cover actual LF1–LF4 with independent integer/floating color and extra precision, associated
+alpha, grayscale, EXIF orientations and independent 2× color/8× extra root resampling. Independent
+small producers and F64 pre-opsin expansion validate native and composed LF presentations, including
+16/20-bit native extras, scalar F32 output, all alpha-output policies and Apply/Keep orientation.
+Cancellation at every deep-LF boundary and root/intermediate/background/consumer corruption retain
+only previously validated output leases. These rows remain **Partial**: shifted extra metadata,
+broader LF crops/color domains and incomplete-frame input still require implementation or conformance.
+Embedded preview/main selection is covered by the checkpoint above.
 
 ### G. VarDCT encode
 

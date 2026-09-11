@@ -1,5 +1,6 @@
 //! Reframe independent libjxl entropy into LF chains with alpha and depth planes.
 //! `cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- OUTPUT_DIRECTORY`
+//! Add `--conformance` for mixed-precision LF1–LF4, alpha, orientation and resampling cases.
 //!
 //! libjxl's encoder disables progressive DC with extras. Retain an ordinary VarDCT frame's
 //! global extras and HF entropy, remove its LF coefficient substream, and reference an independent
@@ -20,6 +21,8 @@ use jxl_wgpu_encode::{
 
 #[path = "support/offline/hex.rs"]
 mod hex;
+#[path = "support/lf_conformance.rs"]
+mod lf_conformance;
 #[path = "support/lf_extra.rs"]
 mod lf_extra;
 
@@ -138,7 +141,7 @@ fn boundaries(data: &[u8], inventory: &FrameInventory) -> (Range<u64>, u64) {
             lf_width: inventory.width,
             lf_height: inventory.height,
             jpeg_upsampling: inventory.jpeg_upsampling,
-            bits_per_sample: 8,
+            bits_per_sample: frame.header().bit_depth.bits_per_sample(),
             global_ma_config: global.gmodular.ma_config(),
             allow_partial: false,
             tracker: None,
@@ -232,6 +235,15 @@ fn physical_with_role(
     assert_eq!(frame.num_passes, 1);
     assert_eq!(frame.flags, 0);
     assert_eq!(inventory.image_header.extra_channels.len(), 2);
+    assert!(inventory.image_header.xyb_encoded);
+    assert!(
+        inventory
+            .image_header
+            .extra_channels
+            .iter()
+            .all(|extra| extra.dimension_shift == 0),
+        "this offline header writer does not reframe shifted extra metadata"
+    );
     let modular = frame.encoding == FrameEncoding::Modular;
     let lf = lf_level != 0;
     assert!(!uses_lf || !modular);
@@ -241,8 +253,20 @@ fn physical_with_role(
     header.write_bits(u64::from(modular), 1).unwrap();
     if !uses_lf {
         header.write_bits(0, 2).unwrap(); // flags=0
-        header.write_bits(0, 6).unwrap(); // color and both extras: 1x upsampling
+        for factor in
+            std::iter::once(frame.upsampling).chain(frame.extra_channel_upsampling.iter().copied())
+        {
+            assert!([1, 2, 4, 8].contains(&factor));
+            header.write_bits(u64::from(factor.ilog2()), 2).unwrap();
+        }
     } else {
+        assert_eq!(frame.upsampling, 1);
+        assert!(
+            frame
+                .extra_channel_upsampling
+                .iter()
+                .all(|&factor| factor == 1)
+        );
         header.write_bits(2, 2).unwrap();
         header.write_bits(32 - 17, 8).unwrap(); // UseLfFrame, omits upsampling
     }
@@ -306,10 +330,12 @@ fn physical_with_role(
 }
 
 fn main() {
-    let distributed = std::env::args().nth(2).is_some_and(|option| {
-        assert_eq!(option, "--distributed");
-        true
-    });
+    let option = std::env::args().nth(2);
+    assert!(matches!(
+        option.as_deref(),
+        None | Some("--distributed" | "--conformance")
+    ));
+    let distributed = option.as_deref() == Some("--distributed");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
     let output = PathBuf::from(std::env::args_os().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output).unwrap();
@@ -323,8 +349,8 @@ fn main() {
     );
     let mut generate = Command::new(generator);
     generate.arg(&temporary);
-    if distributed {
-        generate.arg("--distributed");
+    if let Some(option) = &option {
+        generate.arg(option);
     }
     run(&mut generate);
     let decoder = temporary.join("decode");
@@ -333,6 +359,11 @@ fn main() {
         &decoder,
         &["libjxl", "libjxl_cms"],
     );
+    if option.as_deref() == Some("--conformance") {
+        lf_conformance::generate(&temporary, &output, &decoder);
+        std::fs::remove_dir_all(temporary).unwrap();
+        return;
+    }
     let seed = std::fs::read(temporary.join("extras.jxl")).unwrap();
     let inventory = jxl_gpu_bitstream::parse(&seed, Default::default())
         .unwrap()

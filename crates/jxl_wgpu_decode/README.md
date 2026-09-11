@@ -177,8 +177,8 @@ discard unsubmitted LF updates and drain already submitted work. Source planes, 
 and packed output retain independent byte ownership through GPU completion and cancellation.
 
 Color-only level 1 output matches the Rust decoder's LF flush, while native libjxl validates the
-following DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
-scalar-oracle adapter test validates expansion through LF4, custom weights and odd/one-sample axes.
+following DC/AC and final images. Real recursive codestream coverage reaches LF4; a separate
+scalar-oracle adapter test also validates custom weights and odd/one-sample axes.
 Seven animation families cover RGB/gray, mixed JPEG/Modular, recursive LF, negative/off-canvas
 crops and reference blends with exact clocks and physical IDs. Apply/Keep orientation and whole/
 40-byte fragmented input return identical immutable updates; finals equal final-only decoding.
@@ -198,9 +198,12 @@ Recursive LF expansion clips each 8× grid, expands XYB before inverse opsin and
 independently. A native or composed presentation uses the same alpha-aware color/native/scalar F32
 packer as final frames. Completed LF planes wait for the terminal frame's exact background reference;
 intermediate blending never commits a reference. Final-only requests allocate no LF extra output.
-Independent libjxl small-image producers and F64 expansion/composition cover LF1/LF2, Gaborish,
-alpha/depth, distributed groups and late background writes. These intermediate-policy comparisons
-are separate from ISO final-image precision conformance.
+Independent libjxl small-image producers and F64 expansion/composition cover LF1–LF4, Gaborish,
+integer/floating alpha and depth, associated alpha, grayscale, root color/extra resampling,
+Apply/Keep orientation, distributed groups and late background writes. Native 16/20-bit extra
+packing, all alpha-output policies, cancellation at every deep-LF boundary and late corruption
+have separate checks. These intermediate-policy comparisons are separate from ISO final-image
+precision conformance; shifted metadata, broader crops/color domains and incomplete input remain.
 
 Extra-channel snapshots decode and validate each pass's Modular subimages before copying the
 assembled channels for global inverse transforms, normalization and resampling. Future passes

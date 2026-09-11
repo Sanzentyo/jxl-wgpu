@@ -3012,3 +3012,63 @@ all-feature WebAssembly checks pass. Reference and Metal harnesses each pass 18/
 readback directly maps 221 logical bytes with zero staging bytes. All 42 fixture files regenerate
 exactly, including the 16 unchanged baseline files. Broader LF source precision, associated alpha,
 resampling/crops and actual LF3/LF4 stream combinations remain conformance work.
+
+### LF precision, association and depth conformance (2026-09-12)
+
+`lf_conformance/` contains ten chains from both Modular and VarDCT roots, ten independently
+decodable backgrounds, ten composed chains, 22 standalone LF producers and 22 native linear F32
+producer references. `cases.txt` records each family's maximum LF level. Regenerate the 75 files:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- \
+  crates/jxl_wgpu_decode/test-data/lf_conformance --conformance
+```
+
+| Family | Canvas | LF levels | Color precision | Alpha / depth precision | Other metadata |
+|---|---|---|---|---|---|
+| `integer_associated` | 65×33 | 4→3→2→1 | integer 12 | integer 16 / 20 | associated alpha, orientation 6 |
+| `floating` | 65×33 | 3→2→1 | float 24/7 | float 16/5 / 24/7 | straight alpha, orientation 8 |
+| `resampled_associated` | 193×129 | 1 | integer 16 | integer 16 / 20 | associated alpha, orientation 2, root color 2× / extras 8× |
+| `floating_resampled` | 193×129 | 1 | float 32/8 | float 32/8 / 32/8 | associated alpha, orientation 7, root color 2× / extras 8× |
+| `gray_float` | 65×33 | 2→1 | gray float 32/8 | float 16/5 / 24/7 | associated alpha, orientation 5 |
+
+Float notation is total/exponent bits. Every row has both root coding modes; intermediate consumers
+are VarDCT. The generator extracts raw codestreams from native level-10 containers, preserves each
+source's color/extra resampling factors and reads LF coefficient precision from the parsed header.
+The same entropy becomes a smaller standalone image at each dependency level. Tests compare every
+retained entropy section, restoration field, declared precision, orientation and extra resampling
+factor with its original LF producer. Native libjxl validates all complete and composed images.
+Custom floating samples are dyadic and exactly representable at their declared precision, as
+required by libjxl's lossless [float-to-word conversion](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/enc_modular.cc).
+
+Two output tests cover 190 configurations and 418 LF images across whole input and bounded
+256-byte GPU windows with 137-byte transport fragments. The first native-output matrix additionally
+passed with 40-byte windows. Color, both scalar extra channels, Apply/Keep orientation and all three
+alpha-output policies share final-only byte equality, immutable held outputs and exact reservation
+checks. F64 source-over/Add composition of independent native foregrounds/backgrounds is checked
+against native coalesced finals before use as an LF oracle.
+
+The existing 5e-4 color-reconstruction and 3e-6 extra-plane bounds remain. Straight output from an
+associated source amplifies reconstruction error at low alpha; its reconstruction comparison is
+therefore measured back in the associated domain. A separate independent F64 calculation checks
+delivered alpha conversion against the already native-validated Preserve output at 3e-6 normalized
+error. This separates reconstruction accuracy from alpha-policy correctness; it does not claim a
+5e-4 bound on unweighted straight output or ISO final-image conformance.
+
+Native 16/20-bit alpha/depth output checks unused high bits and at most one code of error. Fifty-six
+lifecycle configurations cancel at every LF boundary or drain to final output after all LF images;
+only held outputs remain charged and those images stay immutable. Forty-four damaged streams cover
+deep integer and floating roots, final LF producers, hidden backgrounds and terminal consumers.
+Their TOCs remain valid while global entropy is truncated. Root/LF/background failures publish no
+LF image; late terminal failures preserve the already validated LF images and release all remaining
+GPU/source reservations. Shifted extra metadata, signed crops with this precision matrix, broader
+LF color domains/custom weights and incomplete-frame input remain separate conformance work.
+
+Final local validation passes all 12 LF-extra tests (the four new tests and eight existing tests),
+with zero failures. Across the new matrix, the maximum color reconstruction error is 0.000332147,
+extra-plane error is 1.818e-7, alpha-policy normalized error is 1.286e-7 and native/scalar final
+composition error is 1.719e-7. All 75 new files regenerate identically twice, and all 42 existing
+LF-extra files remain unchanged. Formatting, warnings-denied Clippy/rustdoc, Rust 1.89 and the
+six-crate all-feature WebAssembly check pass; Reference and Apple M5/Metal harnesses each pass
+18/18 cases. This milestone changes offline generation, tests and documentation; production runtime
+code is unchanged from the preceding LF-presentation implementation.

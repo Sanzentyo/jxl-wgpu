@@ -1,0 +1,5 @@
+integer_associated 4
+floating 3
+resampled_associated 1
+floating_resampled 1
+gray_float 2
