@@ -32,7 +32,6 @@ use crate::{
 };
 
 const MIN_GROUP_DIMENSION: u32 = 128;
-const MAX_MODULAR_PASSES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularGroup {
@@ -350,10 +349,9 @@ fn parse_modular_profile(
             }
         });
     }
-    if !(1..=MAX_MODULAR_PASSES).contains(&frame.num_passes) {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::MultiplePasses,
-            format!("the Modular GPU frontend accepts one through {MAX_MODULAR_PASSES} passes"),
+    if !(1..=jxl_gpu_bitstream::FramePassesInventory::MAX_PASSES).contains(&frame.num_passes) {
+        return Err(jxl_gpu_bitstream::InventoryError::InvalidFrame(
+            "invalid number of progressive passes",
         )
         .into());
     }
@@ -949,41 +947,39 @@ fn parse_modular_profile(
         token_bit_end: dc_end,
     });
 
-    let intermediate_passes = if frame.frame_type == FrameType::Regular && !single_entry {
-        (0..frame.num_passes)
-            .filter(|&completed| {
-                completed != 0
-                    || global_decoded_words != 0
-                    || low_frequency_entropy_group_count != 0
-            })
-            .map(|completed| {
-                let next_stream = modular_pass_stream_index(
-                    frame.low_frequency_group_count,
-                    expected_group_count,
-                    u64::from(completed),
-                    0,
-                )?;
-                Ok(ModularPassBoundary {
-                    progression: crate::FrameProgression::Modular {
-                        physical_frame_index: frame.frame_index,
-                        completed_passes: completed as u8,
-                        total_passes: frame.num_passes as u8,
-                        intended_downsampling: frame
-                            .progressive_passes
-                            .last_pass
-                            .iter()
-                            .zip(&frame.progressive_passes.downsampling)
-                            .filter(|(last, _)| completed > **last)
-                            .fold(8, |divisor, (_, &target)| divisor.min(target)),
-                    },
-                    group_end: entropy_groups
-                        .partition_point(|group| group.stream_index < next_stream),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
+    let mut intermediate_passes = Vec::new();
+    if frame.frame_type == FrameType::Regular && !single_entry {
+        for completed in 0..frame.num_passes {
+            let next_stream = modular_pass_stream_index(
+                frame.low_frequency_group_count,
+                expected_group_count,
+                u64::from(completed),
+                0,
+            )?;
+            let group_end =
+                entropy_groups.partition_point(|group| group.stream_index < next_stream);
+            // Empty leading passes may precede every image sample. In particular, the direct
+            // output path has not run its output writer yet: its cleared bytes are not pixels.
+            if global_decoded_words == 0 && group_end == 0 {
+                continue;
+            }
+            intermediate_passes.push(ModularPassBoundary {
+                progression: crate::FrameProgression::Modular {
+                    physical_frame_index: frame.frame_index,
+                    completed_passes: completed as u8,
+                    total_passes: frame.num_passes as u8,
+                    intended_downsampling: frame
+                        .progressive_passes
+                        .last_pass
+                        .iter()
+                        .zip(&frame.progressive_passes.downsampling)
+                        .filter(|(last, _)| completed > **last)
+                        .fold(8, |divisor, (_, &target)| divisor.min(target)),
+                },
+                group_end,
+            });
+        }
+    }
 
     Ok(StandardModularProfile {
         color_render,

@@ -380,6 +380,11 @@ pub struct FramePassesInventory {
     pub last_pass: Vec<u32>,
 }
 
+impl FramePassesInventory {
+    /// Maximum pass count representable by the current frame-header syntax.
+    pub const MAX_PASSES: u32 = 11;
+}
+
 /// Finite IEEE 754 binary16 value retained exactly as serialized in a JPEG XL header.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -1858,7 +1863,7 @@ fn parse_passes(reader: &mut BitReader<'_>) -> Result<FramePassesInventory, Inve
     for _ in 0..num_downsampling {
         last_pass.push(read_u32(reader, [c(0), c(1), c(2), b(0, 3)])?);
     }
-    if num_downsampling >= num_passes
+    if num_downsampling > num_passes
         || downsampling.windows(2).any(|pair| pair[1] >= pair[0])
         || last_pass.windows(2).any(|pair| pair[1] <= pair[0])
         || last_pass.iter().any(|&pass| pass >= num_passes)
@@ -2921,6 +2926,86 @@ mod tests {
             }
         );
         assert_eq!(reader.bit_offset(), 28);
+    }
+
+    fn write_pass_schedule(passes: u32, factors: &[u32], boundaries: &[u32]) -> BitWriter {
+        let mut bits = BitWriter::new();
+        if passes <= 3 {
+            bits.write_bits(u64::from(passes - 1), 2).unwrap();
+        } else {
+            bits.write_bits(3, 2).unwrap();
+            bits.write_bits(u64::from(passes - 4), 3).unwrap();
+        }
+        if passes == 1 {
+            return bits;
+        }
+        let count = factors.len();
+        bits.write_bits(count.min(3) as u64, 2).unwrap();
+        if count >= 3 {
+            bits.write_bits((count - 3) as u64, 1).unwrap();
+        }
+        for pass in 0..passes - 1 {
+            bits.write_bits(u64::from(pass % 4), 2).unwrap();
+        }
+        for &factor in factors {
+            bits.write_bits(u64::from(factor.trailing_zeros()), 2)
+                .unwrap();
+        }
+        for &pass in boundaries {
+            bits.write_bits(u64::from(pass.min(3)), 2).unwrap();
+            if pass >= 3 {
+                bits.write_bits(u64::from(pass), 3).unwrap();
+            }
+        }
+        bits
+    }
+
+    #[test]
+    fn progressive_pass_inventory_accepts_every_representable_boundary_schedule() {
+        for passes in 1u32..=FramePassesInventory::MAX_PASSES {
+            for factor_mask in 0u32..16 {
+                let factors = [8, 4, 2, 1]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, factor)| ((factor_mask >> i) & 1 != 0).then_some(factor))
+                    .collect::<Vec<_>>();
+                for pass_mask in 0u32..(1 << passes.min(8)) {
+                    if pass_mask.count_ones() != factor_mask.count_ones()
+                        || (passes == 1 && pass_mask != 0)
+                    {
+                        continue;
+                    }
+                    let boundaries = (0..passes.min(8))
+                        .filter(|&pass| (pass_mask >> pass) & 1 != 0)
+                        .collect::<Vec<_>>();
+                    let bits = write_pass_schedule(passes, &factors, &boundaries);
+                    let mut reader = BitReader::new(bits.as_bytes());
+                    assert_eq!(
+                        parse_passes(&mut reader).unwrap(),
+                        FramePassesInventory {
+                            shifts: (0..passes - 1).map(|pass| pass % 4).collect(),
+                            downsampling: factors.clone(),
+                            last_pass: boundaries,
+                        }
+                    );
+                    assert_eq!(reader.bit_offset(), bits.bit_len() as u64);
+                }
+            }
+        }
+        for (passes, factors, boundaries) in [
+            (2, vec![8, 4, 2], vec![0, 1, 2]),
+            (3, vec![2, 4], vec![0, 1]),
+            (3, vec![4, 4], vec![0, 1]),
+            (3, vec![4, 2], vec![1, 0]),
+            (3, vec![4, 2], vec![1, 1]),
+            (3, vec![4], vec![3]),
+        ] {
+            let bits = write_pass_schedule(passes, &factors, &boundaries);
+            assert!(matches!(
+                parse_passes(&mut BitReader::new(bits.as_bytes())),
+                Err(InventoryError::InvalidFrame("invalid progressive passes"))
+            ));
+        }
     }
 
     #[test]

@@ -1304,7 +1304,7 @@ fn validate_profile(profile: DecodeProfile) -> Result<()> {
         }
         DecodeProfile::Modular {
             sample_bit_depth,
-            passes: 1..=3,
+            passes: 1..=jxl_gpu_bitstream::FramePassesInventory::MAX_PASSES,
             prediction,
             ..
         } if crate::modular_sample::ModularSampleEncoding::new(sample_bit_depth).is_some() => {
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn modular_profile_accepts_only_the_negotiated_progressive_pass_range() {
+    fn modular_profile_accepts_every_normative_progressive_pass_count() {
         let profile = |passes| DecodeProfile::Modular {
             sample_bit_depth: jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample: 8 },
             channels: crate::ModularChannels::Gray.into(),
@@ -1427,10 +1427,10 @@ mod tests {
             grouping: crate::ModularGrouping::SingleGroup,
             passes,
         };
-        for passes in 1..=3 {
+        for passes in 1..=jxl_gpu_bitstream::FramePassesInventory::MAX_PASSES {
             validate_profile(profile(passes)).unwrap();
         }
         assert!(validate_profile(profile(0)).is_err());
-        assert!(validate_profile(profile(4)).is_err());
+        assert!(validate_profile(profile(12)).is_err());
     }
 }

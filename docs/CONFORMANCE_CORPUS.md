@@ -2853,3 +2853,50 @@ The full JPEG XL goal remains active. Wider Modular pass/header combinations, pr
 composed numeric updates, LF previews with extras, broader source-color/precision conformance,
 selective regions and incomplete-frame readiness remain open. The VDCT-D04 raw-JPEG precision gap
 is unchanged. This milestone does not close any encoder syntax or encoder quality gate.
+
+### Complete Modular pass-count and downsampling schedules (2026-09-11)
+
+Modular admission and public profile validation now accept every 1–11 pass count. The header and
+shared side-image grouping paths permit as many downsampling boundaries as passes, while retaining
+strict factor/index ordering and the encoded last-pass limit of seven. Header and grouping unit
+tests enumerate every representable boundary schedule, preserve exact bit consumption, and prove
+that each non-LF transformed shift has exactly one owner. The final pass covers all remaining shifts.
+These rules follow libjxl's [Passes field visitor](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/frame_header.cc#L126)
+and [downsampling bracket/target methods](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/frame_header.h#L268).
+
+Two independently encoded bases live in test-data/modular_passes. The offline command
+`cargo run -p jxl_wgpu_decode --example regenerate_modular_passes` reproduces them with cjxl 0.12.0:
+
+| Base | Extent | Bytes | Codestream SHA-256 |
+|---|---:|---:|---|
+| plain.jxl.hex | 1025×3 | 865 | 287a22c49d1cf55779deaca94ee78bd2a949c11616080767fe69c0083e1ac9c1 |
+| squeeze.jxl.hex | 2051×17 | 20,766 | 47cd3847e4b44db2beacd3653353c4e1085e0693d8d1ea1ef1234c131113dc03 |
+
+The test-only reframe helper preserves image metadata and every compressed payload, emits canonical
+TOCs, and moves the original payloads into 40 legal schedules with empty leading, interior and
+trailing passes. It covers every pass count, two/three/four boundaries on the same number of passes,
+last-pass index seven, ignored Modular coefficient shifts 0–3, and full detail completed before the
+final physical pass. Public GPU native Gray8 output equals the source codes; every returned F32
+prefix/final image matches native libjxl within 2e-6, and retained outputs stay byte-identical.
+The current Rust jxl oracle rejects equal-count boundaries and empty final passes after earlier
+full reconstruction; those cases use the source and libjxl oracle. The remaining schedules also
+match the Rust decoder. These oracle limitations do not become production rejections.
+
+A reproduced leading-empty-pass bug returned an unrendered cleared buffer, giving an F32 difference
+of 1.0 against native output. Progression now starts only after global/LF/pass samples have been
+reconstructed. Empty later passes still advance metadata and preserve the preceding image.
+The maximum-count lifecycle test compares whole input with 40-byte GPU windows, admits all eleven
+snapshots under the exact byte budget after a one-byte blocker is released, cancels before/after
+selected boundaries, corrupts the second active residual pass at index seven, retains earlier
+images through that failure, and switches from intermediate output to final-only async completion.
+Only caller-held output bytes remain after retirement; dropping them returns reservations to zero.
+
+The full workspace all-target/all-feature run passes 821 tests across 43 targets, with zero failures
+and one existing ignored latency benchmark. The two schedule/ownership tests enumerate 2,767 valid
+header arrangements. Workspace Clippy with warnings denied, Rust 1.89, all-feature docs and the
+six-crate WebAssembly check pass. Both checked-in base fixtures regenerate byte-for-byte.
+Reference and Apple M5/Metal harnesses each pass 18/18 cases; Reference creates no adapter.
+Gray8 U8 CPU readback directly maps all 221 logical bytes with zero staging bytes.
+
+MOD-D04 and API-03 remain Partial: broader transform/side-image combinations and composed updates
+remain open, as do the other full JPEG XL decoder, encoder and conformance gates.

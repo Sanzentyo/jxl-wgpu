@@ -25,7 +25,7 @@ pub enum DecodeProfile {
         channels: ModularChannelCounts,
         prediction: ModularPredictionProfile,
         grouping: ModularGrouping,
-        /// Progressive pass count declared by the frame (`1..=3` for the negotiated profile).
+        /// Progressive pass count declared by the frame (`1..=11`).
         passes: u32,
     },
     /// Standard XYB VarDCT decoded into a GPU-resident presentation buffer. Transform strategy is

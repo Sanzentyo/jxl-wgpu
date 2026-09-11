@@ -212,8 +212,15 @@ Tests compare native libjxl prefix flushes for integer/float/alpha/resampled ext
 exact-budget retry. Incomplete floating residuals may decode to nonfinite values even when the final
 image is finite; comparisons include matching NaN/infinity classes. No CPU codec runs in production.
 
+The pass count covers the complete 1–11 header range, including up to four downsampling boundaries
+and equal boundary/pass counts for 2–4 passes. Empty leading passes produce no image until some
+samples have been reconstructed. Empty interior/trailing passes preserve the preceding image and
+still advance the completed-pass metadata. Forty plain/Squeeze schedules compare every returned F32 image with libjxl
+and native integer output with source codes. Eleven-pass tests also cover 40-byte entropy windows,
+exact-budget retry, cancellation and late corruption.
+
 The remaining progressive work includes broader LF conformance, LF previews with extra channels,
-composed numeric refinements, wider Modular pass/header combinations, selective regions, and
+composed numeric refinements, broader Modular transform/header combinations, selective regions, and
 incomplete-frame input readiness.
 Native-comparison precision remains a separate conformance gate.
 
@@ -223,7 +230,7 @@ The low-level `WgpuSubmissionEngine` implements a standards-only Modular still p
   metadata requirement;
 - one final still frame with Gray or RGB Modular samples and arbitrary extra planes, each with
   independent 1–31-bit integer or legal JPEG XL floating precision, including 2×/4×/8× color/extra resampling, over a bounded
-  128/256/512/1024-pixel pass-group grid and one through three passes;
+  128/256/512/1024-pixel pass-group grid and one through eleven passes;
 - bounded DC-global, LF-group-local, or pass-group-local MA trees with all JPEG XL Modular predictors, including
   weighted self-correcting prediction, leaf offsets/multipliers/context selection, Prefix or ANS
   entropy, hybrid integers, context maps, and the standard LZ77 distance alphabet;
@@ -538,9 +545,10 @@ Palette/Squeeze sample data is reconstructed in a frame arena. LF-group streams 
 channels whose horizontal and vertical transformed shifts are both at least three; pass groups own
 the remaining channels, including asymmetric shifts. LF streams execute before nonempty pass
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
-one global inverse/finalizer runs after assembly. One through three passes produce a complete final
-image; intermediate pass presentation is not yet exposed. Patches, splines and broader
-original color profiles remain typed unsupported profiles. The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
+one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
+image; optional intermediate images run the same inverse/finalizer on independent arena copies.
+Patches, splines and broader original color profiles remain typed unsupported profiles.
+The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
 mode-specific bindings and pipeline caches while sharing the backend byte budget.

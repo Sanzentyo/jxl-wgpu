@@ -1032,3 +1032,8 @@ global stream. Each snapshot copies the status buffer before its output writer, 
 output-domain error cannot contaminate final entropy validation. Final-only completion drains
 remaining phases and validates all final statuses. The unvalidated final-output API rejects frames
 whose last phase has not yet been submitted.
+
+The complete 1–11 pass range uses the same accounting. Boundaries before any samples exist do not
+allocate snapshots. Eleven-pass Squeeze reconstruction admits eleven intermediate images plus the
+final output under an exact shared byte limit. Tests using 40-byte windows, cancellation and a late
+corrupt pass preserve held-image charges and retire all other reservations.

@@ -66,16 +66,18 @@ pub(crate) fn build_modular_pass_shift_ranges(
     downsampling: &[u32],
     last_pass: &[u32],
 ) -> Result<Vec<Option<ModularPassShiftRange>>> {
-    if pass_count == 0 {
-        return unsupported("the Modular frame declares zero progressive passes");
+    if !(1..=jxl_gpu_bitstream::FramePassesInventory::MAX_PASSES).contains(&pass_count) {
+        return unsupported("the Modular frame declares an invalid progressive pass count");
     }
     if downsampling.len() != last_pass.len()
-        || downsampling.len() >= usize::try_from(pass_count).unwrap_or(usize::MAX)
+        || downsampling.len() > usize::try_from(pass_count).unwrap_or(usize::MAX)
+        || (pass_count == 1 && !downsampling.is_empty())
         || downsampling
             .iter()
             .any(|factor| !matches!(factor, 1 | 2 | 4 | 8))
         || downsampling.windows(2).any(|pair| pair[1] >= pair[0])
         || last_pass.windows(2).any(|pair| pair[1] <= pair[0])
+        || last_pass.iter().any(|&pass| pass >= pass_count || pass > 7)
     {
         return unsupported("the Modular frame has inconsistent progressive-pass metadata");
     }
@@ -283,6 +285,8 @@ mod tests {
     fn pass_brackets_reject_invalid_factors_and_out_of_order_boundaries() {
         for (passes, factors, boundaries) in [
             (0, vec![], vec![]),
+            (12, vec![], vec![]),
+            (1, vec![1], vec![0]),
             (3, vec![0], vec![0]),
             (3, vec![3], vec![0]),
             (3, vec![16], vec![0]),
@@ -292,8 +296,74 @@ mod tests {
             (3, vec![4, 2], vec![0, 0]),
             (3, vec![4], vec![3]),
             (3, vec![4], vec![]),
+            (11, vec![2], vec![8]),
         ] {
             assert!(build_modular_pass_shift_ranges(passes, &factors, &boundaries).is_err());
+        }
+    }
+
+    #[test]
+    fn every_representable_pass_schedule_owns_each_non_lf_shift_exactly_once() {
+        for passes in 1..=11 {
+            for factor_mask in 0u32..16 {
+                let factors = [8, 4, 2, 1]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, factor)| ((factor_mask >> i) & 1 != 0).then_some(factor))
+                    .collect::<Vec<_>>();
+                for pass_mask in 0u32..(1 << passes.min(8)) {
+                    if pass_mask.count_ones() != factor_mask.count_ones()
+                        || (passes == 1 && pass_mask != 0)
+                    {
+                        continue;
+                    }
+                    let boundaries = (0..passes.min(8))
+                        .filter(|&pass| (pass_mask >> pass) & 1 != 0)
+                        .collect::<Vec<_>>();
+                    let ranges =
+                        build_modular_pass_shift_ranges(passes, &factors, &boundaries).unwrap();
+                    assert_eq!(ranges.len(), passes as usize);
+                    for horizontal in 0u32..8 {
+                        for vertical in 0u32..8 {
+                            let shift = horizontal.min(vertical);
+                            let owners = ranges
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(pass, range)| {
+                                    range
+                                        .is_some_and(|range| range.contains(shift))
+                                        .then_some(pass)
+                                })
+                                .collect::<Vec<_>>();
+                            if shift >= 3 {
+                                assert!(owners.is_empty());
+                                assert_eq!(
+                                    modular_pass_for_channel(horizontal, vertical, &ranges),
+                                    None
+                                );
+                                continue;
+                            }
+                            // A transformed plane first appears at the earliest declared detail
+                            // that includes it, or at the unconditional full-resolution final pass.
+                            let expected = factors
+                                .iter()
+                                .zip(&boundaries)
+                                .find_map(|(&factor, &pass)| (factor <= 1 << shift).then_some(pass))
+                                .unwrap_or(passes - 1)
+                                as usize;
+                            assert_eq!(
+                                owners,
+                                [expected],
+                                "passes={passes} {factors:?}/{boundaries:?}"
+                            );
+                            assert_eq!(
+                                modular_pass_for_channel(horizontal, vertical, &ranges),
+                                Some(expected)
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

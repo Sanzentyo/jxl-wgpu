@@ -6,7 +6,6 @@ pub enum UnsupportedCodestreamFeature {
     VarDct,
     ModularBitDepth(u8),
     AdaptiveModularPredictor,
-    MultiplePasses,
     ExtraChannels,
     ColorEncoding,
     Patches,

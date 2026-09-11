@@ -40,6 +40,11 @@ slots; a missing producer is a typed error before GPU submission. The same resol
 contiguous and incremental scanners, with a libjxl `--progressive_dc=2` chain checked under
 one-byte delivery. It never decodes image samples or frame-section entropy.
 
+Pass schedules cover all 1–11 pass counts (`FramePassesInventory::MAX_PASSES`) and up to four strictly
+decreasing downsampling factors with strictly increasing last-pass indices. The number of boundaries
+may equal the number of passes for 2–4 passes. Header tests enumerate every representable boundary
+schedule with exact bit consumption, and reject excess, duplicate, reversed or out-of-range boundaries.
+
 Color and each extra channel independently determine the presence of their blend source field:
 full-frame Replace omits its source, while other modes or partial coverage read it. The channel's
 own mode controls this rule; it does not inherit the color mode. Actual libjxl RGBA animations

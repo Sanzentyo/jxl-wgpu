@@ -1,7 +1,7 @@
 use super::*;
 use jxl_wgpu_decode::Error;
 
-fn drain(backend: &WgpuBackend) {
+pub(super) fn drain(backend: &WgpuBackend) {
     backend
         .device()
         .poll(wgpu::PollType::Wait {
