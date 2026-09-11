@@ -604,7 +604,8 @@ the remaining channels, including asymmetric shifts. LF streams execute before n
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
-Patches, splines and broader original color profiles remain typed unsupported profiles.
+The low-level Modular producer still requires patches to be handled by the common frame
+executor. Splines and broader original color profiles remain typed unsupported profiles.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -632,7 +633,17 @@ whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quan
 reservation release. Fifteen stills and the initial Replace presentation of four animations also
 match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
 clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
-color management, pre-transform references, patches and splines remain separate work.
+color management and splines remain separate work.
+
+The common executor now retains explicitly tagged codec components before inverse color
+conversion for patch references. Prefix/ANS/hybrid/LZ77 dictionaries execute in bounded GPU
+count/validate and command-emission passes; only sixteen control bytes are mapped. All eight
+patch modes, independent alpha/extra-channel selection, clamping and association execute in
+occurrence order from four resident reference versions. GPU inverse color conversion and ordinary
+frame blending follow patch rendering. Native fixtures cover empty/nonempty dictionaries,
+original and XYB color, integer/F32 samples and straight/associated alpha under whole and bounded
+fragmented input. LF producer patches, frame-upsampled/noisy/subsampled-YCbCr consumers,
+progressive patch output and mixed coding-mode patch conformance remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before

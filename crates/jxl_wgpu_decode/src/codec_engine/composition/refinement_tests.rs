@@ -256,3 +256,108 @@ fn exercise_submitted_refinements(backend: &WgpuBackend, hex: &str, numeric: boo
         }
     }
 }
+
+#[test]
+fn encoded_refinements_transform_for_display_without_committing_references() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let compact = include_str!("../../../test-data/vardct_extras_rgba_progressive.jxl.hex")
+        .split_whitespace()
+        .collect::<String>();
+    let encoded: Vec<_> = compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+    let data: Arc<[u8]> = Arc::from(parsed.codestream());
+    let source = Arc::new(GpuCodestream::from_shared(data.clone(), 0..data.len(), false).unwrap());
+    let mut inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    assert_eq!(inventory.frames.len(), 1);
+    let mut plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
+    // Exercise the private producer contract for a displayable pre-transform reference. The
+    // original one-frame entropy is unchanged; these metadata-only flags choose its boundary.
+    plan.nodes[0].needs_composition = true;
+    plan.nodes[0].save_reference = Some(3);
+    let request = GpuOutputRequest::color(jxl_gpu_formats::PixelFormat::rgb_f32(
+        jxl_gpu_formats::RgbChannelOrder::Rgba,
+        false,
+        crate::vardct_rgb8_format().color_spec,
+    ))
+    .unwrap()
+    .with_progressive_output(true);
+    let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    let mut baseline =
+        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap();
+    let mut baseline_pending = baseline.submit(&plan, 0).unwrap();
+    let (frame, progression) = next_intermediate(&mut baseline_pending);
+    baseline_pending.refine(frame, progression).unwrap();
+    let update = pollster::block_on(std::future::poll_fn(|cx| {
+        baseline_pending.poll_update(cx, true)
+    }))
+    .unwrap();
+    let SubmittedGpuUpdate::Intermediate { frame, .. } = update else {
+        panic!("expected CID");
+    };
+    let expected_update = bytes(&frame.output, &backend);
+    drop(frame);
+    let frame = baseline_pending.wait().unwrap();
+    let expected_final = bytes(&frame.output, &backend);
+    drop((frame, baseline));
+    inventory.frames[0].save_before_color_transform = true;
+    for action in 0..3 {
+        let mut session =
+            DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
+                .unwrap();
+        let mut pending = session.submit(&plan, 0).unwrap();
+        let (frame, progression) = next_intermediate(&mut pending);
+        pending.refine(frame, progression).unwrap();
+        assert!(matches!(
+            pending.stage,
+            Some(Stage::Refinement {
+                render: RefinementRender::Transform { .. },
+                ..
+            })
+        ));
+        assert!(references(&pending).iter().all(Option::is_none));
+        if action == 0 {
+            drop(pending);
+        } else {
+            if action == 1 {
+                let update =
+                    pollster::block_on(std::future::poll_fn(|cx| pending.poll_update(cx, true)))
+                        .unwrap();
+                let SubmittedGpuUpdate::Intermediate { frame, .. } = update else {
+                    panic!("expected transformed CID");
+                };
+                assert_float_bytes(&bytes(&frame.output, &backend), &expected_update);
+                assert!(references(&pending).iter().all(Option::is_none));
+            }
+            let frame = pending.wait().unwrap();
+            assert_float_bytes(&bytes(&frame.output, &backend), &expected_final);
+        }
+        drop(session);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backend.transient_memory_budget().snapshot().reserved_bytes != 0
+            && std::time::Instant::now() < deadline
+        {
+            backend.device().poll(wgpu::PollType::Poll).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            backend.transient_memory_budget().snapshot().reserved_bytes,
+            0
+        );
+    }
+}
+
+fn assert_float_bytes(actual: &[u8], expected: &[u8]) {
+    assert_eq!(actual.len(), expected.len());
+    for (a, b) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+        let a = f32::from_le_bytes(a.try_into().unwrap());
+        let b = f32::from_le_bytes(b.try_into().unwrap());
+        assert!(
+            a.is_finite() && (a - b).abs() < 1e-5 * (1.0 + b.abs()),
+            "{a} vs {b}"
+        );
+    }
+}

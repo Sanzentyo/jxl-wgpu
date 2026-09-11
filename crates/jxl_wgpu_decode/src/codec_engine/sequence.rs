@@ -88,6 +88,15 @@ impl SequenceSource {
         index: usize,
         progressive: bool,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        self.prepare_physical_after_features(index, progressive, None)
+    }
+
+    pub(super) fn prepare_physical_after_features(
+        &self,
+        index: usize,
+        progressive: bool,
+        patch_end: Option<u64>,
+    ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         let frame_index = self.inventory.frames[index].frame_index;
         let request = self
             .surface_encodings
@@ -101,7 +110,37 @@ impl SequenceSource {
                 self.request.progressive_output()
                     && self.inventory.frames[index].frame_type == FrameType::LowFrequency,
             );
-        let projected = project_frame_inventory(&self.inventory, frame_index)?;
+        let mut projected = project_frame_inventory(&self.inventory, frame_index)?;
+        if let Some(cursor) = patch_end {
+            // The common GPU feature frontend owns this prefix. Keep the original inventory
+            // authoritative, and give the coding-mode producer only the remaining bit range.
+            let frame = &mut projected.frames[0];
+            let section = frame
+                .sections
+                .iter_mut()
+                .find(|section| {
+                    matches!(
+                        section.kind,
+                        jxl_gpu_bitstream::FrameSectionKind::Single
+                            | jxl_gpu_bitstream::FrameSectionKind::LowFrequencyGlobal
+                    )
+                })
+                .ok_or(crate::Error::EngineContract(
+                    "patch continuation lacks LF-global",
+                ))?;
+            let end = section
+                .bits
+                .end()
+                .ok_or(crate::Error::EngineContract("invalid LF-global range"))?;
+            if cursor < section.bits.offset || cursor > end {
+                return Err(crate::Error::EngineContract(
+                    "patch cursor leaves LF-global",
+                ));
+            }
+            section.bits.offset = cursor;
+            section.bits.length = end - cursor;
+            frame.flags &= !2;
+        }
         match projected.frames[0].encoding {
             FrameEncoding::Modular => {
                 let prepared = if projected.frames[0].frame_type == FrameType::LowFrequency {

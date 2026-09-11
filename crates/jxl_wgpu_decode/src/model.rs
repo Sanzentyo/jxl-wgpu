@@ -373,7 +373,7 @@ pub struct GpuOutputRequest {
     numeric_channel: Option<NumericChannel>,
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
-    frame_surface: bool,
+    frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
     lf_presentation: bool,
 }
 
@@ -516,7 +516,7 @@ impl GpuOutputRequest {
             numeric_channel: None,
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
-            frame_surface: false,
+            frame_surface: None,
             lf_presentation: false,
         }
     }
@@ -568,7 +568,7 @@ impl GpuOutputRequest {
         mut self,
         encoding: crate::frame_surface::FrameSurfaceEncoding,
     ) -> Self {
-        self.frame_surface = true;
+        self.frame_surface = Some(encoding);
         self.format = encoding.format();
         self.alpha = AlphaOutputPolicy::Preserve;
         self.spot_colors = SpotColorPolicy::Preserve;
@@ -587,12 +587,11 @@ impl GpuOutputRequest {
     }
 
     pub(crate) const fn retains_frame_surface(&self) -> bool {
-        self.frame_surface
+        self.frame_surface.is_some()
     }
 
     pub(crate) fn frame_surface_encoding(&self) -> crate::frame_surface::FrameSurfaceEncoding {
-        crate::frame_surface::FrameSurfaceEncoding::from_format(&self.format)
-            .expect("private frame-surface request has a canonical color format")
+        self.frame_surface.expect("private frame surface request")
     }
 
     pub(crate) fn renders_spot_colors(

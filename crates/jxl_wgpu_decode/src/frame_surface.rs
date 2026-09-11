@@ -1,22 +1,27 @@
-//! Private post-transform frame storage. All planes share one accounted allocation; output
+//! Private frame storage with an explicit codec-component or RGB domain. All planes share one
+//! accounted allocation; output
 //! views carry their actual offsets instead of hiding extra samples beyond an RGB layout.
 
 use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, SampleKind};
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region};
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
-/// The color domain at the post-reconstruction boundary. References and blending use the
-/// original encoding; an unreferenced XYB presentation can retain linear RGB until output.
+/// The sample domain at the post-reconstruction boundary. Patch references retain codec
+/// components, frame blending uses the original encoding, and an unreferenced XYB presentation
+/// can retain linear RGB until output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameSurfaceEncoding {
     Srgb,
     Linear,
+    /// Codec components before the inverse color transform. The private producer contract
+    /// carries this tag explicitly; a pixel format alone can never identify this domain.
+    Encoded,
 }
 
 impl FrameSurfaceEncoding {
     pub(crate) fn format(self) -> PixelFormat {
         let mut color = crate::vardct_rgb8_format().color_spec;
-        if self == Self::Linear
+        if self != Self::Srgb
             && let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color
         {
             color.transfer = jxl_gpu_formats::TransferFunction::Linear;
@@ -33,7 +38,7 @@ impl FrameSurfaceEncoding {
     pub(crate) const fn rgb_encoding(self) -> jxl_gpu_protocol::RgbColorEncoding {
         match self {
             Self::Srgb => jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709,
-            Self::Linear => jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+            Self::Linear | Self::Encoded => jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
         }
     }
 }

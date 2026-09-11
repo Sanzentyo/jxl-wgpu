@@ -3072,3 +3072,60 @@ LF-extra files remain unchanged. Formatting, warnings-denied Clippy/rustdoc, Rus
 six-crate all-feature WebAssembly check pass; Reference and Apple M5/Metal harnesses each pass
 18/18 cases. This milestone changes offline generation, tests and documentation; production runtime
 code is unchanged from the preceding LF-presentation implementation.
+
+### GPU patch dictionaries and pre-transform references (2026-09-12)
+
+`patches/` contains eighteen images, each with native sRGB and linear F32 snapshots. Nine source
+families have both an empty dictionary and sixteen overlapping occurrences: original Modular
+RGB/gray/16-bit RGBA, XYB Modular, restored XYB VarDCT, F32 Modular/VarDCT and associated-alpha F32
+Modular/VarDCT. Each retains native image entropy unchanged, inserts a reference-only producer
+saving codec components in slot three, then prefixes an independently encoded flat-ANS patch
+dictionary to the terminal frame's LF-global section. Hybrid configurations are chosen so the
+prefix ends on a byte boundary; no invented padding separates patch and image entropy.
+
+Regenerate all 54 files with the offline native oracle:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_patches
+```
+
+The dictionary exercises all eight modes, repeated overlaps, signed position deltas, alpha
+selection, clamp settings and independent extra-channel operations. Public GPU tests compare
+RGBA F32 and every selected scalar extra with the snapshots. Whole input and fragmented input
+with 256-byte GPU windows must produce identical output words. Additional dynamically assembled
+streams cover 1100 occurrences across parser continuations and 64-command render batches, and a
+six-frame chain that uses all four reference slots and overwrites slot zero with a patched
+version. Those streams also use 40-byte windows and compare with native libjxl when available.
+Malformed source/destination geometry, overflowing counts, invalid/missing/post-transform slots
+and unknown modes must return typed GPU dictionary errors and release their reservations.
+
+Native libjxl's extended-sRGB approximation differs outside its nominal cube. For XYB fixtures,
+the sRGB color oracle therefore applies an independent F64 analytic extended OETF to the stored
+native linear samples. A separate linear-output test checks the reconstruction directly. Existing
+bounds remain 1e-4 normalized error for Modular color, 3e-3 for VarDCT color, and 2e-6 for alpha
+and extras; they are implementation comparisons rather than ISO decoder precision certification.
+Reference alpha is preserved, including associated source samples and color blending's alpha
+update. The decoder performs no host pixel or patch-symbol reconstruction.
+
+Private GPU tests independently encode two-symbol Prefix, unary Prefix and Prefix/LZ77
+replacement dictionaries. They check the exact emitted command words and non-byte-aligned end
+cursor. Count and replay stages check one-byte-short admission, retry, cancellation while either
+stage is submitted, exact 44-byte retained command ownership, and a forced replay allocation
+failure. Naga validates both shaders with portable capabilities. A separate progressive producer
+contract test checks inverse conversion of displayed pre-transform refinements, unchanged
+reference versions, cancellation and final-only draining.
+
+The path currently rejects LF producer patches, frame upsampling, noise, subsampled YCbCr and progressive
+patch output. Mixed coding-mode patch references, source resampling/crop combinations, spline
+interactions and official precision fixtures remain open. The normative blend ordering and
+alpha behavior follow [libjxl blending](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/blending.cc);
+[the patch dictionary decoder](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_patch_dictionary.cc)
+provides an independent parser reference.
+
+The final local regression passes 857 tests across 47 all-feature/all-target workspace targets
+on Apple M5/Metal, plus five doctests; one existing manual benchmark remains ignored. Formatting,
+workspace check, warnings-denied Clippy/rustdoc, Rust 1.89 and six-crate all-feature WebAssembly
+checks pass. Reference and Metal harnesses each pass 18/18 cases, and the Gray8 codec readback
+gate passes. All 54 fixture files regenerate identically. An earlier validation run was stopped
+when review found that LF producer patches could bypass the render stage; an explicit unsupported
+guard and regression test were added before rerunning the complete suite on the final code.

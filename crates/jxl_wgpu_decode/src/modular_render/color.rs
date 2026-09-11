@@ -22,6 +22,7 @@ use crate::color_output::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
+    encoded_output: bool,
     noise: Option<jxl_wgpu::ResidentNoiseParameters>,
     xyb: Option<([f32; 3], InverseOpsin)>,
     gaborish: Option<ResidentGaborishWeights>,
@@ -64,6 +65,7 @@ impl ModularColorConfig {
         Ok(
             (xyb.is_some() || gaborish.is_some() || epf.is_some() || noise.is_some()).then(|| {
                 Self {
+                    encoded_output: false,
                     noise,
                     xyb,
                     gaborish,
@@ -72,6 +74,11 @@ impl ModularColorConfig {
                 }
             }),
         )
+    }
+
+    pub(crate) fn for_encoded_output(mut self) -> Self {
+        self.encoded_output = true;
+        self
     }
 }
 
@@ -112,10 +119,14 @@ impl ColorPlan {
         let output_config = ColorOutputConfig {
             extent,
             orientation: OutputOrientation::Identity,
-            transform: config.xyb.map_or(
-                ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
-                |(_, inverse)| ColorOutputTransform::Xyb(inverse),
-            ),
+            transform: if config.encoded_output {
+                ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709)
+            } else {
+                config.xyb.map_or(
+                    ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+                    |(_, inverse)| ColorOutputTransform::Xyb(inverse),
+                )
+            },
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         };
         let reconstruction = ReconstructionPlan::new(config, extent, sources, factors[0], limits)?;
@@ -662,6 +673,7 @@ mod tests {
             for gaborish in [false, true] {
                 for iterations in 0..=3 {
                     let config = ModularColorConfig {
+                        encoded_output: false,
                         noise: None,
                         xyb: None,
                         gaborish: gaborish.then_some(ResidentGaborishWeights::DEFAULT),
@@ -747,6 +759,7 @@ mod tests {
             })
             .collect();
         let config = ModularColorConfig {
+            encoded_output: false,
             noise: None,
             xyb: None,
             gaborish: Some(ResidentGaborishWeights::DEFAULT),

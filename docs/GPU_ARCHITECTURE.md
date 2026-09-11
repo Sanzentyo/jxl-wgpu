@@ -369,6 +369,15 @@ native multi-plane texture object.
 
 ## Animation and concurrency
 
+Physical producers can retain codec components before inverse color conversion for patch
+references. This is an explicit private surface domain, independent of the RGB output layout.
+Patch dictionaries execute in bounded GPU count/validate and command-emission passes; the host
+receives only allocation/status/cursor control. The common executor resumes the remaining
+LF-global body at that cursor, renders ordered patches from four immutable reference versions,
+then converts color and applies ordinary frame composition. Every extra plane remains resident
+through the same stages. The detailed contracts and remaining combination limits are recorded
+in [WGSL memory](WGSL_MEMORY.md#patch-dictionary-and-pre-transform-reference-abi).
+
 Sync and async animation frontends drive one GPU codec state machine. Stream metadata carries the
 timebase, loop count, and whether frame timecodes exist. A frame carries its index, exact duration,
 cumulative presentation-start ticks, optional bitstream timecode, and composed output.

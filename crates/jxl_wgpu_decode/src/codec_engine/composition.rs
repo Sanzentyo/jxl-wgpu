@@ -33,11 +33,13 @@ mod blend;
 mod gpu;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lf_tests;
+mod patches;
 mod progression;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod refinement_tests;
 mod spot;
 mod submission;
+mod transform;
 use gpu::{Compositor, Surface};
 use progression::LfPreview;
 use submission::GpuWork;
@@ -102,6 +104,7 @@ pub(super) fn needs_surface(
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
     modular_rendering
+        || inventory.frames.iter().any(|frame| frame.flags & 2 != 0)
         || numeric_vardct_color
         || ((source_conversion || wide_vardct_output)
             && request.mapping() == crate::GpuOutputMapping::Color)
@@ -142,7 +145,42 @@ struct Carry {
     source: SequenceSource,
     references: [Option<Surface>; 4],
     lf: [Option<LfFrame>; 4],
-    prepared: Option<WgpuDecodeSubmissionSession>,
+    prepared: Option<PreparedPhysical>,
+}
+
+#[derive(Debug)]
+enum PreparedPhysical {
+    Codec(WgpuDecodeSubmissionSession),
+    Patches(Box<patches::Plan>),
+}
+
+impl PreparedPhysical {
+    fn submit(&mut self, source: &SequenceSource) -> Result<(Stage, usize)> {
+        match self {
+            Self::Codec(producer) => {
+                let pending = producer
+                    .submit_next()?
+                    .ok_or(Error::EngineContract("physical producer returned no frame"))?;
+                let count = submission_counter(&pending, producer.submissions_per_frame());
+                let submissions = count.load(Ordering::Acquire);
+                Ok((
+                    Stage::Decode(PhysicalPending {
+                        pending: Box::new(pending),
+                        count,
+                        lf: None,
+                    }),
+                    submissions,
+                ))
+            }
+            Self::Patches(plan) => {
+                let pending = (**plan).clone().submit(
+                    source.engine.backend().clone(),
+                    Arc::clone(&source.codestream),
+                )?;
+                Ok((Stage::PatchDictionary(Box::new(pending)), 1))
+            }
+        }
+    }
 }
 
 impl Carry {
@@ -151,8 +189,56 @@ impl Carry {
         index: usize,
         node: &crate::FrameExecutionNode,
         progressive: bool,
+    ) -> Result<PreparedPhysical> {
+        let frame = &self.source.inventory.frames[index];
+        if frame.flags & 2 != 0 {
+            let limit = self
+                .source
+                .engine
+                .vardct_engine()
+                .stream_window_limit()
+                .map_or(
+                    self.source
+                        .engine
+                        .backend()
+                        .device()
+                        .limits()
+                        .max_storage_buffer_binding_size,
+                    std::num::NonZeroU64::get,
+                );
+            let references = self.references.each_ref().map(|slot| {
+                slot.as_ref().map_or([0; 4], |surface| {
+                    [
+                        surface.extent.width,
+                        surface.extent.height,
+                        1,
+                        u32::from(surface.encoding == FrameSurfaceEncoding::Encoded),
+                    ]
+                })
+            });
+            return Ok(PreparedPhysical::Patches(Box::new(patches::Plan::new(
+                &self.source.codestream,
+                frame,
+                &self.source.inventory.image_header.extra_channels,
+                references,
+                limit,
+            )?)));
+        }
+        self.prepare_codec(index, node, progressive, None)
+            .map(PreparedPhysical::Codec)
+    }
+
+    fn prepare_codec(
+        &self,
+        index: usize,
+        node: &crate::FrameExecutionNode,
+        progressive: bool,
+        patch_end: Option<u64>,
     ) -> Result<WgpuDecodeSubmissionSession> {
-        let mut session = self.source.prepare_physical(index, progressive)?.session;
+        let mut session = self
+            .source
+            .prepare_physical_after_features(index, progressive, patch_end)?
+            .session;
         if let Some(source) = node.lf_source_frame {
             let level = self.source.inventory.frames[index].lf_level;
             let planes = self
@@ -301,8 +387,19 @@ impl DependentSession {
             .map(|preview| {
                 if let Some(encodings) = &carry.source.surface_encodings {
                     let frame = &carry.source.inventory.frames[last];
+                    // LF previews are already inverse-transformed RGB, even when the complete
+                    // physical producer must retain codec components for a future patch.
+                    let encoding = if encodings[last] == FrameSurfaceEncoding::Encoded {
+                        presentation_encoding(
+                            &carry.source.inventory.image_header,
+                            &plan.nodes[last],
+                            frame,
+                        )
+                    } else {
+                        encodings[last]
+                    };
                     preview
-                        .for_surface(Extent2d::new(frame.width, frame.height), encodings[last])
+                        .for_surface(Extent2d::new(frame.width, frame.height), encoding)
                         .map(Arc::new)
                 } else {
                     Ok(Arc::clone(preview))
@@ -315,16 +412,12 @@ impl DependentSession {
                 Some(carry.prepare(physical, &plan.nodes[physical], physical == last)?);
         }
         let producer = carry.prepared.as_mut().expect("physical producer prepared");
-        let pending = producer
-            .submit_next()?
-            .ok_or(Error::EngineContract("physical producer returned no frame"))?;
-        let count = submission_counter(&pending, producer.submissions_per_frame());
+        let (stage, count) = producer.submit(&carry.source)?;
         carry.prepared = None;
         // Nothing leaves the queue until the first physical GPU submission is admitted.
         let carry = shared.carry.take().expect("physical producer admitted");
         shared.in_flight = Some(index);
-        self.submissions
-            .store(count.load(Ordering::Acquire), Ordering::Release);
+        self.submissions.store(count, Ordering::Release);
         Ok(DependentPending {
             shared: Arc::clone(&self.shared),
             carry: Some(carry),
@@ -334,11 +427,8 @@ impl DependentSession {
             first: presentation.physical_frames.start,
             end: presentation.physical_frames.end,
             physical,
-            stage: Some(Stage::Decode(PhysicalPending {
-                pending: Box::new(pending),
-                count,
-                lf: None,
-            })),
+            stage: Some(stage),
+            patches: None,
             submissions: Arc::clone(&self.submissions),
             completed_submissions: 0,
             finished: false,
@@ -357,6 +447,13 @@ fn composed_source(
     plan: &FrameExecutionPlan,
 ) -> Result<(SequenceSource, Arc<Compositor>)> {
     validate(inventory, plan)?;
+    if request.progressive_output() && inventory.frames.iter().any(|frame| frame.flags & 2 != 0) {
+        return Err(UnsupportedProfile::new(
+            UnsupportedCodestreamFeature::Patches,
+            "progressive patch rendering is not yet connected",
+        )
+        .into());
+    }
     let image = &inventory.image_header;
     if inventory
         .frames
@@ -401,20 +498,34 @@ fn composed_source(
                 .iter()
                 .zip(&inventory.frames)
                 .map(|(node, frame)| {
-                    if image.xyb_encoded
-                        && !frame.do_ycbcr
-                        && !node.needs_composition
-                        && (node.save_reference.is_none() || frame.save_before_color_transform)
+                    if frame.flags & 2 != 0
+                        || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {
-                        FrameSurfaceEncoding::Linear
+                        FrameSurfaceEncoding::Encoded
                     } else {
-                        FrameSurfaceEncoding::Srgb
+                        presentation_encoding(image, node, frame)
                     }
                 })
                 .collect(),
         ),
     };
     Ok((source, compositor))
+}
+
+fn presentation_encoding(
+    image: &jxl_gpu_bitstream::ImageHeaderInventory,
+    node: &crate::FrameExecutionNode,
+    frame: &jxl_gpu_bitstream::FrameInventory,
+) -> FrameSurfaceEncoding {
+    if image.xyb_encoded
+        && !frame.do_ycbcr
+        && !node.needs_composition
+        && (node.save_reference.is_none() || frame.save_before_color_transform)
+    {
+        FrameSurfaceEncoding::Linear
+    } else {
+        FrameSurfaceEncoding::Srgb
+    }
 }
 
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
@@ -437,6 +548,31 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
         .into());
     }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
+        if frame.flags & 2 != 0 && frame.frame_type == FrameType::LowFrequency {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::Patches,
+                "patch rendering in LF producer frames is not yet connected",
+            )
+            .into());
+        }
+        if frame.flags & 2 != 0 && (frame.upsampling != 1 || frame.flags & 1 != 0) {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::Patches,
+                "patch rendering with frame upsampling or noise is not yet connected",
+            )
+            .into());
+        }
+        if (frame.flags & 2 != 0
+            || (node.save_reference.is_some() && frame.save_before_color_transform))
+            && frame.do_ycbcr
+            && frame.jpeg_upsampling != [0; 3]
+        {
+            return Err(UnsupportedProfile::new(
+                UnsupportedCodestreamFeature::Patches,
+                "subsampled YCbCr patch components are not yet connected",
+            )
+            .into());
+        }
         if !node.needs_composition {
             continue;
         }
@@ -494,6 +630,11 @@ struct PhysicalPending {
 
 #[derive(Debug)]
 enum RefinementRender {
+    Transform {
+        work: GpuWork,
+        source: Surface,
+        index: usize,
+    },
     Blend(GpuWork),
     Pack(GpuWork),
 }
@@ -521,6 +662,15 @@ struct LfUpdate {
 
 #[derive(Debug)]
 enum Stage {
+    PatchDictionary(Box<patches::Pending>),
+    PatchRender {
+        work: GpuWork,
+        source: Surface,
+    },
+    ColorTransform {
+        work: GpuWork,
+        source: Surface,
+    },
     Decode(PhysicalPending),
     Blend(GpuWork),
     Pack(GpuWork),
@@ -548,6 +698,7 @@ pub(super) struct DependentPending {
     end: usize,
     physical: usize,
     stage: Option<Stage>,
+    patches: Option<patches::Dictionary>,
     submissions: Arc<AtomicUsize>,
     completed_submissions: usize,
     finished: bool,
@@ -644,17 +795,38 @@ impl DependentPending {
                 self.advance()?;
             }
             Output::Composed(compositor) => {
-                let surface = compositor.import(frame.output.outputs)?;
-                if node.needs_composition {
-                    self.stage = Some(Stage::Blend(compositor.blend(
+                let domain = carry
+                    .source
+                    .surface_encodings
+                    .as_ref()
+                    .map(|domains| domains[self.physical]);
+                let surface = compositor.import_with_encoding(frame.output.outputs, domain)?;
+                if let Some(dictionary) = self
+                    .patches
+                    .take()
+                    .filter(|dictionary| dictionary.count != 0)
+                {
+                    let image = &carry.source.inventory.image_header;
+                    let work = patches::render(
+                        carry.source.engine.backend(),
                         &surface,
                         &carry.references,
-                        header,
-                    )?));
-                    self.submissions.fetch_add(1, Ordering::AcqRel);
-                    self.completed_submissions += 1;
+                        &dictionary,
+                        image.extra_channel_count,
+                        image.extra_channels.iter().any(|extra| {
+                            matches!(
+                                extra.channel_type,
+                                jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
+                            )
+                        }),
+                    )?;
+                    self.stage = Some(Stage::PatchRender {
+                        work,
+                        source: surface,
+                    });
+                    self.count_submission();
                 } else {
-                    self.record(surface)?;
+                    self.reconstructed(surface)?;
                 }
             }
         }
@@ -694,17 +866,95 @@ impl DependentPending {
             &self.nodes[self.physical - self.first],
             self.physical + 1 == self.end,
         )?;
-        let pending = prepared
-            .submit_next()?
-            .ok_or(Error::EngineContract("physical producer returned no frame"))?;
-        let count = submission_counter(&pending, prepared.submissions_per_frame());
-        update_count(self.completed_submissions, &count, &self.submissions)?;
-        self.stage = Some(Stage::Decode(PhysicalPending {
-            pending: Box::new(pending),
-            count,
-            lf: None,
-        }));
+        let (stage, count) = prepared.submit(&carry.source)?;
+        self.submissions
+            .store(self.completed_submissions + count, Ordering::Release);
+        self.stage = Some(stage);
         Ok(())
+    }
+
+    fn count_submission(&mut self) {
+        self.submissions.fetch_add(1, Ordering::AcqRel);
+        self.completed_submissions += 1;
+    }
+
+    fn dictionary_decoded(
+        &mut self,
+        dictionary: patches::Dictionary,
+        submissions: usize,
+    ) -> Result<()> {
+        self.completed_submissions += submissions;
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("patch carry was lost"))?;
+        let mut producer = PreparedPhysical::Codec(carry.prepare_codec(
+            self.physical,
+            &self.nodes[self.physical - self.first],
+            self.physical + 1 == self.end,
+            Some(dictionary.end),
+        )?);
+        let (stage, count) = producer.submit(&carry.source)?;
+        self.submissions
+            .store(self.completed_submissions + count, Ordering::Release);
+        self.patches = Some(dictionary);
+        self.stage = Some(stage);
+        Ok(())
+    }
+
+    fn reconstructed(&mut self, surface: Surface) -> Result<()> {
+        if surface.encoding != FrameSurfaceEncoding::Encoded {
+            return self.transformed(surface);
+        }
+        let carry = self
+            .carry
+            .as_mut()
+            .ok_or(Error::EngineContract("patch carry was lost"))?;
+        let node = &self.nodes[self.physical - self.first];
+        let frame = &carry.source.inventory.frames[self.physical];
+        if frame.save_before_color_transform
+            && let Some(slot) = node.save_reference
+        {
+            carry.references[slot as usize] = Some(surface.clone());
+        }
+        if self.physical + 1 != self.end && frame.save_before_color_transform {
+            return self.advance();
+        }
+        let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame);
+        let work = transform::convert(
+            carry.source.engine.backend(),
+            &surface,
+            &carry.source.inventory.image_header,
+            frame,
+            encoding,
+        )?;
+        self.stage = Some(Stage::ColorTransform {
+            work,
+            source: Surface {
+                encoding,
+                ..surface
+            },
+        });
+        self.count_submission();
+        Ok(())
+    }
+
+    fn transformed(&mut self, surface: Surface) -> Result<()> {
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("patch carry was lost"))?;
+        if self.nodes[self.physical - self.first].needs_composition {
+            self.stage = Some(Stage::Blend(self.output.compositor()?.blend(
+                &surface,
+                &carry.references,
+                &carry.source.inventory.frames[self.physical],
+            )?));
+            self.count_submission();
+            Ok(())
+        } else {
+            self.record(surface)
+        }
     }
 
     fn record(&mut self, surface: Surface) -> Result<()> {
@@ -714,10 +964,10 @@ impl DependentPending {
             .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
         let node = &self.nodes[self.physical - self.first];
         let header = &carry.source.inventory.frames[self.physical];
-        if let Some(slot) = node.save_reference {
-            // Pre-transform references belong to patches. Never reinterpret RGB as XYB/YCbCr.
-            carry.references[slot as usize] =
-                (!header.save_before_color_transform).then(|| surface.clone());
+        if !header.save_before_color_transform
+            && let Some(slot) = node.save_reference
+        {
+            carry.references[slot as usize] = Some(surface.clone());
         }
         if self.physical + 1 == self.end {
             self.stage = Some(Stage::Pack(self.output.compositor()?.pack(&surface)?));
@@ -776,6 +1026,40 @@ impl DependentPending {
                 .as_mut()
                 .ok_or(Error::EngineContract("dependent sequence stage was lost"))?;
             match stage {
+                Stage::PatchDictionary(pending) => {
+                    let result = pending.poll(context);
+                    let count = pending.submissions;
+                    self.submissions
+                        .store(self.completed_submissions + count, Ordering::Release);
+                    let dictionary = match result {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    // The body needs only validated commands. Release parser tables/window/history
+                    // before its admission, matching the blocking path's resource lifetime.
+                    self.stage = None;
+                    self.dictionary_decoded(dictionary, count)?;
+                }
+                Stage::PatchRender { work, source } => {
+                    let buffer = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let mut surface = source.clone();
+                    surface.buffer = buffer;
+                    self.stage = None;
+                    self.reconstructed(surface)?;
+                }
+                Stage::ColorTransform { work, source } => {
+                    let buffer = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let mut surface = source.clone();
+                    surface.buffer = buffer;
+                    self.stage = None;
+                    self.transformed(surface)?;
+                }
                 Stage::Decode(PhysicalPending { pending, lf, count }) => {
                     if self.nodes[self.physical - self.first].lf_last_use.is_some() && lf.is_none()
                     {
@@ -841,6 +1125,39 @@ impl DependentPending {
                     };
                     self.stage = None;
                     return Poll::Ready(self.finish(buffer).map(SubmittedGpuUpdate::Complete));
+                }
+                Stage::Refinement {
+                    render:
+                        RefinementRender::Transform {
+                            work,
+                            source,
+                            index,
+                        },
+                    ..
+                } => {
+                    let buffer = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let surface = Surface {
+                        buffer,
+                        ..source.clone()
+                    };
+                    let index = *index;
+                    let Some(Stage::Refinement {
+                        compositor,
+                        resume,
+                        progression,
+                        ..
+                    }) = self.stage.take()
+                    else {
+                        unreachable!()
+                    };
+                    if emit_intermediates {
+                        self.render_refinement(compositor, surface, index, resume, progression)?;
+                    } else {
+                        self.stage = Some(resume.stage());
+                    }
                 }
                 Stage::Refinement {
                     render: RefinementRender::Blend(work),
@@ -948,6 +1265,18 @@ impl DependentPending {
                 .take()
                 .ok_or(Error::EngineContract("dependent sequence stage was lost"))?
             {
+                Stage::PatchDictionary(pending) => {
+                    let (dictionary, count) = pending.wait()?;
+                    self.dictionary_decoded(dictionary, count)?;
+                }
+                Stage::PatchRender { work, mut source } => {
+                    source.buffer = work.wait()?;
+                    self.reconstructed(source)?;
+                }
+                Stage::ColorTransform { work, mut source } => {
+                    source.buffer = work.wait()?;
+                    self.transformed(source)?;
+                }
                 Stage::Decode(PhysicalPending {
                     mut pending,
                     count,
@@ -971,7 +1300,9 @@ impl DependentPending {
                 Stage::Refinement { resume, render, .. } => {
                     // Final-only completion drains the render, then resumes physical execution.
                     // A blend which has not yet been packed needs no additional presentation work.
-                    let (RefinementRender::Blend(work) | RefinementRender::Pack(work)) = render;
+                    let (RefinementRender::Transform { work, .. }
+                    | RefinementRender::Blend(work)
+                    | RefinementRender::Pack(work)) = render;
                     drop(work.wait()?);
                     self.stage = Some(resume.stage());
                 }
@@ -987,7 +1318,12 @@ impl DependentPending {
     /// Render against committed references without publishing a new reference version.
     fn refine(&mut self, frame: GpuImageFrame, progression: FrameProgression) -> Result<()> {
         let compositor = self.output.compositor()?;
-        let surface = compositor.import(frame.outputs)?;
+        let domain = self
+            .carry
+            .as_ref()
+            .and_then(|carry| carry.source.surface_encodings.as_ref())
+            .map(|encodings| encodings[self.physical]);
+        let surface = compositor.import_with_encoding(frame.outputs, domain)?;
         let Some(Stage::Decode(decode)) = self.stage.take() else {
             return Err(Error::EngineContract(
                 "refinement has no pending physical producer",
@@ -1014,7 +1350,25 @@ impl DependentPending {
             .carry
             .as_ref()
             .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
-        let render = if self.nodes[index - self.first].needs_composition {
+        let node = &self.nodes[index - self.first];
+        let frame = &carry.source.inventory.frames[index];
+        let render = if surface.encoding == FrameSurfaceEncoding::Encoded {
+            let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame);
+            RefinementRender::Transform {
+                work: transform::convert(
+                    carry.source.engine.backend(),
+                    &surface,
+                    &carry.source.inventory.image_header,
+                    frame,
+                    encoding,
+                )?,
+                source: Surface {
+                    encoding,
+                    ..surface
+                },
+                index,
+            }
+        } else if node.needs_composition {
             RefinementRender::Blend(compositor.blend(
                 &surface,
                 &carry.references,

@@ -26,8 +26,8 @@ mod tests;
 pub(super) struct Surface {
     pub(super) buffer: GpuBufferLease,
     pub(super) extent: Extent2d,
-    plane_words: u32,
-    encoding: FrameSurfaceEncoding,
+    pub(super) plane_words: u32,
+    pub(super) encoding: FrameSurfaceEncoding,
 }
 
 #[repr(C, align(16))]
@@ -315,14 +315,24 @@ impl Compositor {
         })
     }
 
-    pub(super) fn import(&self, mut outputs: Vec<GpuImageOutput>) -> Result<Surface> {
+    pub(super) fn import(&self, outputs: Vec<GpuImageOutput>) -> Result<Surface> {
+        self.import_with_encoding(outputs, None)
+    }
+
+    pub(super) fn import_with_encoding(
+        &self,
+        mut outputs: Vec<GpuImageOutput>,
+        domain: Option<FrameSurfaceEncoding>,
+    ) -> Result<Surface> {
         let first = outputs.first().ok_or(Error::EngineContract(
             "physical producer returned no surface",
         ))?;
         let extent = first.layout.extent;
-        let encoding = FrameSurfaceEncoding::from_format(&first.layout.format).ok_or(
-            Error::EngineContract("physical producer returned an unknown RGB surface encoding"),
-        )?;
+        let encoding = domain
+            .or_else(|| FrameSurfaceEncoding::from_format(&first.layout.format))
+            .ok_or(Error::EngineContract(
+                "physical producer returned an unknown RGB surface encoding",
+            ))?;
         let expected = FrameSurfaceLayout::with_encoding(
             extent,
             self.extras.len(),
@@ -366,6 +376,13 @@ impl Compositor {
         references: &[Option<Surface>; 4],
         frame: &FrameInventory,
     ) -> Result<GpuWork> {
+        let references: &[Option<Surface>; 4] = &std::array::from_fn(|index| {
+            std::iter::once(&frame.color_blend)
+                .chain(&frame.extra_channel_blends)
+                .any(|blend| blend.source as usize == index)
+                .then(|| references[index].clone())
+                .flatten()
+        });
         if foreground.encoding != FrameSurfaceEncoding::Srgb
             || references
                 .iter()
@@ -437,6 +454,11 @@ impl Compositor {
     }
 
     pub(super) fn pack(&self, source: &Surface) -> Result<GpuWork> {
+        if source.encoding == FrameSurfaceEncoding::Encoded {
+            return Err(Error::EngineContract(
+                "codec components cannot be presented as RGB",
+            ));
+        }
         if source.extent != self.canvas
             || source.plane_words != (self.surface.plane_bytes / 4) as u32
         {
@@ -475,7 +497,7 @@ impl Compositor {
     }
 }
 
-fn pipeline(
+pub(super) fn pipeline(
     device: &wgpu::Device,
     label: &str,
     source: &str,
@@ -512,7 +534,7 @@ fn aligned(size: u64) -> Result<u64> {
         .ok_or_else(address_error)
 }
 
-fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
+pub(super) fn dispatch(device: &wgpu::Device, elements: u64) -> Result<[u32; 2]> {
     let limit = u64::from(device.limits().max_compute_workgroups_per_dimension);
     if elements == 0 || limit == 0 {
         return Err(Error::EngineContract(

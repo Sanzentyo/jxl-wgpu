@@ -224,7 +224,7 @@ pub(super) const fn completion_fence_bytes() -> u64 {
 }
 
 #[derive(Debug, Default)]
-struct Completion {
+pub(super) struct Completion {
     state: Mutex<CompletionState>,
     condition: Condvar,
 }
@@ -235,7 +235,7 @@ struct CompletionState {
 }
 
 impl Completion {
-    fn complete(&self, result: std::result::Result<(), String>) {
+    pub(super) fn complete(&self, result: std::result::Result<(), String>) {
         let waker = {
             let mut state = super::lock(&self.state);
             if state.result.is_some() {
@@ -249,7 +249,7 @@ impl Completion {
             waker.wake();
         }
     }
-    fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
+    pub(super) fn poll(&self, context: &Context<'_>) -> Poll<Result<()>> {
         let mut state = super::lock(&self.state);
         if let Some(result) = state.result.as_ref() {
             return Poll::Ready(result.clone().map_err(Error::backend));
@@ -258,7 +258,7 @@ impl Completion {
         Poll::Pending
     }
     #[cfg(not(target_arch = "wasm32"))]
-    fn wait(&self) -> Result<()> {
+    pub(super) fn wait(&self) -> Result<()> {
         let mut state = super::lock(&self.state);
         while state.result.is_none() {
             state = self

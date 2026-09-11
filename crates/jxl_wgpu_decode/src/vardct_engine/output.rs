@@ -163,7 +163,14 @@ pub(super) fn prepare_presentation(
     let output_config = ColorOutputConfig {
         extent: Extent2d::new(profile.output_width, profile.output_height),
         orientation,
-        transform: output_transform,
+        transform: if request.retains_frame_surface()
+            && request.frame_surface_encoding()
+                == crate::frame_surface::FrameSurfaceEncoding::Encoded
+        {
+            ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709)
+        } else {
+            output_transform
+        },
         alpha_conversion: if profile.lf_level != 0 {
             jxl_wgpu::AlphaConversion::Preserve
         } else {

@@ -233,6 +233,8 @@ pub enum Error {
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),
     #[error("GPU decode backend failed: {0}")]
     Backend(String),
+    #[error("GPU patch dictionary validation failed with code {code}")]
+    PatchDictionary { code: u32 },
     #[error(
         "the bounded entropy stream window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
     )]

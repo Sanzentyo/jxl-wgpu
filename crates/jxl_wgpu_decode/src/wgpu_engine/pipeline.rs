@@ -465,6 +465,15 @@ impl WgpuSubmissionEngine {
             .is_none()
             .then_some(profile.color_render.clone())
             .flatten();
+        let color_render = if request.retains_frame_surface()
+            && request.frame_surface_encoding()
+                == crate::frame_surface::FrameSurfaceEncoding::Encoded
+        {
+            output.transfer = 0;
+            color_render.map(crate::modular_render::ModularColorConfig::for_encoded_output)
+        } else {
+            color_render
+        };
         if profile.progressive_dc.is_some() {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
                 &frame.inverse_plan
