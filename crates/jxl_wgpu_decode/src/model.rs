@@ -523,9 +523,10 @@ impl GpuOutputRequest {
         self.image
     }
 
-    /// Requests intermediate images at validated LF-frame and coefficient-pass boundaries. Consume
-    /// them with `GpuDecodeSession::next_update` or its async counterpart. Frames without a
-    /// supported intermediate boundary still return their final image.
+    /// Requests intermediate images at validated LF-frame, coefficient-pass and Modular residual
+    /// boundaries. Consume them with `GpuDecodeSession::next_update` or its async counterpart.
+    /// Composed updates retain presentation timing and committed references, including numeric
+    /// output. Frames without an available intermediate image still return their final image.
     #[must_use]
     pub const fn with_progressive_output(mut self, enabled: bool) -> Self {
         self.progressive_output = enabled;

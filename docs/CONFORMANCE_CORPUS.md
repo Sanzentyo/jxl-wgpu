@@ -2900,3 +2900,74 @@ Gray8 U8 CPU readback directly maps all 221 logical bytes with zero staging byte
 
 MOD-D04 and API-03 remain Partial: broader transform/side-image combinations and composed updates
 remain open, as do the other full JPEG XL decoder, encoder and conformance gates.
+
+### Composed Modular and numeric pass images (2026-09-11)
+
+The common compositor now forwards progressive requests for native integer and scalar F32
+selection. Modular global/LF and residual-pass images and VarDCT numeric extra images use the
+same immutable surface import, committed reference versions, blend and final output packer as
+color updates. Hidden and overwritten physical producers validate before a presentation's first
+update; only completed physical frames replace references. No shaders, ABI layouts, production
+CPU codec or dependencies were added.
+
+`cargo run -p jxl_wgpu_decode --example regenerate_modular_composition` uses offline libjxl 0.12.0
+to reproduce three native two-pass animations in `test-data/modular_composition`. Each 2051×17
+canvas contains nine physical layers and six presentations, with negative/oversized/off-canvas
+crops, hidden layers, all five blend modes and independent associated-alpha references. The floating
+fixture uses exact quarter-valued samples and independent color/alpha exponent counts. Its alpha
+precision leaves working bits for the native encoder's responsive Squeeze transform, so tested
+global/LF boundaries contain samples. A stream without such samples still defers publication until
+its first nonempty pass; a declared pass count alone does not guarantee an intermediate image.
+
+| Fixture | Source precision / orientation | Transport bytes | Transport SHA-256 |
+|---|---|---:|---|
+| modular_pass_rgb.jxl.hex | RGB8 / 6 | 328,222 | 12333ec736386c0545766df4656bf913a208af29595bb979b6528838d5277087 |
+| modular_pass_gray_alpha.jxl.hex | Gray16 + associated integer alpha5 / 8 | 63,941 | 22d5d2ea5dabb4da17addce4e958ee45ed199a7bb3986111da20b75ed69fc889 |
+| modular_pass_float.jxl.hex | Gray16/exponent5 + associated alpha24/exponent7 / 5 | 80,212 | 2fb2964ff721e01c4dd6c6d6f9d5796d101b934fa1c7a9f6f639d478bbaa9db6 |
+
+The generator also writes 27 standalone image/frame header fragments, totaling 1,882 bytes.
+Container normalization precedes section addressing. Inserting each animation layer's unchanged
+entropy into its standalone headers must reproduce the independently encoded native raw codestream
+exactly. All three transports and 27 headers regenerate byte-for-byte. Existing associated VarDCT
+fixtures and standalone headers provide a fourth family without duplicating its entropy.
+
+`tests/common/composed_oracle.rs` combines native standalone prefix flushes with independent F64
+encoded-sRGB crop/reference/associated-alpha blending. Each scalar final must also agree with the
+original native coalesced animation within 3e-6 normalized error. This avoids relying on native
+FlushImage support for unfinished cropped/blended frames. Both coding modes use the original
+color and alpha reference selectors; intermediate images never enter the reference history.
+
+`composed_modular_and_numeric_updates_match_independent_native_layers` runs 12 output selections
+with Apply/Keep orientation and whole/40-byte GPU windows, for 48 configurations and 936 returned
+images. Bounded sessions use 137-byte transport chunks and asynchronous update delivery. The matrix
+covers RGBA F32, normalized integer alpha/gray F32, native integer alpha5/gray16 and floating
+alpha/gray F32. Every metadata field, physical ID, progression kind, intended detail, finality and
+presentation count is checked. Final output equals final-only GPU bytes exactly; all whole/bounded
+images agree byte-for-byte, and retained images are re-read unchanged after the last presentation.
+Maximum normalized error on Apple M5 is 1.378e-7 for both Modular color and numeric F32, below the
+3e-6 bound. VarDCT color reaches 0.000299 under its existing 0.001 composition bound; numeric
+VarDCT extras use the tighter 3e-6 bound. Native integer error is at most one Gray16 code, with
+alpha5 exact and all high padding bits zero. The VarDCT color bound is not ISO precision evidence.
+
+Two public lifecycle tests cover 24 admission-retry/cancellation/final-only transitions and eight
+late-pass/hidden-frame corruptions across all four families. Later errors retain earlier validated
+images, publish no image from a failing hidden producer, and poison subsequent update/final calls.
+The private submitted-composition test exercises 48 deterministic cases at direct pack, blend and
+post-blend pack: cancellation, blocking/async final completion and allocation failure for each
+family. Source scratch may retire between public updates and fund later composition allocations,
+so pressure is forced immediately before the actual allocation. Only held image bytes survive
+session/callback retirement; dropping them returns both GPU and input reservations to zero.
+
+The full JPEG XL goal remains active. Composed F64, VarDCT numeric color output, LF previews with
+extras, broader LF/transform/source-color/precision conformance, selective regions and incomplete
+frame input remain open, along with encoder syntax and quality gates. META-03, MOD-D04, VDCT-D06,
+FRAME-03 and API-03 remain Partial.
+
+Final local validation passes 824 tests across 44 all-feature/all-target workspace targets on
+Apple M5/Metal, with zero failures and one existing ignored manual latency benchmark. The three
+new public tests and expanded submission-stage unit pass in that complete run. Formatting,
+warnings-denied Clippy, Rust 1.89, six-crate all-feature WebAssembly checking and warnings-denied
+rustdoc pass. Reference and Metal harnesses each pass 18/18 cases; Reference creates no adapter.
+Gray8 U8 readback directly maps all 221 logical bytes with zero staging bytes. All 30 new fixture
+files regenerate exactly. The 14 existing normal/associated composition fixtures and all 36
+existing progressive-composition header fragments also regenerate unchanged.

@@ -9,10 +9,9 @@ use jxl_wgpu_encode::{
 pub mod hex;
 
 pub fn headers(data: &[u8]) -> String {
-    let inventory = jxl_gpu_bitstream::parse(data, Default::default())
-        .unwrap()
-        .codestream_inventory(Default::default())
-        .unwrap();
+    let parsed = jxl_gpu_bitstream::parse(data, Default::default()).unwrap();
+    let data = parsed.codestream();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
     let end = inventory.frames[0].header_bits.offset as usize / 8;
     let mut result = format!("image {}\n", hex::hex(&data[..end]).replace('\n', ""));
     for frame in &inventory.frames {
@@ -32,6 +31,8 @@ pub fn headers(data: &[u8]) -> String {
 }
 
 pub fn reframe(data: &[u8], frames: &[FrameInventory], headers: &str) -> Vec<u8> {
+    let parsed = jxl_gpu_bitstream::parse(data, Default::default()).unwrap();
+    let data = parsed.codestream();
     let mut lines = headers.lines();
     let mut result = hex::unhex(lines.next().unwrap().strip_prefix("image ").unwrap());
     for source in frames {
@@ -82,10 +83,7 @@ pub fn reframe(data: &[u8], frames: &[FrameInventory], headers: &str) -> Vec<u8>
         );
     }
     assert!(lines.next().is_none());
-    let original = jxl_gpu_bitstream::parse(data, Default::default())
-        .unwrap()
-        .codestream_inventory(Default::default())
-        .unwrap();
+    let original = parsed.codestream_inventory(Default::default()).unwrap();
     let standalone = jxl_gpu_bitstream::parse(&result, Default::default())
         .unwrap()
         .codestream_inventory(Default::default())

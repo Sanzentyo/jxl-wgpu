@@ -4,9 +4,7 @@
 use super::*;
 use jxl_gpu_bitstream::{CodestreamInventory, FrameBlendMode, FrameType};
 
-#[allow(dead_code)]
-#[path = "../../common/progressive_layers.rs"]
-pub(super) mod layers;
+pub(super) use common::progressive_layers as layers;
 
 pub(super) fn present(pixels: &[f64], width: usize, height: usize, orientation: u32) -> Vec<u8> {
     let mut output = vec![0; pixels.len() * 4];

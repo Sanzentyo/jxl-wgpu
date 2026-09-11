@@ -23,7 +23,7 @@ fn references(pending: &DependentPending) -> [Option<wgpu::Buffer>; 4] {
 
 // Drive real hidden producers and stop at the exact submitted refinement boundary. This avoids
 // relying on a poll happening to catch a short GPU blend or pack before its callback completes.
-fn refine(pending: &mut DependentPending) {
+fn next_intermediate(pending: &mut DependentPending) -> (GpuImageFrame, FrameProgression) {
     while pending.physical + 1 != pending.end {
         match pending.stage.take().unwrap() {
             Stage::Decode(PhysicalPending {
@@ -63,18 +63,89 @@ fn refine(pending: &mut DependentPending) {
     )
     .unwrap();
     let SubmittedGpuUpdate::Intermediate { frame, progression } = update else {
-        panic!("expected DC update")
+        panic!("expected initial physical-frame update")
     };
-    assert!(matches!(
-        progression,
-        FrameProgression::Coefficients {
-            completed_passes: 0,
-            ..
+    assert_eq!(progression.completed_passes(), Some(0));
+    (frame.output, progression)
+}
+
+fn require_allocation_failure<T>(backend: &WgpuBackend, operation: impl FnOnce() -> Result<T>) {
+    let memory = backend.transient_memory_budget();
+    let blocker = memory
+        .try_reserve(memory.snapshot().available_bytes)
+        .unwrap();
+    let error = match operation() {
+        Ok(_) => panic!("composition allocated with no available budget"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Error::MemoryBackpressure(_)), "{error:?}");
+    drop(blocker);
+}
+
+fn exercise_pending(
+    mut pending: DependentPending,
+    backend: &WgpuBackend,
+    boundary: usize,
+    action: usize,
+    expected: &(FrameMetadata, Vec<u8>),
+) {
+    let (frame, progression) = next_intermediate(&mut pending);
+    let before = references(&pending);
+    if action == 3 && boundary != 2 {
+        // Stop after producer validation but before any composition allocation. A public update
+        // may legitimately free producer scratch and use those bytes for its following snapshot.
+        require_allocation_failure(backend, || pending.refine(frame, progression));
+        assert_eq!(references(&pending), before);
+        return;
+    }
+    pending.refine(frame, progression).unwrap();
+    assert_eq!(references(&pending), before);
+    assert!(
+        matches!(&pending.stage,
+        Some(Stage::Refinement { render: RefinementRender::Pack(_), .. }) if boundary == 0)
+            || matches!(&pending.stage, Some(Stage::Refinement { render: RefinementRender::Blend(_), .. }) if boundary != 0)
+    );
+    if boundary == 2 {
+        let Some(Stage::Refinement {
+            resume,
+            render: RefinementRender::Blend(work),
+            progression,
+        }) = pending.stage.take()
+        else {
+            unreachable!()
+        };
+        let compositor = pending.output.compositor().unwrap();
+        let surface = compositor.completed_surface(work.wait().unwrap());
+        if action == 3 {
+            require_allocation_failure(backend, || compositor.pack(&surface));
+            assert_eq!(references(&pending), before);
+            return;
         }
+        pending.stage = Some(Stage::Refinement {
+            resume,
+            render: RefinementRender::Pack(compositor.pack(&surface).unwrap()),
+            progression,
+        });
+        pending.submissions.fetch_add(1, Ordering::AcqRel);
+        pending.completed_submissions += 1;
+    }
+    assert!(matches!(
+        pending.unvalidated(),
+        Err(Error::UnvalidatedOutputNotSubmitted)
     ));
-    let before = references(pending);
-    pending.refine(frame.output, progression).unwrap();
-    assert_eq!(references(pending), before);
+    if action == 0 {
+        return;
+    }
+    let frame = if action == 1 {
+        pending.wait().unwrap()
+    } else {
+        let frame =
+            pollster::block_on(std::future::poll_fn(|context| pending.poll(context))).unwrap();
+        drop(pending);
+        frame
+    };
+    assert_eq!(frame.metadata, expected.0);
+    assert_eq!(bytes(&frame.output, backend), expected.1);
 }
 
 #[test]
@@ -84,22 +155,58 @@ fn submitted_composition_refinements_preserve_references_cancel_and_drain_final_
         Err(jxl_wgpu::Error::NoAdapter) => return,
         Err(error) => panic!("{error:?}"),
     };
-    let hex = include_str!("../../../test-data/composition_vardct.jxl.hex");
+    for (hex, numeric) in [
+        (
+            include_str!("../../../test-data/composition_vardct.jxl.hex"),
+            false,
+        ),
+        (
+            include_str!("../../../test-data/modular_composition/modular_pass_rgb.jxl.hex"),
+            false,
+        ),
+        (
+            include_str!("../../../test-data/modular_composition/modular_pass_gray_alpha.jxl.hex"),
+            true,
+        ),
+        (
+            include_str!("../../../test-data/modular_composition/modular_pass_float.jxl.hex"),
+            true,
+        ),
+    ] {
+        exercise_submitted_refinements(&backend, hex, numeric);
+    }
+}
+
+fn exercise_submitted_refinements(backend: &WgpuBackend, hex: &str, numeric: bool) {
     let compact = hex.split_whitespace().collect::<String>();
-    let data: Arc<[u8]> = compact
+    let encoded: Vec<u8> = compact
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect::<Vec<_>>()
-        .into();
-    let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
-        .unwrap()
-        .codestream_inventory(Default::default())
-        .unwrap();
+        .collect();
+    let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
+    let data: Arc<[u8]> = Arc::from(parsed.codestream());
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
     let plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
-    let request = GpuOutputRequest::color(crate::vardct_rgb8_format())
+    let request = if numeric {
+        GpuOutputRequest::numeric(
+            jxl_gpu_formats::vpi::VpiPitchLinearFormat::F32.pixel_format(),
+            match inventory.image_header.extra_channels[0].bit_depth {
+                jxl_gpu_bitstream::SampleBitDepth::Integer { .. } => {
+                    crate::NumericSampleMapping::NormalizedUnsigned
+                }
+                jxl_gpu_bitstream::SampleBitDepth::Float { .. } => {
+                    crate::NumericSampleMapping::NativeFloat
+                }
+            },
+        )
         .unwrap()
-        .with_progressive_output(true);
+        .with_extra_channel(0)
+        .unwrap()
+    } else {
+        GpuOutputRequest::color(crate::vardct_rgb8_format()).unwrap()
+    }
+    .with_progressive_output(true);
     let source = Arc::new(GpuCodestream::from_shared(data.clone(), 0..data.len(), false).unwrap());
     let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
     let mut baseline =
@@ -107,71 +214,32 @@ fn submitted_composition_refinements_preserve_references_cancel_and_drain_final_
     let expected: Vec<_> = (0..2)
         .map(|i| {
             let frame = baseline.submit(&plan, i).unwrap().wait().unwrap();
-            (frame.metadata, bytes(&frame.output, &backend))
+            (frame.metadata, bytes(&frame.output, backend))
         })
         .collect();
     drop(baseline);
     for boundary in 0..3 {
         let presentation = usize::from(boundary != 0);
-        for action in 0..3 {
+        for action in 0..4 {
             let mut session =
                 DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan)
                     .unwrap();
             for i in 0..presentation {
                 drop(session.submit(&plan, i).unwrap().wait().unwrap());
             }
-            let mut pending = session.submit(&plan, presentation).unwrap();
-            refine(&mut pending);
-            assert!(
-                matches!(&pending.stage,
-                Some(Stage::Refinement { render: RefinementRender::Pack(_), .. }) if boundary == 0)
-                    || matches!(&pending.stage, Some(Stage::Refinement { render: RefinementRender::Blend(_), .. }) if boundary != 0)
+            exercise_pending(
+                session.submit(&plan, presentation).unwrap(),
+                backend,
+                boundary,
+                action,
+                &expected[presentation],
             );
-            if boundary == 2 {
-                let Some(Stage::Refinement {
-                    resume,
-                    render: RefinementRender::Blend(work),
-                    progression,
-                }) = pending.stage.take()
-                else {
-                    unreachable!()
-                };
-                let compositor = pending.output.compositor().unwrap();
-                let surface = compositor.completed_surface(work.wait().unwrap());
-                pending.stage = Some(Stage::Refinement {
-                    resume,
-                    render: RefinementRender::Pack(compositor.pack(&surface).unwrap()),
-                    progression,
-                });
-                pending.submissions.fetch_add(1, Ordering::AcqRel);
-                pending.completed_submissions += 1;
-            }
-            let before = references(&pending);
-            // An intermediate pack is intentionally absent from final-output escape hatches.
-            assert!(matches!(
-                pending.unvalidated(),
-                Err(Error::UnvalidatedOutputNotSubmitted)
-            ));
-            if action == 0 {
-                drop(pending);
+            if matches!(action, 0 | 3) {
                 assert!(matches!(
                     session.submit(&plan, presentation),
                     Err(Error::SessionPoisoned)
                 ));
-            } else {
-                let frame = if action == 1 {
-                    pending.wait().unwrap()
-                } else {
-                    let frame =
-                        pollster::block_on(std::future::poll_fn(|context| pending.poll(context)))
-                            .unwrap();
-                    drop(pending);
-                    frame
-                };
-                assert_eq!(frame.metadata, expected[presentation].0);
-                assert_eq!(bytes(&frame.output, &backend), expected[presentation].1);
             }
-            drop(before);
             drop(session);
             let memory = backend.transient_memory_budget();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

@@ -8,6 +8,9 @@ mod lifecycle;
 #[path = "progression_schedules.rs"]
 mod schedules;
 
+#[path = "progression_composition.rs"]
+mod composition;
+
 fn fixture(width: u32, height: u32) -> Option<Vec<u8>> {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if Command::new("cjxl").arg("--version").output().is_err() {

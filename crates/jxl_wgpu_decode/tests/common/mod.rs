@@ -443,5 +443,7 @@ pub fn jpeg_dc_edge_case(selectors: &str) -> Vec<u8> {
     })
 }
 
+pub mod composed_oracle;
 pub mod modular_passes;
+pub mod progressive_layers;
 pub mod progressive_oracle;

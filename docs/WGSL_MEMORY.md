@@ -1037,3 +1037,22 @@ The complete 1–11 pass range uses the same accounting. Boundaries before any s
 allocate snapshots. Eleven-pass Squeeze reconstruction admits eleven intermediate images plus the
 final output under an exact shared byte limit. Tests using 40-byte windows, cancellation and a late
 corrupt pass preserve held-image charges and retire all other reservations.
+
+### Composed Modular and numeric pass images
+
+The common compositor forwards progression to its canonical color/extra surface producer for
+both color and numeric output requests. Modular global/LF and residual-pass snapshots use the same
+immutable import, committed-reference blend and independent pack stages as VarDCT coefficients.
+Native integer and scalar F32 packing select the requested plane after composition. Only complete
+physical frames write reference slots; intermediate images retain the presentation's timing and
+logical frame slot. Existing surface, blend and output shader layouts are unchanged.
+
+Source scratch can retire between public updates, making those bytes available for a later blend
+or pack. Deterministic tests therefore exhaust the shared budget immediately before the actual
+allocation, after producer validation or blend completion. All 48 direct-pack, blend and post-blend
+pack cases cover cancellation, blocking/async final completion and forced allocation failure across
+VarDCT, integer Modular and floating Modular surfaces. Failed or cancelled continuations poison the
+presentation; submitted work keeps its leases until callbacks retire. Public tests additionally
+cover 24 cancellation/final-only transitions and eight late-pass/hidden-producer corruptions through
+40-byte windows. Previously returned images stay byte-identical, only their output charges survive
+session retirement, and dropping those images returns GPU and source reservations to zero.

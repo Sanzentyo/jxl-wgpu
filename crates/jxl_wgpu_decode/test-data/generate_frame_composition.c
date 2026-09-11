@@ -15,6 +15,7 @@ static size_t jpeg_size;
 static int associated;
 /* Offline standalone headers for testing progressive composition without FlushImage blending. */
 static int isolated_layer = -1;
+static int modular_progressive = 0;
 
 typedef struct {
   int x, y;
@@ -39,13 +40,16 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
   JxlEncoder* enc = JxlEncoderCreate(NULL);
   JxlBasicInfo info;
   JxlEncoderInitBasicInfo(&info);
+  int floating = modular_progressive && strcmp(name, "modular_pass_float") == 0;
   info.xsize = isolated_layer < 0 ? width : layers[isolated_layer].width; info.ysize = isolated_layer < 0 ? height : layers[isolated_layer].height; info.bits_per_sample = bits;
+  info.exponent_bits_per_sample = floating ? 5 : 0;
   int different_alpha = channels == 2 || strcmp(name, "rgba_mixed_depth") == 0 || associated;
   uint32_t color_channels = channels <= 2 ? 1 : 3;
   int has_alpha = channels != color_channels;
-  uint32_t alpha_bits = has_alpha ? (different_alpha ? 5 : bits) : 0;
+  uint32_t alpha_bits = has_alpha ? (floating ? 24 : different_alpha ? 5 : bits) : 0;
   info.num_color_channels = color_channels;
   info.num_extra_channels = has_alpha; info.alpha_bits = alpha_bits;
+  info.alpha_exponent_bits = floating ? 7 : 0;
   info.alpha_premultiplied = associated;
   info.uses_original_profile = vardct <= 0; info.orientation = (JxlOrientation)orientation;
   info.have_animation = !still && isolated_layer < 0;
@@ -61,7 +65,7 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
     size_t bytes = (size_t)layer->width * layer->height * channels * (different_alpha ? 4 : bits > 8 ? 2 : 1);
     void* pixels = malloc(bytes);
     uint32_t mask = (1u << bits) - 1;
-    uint32_t alpha_mask = has_alpha ? (1u << alpha_bits) - 1 : mask;
+    uint32_t alpha_mask = has_alpha && !floating ? (1u << alpha_bits) - 1 : mask;
     for (uint32_t y = 0; y < layer->height; ++y) for (uint32_t x = 0; x < layer->width; ++x) {
       const uint32_t values[4] = {
         (613*x + 107*y + 43*(x^y) + 193*frame) & mask,
@@ -72,14 +76,15 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
       for (uint32_t c = 0; c < channels; ++c) {
         size_t pos = ((size_t)y*layer->width + x)*channels + c;
         uint32_t canonical = channels == 2 && c == 1 ? 3 : c;
-        if (different_alpha) ((float*)pixels)[pos] = (float)values[canonical] / (float)(canonical == 3 ? alpha_mask : mask);
+        if (floating) ((float*)pixels)[pos] = 0.25f * (float)((values[canonical] >> (canonical == 3 ? 4 : 2)) & 3);
+        else if (different_alpha) ((float*)pixels)[pos] = (float)values[canonical] / (float)(canonical == 3 ? alpha_mask : mask);
         else if (bits > 8) ((uint16_t*)pixels)[pos] = values[c];
         else ((uint8_t*)pixels)[pos] = values[c];
       }
     }
     JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, NULL);
     int jpeg_frame = vardct < 0 && frame == 3;
-    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, dc ? 4 : 1));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, modular_progressive ? 9 : dc ? 4 : 1));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, vardct <= 0 && !jpeg_frame));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PATCHES, 0));
     if (associated) check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1));
@@ -91,6 +96,11 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
       check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_DC, layer_dc));
     } else if (!jpeg_frame) {
       check(JxlEncoderSetFrameLossless(settings, JXL_TRUE));
+      if (modular_progressive) {
+        check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, 1));
+        check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
+        check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_GROUP_ORDER, 0));
+      }
       if (!different_alpha) {
         JxlBitDepth depth = {JXL_BIT_DEPTH_FROM_CODESTREAM, bits, 0};
         check(JxlEncoderSetFrameBitDepth(settings, &depth));
@@ -146,6 +156,17 @@ static void generate(const char* dir, const char* name, uint32_t width, uint32_t
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--modular-progressive")) {
+    modular_progressive = 1;
+    for (isolated_layer = -1; isolated_layer < 9; ++isolated_layer) {
+      associated = 0;
+      generate(argv[1], "modular_pass_rgb", 2051, 17, 3, 8, isolated_layer < 0 ? 6 : 1, 0, 0, 0);
+      associated = 1;
+      generate(argv[1], "modular_pass_gray_alpha", 2051, 17, 2, 16, isolated_layer < 0 ? 8 : 1, 0, 0, 0);
+      generate(argv[1], "modular_pass_float", 2051, 17, 2, 16, isolated_layer < 0 ? 5 : 1, 0, 0, 0);
+    }
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--progressive-layers")) {
     for (isolated_layer = 0; isolated_layer < 9; ++isolated_layer) {
       generate(argv[1], "vardct", 259, 17, 3, 8, 1, 1, 0, 1);

@@ -1,36 +1,14 @@
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
 
 #[path = "offline/hex.rs"]
 mod hex;
 pub use hex::{hex, unhex};
 
-pub fn run(command: &mut Command) -> Output {
-    let output = command.output().expect("run offline fixture tool");
-    assert!(
-        output.status.success(),
-        "{command:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-pub fn compile(source: &Path, binary: &Path, libraries: &[&str]) {
-    let flags = run(Command::new("pkg-config")
-        .args(["--cflags", "--libs"])
-        .args(libraries));
-    run(Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(source)
-        .args(
-            std::str::from_utf8(&flags.stdout)
-                .unwrap()
-                .split_whitespace(),
-        )
-        .arg("-o")
-        .arg(binary));
-}
+#[path = "offline/process.rs"]
+mod process;
+pub use process::{compile, run};
 
 pub fn float_hex(bytes: &[u8]) -> String {
     assert!(bytes.len().is_multiple_of(4));

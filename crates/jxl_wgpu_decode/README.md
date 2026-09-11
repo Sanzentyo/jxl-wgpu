@@ -115,7 +115,8 @@ composed presentations. Each presentation validates all overwritten/hidden produ
 refinements from its final Regular physical frame. The compositor blends each immutable producer
 snapshot against the committed reference versions and then applies output color conversion and
 orientation. Only complete physical frames update reference slots. Modular color and numeric
-frames expose global/LF and residual-pass images; SkipProgressive frames return final images.
+frames expose global/LF and residual-pass images through the same compositor, including native
+integer and scalar F32 selection. SkipProgressive frames return final images.
 Color-only LF-dependent presentations, including composed animations, can additionally publish their
 completed Modular/VarDCT LF dependencies.
 Input must still be complete for `open` or `stream(...).finish()`; this is independent of early
@@ -219,8 +220,18 @@ still advance the completed-pass metadata. Forty plain/Squeeze schedules compare
 and native integer output with source codes. Eleven-pass tests also cover 40-byte entropy windows,
 exact-budget retry, cancellation and late corruption.
 
+Composed Modular snapshots use the common post-transform reference/blend/pack path. Native integer
+and scalar F32 requests now receive the same intermediate images as color requests, including
+VarDCT numeric extras. Three native two-pass animations cover RGB8, Gray16 with associated alpha5,
+and floating Gray16/exponent5 with associated alpha24/exponent7. Independent standalone layer
+flushes plus F64 crop/reference composition verify all five blend modes across nine layers and six
+presentations. The 48 output/orientation/window configurations check 936 images, retained leases,
+exact timing and final-only equality. Cancellation, late entropy rejection and forced allocation
+failure also preserve prior images and retire all other reservations. Composed F64 and VarDCT
+numeric color-channel requests remain unsupported.
+
 The remaining progressive work includes broader LF conformance, LF previews with extra channels,
-composed numeric refinements, broader Modular transform/header combinations, selective regions, and
+broader Modular transform/header combinations, selective regions, and
 incomplete-frame input readiness.
 Native-comparison precision remains a separate conformance gate.
 

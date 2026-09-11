@@ -369,9 +369,7 @@ fn composed_source(
         crate::vardct_rgb8_format().color_spec,
     ))?
     .for_frame_surface(FrameSurfaceEncoding::Srgb)
-    .with_progressive_output(
-        request.progressive_output() && request.mapping() == crate::GpuOutputMapping::Color,
-    )
+    .with_progressive_output(request.progressive_output())
     .with_max_frame_slots(request.max_frame_slots());
     let compositor = Arc::new(Compositor::new(
         engine.backend().clone(),
