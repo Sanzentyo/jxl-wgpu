@@ -132,6 +132,7 @@ impl Compositor {
         });
         let alpha_channel = first_alpha.map_or(u32::MAX, |(index, _)| 3 + index as u32);
         let alpha_conversion = request.alpha_conversion(extras);
+        let color_channel = request.numeric_color_channel(grayscale)?;
         let selected = request
             .extra_channel()
             .map(|index| {
@@ -203,13 +204,6 @@ impl Compositor {
             )
         ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
         let (packing, source) = if native.is_some() || scalar_float {
-            if selected.is_none()
-                && (scalar_float
-                    || native.is_some_and(|n| n.channels == crate::ModularChannels::Gray))
-                && !grayscale
-            {
-                return Err(Error::UnsupportedOutputFormat("numeric grayscale composition requires a grayscale codestream or selected extra channel".into()));
-            }
             if let (Some(native), Some((_, extra))) = (native, selected)
                 && (native.channels != crate::ModularChannels::Gray
                     || extra.bit_depth
@@ -251,7 +245,7 @@ impl Compositor {
                     source: [
                         (surface.plane_bytes / 4) as u32,
                         alpha_channel,
-                        selected.map_or(0, |(index, _)| index),
+                        selected.map_or(color_channel.unwrap_or(0), |(index, _)| index),
                         u32::from(scalar_float),
                     ],
                 }),

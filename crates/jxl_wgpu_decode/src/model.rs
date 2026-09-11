@@ -284,26 +284,32 @@ impl AnimationMetadata {
     }
 }
 
-/// Numeric interpretation applied while writing a decoded non-color sample.
+/// Numeric interpretation applied while writing one decoded color or extra-channel sample.
 ///
 /// This mapping is explicit because a [`PixelFormat`] with `ColorModel::NonColor` carries storage
 /// shape, not normalization semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NumericSampleMapping {
-    /// Interpret the declared floating source precision and deliver its exact binary32 widening.
-    /// No integer normalization or color transfer is applied. Unresampled, uncomposed samples
-    /// preserve signed zeros, subnormals, infinities and NaN payloads. Filtering and composition
-    /// operate on the decoded floating values before delivery.
+    /// Deliver floating samples in the original image encoding as binary32 values. Lossless
+    /// Modular samples are exact binary32 widenings of the declared source precision. Unresampled,
+    /// uncomposed lossless samples preserve signed zeros, subnormals, infinities and NaN payloads.
+    /// VarDCT, filtering and composition return reconstructed floating values. No presentation
+    /// color conversion, spot rendering or alpha-association change is applied.
     NativeFloat,
-    /// Preserve the decoded unsigned integer code exactly in the low valid bits of the canonical
-    /// lossless-Modular Gray `u8`/`u16`/`u32` storage descriptor. The requested valid depth and the
-    /// codestream depth must match. Uncomposed working samples outside that unsigned range return
-    /// a typed error. Composed presentation clamps to the output range.
+    /// Deliver unsigned integer codes in the low valid bits of the canonical Gray
+    /// `u8`/`u16`/`u32` storage descriptor. The requested valid depth and the codestream depth must
+    /// match. Lossless Modular preserves source codes exactly; uncomposed Modular working samples
+    /// outside that unsigned range return a typed error. Composed presentation clamps to the range.
     /// Resampled planes are reconstructed at presentation resolution first, then rounded to the
     /// nearest code at the declared depth; exact preservation applies before filtering/composition.
+    /// VarDCT color samples are reconstructed in the original image encoding, clamped to the
+    /// unsigned range and rounded once at the declared depth; the original lossy input is not
+    /// recoverable.
     NativeUnsigned,
     /// Divide a 1–31-bit unsigned source by its own maximum code into scalar F32 storage.
-    /// No transfer function or color conversion is applied, including for extra channels.
+    /// Color samples use the original image encoding after codec reconstruction; no presentation
+    /// color conversion, spot rendering or alpha-association change is applied. Extra channels
+    /// never pass through a color transform.
     /// Signed working samples outside the declared unsigned range remain outside `[0, 1]`;
     /// normalization does not wrap or clamp them.
     NormalizedUnsigned,
@@ -343,6 +349,14 @@ pub enum GpuOutputMapping {
     Numeric(NumericSampleMapping),
 }
 
+/// Source of a scalar numeric output. Color indices follow the original image encoding:
+/// `0` for grayscale, or `0`, `1`, `2` for red, green and blue. Extra indices follow stream metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumericChannel {
+    Color(u32),
+    Extra(u32),
+}
+
 /// Generic GPU output request. No CPU-readable fallback representation exists.
 ///
 /// Construction is deliberately split between [`GpuOutputRequest::color`] and
@@ -356,7 +370,7 @@ pub struct GpuOutputRequest {
     mapping: GpuOutputMapping,
     max_frame_slots: NonZeroUsize,
     orientation: OrientationPolicy,
-    extra_channel: Option<u32>,
+    numeric_channel: Option<NumericChannel>,
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
     frame_surface: bool,
@@ -444,7 +458,7 @@ impl GpuOutputRequest {
     }
 
     /// Creates a non-color output request with an explicit sample mapping. `NativeUnsigned`
-    /// recognizes the canonical valid-bit-padded Gray lossless-Modular descriptor directly.
+    /// recognizes the canonical valid-bit-padded unsigned Gray descriptor directly.
     pub fn numeric(format: PixelFormat, mapping: NumericSampleMapping) -> Result<Self> {
         if mapping == NumericSampleMapping::NativeUnsigned {
             return match native_modular_format(&format) {
@@ -454,8 +468,7 @@ impl GpuOutputRequest {
                 }) => Ok(Self::from_parts(format, GpuOutputMapping::Numeric(mapping))),
                 Some(_) => Err(Error::NumericMappingForColorOutput),
                 None => Err(Error::UnsupportedOutputFormat(
-                    "native lossless-Modular output requires the canonical unsigned Gray descriptor"
-                        .into(),
+                    "native unsigned output requires the canonical unsigned Gray descriptor".into(),
                 )),
             };
         }
@@ -500,7 +513,7 @@ impl GpuOutputRequest {
             mapping,
             max_frame_slots: NonZeroUsize::new(2).expect("two is nonzero"),
             orientation: OrientationPolicy::Apply,
-            extra_channel: None,
+            numeric_channel: None,
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
             frame_surface: false,
@@ -616,9 +629,13 @@ impl GpuOutputRequest {
         self.alpha.conversion(associated)
     }
 
-    /// Selects one extra channel by its index in the stream metadata. The result is a scalar
-    /// numeric image; its values never pass through a color transfer function.
-    pub fn with_extra_channel(mut self, index: u32) -> Result<Self> {
+    /// Selects one decoded sample channel, replacing any previous selection. RGB numeric output
+    /// requires an explicit color index; grayscale defaults to its only color channel. Indices
+    /// are checked against the selected image when opening the decoder.
+    ///
+    /// Color values preserve the original image encoding and alpha association, with spot inks
+    /// excluded. VarDCT color output uses the common [`crate::WgpuDecodeEngine`] presentation path.
+    pub fn with_numeric_channel(mut self, channel: NumericChannel) -> Result<Self> {
         let scalar = self.format.planes.len() == 1
             && match classify_pixel_format(&self.format) {
                 Ok(PixelFormatClass::Numeric(numeric)) => numeric.components == 1,
@@ -636,17 +653,60 @@ impl GpuOutputRequest {
             )
         {
             return Err(Error::UnsupportedOutputFormat(
-                "extra-channel output requires scalar native unsigned, normalized integer or floating F32 samples"
+                "channel selection requires scalar native unsigned, normalized integer or floating F32 samples"
                     .into(),
             ));
         }
-        self.extra_channel = Some(index);
+        self.numeric_channel = Some(channel);
         Ok(self)
+    }
+
+    /// Selects gray (`0`) or one original RGB component (`0` red, `1` green, `2` blue).
+    pub fn with_color_channel(self, index: u32) -> Result<Self> {
+        self.with_numeric_channel(NumericChannel::Color(index))
+    }
+
+    /// Selects one extra channel by its index in the stream metadata. The result is a scalar
+    /// numeric image; its values never pass through a color transfer function.
+    pub fn with_extra_channel(self, index: u32) -> Result<Self> {
+        self.with_numeric_channel(NumericChannel::Extra(index))
+    }
+
+    #[must_use]
+    pub const fn numeric_channel(&self) -> Option<NumericChannel> {
+        self.numeric_channel
+    }
+
+    #[must_use]
+    pub const fn color_channel(&self) -> Option<u32> {
+        match self.numeric_channel {
+            Some(NumericChannel::Color(index)) => Some(index),
+            _ => None,
+        }
     }
 
     #[must_use]
     pub const fn extra_channel(&self) -> Option<u32> {
-        self.extra_channel
+        match self.numeric_channel {
+            Some(NumericChannel::Extra(index)) => Some(index),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn numeric_color_channel(&self, grayscale: bool) -> Result<Option<u32>> {
+        if self.mapping == GpuOutputMapping::Color || self.extra_channel().is_some() {
+            return Ok(None);
+        }
+        let count = if grayscale { 1 } else { 3 };
+        let index = match self.color_channel() {
+            Some(index) => index,
+            None if grayscale => 0,
+            None => return Err(Error::NumericColorChannelRequired),
+        };
+        if index >= count {
+            return Err(Error::ColorChannelIndex { index, count });
+        }
+        Ok(Some(index))
     }
 
     #[must_use]

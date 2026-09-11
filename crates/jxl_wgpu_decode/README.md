@@ -242,8 +242,9 @@ and floating Gray16/exponent5 with associated alpha24/exponent7. Independent sta
 flushes plus F64 crop/reference composition verify all five blend modes across nine layers and six
 presentations. The 48 output/orientation/window configurations check 936 images, retained leases,
 exact timing and final-only equality. Cancellation, late entropy rejection and forced allocation
-failure also preserve prior images and retire all other reservations. Composed F64 and VarDCT
-numeric color-channel requests remain unsupported.
+failure also preserve prior images and retire all other reservations. Selected color channels in
+both coding modes now share native/scalar F32 progression. Legacy Gray8 numeric layout mappings
+through composition, including F64, remain unsupported.
 
 The remaining progressive work includes broader LF and extra-channel precision conformance,
 broader Modular transform/header combinations, selective regions, and
@@ -292,9 +293,9 @@ declared representation before color conversion. Additional source color domains
 
 All 1–31-bit primary and extra-channel declarations are admitted by Modular and XYB/original-sRGB VarDCT.
 `native_modular_pixel_format(ModularChannels::Gray, bits)` creates a canonical scalar layout for
-`NumericSampleMapping::NativeUnsigned` from Modular grayscale or a selected extra in either mode;
-RGB/RGBA layouts can be passed to `GpuOutputRequest::color`. General VarDCT numeric color-channel
-delivery remains a separate incomplete output feature.
+`NumericSampleMapping::NativeUnsigned` from a gray/RGB component or a selected extra in either mode;
+RGB/RGBA layouts can be passed to `GpuOutputRequest::color`. VarDCT scalar color delivery uses the
+common `WgpuDecodeEngine` presentation path.
 Valid depths 1–8, 9–16 and 17–31 use 8-, 16- and 32-bit words, respectively, with zero high padding.
 The encoder's current 1–16-bit input limit is independent of this decoder delivery API.
 
@@ -317,6 +318,36 @@ orientations, 2×/4×/8× reconstruction, progressive DC and animation. Whole an
 output must agree. `cargo run -p jxl_wgpu_decode --example regenerate_integer` reproduces the corpus;
 its documented header generation covers legal precisions beyond libjxl's public encoder limit.
 
+### Selecting numeric color channels
+
+`GpuOutputRequest::with_color_channel(index)` selects gray (`0`) or an original RGB component
+(`0` red, `1` green, `2` blue). RGB requires an explicit selection; grayscale defaults to channel 0.
+Color and extra selection share one `NumericChannel` value, so a new selection replaces the old
+one. Invalid indices and mismatched source types/depths are rejected before GPU admission.
+
+```rust,ignore
+let green = GpuOutputRequest::numeric(
+    PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+    NumericSampleMapping::NormalizedUnsigned,
+)?.with_color_channel(1)?;
+let mut session = GpuDecoder::wgpu(backend)?.open(&encoded, green)?;
+```
+
+Use `NativeUnsigned` for matching-depth unsigned codes, `NormalizedUnsigned` for integer samples
+normalized to F32, or `NativeFloat` for floating sources. Numeric color uses the original image
+encoding after codec reconstruction and preserves the original alpha association. Alpha output
+and spot-rendering policies do not modify these values. Orientation follows reconstruction and
+composition. VarDCT stills, pass/LF images and animations use the common engine's accounted F32
+surfaces and GPU packer; lossless Modular stills select a resident source plane directly, retaining
+all integer bits and floating payloads. VarDCT unsigned output clamps and rounds the reconstructed
+value once at the declared depth; it cannot recover the original lossy input.
+
+`tests/numeric_channels.rs` checks native libjxl components, direct 17/31-bit Modular codes,
+XYB/original-RGB/JPEG reconstruction, associated alpha, spots, resampling, progressive prefixes,
+cropped LF composition, exact final integer rounding, cancellation, corruption and admission
+retry. Whole and bounded fragmented output agree. VarDCT and composed legacy `NormalizedGray8`
+layouts, including their F64 policy, remain separate output work.
+
 ### Floating source samples
 
 `DecodeProfile::{Modular, VarDct}` and `StandardVarDctProfile` expose `sample_bit_depth: SampleBitDepth`
@@ -326,10 +357,10 @@ stored separately from transform geometry in a validated `ModularOutputPlane`.
 `ModularSampleDomain::Encoded` identifies those original sample words; `DecodedF32` identifies
 converted values, including filtered planes. Each extra retains its own integer or floating type.
 
-Use `NumericSampleMapping::NativeFloat` with scalar F32 storage for Modular grayscale or a selected
+Use `NumericSampleMapping::NativeFloat` with scalar F32 storage for a gray/RGB component or a selected
 floating extra in either coding mode. Integer sources continue to use `NativeUnsigned` or
 `NormalizedUnsigned`; mismatched mappings are rejected. Binary16, binary32 and every custom precision
-are widened using integer bit assembly on GPU. Unfiltered, uncomposed F32 samples preserve signed
+are widened using integer bit assembly on GPU. Unfiltered, uncomposed lossless Modular samples preserve signed
 zero, subnormals, infinities and NaN payloads; no-op RGB F32 delivery also copies bits directly.
 Filtering, color conversion, alpha and blending operate on decoded values and make no payload or
 bit-exact arithmetic guarantee. Native scalar floating output never divides by an integer maximum.
@@ -344,8 +375,8 @@ XYB coefficients or the integer Modular words used by progressive-DC dependencie
 plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
 Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
 `cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
-libjxl 0.12 tools; the production crates do not link that codec. Original non-sRGB/ICC domains,
-pre-transform references and source integer precision above 16 remain separate requirements.
+libjxl 0.12 tools; the production crates do not link that codec. Original non-sRGB/ICC domains and
+pre-transform references remain separate requirements.
 
 Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
@@ -1057,8 +1088,9 @@ cost 352 bytes in total and are checked individually against binding limits. Pad
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
 Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`
-color output within one RGB8 code. Non-color numeric output, arbitrary ICC output, and explicit
-luminance mapping for PQ/HLG remain typed gaps; relative SDR is never relabeled as HDR.
+color output within one RGB8 code. Scalar numeric color requests use the common frame surface and
+packer described above. Legacy Gray8 numeric layouts, arbitrary ICC output, and explicit luminance
+mapping for PQ/HLG remain typed gaps; relative SDR is never relabeled as HDR.
 
 Nine additional F32 layout/transfer cases preserve unclipped color without integer quantization.
 The CPU comparisons measure reconstruction error in linear light and report encoded error as well;
@@ -1184,7 +1216,7 @@ operation.
 This is not full VarDCT coverage. Broader progressive
 intermediates, larger/transformed raw-matrix conformance, broader asymmetric JPEG
 restoration/resampling combinations and other Modular side images,
-numeric color-channel output, ICC/HDR luminance mapping,
+legacy Gray8 numeric layout output, ICC/HDR luminance mapping,
 and complete progressive presentation remain typed or unproven gaps. Crop/blend
 animation and post-transform references are supported through the common frame executor. Unsupported paths return typed
 errors. They are not substituted with dummy coefficients or a CPU implementation.

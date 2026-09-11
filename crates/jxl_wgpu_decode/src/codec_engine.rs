@@ -90,6 +90,7 @@ impl WgpuDecodeEngine {
         request: &GpuOutputRequest,
         inventory: &jxl_gpu_bitstream::CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
+        request.numeric_color_channel(inventory.image_header.grayscale)?;
         if let Some(index) = request.extra_channel()
             && index as usize >= inventory.image_header.extra_channels.len()
         {

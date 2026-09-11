@@ -93,7 +93,16 @@ pub(super) fn needs_surface(
                             epf: jxl_gpu_bitstream::EdgePreservingFilterInventory::Disabled,
                         })
         });
+    // Include reconstruction and the inverse codec transform before selecting an original color
+    // component. The resident frame surface keeps those samples unquantized until presentation.
+    let numeric_vardct_color = matches!(request.mapping(), crate::GpuOutputMapping::Numeric(_))
+        && request.extra_channel().is_none()
+        && inventory
+            .frames
+            .iter()
+            .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
     modular_rendering
+        || numeric_vardct_color
         || ((source_conversion || wide_vardct_output)
             && request.mapping() == crate::GpuOutputMapping::Color)
         || request.renders_spot_colors(&inventory.image_header.extra_channels)

@@ -104,7 +104,7 @@ pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};
 pub use model::{
     AlphaOutputPolicy, AnimationMetadata, DecodeProfile, F64OutputPolicy, FrameDuration,
     FrameMetadata, FrameTimebase, GpuOutputMapping, GpuOutputRequest, ModularChannelCounts,
-    ModularChannels, ModularGrouping, ModularPredictionProfile, ModularPredictor,
+    ModularChannels, ModularGrouping, ModularPredictionProfile, ModularPredictor, NumericChannel,
     NumericSampleMapping, OrientationPolicy, SpotColorPolicy, native_modular_pixel_format,
 };
 pub use modular_finalize::ModularFinalizeError;

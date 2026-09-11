@@ -80,6 +80,15 @@ impl OutputChannels {
                 alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
             });
         }
+        if let Some(index) = request.numeric_color_channel(color_count == 1)? {
+            return Ok(Self {
+                indices: vec![index as usize],
+                encodings: vec![profile.sample_encoding],
+                format_channels: ModularChannels::Gray,
+                encoding: profile.sample_encoding,
+                alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
+            });
+        }
         if profile
             .extra_channels
             .iter()
@@ -112,12 +121,6 @@ impl OutputChannels {
             });
         let native = native_modular_format(request.format());
         let alpha_conversion = request.alpha_conversion(&profile.extra_channels);
-        if native.is_some_and(|native| native.channels == ModularChannels::Gray) && color_count != 1
-        {
-            return Err(Error::UnsupportedOutputFormat(
-                "numeric color output requires a grayscale source".into(),
-            ));
-        }
         let mut indices: Vec<_> = (0..color_count).collect();
         let mut encodings = vec![profile.sample_encoding; color_count];
         // Gray+alpha is a source topology, never a fabricated two-component RGB pixel format.

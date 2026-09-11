@@ -265,6 +265,10 @@ pub enum Error {
     FrameDependencyBackpressure { index: usize },
     #[error("extra-channel index {index} is outside the {count} declared channels")]
     ExtraChannelIndex { index: u32, count: u32 },
+    #[error("color-channel index {index} is outside the {count} declared color channels")]
+    ColorChannelIndex { index: u32, count: u32 },
+    #[error("numeric RGB output requires an explicit color-channel selection")]
+    NumericColorChannelRequired,
     #[error(
         "{color_channels} color channels plus {extra_channels} extra channels exceed u32 addressing"
     )]
