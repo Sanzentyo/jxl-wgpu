@@ -14,10 +14,16 @@ use super::color::{
 use super::{ModularOutputPlane, Result, invalid, require, upsample_kernel};
 use crate::progressive_dc::ProgressiveDcXybPlanes;
 
+pub(crate) struct ModularLfPipelines<'a> {
+    pub(crate) color: &'a ReconstructionPipeline,
+    pub(crate) extras: Option<&'a super::ModularRenderPipeline>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ModularLfPlan {
     reconstruction: ReconstructionPlan,
     kernel: Option<ResidentUpsampleKernel>,
+    extras: Option<super::ModularRenderPlan>,
 }
 
 impl ModularLfPlan {
@@ -25,14 +31,27 @@ impl ModularLfPlan {
         config: ModularColorConfig,
         extent: Extent2d,
         sources: &[ModularOutputPlane],
-        factor: u32,
+        factors: &[u32],
         weights: &UpsamplingWeightsInventory,
         limits: &wgpu::Limits,
     ) -> Result<Self> {
-        if sources.len() != 3 {
-            return invalid("LF reconstruction requires exactly three color planes");
+        if sources.len() < 3 || sources.len() != factors.len() {
+            return invalid("LF reconstruction requires three color planes and matching factors");
         }
-        let reconstruction = ReconstructionPlan::new(config, extent, sources, factor, limits)?;
+        let factor = factors[0];
+        let reconstruction =
+            ReconstructionPlan::new(config, extent, &sources[..3], factor, limits)?;
+        let extras = (sources.len() > 3)
+            .then(|| {
+                super::ModularRenderPlan::new(
+                    extent,
+                    sources[3..].to_vec(),
+                    factors[3..].to_vec(),
+                    weights,
+                    limits,
+                )
+            })
+            .transpose()?;
         let kernel = (factor != 1)
             .then(|| upsample_kernel(weights, factor))
             .transpose()?;
@@ -48,21 +67,29 @@ impl ModularLfPlan {
         Ok(Self {
             reconstruction,
             kernel,
+            extras,
         })
+    }
+
+    pub(crate) fn has_extras(&self) -> bool {
+        self.extras.is_some()
     }
 
     pub(crate) fn plane_bytes(&self) -> u64 {
         let extent = self.reconstruction.output_extent;
         u64::from(extent.width) * u64::from(extent.height) * 4 * 3
+            + self.extras.as_ref().map_or(0, |plan| plan.output_bytes)
     }
 
     pub(crate) fn uniform_bytes(&self) -> u64 {
         self.reconstruction.uniform_bytes
+            + self.extras.as_ref().map_or(0, |plan| plan.uniform_bytes)
     }
 
     pub(crate) fn total_bytes(&self) -> u64 {
         self.reconstruction.storage_bytes
-            + self.uniform_bytes()
+            + self.reconstruction.uniform_bytes
+            + self.extras.as_ref().map_or(0, |plan| plan.total_bytes())
             + self
                 .kernel
                 .as_ref()
@@ -73,7 +100,7 @@ impl ModularLfPlan {
         &self,
         device: &wgpu::Device,
         permit: &mut MemoryPermit,
-    ) -> crate::Result<(ModularLfBuffers, ProgressiveDcXybPlanes)> {
+    ) -> crate::Result<(ModularLfBuffers, crate::progressive_dc::ProgressiveDcOutput)> {
         let reconstruction = self.reconstruction.allocate(device);
         let output = self.reconstruction.output_buffers(&reconstruction);
         let reservations = [
@@ -100,8 +127,22 @@ impl ModularLfPlan {
             extent.height,
             extent.width,
         )?;
+        let extra_buffers = self
+            .extras
+            .as_ref()
+            .map(|plan| plan.allocate(device))
+            .transpose()?;
+        let extras = self
+            .extras
+            .as_ref()
+            .zip(extra_buffers.as_ref())
+            .map(|(plan, buffers)| {
+                crate::progressive_dc::ProgressiveDcExtras::retain(plan, buffers, permit)
+            })
+            .transpose()?;
         Ok((
             ModularLfBuffers {
+                extras: extra_buffers,
                 reconstruction,
                 weights: self
                     .kernel
@@ -110,7 +151,10 @@ impl ModularLfPlan {
                     .transpose()
                     .map_err(super::ModularRenderError::from)?,
             },
-            planes,
+            crate::progressive_dc::ProgressiveDcOutput {
+                xyb: planes,
+                extras,
+            },
         ))
     }
 
@@ -118,26 +162,47 @@ impl ModularLfPlan {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        pipeline: &ReconstructionPipeline,
+        pipelines: ModularLfPipelines<'_>,
         buffers: &ModularLfBuffers,
         source: ResidentStorageBinding<'_>,
         sources: &[ModularOutputPlane],
     ) -> Result<Vec<wgpu::Buffer>> {
-        pipeline.encode(
+        let mut uniforms = pipelines.color.encode(
             device,
             encoder,
             ReconstructionInputs {
                 plan: &self.reconstruction,
                 buffers: &buffers.reconstruction,
                 source,
-                sources,
+                sources: &sources[..3],
                 weights: buffers.weights.as_ref(),
             },
-        )
+        )?;
+        if let Some(plan) = &self.extras {
+            let pipeline = pipelines.extras.ok_or(super::ModularRenderError::Invalid {
+                reason: "LF extra pipeline is missing",
+            })?;
+            let buffers = buffers
+                .extras
+                .as_ref()
+                .ok_or(super::ModularRenderError::Invalid {
+                    reason: "LF extra buffers are missing",
+                })?;
+            uniforms.extend(pipeline.encode(
+                device,
+                encoder,
+                plan,
+                buffers,
+                source,
+                &sources[3..],
+            )?);
+        }
+        Ok(uniforms)
     }
 }
 
 pub(crate) struct ModularLfBuffers {
+    extras: Option<super::ModularRenderBuffers>,
     reconstruction: ReconstructionBuffers,
     weights: Option<ResidentUpsampleWeights>,
 }

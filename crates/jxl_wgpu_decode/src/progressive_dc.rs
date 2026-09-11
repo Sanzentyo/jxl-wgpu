@@ -101,6 +101,38 @@ impl ProgressiveDcXybPlanes {
     }
 }
 
+/// A producer's retained output, published only after validation. Prediction slots retain only
+/// XYB; presentation owns extras separately, so no alpha/depth allocation survives merely because
+/// a later frame predicts LF.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressiveDcOutput {
+    pub(crate) xyb: ProgressiveDcXybPlanes,
+    pub(crate) extras: Option<ProgressiveDcExtras>,
+}
+
+/// Decoded, normalized F32 extra planes in stream order, at the producer's LF output extent.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressiveDcExtras {
+    pub(crate) buffer: GpuBufferLease,
+    pub(crate) planes: Vec<crate::modular_transform::GpuModularChannelLayout>,
+}
+
+impl ProgressiveDcExtras {
+    pub(crate) fn retain(
+        plan: &crate::modular_render::ModularRenderPlan,
+        buffers: &crate::modular_render::ModularRenderBuffers,
+        permit: &mut jxl_wgpu::MemoryPermit,
+    ) -> Result<Self, ProgressiveDcGpuError> {
+        Ok(Self {
+            buffer: GpuBufferLease::from_tracked(
+                buffers.output.clone(),
+                permit.split_off(plan.output_bytes)?,
+            ),
+            planes: plan.planes().iter().map(|plane| plane.layout).collect(),
+        })
+    }
+}
+
 /// Inputs to the progressive-DC LF resource packing pass.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProgressiveDcPackInputs<'a> {

@@ -45,6 +45,49 @@ fn compile(source: &Path, binary: &Path, libraries: &[&str]) {
         .arg(binary));
 }
 
+fn write_lf_oracle(
+    output: &Path,
+    temporary: &Path,
+    decoder: &Path,
+    name: &str,
+    level: u32,
+    encoded: &[u8],
+) {
+    let input = temporary.join("lf-oracle.jxl");
+    std::fs::write(&input, encoded).unwrap();
+    let reference = run(Command::new(decoder).arg(&input).args([
+        "--linear",
+        "--preserve-alpha",
+        "--keep-orientation",
+    ]));
+    let image = jxl_gpu_bitstream::parse(encoded, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap()
+        .image_header;
+    assert_eq!(
+        reference.len(),
+        image.width as usize * image.height as usize * 6 * 4
+    );
+    std::fs::write(
+        output.join(format!("{name}.lf{level}.jxl.hex")),
+        hex::hex(encoded),
+    )
+    .unwrap();
+    let words = reference
+        .chunks_exact(4)
+        .map(|word| format!("{:08x}", u32::from_le_bytes(word.try_into().unwrap())))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        output.join(format!("{name}.lf{level}.linear.f32.hex")),
+        words
+            .chunks(8)
+            .map(|line| line.join(" ") + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+}
+
 fn copy_bits(writer: &mut BitWriter, data: &[u8], range: Range<u64>) {
     let mut reader = BitReader::new(data);
     reader.skip_bits(range.start).unwrap();
@@ -162,7 +205,24 @@ fn boundaries(data: &[u8], inventory: &FrameInventory) -> (Range<u64>, u64) {
     (start..end, syntax_end)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Final,
+    Background,
+    Blend,
+}
+
 fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8> {
+    physical_with_role(data, lf_level, uses_lf, gaborish, Role::Final)
+}
+
+fn physical_with_role(
+    data: &[u8],
+    lf_level: u32,
+    uses_lf: bool,
+    gaborish: bool,
+    role: Role,
+) -> Vec<u8> {
     let inventory = jxl_gpu_bitstream::parse(data, Default::default())
         .unwrap()
         .codestream_inventory(Default::default())
@@ -199,8 +259,25 @@ fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8
         header.write_bits(u64::from(lf_level - 1), 2).unwrap();
     } else {
         header.write_bits(0, 1).unwrap(); // no crop
-        header.write_bits(0, 6).unwrap(); // replace for color and both extras
-        header.write_bits(1, 1).unwrap(); // last frame
+        if role == Role::Blend {
+            for _ in 0..2 {
+                header.write_bits(2, 2).unwrap(); // Blend color and alpha
+                header.write_bits(0, 2).unwrap(); // alpha index zero
+                header.write_bits(1, 1).unwrap(); // clamp alpha
+                header.write_bits(1, 2).unwrap(); // reference slot one
+            }
+            header.write_bits(1, 2).unwrap(); // Add depth
+            header.write_bits(1, 2).unwrap(); // reference slot one
+        } else {
+            header.write_bits(0, 6).unwrap(); // replace color and both extras
+        }
+        header
+            .write_bits(u64::from(role != Role::Background), 1)
+            .unwrap();
+        if role == Role::Background {
+            header.write_bits(1, 2).unwrap(); // save reference one
+            header.write_bits(0, 1).unwrap(); // save after color transform
+        }
     }
     header.write_bits(0, 2).unwrap(); // name
     header.write_bits(0, 1).unwrap(); // custom restoration
@@ -308,7 +385,81 @@ fn main() {
             if nested {
                 stream.extend_from_slice(middle.as_ref().unwrap());
             }
+            if nested {
+                // Both LF updates precede the hidden background. LF2's prediction slot expires
+                // before either presentation can run, exercising independent extra ownership.
+                let mut composed = stream.clone();
+                composed.extend(physical_with_role(&seed, 0, false, true, Role::Background));
+                composed.extend(physical_with_role(&seed, 0, true, true, Role::Blend));
+                let path = temporary.join("composed.jxl");
+                std::fs::write(&path, &composed).unwrap();
+                let reference = run(Command::new(&decoder).arg(&path).arg("--preserve-alpha"));
+                assert_eq!(
+                    reference.len(),
+                    inventory.image_header.width as usize
+                        * inventory.image_header.height as usize
+                        * 6
+                        * 4
+                );
+                std::fs::write(
+                    output.join(format!("{name}.composed.jxl.hex")),
+                    hex::hex(&composed),
+                )
+                .unwrap();
+                // Match the composed consumer's restoration; the older final-only fixture
+                // intentionally disables consumer Gaborish and is not this layer's oracle.
+                let mut foreground = stream.clone();
+                foreground.extend(physical(&seed, 0, true, true));
+                std::fs::write(
+                    output.join(format!("{name}.foreground.jxl.hex")),
+                    hex::hex(&foreground),
+                )
+                .unwrap();
+                // Reconstruct the exact hidden background as an independent ordinary image.
+                let mut background =
+                    seed[..inventory.frames[0].header_bits.offset as usize / 8].to_vec();
+                background.extend(physical(&seed, 0, false, true));
+                for layer in [&foreground, &background] {
+                    std::fs::write(&path, layer).unwrap();
+                    assert_eq!(
+                        run(Command::new(&decoder).arg(&path).arg("--preserve-alpha")).len(),
+                        reference.len()
+                    );
+                }
+                std::fs::write(
+                    output.join(format!("{name}.background.jxl.hex")),
+                    hex::hex(&background),
+                )
+                .unwrap();
+            }
             stream.extend_from_slice(&consumer);
+            // Independently decodable LF producers retain the same entropy and restoration,
+            // but use a smaller ordinary image canvas. A nested LF1 oracle retains its LF2
+            // dependency as LF1 relative to that canvas.
+            let seed_prefix = |data: &[u8]| {
+                let inventory = jxl_gpu_bitstream::parse(data, Default::default())
+                    .unwrap()
+                    .codestream_inventory(Default::default())
+                    .unwrap();
+                data[..inventory.frames[0].header_bits.offset as usize / 8].to_vec()
+            };
+            let mut root_image = seed_prefix(&seed_root);
+            root_image.extend(physical(&seed_root, 0, false, gaborish));
+            write_lf_oracle(
+                &output,
+                &temporary,
+                &decoder,
+                &name,
+                if nested { 2 } else { 1 },
+                &root_image,
+            );
+            if nested {
+                let middle_seed = std::fs::read(temporary.join("vardct_root.jxl")).unwrap();
+                let mut middle_image = seed_prefix(&middle_seed);
+                middle_image.extend(physical(&seed_root, 1, false, gaborish));
+                middle_image.extend(physical(&middle_seed, 0, true, true));
+                write_lf_oracle(&output, &temporary, &decoder, &name, 1, &middle_image);
+            }
             let encoded = temporary.join("oracle.jxl");
             std::fs::write(&encoded, &stream).unwrap();
             let reference = run(Command::new(&decoder).arg(&encoded));

@@ -176,8 +176,8 @@ the next physical producer is admitted on a later poll. Native and poll/async fi
 discard unsubmitted LF updates and drain already submitted work. Source planes, render scratch
 and packed output retain independent byte ownership through GPU completion and cancellation.
 
-Level 1 output matches the Rust decoder's LF flush, while native libjxl validates the following
-DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
+Color-only level 1 output matches the Rust decoder's LF flush, while native libjxl validates the
+following DC/AC and final images. Full recursive codestream coverage currently reaches LF2; a separate
 scalar-oracle adapter test validates expansion through LF4, custom weights and odd/one-sample axes.
 Seven animation families cover RGB/gray, mixed JPEG/Modular, recursive LF, negative/off-canvas
 crops and reference blends with exact clocks and physical IDs. Apply/Keep orientation and whole/
@@ -188,7 +188,19 @@ against native coalesced finals before comparing GPU updates. Composed LF1 image
 the Rust decoder's standalone LF flush and the same independent scalar composition, including a
 hidden reference decoded between LF and its visible consumer. The maximum normalized linear LF1
 error is below 0.000285 under the existing 0.001 composition regression bound. LF2 has renderer and
-lifetime evidence without a native per-level pixel-oracle claim. No production CPU codec is used.
+lifetime evidence for those animation fixtures. Additional LF1/LF2 alpha/depth fixtures use native
+small-image producers plus independent F64 XYB expansion and composition.
+No production CPU codec is used.
+
+LF intermediates with extras use separate prediction and presentation ownership. Modular and
+VarDCT roots normalize every extra using its own precision and resampling before retaining it.
+Recursive LF expansion clips each 8× grid, expands XYB before inverse opsin and expands extras
+independently. A native or composed presentation uses the same alpha-aware color/native/scalar F32
+packer as final frames. Completed LF planes wait for the terminal frame's exact background reference;
+intermediate blending never commits a reference. Final-only requests allocate no LF extra output.
+Independent libjxl small-image producers and F64 expansion/composition cover LF1/LF2, Gaborish,
+alpha/depth, distributed groups and late background writes. These intermediate-policy comparisons
+are separate from ISO final-image precision conformance.
 
 Extra-channel snapshots decode and validate each pass's Modular subimages before copying the
 assembled channels for global inverse transforms, normalization and resampling. Future passes
@@ -230,7 +242,7 @@ exact timing and final-only equality. Cancellation, late entropy rejection and f
 failure also preserve prior images and retire all other reservations. Composed F64 and VarDCT
 numeric color-channel requests remain unsupported.
 
-The remaining progressive work includes broader LF conformance, LF previews with extra channels,
+The remaining progressive work includes broader LF and extra-channel precision conformance,
 broader Modular transform/header combinations, selective regions, and
 incomplete-frame input readiness.
 Native-comparison precision remains a separate conformance gate.

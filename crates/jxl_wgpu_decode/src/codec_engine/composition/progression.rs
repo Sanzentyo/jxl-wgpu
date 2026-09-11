@@ -27,6 +27,9 @@ pub(super) struct LfPreview {
     backend: WgpuBackend,
     config: ColorOutputConfig,
     pub(super) layout: ImageLayout,
+    pub(super) surface: Option<crate::frame_surface::FrameSurfaceLayout>,
+    pub(super) compositor: Option<Arc<super::gpu::Compositor>>,
+    extra_count: usize,
     output_plan: ColorOutputPlan,
     output_storage_bytes: u64,
     kernel: Arc<ResidentUpsampleKernel>,
@@ -48,9 +51,33 @@ impl LfPreview {
         image: &ImageHeaderInventory,
         request: &GpuOutputRequest,
     ) -> Result<Self> {
+        let canonical =
+            !image.extra_channels.is_empty() || request.mapping() != crate::GpuOutputMapping::Color;
+        let compositor = canonical
+            .then(|| {
+                super::gpu::Compositor::new(
+                    backend.clone(),
+                    Extent2d::new(image.width, image.height),
+                    &image.extra_channels,
+                    image.grayscale,
+                    image.bit_depth,
+                    OutputOrientation::from_exif_value(image.orientation).ok_or(
+                        Error::InvalidImageOrientation {
+                            value: image.orientation,
+                        },
+                    )?,
+                    request,
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
+        let working = request
+            .clone()
+            .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Linear);
+        let render_request = if canonical { &working } else { request };
         let config = ColorOutputConfig {
             extent: Extent2d::new(image.width, image.height),
-            orientation: request.orientation_policy().resolve(
+            orientation: render_request.orientation_policy().resolve(
                 OutputOrientation::from_exif_value(image.orientation).ok_or(
                     Error::InvalidImageOrientation {
                         value: image.orientation,
@@ -60,9 +87,9 @@ impl LfPreview {
             transform: ColorOutputTransform::Xyb(InverseOpsin::from_image(image).ok_or(
                 Error::EngineContract("LF presentation has no inverse opsin metadata"),
             )?),
-            alpha_conversion: request.alpha_conversion(&image.extra_channels),
+            alpha_conversion: render_request.alpha_conversion(&image.extra_channels),
         };
-        let layout = ImageLayout::packed(config.output_extent(), request.format().clone())?;
+        let layout = ImageLayout::packed(config.output_extent(), render_request.format().clone())?;
         config.validate_layout(&layout)?;
         let device = backend.device();
         let output_plan = ColorOutputPlan::for_limits(&layout, &device.limits())?;
@@ -75,7 +102,10 @@ impl LfPreview {
                 .map(|v| v.to_f32())
                 .collect::<Vec<_>>(),
         )?;
-        Ok(Self {
+        let preview = Self {
+            surface: None,
+            compositor,
+            extra_count: image.extra_channels.len(),
             config,
             layout,
             output_plan,
@@ -84,7 +114,15 @@ impl LfPreview {
             upsample: Arc::new(ResidentUpsamplePipeline::new(device)?),
             packer: Arc::new(ColorOutputPacker::new(device)?),
             backend,
-        })
+        };
+        if canonical {
+            preview.for_surface(
+                config.extent,
+                crate::frame_surface::FrameSurfaceEncoding::Linear,
+            )
+        } else {
+            Ok(preview)
+        }
     }
 
     /// Reuse the image's renderer for a physical layer in the compositor's canonical storage.
@@ -95,13 +133,14 @@ impl LfPreview {
     ) -> Result<Self> {
         let surface = crate::frame_surface::FrameSurfaceLayout::with_encoding(
             extent,
-            0,
+            self.extra_count,
             encoding,
             &self.backend.device().limits(),
         )?;
         let config = ColorOutputConfig {
             extent,
             orientation: OutputOrientation::Identity,
+            alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
             ..self.config
         };
         config.validate_layout(&surface.color)?;
@@ -109,14 +148,25 @@ impl LfPreview {
             ColorOutputPlan::for_limits(&surface.color, &self.backend.device().limits())?;
         Ok(Self {
             config,
-            layout: surface.color,
+            layout: surface.color.clone(),
+            surface: Some(surface.clone()),
             output_plan,
             output_storage_bytes: surface.storage_bytes,
             ..self.clone()
         })
     }
 
+    #[cfg(test)]
     pub(super) fn submit(&self, planes: &ProgressiveDcXybPlanes, level: u8) -> Result<GpuWork> {
+        self.submit_with_extras(planes, None, level)
+    }
+
+    pub(super) fn submit_with_extras(
+        &self,
+        planes: &ProgressiveDcXybPlanes,
+        extras: Option<&crate::progressive_dc::ProgressiveDcExtras>,
+        level: u8,
+    ) -> Result<GpuWork> {
         if !(1..=4).contains(&level) {
             return Err(Error::EngineContract(
                 "LF presentation level is outside 1 through 4",
@@ -133,6 +183,24 @@ impl LfPreview {
         planes.validate_extent([input_extent.width, input_extent.height])?;
         // Each recursive dependency is reconstructed with the image's Up8 kernel. Clip to the
         // exact grid before the next stage so odd borders never sample padding as image data.
+        if extras.map_or(0, |extras| extras.planes.len()) != self.extra_count {
+            return Err(Error::EngineContract(
+                "LF presentation extra channel count mismatch",
+            ));
+        }
+        let input_extent = extent_at(level);
+        if extras.is_some_and(|extras| {
+            extras.planes.iter().any(|plane| {
+                plane.width != input_extent.width
+                    || plane.height != input_extent.height
+                    || plane.row_stride_words < plane.width
+            })
+        }) {
+            return Err(Error::EngineContract(
+                "LF presentation extra channel extent mismatch",
+            ));
+        }
+        let channels = 3 + self.extra_count;
         let extents = (0..level).rev().map(extent_at).collect::<Vec<_>>();
         let device = self.backend.device();
         let sizes = extents
@@ -143,8 +211,8 @@ impl LfPreview {
                 Ok(size)
             })
             .collect::<Result<Vec<_>>>()?;
-        let transient_bytes = sizes.iter().sum::<u64>() * 3
-            + u64::from(level) * 3 * ResidentUpsamplePipeline::UNIFORM_BYTES
+        let transient_bytes = sizes.iter().sum::<u64>() * channels as u64
+            + u64::from(level) * channels as u64 * ResidentUpsamplePipeline::UNIFORM_BYTES
             + self.kernel.weight_bytes()
             + self.output_plan.memory.transient_bytes
             + completion_fence_bytes();
@@ -170,24 +238,44 @@ impl LfPreview {
         let stages = sizes
             .iter()
             .map(|&size| {
-                std::array::from_fn::<_, 3, _>(|_| {
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("JPEG XL LF intermediate XYB"),
-                        size,
-                        usage: wgpu::BufferUsages::STORAGE,
-                        mapped_at_creation: false,
+                (0..channels)
+                    .map(|_| {
+                        device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("JPEG XL LF intermediate XYB"),
+                            size,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                            mapped_at_creation: false,
+                        })
                     })
-                })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let weights = self.kernel.upload(device)?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("JPEG XL LF intermediate rendering"),
         });
-        let mut uniforms = Vec::with_capacity(usize::from(level) * 3);
+        let mut uniforms = Vec::with_capacity(usize::from(level) * channels);
         for (index, (stage, extent)) in stages.iter().zip(&extents).enumerate() {
             for (channel, output) in stage.iter().enumerate() {
-                let input = if index == 0 {
+                let input = if index == 0 && channel >= 3 {
+                    let extras = extras.expect("validated LF extras");
+                    let plane = extras.planes[channel - 3];
+                    ResidentF32Plane {
+                        storage: ResidentStorageBinding {
+                            buffer: extras.buffer.as_wgpu_buffer(),
+                            offset: u64::from(plane.word_offset) * 4,
+                            size: NonZeroU64::new(
+                                (u64::from(plane.height - 1) * u64::from(plane.row_stride_words)
+                                    + u64::from(plane.width))
+                                    * 4,
+                            )
+                            .expect("nonempty extra plane"),
+                        },
+                        width: plane.width,
+                        height: plane.height,
+                        stride: plane.row_stride_words,
+                    }
+                } else if index == 0 {
                     let plane = &planes.planes[channel];
                     ResidentF32Plane {
                         storage: binding(plane.buffer.as_wgpu_buffer()),
@@ -224,22 +312,29 @@ impl LfPreview {
             device,
             &mut encoder,
             ColorOutputInputs {
-                planes: stages
-                    .last()
-                    .expect("nonzero LF level")
-                    .each_ref()
-                    .map(|plane| ColorOutputPlane {
-                        storage: binding(plane),
-                        width: self.config.extent.width,
-                        height: self.config.extent.height,
-                        stride: self.config.extent.width,
-                    }),
+                planes: std::array::from_fn(|channel| ColorOutputPlane {
+                    storage: binding(&stages.last().expect("nonzero LF level")[channel]),
+                    width: self.config.extent.width,
+                    height: self.config.extent.height,
+                    stride: self.config.extent.width,
+                }),
                 alpha: None,
                 output: binding(output.as_wgpu_buffer()),
                 layout: &self.layout,
                 config: self.config,
             },
         )?;
+        if let Some(surface) = &self.surface {
+            for (channel, layout) in surface.extras.iter().enumerate() {
+                encoder.copy_buffer_to_buffer(
+                    &stages.last().expect("nonzero LF level")[3 + channel],
+                    0,
+                    output.as_wgpu_buffer(),
+                    layout.planes[0].offset,
+                    u64::from(self.config.extent.width) * u64::from(self.config.extent.height) * 4,
+                );
+            }
+        }
         submit_recorded(
             &self.backend,
             encoder,
@@ -248,6 +343,7 @@ impl LfPreview {
                 .planes
                 .iter()
                 .map(|plane| plane.buffer.clone())
+                .chain(extras.map(|extra| extra.buffer.clone()))
                 .collect(),
             (stages, weights, uniforms, scratch),
             permit,

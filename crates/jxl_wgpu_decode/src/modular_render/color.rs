@@ -691,7 +691,7 @@ mod tests {
                         config,
                         extent,
                         &[source; 3],
-                        factor,
+                        &[factor; 3],
                         &weights,
                         &backend.device().limits(),
                     )
@@ -700,7 +700,7 @@ mod tests {
                         MemoryBudget::new(std::num::NonZeroU64::new(plan.total_bytes()).unwrap());
                     let mut permit = budget.try_reserve(plan.total_bytes()).unwrap();
                     let (buffers, planes) = plan.allocate(backend.device(), &mut permit).unwrap();
-                    assert_eq!((planes.width(), planes.height()), (37, 17));
+                    assert_eq!((planes.xyb.width(), planes.xyb.height()), (37, 17));
                     assert_eq!(plan.plane_bytes(), 37 * 17 * 4 * 3);
                     assert_eq!(permit.bytes(), plan.total_bytes() - plan.plane_bytes());
                     assert_eq!(budget.snapshot().reserved_bytes, plan.total_bytes());

@@ -295,8 +295,9 @@ impl WgpuSubmissionEngine {
         } else {
             native_modular_pixel_format(crate::ModularChannels::Rgb, profile.bits_per_sample)?
         };
-        let internal_request =
-            GpuOutputRequest::color(format)?.with_max_frame_slots(request.max_frame_slots());
+        let internal_request = GpuOutputRequest::color(format)?
+            .with_max_frame_slots(request.max_frame_slots())
+            .with_lf_presentation(request.retains_lf_presentation());
         self.open_profile(codestream, &internal_request, profile)
     }
 
@@ -484,7 +485,7 @@ impl WgpuSubmissionEngine {
                 &output
                     .source_channels
                     .select(&inverse.final_gpu_layouts())?,
-                profile.channel_upsampling[0],
+                &factors,
                 &profile.upsampling_weights,
                 &self.backend.device().limits(),
             )?);
@@ -577,7 +578,11 @@ impl WgpuSubmissionEngine {
                     needs_palette,
                     needs_squeeze,
                     needs_rct,
-                    output.render.is_some(),
+                    output.render.is_some()
+                        || output
+                            .lf_render
+                            .as_ref()
+                            .is_some_and(|plan| plan.has_extras()),
                 )
             })
             .transpose()?;

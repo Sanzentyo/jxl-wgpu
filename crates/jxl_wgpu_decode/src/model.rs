@@ -360,6 +360,7 @@ pub struct GpuOutputRequest {
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
     frame_surface: bool,
+    lf_presentation: bool,
 }
 
 /// Association of the first alpha channel and color output. Numeric requests, including selected
@@ -503,6 +504,7 @@ impl GpuOutputRequest {
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
             frame_surface: false,
+            lf_presentation: false,
         }
     }
 
@@ -526,7 +528,8 @@ impl GpuOutputRequest {
     /// Requests intermediate images at validated LF-frame, coefficient-pass and Modular residual
     /// boundaries. Consume them with `GpuDecodeSession::next_update` or its async counterpart.
     /// Composed updates retain presentation timing and committed references, including numeric
-    /// output. Frames without an available intermediate image still return their final image.
+    /// output. LF images expand pre-color XYB and independent normalized extras before packing
+    /// or composition. Frames without an available intermediate image still return their final image.
     #[must_use]
     pub const fn with_progressive_output(mut self, enabled: bool) -> Self {
         self.progressive_output = enabled;
@@ -558,6 +561,16 @@ impl GpuOutputRequest {
         self.spot_colors = SpotColorPolicy::Preserve;
         self.orientation = OrientationPolicy::Keep;
         self
+    }
+
+    /// Retain normalized LF extras only while an intermediate presentation can use them.
+    pub(crate) const fn with_lf_presentation(mut self, enabled: bool) -> Self {
+        self.lf_presentation = enabled;
+        self
+    }
+
+    pub(crate) const fn retains_lf_presentation(&self) -> bool {
+        self.lf_presentation
     }
 
     pub(crate) const fn retains_frame_surface(&self) -> bool {

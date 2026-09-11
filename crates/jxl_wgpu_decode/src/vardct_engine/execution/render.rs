@@ -18,7 +18,7 @@ pub(super) struct FrameRenderInputs<'a> {
 pub(super) struct FrameRenderResult {
     pub(super) output_scratch: FrameOutputScratch,
     pub(super) post_transform_buffers: PostTransformJobBuffers,
-    pub(super) lf_planes: Option<ProgressiveDcXybPlanes>,
+    pub(super) lf_output: Option<crate::progressive_dc::ProgressiveDcOutput>,
     pub(super) resident_scratch: Vec<ResidentVarDctScratch>,
     _dc_reconstruction: Option<(ResidentUpsampleWeights, Vec<wgpu::Buffer>)>,
 }
@@ -58,7 +58,7 @@ pub(super) fn encode_frame_render(
         })?;
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
     let mut dc_reconstruction = None;
-    let (output_scratch, post_transform_buffers, lf_planes) = match source.output {
+    let (output_scratch, post_transform_buffers, lf_output) = match source.output {
         VarDctFrameOutput::Color { mut config, plan } => {
             let resident_planes =
                 resident_planes.ok_or(VarDctDecodeError::EntropyWindowContract {
@@ -388,14 +388,14 @@ pub(super) fn encode_frame_render(
             debug_assert_eq!(output_scratch.plan, plan);
             // An LF slot contains the complete pre-color-transform image, including restoration
             // and frame upsampling. Retain only these final allocations after validation.
-            let lf_planes = if source.packet.profile.lf_level != 0 {
+            let lf_output = if source.packet.profile.lf_level != 0 {
                 let mut tracked = |buffer: &wgpu::Buffer| {
                     let permit = transient_permit
                         .split_off(buffer.size())
                         .map_err(ProgressiveDcGpuError::from)?;
                     Ok::<_, VarDctDecodeError>(GpuBufferLease::from_tracked(buffer.clone(), permit))
                 };
-                Some(ProgressiveDcXybPlanes::from_leases(
+                let xyb = ProgressiveDcXybPlanes::from_leases(
                     [
                         tracked(&presentation_planes[0])?,
                         tracked(&presentation_planes[1])?,
@@ -404,7 +404,20 @@ pub(super) fn encode_frame_render(
                     output_width,
                     output_height,
                     presentation_stride,
-                )?)
+                )?;
+                let extras = source
+                    .extra_render
+                    .as_ref()
+                    .zip(rendered_extra)
+                    .map(|(plan, buffers)| {
+                        crate::progressive_dc::ProgressiveDcExtras::retain(
+                            plan,
+                            buffers,
+                            transient_permit,
+                        )
+                    })
+                    .transpose()?;
+                Some(crate::progressive_dc::ProgressiveDcOutput { xyb, extras })
             } else {
                 None
             };
@@ -427,7 +440,7 @@ pub(super) fn encode_frame_render(
                     _scratch: output_scratch,
                 },
                 post_transform_buffers,
-                lf_planes,
+                lf_output,
             )
         }
         VarDctFrameOutput::Extra { index, plan } => {
@@ -507,7 +520,7 @@ pub(super) fn encode_frame_render(
     Ok(FrameRenderResult {
         output_scratch,
         post_transform_buffers,
-        lf_planes,
+        lf_output,
         resident_scratch,
         _dc_reconstruction: dc_reconstruction,
     })

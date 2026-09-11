@@ -96,7 +96,11 @@ impl SequenceSource {
                 || self.request.clone(),
                 |encodings| self.request.clone().for_frame_surface(encodings[index]),
             )
-            .with_progressive_output(progressive && self.request.progressive_output());
+            .with_progressive_output(progressive && self.request.progressive_output())
+            .with_lf_presentation(
+                self.request.progressive_output()
+                    && self.inventory.frames[index].frame_type == FrameType::LowFrequency,
+            );
         let projected = project_frame_inventory(&self.inventory, frame_index)?;
         match projected.frames[0].encoding {
             FrameEncoding::Modular => {
@@ -121,6 +125,7 @@ impl SequenceSource {
                 let request = if projected.frames[0].frame_type == FrameType::LowFrequency {
                     GpuOutputRequest::color(crate::vardct_rgb8_format())?
                         .with_max_frame_slots(request.max_frame_slots())
+                        .with_lf_presentation(request.retains_lf_presentation())
                 } else {
                     request
                 };

@@ -2971,3 +2971,44 @@ rustdoc pass. Reference and Metal harnesses each pass 18/18 cases; Reference cre
 Gray8 U8 readback directly maps all 221 logical bytes with zero staging bytes. All 30 new fixture
 files regenerate exactly. The 14 existing normal/associated composition fixtures and all 36
 existing progressive-composition header fragments also regenerate unchanged.
+
+### LF intermediate alpha and extra presentation (2026-09-12)
+
+`regenerate_lf_extra_channels` also writes ten small independently decodable LF producer images
+and their native linear-RGB/alpha/depth references. Their frame entropy is unchanged; an LF root
+becomes an ordinary small image, and a nested LF1 image retains LF2 as an LF1 dependency relative
+to its smaller canvas. Native libjxl validates each standalone. Tests recover XYB from native
+linear RGB with an independent F64 matrix inverse, recursively expand it using the compact Up8
+triangle before inverse opsin, and expand the independent normalized extras directly. The native
+F32 source and forward/inverse conversion limit the color oracle's precision. The 5e-4 color and
+3e-6 scalar bounds measure this intermediate-presentation policy, not ISO final-image conformance.
+
+Two additional four-frame `nested_*_gab1.composed.jxl.hex` streams put LF2 and LF1 before a hidden
+full-size background which saves reference slot one. The terminal LF-dependent frame blends RGB
+and alpha against that slot and adds depth. LF2's prediction slot expires while both previews are
+still queued; presentation extras must remain alive independently. Native standalone backgrounds
+plus scalar F64 source-over/Add provide the per-level composition oracle. Separate foregrounds
+preserve the composed consumer's Gaborish setting, so native coalesced finals also validate the
+scalar composition domain. The generator checks native acceptance and preserves all original
+baseline LF-extra fixtures. The same two regeneration commands above reproduce all 42 files in
+this directory.
+
+GPU tests cover whole and 40-byte-window/137-byte-fragment input, RGBA F32, both scalar extra planes,
+native unsigned extra packing, immutable held outputs and byte-identical final-only images.
+Public cancellation/final-only switching covers 72 cases. A further 48 private queued/render/
+blend/pack cases verify slot expiry, committed-reference stability, exact reservation release and
+six forced allocation failures. Broken LF and late background/consumer entropy must not expose
+an unvalidated preview, and already returned images remain unchanged after terminal errors.
+
+The local regression covers 829 tests across all 44 all-feature/all-target workspace targets on
+Apple M5/Metal, with one existing ignored manual latency benchmark. The initial workspace command
+passed 768 tests and found a mismatch in the new scalar final-composition oracle: its independent
+foreground disabled the composed consumer's Gaborish filter. After generating a matched foreground,
+all four LF presentation tests pass, as do the remaining examples and 60 encoder tests. No runtime
+code or tolerance changed to resolve that failure. The scalar/native final composition error is
+below 1.65e-7, LF color error below 1.35e-4 and LF scalar-extra error below 1.71e-7; composed native
+extra codes match exactly. Formatting, warnings-denied Clippy/rustdoc, Rust 1.89 and six-crate
+all-feature WebAssembly checks pass. Reference and Metal harnesses each pass 18/18 cases; Gray8
+readback directly maps 221 logical bytes with zero staging bytes. All 42 fixture files regenerate
+exactly, including the 16 unchanged baseline files. Broader LF source precision, associated alpha,
+resampling/crops and actual LF3/LF4 stream combinations remain conformance work.

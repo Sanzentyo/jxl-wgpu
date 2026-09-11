@@ -1886,7 +1886,7 @@ pub(super) fn submit_decode(
             std::mem::align_of::<u32>() as u64,
         )
     });
-    let (lf_render, progressive_dc_planes) = match &source.output.lf_render {
+    let (lf_render, progressive_dc_output) = match &source.output.lf_render {
         Some(plan) => {
             let (buffers, planes) = plan.allocate(device, &mut memory_permits.transient)?;
             (Some(buffers), Some(planes))
@@ -2062,7 +2062,7 @@ pub(super) fn submit_decode(
         _params: params_buffer,
         _dispatch_control: dispatch_control,
         _transient_permit: memory_permits.transient,
-        progressive_dc_planes,
+        progressive_dc_output,
         lf_render,
     });
     let mut stream_sample_counts = source
@@ -2177,7 +2177,13 @@ pub(super) fn encode_frame_completion(
             plan.encode(
                 device,
                 commands,
-                pipeline,
+                crate::modular_render::ModularLfPipelines {
+                    color: pipeline,
+                    extras: pipelines
+                        .inverse
+                        .as_ref()
+                        .and_then(|pipelines| pipelines.render.as_deref()),
+                },
                 buffers,
                 ResidentStorageBinding::entire(arena)
                     .map_err(|_| Error::EngineContract("LF Modular arena is empty"))?,

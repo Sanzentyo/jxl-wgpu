@@ -1056,3 +1056,23 @@ presentation; submitted work keeps its leases until callbacks retire. Public tes
 cover 24 cancellation/final-only transitions and eight late-pass/hidden-producer corruptions through
 40-byte windows. Previously returned images stay byte-identical, only their output charges survive
 session retirement, and dropping those images returns GPU and source reservations to zero.
+
+### LF intermediate extra-plane ownership
+
+`ProgressiveDcOutput` separates prediction XYB from optional presentation extras. Opt-in LF
+producers reuse `ModularRenderPlan` normalization and effective 2×/4×/8× resampling for every extra,
+with independent sample encodings. Modular includes the complete extra plan in `modular_render_bytes`;
+VarDCT includes it in `extra_render_bytes`. The aligned output allocation splits its exact permit
+from producer scratch before submission. Prediction slots retain only XYB. A queued presentation
+owns the normalized extras independently until its exact background version has validated, including
+when an LF2 predictor slot expires while LF1 and the hidden background execute.
+
+LF rendering admits all recursive up8 stages for 3 + N planes, one 48-byte upsampling uniform per
+plane/stage, the common weight table, color packing scratch, completion fence and aligned output
+surface. XYB expands before inverse opsin; extras expand independently on the same clipped grids.
+The canonical surface copies the final extra planes into their aligned views and preserves alpha
+association. The common compositor/packer applies alpha, selected native/scalar F32 output and
+orientation. Direct color-only LF rendering keeps its existing path. Refinement stages own the
+specific compositor they need, so a native final producer can use canonical LF intermediate packing
+without changing its final output path. Callbacks retain input leases and scratch until validation;
+only immutable output allocations survive completion. No new WGSL ABI or CPU image path is added.

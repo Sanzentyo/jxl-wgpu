@@ -111,7 +111,7 @@ enum Output {
 }
 
 impl Output {
-    fn compositor(&self) -> Result<&Compositor> {
+    fn compositor(&self) -> Result<&Arc<Compositor>> {
         match self {
             Self::Composed(compositor) => Ok(compositor),
             Self::Native => Err(Error::EngineContract(
@@ -205,9 +205,7 @@ impl DependentSession {
             )
         };
         let lf_preview = if request.progressive_output()
-            && request.mapping() == crate::GpuOutputMapping::Color
             && inventory.image_header.xyb_encoded
-            && inventory.image_header.extra_channels.is_empty()
             && inventory
                 .frames
                 .iter()
@@ -482,7 +480,7 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
 struct PhysicalPending {
     pending: Box<WgpuDecodePendingFrame>,
     count: Arc<AtomicUsize>,
-    lf: Option<ProgressiveDcXybPlanes>,
+    lf: Option<crate::progressive_dc::ProgressiveDcOutput>,
 }
 
 #[derive(Debug)]
@@ -508,7 +506,7 @@ impl Resume {
 
 #[derive(Debug)]
 struct LfUpdate {
-    planes: ProgressiveDcXybPlanes,
+    planes: crate::progressive_dc::ProgressiveDcOutput,
     progression: FrameProgression,
 }
 
@@ -518,6 +516,7 @@ enum Stage {
     Blend(GpuWork),
     Pack(GpuWork),
     Refinement {
+        compositor: Arc<Compositor>,
         resume: Resume,
         render: RefinementRender,
         progression: FrameProgression,
@@ -574,7 +573,7 @@ impl DependentPending {
         &mut self,
         frame: SubmittedGpuFrame<GpuImageFrame>,
         count: &AtomicUsize,
-        lf: Option<ProgressiveDcXybPlanes>,
+        lf: Option<crate::progressive_dc::ProgressiveDcOutput>,
         emit_intermediates: bool,
     ) -> Result<Option<SubmittedGpuFrame<GpuImageFrame>>> {
         self.completed_submissions =
@@ -605,9 +604,11 @@ impl DependentPending {
                 Some(last_use) => Some(LfFrame {
                     frame_index: node.frame_index,
                     last_use,
-                    planes: lf.ok_or(Error::EngineContract(
-                        "validated LF producer lost its planes",
-                    ))?,
+                    planes: lf
+                        .ok_or(Error::EngineContract(
+                            "validated LF producer lost its planes",
+                        ))?
+                        .xyb,
                 }),
                 None => None,
             };
@@ -662,7 +663,7 @@ impl DependentPending {
                     .lf_preview
                     .as_ref()
                     .expect("LF preview selected")
-                    .submit(&update.planes, level)?,
+                    .submit_with_extras(&update.planes.xyb, update.planes.extras.as_ref(), level)?,
                 progression: update.progression,
             });
             self.submissions.fetch_add(1, Ordering::AcqRel);
@@ -777,7 +778,7 @@ impl DependentPending {
                                 Poll::Ready(result) => result?,
                             }
                         }
-                        *lf = Some(lf_planes(pending)?);
+                        *lf = Some(lf_output(pending)?);
                     }
                     let result = if emit_intermediates && self.physical + 1 == self.end {
                         Pin::new(pending.as_mut()).poll_next_update(context)
@@ -834,6 +835,7 @@ impl DependentPending {
                 }
                 Stage::Refinement {
                     render: RefinementRender::Blend(work),
+                    compositor,
                     ..
                 } => {
                     let buffer = match work.poll(context) {
@@ -847,7 +849,6 @@ impl DependentPending {
                         self.stage = Some(resume.stage());
                         continue;
                     }
-                    let compositor = self.output.compositor()?;
                     let work = compositor.pack(&compositor.completed_surface(buffer))?;
                     let Some(Stage::Refinement { render, .. }) = self.stage.as_mut() else {
                         unreachable!()
@@ -867,6 +868,7 @@ impl DependentPending {
                     let Some(Stage::Refinement {
                         resume,
                         progression,
+                        compositor,
                         ..
                     }) = self.stage.take()
                     else {
@@ -876,7 +878,7 @@ impl DependentPending {
                     if emit_intermediates {
                         return Poll::Ready(Ok(self.update(
                             buffer,
-                            self.output.compositor()?.layout.clone(),
+                            compositor.layout.clone(),
                             progression,
                         )));
                     }
@@ -889,28 +891,38 @@ impl DependentPending {
                     let progression = *progression;
                     self.stage = Some(Stage::Advance);
                     if emit_intermediates {
-                        let layout = self
+                        let preview = self
                             .lf_preview
                             .as_ref()
-                            .ok_or(Error::EngineContract("LF preview renderer was lost"))?
-                            .layout
-                            .clone();
-                        if matches!(*self.output, Output::Composed(_)) {
-                            let surface =
-                                self.output.compositor()?.import(vec![GpuImageOutput {
-                                    id: OutputId(0),
-                                    layout,
-                                    buffer,
-                                }])?;
+                            .ok_or(Error::EngineContract("LF preview renderer was lost"))?;
+                        if let Some(surface_layout) = &preview.surface {
+                            let compositor = match &*self.output {
+                                Output::Composed(compositor) => Arc::clone(compositor),
+                                Output::Native => {
+                                    Arc::clone(preview.compositor.as_ref().ok_or(
+                                        Error::EngineContract("LF output packer was lost"),
+                                    )?)
+                                }
+                            };
+                            let surface = compositor.import(crate::frame_surface::outputs(
+                                &preview.layout,
+                                Some(surface_layout),
+                                &buffer,
+                            ))?;
                             self.render_refinement(
+                                compositor,
                                 surface,
                                 self.end - 1,
                                 Resume::Advance,
                                 progression,
                             )?;
-                            continue;
+                        } else {
+                            return Poll::Ready(Ok(self.update(
+                                buffer,
+                                preview.layout.clone(),
+                                progression,
+                            )));
                         }
-                        return Poll::Ready(Ok(self.update(buffer, layout, progression)));
                     }
                 }
                 Stage::Advance => self.advance()?,
@@ -937,7 +949,7 @@ impl DependentPending {
                         if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
                             pending.wait_until_dependency_submitted()?;
                         }
-                        lf = Some(lf_planes(&pending)?);
+                        lf = Some(lf_output(&pending)?);
                     }
                     if let Some(frame) = self.decoded(pending.wait()?, &count, lf, false)? {
                         return Ok(frame);
@@ -972,17 +984,23 @@ impl DependentPending {
                 "refinement has no pending physical producer",
             ));
         };
-        self.render_refinement(surface, self.physical, Resume::Decode(decode), progression)
+        self.render_refinement(
+            Arc::clone(self.output.compositor()?),
+            surface,
+            self.physical,
+            Resume::Decode(decode),
+            progression,
+        )
     }
 
     fn render_refinement(
         &mut self,
+        compositor: Arc<Compositor>,
         surface: Surface,
         index: usize,
         resume: Resume,
         progression: FrameProgression,
     ) -> Result<()> {
-        let compositor = self.output.compositor()?;
         let carry = self
             .carry
             .as_ref()
@@ -997,6 +1015,7 @@ impl DependentPending {
             RefinementRender::Pack(compositor.pack(&surface)?)
         };
         self.stage = Some(Stage::Refinement {
+            compositor,
             resume,
             render,
             progression,
@@ -1061,10 +1080,12 @@ fn packed_frame(layout: ImageLayout, buffer: jxl_wgpu::GpuBufferLease) -> GpuIma
     }
 }
 
-fn lf_planes(pending: &WgpuDecodePendingFrame) -> Result<ProgressiveDcXybPlanes> {
+fn lf_output(
+    pending: &WgpuDecodePendingFrame,
+) -> Result<crate::progressive_dc::ProgressiveDcOutput> {
     match pending {
-        WgpuDecodePendingFrame::Modular(pending) => pending.progressive_dc_planes(),
-        WgpuDecodePendingFrame::VarDct(pending) => Ok(pending.progressive_dc_planes()?),
+        WgpuDecodePendingFrame::Modular(pending) => pending.progressive_dc_output(),
+        WgpuDecodePendingFrame::VarDct(pending) => Ok(pending.progressive_dc_output()?),
         WgpuDecodePendingFrame::Sequence(_) => {
             Err(Error::EngineContract("LF producer is a sequence"))
         }

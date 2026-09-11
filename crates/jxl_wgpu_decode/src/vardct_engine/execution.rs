@@ -482,7 +482,7 @@ struct VarDctJobLifetime {
     _rendered_extra: Option<crate::modular_render::ModularRenderBuffers>,
     _hf_coefficients: Mutex<Option<HfCoefficientJobBuffers>>,
     _resident_planes: Option<[wgpu::Buffer; 3]>,
-    lf_planes: Option<ProgressiveDcXybPlanes>,
+    lf_output: Option<crate::progressive_dc::ProgressiveDcOutput>,
     _post_transform: PostTransformJobBuffers,
     _resident_scratch: Vec<ResidentVarDctScratch>,
     _output_scratch: FrameOutputScratch,
@@ -602,9 +602,9 @@ impl FramePendingFrame {
         matches!(self.stage, VarDctPendingStage::Final { .. })
     }
 
-    pub(crate) fn progressive_dc_planes(
+    pub(crate) fn progressive_dc_output(
         &self,
-    ) -> Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
+    ) -> Result<crate::progressive_dc::ProgressiveDcOutput, VarDctDecodeError> {
         if !self.dependency_submission_ready() {
             return Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted);
         }
@@ -613,7 +613,7 @@ impl FramePendingFrame {
             .as_ref()
             .ok_or(VarDctDecodeError::CompletionConsumed)?;
         lifetime
-            .lf_planes
+            .lf_output
             .clone()
             .ok_or(VarDctDecodeError::UnvalidatedOutputNotSubmitted)
     }
@@ -2681,7 +2681,7 @@ fn submit_vardct(
     let render::FrameRenderResult {
         output_scratch,
         post_transform_buffers,
-        lf_planes,
+        lf_output,
         resident_scratch,
         ..
     } = render::encode_frame_render(
@@ -2828,7 +2828,7 @@ fn submit_vardct(
         _rendered_extra: rendered_extra,
         _hf_coefficients: Mutex::new(hf_coefficient_buffers),
         _resident_planes: resident_planes,
-        lf_planes,
+        lf_output,
         _post_transform: post_transform_buffers,
         _resident_scratch: resident_scratch,
         _output_scratch: output_scratch,

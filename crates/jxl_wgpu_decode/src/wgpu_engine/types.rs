@@ -147,7 +147,8 @@ pub struct WgpuDecodeMemoryStats {
     pub final_output_uniform_bytes: u64,
     /// All F32 reconstruction planes, scratch, weights and uniforms, including LF producers.
     pub modular_render_bytes: u64,
-    /// Retained LF XYB buffers, included in `modular_render_bytes` and split from transient scratch.
+    /// Retained LF XYB and optional presentation-extra buffers, included in
+    /// `modular_render_bytes` and split from transient scratch.
     pub progressive_dc_plane_bytes: u64,
     /// LF normalization, restoration and upsampling uniforms, included in `modular_render_bytes`.
     pub progressive_dc_uniform_bytes: u64,

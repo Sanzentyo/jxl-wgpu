@@ -247,7 +247,7 @@ pub(super) fn record_intermediates(
                 detail: "DC validation size changed",
             });
         }
-        if rendered.lf_planes.is_some() {
+        if rendered.lf_output.is_some() {
             return Err(VarDctDecodeError::EngineContract {
                 detail: "coefficient images cannot produce LF dependencies",
             });

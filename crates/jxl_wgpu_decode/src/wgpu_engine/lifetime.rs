@@ -8,7 +8,6 @@ use crate::GpuCodestream;
 use crate::buffer_pool::DecodeBufferLease;
 use crate::modular_finalize::ModularFinalizeParams;
 use crate::profile::StandardModularProfile;
-use crate::progressive_dc::ProgressiveDcXybPlanes;
 
 use super::execution::{GroupDispatchLayout, OutputPlan};
 pub(super) struct DecodeSource {
@@ -40,7 +39,7 @@ pub(super) struct DecodeJobLifetime {
     pub(super) _params: DecodeBufferLease,
     pub(super) _dispatch_control: DecodeBufferLease,
     pub(super) _transient_permit: MemoryPermit,
-    pub(super) progressive_dc_planes: Option<ProgressiveDcXybPlanes>,
+    pub(super) progressive_dc_output: Option<crate::progressive_dc::ProgressiveDcOutput>,
     pub(super) lf_render: Option<crate::modular_render::ModularLfBuffers>,
 }
 

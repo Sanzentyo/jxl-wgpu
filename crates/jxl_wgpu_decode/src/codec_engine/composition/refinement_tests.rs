@@ -107,6 +107,7 @@ fn exercise_pending(
     );
     if boundary == 2 {
         let Some(Stage::Refinement {
+            compositor,
             resume,
             render: RefinementRender::Blend(work),
             progression,
@@ -114,7 +115,6 @@ fn exercise_pending(
         else {
             unreachable!()
         };
-        let compositor = pending.output.compositor().unwrap();
         let surface = compositor.completed_surface(work.wait().unwrap());
         if action == 3 {
             require_allocation_failure(backend, || compositor.pack(&surface));
@@ -122,6 +122,7 @@ fn exercise_pending(
             return;
         }
         pending.stage = Some(Stage::Refinement {
+            compositor: Arc::clone(&compositor),
             resume,
             render: RefinementRender::Pack(compositor.pack(&surface).unwrap()),
             progression,

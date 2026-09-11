@@ -205,11 +205,11 @@ pub(super) fn selected_extra_indices(
     extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
     profile: &crate::vardct_frontend::StandardVarDctProfile,
 ) -> Vec<usize> {
-    // All LF extras must be decoded and validated, but only XYB feeds subsequent LF consumers.
-    if profile.lf_level != 0 {
+    // All LF extras validate. Only an intermediate presentation retains their normalized planes.
+    if profile.lf_level != 0 && !request.retains_lf_presentation() {
         return Vec::new();
     }
-    if request.retains_frame_surface() {
+    if request.retains_frame_surface() || request.retains_lf_presentation() {
         return (0..extras.len()).collect();
     }
     request

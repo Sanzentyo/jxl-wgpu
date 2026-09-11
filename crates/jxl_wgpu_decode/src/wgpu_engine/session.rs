@@ -10,7 +10,6 @@ use jxl_wgpu::{
 
 use crate::buffer_pool::DecodeBufferPool;
 use crate::modular_render::ModularReconstructionPipeline;
-use crate::progressive_dc::ProgressiveDcXybPlanes;
 use crate::{
     Error, FrameDuration, FrameMetadata, GpuPendingFrame, GpuSubmissionSession, Result,
     SubmittedGpuFrame, SubmittedGpuUpdate,
@@ -140,10 +139,12 @@ impl std::fmt::Debug for WgpuPendingFrame {
 }
 
 impl WgpuPendingFrame {
-    pub(crate) fn progressive_dc_planes(&self) -> Result<ProgressiveDcXybPlanes> {
+    pub(crate) fn progressive_dc_output(
+        &self,
+    ) -> Result<crate::progressive_dc::ProgressiveDcOutput> {
         self.lifetime
             .as_ref()
-            .and_then(|lifetime| lifetime.progressive_dc_planes.clone())
+            .and_then(|lifetime| lifetime.progressive_dc_output.clone())
             .ok_or(Error::EngineContract(
                 "Modular pending frame does not retain progressive-DC XYB planes",
             ))

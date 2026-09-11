@@ -557,11 +557,11 @@ impl VarDctPendingFrame {
     pub(crate) fn submissions_per_frame_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.runtime.submissions_per_frame)
     }
-    pub(crate) fn progressive_dc_planes(
+    pub(crate) fn progressive_dc_output(
         &self,
-    ) -> std::result::Result<ProgressiveDcXybPlanes, VarDctDecodeError> {
+    ) -> std::result::Result<crate::progressive_dc::ProgressiveDcOutput, VarDctDecodeError> {
         match &self.state {
-            PendingStage::Frame(pending) => pending.progressive_dc_planes(),
+            PendingStage::Frame(pending) => pending.progressive_dc_output(),
             _ => Err(VarDctDecodeError::UnvalidatedOutputNotSubmitted),
         }
     }

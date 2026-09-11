@@ -32,9 +32,9 @@ impl OutputChannels {
         profile: &StandardModularProfile,
         request: &GpuOutputRequest,
     ) -> Result<Self> {
-        // LF dependencies retain only pre-color-transform XYB. The full source topology still
-        // decodes and validates every extra, independent of presentation or alpha policy.
-        if profile.progressive_dc.is_some() {
+        // Prediction needs only XYB. Opt-in LF presentation also normalizes all extras;
+        // every source plane is entropy-validated regardless of either selection.
+        if profile.progressive_dc.is_some() && !request.retains_lf_presentation() {
             return Ok(Self::identity(
                 ModularChannels::Rgb,
                 profile.sample_encoding,
@@ -59,7 +59,7 @@ impl OutputChannels {
             });
         }
         let color_count = profile.channels.color_count() as usize;
-        if request.retains_frame_surface() {
+        if request.retains_frame_surface() || request.retains_lf_presentation() {
             let indices = (0..3)
                 .map(|index| if color_count == 1 { 0 } else { index })
                 .chain(color_count..color_count + profile.extra_channels.len())

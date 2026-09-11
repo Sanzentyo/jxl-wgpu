@@ -17,7 +17,7 @@ mod color;
 mod lf;
 pub(crate) use color::ModularColorConfig;
 pub(crate) use color::ReconstructionPipeline as ModularReconstructionPipeline;
-pub(crate) use lf::{ModularLfBuffers, ModularLfPlan};
+pub(crate) use lf::{ModularLfBuffers, ModularLfPipelines, ModularLfPlan};
 
 /// Interpretation of resident Modular output words after inverse transforms or resampling.
 #[repr(u32)]
