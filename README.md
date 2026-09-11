@@ -247,6 +247,10 @@ LF roots in both coding modes validate extras and keep prediction XYB separate f
 normalized extra planes retained for intermediate presentation.
 Real LF1–LF4 streams cover independent integer/floating precision, associated alpha, grayscale,
 root color/extra resampling, orientation and delayed composition with native/scalar output.
+LF consumers may use a smaller local block rectangle of the producer, including negative canvas
+crops. Prediction and intermediate presentation keep the producer's row strides and GPU leases;
+crop placement is applied by composition. An additional native-accepted corpus covers intrinsic
+extra shifts 1–3, signed/extended-range floating depth, and cropped alpha/depth output.
 LF-consuming VarDCT frames preserve those tracked planes through global and LF-group Modular
 cursor stages. Eight independent alpha/depth fixtures cover direct and recursive LF chains,
 Gaborish, two LF groups with Squeeze, bounded fragmented input, ignored-extra corruption and

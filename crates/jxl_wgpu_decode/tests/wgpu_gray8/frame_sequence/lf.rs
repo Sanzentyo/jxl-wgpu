@@ -246,16 +246,17 @@ fn frame_plan_validates_lf_slot_versions_levels_modes_flags_and_extents() {
         .iter()
         .position(|frame| frame.frame_type != FrameType::LowFrequency)
         .unwrap();
-    for change in 0..7 {
+    for change in 0..8 {
         let mut invalid = inventory.clone();
         match change {
             0 => invalid.frames[0].lf_level = 0,
             1 => invalid.frames[0].lf_level = 5,
             2 => invalid.frames[first_color].lf_source_frame = Some(0),
             3 => invalid.frames[first_color].encoding = FrameEncoding::Modular,
-            4 => invalid.frames[0].width *= 2,
+            4 => invalid.frames[first_color].width *= 2,
             5 => invalid.frames[first_color].flags &= !32,
             6 => invalid.frames[first_color].lf_level = 1,
+            7 => invalid.frames[first_color].height *= 2,
             _ => unreachable!(),
         }
         assert!(

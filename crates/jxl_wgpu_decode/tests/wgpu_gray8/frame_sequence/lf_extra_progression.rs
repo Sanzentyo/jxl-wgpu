@@ -92,6 +92,16 @@ fn expected_from(
     level: u8,
     image: &ImageHeaderInventory,
 ) -> [Vec<f64>; 5] {
+    expected_at(directory, name, level, image, [image.width, image.height])
+}
+
+fn expected_at(
+    directory: &std::path::Path,
+    name: &str,
+    level: u8,
+    image: &ImageHeaderInventory,
+    extent: [u32; 2],
+) -> [Vec<f64>; 5] {
     let input =
         std::fs::read_to_string(directory.join(format!("{name}.lf{level}.jxl.hex"))).unwrap();
     let compact = input.split_whitespace().collect::<String>();
@@ -188,9 +198,22 @@ fn expected_from(
             planes[3 + c].push(f64::from(native[(4 + c) * pixels + i]));
         }
     }
+    // LF prediction addresses a consumer-local rectangle at the producer's top left.
+    // Its presentation policy clips that grid before recursive expansion and composition.
+    let crop_w = extent[0].div_ceil(1 << (3 * level)) as usize;
+    let crop_h = extent[1].div_ceil(1 << (3 * level)) as usize;
+    assert!(crop_w <= width && crop_h <= height);
+    planes = planes.map(|v| {
+        v.chunks_exact(width)
+            .take(crop_h)
+            .flat_map(|row| row[..crop_w].iter().copied())
+            .collect()
+    });
+    width = crop_w;
+    height = crop_h;
     for stage in (0..level).rev() {
-        let out_w = image.width.div_ceil(1 << (3 * stage)) as usize;
-        let out_h = image.height.div_ceil(1 << (3 * stage)) as usize;
+        let out_w = extent[0].div_ceil(1 << (3 * stage)) as usize;
+        let out_h = extent[1].div_ceil(1 << (3 * stage)) as usize;
         planes = planes.map(|v| up8(&v, width, height, out_w, out_h, image));
         width = out_w;
         height = out_h;

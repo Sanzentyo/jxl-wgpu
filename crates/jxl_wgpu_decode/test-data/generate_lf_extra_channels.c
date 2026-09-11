@@ -5,15 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void check(JxlEncoderStatus status) {
-  if (status != JXL_ENC_SUCCESS) abort();
+static void check_at(JxlEncoderStatus status, int line) {
+  if (status != JXL_ENC_SUCCESS) {
+    fprintf(stderr, "libjxl encoder status %d at line %d\n", status, line);
+    abort();
+  }
 }
+#define check(status) check_at(status, __LINE__)
 
 typedef struct {
   const char* name;
   uint32_t width, height, levels, colors, bits, exponent;
   uint32_t alpha_bits, alpha_exponent, depth_bits, depth_exponent;
   int associated, orientation, resampling, extra_resampling;
+  uint32_t alpha_shift, depth_shift;
+  int signed_depth;
 } Case;
 
 static void generate_case(const char* directory, const char* name, uint32_t width,
@@ -40,6 +46,7 @@ static void generate_case(const char* directory, const char* name, uint32_t widt
       ec.bits_per_sample = c ? config->depth_bits : config->alpha_bits;
       ec.exponent_bits_per_sample = c ? config->depth_exponent : config->alpha_exponent;
       ec.alpha_premultiplied = !c && config->associated;
+      ec.dim_shift = c ? config->depth_shift : config->alpha_shift;
     }
     check(JxlEncoderSetExtraChannelInfo(encoder, c, &ec));
   }
@@ -57,7 +64,7 @@ static void generate_case(const char* directory, const char* name, uint32_t widt
       config && root ? config->resampling : 1));
   if (config) {
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EXTRA_CHANNEL_RESAMPLING,
-        root ? config->extra_resampling : 1));
+        root ? config->extra_resampling : 1 << config->alpha_shift));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_KEEP_INVISIBLE, 1));
     check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_PREDICTOR, 0));
   }
@@ -94,6 +101,8 @@ static void generate_case(const char* directory, const char* name, uint32_t widt
         // the native encoder's lossless float-to-word conversion at both declared depths.
         if (config) samples[y * width + x] =
             (float)((13 + (c ? 31 : 11)*x + (c ? 3 : 17)*y + 7*level) % 129) / 128.0f;
+        if (config && config->signed_depth && c) samples[y * width + x] =
+            (float)((int)((13 + 31*x + 3*y + 7*level) % 257) - 64) / 128.0f;
       }
     }
     JxlPixelFormat plane = {1, config ? JXL_TYPE_FLOAT : JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
@@ -110,7 +119,11 @@ static void generate_case(const char* directory, const char* name, uint32_t widt
   do {
     uint8_t output[16384]; uint8_t* next = output; size_t available = sizeof(output);
     status = JxlEncoderProcessOutput(encoder, &next, &available);
-    if (status != JXL_ENC_SUCCESS && status != JXL_ENC_NEED_MORE_OUTPUT) abort();
+    if (status != JXL_ENC_SUCCESS && status != JXL_ENC_NEED_MORE_OUTPUT) {
+      fprintf(stderr, "%s: libjxl output status %d, error %d\n",
+          name, status, JxlEncoderGetError(encoder));
+      abort();
+    }
     const size_t size = sizeof(output) - available;
     if (fwrite(output, 1, size, file) != size) abort();
   } while (status == JXL_ENC_NEED_MORE_OUTPUT);
@@ -123,19 +136,26 @@ static void generate(const char* directory, const char* name, uint32_t width,
   generate_case(directory, name, width, height, modular, extras, responsive, NULL, 0, 0);
 }
 
-static void conformance(const char* directory) {
+static void conformance(const char* directory, int geometry) {
   const Case cases[] = {
-    {"integer_associated", 65, 33, 4, 3, 12, 0, 16, 0, 20, 0, 1, 6, 1, 1},
-    {"floating", 65, 33, 3, 3, 24, 7, 16, 5, 24, 7, 0, 8, 1, 1},
-    {"resampled_associated", 193, 129, 1, 3, 16, 0, 16, 0, 20, 0, 1, 2, 2, 8},
-    {"floating_resampled", 193, 129, 1, 3, 32, 8, 32, 8, 32, 8, 1, 7, 2, 8},
-    {"gray_float", 65, 33, 2, 1, 32, 8, 16, 5, 24, 7, 1, 5, 1, 1},
+    {"integer_associated", 65, 33, 4, 3, 12, 0, 16, 0, 20, 0, 1, 6, 1, 1, 0, 0, 0},
+    {"floating", 65, 33, 3, 3, 24, 7, 16, 5, 24, 7, 0, 8, 1, 1, 0, 0, 0},
+    {"resampled_associated", 193, 129, 1, 3, 16, 0, 16, 0, 20, 0, 1, 2, 2, 8, 0, 0, 0},
+    {"floating_resampled", 193, 129, 1, 3, 32, 8, 32, 8, 32, 8, 1, 7, 2, 8, 0, 0, 0},
+    {"gray_float", 65, 33, 2, 1, 32, 8, 16, 5, 24, 7, 1, 5, 1, 1, 0, 0, 0},
+  };
+  const Case geometry_cases[] = {
+    {"shifted_integer", 65, 33, 2, 3, 12, 0, 16, 0, 20, 0, 1, 6, 1, 4, 1, 1, 0},
+    {"shifted_float", 65, 33, 2, 3, 24, 7, 32, 8, 32, 8, 1, 8, 1, 8, 2, 2, 1},
+    {"shifted_thin_float", 193, 65, 1, 3, 24, 7, 32, 8, 32, 8, 0, 3, 1, 8, 3, 3, 1},
+    {"signed_float", 65, 33, 3, 3, 24, 7, 16, 5, 24, 7, 0, 5, 1, 1, 0, 0, 1},
   };
   char path[4096];
   if (snprintf(path, sizeof(path), "%s/conformance.txt", directory) >= (int)sizeof(path)) abort();
   FILE* manifest = fopen(path, "w"); if (!manifest) abort();
-  for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
-    const Case* config = &cases[i];
+  const size_t count = geometry ? sizeof(geometry_cases) / sizeof(*geometry_cases) : sizeof(cases) / sizeof(*cases);
+  for (size_t i = 0; i < count; ++i) {
+    const Case* config = geometry ? &geometry_cases[i] : &cases[i];
     fprintf(manifest, "%s %u\n", config->name, config->levels);
     for (uint32_t level = 0; level <= config->levels; ++level) {
       uint32_t factor = 1u << (3 * level);
@@ -148,13 +168,23 @@ static void conformance(const char* directory) {
             level == config->levels);
       }
     }
+    if (geometry) {
+      char name[4096];
+      if (snprintf(name, sizeof(name), "%s_crop", config->name) >= (int)sizeof(name)) abort();
+      generate_case(directory, name, config->width - 12, config->height - 8,
+                    0, 2, 0, config, 0, 0);
+    }
   }
   if (fclose(manifest)) abort();
 }
 
 int main(int argc, char** argv) {
   if (argc == 3 && !strcmp(argv[2], "--conformance")) {
-    conformance(argv[1]);
+    conformance(argv[1], 0);
+    return 0;
+  }
+  if (argc == 3 && !strcmp(argv[2], "--geometry")) {
+    conformance(argv[1], 1);
     return 0;
   }
   if (argc == 3 && !strcmp(argv[2], "--distributed")) {

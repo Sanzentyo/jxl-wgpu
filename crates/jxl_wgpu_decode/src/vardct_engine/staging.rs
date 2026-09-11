@@ -236,8 +236,8 @@ impl VarDctDecodeSession {
         match self.prepared.as_mut() {
             Some(PreparedStage::Frame(session)) => session.set_progressive_dc_source(planes),
             Some(PreparedStage::Global(source)) if source.packet.profile().uses_lf_frame => {
-                planes.validate_extent(source.packet.profile().block_extent())?;
-                source.external_lf = Some(planes);
+                source.external_lf =
+                    Some(planes.into_extent(source.packet.profile().block_extent())?);
                 Ok(())
             }
             _ => Err(VarDctDecodeError::UnexpectedProgressiveDcSource),

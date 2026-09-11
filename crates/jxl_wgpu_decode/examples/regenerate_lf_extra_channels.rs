@@ -1,6 +1,7 @@
 //! Reframe independent libjxl entropy into LF chains with alpha and depth planes.
 //! `cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- OUTPUT_DIRECTORY`
 //! Add `--conformance` for mixed-precision LF1–LF4, alpha, orientation and resampling cases.
+//! Add `--geometry` for intrinsic extra-channel shifts and signed floating-point samples.
 //!
 //! libjxl's encoder disables progressive DC with extras. Retain an ordinary VarDCT frame's
 //! global extras and HF entropy, remove its LF coefficient substream, and reference an independent
@@ -213,6 +214,7 @@ enum Role {
     Final,
     Background,
     Blend,
+    Crop { x0: i32, y0: i32, blend: bool },
 }
 
 fn physical(data: &[u8], lf_level: u32, uses_lf: bool, gaborish: bool) -> Vec<u8> {
@@ -236,14 +238,17 @@ fn physical_with_role(
     assert_eq!(frame.flags, 0);
     assert_eq!(inventory.image_header.extra_channels.len(), 2);
     assert!(inventory.image_header.xyb_encoded);
-    assert!(
-        inventory
-            .image_header
-            .extra_channels
-            .iter()
-            .all(|extra| extra.dimension_shift == 0),
-        "this offline header writer does not reframe shifted extra metadata"
-    );
+    let extra_selectors = frame
+        .extra_channel_upsampling
+        .iter()
+        .zip(&inventory.image_header.extra_channels)
+        .map(|(&factor, extra)| {
+            let selector = factor >> extra.dimension_shift;
+            assert_eq!(selector << extra.dimension_shift, factor);
+            assert!([1, 2, 4, 8].contains(&selector));
+            selector
+        })
+        .collect::<Vec<_>>();
     let modular = frame.encoding == FrameEncoding::Modular;
     let lf = lf_level != 0;
     assert!(!uses_lf || !modular);
@@ -253,20 +258,14 @@ fn physical_with_role(
     header.write_bits(u64::from(modular), 1).unwrap();
     if !uses_lf {
         header.write_bits(0, 2).unwrap(); // flags=0
-        for factor in
-            std::iter::once(frame.upsampling).chain(frame.extra_channel_upsampling.iter().copied())
-        {
+        for factor in std::iter::once(frame.upsampling).chain(extra_selectors.iter().copied()) {
             assert!([1, 2, 4, 8].contains(&factor));
             header.write_bits(u64::from(factor.ilog2()), 2).unwrap();
         }
     } else {
         assert_eq!(frame.upsampling, 1);
-        assert!(
-            frame
-                .extra_channel_upsampling
-                .iter()
-                .all(|&factor| factor == 1)
-        );
+        // Omitted selectors default to one; each intrinsic dimension shift still applies.
+        assert!(extra_selectors.iter().all(|&factor| factor == 1));
         header.write_bits(2, 2).unwrap();
         header.write_bits(32 - 17, 8).unwrap(); // UseLfFrame, omits upsampling
     }
@@ -282,8 +281,25 @@ fn physical_with_role(
     if lf {
         header.write_bits(u64::from(lf_level - 1), 2).unwrap();
     } else {
-        header.write_bits(0, 1).unwrap(); // no crop
-        if role == Role::Blend {
+        if let Role::Crop { x0, y0, .. } = role {
+            header.write_bits(1, 1).unwrap();
+            // Small signed origins and extents use the first crop U32 distribution.
+            let signed = |v: i32| {
+                if v < 0 {
+                    (-v * 2 - 1) as u32
+                } else {
+                    (v * 2) as u32
+                }
+            };
+            for value in [signed(x0), signed(y0), frame.width, frame.height] {
+                assert!(value < 256);
+                header.write_bits(0, 2).unwrap();
+                header.write_bits(u64::from(value), 8).unwrap();
+            }
+        } else {
+            header.write_bits(0, 1).unwrap(); // no crop
+        }
+        if role == Role::Blend || matches!(role, Role::Crop { blend: true, .. }) {
             for _ in 0..2 {
                 header.write_bits(2, 2).unwrap(); // Blend color and alpha
                 header.write_bits(0, 2).unwrap(); // alpha index zero
@@ -293,7 +309,17 @@ fn physical_with_role(
             header.write_bits(1, 2).unwrap(); // Add depth
             header.write_bits(1, 2).unwrap(); // reference slot one
         } else {
-            header.write_bits(0, 6).unwrap(); // replace color and both extras
+            // Cropped Replace needs the implicit zero background outside its extent.
+            header
+                .write_bits(
+                    0,
+                    if matches!(role, Role::Crop { .. }) {
+                        12
+                    } else {
+                        6
+                    },
+                )
+                .unwrap();
         }
         header
             .write_bits(u64::from(role != Role::Background), 1)
@@ -333,7 +359,7 @@ fn main() {
     let option = std::env::args().nth(2);
     assert!(matches!(
         option.as_deref(),
-        None | Some("--distributed" | "--conformance")
+        None | Some("--distributed" | "--conformance" | "--geometry")
     ));
     let distributed = option.as_deref() == Some("--distributed");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
@@ -359,7 +385,7 @@ fn main() {
         &decoder,
         &["libjxl", "libjxl_cms"],
     );
-    if option.as_deref() == Some("--conformance") {
+    if matches!(option.as_deref(), Some("--conformance" | "--geometry")) {
         lf_conformance::generate(&temporary, &output, &decoder);
         std::fs::remove_dir_all(temporary).unwrap();
         return;

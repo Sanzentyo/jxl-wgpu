@@ -120,6 +120,11 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 height.div_ceil(1 << (3 * level)),
             );
             let stride = source.width + 3;
+            let producer = if surface {
+                Extent2d::new(source.width + 2, source.height + 1)
+            } else {
+                source
+            };
             let mut cpu = std::array::from_fn::<_, 3, _>(|channel| {
                 (0..source.width * source.height)
                     .map(|i| {
@@ -133,7 +138,7 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                     .collect::<Vec<_>>()
             });
             let leases = std::array::from_fn(|channel| {
-                let mut padded = vec![f32::NAN; (stride * source.height) as usize];
+                let mut padded = vec![f32::NAN; (stride * producer.height) as usize];
                 for y in 0..source.height {
                     for x in 0..source.width {
                         padded[(y * stride + x) as usize] =
@@ -151,9 +156,21 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                 let permit = memory.try_reserve(buffer.size()).unwrap();
                 GpuBufferLease::from_tracked(buffer, permit)
             });
-            let planes =
-                ProgressiveDcXybPlanes::from_leases(leases, source.width, source.height, stride)
-                    .unwrap();
+            let planes = ProgressiveDcXybPlanes::from_leases(
+                leases,
+                producer.width,
+                producer.height,
+                stride,
+            )
+            .unwrap();
+            for extent in [
+                [0, source.height],
+                [source.width, 0],
+                [producer.width + 1, source.height],
+                [source.width, producer.height + 1],
+            ] {
+                assert!(planes.clone().into_extent(extent).is_err());
+            }
             let bytes = |w: u32, h: u32| u64::from(w) * u64::from(h) * 4;
             let total = renderer.output_storage_bytes
                 + renderer.output_plan.memory.transient_bytes

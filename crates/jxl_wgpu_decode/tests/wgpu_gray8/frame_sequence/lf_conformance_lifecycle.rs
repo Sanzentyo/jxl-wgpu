@@ -2,7 +2,7 @@ use super::*;
 
 type Held = (jxl_wgpu::GpuImageOutput, Vec<u8>);
 
-fn hold(backend: &WgpuBackend, output: &jxl_wgpu::GpuImageOutput) -> Held {
+pub(super) fn hold(backend: &WgpuBackend, output: &jxl_wgpu::GpuImageOutput) -> Held {
     (
         jxl_wgpu::GpuImageOutput {
             id: output.id,
@@ -13,7 +13,11 @@ fn hold(backend: &WgpuBackend, output: &jxl_wgpu::GpuImageOutput) -> Held {
     )
 }
 
-fn released(backend: &WgpuBackend, decoder: &GpuDecoder<WgpuDecodeEngine>, held: Vec<Held>) {
+pub(super) fn released(
+    backend: &WgpuBackend,
+    decoder: &GpuDecoder<WgpuDecodeEngine>,
+    held: Vec<Held>,
+) {
     retired(backend);
     assert_eq!(
         decoder.incremental_input_budget().snapshot().reserved_bytes,
@@ -31,7 +35,7 @@ fn released(backend: &WgpuBackend, decoder: &GpuDecoder<WgpuDecodeEngine>, held:
     assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
 }
 
-fn integer_error(bytes: &[u8], values: &[f64], bits: u32) {
+pub(super) fn integer_error(bytes: &[u8], values: &[f64], bits: u32) {
     let stride = if bits <= 16 { 2 } else { 4 };
     assert_eq!(bytes.len(), values.len() * stride);
     let maximum = (1_u32 << bits) - 1;
@@ -146,80 +150,81 @@ fn lf_deep_and_floating_corruption_cannot_publish_unvalidated_images() {
         .into_iter()
         .filter(|(name, _)| name.starts_with("integer_associated") || name.starts_with("floating_"))
     {
-        let encoded = fixture(&name, ".composed");
-        let inventory = parse(&encoded, Default::default())
+        reject_corruption(&backend, &name, levels, &fixture(&name, ".composed"));
+    }
+}
+
+pub(super) fn reject_corruption(backend: &WgpuBackend, name: &str, levels: u8, encoded: &[u8]) {
+    let inventory = parse(encoded, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    for damaged in [
+        0,
+        usize::from(levels) - 1,
+        usize::from(levels),
+        usize::from(levels) + 1,
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>()
+    {
+        let mut corrupt = encoded[..inventory.frames[0].header_bits.offset as usize / 8].to_vec();
+        for (index, frame) in inventory.frames.iter().enumerate() {
+            let mut packets = payloads(encoded, frame);
+            if index == damaged {
+                let end = global_end(encoded, frame) / 8 - frame.sections[0].bytes.offset as usize;
+                packets[0].truncate(end - 1);
+            }
+            corrupt.extend(reassemble(encoded, frame, packets));
+        }
+        parse(&corrupt, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
             .unwrap();
-        for damaged in [
-            0,
-            usize::from(levels) - 1,
-            usize::from(levels),
-            usize::from(levels) + 1,
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        {
-            let mut corrupt =
-                encoded[..inventory.frames[0].header_bits.offset as usize / 8].to_vec();
-            for (index, frame) in inventory.frames.iter().enumerate() {
-                let mut packets = payloads(&encoded, frame);
-                if index == damaged {
-                    let end =
-                        global_end(&encoded, frame) / 8 - frame.sections[0].bytes.offset as usize;
-                    packets[0].truncate(end - 1);
-                }
-                corrupt.extend(reassemble(&encoded, frame, packets));
-            }
-            parse(&corrupt, Default::default())
+        let decoder = GpuDecoder::new(
+            WgpuDecodeEngine::new(backend.clone())
                 .unwrap()
-                .codestream_inventory(Default::default())
-                .unwrap();
-            let decoder = GpuDecoder::new(
-                WgpuDecodeEngine::new(backend.clone())
-                    .unwrap()
-                    .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+                .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
+        );
+        for extra in [None, Some(1)] {
+            let mut session = incremental(
+                &decoder,
+                &corrupt,
+                request(&inventory.image_header, extra).with_progressive_output(true),
             );
-            for extra in [None, Some(1)] {
-                let mut session = incremental(
-                    &decoder,
-                    &corrupt,
-                    request(&inventory.image_header, extra).with_progressive_output(true),
-                );
-                let mut held = Vec::new();
-                loop {
-                    match pollster::block_on(session.next_update_async()) {
-                        Ok(Some(update)) => {
-                            assert!(matches!(
-                                update.progression(),
-                                Some(FrameProgression::LowFrequency { .. })
-                            ));
-                            held.push(hold(&backend, &update.output().outputs[0]));
-                        }
-                        Err(error) => {
-                            assert!(
-                                matches!(
-                                    error,
-                                    Error::ModularEntropyRejected { .. } | Error::VarDct(_)
-                                ),
-                                "{name} damaged={damaged}: {error:?}"
-                            );
-                            break;
-                        }
-                        Ok(None) => panic!("{name} damaged={damaged}: corrupt entropy accepted"),
+            let mut held = Vec::new();
+            loop {
+                match pollster::block_on(session.next_update_async()) {
+                    Ok(Some(update)) => {
+                        assert!(matches!(
+                            update.progression(),
+                            Some(FrameProgression::LowFrequency { .. })
+                        ));
+                        held.push(hold(backend, &update.output().outputs[0]));
                     }
+                    Err(error) => {
+                        assert!(
+                            matches!(
+                                error,
+                                Error::ModularEntropyRejected { .. } | Error::VarDct(_)
+                            ),
+                            "{name} damaged={damaged}: {error:?}"
+                        );
+                        break;
+                    }
+                    Ok(None) => panic!("{name} damaged={damaged}: corrupt entropy accepted"),
                 }
-                assert_eq!(
-                    held.len(),
-                    if damaged == usize::from(levels) + 1 {
-                        usize::from(levels)
-                    } else {
-                        0
-                    }
-                );
-                drop(session);
-                released(&backend, &decoder, held);
             }
+            assert_eq!(
+                held.len(),
+                if damaged == usize::from(levels) + 1 {
+                    usize::from(levels)
+                } else {
+                    0
+                }
+            );
+            drop(session);
+            released(backend, &decoder, held);
         }
     }
 }

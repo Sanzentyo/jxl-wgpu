@@ -3,6 +3,8 @@ use super::*;
 use jxl_gpu_bitstream::{ExtraChannelTypeInventory, SampleBitDepth};
 use jxl_wgpu_decode::{AlphaOutputPolicy, OrientationPolicy};
 
+#[path = "lf_geometry.rs"]
+mod geometry;
 #[path = "lf_conformance_lifecycle.rs"]
 mod lifecycle;
 
@@ -11,7 +13,11 @@ fn directory() -> std::path::PathBuf {
 }
 
 fn fixture(name: &str, suffix: &str) -> Vec<u8> {
-    read_fixture(&directory().join(format!("{name}{suffix}.jxl.hex")))
+    fixture_from(&directory(), name, suffix)
+}
+
+fn fixture_from(directory: &std::path::Path, name: &str, suffix: &str) -> Vec<u8> {
+    read_fixture(&directory.join(format!("{name}{suffix}.jxl.hex")))
 }
 
 fn cases() -> Vec<(String, u8)> {
@@ -42,6 +48,14 @@ fn assert_metadata(name: &str, level: u8, image: &ImageHeaderInventory) {
             (float(32, 8), float(32, 8), float(32, 8), true, 7, 1)
         } else if name.starts_with("gray_float_") {
             (float(32, 8), float(16, 5), float(24, 7), true, 5, 2)
+        } else if name.starts_with("shifted_integer_") {
+            (integer(12), integer(16), integer(20), true, 6, 2)
+        } else if name.starts_with("shifted_float_") {
+            (float(24, 7), float(32, 8), float(32, 8), true, 8, 2)
+        } else if name.starts_with("shifted_thin_float_") {
+            (float(24, 7), float(32, 8), float(32, 8), false, 3, 1)
+        } else if name.starts_with("signed_float_") {
+            (float(24, 7), float(16, 5), float(24, 7), false, 5, 3)
         } else {
             assert!(name.starts_with("floating_"));
             (float(24, 7), float(16, 5), float(24, 7), false, 8, 3)
@@ -57,6 +71,21 @@ fn assert_metadata(name: &str, level: u8, image: &ImageHeaderInventory) {
     );
     assert_eq!(image.orientation, orientation);
     assert_eq!(image.grayscale, name.starts_with("gray_"));
+    let shift = if name.starts_with("shifted_integer_") {
+        1
+    } else if name.starts_with("shifted_float_") {
+        2
+    } else if name.starts_with("shifted_thin_float_") {
+        3
+    } else {
+        0
+    };
+    assert!(
+        image
+            .extra_channels
+            .iter()
+            .all(|ec| ec.dimension_shift == shift)
+    );
 }
 
 fn assert_error(actual: &[f32], expected: &[f64], tolerance: f64, label: &str, relative: bool) {
@@ -132,7 +161,17 @@ struct Check {
 
 impl Check {
     fn new(name: &str, levels: u8, composed: bool) -> Option<Self> {
-        let encoded = fixture(name, if composed { ".composed" } else { "" });
+        Self::from_directory(&directory(), name, levels, composed)
+    }
+
+    fn from_directory(
+        directory: &std::path::Path,
+        name: &str,
+        levels: u8,
+        composed: bool,
+    ) -> Option<Self> {
+        let fixture = |suffix| fixture_from(directory, name, suffix);
+        let encoded = fixture(if composed { ".composed" } else { "" });
         let inventory = parse(&encoded, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
@@ -160,20 +199,50 @@ impl Check {
         );
         assert_eq!(
             inventory.frames[0].extra_channel_upsampling,
-            vec![if name.contains("resampled") { 8 } else { 1 }; 2]
+            vec![
+                if name.starts_with("shifted_integer_") {
+                    4
+                } else if name.contains("resampled") || name.starts_with("shifted_") {
+                    8
+                } else {
+                    1
+                };
+                2
+            ]
         );
+        assert_eq!(
+            inventory.frames[0].encoding,
+            if name.ends_with("_modular") {
+                FrameEncoding::Modular
+            } else {
+                assert!(name.ends_with("_vardct"));
+                FrameEncoding::VarDct
+            }
+        );
+        for frame in inventory
+            .frames
+            .iter()
+            .filter(|frame| frame.flags & 32 != 0)
+        {
+            assert_eq!(frame.upsampling, 1);
+            assert_eq!(
+                frame.extra_channel_upsampling,
+                image
+                    .extra_channels
+                    .iter()
+                    .map(|ec| 1 << ec.dimension_shift)
+                    .collect::<Vec<_>>()
+            );
+        }
         let options = &["--preserve-alpha", "--keep-orientation"];
         let native = planes(&oracle::libjxl_output(&encoded, options)?);
         let mut previews: Vec<_> = (1..=levels)
             .rev()
-            .map(|level| expected_from(&directory(), name, level, &image))
+            .map(|level| expected_from(directory, name, level, &image))
             .collect();
         if composed {
-            let background = planes(&oracle::libjxl_output(
-                &fixture(name, ".background"),
-                options,
-            )?);
-            let mut foreground = planes(&oracle::libjxl_output(&fixture(name, ""), options)?);
+            let background = planes(&oracle::libjxl_output(&fixture(".background"), options)?);
+            let mut foreground = planes(&oracle::libjxl_output(&fixture(""), options)?);
             let associated = matches!(
                 image.extra_channels[0].channel_type,
                 ExtraChannelTypeInventory::Alpha { associated: true }

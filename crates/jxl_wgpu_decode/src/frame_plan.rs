@@ -175,9 +175,11 @@ impl FrameExecutionPlan {
                     producer.width.div_ceil(lf_scale),
                     producer.height.div_ceil(lf_scale),
                 );
-                if source_extent != (width.div_ceil(8), height.div_ceil(8)) {
+                // A cropped consumer reads the top-left block rectangle of the LF image.
+                // Its signed canvas origin affects composition, not prediction coordinates.
+                if source_extent.0 < width.div_ceil(8) || source_extent.1 < height.div_ceil(8) {
                     return Err(invalid(
-                        "LF producer extent does not match the consumer block extent",
+                        "LF producer extent is smaller than the consumer block extent",
                     ));
                 }
                 nodes[source_position].lf_last_use = Some(frame.frame_index);

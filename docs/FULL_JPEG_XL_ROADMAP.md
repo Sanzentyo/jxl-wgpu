@@ -304,8 +304,21 @@ alpha, grayscale, EXIF orientations and independent 2× color/8× extra root res
 small producers and F64 pre-opsin expansion validate native and composed LF presentations, including
 16/20-bit native extras, scalar F32 output, all alpha-output policies and Apply/Keep orientation.
 Cancellation at every deep-LF boundary and root/intermediate/background/consumer corruption retain
-only previously validated output leases. These rows remain **Partial**: shifted extra metadata,
-broader LF crops/color domains and incomplete-frame input still require implementation or conformance.
+only previously validated output leases.
+
+Eight additional LF1–LF3 chains cover intrinsic extra-channel shifts 1–3, signed floating source
+depth and values above one, independent alpha/depth precision, and both LF root coding modes.
+Sixteen cropped consumers use negative horizontal or vertical canvas origins and smaller block
+rectangles than their LF producers. The frame plan accepts a containing producer and rejects an
+undersized one. Prediction packs a top-left view with the original row strides and tracked leases;
+LF presentation clips that same local grid before each recursive Up8 stage, then composites at the
+signed origin. No pixel copy/readback is introduced for these views. Native final images and
+independent small-producer/F64 presentation oracles cover color, alpha, depth, Apply/Keep orientation
+and final-only convergence. Native 16/20-bit output, signed F32, cancellation, final-only drain and
+root/intermediate/background/consumer corruption exercise the same ownership contract. Poisoned
+padding and surplus producer rows/columns test clipping with both default and custom Up8 weights.
+These rows remain **Partial**: broader LF crop/filter/color-domain combinations and incomplete-frame
+input still require implementation or conformance.
 Embedded preview/main selection is covered by the checkpoint above.
 
 ### G. VarDCT encode

@@ -180,7 +180,9 @@ impl LfPreview {
             )
         };
         let input_extent = extent_at(level);
-        planes.validate_extent([input_extent.width, input_extent.height])?;
+        let planes = planes
+            .clone()
+            .into_extent([input_extent.width, input_extent.height])?;
         // Each recursive dependency is reconstructed with the image's Up8 kernel. Clip to the
         // exact grid before the next stage so odd borders never sample padding as image data.
         if extras.map_or(0, |extras| extras.planes.len()) != self.extra_count {
@@ -188,11 +190,10 @@ impl LfPreview {
                 "LF presentation extra channel count mismatch",
             ));
         }
-        let input_extent = extent_at(level);
         if extras.is_some_and(|extras| {
             extras.planes.iter().any(|plane| {
-                plane.width != input_extent.width
-                    || plane.height != input_extent.height
+                plane.width < input_extent.width
+                    || plane.height < input_extent.height
                     || plane.row_stride_words < plane.width
             })
         }) {
@@ -265,14 +266,15 @@ impl LfPreview {
                             buffer: extras.buffer.as_wgpu_buffer(),
                             offset: u64::from(plane.word_offset) * 4,
                             size: NonZeroU64::new(
-                                (u64::from(plane.height - 1) * u64::from(plane.row_stride_words)
-                                    + u64::from(plane.width))
+                                (u64::from(input_extent.height - 1)
+                                    * u64::from(plane.row_stride_words)
+                                    + u64::from(input_extent.width))
                                     * 4,
                             )
                             .expect("nonempty extra plane"),
                         },
-                        width: plane.width,
-                        height: plane.height,
+                        width: input_extent.width,
+                        height: input_extent.height,
                         stride: plane.row_stride_words,
                     }
                 } else if index == 0 {

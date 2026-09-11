@@ -92,8 +92,7 @@ impl FrameDecodeSession {
         if !source.packet.profile.uses_lf_frame {
             return Err(VarDctDecodeError::UnexpectedProgressiveDcSource);
         }
-        planes.validate_extent(source.packet.block_extent())?;
-        source.external_lf = Some(planes);
+        source.external_lf = Some(planes.into_extent(source.packet.block_extent())?);
         Ok(())
     }
 }

@@ -1,0 +1,4 @@
+shifted_integer 2
+shifted_float 2
+shifted_thin_float 1
+signed_float 3

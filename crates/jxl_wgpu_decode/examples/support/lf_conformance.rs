@@ -43,6 +43,62 @@ fn validate(decoder: &Path, temporary: &Path, encoded: &[u8]) {
     );
 }
 
+fn crops(
+    temporary: &Path,
+    output: &Path,
+    decoder: &Path,
+    name: &str,
+    seeds: &[Vec<u8>],
+    name_out: &str,
+) {
+    let path = temporary.join(format!("{name}_crop.jxl"));
+    if !path.exists() {
+        return;
+    }
+    let data = std::fs::read(path).unwrap();
+    let data = jxl_gpu_bitstream::parse(&data, Default::default())
+        .unwrap()
+        .codestream()
+        .to_vec();
+    for (suffix, x0, y0, blend) in [
+        ("crop_foreground", 0, 0, false),
+        ("crop_left", -3, 5, true),
+        ("crop_top", 5, -3, true),
+    ] {
+        let mut encoded = prefix(&seeds[0]);
+        for level in (1..seeds.len()).rev() {
+            encoded.extend(physical(
+                &seeds[level],
+                level as u32,
+                level + 1 != seeds.len(),
+                true,
+            ));
+        }
+        if blend {
+            encoded.extend(physical_with_role(
+                &seeds[0],
+                0,
+                false,
+                true,
+                Role::Background,
+            ));
+        }
+        encoded.extend(physical_with_role(
+            &data,
+            0,
+            true,
+            true,
+            Role::Crop { x0, y0, blend },
+        ));
+        validate(decoder, temporary, &encoded);
+        std::fs::write(
+            output.join(format!("{name_out}.{suffix}.jxl.hex")),
+            hex::hex(&encoded),
+        )
+        .unwrap();
+    }
+}
+
 pub(super) fn generate(temporary: &Path, output: &Path, decoder: &Path) {
     let manifest = std::fs::read_to_string(temporary.join("conformance.txt")).unwrap();
     for row in manifest.lines() {
@@ -104,6 +160,7 @@ pub(super) fn generate(temporary: &Path, output: &Path, decoder: &Path) {
                 )
                 .unwrap();
             }
+            crops(temporary, output, decoder, name, &seeds, &name_out);
             eprintln!(
                 "{name_out}: LF{levels} chain, independent producers and coalesced composition accepted"
             );

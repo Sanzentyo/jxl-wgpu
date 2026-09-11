@@ -48,12 +48,19 @@ pub(crate) struct ProgressiveDcXybPlanes {
 }
 
 impl ProgressiveDcXybPlanes {
-    pub(crate) fn validate_extent(
-        &self,
+    /// Retains a top-left consumer view without copying pixels or changing the row strides.
+    pub(crate) fn into_extent(
+        mut self,
         [expected_width, expected_height]: [u32; 2],
-    ) -> Result<(), ProgressiveDcGpuError> {
-        for (plane, actual) in self.planes.iter().enumerate() {
-            if actual.width != expected_width || actual.height != expected_height {
+    ) -> Result<Self, ProgressiveDcGpuError> {
+        if expected_width == 0 || expected_height == 0 {
+            return Err(ProgressiveDcGpuError::EmptyExtent {
+                role: "LF consumer view",
+                axis: "pixel",
+            });
+        }
+        for (plane, actual) in self.planes.iter_mut().enumerate() {
+            if actual.width < expected_width || actual.height < expected_height {
                 return Err(ProgressiveDcGpuError::PlaneExtent {
                     plane,
                     actual_width: actual.width,
@@ -62,8 +69,10 @@ impl ProgressiveDcXybPlanes {
                     expected_height,
                 });
             }
+            actual.width = expected_width;
+            actual.height = expected_height;
         }
-        Ok(())
+        Ok(self)
     }
 
     /// Wraps three already-created storage buffers in the owned XYB representation.
