@@ -1,5 +1,8 @@
+use super::super::entropy_program::{STATE_WORDS, STATUS_BYTES};
 use super::*;
 use jxl_gpu_bitstream::{BitRange, BitWriter};
+use jxl_wgpu::WgpuBackend;
+use std::sync::Arc;
 
 fn backend() -> WgpuBackend {
     pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap()
@@ -182,18 +185,17 @@ fn dictionary_count_and_replay_are_accounted_retryable_and_cancellation_owned() 
             .submit(backend.clone(), source.clone())
             .unwrap();
         if phase != 0 {
-            pending.completion.wait().unwrap();
             if phase == 2 {
                 let blocker = memory
                     .try_reserve(memory.snapshot().available_bytes - 43)
                     .unwrap();
                 assert!(matches!(
-                    pending.advance(),
+                    pending.complete_submission(),
                     Err(Error::MemoryBackpressure(_))
                 ));
                 drop(blocker);
             } else {
-                assert!(pending.advance().unwrap().is_none());
+                assert!(pending.complete_submission().unwrap().is_none());
                 assert_eq!(pending.submissions, 2);
             }
         }

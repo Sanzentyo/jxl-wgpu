@@ -1,5 +1,6 @@
 //! Preserve native entropy while composing patches before upsampling and noise.
 
+use jxl_test_support::fixtures::frame_features;
 use jxl_test_support::fixtures::noise;
 use jxl_test_support::fixtures::patch_features as fixtures;
 use jxl_test_support::fixtures::patches;
@@ -32,7 +33,7 @@ fn main() {
         for suffix in family.suffixes() {
             let source = if suffix.contains("noise") || (suffix == "_chain" && family.inject_noise)
             {
-                patches::with_noise(&original, family.lf)
+                frame_features::with_noise(&original, family.lf)
             } else if suffix == "_zero" {
                 noise::zero_noise(&original, &info, None)
             } else {
@@ -75,26 +76,30 @@ fn main() {
             } else {
                 let values = dictionary(info.frames.last().unwrap());
                 if suffix == "_chain" {
-                    patches::assemble_frames(&[
-                        patches::Frame {
+                    frame_features::assemble_frames(&[
+                        frame_features::Frame {
                             codestream: &source,
                             reference: Some((3, true)),
                             patches: None,
+                            splines: None,
                         },
-                        patches::Frame {
+                        frame_features::Frame {
                             codestream: &source,
                             reference: Some((3, true)),
                             patches: Some(&values),
+                            splines: None,
                         },
-                        patches::Frame {
+                        frame_features::Frame {
                             codestream: &source,
                             reference: Some((3, true)),
                             patches: Some(&values),
+                            splines: None,
                         },
-                        patches::Frame {
+                        frame_features::Frame {
                             codestream: &source,
                             reference: None,
                             patches: Some(&values),
+                            splines: None,
                         },
                     ])
                 } else {

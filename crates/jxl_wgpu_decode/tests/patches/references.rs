@@ -59,16 +59,18 @@ fn subsampled_patches_reject_references_saved_after_color_conversion() {
     let original = source("noise/jpeg_420");
     let frame = inventory(&original).frames.remove(0);
     let values = fixtures::values(&frame, 0, 16);
-    let data = fixtures::assemble_frames(&[
-        fixtures::Frame {
+    let data = frame_features::assemble_frames(&[
+        frame_features::Frame {
             codestream: &original,
             reference: Some((3, false)),
             patches: None,
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: None,
             patches: Some(&values),
+            splines: None,
         },
     ]);
     for limit in [None, NonZeroU64::new(256)] {

@@ -48,6 +48,7 @@ pub(super) struct VarDctSource {
     pub(super) intermediate_outputs: Vec<VarDctIntermediateOutput>,
     pub(super) noise: Option<jxl_wgpu::ResidentNoisePlan>,
     pub(super) noise_parameters: Option<jxl_wgpu::ResidentNoiseParameters>,
+    pub(super) base_color_correlation: [f32; 2],
     pub(super) codestream: GpuCodestream,
     pub(super) packet: BoundedVarDctPacketPlan,
     pub(super) groups: Vec<VarDctGroupSource>,
@@ -183,6 +184,7 @@ pub(super) fn prepare_packet_source(
         options.output_variant,
     )?;
     let render_color = output.is_color();
+    let base_color_correlation = packet.lf_correlation.base;
     let noise_parameters = packet
         .noise
         .and_then(|noise| noise.parameters(frame, packet.lf_correlation.base));
@@ -597,6 +599,7 @@ pub(super) fn prepare_packet_source(
         gaborish,
         noise,
         noise_parameters,
+        base_color_correlation,
         epf,
         frame_upsample,
         output,

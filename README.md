@@ -214,7 +214,12 @@ applying patches. Another 276-image corpus covers all 64 sampling selector tripl
 mixed Modular/VarDCT sources, RGB/YCbCr component references and reference-slot overwrites.
 Independent reference selection and precision limits are documented in
 [the conformance corpus](docs/CONFORMANCE_CORPUS.md#subsampled-and-mixed-component-patch-references-2026-09-13).
-Splines, Modular YCbCr and broader original color domains remain pending.
+GPU spline entropy decoding, bounded Catmull–Rom geometry and ordered tile rendering now execute
+after patches and before frame upsampling/noise. Both codecs, LF producers/consumers, numeric
+extras and immutable progressive updates have dedicated coverage. The official 60-frame
+`animation_spline` float32 reference passes its per-frame RMSE and peak-error limits under whole
+and bounded fragmented input. Modular YCbCr, broader original color domains and unequal late
+color/extra resampling remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular
@@ -349,7 +354,7 @@ fixtures match Rust `jxl` and `djxl` exactly for Modular and within one RGB8 cod
 whole and bounded fragmented async input. The common executor also composes crops and all five
 blend modes against four resident post-transform reference slots. Composed DC/AC images include
 independent alpha blending and retain committed references until final reconstruction. Arbitrary ICC
-transforms, spline rendering and remaining patch combinations still require integration and conformance.
+transforms and remaining frame-feature combinations still require integration and conformance.
 
 XYB and original-sRGB Modular/VarDCT, plus JPEG YCbCr VarDCT, synthesize the signaled noise model on the GPU
 after restoration and frame upsampling, before color conversion. A shared portable shader generates

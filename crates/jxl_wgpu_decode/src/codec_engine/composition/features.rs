@@ -1,4 +1,4 @@
-//! Complete deferred frame upsampling and noise on fresh, accounted component planes.
+//! Complete splines, deferred upsampling and noise on fresh, accounted component planes.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use jxl_wgpu::{
 };
 
 use super::gpu::Surface;
+use super::splines;
 use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::progressive_dc::{
@@ -29,6 +30,7 @@ pub(super) struct Plan {
     extra_count: usize,
     upsample: Option<ResidentUpsampleKernel>,
     noise: Option<ResidentNoisePlan>,
+    splines: Option<Arc<splines::Cache>>,
 }
 
 impl Plan {
@@ -36,9 +38,10 @@ impl Plan {
         image: &ImageHeaderInventory,
         frame: &FrameInventory,
         noise: Option<ResidentNoiseParameters>,
+        splines: Option<Arc<splines::Cache>>,
         limits: &wgpu::Limits,
     ) -> Result<Option<Arc<Self>>> {
-        if frame.upsampling == 1 && noise.is_none() {
+        if frame.upsampling == 1 && noise.is_none() && splines.is_none() {
             return Ok(None);
         }
         let divisor = 1_u32 << (3 * frame.lf_level);
@@ -64,6 +67,7 @@ impl Plan {
             extra_count: image.extra_channels.len(),
             upsample,
             noise,
+            splines,
         })))
     }
 
@@ -77,6 +81,16 @@ impl Plan {
                 .noise
                 .as_ref()
                 .map_or(0, ResidentNoisePlan::total_bytes)
+            + self.splines.as_ref().map_or(0, |cache| {
+                cache.scratch_bytes()
+                    + if self.upsample.is_some() {
+                        u64::from(self.input_extent.width)
+                            * u64::from(self.input_extent.height)
+                            * 12
+                    } else {
+                        0
+                    }
+            })
     }
 
     fn layout(&self, backend: &WgpuBackend) -> Result<FrameSurfaceLayout> {
@@ -254,9 +268,47 @@ impl Plan {
             .map(|kernel| kernel.upload(device))
             .transpose()?;
         let mut uniforms = Vec::new();
+        let coded_planes: Vec<_> = if self.splines.is_some() && weights.is_some() {
+            (0..3)
+                .map(|_| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("JPEG XL spline components before upsampling"),
+                        size: u64::from(self.input_extent.width)
+                            * u64::from(self.input_extent.height)
+                            * 4,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut rendered_inputs = inputs.to_vec();
+        if let Some(cache) = self.splines.as_ref().filter(|_| weights.is_some()) {
+            for (index, buffer) in coded_planes.iter().enumerate() {
+                let plane = ResidentF32Plane {
+                    storage: ResidentStorageBinding {
+                        buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(buffer.size()).expect("nonempty spline plane"),
+                    },
+                    width: self.input_extent.width,
+                    height: self.input_extent.height,
+                    stride: self.input_extent.width,
+                };
+                copy_plane(encoder, inputs[index], plane);
+                rendered_inputs[index] = plane;
+            }
+            uniforms.extend(cache.record(
+                device,
+                encoder,
+                [rendered_inputs[0], rendered_inputs[1], rendered_inputs[2]],
+            )?);
+        }
         if let Some(weights) = &weights {
             let pipeline = ResidentUpsamplePipeline::new(device)?;
-            for (&input, &output) in inputs.iter().zip(outputs) {
+            for (&input, &output) in rendered_inputs.iter().zip(outputs) {
                 uniforms.push(pipeline.encode(
                     device,
                     encoder,
@@ -274,15 +326,14 @@ impl Plan {
                 {
                     return Err(Error::EngineContract("deferred feature copy geometry"));
                 }
-                for row in 0..self.output_extent.height {
-                    encoder.copy_buffer_to_buffer(
-                        input.storage.buffer,
-                        input.storage.offset + u64::from(row) * u64::from(input.stride) * 4,
-                        output.storage.buffer,
-                        output.storage.offset + u64::from(row) * u64::from(output.stride) * 4,
-                        u64::from(self.output_extent.width) * 4,
-                    );
-                }
+                copy_plane(encoder, input, output);
+            }
+            if let Some(cache) = &self.splines {
+                uniforms.extend(cache.record(
+                    device,
+                    encoder,
+                    [outputs[0], outputs[1], outputs[2]],
+                )?);
             }
         }
         let noise = self.noise.as_ref().map(|plan| plan.allocate(device));
@@ -301,6 +352,8 @@ impl Plan {
             _weights: weights,
             _uniforms: uniforms,
             _noise: noise,
+            _splines: self.splines.clone(),
+            _coded_planes: coded_planes,
         })
     }
 }
@@ -309,6 +362,24 @@ struct Resources {
     _weights: Option<jxl_wgpu::ResidentUpsampleWeights>,
     _uniforms: Vec<wgpu::Buffer>,
     _noise: Option<wgpu::Buffer>,
+    _splines: Option<Arc<splines::Cache>>,
+    _coded_planes: Vec<wgpu::Buffer>,
+}
+
+fn copy_plane(
+    encoder: &mut wgpu::CommandEncoder,
+    input: ResidentF32Plane<'_>,
+    output: ResidentF32Plane<'_>,
+) {
+    for row in 0..input.height {
+        encoder.copy_buffer_to_buffer(
+            input.storage.buffer,
+            input.storage.offset + u64::from(row) * u64::from(input.stride) * 4,
+            output.storage.buffer,
+            output.storage.offset + u64::from(row) * u64::from(output.stride) * 4,
+            u64::from(input.width) * 4,
+        );
+    }
 }
 
 fn retained(

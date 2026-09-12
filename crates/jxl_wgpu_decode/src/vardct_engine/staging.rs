@@ -94,6 +94,13 @@ pub struct VarDctDecodeSession {
 }
 
 impl VarDctDecodeSession {
+    pub(crate) fn base_color_correlation(&self) -> Option<[f32; 2]> {
+        Some(match self.prepared.as_ref()? {
+            PreparedStage::Frame(session) => session.source.as_ref()?.base_color_correlation,
+            PreparedStage::Global(source) => source.packet.base_color_correlation(),
+        })
+    }
+
     pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
         match self.prepared.as_ref()? {
             PreparedStage::Frame(session) => session.source.as_ref()?.noise_parameters,

@@ -604,8 +604,8 @@ the remaining channels, including asymmetric shifts. LF streams execute before n
 streams in pass/group order, all use the same bounded-window executor and aggregate status map, and
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
-The low-level Modular producer still requires patches to be handled by the common frame
-executor. Splines and broader original color profiles remain typed unsupported profiles.
+The low-level Modular producer requires patches and splines to be handled by the common frame
+executor. Broader original color profiles remain typed unsupported profiles.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -633,7 +633,7 @@ whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quan
 reservation release. Fifteen stills and the initial Replace presentation of four animations also
 match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
 clamped-Multiply defect. Enumerated D65 sRGB remains the admitted original color profile; full
-color management and splines remain separate work.
+color management remains separate work.
 
 The common executor now retains explicitly tagged codec components before inverse color
 conversion for patch references. Prefix/ANS/hybrid/LZ77 dictionaries execute in bounded GPU
@@ -667,7 +667,31 @@ same expansion is shared with restoration when enabled. A separate 276-image cor
 sources with resampling and extras, LF root changes, RGB/YCbCr crossings and all four overwritten
 reference slots. Whole/fragmented progression, final-only equality and exact reservation/release
 are checked. The corpus records native fast-renderer and extended-range CMS limitations with
-explicit independent references. Splines, Modular YCbCr and broader original color domains remain open.
+explicit independent references. Modular YCbCr and broader original color domains remain open.
+
+Spline programs share the bounded Prefix/ANS/hybrid/LZ77 executor with patch dictionaries. Their
+six-context entropy prefix decodes to resident quantized coefficients and absolute control points;
+the host sees only completion counts and the exact LF-global cursor. GPU geometry applies the
+quantization adjustment, base color correlation, centripetal Catmull–Rom interpolation and
+equally spaced continuous-DCT samples. Count/replay allocates exact draw records and ordered
+32×32 tile references. Each pixel processes at most 256 references per dispatch, preserving
+sample order across dispatches without floating-point atomics. Checked control-point, coordinate,
+geometry-work and device-storage limits return typed errors.
+
+The common frame executor renders patches, splines, late upsampling and noise in that order,
+then publishes LF prediction or pre-transform references. Splines affect only the three codec
+components; alpha and other extras preserve their independent paths. VarDCT base correlation is
+available even without a noise model. Pass and LF updates reuse the completed spline cache and
+write fresh surfaces; held output images remain immutable. The cache and continuation allocations
+follow the shared byte budget through completion, cancellation and late allocation failure.
+
+`tests/splines/main.rs` checks the official 60-frame float32 `animation_spline` reference with
+per-frame maximum channel RMSE ≤ 0.0001 and peak error ≤ 0.004. Another 58 generated streams cover
+both modes, original/XYB color, patches, noise, standard/custom 2×/4×/8× upsampling, LF chains,
+extras and JPEG component restoration. Four progressive streams have independent native
+snapshots for color and every extra channel. Whole and bounded fragmented output must agree
+bit-for-bit. Unequal late color/extra upsampling and broader original-color profiles remain open;
+these results do not establish full JPEG XL conformance.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before
@@ -695,8 +719,9 @@ A pinned, development-only jxl-oxide oracle and independent scalar Gaborish calc
 vertical-subsampling defects in the other references. LF color uses the existing Rust sRGB and
 native sRGB/linear tolerances; scalar extras remain exact. See the conformance corpus for the
 reference selection and observed errors. The patch-feature corpus adds reference-only noise,
-overwritten reference chains and LF patch/resampling/noise combinations. Spline interactions,
-broader LF restoration cross-products and ISO precision coverage remain open.
+overwritten reference chains and LF patch/resampling/noise combinations. The spline corpus also
+checks ordered patch/spline/resampling/noise execution. Broader LF restoration cross-products and
+the remaining ISO precision coverage remain open.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after

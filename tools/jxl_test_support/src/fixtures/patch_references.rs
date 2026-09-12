@@ -1,5 +1,5 @@
 //! Component-domain patch references across coding modes and JPEG sampling layouts.
-use super::{noise, patches};
+use super::{frame_features, noise, patches};
 use jxl_gpu_bitstream::CodestreamInventory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,30 +264,34 @@ impl Case {
                     values
                 })
                 .collect();
-            let mut frames = vec![patches::Frame {
+            let mut frames = vec![frame_features::Frame {
                 codestream: &sources[0],
                 reference: Some((0, true)),
                 patches: None,
+                splines: None,
             }];
             for (i, values) in dictionaries.iter().enumerate() {
-                frames.push(patches::Frame {
+                frames.push(frame_features::Frame {
                     codestream: &sources[(i + 1) % 2],
                     reference: (i < 4).then_some((((i + 1) % 4) as u32, true)),
                     patches: Some(values),
+                    splines: None,
                 });
             }
-            patches::assemble_frames(&frames)
+            frame_features::assemble_frames(&frames)
         } else {
-            patches::assemble_frames(&[
-                patches::Frame {
+            frame_features::assemble_frames(&[
+                frame_features::Frame {
                     codestream: &sources[0],
                     reference: Some((3, true)),
                     patches: None,
+                    splines: None,
                 },
-                patches::Frame {
+                frame_features::Frame {
                     codestream: &sources[1],
                     reference: None,
                     patches: Some(&dictionaries[1]),
+                    splines: None,
                 },
             ])
         }

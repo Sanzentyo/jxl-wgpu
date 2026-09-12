@@ -885,8 +885,66 @@ lifetime; no shader ABI or binding count changes. Private tests check all 64 sel
 and 256-byte windows, exact one-byte-short admission, retry rollback, completed output ownership,
 cancellation and decoding again after release. Public tests also reject post-transform YCbCr
 references and verify source/GPU budget release. Mixed codec and component-domain references use
-the same explicitly tagged surface and four versioned slots. Spline interactions and broader
-color-domain integration remain open.
+the same explicitly tagged surface and four versioned slots. The following spline stage reuses
+these component surfaces; broader color-domain integration remains open.
+
+## Spline entropy, geometry and ordered tile raster ABI
+
+The common `composition::entropy_program` runner owns bounded uploads, entropy metadata, LZ77
+history, a 32-word continuation state and a 16-byte status map. Patches retain their existing
+128-byte parameter storage. Splines use 48 bytes of 16-byte-aligned read-only parameter storage:
+the 12-byte entropy descriptor
+and one capacity word at byte 0, four window words at byte 16, then control-point limit, context
+offset, reset and header stride at byte 32. Count/validate and exact-size emission replay map
+only error, cursor, completion and output count. Bounded histogram parsing cannot leave the
+LF-global section. The host never reads point or coefficient arrays.
+
+The resident spline program uses four leading words (spline count, signed quantization adjustment,
+point-arena offset and padding), followed by 136 words per spline. Each header stores point-arena
+offset/count, first absolute x/y, 128 signed DCT coefficients, cached F32 arc length and three
+padding words. Remaining absolute control points are interleaved signed x/y words. Geometry
+dequantizes the coefficient area once in place; emission replay preserves that data and the arc
+length cache. The decoder checks at most `min(2^20, coded_width*coded_height/2)` control points,
+coordinate magnitude below `2^23` and delta magnitude below `2^30`.
+
+Geometry binds the program, 256-byte continuation state, tile index, draw records and tile
+references as five read-write storage buffers, followed by a 64-byte aligned uniform. Its four
+16-byte fields are image/tile geometry, reset/phase/output capacities, base color correlation,
+and work limit/header stride/tile side/steps per dispatch. The first 32 state bytes are mapped:
+error, phase, record/reference counts, maximum tile population, work count and padding. One
+workgroup advances at most 512 steps per submission, with a checked `2^24` total-work limit for
+each count or emission run. Arc construction, sample counting and tile prefix sums precede exact
+record/reference admission. Emission verifies the same counts before publishing an immutable
+cache. Zero-length or zero-thickness splines can complete without a drawing cache.
+
+For `T` 32×32 tiles, the index occupies `(3*T+1)*4` bytes: counts, `T+1` offsets and emission
+cursors. Each draw record is 48 bytes: F32 center/inverse sigma/intensity at byte 0, correlated
+color at byte 16 and the clipped integer rectangle at byte 32. Each ordered tile reference is
+one four-byte record index. Initial admission atomically reserves tile storage, state, uniform,
+status and 48/4-byte output placeholders. Exact replay output uses a second atomic reservation;
+all retained allocations split ownership from their admitted permits before buffer creation.
+
+Rasterization binds three read-write F32 component planes, three read-only cache buffers and a
+48-byte uniform (image/tile geometry, plane strides, reference batch). An 8×8 workgroup owns one
+pixel per invocation. Successive dispatches visit at most 256 references per tile in original
+spline/sample order; no floating-point atomics or workgroup scratch is used. Uniform storage is
+exactly `48*ceil(max_tile_population/256)` bytes. Frame upsampling additionally reserves three
+coded-size component planes so spline addition precedes interpolation; extras are never drawn
+into. Factor-one completion writes directly to fresh output planes. Noise follows interpolation.
+
+The original physical inventory retains feature flags. A validated `FeaturePrefix` removes only
+completed patch/spline prefix bits and those flags from the coding-mode producer projection.
+Geometry obtains VarDCT base correlation independently of noise metadata. The completed cache is
+available before queued LF previews or pass updates; all render submissions retain its three
+leases and their source planes until completion. Cancellation cannot release live GPU storage,
+and advancing to another physical frame drops the old cache before new admission. Prediction,
+pre-transform references and held preview outputs retain only their own completed surfaces.
+
+Actual-adapter tests cover prefix replay and exact cursor recovery through 40-byte windows,
+singleton caches, malformed geometry, checked work/output limits, multi-submission geometry,
+multiple raster batches, exact replay-admission failure, cancellation at entropy/geometry/raster
+boundaries and immutable held LF/pass images. Public output uses 256-byte windows and matches
+whole-input bits. No point, draw-record or image readback belongs to production execution.
 
 ## Alpha association at output
 

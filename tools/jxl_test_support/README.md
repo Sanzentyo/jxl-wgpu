@@ -12,6 +12,11 @@ The module tree follows the source tree:
 - `gpu` drives whole or fragmented test input and reads explicitly requested test output.
 - `offline` writes fixture files and manages native generator processes and hexadecimal formats.
 
+`fixtures::frame_features` owns common frame headers, bounded prefix assembly and feature entropy
+writing. `fixtures::patches` and `fixtures::splines` define their respective scenarios using that
+shared contract. A frame explicitly declares its patch and spline programs; assembly preserves
+their codestream order without reaching into another test target or example's private files.
+
 Each decoder integration target has a `tests/<target>/main.rs` entry point. Its private modules
 live below that directory and use ordinary `mod` declarations. Examples with private helpers
 follow the same `examples/<target>/main.rs` layout. Shared helpers are imported from this crate;

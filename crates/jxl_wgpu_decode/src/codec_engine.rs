@@ -246,6 +246,14 @@ pub enum WgpuDecodeSubmissionSession {
 }
 
 impl WgpuDecodeSubmissionSession {
+    pub(crate) fn base_color_correlation(&self) -> Option<[f32; 2]> {
+        match self {
+            Self::Modular(_) => Some([0.0, 1.0]),
+            Self::VarDct(session) => session.base_color_correlation(),
+            Self::Sequence(_) => None,
+        }
+    }
+
     pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
         match self {
             Self::Modular(session) => session.noise_parameters(),

@@ -13,8 +13,10 @@ and Modular subimage geometry from the following `jxl-oxide` crates:
 - `jxl-coding` 1.0.1 (entropy-descriptor and permutation grammar)
 
 Those crates are distributed under `MIT OR Apache-2.0`. Production code uses `jxl-bitstream` and
-`jxl-coding` only for bounded metadata parsing; `jxl-frame`, `jxl-modular`, and `jxl-vardct` are
-dev-only scalar-oracle dependencies and are not a CPU codec fallback.
+`jxl-coding` for bounded metadata parsing, and `jxl-vardct` for bounded dequantization-matrix
+metadata. The latter brings `jxl-modular` into the transitive dependency graph. Production does
+not invoke those crates to reconstruct coefficient, residual or pixel images. `jxl-frame` and
+direct scalar-oracle use of `jxl-modular` remain development-only; there is no CPU codec fallback.
 
 `test-data/green_queen_vardct_permuted.jxl.hex` is a libjxl 0.12.0 re-encode derived from the
 BSD-3-Clause `green_queen_vardct_e3.jxl` fixture retained by this workspace. It is used only as a
@@ -60,3 +62,15 @@ libjxl 0.12.0, with synthetic Exif orientation and no external imagery. PGM/PPM 
 `docs/CONFORMANCE_CORPUS.md`. The orientation helpers are shared original WGSL coordinate mappings;
 the metadata extension probe reuses the MIT OR Apache-2.0 `jxl-image` 0.13.0 public field parsers.
 CPU pixel generation, PNM oracle parsing, and scalar color conversion are test-only.
+
+The spline entropy grammar, quantization constants, centripetal Catmull–Rom interpolation,
+continuous-DCT sampling and radial error-function approximation follow libjxl 0.12.0
+(`a7a9c787341cf703dede03c2009fa460cae5e5df`), specifically `lib/jxl/splines.cc`,
+`lib/jxl/render_pipeline/stage_splines.cc` and `lib/jxl/base/fast_math-inl.h`.
+The production WGSL implementation uses bounded continuation, count/replay admission and ordered
+tile rendering; it does not call or upload CPU spline geometry. The upstream BSD-3-Clause notice
+is reproduced in `test-data/splines/LICENSE`.
+
+The official `animation_spline` float32 reference and ICC under `test-data/splines/` come from
+`libjxl/conformance` commit `b1d0f990b03e57bf6d137c365cd5dc8b470b9191`, under the same adjacent
+license. Its README records content-addressed SHA-256 values and reproduction instructions.

@@ -1,5 +1,16 @@
 use thiserror::Error;
 
+/// Checked bounds on resident spline storage and portable coordinate arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplineResource {
+    ControlPoints,
+    CoordinateMagnitude,
+    DeltaMagnitude,
+    GeometrySteps,
+    DrawRecords,
+    TileReferences,
+}
+
 /// Codestream feature recognized by a frontend but outside its GPU profile.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UnsupportedCodestreamFeature {
@@ -237,10 +248,19 @@ pub enum Error {
     Backend(String),
     #[error("GPU patch dictionary validation failed with code {code}")]
     PatchDictionary { code: u32 },
+    #[error("GPU spline entropy validation failed with code {code}")]
+    SplineEntropy { code: u32 },
+    #[error("JPEG XL spline {resource:?} exceeded the checked limit {limit}")]
+    SplineResourceLimit {
+        resource: SplineResource,
+        limit: u64,
+    },
+    #[error("GPU spline geometry validation failed with code {code}")]
+    SplineGeometry { code: u32 },
     #[error(
-        "frame {frame_index} patch extra channel {channel} upsamples by {extra_factor}, color by {color_factor}"
+        "frame {frame_index} deferred extra channel {channel} upsamples by {extra_factor}, color by {color_factor}"
     )]
-    PatchExtraUpsampling {
+    FrameFeatureExtraUpsampling {
         frame_index: u32,
         channel: u32,
         color_factor: u32,
@@ -266,6 +286,8 @@ pub enum Error {
     },
     #[error("GPU decode memory backpressure: {0}")]
     MemoryBackpressure(#[from] jxl_wgpu::MemoryBudgetError),
+    #[error("GPU decode reservation split failed: {0}")]
+    MemoryPermitSplit(#[from] jxl_wgpu::MemoryPermitSplitError),
     #[error("GPU decode submission-poll backpressure: {0}")]
     PollBackpressure(#[from] jxl_wgpu::SubmissionPollerError),
     #[error("GPU decode engine violated its public contract: {0}")]

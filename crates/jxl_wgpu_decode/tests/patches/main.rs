@@ -1,6 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 mod features;
+use jxl_test_support::fixtures::frame_features;
 use jxl_test_support::fixtures::patches as fixtures;
 use jxl_test_support::offline::hex;
 mod lf;
@@ -375,36 +376,42 @@ fn patches_use_all_four_reference_slots_and_the_latest_completed_version() {
             values
         })
         .collect();
-    let data = fixtures::assemble_frames(&[
-        fixtures::Frame {
+    let data = frame_features::assemble_frames(&[
+        frame_features::Frame {
             codestream: &original,
             reference: Some((0, true)),
             patches: None,
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: Some((1, true)),
             patches: Some(&dictionaries[0]),
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: Some((2, true)),
             patches: Some(&dictionaries[1]),
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: Some((3, true)),
             patches: Some(&dictionaries[2]),
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: Some((0, true)),
             patches: Some(&dictionaries[3]),
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: None,
             patches: Some(&dictionaries[0]),
+            splines: None,
         },
     ]);
     let expected = oracle::libjxl_output(&data, &["--preserve-alpha"]);
@@ -434,16 +441,18 @@ fn patches_use_all_four_reference_slots_and_the_latest_completed_version() {
         drop((frame, session));
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
-    let data = fixtures::assemble_frames(&[
-        fixtures::Frame {
+    let data = frame_features::assemble_frames(&[
+        frame_features::Frame {
             codestream: &original,
             reference: Some((0, false)),
             patches: None,
+            splines: None,
         },
-        fixtures::Frame {
+        frame_features::Frame {
             codestream: &original,
             reference: None,
             patches: Some(&dictionaries[0]),
+            splines: None,
         },
     ]);
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();

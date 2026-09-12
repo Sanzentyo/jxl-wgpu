@@ -481,6 +481,10 @@ pub(crate) struct PendingGlobalModular {
 }
 
 impl PendingGlobalModular {
+    pub(crate) fn base_color_correlation(&self) -> [f32; 2] {
+        self.prefix.lf_global.lf_correlation.base
+    }
+
     pub(crate) fn noise_parameters(
         &self,
         frame: &jxl_gpu_bitstream::FrameInventory,

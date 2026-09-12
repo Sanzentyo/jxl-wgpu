@@ -19,7 +19,7 @@ use jxl_wgpu::{
     GpuImageFrame, GpuImageOutput, UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput,
 };
 
-use super::sequence::{SequenceSource, submission_counter};
+use super::sequence::{FeaturePrefix, SequenceSource, submission_counter};
 use super::{WgpuDecodeEngine, WgpuDecodePendingFrame, WgpuDecodeSubmissionSession};
 use crate::frame_surface::FrameSurfaceEncoding;
 use crate::progressive_dc::ProgressiveDcXybPlanes;
@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod blend;
+mod entropy_program;
 mod features;
 mod gpu;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -38,6 +39,9 @@ mod patches;
 mod progression;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod refinement_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod spline_tests;
+mod splines;
 mod spot;
 mod submission;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -107,7 +111,7 @@ pub(super) fn needs_surface(
             .iter()
             .any(|frame| frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct);
     modular_rendering
-        || inventory.frames.iter().any(|frame| frame.flags & 2 != 0)
+        || inventory.frames.iter().any(|frame| frame.flags & 0x12 != 0)
         || numeric_vardct_color
         || ((source_conversion || wide_vardct_output)
             && request.mapping() == crate::GpuOutputMapping::Color)
@@ -158,6 +162,7 @@ enum PreparedPhysical {
         features: Option<Arc<features::Plan>>,
     },
     Patches(Box<patches::Plan>),
+    Splines(Box<splines::Plan>),
 }
 
 impl PreparedPhysical {
@@ -189,11 +194,43 @@ impl PreparedPhysical {
                 )?;
                 Ok((Stage::PatchDictionary(Box::new(pending)), 1))
             }
+            Self::Splines(plan) => {
+                let pending = (**plan).clone().submit(
+                    source.engine.backend().clone(),
+                    Arc::clone(&source.codestream),
+                )?;
+                Ok((Stage::SplineEntropy(Box::new(pending)), 1))
+            }
         }
     }
 }
 
 impl Carry {
+    fn stream_limit(&self) -> u64 {
+        self.source
+            .engine
+            .vardct_engine()
+            .stream_window_limit()
+            .map_or(
+                self.source
+                    .engine
+                    .backend()
+                    .device()
+                    .limits()
+                    .max_storage_buffer_binding_size,
+                std::num::NonZeroU64::get,
+            )
+    }
+
+    fn prepare_splines(&self, index: usize, start: Option<u64>) -> Result<PreparedPhysical> {
+        Ok(PreparedPhysical::Splines(Box::new(splines::Plan::new(
+            &self.source.codestream,
+            &self.source.inventory.frames[index],
+            start,
+            self.stream_limit(),
+        )?)))
+    }
+
     fn render_patches(
         &self,
         surface: &Surface,
@@ -223,20 +260,6 @@ impl Carry {
     ) -> Result<PreparedPhysical> {
         let frame = &self.source.inventory.frames[index];
         if frame.flags & 2 != 0 {
-            let limit = self
-                .source
-                .engine
-                .vardct_engine()
-                .stream_window_limit()
-                .map_or(
-                    self.source
-                        .engine
-                        .backend()
-                        .device()
-                        .limits()
-                        .max_storage_buffer_binding_size,
-                    std::num::NonZeroU64::get,
-                );
             let references = self.references.each_ref().map(|slot| {
                 slot.as_ref().map_or([0; 4], |surface| {
                     [
@@ -252,10 +275,17 @@ impl Carry {
                 frame,
                 &self.source.inventory.image_header.extra_channels,
                 references,
-                limit,
+                self.stream_limit(),
             )?)));
         }
-        self.prepare_codec(index, node, progressive, None)
+        if frame.flags & 16 != 0 {
+            return self.prepare_splines(index, None);
+        }
+        self.finish_codec(
+            index,
+            self.prepare_codec(index, node, progressive, None)?,
+            None,
+        )
     }
 
     fn prepare_codec(
@@ -263,11 +293,11 @@ impl Carry {
         index: usize,
         node: &crate::FrameExecutionNode,
         progressive: bool,
-        patch_end: Option<u64>,
-    ) -> Result<PreparedPhysical> {
+        prefix: Option<FeaturePrefix>,
+    ) -> Result<WgpuDecodeSubmissionSession> {
         let mut session = self
             .source
-            .prepare_physical_after_features(index, progressive, patch_end)?
+            .prepare_physical_after_features(index, progressive, prefix)?
             .session;
         if let Some(source) = node.lf_source_frame {
             let level = self.source.inventory.frames[index].lf_level;
@@ -284,12 +314,22 @@ impl Carry {
             };
             producer.set_progressive_dc_source(planes.planes.clone())?;
         }
-        let features = (self.source.inventory.frames[index].flags & 2 != 0)
+        Ok(session)
+    }
+
+    fn finish_codec(
+        &self,
+        index: usize,
+        session: WgpuDecodeSubmissionSession,
+        splines: Option<Arc<splines::Cache>>,
+    ) -> Result<PreparedPhysical> {
+        let features = (self.source.inventory.frames[index].flags & 0x12 != 0)
             .then(|| {
                 features::Plan::new(
                     &self.source.inventory.image_header,
                     &self.source.inventory.frames[index],
                     session.noise_parameters(),
+                    splines,
                     &self.source.engine.backend().device().limits(),
                 )
             })
@@ -428,7 +468,7 @@ impl DependentSession {
             .map(|preview| {
                 if let Some(encodings) = &carry.source.surface_encodings {
                     let frame = &carry.source.inventory.frames[last];
-                    let extent = if frame.flags & 2 != 0 {
+                    let extent = if frame.flags & 0x12 != 0 {
                         let (width, height) = frame
                             .color_sample_extent()
                             .ok_or(Error::EngineContract("LF preview coded extent overflow"))?;
@@ -466,6 +506,7 @@ impl DependentSession {
             stage: Some(stage),
             patches: None,
             features: None,
+            feature_prefix: None,
             submissions: Arc::clone(&self.submissions),
             completed_submissions: 0,
             finished: false,
@@ -528,7 +569,7 @@ fn composed_source(
                 .iter()
                 .zip(&inventory.frames)
                 .map(|(node, frame)| {
-                    if frame.flags & 2 != 0
+                    if frame.flags & 0x12 != 0
                         || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {
                         FrameSurfaceEncoding::Encoded
@@ -578,10 +619,10 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
         .into());
     }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
-        if frame.flags & 2 != 0 && frame.upsampling != 1 {
+        if frame.flags & 0x12 != 0 && frame.upsampling != 1 {
             for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
                 if factor != frame.upsampling {
-                    return Err(Error::PatchExtraUpsampling {
+                    return Err(Error::FrameFeatureExtraUpsampling {
                         frame_index: frame.frame_index,
                         channel: channel as u32,
                         color_factor: frame.upsampling,
@@ -692,6 +733,11 @@ struct LfUpdate {
 #[derive(Debug)]
 enum Stage {
     PatchDictionary(Box<patches::Pending>),
+    SplineEntropy(Box<splines::Pending>),
+    SplineGeometry {
+        pending: Box<splines::PendingGeometry>,
+        session: Box<WgpuDecodeSubmissionSession>,
+    },
     LfPatchRender(GpuWork<crate::progressive_dc::ProgressiveDcOutput>),
     LfFeatures(GpuWork<crate::progressive_dc::ProgressiveDcOutput>),
     Features(GpuWork<Surface>),
@@ -734,6 +780,7 @@ pub(super) struct DependentPending {
     stage: Option<Stage>,
     patches: Option<patches::Dictionary>,
     features: Option<(usize, Arc<features::Plan>)>,
+    feature_prefix: Option<usize>,
     submissions: Arc<AtomicUsize>,
     completed_submissions: usize,
     finished: bool,
@@ -896,7 +943,7 @@ impl DependentPending {
         self.nodes[self.physical - self.first].lf_last_use.is_some()
             || self.carry.as_ref().is_some_and(|carry| {
                 let frame = &carry.source.inventory.frames[self.physical];
-                frame.frame_type == FrameType::LowFrequency && frame.flags & 2 != 0
+                frame.frame_type == FrameType::LowFrequency && frame.flags & 0x12 != 0
             })
     }
 
@@ -944,6 +991,10 @@ impl DependentPending {
             return self.start_lf_preview(Resume::Advance);
         }
         self.physical += 1;
+        // Published references and queued LF images own their completed planes. A previous
+        // frame's spline cache has no readers once its final feature submission completes.
+        self.features = None;
+        self.feature_prefix = None;
         if self.physical >= self.end {
             return Err(Error::EngineContract(
                 "presentation ended without a color producer",
@@ -1001,21 +1052,101 @@ impl DependentPending {
             .carry
             .as_ref()
             .ok_or(Error::EngineContract("patch carry was lost"))?;
-        let mut producer = carry.prepare_codec(
+        let cursor = dictionary.end;
+        self.patches = Some(dictionary);
+        if carry.source.inventory.frames[self.physical].flags & 16 != 0 {
+            let (stage, count) = carry
+                .prepare_splines(self.physical, Some(cursor))?
+                .submit(&carry.source)?;
+            self.submissions
+                .store(self.completed_submissions + count, Ordering::Release);
+            self.stage = Some(stage);
+            return Ok(());
+        }
+        let session = carry.prepare_codec(
             self.physical,
             &self.nodes[self.physical - self.first],
             self.physical + 1 == self.end,
-            Some(dictionary.end),
+            Some(FeaturePrefix {
+                cursor,
+                handled_flags: 2,
+            }),
         )?;
+        self.start_codec(carry.finish_codec(self.physical, session, None)?)
+    }
+
+    fn splines_decoded(
+        &mut self,
+        program: entropy_program::DecodedProgram,
+        submissions: usize,
+    ) -> Result<()> {
+        self.completed_submissions += submissions;
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("spline carry was lost"))?;
+        let frame = &carry.source.inventory.frames[self.physical];
+        let session = carry.prepare_codec(
+            self.physical,
+            &self.nodes[self.physical - self.first],
+            self.physical + 1 == self.end,
+            Some(FeaturePrefix {
+                cursor: program.end,
+                handled_flags: frame.flags & 0x12,
+            }),
+        )?;
+        let (width, height) = frame
+            .color_sample_extent()
+            .ok_or(Error::EngineContract("spline coded extent overflow"))?;
+        let correlation = session
+            .base_color_correlation()
+            .ok_or(Error::EngineContract(
+                "spline base correlation is unavailable",
+            ))?;
+        let pending = splines::GeometryPlan::new(
+            program,
+            Extent2d::new(width, height),
+            correlation,
+            &carry.source.engine.backend().device().limits(),
+        )?
+        .submit(carry.source.engine.backend().clone())?;
+        self.stage = Some(Stage::SplineGeometry {
+            pending: Box::new(pending),
+            session: Box::new(session),
+        });
+        self.submissions
+            .store(self.completed_submissions + 1, Ordering::Release);
+        Ok(())
+    }
+
+    fn spline_geometry_completed(
+        &mut self,
+        cache: Option<Arc<splines::Cache>>,
+        submissions: usize,
+        session: WgpuDecodeSubmissionSession,
+    ) -> Result<()> {
+        self.completed_submissions += submissions;
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("spline carry was lost"))?;
+        self.start_codec(carry.finish_codec(self.physical, session, cache)?)
+    }
+
+    fn start_codec(&mut self, mut producer: PreparedPhysical) -> Result<()> {
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("feature carry was lost"))?;
         let (stage, count) = producer.submit(&carry.source)?;
         self.submissions
             .store(self.completed_submissions + count, Ordering::Release);
-        self.patches = Some(dictionary);
+        self.feature_prefix = Some(self.physical);
         self.stage = Some(
             if self.physical + 1 == self.end && !self.lf_pending.is_empty() {
                 let Stage::Decode(decode) = stage else {
                     return Err(Error::EngineContract(
-                        "patch body did not submit a codec producer",
+                        "feature body did not submit a codec producer",
                     ));
                 };
                 // Preserve the admitted body while queued dependencies are presented. Returning an
@@ -1051,7 +1182,7 @@ impl DependentPending {
         let carry = self
             .carry
             .as_mut()
-            .ok_or(Error::EngineContract("patch carry was lost"))?;
+            .ok_or(Error::EngineContract("frame feature carry was lost"))?;
         let node = &self.nodes[self.physical - self.first];
         let frame = &carry.source.inventory.frames[self.physical];
         if frame.save_before_color_transform
@@ -1085,7 +1216,7 @@ impl DependentPending {
         let carry = self
             .carry
             .as_ref()
-            .ok_or(Error::EngineContract("patch carry was lost"))?;
+            .ok_or(Error::EngineContract("frame composition carry was lost"))?;
         if self.nodes[self.physical - self.first].needs_composition {
             self.stage = Some(Stage::Blend(self.output.compositor()?.blend(
                 &surface,
@@ -1182,6 +1313,32 @@ impl DependentPending {
                     // before its admission, matching the blocking path's resource lifetime.
                     self.stage = None;
                     self.dictionary_decoded(dictionary, count)?;
+                }
+                Stage::SplineEntropy(pending) => {
+                    let result = pending.poll(context);
+                    let count = pending.submissions;
+                    self.submissions
+                        .store(self.completed_submissions + count, Ordering::Release);
+                    let program = match result {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    self.stage = None;
+                    self.splines_decoded(program, count)?;
+                }
+                Stage::SplineGeometry { pending, .. } => {
+                    let result = pending.poll(context);
+                    let count = pending.submissions;
+                    self.submissions
+                        .store(self.completed_submissions + count, Ordering::Release);
+                    let cache = match result {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let Some(Stage::SplineGeometry { session, .. }) = self.stage.take() else {
+                        unreachable!()
+                    };
+                    self.spline_geometry_completed(cache, count, *session)?;
                 }
                 Stage::LfPatchRender(work) => {
                     let planes = match work.poll(context) {
@@ -1426,7 +1583,7 @@ impl DependentPending {
                     } else {
                         if !self.lf_references_ready()? {
                             return Poll::Ready(Err(Error::EngineContract(
-                                "patch LF preview references are not ready",
+                                "LF preview features and references are not ready",
                             )));
                         }
                         self.start_lf_preview(Resume::LfPreviews(decode))?;
@@ -1504,6 +1661,14 @@ impl DependentPending {
                 Stage::PatchDictionary(pending) => {
                     let (dictionary, count) = pending.wait()?;
                     self.dictionary_decoded(dictionary, count)?;
+                }
+                Stage::SplineEntropy(pending) => {
+                    let (program, count) = pending.wait()?;
+                    self.splines_decoded(program, count)?;
+                }
+                Stage::SplineGeometry { pending, session } => {
+                    let (cache, count) = pending.wait()?;
+                    self.spline_geometry_completed(cache, count, *session)?;
                 }
                 Stage::LfPatchRender(work) => {
                     self.complete_lf_features(Some(work.wait()?), false)?
@@ -1710,8 +1875,8 @@ impl DependentPending {
             .carry
             .as_ref()
             .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
-        if carry.source.inventory.frames[self.end - 1].flags & 2 != 0
-            && (self.physical + 1 != self.end || self.patches.is_none())
+        if carry.source.inventory.frames[self.end - 1].flags & 0x12 != 0
+            && self.feature_prefix != Some(self.end - 1)
         {
             return Ok(false);
         }

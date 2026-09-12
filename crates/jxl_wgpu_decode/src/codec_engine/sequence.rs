@@ -82,6 +82,13 @@ pub(super) struct SequenceSource {
     pub(super) surface_encodings: Option<Arc<[crate::frame_surface::FrameSurfaceEncoding]>>,
 }
 
+/// Prefixes validated by the common GPU feature frontend before a coding-mode producer starts.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FeaturePrefix {
+    pub(super) cursor: u64,
+    pub(super) handled_flags: u64,
+}
+
 impl SequenceSource {
     pub(super) fn prepare_physical(
         &self,
@@ -95,7 +102,7 @@ impl SequenceSource {
         &self,
         index: usize,
         progressive: bool,
-        patch_end: Option<u64>,
+        prefix: Option<FeaturePrefix>,
     ) -> Result<PreparedGpuSession<WgpuDecodeSubmissionSession>> {
         let frame_index = self.inventory.frames[index].frame_index;
         let request = self
@@ -109,18 +116,27 @@ impl SequenceSource {
             .with_lf_extras(
                 self.inventory.frames[index].frame_type == FrameType::LowFrequency
                     && (self.request.progressive_output()
-                        || self.inventory.frames[index].flags & 2 != 0),
+                        || self.inventory.frames[index].flags & 0x12 != 0),
             );
-        let request = if self.inventory.frames[index].flags & 2 != 0 {
+        let request = if self.inventory.frames[index].flags & 0x12 != 0 {
             request.before_frame_features()
         } else {
             request
         };
         let mut projected = project_frame_inventory(&self.inventory, frame_index)?;
-        if let Some(cursor) = patch_end {
+        if let Some(FeaturePrefix {
+            cursor,
+            handled_flags,
+        }) = prefix
+        {
             // The common GPU feature frontend owns this prefix. Keep the original inventory
             // authoritative, and give the coding-mode producer only the remaining bit range.
             let frame = &mut projected.frames[0];
+            if handled_flags != frame.flags & 0x12 {
+                return Err(crate::Error::EngineContract(
+                    "incomplete frame feature prefix",
+                ));
+            }
             let section = frame
                 .sections
                 .iter_mut()
@@ -132,7 +148,7 @@ impl SequenceSource {
                     )
                 })
                 .ok_or(crate::Error::EngineContract(
-                    "patch continuation lacks LF-global",
+                    "feature continuation lacks LF-global",
                 ))?;
             let end = section
                 .bits
@@ -140,12 +156,12 @@ impl SequenceSource {
                 .ok_or(crate::Error::EngineContract("invalid LF-global range"))?;
             if cursor < section.bits.offset || cursor > end {
                 return Err(crate::Error::EngineContract(
-                    "patch cursor leaves LF-global",
+                    "feature cursor leaves LF-global",
                 ));
             }
             section.bits.offset = cursor;
             section.bits.length = end - cursor;
-            frame.flags &= !2;
+            frame.flags &= !handled_flags;
         }
         match projected.frames[0].encoding {
             FrameEncoding::Modular => {

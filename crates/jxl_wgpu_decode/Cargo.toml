@@ -21,6 +21,8 @@ thiserror = "2.0.20"
 wgpu = "30.0.1"
 
 [dev-dependencies]
+flate2 = "1.1.10"
+sha2.workspace = true
 jxl_test_support.workspace = true
 jxl.workspace = true
 jxl-frame.workspace = true

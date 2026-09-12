@@ -235,7 +235,7 @@ fn patch_extra_resampling_mismatch_is_malformed_before_gpu_admission() {
                 panic!("mismatched patch extra resampling was admitted: {name}");
             };
             assert!(
-                matches!(error, Error::PatchExtraUpsampling { frame_index, channel: 0, color_factor, extra_factor }
+                matches!(error, Error::FrameFeatureExtraUpsampling { frame_index, channel: 0, color_factor, extra_factor }
                 if frame_index == invalid.frame_index && color_factor == invalid.upsampling && extra_factor == expected_extra_factor),
                 "{name}: {error:?}"
             );

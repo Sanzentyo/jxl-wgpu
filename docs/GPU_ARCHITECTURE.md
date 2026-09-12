@@ -381,6 +381,16 @@ consumer drains submitted presentation work and resumes the physical producer. E
 remains resident through the same stages. The detailed contracts and remaining combination limits are recorded
 in [WGSL memory](WGSL_MEMORY.md#patch-dictionary-and-pre-transform-reference-abi).
 
+Splines use the same bounded entropy continuation runner after the patch prefix, preserving an
+explicit cursor and handled-feature mask before the coding-mode body is prepared. Quantized
+control points and coefficients remain resident. A separate bounded geometry stage computes arc
+lengths, dequantized continuous-DCT samples and ordered 32×32 tile references with count/replay
+admission. Raster dispatches assign each component pixel one owner and process tile references in
+batches of 256, preserving addition order. The common feature plan applies patches, splines,
+frame upsampling and noise before prediction/reference publication. LF previews and progressive
+passes share the completed cache while writing independent surfaces. Their buffers and cache
+leases use the same completion lifetime and byte budget; no CPU image reconstruction is involved.
+
 Sync and async animation frontends drive one GPU codec state machine. Stream metadata carries the
 timebase, loop count, and whether frame timecodes exist. A frame carries its index, exact duration,
 cumulative presentation-start ticks, optional bitstream timecode, and composed output.
