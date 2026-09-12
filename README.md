@@ -220,7 +220,12 @@ extras and immutable progressive updates have dedicated coverage. The official 6
 `animation_spline` float32 reference passes its per-frame RMSE and peak-error limits under whole
 and bounded fragmented input. Independent plane extents now support unequal color/extra factors:
 extras use one complete interpolation filter before splines while color is expanded afterward.
-Modular YCbCr and broader original color domains remain pending.
+Modular YCbCr now uses independently sized JPEG component grids for integer and floating samples,
+then GPU component expansion, restoration, frame resampling and color conversion. One hundred
+independently encoded cases cover all 64 sampling selector triples, every group dimension,
+global/LF/pass streams, gray, mixed-depth extras, orientation and bounded progressive output.
+Its broader patch/spline/noise and mixed-frame combinations, and broader original color domains,
+still need conformance coverage.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

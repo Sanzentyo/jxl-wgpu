@@ -528,22 +528,25 @@ impl WgpuSubmissionEngine {
             } else {
                 &profile.resident_entropy_plans[0].inverse_plan
             };
-            let render = crate::modular_render::ModularRenderPlan::new(
-                output
-                    .source_channels
-                    .select(&inverse.final_gpu_layouts())?,
-                channels,
-                &profile.upsampling_weights,
-                &self.backend.device().limits(),
-            )?;
+            let sources = output
+                .source_channels
+                .select(&inverse.final_gpu_layouts())?;
             output.render = Some(if let Some(config) = color_render {
-                render.with_color(
+                crate::modular_render::ModularRenderPlan::for_color(
+                    sources,
+                    channels,
                     config,
                     output.layout.format.color_spec,
+                    &profile.upsampling_weights,
                     &self.backend.device().limits(),
                 )?
             } else {
-                render
+                crate::modular_render::ModularRenderPlan::new(
+                    sources,
+                    channels,
+                    &profile.upsampling_weights,
+                    &self.backend.device().limits(),
+                )?
             });
         }
 

@@ -120,9 +120,9 @@ impl ModularLfPlan {
         let mut reservations = reservations.into_iter();
         let extent = self.reconstruction.output_extent;
         let planes = ProgressiveDcXybPlanes::from_leases(
-            output.clone().map(|buffer| {
+            output.map(|buffer| {
                 GpuBufferLease::from_tracked(
-                    buffer,
+                    buffer.clone(),
                     reservations.next().expect("three LF plane reservations"),
                 )
             }),

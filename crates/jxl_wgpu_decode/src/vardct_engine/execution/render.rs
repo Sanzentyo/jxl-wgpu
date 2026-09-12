@@ -275,7 +275,7 @@ pub(super) fn encode_frame_render(
                 || restoration.is_some()
                 || frame_upsample_planes.is_some()
             {
-                [crate::vardct_frontend::VarDctChannelShift::default(); 3]
+                [crate::jpeg_sampling::JpegComponentShift::default(); 3]
             } else {
                 source.packet.profile.channel_shifts
             };

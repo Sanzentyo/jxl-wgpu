@@ -12,6 +12,12 @@ pub(crate) fn source_topology(
     frame: &FrameInventory,
     color_channels: u32,
 ) -> Result<ModularChannelTopology> {
+    frame.validate_jpeg_sampling()?;
+    if !matches!(color_channels, 0 | 1 | 3) {
+        return Err(Error::EngineContract(
+            "invalid Modular color component count",
+        ));
+    }
     let (width, height) = frame
         .color_sample_extent()
         .ok_or(Error::EngineContract("invalid Modular color grid"))?;
@@ -33,10 +39,22 @@ pub(crate) fn source_topology(
         .ok_or(Error::EngineContract("invalid Modular LF grid"))?;
     let output_width = frame.width.div_ceil(lf_factor);
     let output_height = frame.height.div_ceil(lf_factor);
-    let mut channels = vec![
-        ModularChannelGeometry::new(width, height, 0, 0, bits_per_sample);
-        color_channels as usize
-    ];
+    let shifts = crate::jpeg_sampling::component_shifts(frame.jpeg_upsampling);
+    let mut channels: Vec<_> = shifts[..color_channels as usize]
+        .iter()
+        .map(|shift| {
+            let [width, height] = shift
+                .shifted_extent(width, height)
+                .expect("validated JPEG component sampling");
+            ModularChannelGeometry::new(
+                width,
+                height,
+                shift.horizontal as i32,
+                shift.vertical as i32,
+                bits_per_sample,
+            )
+        })
+        .collect();
     for &factor in &frame.extra_channel_upsampling {
         if !matches!(factor, 1 | 2 | 4 | 8) || factor < frame.upsampling {
             return Err(Error::EngineContract("invalid Modular extra-channel grid"));

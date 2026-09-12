@@ -1,14 +1,12 @@
 //! Whole/fragmented decode and byte-exact GPU readback shared by precision conformance tests.
 use jxl_wgpu::{GpuImageOutput, WgpuBackend};
-use jxl_wgpu_decode::{
-    GpuDecodeSession, GpuDecoder, GpuOutputRequest, WgpuDecodeEngine, WgpuDecodeSubmissionSession,
-};
+use jxl_wgpu_decode::{GpuDecodeSession, GpuDecoder, GpuOutputRequest, GpuSubmissionEngine};
 use std::sync::Arc;
-pub fn open_fragmented(
-    decoder: &GpuDecoder<WgpuDecodeEngine>,
+pub fn open_fragmented<E: GpuSubmissionEngine>(
+    decoder: &GpuDecoder<E>,
     data: &[u8],
     request: GpuOutputRequest,
-) -> GpuDecodeSession<WgpuDecodeSubmissionSession> {
+) -> GpuDecodeSession<E::Session> {
     let mut stream = decoder.stream(request).unwrap();
     let mut transport =
         jxl_gpu_bitstream::ContainerStreamScanner::new(decoder.container_stream_limits());

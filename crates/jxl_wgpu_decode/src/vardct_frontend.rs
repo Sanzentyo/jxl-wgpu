@@ -11,6 +11,7 @@ use jxl_gpu_bitstream::{
 };
 use thiserror::Error;
 
+use crate::jpeg_sampling::{JpegComponentShift, block_alignment, component_shifts};
 use crate::modular_tree::{BitInput, MaTreeLimits, read_clusters};
 
 const MAX_CODESTREAM_BYTES: u64 = 1 << 28;
@@ -26,27 +27,6 @@ const MAX_GROUPS: u64 = 1 << 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VarDctFrontendCapability {
     EntropyPackets,
-}
-
-/// Effective horizontal and vertical JPEG component subsampling relative to the largest
-/// component grid. JPEG XL permits only zero or one bit of shift on each axis.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct VarDctChannelShift {
-    pub horizontal: u32,
-    pub vertical: u32,
-}
-
-impl VarDctChannelShift {
-    #[must_use]
-    pub const fn is_subsampled(self) -> bool {
-        self.horizontal != 0 || self.vertical != 0
-    }
-
-    pub(crate) fn shifted_extent(self, width: u32, height: u32) -> Option<[u32; 2]> {
-        let horizontal = 1u32.checked_shl(self.horizontal)?;
-        let vertical = 1u32.checked_shl(self.vertical)?;
-        Some([width.div_ceil(horizontal), height.div_ceil(vertical)])
-    }
 }
 
 /// Color-domain contract carried by resident VarDCT planes before output conversion.
@@ -946,7 +926,7 @@ pub struct StandardVarDctProfile {
     pub sample_bit_depth: SampleBitDepth,
     pub color_transform: VarDctColorTransform,
     /// Resident channel order is X/Y/B, Cb/Y/Cr, or R/G/B. Only YCbCr permits shifts.
-    pub channel_shifts: [VarDctChannelShift; 3],
+    pub channel_shifts: [JpegComponentShift; 3],
     /// Raw JPEG component sampling selectors in Cb/X, Y, Cr/B order.
     pub jpeg_upsampling: [u32; 3],
     /// Axis padding required by the JPEG component sampling factors before channel shifts.
@@ -1045,9 +1025,9 @@ impl StandardVarDctProfile {
             } else {
                 VarDctColorTransform::Rgb
             },
-            channel_shifts: jpeg_channel_shifts(frame.jpeg_upsampling),
+            channel_shifts: component_shifts(frame.jpeg_upsampling),
             jpeg_upsampling: frame.jpeg_upsampling,
-            jpeg_block_alignment: jpeg_block_alignment(frame.jpeg_upsampling),
+            jpeg_block_alignment: block_alignment(frame.jpeg_upsampling),
             group_dimension: 128u32 << frame.group_size_shift,
             group_count: frame.group_count,
             low_frequency_group_count: frame.low_frequency_group_count,
@@ -1187,32 +1167,6 @@ fn align_up_power_of_two(value: u32, shift: u32) -> Result<u32, VarDctFrontendEr
         .ok_or(VarDctFrontendError::Unsupported {
             feature: UnsupportedVarDctFeature::ImageDimensions,
         })
-}
-
-/// Block alignment of selectors already checked by `FrameInventory::validate_jpeg_sampling`.
-pub(crate) fn jpeg_block_alignment(jpeg_upsampling: [u32; 3]) -> [u32; 2] {
-    const HORIZONTAL: [u32; 4] = [0, 1, 1, 0];
-    const VERTICAL: [u32; 4] = [0, 1, 0, 1];
-    jpeg_upsampling.into_iter().fold([0, 0], |maximum, value| {
-        let index = value as usize;
-        [
-            maximum[0].max(HORIZONTAL[index]),
-            maximum[1].max(VERTICAL[index]),
-        ]
-    })
-}
-
-fn jpeg_channel_shifts(jpeg_upsampling: [u32; 3]) -> [VarDctChannelShift; 3] {
-    const HORIZONTAL: [u32; 4] = [0, 1, 1, 0];
-    const VERTICAL: [u32; 4] = [0, 1, 0, 1];
-    let maximum = jpeg_block_alignment(jpeg_upsampling);
-    jpeg_upsampling.map(|value| {
-        let index = value as usize;
-        VarDctChannelShift {
-            horizontal: maximum[0] - HORIZONTAL[index],
-            vertical: maximum[1] - VERTICAL[index],
-        }
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

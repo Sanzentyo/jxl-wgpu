@@ -4,6 +4,7 @@ use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
+use jxl_wgpu_decode::JpegComponentShift;
 use jxl_wgpu_decode::vardct::artifact::{
     BACKEND_REQUIREMENT_FREQUENCY_CFL_GRID, GpuDispatchIndirectArgs, GpuGeneralVarDctTask,
     GpuHfTaskMetadata, GpuVarDctArtifactStatus, GpuVarDctBucket, GpuVarDctLoweringError,
@@ -12,7 +13,6 @@ use jxl_wgpu_decode::vardct::artifact::{
     HfOrderTableLayout, VAR_DCT_ARTIFACT_SHADER, VAR_DCT_STRATEGY_COUNT,
     VarDctArtifactDeviceLimits, VarDctArtifactError, VarDctArtifactLayout,
 };
-use jxl_wgpu_decode::vardct::frontend::VarDctChannelShift;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -68,7 +68,7 @@ fn config(raw_metadata_words: u64) -> HfMetadataArtifactConfig {
         quant_offset: 0,
         correlation_offset: 0,
         global_scale: 8_813,
-        channel_shifts: [VarDctChannelShift::default(); 3],
+        channel_shifts: [JpegComponentShift::default(); 3],
         lf_offsets: [0; 3],
         lf_strides: [13; 3],
         matrix_offsets: std::array::from_fn(|strategy| 1_000 + strategy as u32 * 64),
@@ -118,7 +118,7 @@ fn lower_topology(
         quant_offset: 0,
         correlation_offset: 0,
         global_scale: 8_813,
-        channel_shifts: [VarDctChannelShift::default(); 3],
+        channel_shifts: [JpegComponentShift::default(); 3],
         lf_offsets: [0; 3],
         lf_strides: [blocks[0]; 3],
         matrix_offsets: [0; VAR_DCT_STRATEGY_COUNT],

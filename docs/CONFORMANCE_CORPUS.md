@@ -3603,3 +3603,52 @@ test run and subsequent checks; only this validation record was added afterward.
 dependency tree is unchanged. The Rust module/lint audit found no ad hoc module paths or
 unjustified unused-code suppression; the five existing, documented Wasm-only dead-code
 expectations remain unchanged.
+
+## Modular YCbCr component grids (2026-09-13)
+
+The independent native corpus in
+[`test-data/modular_ycbcr`](../crates/jxl_wgpu_decode/test-data/modular_ycbcr/README.md)
+adds 100 original JPEG XL streams, six independently expanded equivalent streams and unclipped
+native F32 references. Its 216 data files occupy 16,635,079 bytes. The manifest checks actual
+image/frame metadata, including every sampling selector triple, integer/floating precision,
+orientation, filter settings and independent extra-channel factors. Native libjxl accepts all
+original streams; two independent decoders cross-check the six equivalent restoration references.
+The corpus README records the precise native/jxl-oxide reference limitations and reproduction.
+
+The required-adapter integration target compares RGBA, every selectable original RGB component
+and every extra plane at maxAE 2e-6. Whole and 40-byte-window decoding with 43-byte transport
+fragments are bit-identical. It covers all four group dimensions on both axes, a global-prefix
+ownership boundary, a three-LF-group extra stream, 2×/4×/8× frame/extra expansion, gray, associated
+alpha and orientation. Nine native prefix snapshots cover three two-pass schedules, including
+omitted empty leading boundaries. Progressive color/numeric output retains immutable earlier
+images through subsequent passes, final-only draining and cancellation.
+
+Eleven direct-render admission cases compare native output, prove exact expansion-memory deltas
+for asymmetric grids, reject a one-byte shortfall before submission, retry the same session with
+the exact budget, retain only completed output leases and release cancelled work. The transport
+helper is now generic over the actual submission engine; normal Rust modules share it without
+path overrides or unused-code suppression. Production pixel reconstruction remains entirely GPU
+resident. Transform, frame-feature, mixed-frame and broader color-domain cross-products remain
+open conformance work under the active full JPEG XL goal.
+
+Validation on Rust 1.98.1 and Apple M5/Metal completed all 57 workspace targets in 48.42 minutes:
+903 tests passed, none failed, and the existing manual allocation benchmark remained ignored.
+All 901 previous test entries were retained, with three new entries; all five doctests passed.
+Formatting, workspace/all-target/all-feature checking, strict Clippy, warning-free rustdoc and
+the six production libraries' Wasm checks passed. Reference and Metal harnesses each passed all
+18 cases, and the codec CPU-readback smoke test returned the expected 221 bytes.
+
+The native generator was rebuilt with the same Release configuration as libjxl, without a
+target-only debug override that would change the `Fields` virtual interface. Both independent
+equivalent-stream references explicitly require finite samples before reducing their error;
+their largest difference was 4.7683716e-7. Ten focused regeneration commands reproduced the
+checked-in bytes, including all 100 new original streams and six equivalents. Hashes for all
+2,848 files in the decoder's test-data tree remained unchanged across those commands.
+
+All 3,311 workspace input files stayed fixed during full validation. The only subsequent edits
+were the offline generator's build settings, stricter reference checks and documentation;
+formatting, workspace checking, strict Clippy, rustdoc and fixture regeneration then passed again.
+Production Rust/WGSL, integration tests and fixture data match the fully tested snapshot.
+The audit of 330 Rust files found no ad hoc module paths or unjustified unused-code suppression;
+the five existing, documented Wasm-only dead-code expectations remain unchanged. Dependency
+manifests and the lockfile are unchanged.

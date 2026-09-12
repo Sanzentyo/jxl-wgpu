@@ -267,11 +267,22 @@ disjoint full-frame views. One shared inverse plan and one 144-byte finalizer th
 pass group. The frame arena, all subimage entropy/predictor state, inverse uniforms, and finalizer
 uniform share the same byte admission and device binding checks. Zero- and nonzero-sample DC-global
 Prefix/ANS ranges use the same exact termination logic; one map validates their status with every
-LF/pass subimage. A one-to-three-pass frame uses the header's downsampling/last-pass brackets to
+LF/pass subimage. A one-to-eleven-pass frame uses the header's downsampling/last-pass brackets to
 assign every non-LF channel by `min(hshift, vshift)`. Empty passes retain their TOC sections but
 schedule no GPU entropy; nonempty streams execute in pass/group order before the one frame-wide
-inverse. This produces only the final image today, not an intermediate presentation after each
-pass.
+inverse. Opt-in intermediate presentations reconstruct and pack separate immutable surfaces at
+completed DC/pass boundaries; empty leading boundaries with no decoded samples are omitted.
+
+Modular YCbCr uses the same global/LF/pass ownership with three independently sized Cb/Y/Cr
+grids, including grayscale presentation. `JpegComponentShift` now represents effective sampling
+for both coding modes; the former VarDCT-specific public type has been removed. The typed Modular
+color plan distinguishes RGB, XYB and YCbCr. Normalization allocates each component's actual
+extent, and only shifted components receive a full color-grid destination plus a 32-byte uniform.
+The existing resident JPEG interpolation kernel expands them before Gaborish/EPF and frame
+resampling. Output packing and numeric RGB selection happen after YCbCr conversion, preserving
+the original unclipped F32 domain and alpha association. Scalar extras retain independent depths
+and resampling grids. All normalization, expansion, restoration and output allocations are
+included in admission before any GPU submission; only final output leases survive scratch release.
 Each pass-group header independently selects the global MA configuration or supplies a bounded
 local tree, entropy tables, hybrid configs, context map, LZ77 parameters, and weighted-predictor
 header. Host lowering packs the global descriptor first, appends and rebases distinct locals,

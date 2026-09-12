@@ -10,7 +10,7 @@ use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding, XybParams}
 use jxl_wgpu::{ImageOutputParams, ImageOutputSource, KernelVariant, ResidentStorageBinding};
 use wgpu::util::DeviceExt;
 
-use crate::vardct_frontend::VarDctChannelShift;
+use crate::jpeg_sampling::JpegComponentShift;
 
 const OUTPUT_WORD_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 #[cfg(test)]
@@ -58,7 +58,7 @@ pub enum ColorOutputTransform {
     Xyb(InverseOpsin),
     /// JPEG reconstruction's encoded YCbCr, including component upsampling.
     Ycbcr {
-        channel_shifts: [VarDctChannelShift; 3],
+        channel_shifts: [JpegComponentShift; 3],
     },
 }
 
@@ -712,7 +712,7 @@ fn validate_inputs(
         validate_binding(device, role, input.storage, required_bytes)?;
         let shift = match inputs.config.transform {
             ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
-                VarDctChannelShift::default()
+                JpegComponentShift::default()
             }
             ColorOutputTransform::Ycbcr { channel_shifts } => channel_shifts[plane],
         };

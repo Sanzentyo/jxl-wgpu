@@ -38,6 +38,7 @@ mod frame_surface;
 mod image_selection;
 mod inflight;
 mod input_budget;
+mod jpeg_sampling;
 mod model;
 mod modular_assembly;
 mod modular_finalize;
@@ -99,6 +100,7 @@ pub use input_budget::{
     DEFAULT_INCREMENTAL_INPUT_SPANS, IncrementalInputBudget, IncrementalInputBudgetError,
     IncrementalInputBudgetSnapshot,
 };
+pub use jpeg_sampling::JpegComponentShift;
 pub use jxl_gpu_bitstream::ParseLimits;
 pub use jxl_gpu_formats::{ImageLayout, PixelFormat};
 pub use jxl_wgpu::{UnvalidatedGpuImageFrame, UnvalidatedGpuImageOutput};

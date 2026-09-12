@@ -90,7 +90,7 @@ impl Plan {
             // components, so normalized chroma shifts cannot determine these bounds.
             frame.validate_jpeg_sampling()?;
             let [horizontal, vertical] =
-                crate::vardct_frontend::jpeg_block_alignment(frame.jpeg_upsampling);
+                crate::jpeg_sampling::block_alignment(frame.jpeg_upsampling);
             let block_width = 8 << horizontal;
             let block_height = 8 << vertical;
             width = width

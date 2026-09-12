@@ -16,20 +16,29 @@ fn source_at(channel: u32, coordinate: vec2<u32>) -> u32 {
 }
 @compute @workgroup_size(16, 16, 1)
 fn normalize_color(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.sources[0].x || id.y >= params.sources[0].y { return; }
-    let words = vec3<u32>(source_at(0u, id.xy), source_at(1u, id.xy), source_at(2u, id.xy));
-    var color: vec3<f32>;
     if params.encodings.w == 1u {
+        if id.x >= params.sources[0].x || id.y >= params.sources[0].y { return; }
+        let words = vec3<u32>(source_at(0u, id.xy), source_at(1u, id.xy), source_at(2u, id.xy));
         // Modular stores Y/X/(B-Y). The sum is performed in the signed working-word domain.
-        color = vec3<f32>(f32(bitcast<i32>(words.y)), f32(bitcast<i32>(words.x)),
+        let color = vec3<f32>(f32(bitcast<i32>(words.y)), f32(bitcast<i32>(words.x)),
             f32(bitcast<i32>(words.z + words.x))) * params.multipliers.xyz;
-    } else {
-        color = vec3<f32>(bitcast<f32>(modular_sample_f32_bits(words.x, params.encodings.x)),
-            bitcast<f32>(modular_sample_f32_bits(words.y, params.encodings.y)),
-            bitcast<f32>(modular_sample_f32_bits(words.z, params.encodings.z)));
+        let index = id.y * params.sources[0].x + id.x;
+        output_x[index] = color.x;
+        output_y[index] = color.y;
+        output_b[index] = color.z;
+        return;
     }
-    let index = id.y * params.sources[0].x + id.x;
-    output_x[index] = color.x;
-    output_y[index] = color.y;
-    output_b[index] = color.z;
+    // RGB and YCbCr retain component order. Each YCbCr plane may have its own grid.
+    if id.x < params.sources[0].x && id.y < params.sources[0].y {
+        output_x[id.y * params.sources[0].x + id.x] =
+            bitcast<f32>(modular_sample_f32_bits(source_at(0u, id.xy), params.encodings.x));
+    }
+    if id.x < params.sources[1].x && id.y < params.sources[1].y {
+        output_y[id.y * params.sources[1].x + id.x] =
+            bitcast<f32>(modular_sample_f32_bits(source_at(1u, id.xy), params.encodings.y));
+    }
+    if id.x < params.sources[2].x && id.y < params.sources[2].y {
+        output_b[id.y * params.sources[2].x + id.x] =
+            bitcast<f32>(modular_sample_f32_bits(source_at(2u, id.xy), params.encodings.z));
+    }
 }

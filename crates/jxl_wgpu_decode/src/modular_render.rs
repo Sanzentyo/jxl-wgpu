@@ -43,6 +43,8 @@ pub enum ModularRenderError {
     #[error(transparent)]
     Upsample(#[from] ResidentUpsampleError),
     #[error(transparent)]
+    ChromaUpsample(#[from] jxl_wgpu::ResidentChromaUpsampleError),
+    #[error(transparent)]
     Restoration(#[from] crate::RestorationError),
     #[error(transparent)]
     Gaborish(#[from] jxl_wgpu::ResidentGaborishError),
@@ -90,6 +92,27 @@ impl ModularRenderPlan {
         sources: Vec<ModularOutputPlane>,
         resampling: Vec<ChannelResampling>,
         weights: &UpsamplingWeightsInventory,
+        limits: &wgpu::Limits,
+    ) -> Result<Self> {
+        Self::build(sources, resampling, weights, None, limits)
+    }
+
+    pub(crate) fn for_color(
+        sources: Vec<ModularOutputPlane>,
+        resampling: Vec<ChannelResampling>,
+        config: ModularColorConfig,
+        target: jxl_gpu_formats::ColorSpecification,
+        weights: &UpsamplingWeightsInventory,
+        limits: &wgpu::Limits,
+    ) -> Result<Self> {
+        Self::build(sources, resampling, weights, Some((config, target)), limits)
+    }
+
+    fn build(
+        sources: Vec<ModularOutputPlane>,
+        resampling: Vec<ChannelResampling>,
+        weights: &UpsamplingWeightsInventory,
+        color: Option<(ModularColorConfig, jxl_gpu_formats::ColorSpecification)>,
         limits: &wgpu::Limits,
     ) -> Result<Self> {
         if sources.is_empty()
@@ -154,9 +177,13 @@ impl ModularRenderPlan {
             sources.iter().zip(&resampling).enumerate()
         {
             let source = source_info.layout;
+            let reconstruct_color = color.is_some() && index < 3;
             if !matches!(factor, 1 | 2 | 4 | 8)
-                || source.width != extent.width.div_ceil(factor)
-                || source.height != extent.height.div_ceil(factor)
+                || source.width == 0
+                || source.height == 0
+                || (!reconstruct_color
+                    && (source.width != extent.width.div_ceil(factor)
+                        || source.height != extent.height.div_ceil(factor)))
                 || source.row_stride_words < source.width
                 || source.reserved != 0
                 || source.hshift < 0
@@ -168,11 +195,15 @@ impl ModularRenderPlan {
                 + u64::from(source.height - 1) * u64::from(source.row_stride_words)
                 + u64::from(source.width);
             require("source address words", source_words, u64::from(u32::MAX))?;
-            uniform_bytes += std::mem::size_of::<NormalizeParams>() as u64;
+            if !reconstruct_color {
+                uniform_bytes += std::mem::size_of::<NormalizeParams>() as u64;
+            }
             if factor != 1 {
-                scratch_bytes =
-                    scratch_bytes.max(u64::from(source.width) * u64::from(source.height) * 4);
-                uniform_bytes += ResidentUpsamplePipeline::UNIFORM_BYTES;
+                if !reconstruct_color {
+                    scratch_bytes =
+                        scratch_bytes.max(u64::from(source.width) * u64::from(source.height) * 4);
+                    uniform_bytes += ResidentUpsamplePipeline::UNIFORM_BYTES;
+                }
                 if !kernels.iter().any(|kernel| kernel.factor() == factor) {
                     kernels.push(upsample_kernel(weights, factor)?);
                 }
@@ -199,10 +230,25 @@ impl ModularRenderPlan {
         for kernel in &kernels {
             require("weight bytes", kernel.weight_bytes(), storage_limit)?;
         }
+        let factors: Vec<_> = resampling.iter().map(|channel| channel.factor).collect();
+        let color = color
+            .map(|(config, target)| {
+                color::ColorPlan::new(
+                    config,
+                    resampling[0].extent,
+                    &sources,
+                    &factors,
+                    &planes,
+                    target,
+                    limits,
+                )
+            })
+            .transpose()?;
+        uniform_bytes += color.as_ref().map_or(0, |plan| plan.uniform_bytes);
         Ok(Self {
-            color: None,
+            color,
             sources,
-            factors: resampling.iter().map(|channel| channel.factor).collect(),
+            factors,
             planes,
             kernels,
             output_bytes,
@@ -218,41 +264,6 @@ impl ModularRenderPlan {
             + self.weight_bytes
             + self.uniform_bytes
             + self.color.as_ref().map_or(0, |color| color.storage_bytes)
-    }
-
-    pub(crate) fn with_color(
-        mut self,
-        config: ModularColorConfig,
-        target: jxl_gpu_formats::ColorSpecification,
-        limits: &wgpu::Limits,
-    ) -> Result<Self> {
-        let color = color::ColorPlan::new(
-            config,
-            self.output_extent(),
-            &self.sources,
-            &self.factors,
-            &self.planes,
-            target,
-            limits,
-        )?;
-        self.uniform_bytes -= 3 * std::mem::size_of::<NormalizeParams>() as u64
-            + if self.factors[0] == 1 {
-                0
-            } else {
-                3 * ResidentUpsamplePipeline::UNIFORM_BYTES
-            };
-        self.uniform_bytes += color.uniform_bytes;
-        self.scratch_bytes = self
-            .sources
-            .iter()
-            .zip(&self.factors)
-            .skip(3)
-            .filter(|(_, factor)| **factor != 1)
-            .map(|(plane, _)| u64::from(plane.layout.width) * u64::from(plane.layout.height) * 4)
-            .max()
-            .unwrap_or(0);
-        self.color = Some(color);
-        Ok(self)
     }
 
     pub(crate) fn color_converted(&self) -> bool {

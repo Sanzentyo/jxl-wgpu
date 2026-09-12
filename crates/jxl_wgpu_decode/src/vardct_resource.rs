@@ -8,7 +8,7 @@ use jxl_wgpu::{KernelVariant, VAR_DCT_AFV_BASIS};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-use crate::vardct_frontend::VarDctChannelShift;
+use crate::jpeg_sampling::JpegComponentShift;
 
 const RESOURCE_SHADER: &str = include_str!("vardct_resource.wgsl");
 
@@ -38,7 +38,7 @@ impl VarDctResourceLayout {
             blocks_x,
             blocks_y,
             quant_count,
-            [VarDctChannelShift::default(); 3],
+            [JpegComponentShift::default(); 3],
         )
     }
 
@@ -46,7 +46,7 @@ impl VarDctResourceLayout {
         blocks_x: u32,
         blocks_y: u32,
         quant_count: u32,
-        channel_shifts: [VarDctChannelShift; 3],
+        channel_shifts: [JpegComponentShift; 3],
     ) -> Result<Self, VarDctResourceError> {
         validate_channel_shifts(channel_shifts)?;
         let block_count =
@@ -298,7 +298,7 @@ pub struct VarDctResourceParams {
 pub struct VarDctResourceConfig {
     pub block_extent: [u32; 2],
     pub output_origin: [u32; 2],
-    pub channel_shifts: [VarDctChannelShift; 3],
+    pub channel_shifts: [JpegComponentShift; 3],
     pub lf_offsets: [u32; 3],
     pub lf_strides: [u32; 3],
     pub apply_chroma_from_luma: bool,
@@ -417,7 +417,7 @@ impl VarDctResourceParams {
 }
 
 fn validate_channel_shifts(
-    channel_shifts: [VarDctChannelShift; 3],
+    channel_shifts: [JpegComponentShift; 3],
 ) -> Result<(), VarDctResourceError> {
     for (channel, shift) in channel_shifts.into_iter().enumerate() {
         if shift.horizontal > 1 || shift.vertical > 1 {
@@ -713,12 +713,12 @@ mod tests {
     #[test]
     fn jpeg_component_shifts_are_bounded_before_layout_arithmetic() {
         let shifts = [
-            VarDctChannelShift {
+            JpegComponentShift {
                 horizontal: 2,
                 vertical: 0,
             },
-            VarDctChannelShift::default(),
-            VarDctChannelShift::default(),
+            JpegComponentShift::default(),
+            JpegComponentShift::default(),
         ];
         assert_eq!(
             VarDctResourceLayout::with_channel_shifts(4, 2, 1, shifts).unwrap_err(),

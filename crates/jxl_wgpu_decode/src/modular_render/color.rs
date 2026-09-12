@@ -19,12 +19,39 @@ use crate::color_output::{
     ColorOutputConfig, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan, ColorOutputPlane,
     ColorOutputTransform, InverseOpsin,
 };
+use crate::jpeg_sampling::{JpegComponentShift, component_shifts};
+
+#[derive(Clone, Debug, PartialEq)]
+enum ModularColorTransform {
+    Rgb,
+    Xyb { lf: [f32; 3], inverse: InverseOpsin },
+    Ycbcr { shifts: [JpegComponentShift; 3] },
+}
+
+impl ModularColorTransform {
+    fn shifts(&self) -> [JpegComponentShift; 3] {
+        match self {
+            Self::Ycbcr { shifts } => *shifts,
+            Self::Rgb | Self::Xyb { .. } => [JpegComponentShift::default(); 3],
+        }
+    }
+
+    fn output(&self) -> ColorOutputTransform {
+        match self {
+            Self::Rgb => ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+            Self::Xyb { inverse, .. } => ColorOutputTransform::Xyb(*inverse),
+            Self::Ycbcr { .. } => ColorOutputTransform::Ycbcr {
+                channel_shifts: [JpegComponentShift::default(); 3],
+            },
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
     encoded_output: bool,
     noise: Option<jxl_wgpu::ResidentNoiseParameters>,
-    xyb: Option<([f32; 3], InverseOpsin)>,
+    transform: ModularColorTransform,
     gaborish: Option<ResidentGaborishWeights>,
     epf: Vec<ResidentEpfParameters>,
     inverse_sigma: f32,
@@ -51,29 +78,33 @@ impl ModularColorConfig {
         if epf.is_some() && sigma < 1e-8 {
             return Err(crate::RestorationError::InvalidModularSigma { value: sigma }.into());
         }
-        let xyb = if image.xyb_encoded {
-            Some((
-                lf.map(|value| value / 128.0),
-                InverseOpsin::from_image(image).ok_or(ModularRenderError::Invalid {
+        let transform = if image.xyb_encoded {
+            ModularColorTransform::Xyb {
+                lf: lf.map(|value| value / 128.0),
+                inverse: InverseOpsin::from_image(image).ok_or(ModularRenderError::Invalid {
                     reason: "XYB inverse opsin metadata is missing",
                 })?,
-            ))
+            }
+        } else if frame.do_ycbcr {
+            ModularColorTransform::Ycbcr {
+                shifts: component_shifts(frame.jpeg_upsampling),
+            }
         } else {
-            None
+            ModularColorTransform::Rgb
         };
         let noise = noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0]));
-        Ok(
-            (xyb.is_some() || gaborish.is_some() || epf.is_some() || noise.is_some()).then(|| {
-                Self {
-                    encoded_output: false,
-                    noise,
-                    xyb,
-                    gaborish,
-                    epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
-                    inverse_sigma: -1.171_572_9 / sigma,
-                }
-            }),
-        )
+        Ok((transform != ModularColorTransform::Rgb
+            || gaborish.is_some()
+            || epf.is_some()
+            || noise.is_some())
+        .then(|| Self {
+            encoded_output: false,
+            noise,
+            transform,
+            gaborish,
+            epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
+            inverse_sigma: -1.171_572_9 / sigma,
+        }))
     }
 
     pub(crate) fn for_encoded_output(mut self) -> Self {
@@ -135,10 +166,7 @@ impl ColorPlan {
             transform: if config.encoded_output {
                 ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709)
             } else {
-                config.xyb.map_or(
-                    ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
-                    |(_, inverse)| ColorOutputTransform::Xyb(inverse),
-                )
+                config.transform.output()
             },
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         };
@@ -177,10 +205,12 @@ impl ColorPlan {
 pub(crate) struct ReconstructionPlan {
     noise: Option<jxl_wgpu::ResidentNoisePlan>,
     config: ModularColorConfig,
-    source_extent: Extent2d,
+    coded_extent: Extent2d,
+    source_extents: [Extent2d; 3],
     pub(super) output_extent: Extent2d,
     factor: u32,
-    source_plane_bytes: u64,
+    normalized_bytes: [u64; 3],
+    coded_plane_bytes: u64,
     upsample_plane_bytes: u64,
     pub(super) storage_bytes: u64,
     pub(super) uniform_bytes: u64,
@@ -203,15 +233,35 @@ impl ReconstructionPlan {
         {
             return invalid("color reconstruction extent, factor or plane count");
         }
-        let source = sources[0].layout;
-        if sources[..3].iter().any(|plane| {
-            let layout = plane.layout;
-            layout.width != extent.width.div_ceil(factor)
-                || layout.height != extent.height.div_ceil(factor)
-                || layout.row_stride_words < layout.width
-                || layout.reserved != 0
-        }) {
-            return invalid("Modular color reconstruction requires equal color grids");
+        let coded_extent = Extent2d::new(
+            extent.width.div_ceil(factor),
+            extent.height.div_ceil(factor),
+        );
+        let shifts = config.transform.shifts();
+        if shifts
+            .iter()
+            .any(|shift| shift.horizontal > 1 || shift.vertical > 1)
+        {
+            return invalid("invalid Modular JPEG component shift");
+        }
+        let source_extents = shifts.map(|shift| {
+            let [width, height] = shift
+                .shifted_extent(coded_extent.width, coded_extent.height)
+                .expect("bounded JPEG component shift");
+            Extent2d::new(width, height)
+        });
+        if sources[..3]
+            .iter()
+            .zip(source_extents)
+            .any(|(plane, extent)| {
+                let layout = plane.layout;
+                layout.width != extent.width
+                    || layout.height != extent.height
+                    || layout.row_stride_words < layout.width
+                    || layout.reserved != 0
+            })
+        {
+            return invalid("Modular color source does not match component sampling");
         }
         for plane in &sources[..3] {
             let layout = plane.layout;
@@ -240,7 +290,9 @@ impl ReconstructionPlan {
             std::mem::size_of::<NormalizeColorParams>() as u64,
             limits.max_uniform_buffer_binding_size,
         )?;
-        let source_plane_bytes = u64::from(source.width) * u64::from(source.height) * 4;
+        let normalized_bytes =
+            source_extents.map(|extent| u64::from(extent.width) * u64::from(extent.height) * 4);
+        let coded_plane_bytes = u64::from(coded_extent.width) * u64::from(coded_extent.height) * 4;
         let upsample_plane_bytes = if factor == 1 {
             0
         } else {
@@ -250,17 +302,19 @@ impl ReconstructionPlan {
             .max_buffer_size
             .min(limits.max_storage_buffer_binding_size)
             .min(u64::from(u32::MAX) * 4);
-        require("color source plane", source_plane_bytes, limit)?;
+        require("color source plane", coded_plane_bytes, limit)?;
         require("color upsampling plane", upsample_plane_bytes, limit)?;
         let noise = config
             .noise
             .map(|parameters| jxl_wgpu::ResidentNoisePlan::new(extent, parameters, limits))
             .transpose()?;
-        let storage_bytes = source_plane_bytes
-            * if config.gaborish.is_some() || !config.epf.is_empty() {
-                6
+        let shifted_count = shifts.iter().filter(|shift| shift.is_subsampled()).count() as u64;
+        let storage_bytes = normalized_bytes.iter().sum::<u64>()
+            + coded_plane_bytes * shifted_count
+            + if config.gaborish.is_some() || !config.epf.is_empty() {
+                coded_plane_bytes * 3
             } else {
-                3
+                0
             }
             + upsample_plane_bytes * 3
             + noise
@@ -270,6 +324,7 @@ impl ReconstructionPlan {
             .as_ref()
             .map_or(0, |_| jxl_wgpu::ResidentNoisePlan::UNIFORM_BYTES)
             + std::mem::size_of::<NormalizeColorParams>() as u64
+            + shifted_count * jxl_wgpu::ResidentChromaUpsampleMemoryPlan::UNIFORM_BYTES
             + config
                 .gaborish
                 .map_or(0, |_| jxl_wgpu::ResidentGaborishMemoryPlan::UNIFORM_BYTES)
@@ -282,10 +337,12 @@ impl ReconstructionPlan {
         Ok(Self {
             config,
             noise,
-            source_extent: Extent2d::new(source.width, source.height),
+            coded_extent,
+            source_extents,
             output_extent: extent,
             factor,
-            source_plane_bytes,
+            normalized_bytes,
+            coded_plane_bytes,
             upsample_plane_bytes,
             storage_bytes,
             uniform_bytes,
@@ -296,36 +353,46 @@ impl ReconstructionPlan {
     pub(super) fn output_buffers<'a>(
         &self,
         buffers: &'a ReconstructionBuffers,
-    ) -> &'a [wgpu::Buffer; 3] {
+    ) -> [&'a wgpu::Buffer; 3] {
         if let Some(upsampled) = &buffers.upsampled {
-            upsampled
+            upsampled.each_ref()
         } else if (usize::from(self.config.gaborish.is_some()) + self.config.epf.len()) % 2 == 1 {
             buffers
                 .scratch
                 .as_ref()
                 .expect("restoration scratch was planned")
+                .each_ref()
         } else {
-            &buffers.normalized
+            buffers.expanded_planes()
         }
     }
     pub(super) fn allocate(&self, device: &wgpu::Device) -> ReconstructionBuffers {
-        let create = |label, size| {
-            std::array::from_fn(|_| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(label),
-                    size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                })
+        let create_plane = |label, size| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             })
         };
+        let create = |label, size| std::array::from_fn(|_| create_plane(label, size));
         ReconstructionBuffers {
             noise: self.noise.as_ref().map(|plan| plan.allocate(device)),
-            normalized: create("jxl-wgpu Modular decoded color", self.source_plane_bytes),
+            normalized: self
+                .normalized_bytes
+                .map(|bytes| create_plane("jxl-wgpu Modular decoded color", bytes)),
+            expanded: self.config.transform.shifts().map(|shift| {
+                shift.is_subsampled().then(|| {
+                    create_plane(
+                        "jxl-wgpu Modular expanded JPEG component",
+                        self.coded_plane_bytes,
+                    )
+                })
+            }),
             scratch: (self.config.gaborish.is_some() || !self.config.epf.is_empty()).then(|| {
                 create(
                     "jxl-wgpu Modular restoration scratch",
-                    self.source_plane_bytes,
+                    self.coded_plane_bytes,
                 )
             }),
             upsampled: (self.factor != 1).then(|| {
@@ -340,8 +407,19 @@ impl ReconstructionPlan {
 pub(crate) struct ReconstructionBuffers {
     noise: Option<wgpu::Buffer>,
     normalized: [wgpu::Buffer; 3],
+    expanded: [Option<wgpu::Buffer>; 3],
     scratch: Option<[wgpu::Buffer; 3]>,
     upsampled: Option<[wgpu::Buffer; 3]>,
+}
+
+impl ReconstructionBuffers {
+    fn expanded_planes(&self) -> [&wgpu::Buffer; 3] {
+        std::array::from_fn(|index| {
+            self.expanded[index]
+                .as_ref()
+                .unwrap_or(&self.normalized[index])
+        })
+    }
 }
 
 pub(super) struct ColorPipeline {
@@ -411,6 +489,12 @@ pub(crate) struct ReconstructionPipeline {
     noise: std::sync::OnceLock<
         std::result::Result<jxl_wgpu::ResidentNoisePipeline, jxl_wgpu::ResidentNoiseError>,
     >,
+    chroma: std::sync::OnceLock<
+        std::result::Result<
+            jxl_wgpu::ResidentChromaUpsamplePipeline,
+            jxl_wgpu::ResidentChromaUpsampleError,
+        >,
+    >,
     normalize: wgpu::ComputePipeline,
     gaborish: ResidentGaborishPipeline,
     epf: ResidentEpfPipeline,
@@ -439,6 +523,7 @@ impl ReconstructionPipeline {
             upsample: ResidentUpsamplePipeline::new(device)?,
             // Noise pipelines are compiled only for frames carrying a nonzero model.
             noise: std::sync::OnceLock::new(),
+            chroma: std::sync::OnceLock::new(),
         })
     }
 
@@ -458,10 +543,10 @@ impl ReconstructionPipeline {
         if sources.len() < 3 {
             return invalid("missing color source planes");
         }
-        for plane in &sources[..3] {
+        for (plane, extent) in sources[..3].iter().zip(plan.source_extents) {
             let layout = plane.layout;
-            if layout.width != plan.source_extent.width
-                || layout.height != plan.source_extent.height
+            if layout.width != extent.width
+                || layout.height != extent.height
                 || layout.row_stride_words < layout.width
                 || layout.reserved != 0
             {
@@ -497,11 +582,15 @@ impl ReconstructionPipeline {
                 sources[0].encoding.packed(),
                 sources[1].encoding.packed(),
                 sources[2].encoding.packed(),
-                u32::from(plan.config.xyb.is_some()),
+                u32::from(matches!(
+                    plan.config.transform,
+                    ModularColorTransform::Xyb { .. }
+                )),
             ],
-            multipliers: plan.config.xyb.map_or([0.0; 4], |(values, _)| {
-                [values[0], values[1], values[2], 0.0]
-            }),
+            multipliers: match plan.config.transform {
+                ModularColorTransform::Xyb { lf, .. } => [lf[0], lf[1], lf[2], 0.0],
+                _ => [0.0; 4],
+            },
         };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu Modular color normalization parameters"),
@@ -533,22 +622,49 @@ impl ReconstructionPipeline {
             pass.set_pipeline(&self.normalize);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(
-                plan.source_extent.width.div_ceil(16),
-                plan.source_extent.height.div_ceil(16),
+                plan.coded_extent.width.div_ceil(16),
+                plan.coded_extent.height.div_ceil(16),
                 1,
             );
         }
         let mut uniforms = vec![uniform];
-        let mut current = &buffers.normalized;
+        for (index, shift) in plan.config.transform.shifts().into_iter().enumerate() {
+            if !shift.is_subsampled() {
+                continue;
+            }
+            let pipeline = self
+                .chroma
+                .get_or_init(|| jxl_wgpu::ResidentChromaUpsamplePipeline::new(device))
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let output = buffers.expanded[index]
+                .as_ref()
+                .ok_or(ModularRenderError::Invalid {
+                    reason: "missing expanded JPEG component",
+                })?;
+            uniforms.push(pipeline.encode(
+                device,
+                encoder,
+                jxl_wgpu::ResidentChromaUpsampleInputs {
+                    input: resident_plane(&buffers.normalized[index], plan.source_extents[index])?,
+                    output: resident_plane(output, plan.coded_extent)?,
+                    shift: jxl_wgpu::ResidentChromaShift {
+                        horizontal: shift.horizontal != 0,
+                        vertical: shift.vertical != 0,
+                    },
+                },
+            )?);
+        }
+        let mut current = buffers.expanded_planes();
         if let Some(scratch) = &buffers.scratch {
-            let mut destination = scratch;
+            let mut destination = scratch.each_ref();
             if let Some(weights) = plan.config.gaborish {
                 uniforms.push(self.gaborish.encode(
                     device,
                     encoder,
                     ResidentGaborishInputs {
-                        inputs: resident_planes(current, plan.source_extent)?,
-                        outputs: resident_planes(destination, plan.source_extent)?,
+                        inputs: resident_planes(current, plan.coded_extent)?,
+                        outputs: resident_planes(destination, plan.coded_extent)?,
                         weights,
                     },
                 )?);
@@ -559,8 +675,8 @@ impl ReconstructionPipeline {
                     device,
                     encoder,
                     ResidentEpfInputs {
-                        inputs: resident_planes(current, plan.source_extent)?,
-                        outputs: resident_planes(destination, plan.source_extent)?,
+                        inputs: resident_planes(current, plan.coded_extent)?,
+                        outputs: resident_planes(destination, plan.coded_extent)?,
                         sigma: ResidentEpfSigma::Constant(plan.config.inverse_sigma),
                         parameters,
                     },
@@ -572,9 +688,9 @@ impl ReconstructionPipeline {
             let weights = weights.ok_or(ModularRenderError::Invalid {
                 reason: "missing color upsampling weights",
             })?;
-            for (input, output) in resident_planes(current, plan.source_extent)?
+            for (input, output) in resident_planes(current, plan.coded_extent)?
                 .into_iter()
-                .zip(resident_planes(upsampled, plan.output_extent)?)
+                .zip(resident_planes(upsampled.each_ref(), plan.output_extent)?)
             {
                 uniforms.push(self.upsample.encode(
                     device,
@@ -627,22 +743,23 @@ pub(super) struct ReconstructionInputs<'a> {
 }
 
 fn resident_planes(
-    buffers: &[wgpu::Buffer; 3],
+    buffers: [&wgpu::Buffer; 3],
     extent: Extent2d,
 ) -> Result<[ResidentF32Plane<'_>; 3]> {
-    let plane = |buffer| -> Result<_> {
-        Ok(ResidentF32Plane {
-            storage: binding(buffer)?,
-            width: extent.width,
-            height: extent.height,
-            stride: extent.width,
-        })
-    };
     Ok([
-        plane(&buffers[0])?,
-        plane(&buffers[1])?,
-        plane(&buffers[2])?,
+        resident_plane(buffers[0], extent)?,
+        resident_plane(buffers[1], extent)?,
+        resident_plane(buffers[2], extent)?,
     ])
+}
+
+fn resident_plane(buffer: &wgpu::Buffer, extent: Extent2d) -> Result<ResidentF32Plane<'_>> {
+    Ok(ResidentF32Plane {
+        storage: binding(buffer)?,
+        width: extent.width,
+        height: extent.height,
+        stride: extent.width,
+    })
 }
 
 #[cfg(test)]
@@ -688,7 +805,7 @@ mod tests {
                     let config = ModularColorConfig {
                         encoded_output: false,
                         noise: None,
-                        xyb: None,
+                        transform: ModularColorTransform::Rgb,
                         gaborish: gaborish.then_some(ResidentGaborishWeights::DEFAULT),
                         epf: if iterations == 0 {
                             Vec::new()
@@ -773,7 +890,7 @@ mod tests {
         let config = ModularColorConfig {
             encoded_output: false,
             noise: None,
-            xyb: None,
+            transform: ModularColorTransform::Rgb,
             gaborish: Some(ResidentGaborishWeights::DEFAULT),
             epf: crate::restoration::restoration_config(RestorationFilterInventory::Default)
                 .unwrap()

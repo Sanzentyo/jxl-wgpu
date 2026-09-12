@@ -1884,7 +1884,7 @@ fn resident_shifted_image_planes<'a>(
     buffers: &'a [wgpu::Buffer; 3],
     width: u32,
     height: u32,
-    shifts: [crate::vardct_frontend::VarDctChannelShift; 3],
+    shifts: [crate::jpeg_sampling::JpegComponentShift; 3],
 ) -> Result<[ResidentF32Plane<'a>; 3], VarDctDecodeError> {
     let plane = |channel: usize| -> Result<ResidentF32Plane<'a>, VarDctDecodeError> {
         let shift = shifts[channel];

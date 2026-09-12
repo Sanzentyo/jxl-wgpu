@@ -261,18 +261,20 @@ fn parse_modular_profile(
         }
     };
     let bits_per_sample = sample_encoding.bits();
-    // XYB Modular dependency frames always contain Y/X/B, including when the final image's
-    // presentation encoding is grayscale. Only non-XYB Modular stores a single gray plane.
-    let channels = ModularChannelCounts::new(
-        image.grayscale && !image.xyb_encoded,
-        image.extra_channel_count,
-    )?;
     if (image.animation.is_some() && purpose == ModularProfilePurpose::Presentation)
         || image.preview_size.is_some()
         || inventory.frames.len() != 1
     {
         return unsupported("the Modular GPU profile requires exactly one still-image frame");
     }
+    let frame = &inventory.frames[0];
+    frame.validate_jpeg_sampling()?;
+    // Only original-color grayscale stores one plane. XYB and YCbCr each carry three
+    // components even when the image's presentation color encoding is grayscale.
+    let channels = ModularChannelCounts::new(
+        image.grayscale && !image.xyb_encoded && !frame.do_ycbcr,
+        image.extra_channel_count,
+    )?;
     let orientation = match purpose {
         ModularProfilePurpose::Presentation | ModularProfilePurpose::Frame => {
             validate_image_header(image, channels)?
@@ -288,12 +290,10 @@ fn parse_modular_profile(
         }
     };
 
-    let frame = &inventory.frames[0];
     let shared_frame_is_invalid = frame.is_preview
         || frame.encoding != FrameEncoding::Modular
         || frame.flags & !1 != 0
-        || frame.do_ycbcr
-        || frame.jpeg_upsampling != [0; 3]
+        || (image.xyb_encoded && frame.do_ycbcr)
         || !matches!(frame.upsampling, 1 | 2 | 4 | 8)
         || frame.extra_channel_upsampling.len() != image.extra_channels.len()
         || frame

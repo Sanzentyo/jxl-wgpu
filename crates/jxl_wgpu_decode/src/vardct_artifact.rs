@@ -13,7 +13,7 @@ use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::TransformKind;
 use thiserror::Error;
 
-use crate::vardct_frontend::VarDctChannelShift;
+use crate::jpeg_sampling::JpegComponentShift;
 
 pub const VAR_DCT_STRATEGY_COUNT: usize = 27;
 pub const HF_ORDER_COUNT: usize = 13;
@@ -117,7 +117,7 @@ pub struct HfMetadataArtifactConfig {
     /// LF-global quantization scale denominator component.
     pub global_scale: u32,
     /// Effective resident channel shifts in Cb/X, Y, Cr/B order.
-    pub channel_shifts: [VarDctChannelShift; 3],
+    pub channel_shifts: [JpegComponentShift; 3],
     /// Base vector and row stride of each channel's LF resource plane.
     pub lf_offsets: [u32; 3],
     pub lf_strides: [u32; 3],

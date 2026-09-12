@@ -2,6 +2,7 @@
 pub mod frame_features;
 pub mod jpeg_sampling;
 pub mod modular_passes;
+pub mod modular_ycbcr;
 pub mod noise;
 pub mod patch_features;
 pub mod patch_references;
