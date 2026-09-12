@@ -551,13 +551,6 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
         .into());
     }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
-        if frame.flags & 2 != 0 && frame.frame_type == FrameType::LowFrequency {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::Patches,
-                "patch rendering in LF producer frames is not yet connected",
-            )
-            .into());
-        }
         if frame.flags & 2 != 0 && (frame.upsampling != 1 || frame.flags & 1 != 0) {
             return Err(UnsupportedProfile::new(
                 UnsupportedCodestreamFeature::Patches,
@@ -673,6 +666,7 @@ struct LfUpdate {
 #[derive(Debug)]
 enum Stage {
     PatchDictionary(Box<patches::Pending>),
+    LfPatchRender(GpuWork<crate::progressive_dc::ProgressiveDcOutput>),
     PatchRender {
         work: GpuWork,
         source: Surface,
@@ -750,6 +744,7 @@ impl DependentPending {
     ) -> Result<Option<SubmittedGpuFrame<GpuImageFrame>>> {
         self.completed_submissions =
             update_count(self.completed_submissions, count, &self.submissions)?;
+        let preview = self.presents_lf(emit_intermediates);
         let carry = self
             .carry
             .as_mut()
@@ -767,35 +762,27 @@ impl DependentPending {
             }
         }
         if header.frame_type == FrameType::LowFrequency {
-            let preview = emit_intermediates
-                && self.lf_updates.contains(&node.frame_index)
-                && self.lf_preview.is_some()
-                && carry.source.inventory.frames[self.end - 1].frame_type == FrameType::Regular;
-            let preview_planes = preview.then(|| lf.clone()).flatten();
-            carry.lf[header.lf_level as usize - 1] = match node.lf_last_use {
-                Some(last_use) => Some(LfFrame {
-                    frame_index: node.frame_index,
-                    last_use,
-                    planes: lf
-                        .ok_or(Error::EngineContract(
-                            "validated LF producer lost its planes",
-                        ))?
-                        .xyb,
-                }),
-                None => None,
-            };
             drop(frame);
-            if let Some(planes) = preview_planes {
-                let level = header.lf_level as u8;
-                self.lf_pending.push_back(LfUpdate {
-                    planes,
-                    progression: FrameProgression::LowFrequency {
-                        physical_frame_index: node.frame_index,
-                        level,
-                    },
-                });
+            if header.flags & 2 != 0 {
+                let dictionary = self.patches.take().ok_or(Error::EngineContract(
+                    "LF producer patch dictionary was lost",
+                ))?;
+                if dictionary.count != 0 {
+                    let work = patches::render_lf(
+                        carry.source.engine.backend(),
+                        lf.as_ref()
+                            .ok_or(Error::EngineContract("LF patch planes were lost"))?,
+                        &carry.references,
+                        &dictionary,
+                        &carry.source.inventory.image_header.extra_channels,
+                        preview,
+                    )?;
+                    self.stage = Some(Stage::LfPatchRender(work));
+                    self.count_submission();
+                    return Ok(None);
+                }
             }
-            self.advance()?;
+            self.record_lf(lf, emit_intermediates)?;
             return Ok(None);
         }
         match &*self.output {
@@ -830,6 +817,64 @@ impl DependentPending {
             }
         }
         Ok(None)
+    }
+
+    fn presents_lf(&self, emit_intermediates: bool) -> bool {
+        emit_intermediates
+            && self
+                .lf_updates
+                .contains(&self.nodes[self.physical - self.first].frame_index)
+            && self.lf_preview.is_some()
+            && self.carry.as_ref().is_some_and(|carry| {
+                carry.source.inventory.frames[self.end - 1].frame_type == FrameType::Regular
+            })
+    }
+
+    fn needs_lf_output(&self) -> bool {
+        self.nodes[self.physical - self.first].lf_last_use.is_some()
+            || self.carry.as_ref().is_some_and(|carry| {
+                let frame = &carry.source.inventory.frames[self.physical];
+                frame.frame_type == FrameType::LowFrequency && frame.flags & 2 != 0
+            })
+    }
+
+    /// Publish only the validated, feature-complete LF version. Extra planes belong to queued
+    /// presentation, independently of prediction slots and ordinary patch reference slots.
+    fn record_lf(
+        &mut self,
+        lf: Option<crate::progressive_dc::ProgressiveDcOutput>,
+        emit_intermediates: bool,
+    ) -> Result<()> {
+        let preview = self.presents_lf(emit_intermediates);
+        let carry = self
+            .carry
+            .as_mut()
+            .ok_or(Error::EngineContract("LF carry was lost"))?;
+        let node = &self.nodes[self.physical - self.first];
+        let header = &carry.source.inventory.frames[self.physical];
+        let preview_planes = preview.then(|| lf.clone()).flatten();
+        carry.lf[header.lf_level as usize - 1] = match node.lf_last_use {
+            Some(last_use) => Some(LfFrame {
+                frame_index: node.frame_index,
+                last_use,
+                planes: lf
+                    .ok_or(Error::EngineContract(
+                        "validated LF producer lost its planes",
+                    ))?
+                    .xyb,
+            }),
+            None => None,
+        };
+        if let Some(planes) = preview_planes {
+            self.lf_pending.push_back(LfUpdate {
+                planes,
+                progression: FrameProgression::LowFrequency {
+                    physical_frame_index: node.frame_index,
+                    level: header.lf_level as u8,
+                },
+            });
+        }
+        self.advance()
     }
 
     fn advance(&mut self) -> Result<()> {
@@ -1040,6 +1085,7 @@ impl DependentPending {
             self.lf_pending.clear();
         }
         loop {
+            let needs_lf_output = self.needs_lf_output();
             let stage = self
                 .stage
                 .as_mut()
@@ -1058,6 +1104,14 @@ impl DependentPending {
                     // before its admission, matching the blocking path's resource lifetime.
                     self.stage = None;
                     self.dictionary_decoded(dictionary, count)?;
+                }
+                Stage::LfPatchRender(work) => {
+                    let planes = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    self.stage = None;
+                    self.record_lf(Some(planes), emit_intermediates)?;
                 }
                 Stage::PatchRender { work, source } => {
                     let buffer = match work.poll(context) {
@@ -1080,8 +1134,7 @@ impl DependentPending {
                     self.transformed(surface)?;
                 }
                 Stage::Decode(PhysicalPending { pending, lf, count }) => {
-                    if self.nodes[self.physical - self.first].lf_last_use.is_some() && lf.is_none()
-                    {
+                    if needs_lf_output && lf.is_none() {
                         if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
                             let result = pending.poll_until_dependency_submitted(context);
                             update_count(self.completed_submissions, count, &self.submissions)?;
@@ -1311,6 +1364,7 @@ impl DependentPending {
     pub(super) fn wait(mut self) -> Result<SubmittedGpuFrame<GpuImageFrame>> {
         self.lf_pending.clear();
         loop {
+            let needs_lf_output = self.needs_lf_output();
             match self
                 .stage
                 .take()
@@ -1320,6 +1374,7 @@ impl DependentPending {
                     let (dictionary, count) = pending.wait()?;
                     self.dictionary_decoded(dictionary, count)?;
                 }
+                Stage::LfPatchRender(work) => self.record_lf(Some(work.wait()?), false)?,
                 Stage::PatchRender { work, mut source } => {
                     source.buffer = work.wait()?;
                     self.reconstructed(source)?;
@@ -1333,8 +1388,7 @@ impl DependentPending {
                     count,
                     mut lf,
                 }) => {
-                    if self.nodes[self.physical - self.first].lf_last_use.is_some() && lf.is_none()
-                    {
+                    if needs_lf_output && lf.is_none() {
                         if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
                             pending.wait_until_dependency_submitted()?;
                         }

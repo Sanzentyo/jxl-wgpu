@@ -200,9 +200,12 @@ decode on the GPU with Prefix/ANS and LZ77, bounded input windows, and four expl
 pre-transform reference slots. Ordered rendering supports all eight patch modes, independently
 selected alpha/extra channels and clamping before inverse color conversion. Modular and VarDCT
 pass updates apply the same dictionary to fresh surfaces without changing saved references;
-native prefix snapshots cover color and every extra channel. Patches in LF producers, separate
-LF previews of patch consumers, frame upsampling/noise/subsampled YCbCr, mixed-mode patch
-conformance and broader original color domains remain pending.
+native prefix snapshots cover color and every extra channel. Separate LF previews of patch
+consumers apply the dictionary to fresh component surfaces before presentation. Both LF producer
+modes also apply patches before publishing prediction XYB, with independently retained preview
+extras; unused and overwritten producers still validate and execute their features. Patch
+combinations with frame upsampling/noise/subsampled YCbCr, mixed-mode patch conformance and broader
+original color domains remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

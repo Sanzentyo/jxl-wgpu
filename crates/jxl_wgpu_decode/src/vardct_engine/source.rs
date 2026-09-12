@@ -377,7 +377,7 @@ pub(super) fn prepare_packet_source(
     );
     let extra_render = (!extra_indices.is_empty()
         && (surface.is_some()
-            || request.retains_lf_presentation()
+            || request.retains_lf_extras()
             || extra_indices
                 .iter()
                 .any(|&index| frame.extra_channel_upsampling[index] != 1)))

@@ -3237,3 +3237,62 @@ Reference and Apple M5/Metal harnesses each pass 18/18 cases; the Gray8 codec re
 221 output bytes and no staging allocation. All 86 basic, pass-progressive and LF patch fixture
 files regenerate identically. Hashes confirm that the complete validation used one unchanged
 source snapshot; only this validation record was appended afterward.
+
+### GPU patches in LF producer frames (2026-09-12)
+
+`patches/lf_producers/` adds fourteen images and fourteen native final snapshot files. Four
+65×33 RGB families reuse the unchanged entropy of `lf_extra_channels/`: `vardct_gab0`,
+`modular_gab1`, `nested_vardct_gab1` and `nested_modular_gab1`. An initial unmodified LF chain
+supplies a hidden pre-transform reference in slot three; a second chain applies dictionaries
+inside its LF producers before the unchanged final consumer predicts from them. The baseline
+dictionary has sixteen overlapping occurrences covering every patch mode and independent
+alpha/depth selection. Empty variants reproduce the native source exactly. Four variants insert
+an unused patched LF producer which is overwritten immediately; native output remains identical.
+Two VarDCT variants place 2×2 replacements across the last visible row and column, within padded
+blocks. All fourteen inputs are accepted by native libjxl 0.12.0.
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_producer_patches
+```
+
+The runtime follows the feature-before-prediction order in
+[dec_cache.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc).
+The existing ordered patch kernel operates on a temporary all-channel surface. GPU copies import
+strided reconstructed XYB and normalized extras and export three separate prediction buffers;
+preview extras use a distinct allocation with aligned plane offsets. These copies and patch
+batches share one accounted submission. A typed completion owns all output allocations through
+cancellation. Only after completion can the LF slot be replaced or an LF preview queued. Every
+LF producer executes its features even if no later frame uses it. Final-only requests retain
+input extras when patches need them, then release them independently of the prediction lifetime.
+Dictionary destinations and count limits now use reduced coded geometry and VarDCT block padding,
+matching [dec_frame.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc).
+
+Public color tests cover 56 linear/extended-sRGB and whole/fragmented configurations. Transport
+fragments contain 43 bytes and bounded GPU windows contain 256 bytes. Every delivered word agrees
+between input policies; final-only output equals the final update, and held updates remain
+immutable. Native final color differs by less than 4.6e-5 normalized error against the existing
+3e-3 VarDCT bound. Twenty-eight selected alpha/depth outputs match native final planes exactly
+against a 2e-6 bound. Public LF/CID previews are checked for order, finiteness, input-policy equality
+and immutable delivery; no native LF/CID color snapshots are claimed for this new corpus.
+
+Private tests independently apply f64 patch algebra to validated input components and compare
+every returned LF color/extra sample within 2e-6 normalized error. Four source families exercise
+packed and padded input rows, 9×5 and 2×1 extents, and both extra-retention policies. Exact
+reservation checks distinguish prediction buffers from preview extras. Forty lifecycle cases
+stop at dictionary, admitted body and submitted patch boundaries to exercise cancellation,
+blocking/async final draining and allocation failure without changing committed references.
+Sixteen malformed cases reject destinations outside the reduced coded rectangle, including
+unused producers, before any LF output. Four later-LF entropy failures preserve the earlier
+validated LF2 image and release every other source/GPU reservation.
+
+Patch combinations with frame upsampling, noise or subsampled YCbCr, mixed coding-mode patch
+references, broader LF color/precision coverage, splines and the remaining roadmap items remain open.
+
+The complete serial workspace run passes 872 tests across 50 targets, with zero failures, no
+filtered tests and one existing ignored allocation benchmark; all five doctests pass. Formatting,
+all-target/all-feature workspace checks, Clippy and rustdoc with warnings denied, Rust 1.89 and
+six-library wasm all-feature checks pass. Reference and Apple M5/Metal harnesses each pass 18/18
+cases; the Gray8 codec readback passes with 221 bytes, direct mapping and no staging allocation.
+All 114 basic, pass-progressive, LF-consumer and LF-producer patch fixture files regenerate
+identically. Hashes confirm that the full run used one unchanged source snapshot; only
+documentation corrections and this validation record were written afterward.

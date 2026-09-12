@@ -2188,12 +2188,18 @@ fn submit_vardct(
         "jxl-wgpu VarDCT Y plane",
         "jxl-wgpu VarDCT B plane",
     ];
+    // Feature rendering can copy a retained LF image into its common component surface.
+    let retained_usage = if source.packet.profile.lf_level != 0 {
+        wgpu::BufferUsages::COPY_SRC
+    } else {
+        wgpu::BufferUsages::empty()
+    };
     let resident_planes = source.output.is_color().then(|| {
         std::array::from_fn(|channel| {
             storage(
                 image_labels[channel],
                 source.memory.resident_plane_bytes[channel],
-                wgpu::BufferUsages::COPY_DST,
+                wgpu::BufferUsages::COPY_DST | retained_usage,
             )
         })
     });
@@ -2213,11 +2219,7 @@ fn submit_vardct(
         let full_plane_bytes = source.memory.pre_restoration_upsample_bytes / shifted_channels;
         std::array::from_fn(|channel| {
             if source.packet.profile.channel_shifts[channel].is_subsampled() {
-                storage(
-                    labels[channel],
-                    full_plane_bytes,
-                    wgpu::BufferUsages::empty(),
-                )
+                storage(labels[channel], full_plane_bytes, retained_usage)
             } else {
                 resident_planes.as_ref().expect("color planes")[channel].clone()
             }
@@ -2233,7 +2235,7 @@ fn submit_vardct(
             storage(
                 labels[channel],
                 source.memory.restoration_scratch_bytes / 3,
-                wgpu::BufferUsages::empty(),
+                retained_usage,
             )
         })
     });
@@ -2242,7 +2244,7 @@ fn submit_vardct(
             storage(
                 "jxl-wgpu VarDCT upsampled frame plane",
                 source.memory.frame_upsample_bytes / 3,
-                wgpu::BufferUsages::empty(),
+                retained_usage,
             )
         })
     });

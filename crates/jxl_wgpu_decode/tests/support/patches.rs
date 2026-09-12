@@ -330,59 +330,130 @@ fn assemble_frame_sequence(bytes: &[u8], frames: &[FixtureFrame<'_>], repeat_lf:
         if index == 0 || repeat_lf {
             result.extend_from_slice(dependencies);
         }
-        let packets = frame.sections.iter().map(|section| {
-            let kind = match section.kind {
-                FrameSectionKind::Single => GroupPacketKind::Single,
-                FrameSectionKind::LowFrequencyGlobal => GroupPacketKind::DcGlobal,
-                FrameSectionKind::LowFrequencyGroup { group_index } => {
-                    GroupPacketKind::DcGroup(group_index as u32)
-                }
-                FrameSectionKind::HighFrequencyGlobal => GroupPacketKind::AcGlobal,
-                FrameSectionKind::PassGroup {
-                    pass_index,
-                    group_index,
-                } => GroupPacketKind::AcGroup {
-                    pass: pass_index as u8,
-                    group: group_index as u32,
-                },
-            };
-            let payload = if let Some(patch_values) = patch_values
-                && matches!(
-                    section.kind,
-                    FrameSectionKind::Single | FrameSectionKind::LowFrequencyGlobal
-                ) {
-                let mut prefix = dictionary(patch_values);
-                // Preserve the enclosing section's byte padding when shifting its entropy.
-                copy_bits(
-                    &mut prefix,
-                    bytes,
-                    section.bits.offset,
-                    section.bits.end().unwrap(),
-                );
-                prefix.align_to_byte().unwrap();
-                prefix.into_bytes()
-            } else {
-                bytes[section.bytes.offset as usize..section.bytes.end().unwrap() as usize].to_vec()
-            };
-            GroupPacket::new(kind, payload)
-        });
-        result.extend(
-            assemble_frame(
-                FramePacketSet::new(
-                    header(image, frame, reference, patch_values.is_some()),
-                    FrameGroupLayout::new(
-                        frame.low_frequency_group_count as u32,
-                        frame.group_count as u32,
-                        frame.num_passes as u8,
-                    )
-                    .unwrap(),
-                    packets,
-                )
-                .unwrap(),
-            )
-            .unwrap()
-            .into_bytes(),
-        );
+        result.extend(packet_frame(
+            bytes,
+            frame,
+            header(image, frame, reference, patch_values.is_some()),
+            patch_values,
+        ));
     }
     result
+}
+
+/// First decode an unchanged LF chain and save its main frame as a component reference. Then
+/// replace the LF slots with patch-bearing producers and decode the unchanged main consumer.
+pub fn assemble_lf_producers(bytes: &[u8], dictionaries: &[Option<&[u32]>]) -> Vec<u8> {
+    let parsed = jxl_gpu_bitstream::parse(bytes, Default::default()).unwrap();
+    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+    let bytes = parsed.codestream();
+    let main = inventory.frames.last().unwrap();
+    let dependencies = &inventory.frames[..inventory.frames.len() - 1];
+    assert_eq!(dependencies.len(), dictionaries.len());
+    assert!(dependencies.iter().all(|frame| frame.lf_level != 0));
+    let mut result = bytes[..main.header_bits.offset as usize / 8].to_vec();
+    result.extend(packet_frame(
+        bytes,
+        main,
+        header(&inventory.image_header, main, Some((3, true)), false),
+        None,
+    ));
+    for (frame, &values) in dependencies.iter().zip(dictionaries) {
+        let header = if values.is_some() {
+            let mut old_flags = BitWriter::new();
+            flags(&mut old_flags, frame.flags);
+            let mut writer = BitWriter::new();
+            // Non-default, frame type and encoding precede the U64 flags. Preserve every
+            // remaining header bit, including the LF level and native filter parameters.
+            let start = frame.header_bits.offset;
+            let mut reader = BitReader::new(bytes);
+            reader.skip_bits(start).unwrap();
+            assert_eq!(reader.read_bits(1).unwrap(), 0);
+            reader.skip_bits(3).unwrap();
+            let mut expected = BitReader::new(old_flags.as_bytes());
+            assert_eq!(
+                reader.read_bits(old_flags.bit_len() as u8).unwrap(),
+                expected.read_bits(old_flags.bit_len() as u8).unwrap()
+            );
+            copy_bits(&mut writer, bytes, start, start + 4);
+            flags(&mut writer, frame.flags | 2);
+            copy_bits(
+                &mut writer,
+                bytes,
+                start + 4 + old_flags.bit_len() as u64,
+                frame.header_bits.end().unwrap(),
+            );
+            BitFragment::new(writer.as_bytes().to_vec(), writer.bit_len()).unwrap()
+        } else {
+            let mut writer = BitWriter::new();
+            copy_bits(
+                &mut writer,
+                bytes,
+                frame.header_bits.offset,
+                frame.header_bits.end().unwrap(),
+            );
+            BitFragment::new(writer.as_bytes().to_vec(), writer.bit_len()).unwrap()
+        };
+        result.extend(packet_frame(bytes, frame, header, values));
+    }
+    result.extend_from_slice(&bytes[main.header_bits.offset as usize / 8..]);
+    result
+}
+
+fn packet_frame(
+    bytes: &[u8],
+    frame: &FrameInventory,
+    header: BitFragment,
+    patch_values: Option<&[u32]>,
+) -> Vec<u8> {
+    let packets = frame.sections.iter().map(|section| {
+        let kind = match section.kind {
+            FrameSectionKind::Single => GroupPacketKind::Single,
+            FrameSectionKind::LowFrequencyGlobal => GroupPacketKind::DcGlobal,
+            FrameSectionKind::LowFrequencyGroup { group_index } => {
+                GroupPacketKind::DcGroup(group_index as u32)
+            }
+            FrameSectionKind::HighFrequencyGlobal => GroupPacketKind::AcGlobal,
+            FrameSectionKind::PassGroup {
+                pass_index,
+                group_index,
+            } => GroupPacketKind::AcGroup {
+                pass: pass_index as u8,
+                group: group_index as u32,
+            },
+        };
+        let payload = if let Some(patch_values) = patch_values
+            && matches!(
+                section.kind,
+                FrameSectionKind::Single | FrameSectionKind::LowFrequencyGlobal
+            ) {
+            let mut prefix = dictionary(patch_values);
+            // Preserve the enclosing section's byte padding when shifting its entropy.
+            copy_bits(
+                &mut prefix,
+                bytes,
+                section.bits.offset,
+                section.bits.end().unwrap(),
+            );
+            prefix.align_to_byte().unwrap();
+            prefix.into_bytes()
+        } else {
+            bytes[section.bytes.offset as usize..section.bytes.end().unwrap() as usize].to_vec()
+        };
+        GroupPacket::new(kind, payload)
+    });
+    assemble_frame(
+        FramePacketSet::new(
+            header,
+            FrameGroupLayout::new(
+                frame.low_frequency_group_count as u32,
+                frame.group_count as u32,
+                frame.num_passes as u8,
+            )
+            .unwrap(),
+            packets,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .into_bytes()
 }

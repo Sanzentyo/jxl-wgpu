@@ -1,4 +1,6 @@
 use super::*;
+
+mod producer_patches;
 use jxl_wgpu::{ImageReadbackPipeline, WgpuBackend};
 
 fn fixture(name: &str) -> Arc<[u8]> {
@@ -58,30 +60,6 @@ fn data(deferred: bool) -> Vec<u8> {
 }
 
 #[test]
-fn lf_patch_flags_are_rejected_before_the_dependency_path_can_skip_rendering() {
-    let data = data(false);
-    let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
-        .unwrap()
-        .codestream_inventory(Default::default())
-        .unwrap();
-    let mut checked = 0;
-    for (index, frame) in inventory.frames.iter().enumerate() {
-        if frame.frame_type != FrameType::LowFrequency {
-            continue;
-        }
-        let mut patched = inventory.clone();
-        patched.frames[index].flags |= 2;
-        let plan = FrameExecutionPlan::negotiate(&patched).unwrap();
-        assert!(
-            matches!(validate(&patched, &plan), Err(Error::UnsupportedProfile(error))
-            if error.feature == UnsupportedCodestreamFeature::Patches)
-        );
-        checked += 1;
-    }
-    assert!(checked > 0);
-}
-
-#[test]
 fn patch_consumers_negotiate_component_surfaces_for_lf_previews() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let bytes: Arc<[u8]> = data(false).into();
@@ -137,10 +115,7 @@ fn decode(pending: &mut DependentPending) {
     let Some(Stage::Decode(mut decode)) = pending.stage.take() else {
         panic!("physical decode stage")
     };
-    if pending.nodes[pending.physical - pending.first]
-        .lf_last_use
-        .is_some()
-    {
+    if pending.needs_lf_output() {
         if let WgpuDecodePendingFrame::VarDct(producer) = decode.pending.as_mut() {
             producer.wait_until_dependency_submitted().unwrap();
         }

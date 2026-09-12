@@ -212,11 +212,11 @@ pub(super) fn selected_extra_indices(
     extras: &[jxl_gpu_bitstream::ExtraChannelInventory],
     profile: &crate::vardct_frontend::StandardVarDctProfile,
 ) -> Vec<usize> {
-    // All LF extras validate. Only an intermediate presentation retains their normalized planes.
-    if profile.lf_level != 0 && !request.retains_lf_presentation() {
+    // All LF extras validate. Patches and intermediate presentation need normalized planes too.
+    if profile.lf_level != 0 && !request.retains_lf_extras() {
         return Vec::new();
     }
-    if request.retains_frame_surface() || request.retains_lf_presentation() {
+    if request.retains_frame_surface() || request.retains_lf_extras() {
         return (0..extras.len()).collect();
     }
     request

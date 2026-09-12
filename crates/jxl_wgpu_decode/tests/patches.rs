@@ -7,6 +7,8 @@ mod fixtures;
 mod hex;
 #[path = "patches/lf.rs"]
 mod lf;
+#[path = "patches/lf_producers.rs"]
+mod lf_producers;
 #[path = "common/extra_channel_oracle.rs"]
 #[allow(dead_code)]
 mod oracle;

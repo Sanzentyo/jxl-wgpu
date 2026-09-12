@@ -17,6 +17,7 @@ use crate::{Error, GpuCodestream, Result};
 
 mod render;
 pub(super) use render::render;
+pub(super) use render::render_lf;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
@@ -68,8 +69,15 @@ impl Plan {
         let entropy = EntropyDecoderIr::parse(&mut reader, 10, MaTreeLimits::default())?;
         let token_start = reader.bit_offset();
         let token_end = section.bits.end().ok_or_else(overflow)?;
-        let max_ref = u64::from(frame.width)
-            .checked_mul(u64::from(frame.height))
+        let (mut width, mut height) = frame.color_sample_extent().ok_or_else(overflow)?;
+        if frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct {
+            // Patches address the coded, padded image before frame upsampling. Subsampled
+            // YCbCr is rejected by composition admission until its feature graph is connected.
+            width = width.div_ceil(8).checked_mul(8).ok_or_else(overflow)?;
+            height = height.div_ceil(8).checked_mul(8).ok_or_else(overflow)?;
+        }
+        let max_ref = u64::from(width)
+            .checked_mul(u64::from(height))
             .and_then(|pixels| 1024u64.checked_add(pixels / 4))
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(overflow)?;
@@ -119,7 +127,7 @@ impl Plan {
                 },
                 capacity: 0,
                 window: [0; 4],
-                image: [frame.width, frame.height, extra_count, max_ref],
+                image: [width, height, extra_count, max_ref],
                 limits: [max_positions, stride, contexts, 1],
                 references,
             },

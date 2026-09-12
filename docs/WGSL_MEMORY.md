@@ -818,9 +818,33 @@ surface, followed by inverse color conversion and presentation. No intermediate 
 or consumes the dictionary needed by later passes. Switching to final-only completion drains only
 submitted presentation work before resuming the physical producer. Patch, conversion and packing
 boundaries have cancellation, exact-reference-identity and allocation-failure coverage.
-The current path rejects LF producer patches, separate LF previews of patch consumers, frame
-upsampling, noise and subsampled YCbCr; their render-stage ordering still needs integration and
-conformance tests.
+Separate LF previews of patch consumers expand prediction components into fresh surfaces before
+applying the consumer's dictionary. These presentation copies never replace prediction planes or
+ordinary reference slots, and the dictionary remains available to later pass/final rendering.
+
+LF producers in both coding modes apply the same ordered kernel before publishing their prediction
+version. GPU copies import restored XYB and every normalized extra into an aligned planar working
+surface, preserving input offsets and padded row strides. LF reconstruction buffers carry
+`COPY_SRC`; input geometry, ranges and usage are checked before recording. Dictionary destinations
+use the reduced coded extent, including VarDCT's 8×8 padding; rendering clips to visible samples.
+
+One reservation covers two complete all-channel surfaces (working and per-occurrence snapshot),
+112 bytes per batch of at most 64 occurrences, the completion fence, three compact XYB outputs of
+`width * height * 4` bytes each, and optional preview extras. Extra outputs share a separate
+allocation with `FrameSurfaceLayout::plane_bytes`-aligned plane offsets. Import, patch rendering
+and export execute in one submission. Each retained output splits its exact permit from scratch;
+`GpuWork<ProgressiveDcOutput>` keeps all inputs, references, commands and output allocations alive
+through completion, including abandoned native/browser work. No image samples are mapped.
+
+Only completed work enters the LF predictor slot or preview queue. The slot retains XYB alone;
+preview extras have independent ownership. Final-only decoding still retains input extras needed
+for patch algebra, then releases them after rendering. Unused or overwritten LF producers validate
+and execute their features without publishing a prediction version. Dictionary/body/render
+cancellation, blocking/async final draining and allocation failure preserve committed references
+and release exact reservations. Existing patch shader layouts and binding counts are unchanged.
+
+Patch combinations with frame upsampling, noise and subsampled YCbCr still require render-stage
+integration and conformance tests.
 
 ## Alpha association at output
 

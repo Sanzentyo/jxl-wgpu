@@ -374,7 +374,7 @@ pub struct GpuOutputRequest {
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
-    lf_presentation: bool,
+    lf_extras: bool,
 }
 
 /// Association of the first alpha channel and color output. Numeric requests, including selected
@@ -517,7 +517,7 @@ impl GpuOutputRequest {
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
             frame_surface: None,
-            lf_presentation: false,
+            lf_extras: false,
         }
     }
 
@@ -576,14 +576,14 @@ impl GpuOutputRequest {
         self
     }
 
-    /// Retain normalized LF extras only while an intermediate presentation can use them.
-    pub(crate) const fn with_lf_presentation(mut self, enabled: bool) -> Self {
-        self.lf_presentation = enabled;
+    /// Retain normalized LF extras for producer features or intermediate presentation.
+    pub(crate) const fn with_lf_extras(mut self, enabled: bool) -> Self {
+        self.lf_extras = enabled;
         self
     }
 
-    pub(crate) const fn retains_lf_presentation(&self) -> bool {
-        self.lf_presentation
+    pub(crate) const fn retains_lf_extras(&self) -> bool {
+        self.lf_extras
     }
 
     pub(crate) const fn retains_frame_surface(&self) -> bool {

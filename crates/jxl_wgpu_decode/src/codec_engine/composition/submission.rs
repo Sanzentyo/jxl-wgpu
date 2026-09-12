@@ -123,15 +123,18 @@ pub(super) fn submit(backend: &WgpuBackend, request: Submission<'_>) -> Result<G
 }
 
 /// Completes a recorded render chain with the same accounted lifetime as frame composition.
-pub(super) fn submit_recorded<R: wgpu::WasmNotSendSync + 'static>(
+pub(super) fn submit_recorded<
+    R: wgpu::WasmNotSendSync + 'static,
+    O: Clone + wgpu::WasmNotSendSync + 'static,
+>(
     backend: &WgpuBackend,
     encoder: wgpu::CommandEncoder,
-    output: GpuBufferLease,
+    output: O,
     inputs: Vec<GpuBufferLease>,
     resources: R,
     permit: MemoryPermit,
     poll: SubmissionPollPermit,
-) -> Result<GpuWork> {
+) -> Result<GpuWork<O>> {
     let guards = inputs
         .iter()
         .map(GpuBufferLease::try_acquire_gpu_submission)
@@ -154,8 +157,8 @@ pub(super) fn submit_recorded<R: wgpu::WasmNotSendSync + 'static>(
         fence
     };
     let lifetime = Arc::new(WorkLifetime {
-        _buffers: inputs.iter().cloned().chain([output.clone()]).collect(),
-        _resources: resources,
+        _buffers: inputs,
+        _resources: (resources, output.clone()),
         _permit: permit,
         #[cfg(target_arch = "wasm32")]
         completion_fence,
@@ -276,12 +279,12 @@ impl Completion {
 }
 
 #[derive(Debug)]
-pub(super) struct GpuWork {
-    output: Option<GpuBufferLease>,
+pub(super) struct GpuWork<O = GpuBufferLease> {
+    output: Option<O>,
     completion: Arc<Completion>,
 }
-impl GpuWork {
-    pub(super) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<GpuBufferLease>> {
+impl<O> GpuWork<O> {
+    pub(super) fn poll(&mut self, context: &Context<'_>) -> Poll<Result<O>> {
         self.completion.poll(context).map(|result| {
             result?;
             self.output.take().ok_or(Error::EngineContract(
@@ -290,12 +293,15 @@ impl GpuWork {
         })
     }
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn wait(mut self) -> Result<GpuBufferLease> {
+    pub(super) fn wait(mut self) -> Result<O> {
         self.completion.wait()?;
         self.output.take().ok_or(Error::EngineContract(
             "composition completion consumed twice",
         ))
     }
+}
+
+impl GpuWork {
     pub(super) fn unvalidated(&self) -> Result<GpuBufferLease> {
         self.output.clone().ok_or(Error::EngineContract(
             "composition completion consumed twice",

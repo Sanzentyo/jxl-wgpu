@@ -649,8 +649,12 @@ Separate LF previews also retain codec components and every extra, wait for hidd
 dictionary validation, then apply patches before inverse color conversion. Queued LF output owns
 its planes independently of expired prediction slots and preserves the admitted consumer body.
 Single/nested LF fixtures cover both root codecs, native/scalar color and extra references,
-bounded delivery, cancellation, allocation failure and late entropy errors. LF producer patches,
-frame-upsampled/noisy/subsampled-YCbCr consumers and mixed coding-mode patch conformance remain open.
+bounded delivery, cancellation, allocation failure and late entropy errors. LF producer frames
+also apply patches to every reconstructed component before saving the prediction version,
+including producers overwritten before use. One GPU submission copies and patches the planes;
+prediction and preview extras retain separate allocations. Dictionary bounds use reduced coded
+geometry, including VarDCT padding. Patch combinations with frame upsampling, noise or subsampled
+YCbCr, and mixed coding-mode patch conformance remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before

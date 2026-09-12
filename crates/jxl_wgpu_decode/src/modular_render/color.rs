@@ -301,7 +301,7 @@ impl ReconstructionPlan {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
                     size,
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 })
             })

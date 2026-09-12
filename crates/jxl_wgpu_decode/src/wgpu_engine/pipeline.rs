@@ -297,7 +297,7 @@ impl WgpuSubmissionEngine {
         };
         let internal_request = GpuOutputRequest::color(format)?
             .with_max_frame_slots(request.max_frame_slots())
-            .with_lf_presentation(request.retains_lf_presentation());
+            .with_lf_extras(request.retains_lf_extras());
         self.open_profile(codestream, &internal_request, profile)
     }
 
