@@ -315,6 +315,7 @@ impl Compositor {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn import(&self, outputs: Vec<GpuImageOutput>) -> Result<Surface> {
         self.import_with_encoding(outputs, None)
     }

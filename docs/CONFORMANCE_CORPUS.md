@@ -3168,8 +3168,8 @@ reconstruction publishes references. Private GPU tests stop at submitted patch, 
 pack stages to exercise cancellation, blocking/async final-only draining and allocation failure;
 dictionary identity and all four committed reference identities must remain unchanged.
 
-Separate LF previews of patch consumers still require a component-domain preview path and are
-rejected before submission. LF producer patches, upsampled/noisy/subsampled-YCbCr consumers,
+At that checkpoint, separate LF previews of patch consumers required a component-domain preview
+path and were rejected before submission. LF producer patches, upsampled/noisy/subsampled-YCbCr consumers,
 mixed coding-mode references, spline interactions and official precision conformance remain open.
 
 The completed local regression passes 862 tests across 48 all-feature/all-target workspace targets
@@ -3179,3 +3179,61 @@ checks pass. Reference and Metal harnesses each pass 18/18 cases, the Gray8 code
 passes, and all 70 patch fixture files regenerate identically. The complete test run used one
 unchanged source snapshot; only this validation record and two documentation clarifications
 were applied afterward.
+
+### Separate LF previews with GPU patches (2026-09-12)
+
+`patches/lf/` adds eight images and eight snapshot files. Four 65×33 RGB families reuse the
+unchanged entropy of `lf_extra_channels/`: `vardct_gab0`, `modular_gab1`,
+`nested_vardct_gab1` and `nested_modular_gab1`. Each has empty and sixteen-occurrence dictionaries.
+The single-level or LF2→LF1 dependency chain precedes a hidden VarDCT reference in slot three and
+its patch-bearing consumer. This forces LF presentations to wait for a later reference and the
+GPU-validated dictionary. The nested LF2 predictor slot expires before either preview is returned.
+Both root coding modes, Gaborish, odd extents, all eight patch modes, overlapping occurrences,
+clamping and independent alpha/depth selection are exercised.
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_patches
+```
+
+The offline C helper now accepts `--xyb`, requesting native libjxl 0.12.0 scaled XYB output.
+Its affine scale/offset is inverted in f64 using the constants and mapping in
+[opsin_params.h](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/cms/opsin_params.h) and
+[stage_xyb.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/render_pipeline/stage_xyb.cc).
+This obtains codec components without an ill-conditioned RGB/cube-root round trip. Each small LF
+image preserves the producer's sample extent, restoration, extra resampling and every entropy
+section. Independent f64 mirror/5×5 expansion and patch algebra from
+[blending.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/blending.cc) and
+[alpha.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/alpha.cc) generate twelve LF
+presentations. Eight complete final images come directly from native linear output; applying the
+same scalar algebra to native full-size components matches those finals within 4.6e-7 normalized
+error, against a 2e-6 bound. Each frozen snapshot stores packed linear RGBA followed by scalar
+alpha and depth. This is an explicit LF presentation policy, not an ISO precision certification.
+
+Public tests compare linear and analytic extended-sRGB output, both extra planes, whole input and
+43-byte transport fragments with 256-byte GPU windows. The color matrix has 32 configurations;
+all delivered words match across input policies, final-only output matches the final update, and
+held images remain immutable. The maximum observed normalized color error is below 4.2e-5 and
+alpha/extra error below 8e-8. Acceptance bounds are 5e-4 for LF color, 3e-3 for final VarDCT color
+and 2e-6 for alpha/extras. These single-section streams also return a coefficient-zero image
+between LF and final delivery. libjxl cannot flush that incomplete section: its color is checked
+for finiteness, order, whole/window equality and immutability, while its already-global extras
+are compared with native final planes. No native CID color oracle is claimed for these fixtures.
+
+Private tests stop at the queued dependency, admitted body, LF expansion, patch, inverse color
+and pack boundaries. Cancellation, blocking/async final draining, intermediate delivery and
+allocation failure preserve the dictionary and committed reference identities and release exact
+reservations. A separate regression requires a later extra-channel background even when color
+can already use the implicit zero canvas. Invalid dictionaries and corrupt hidden references
+publish no LF output; corrupt terminal AC preserves previously validated LF/CID images. The
+production path still maps only dictionary/control status and performs no host image reconstruction.
+
+LF producer patches, patch consumers with frame upsampling/noise/subsampled YCbCr, mixed coding-mode
+patch references, broader LF color/precision cases and the remaining roadmap items remain open.
+
+The completed local regression passes 868 tests across 49 all-feature/all-target workspace targets
+(one existing ignored test), plus five doctests. Formatting, workspace checks, Clippy with warnings
+denied, rustdoc with warnings denied, Rust 1.89 checks and six-library wasm all-feature checks pass.
+Reference and Apple M5/Metal harnesses each pass 18/18 cases; the Gray8 codec readback passes with
+221 output bytes and no staging allocation. All 86 basic, pass-progressive and LF patch fixture
+files regenerate identically. Hashes confirm that the complete validation used one unchanged
+source snapshot; only this validation record was appended afterward.

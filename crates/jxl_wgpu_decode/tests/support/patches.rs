@@ -157,7 +157,7 @@ fn header(
     patches: bool,
 ) -> BitFragment {
     assert!(!source.have_crop && source.lf_level == 0);
-    assert!(source.flags & !0x80 == 0 && source.upsampling == 1);
+    assert!(source.flags & !0xa0 == 0 && source.upsampling == 1);
     assert!(image.animation.is_none());
     // Reference-only headers imply one pass. Multipass producers remain hidden regular frames
     // with duration zero, preserving the complete native pass schedule and entropy packets.
@@ -174,19 +174,21 @@ fn header(
     if !image.xyb_encoded {
         writer.write_bits(u64::from(source.do_ycbcr), 1).unwrap();
     }
-    if source.do_ycbcr {
+    if source.do_ycbcr && !source.uses_lf_frame() {
         for factor in source.jpeg_upsampling {
             writer.write_bits(u64::from(factor), 2).unwrap();
         }
     }
-    writer.write_bits(0, 2).unwrap();
-    for (extra, factor) in image
-        .extra_channels
-        .iter()
-        .zip(&source.extra_channel_upsampling)
-    {
-        let encoded = factor >> extra.dimension_shift;
-        writer.write_bits(u64::from(encoded.ilog2()), 2).unwrap();
+    if !source.uses_lf_frame() {
+        writer.write_bits(0, 2).unwrap();
+        for (extra, factor) in image
+            .extra_channels
+            .iter()
+            .zip(&source.extra_channel_upsampling)
+        {
+            let encoded = factor >> extra.dimension_shift;
+            writer.write_bits(u64::from(encoded.ilog2()), 2).unwrap();
+        }
     }
     if source.encoding == FrameEncoding::Modular {
         writer
@@ -290,19 +292,44 @@ pub fn assemble(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
     )
 }
 
+/// LF dependencies precede both the hidden patch reference and its visible consumer.
+pub fn assemble_shared_lf(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
+    assemble_frame_sequence(
+        bytes,
+        &[(Some((3, true)), None), (None, Some(patch_values))],
+        false,
+    )
+}
+
 pub type FixtureFrame<'a> = (Option<(u32, bool)>, Option<&'a [u32]>);
 
 /// Reuse native image entropy while exercising successive reference-slot versions. Every frame
 /// except the final presentation is hidden; an optional dictionary precedes its body.
 pub fn assemble_frames(bytes: &[u8], frames: &[FixtureFrame<'_>]) -> Vec<u8> {
+    assemble_frame_sequence(bytes, frames, true)
+}
+
+fn assemble_frame_sequence(bytes: &[u8], frames: &[FixtureFrame<'_>], repeat_lf: bool) -> Vec<u8> {
     let parsed = jxl_gpu_bitstream::parse(bytes, Default::default()).unwrap();
     let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-    assert_eq!(inventory.frames.len(), 1);
+    assert!(!inventory.frames.is_empty());
+    assert!(
+        inventory.frames[..inventory.frames.len() - 1]
+            .iter()
+            .all(|frame| frame.frame_type == jxl_gpu_bitstream::FrameType::LowFrequency)
+    );
     let image = &inventory.image_header;
-    let frame = &inventory.frames[0];
+    let frame = inventory.frames.last().unwrap();
     let bytes = parsed.codestream();
-    let mut result = bytes[..frame.header_bits.offset as usize / 8].to_vec();
-    for &(reference, patch_values) in frames {
+    let image_end = inventory.frames[0].header_bits.offset as usize / 8;
+    let dependencies = &bytes[image_end..frame.header_bits.offset as usize / 8];
+    let mut result = bytes[..image_end].to_vec();
+    for (index, &(reference, patch_values)) in frames.iter().enumerate() {
+        // LF slot identities are implicit in the stream. Copying the dependency chain before
+        // each consumer establishes a new validated version without changing its entropy.
+        if index == 0 || repeat_lf {
+            result.extend_from_slice(dependencies);
+        }
         let packets = frame.sections.iter().map(|section| {
             let kind = match section.kind {
                 FrameSectionKind::Single => GroupPacketKind::Single,

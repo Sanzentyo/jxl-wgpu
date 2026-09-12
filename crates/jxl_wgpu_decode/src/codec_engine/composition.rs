@@ -408,19 +408,8 @@ impl DependentSession {
             .map(|preview| {
                 if let Some(encodings) = &carry.source.surface_encodings {
                     let frame = &carry.source.inventory.frames[last];
-                    // LF previews are already inverse-transformed RGB, even when the complete
-                    // physical producer must retain codec components for a future patch.
-                    let encoding = if encodings[last] == FrameSurfaceEncoding::Encoded {
-                        presentation_encoding(
-                            &carry.source.inventory.image_header,
-                            &plan.nodes[last],
-                            frame,
-                        )
-                    } else {
-                        encodings[last]
-                    };
                     preview
-                        .for_surface(Extent2d::new(frame.width, frame.height), encoding)
+                        .for_surface(Extent2d::new(frame.width, frame.height), encodings[last])
                         .map(Arc::new)
                 } else {
                     Ok(Arc::clone(preview))
@@ -468,18 +457,6 @@ fn composed_source(
     plan: &FrameExecutionPlan,
 ) -> Result<(SequenceSource, Arc<Compositor>)> {
     validate(inventory, plan)?;
-    if request.progressive_output()
-        && plan.presentations.iter().any(|presentation| {
-            let frame = &inventory.frames[presentation.physical_frames.end - 1];
-            frame.flags & 2 != 0 && frame.lf_source_frame.is_some()
-        })
-    {
-        return Err(UnsupportedProfile::new(
-            UnsupportedCodestreamFeature::Patches,
-            "patch rendering of separate low-frequency previews is not yet connected",
-        )
-        .into());
-    }
     let image = &inventory.image_header;
     if inventory
         .frames
@@ -673,6 +650,7 @@ enum RefinementRender {
 #[derive(Debug)]
 enum Resume {
     Decode(PhysicalPending),
+    LfPreviews(PhysicalPending),
     Advance,
 }
 
@@ -680,6 +658,7 @@ impl Resume {
     fn stage(self) -> Stage {
         match self {
             Self::Decode(decode) => Stage::Decode(decode),
+            Self::LfPreviews(decode) => Stage::LfPreviews(decode),
             Self::Advance => Stage::Advance,
         }
     }
@@ -714,7 +693,9 @@ enum Stage {
     LfPreview {
         work: GpuWork,
         progression: FrameProgression,
+        resume: Resume,
     },
+    LfPreviews(PhysicalPending),
     Advance,
 }
 
@@ -853,21 +834,7 @@ impl DependentPending {
 
     fn advance(&mut self) -> Result<()> {
         if !self.lf_pending.is_empty() && self.lf_references_ready()? {
-            let update = self.lf_pending.pop_front().expect("nonempty LF updates");
-            let FrameProgression::LowFrequency { level, .. } = update.progression else {
-                unreachable!()
-            };
-            self.stage = Some(Stage::LfPreview {
-                work: self
-                    .lf_preview
-                    .as_ref()
-                    .expect("LF preview selected")
-                    .submit_with_extras(&update.planes.xyb, update.planes.extras.as_ref(), level)?,
-                progression: update.progression,
-            });
-            self.submissions.fetch_add(1, Ordering::AcqRel);
-            self.completed_submissions += 1;
-            return Ok(());
+            return self.start_lf_preview(Resume::Advance);
         }
         self.physical += 1;
         if self.physical >= self.end {
@@ -888,6 +855,27 @@ impl DependentPending {
         self.submissions
             .store(self.completed_submissions + count, Ordering::Release);
         self.stage = Some(stage);
+        Ok(())
+    }
+
+    fn start_lf_preview(&mut self, resume: Resume) -> Result<()> {
+        let update = self
+            .lf_pending
+            .pop_front()
+            .ok_or(Error::EngineContract("LF preview queue is empty"))?;
+        let FrameProgression::LowFrequency { level, .. } = update.progression else {
+            unreachable!()
+        };
+        self.stage = Some(Stage::LfPreview {
+            work: self
+                .lf_preview
+                .as_ref()
+                .ok_or(Error::EngineContract("LF preview renderer was lost"))?
+                .submit_with_extras(&update.planes.xyb, update.planes.extras.as_ref(), level)?,
+            progression: update.progression,
+            resume,
+        });
+        self.count_submission();
         Ok(())
     }
 
@@ -916,7 +904,20 @@ impl DependentPending {
         self.submissions
             .store(self.completed_submissions + count, Ordering::Release);
         self.patches = Some(dictionary);
-        self.stage = Some(stage);
+        self.stage = Some(
+            if self.physical + 1 == self.end && !self.lf_pending.is_empty() {
+                let Stage::Decode(decode) = stage else {
+                    return Err(Error::EngineContract(
+                        "patch body did not submit a codec producer",
+                    ));
+                };
+                // Preserve the admitted body while queued dependencies are presented. Returning an
+                // update does not eagerly admit the next preview or consume the retained dictionary.
+                Stage::LfPreviews(decode)
+            } else {
+                stage
+            },
+        );
         Ok(())
     }
 
@@ -1232,13 +1233,34 @@ impl DependentPending {
                         )));
                     }
                 }
-                Stage::LfPreview { work, progression } => {
+                Stage::LfPreviews(_) => {
+                    let Some(Stage::LfPreviews(decode)) = self.stage.take() else {
+                        unreachable!()
+                    };
+                    if self.lf_pending.is_empty() {
+                        self.stage = Some(Stage::Decode(decode));
+                    } else {
+                        if !self.lf_references_ready()? {
+                            return Poll::Ready(Err(Error::EngineContract(
+                                "patch LF preview references are not ready",
+                            )));
+                        }
+                        self.start_lf_preview(Resume::LfPreviews(decode))?;
+                    }
+                }
+                Stage::LfPreview { work, .. } => {
                     let buffer = match work.poll(context) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result?,
                     };
-                    let progression = *progression;
-                    self.stage = Some(Stage::Advance);
+                    let Some(Stage::LfPreview {
+                        progression,
+                        resume,
+                        ..
+                    }) = self.stage.take()
+                    else {
+                        unreachable!()
+                    };
                     if emit_intermediates {
                         let preview = self
                             .lf_preview
@@ -1253,25 +1275,31 @@ impl DependentPending {
                                     )?)
                                 }
                             };
-                            let surface = compositor.import(crate::frame_surface::outputs(
-                                &preview.layout,
-                                Some(surface_layout),
-                                &buffer,
-                            ))?;
-                            self.render_refinement(
+                            let surface = compositor.import_with_encoding(
+                                crate::frame_surface::outputs(
+                                    &preview.layout,
+                                    Some(surface_layout),
+                                    &buffer,
+                                ),
+                                preview.surface_encoding,
+                            )?;
+                            self.begin_refinement(
                                 compositor,
                                 surface,
                                 self.end - 1,
-                                Resume::Advance,
+                                resume,
                                 progression,
                             )?;
                         } else {
+                            self.stage = Some(resume.stage());
                             return Poll::Ready(Ok(self.update(
                                 buffer,
                                 preview.layout.clone(),
                                 progression,
                             )));
                         }
+                    } else {
+                        self.stage = Some(resume.stage());
                     }
                 }
                 Stage::Advance => self.advance()?,
@@ -1330,10 +1358,11 @@ impl DependentPending {
                     drop(work.wait()?);
                     self.stage = Some(resume.stage());
                 }
-                Stage::LfPreview { work, .. } => {
+                Stage::LfPreview { work, resume, .. } => {
                     drop(work.wait()?);
-                    self.advance()?;
+                    self.stage = Some(resume.stage());
                 }
+                Stage::LfPreviews(decode) => self.stage = Some(Stage::Decode(decode)),
                 Stage::Advance => self.advance()?,
             }
         }
@@ -1353,38 +1382,52 @@ impl DependentPending {
                 "refinement has no pending physical producer",
             ));
         };
-        if let Some(dictionary) = self
-            .patches
-            .as_ref()
-            .filter(|dictionary| dictionary.count != 0)
-        {
-            let carry = self
-                .carry
-                .as_ref()
-                .ok_or(Error::EngineContract("patch refinement carry was lost"))?;
-            let work = carry.render_patches(&surface, dictionary)?;
-            // Each refinement owns a fresh patched surface. Keep the dictionary and committed
-            // reference versions available for subsequent passes and the final reconstruction.
-            self.stage = Some(Stage::Refinement {
-                compositor: Arc::clone(self.output.compositor()?),
-                resume: Resume::Decode(decode),
-                render: RefinementRender::Patches {
-                    work,
-                    source: surface,
-                    index: self.physical,
-                },
-                progression,
-            });
-            self.count_submission();
-            return Ok(());
-        }
-        self.render_refinement(
+        self.begin_refinement(
             Arc::clone(self.output.compositor()?),
             surface,
             self.physical,
             Resume::Decode(decode),
             progression,
         )
+    }
+
+    fn begin_refinement(
+        &mut self,
+        compositor: Arc<Compositor>,
+        surface: Surface,
+        index: usize,
+        resume: Resume,
+        progression: FrameProgression,
+    ) -> Result<()> {
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("patch refinement carry was lost"))?;
+        let dictionary = if carry.source.inventory.frames[index].flags & 2 != 0 {
+            Some(self.patches.as_ref().ok_or(Error::EngineContract(
+                "patch refinement dictionary is not ready",
+            ))?)
+        } else {
+            None
+        };
+        if let Some(dictionary) = dictionary.filter(|dictionary| dictionary.count != 0) {
+            let work = carry.render_patches(&surface, dictionary)?;
+            // Each refinement owns a fresh patched surface. Keep the dictionary and committed
+            // reference versions available for subsequent passes and the final reconstruction.
+            self.stage = Some(Stage::Refinement {
+                compositor,
+                resume,
+                render: RefinementRender::Patches {
+                    work,
+                    source: surface,
+                    index,
+                },
+                progression,
+            });
+            self.count_submission();
+            return Ok(());
+        }
+        self.render_refinement(compositor, surface, index, resume, progression)
     }
 
     fn render_refinement(
@@ -1440,6 +1483,15 @@ impl DependentPending {
     /// A newly decoded LF dependency may precede hidden layers which write the presentation's
     /// background. Keep its planes until that exact reference version has completed validation.
     fn lf_references_ready(&self) -> Result<bool> {
+        let carry = self
+            .carry
+            .as_ref()
+            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
+        if carry.source.inventory.frames[self.end - 1].flags & 2 != 0
+            && (self.physical + 1 != self.end || self.patches.is_none())
+        {
+            return Ok(false);
+        }
         if matches!(*self.output, Output::Native) {
             return Ok(true);
         }
@@ -1449,16 +1501,16 @@ impl DependentPending {
         if !node.needs_composition {
             return Ok(true);
         }
-        let carry = self
-            .carry
-            .as_ref()
-            .ok_or(Error::EngineContract("dependent sequence carry was lost"))?;
-        let source = carry.source.inventory.frames[self.end - 1]
-            .color_blend
-            .source as usize;
-        Ok(node.references[source].is_none_or(|reference| {
-            reference.frame_index <= self.nodes[self.physical - self.first].frame_index
-        }))
+        let frame = &carry.source.inventory.frames[self.end - 1];
+        // Extra channels and their selected alpha may read a different, later hidden producer
+        // from the color background. Readiness must cover every reference bound by the blend.
+        Ok(std::iter::once(&frame.color_blend)
+            .chain(&frame.extra_channel_blends)
+            .all(|blend| {
+                node.references[blend.source as usize].is_none_or(|reference| {
+                    reference.frame_index <= self.nodes[self.physical - self.first].frame_index
+                })
+            }))
     }
 
     fn update(

@@ -3,7 +3,7 @@ use jxl_gpu_bitstream::{CodestreamInventory, FrameEncoding, SampleBitDepth};
 use jxl_wgpu_decode::{FrameProgression, OrientationPolicy};
 use std::num::NonZeroUsize;
 
-fn color_request(linear: bool) -> GpuOutputRequest {
+pub(super) fn color_request(linear: bool) -> GpuOutputRequest {
     let mut format = request().format().clone();
     if linear && let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = format.color_spec
     {
@@ -43,7 +43,7 @@ fn assert_progression(
     }
 }
 
-fn srgb(value: f32) -> f32 {
+pub(super) fn srgb(value: f32) -> f32 {
     let v = f64::from(value);
     (v.signum()
         * if v.abs() <= 0.0031308 {
@@ -53,7 +53,7 @@ fn srgb(value: f32) -> f32 {
         }) as f32
 }
 
-fn compare(actual: &[u32], expected: &[f32], tolerance: f32, label: &str) {
+pub(super) fn compare(actual: &[u32], expected: &[f32], tolerance: f32, label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}");
     let mut max = 0f32;
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -68,7 +68,7 @@ fn compare(actual: &[u32], expected: &[f32], tolerance: f32, label: &str) {
     eprintln!("{label}: max normalized error {max}");
 }
 
-fn drain(backend: &WgpuBackend, retained: u64) {
+pub(super) fn drain(backend: &WgpuBackend, retained: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while backend.transient_memory_budget().snapshot().reserved_bytes != retained
         && std::time::Instant::now() < deadline

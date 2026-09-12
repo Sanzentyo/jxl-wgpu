@@ -5,6 +5,8 @@ mod fixtures;
 #[allow(dead_code)]
 #[path = "../examples/support/offline/hex.rs"]
 mod hex;
+#[path = "patches/lf.rs"]
+mod lf;
 #[path = "common/extra_channel_oracle.rs"]
 #[allow(dead_code)]
 mod oracle;

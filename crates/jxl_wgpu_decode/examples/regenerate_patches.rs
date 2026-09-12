@@ -5,6 +5,7 @@ use std::process::Command;
 #[allow(dead_code)]
 #[path = "support/offline.rs"]
 mod offline;
+#[allow(dead_code)]
 #[path = "../tests/support/patches.rs"]
 mod patches;
 

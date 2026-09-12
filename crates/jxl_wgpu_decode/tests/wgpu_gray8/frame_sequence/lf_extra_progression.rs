@@ -5,80 +5,8 @@ use super::*;
 use jxl_gpu_bitstream::ImageHeaderInventory;
 use jxl_wgpu_decode::FrameProgression;
 
-fn up8(
-    input: &[f64],
-    width: usize,
-    height: usize,
-    out_w: usize,
-    out_h: usize,
-    image: &ImageHeaderInventory,
-) -> Vec<f64> {
-    let mirror = |v: i64, size: usize| {
-        let p = size as i64 * 2;
-        let v = v.rem_euclid(p);
-        v.min(p - 1 - v) as usize
-    };
-    (0..out_h)
-        .flat_map(|y| {
-            (0..out_w).map(move |x| {
-                let mut sum = 0.0;
-                let mut low = f64::INFINITY;
-                let mut high = f64::NEG_INFINITY;
-                for row in 0..5 {
-                    for col in 0..5 {
-                        let value = input[mirror((y / 8) as i64 + row - 2, height) * width
-                            + mirror((x / 8) as i64 + col - 2, width)];
-                        let phase = |p: usize, tap: i64| {
-                            p.min(7 - p) as i64 * 5 + if p < 4 { tap } else { 4 - tap }
-                        };
-                        let (a, b) = (phase(x % 8, col), phase(y % 8, row));
-                        let (i, j) = (a.min(b), a.max(b));
-                        sum += value
-                            * f64::from(
-                                image.upsampling_weights.up8[(i * (41 - i) / 2 + j - i) as usize]
-                                    .to_f32(),
-                            );
-                        low = low.min(value);
-                        high = high.max(value);
-                    }
-                }
-                sum.clamp(low, high)
-            })
-        })
-        .collect()
-}
-
-fn inverse(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut rows: [[f64; 6]; 3] = std::array::from_fn(|i| {
-        std::array::from_fn(|j| {
-            if j < 3 {
-                matrix[i][j]
-            } else {
-                f64::from(j - 3 == i)
-            }
-        })
-    });
-    for i in 0..3 {
-        let divisor = rows[i][i];
-        for value in &mut rows[i] {
-            *value /= divisor;
-        }
-        let pivot = rows[i];
-        for (k, row) in rows.iter_mut().enumerate() {
-            if k == i {
-                continue;
-            }
-            let scale = row[i];
-            for (value, pivot) in row.iter_mut().zip(pivot) {
-                *value -= scale * pivot;
-            }
-        }
-    }
-    rows.map(|row| row[3..].try_into().unwrap())
-}
-fn product(matrix: [[f64; 3]; 3], values: [f64; 3]) -> [f64; 3] {
-    matrix.map(|row| row.into_iter().zip(values).map(|(a, b)| a * b).sum())
-}
+#[path = "../../support/lf_oracle.rs"]
+mod scalar;
 
 fn expected(name: &str, level: u8, image: &ImageHeaderInventory) -> [Vec<f64>; 5] {
     let directory =
@@ -167,74 +95,20 @@ fn expected_at(
                 .all(|(a, b)| (a - b).abs() <= 2e-6)
         );
     }
-    let mut width = image.width.div_ceil(1 << (3 * level)) as usize;
-    let mut height = image.height.div_ceil(1 << (3 * level)) as usize;
-    let pixels = width * height;
-    assert_eq!(native.len(), pixels * 6);
-    let opsin = image.opsin_inverse_matrix.unwrap();
-    let matrix = opsin
-        .inverse_matrix
-        .map(|r| r.map(|v| f64::from(v.to_f32())));
-    let forward = inverse(matrix);
-    let bias = opsin.opsin_bias.map(|v| f64::from(v.to_f32()));
-    let intensity = f64::from(image.tone_mapping.intensity_target.to_f32()) / 255.0;
-    let mut planes: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::with_capacity(pixels));
-    for i in 0..pixels {
-        let lms = product(
-            forward,
-            std::array::from_fn(|c| f64::from(native[i * 4 + c])),
-        );
-        let mixed: [f64; 3] =
-            std::array::from_fn(|c| (lms[c] * intensity - bias[c]).cbrt() + bias[c].cbrt());
-        let xyb = [
-            (mixed[0] - mixed[1]) / 2.0,
-            (mixed[0] + mixed[1]) / 2.0,
-            mixed[2],
-        ];
-        for c in 0..3 {
-            planes[c].push(xyb[c]);
-        }
-        for c in 0..2 {
-            planes[3 + c].push(f64::from(native[(4 + c) * pixels + i]));
+    let divisor = 1 << (3 * level);
+    let source_extent = [
+        image.width.div_ceil(divisor),
+        image.height.div_ceil(divisor),
+    ];
+    let mut planes = scalar::Planes::from_native(&native, image, source_extent);
+    planes.expand(image, extent, level);
+    let mut planes = planes.into_linear(image);
+    for plane in &mut planes[..3] {
+        for value in plane {
+            *value = scalar::srgb(*value);
         }
     }
-    // LF prediction addresses a consumer-local rectangle at the producer's top left.
-    // Its presentation policy clips that grid before recursive expansion and composition.
-    let crop_w = extent[0].div_ceil(1 << (3 * level)) as usize;
-    let crop_h = extent[1].div_ceil(1 << (3 * level)) as usize;
-    assert!(crop_w <= width && crop_h <= height);
-    planes = planes.map(|v| {
-        v.chunks_exact(width)
-            .take(crop_h)
-            .flat_map(|row| row[..crop_w].iter().copied())
-            .collect()
-    });
-    width = crop_w;
-    height = crop_h;
-    for stage in (0..level).rev() {
-        let out_w = extent[0].div_ceil(1 << (3 * stage)) as usize;
-        let out_h = extent[1].div_ceil(1 << (3 * stage)) as usize;
-        planes = planes.map(|v| up8(&v, width, height, out_w, out_h, image));
-        width = out_w;
-        height = out_h;
-    }
-    let [x, y, b, _, _] = &mut planes;
-    for ((x, y), b) in x.iter_mut().zip(y).zip(b) {
-        let mixed = [*y + *x, *y - *x, *b];
-        let lms =
-            std::array::from_fn(|c| ((mixed[c] - bias[c].cbrt()).powi(3) + bias[c]) / intensity);
-        let rgb = product(matrix, lms).map(|value| {
-            let a = value.abs();
-            value.signum()
-                * if a <= 0.0031308 {
-                    a * 12.92
-                } else {
-                    1.055 * a.powf(1.0 / 2.4) - 0.055
-                }
-        });
-        (*x, *y, *b) = (rgb[0], rgb[1], rgb[2]);
-    }
-    planes
+    planes.try_into().ok().unwrap()
 }
 
 #[path = "lf_conformance.rs"]

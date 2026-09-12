@@ -7,6 +7,7 @@ mod offline;
 #[allow(dead_code)]
 #[path = "../tests/common/progressive_oracle.rs"]
 mod oracle;
+#[allow(dead_code)]
 #[path = "../tests/support/patches.rs"]
 mod patches;
 

@@ -645,8 +645,12 @@ original and XYB color, integer/F32 samples and straight/associated alpha under 
 fragmented input. Modular and VarDCT pass updates apply the same dictionary to fresh surfaces
 without changing saved references. Native prefix snapshots cover color and every extra channel;
 cancellation, final-only switching and staged allocation failure preserve committed versions.
-LF producer patches, separate LF previews of patch consumers, frame-upsampled/noisy/subsampled-YCbCr
-consumers and mixed coding-mode patch conformance remain open.
+Separate LF previews also retain codec components and every extra, wait for hidden references and
+dictionary validation, then apply patches before inverse color conversion. Queued LF output owns
+its planes independently of expired prediction slots and preserves the admitted consumer body.
+Single/nested LF fixtures cover both root codecs, native/scalar color and extra references,
+bounded delivery, cancellation, allocation failure and late entropy errors. LF producer patches,
+frame-upsampled/noisy/subsampled-YCbCr consumers and mixed coding-mode patch conformance remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before

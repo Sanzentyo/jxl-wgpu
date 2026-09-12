@@ -13,7 +13,7 @@ fn bytes(frame: &GpuImageFrame, backend: &WgpuBackend) -> Vec<u8> {
         .clone()
 }
 
-fn references(pending: &DependentPending) -> [Option<wgpu::Buffer>; 4] {
+pub(super) fn references(pending: &DependentPending) -> [Option<wgpu::Buffer>; 4] {
     std::array::from_fn(|i| {
         pending.carry.as_ref().unwrap().references[i]
             .as_ref()
@@ -75,7 +75,10 @@ fn next_intermediate(pending: &mut DependentPending) -> (GpuImageFrame, FramePro
     (frame.output, progression)
 }
 
-fn require_allocation_failure<T>(backend: &WgpuBackend, operation: impl FnOnce() -> Result<T>) {
+pub(super) fn require_allocation_failure<T>(
+    backend: &WgpuBackend,
+    operation: impl FnOnce() -> Result<T>,
+) {
     let memory = backend.transient_memory_budget();
     let blocker = memory
         .try_reserve(memory.snapshot().available_bytes)
@@ -368,7 +371,11 @@ fn assert_float_bytes(actual: &[u8], expected: &[u8]) {
     }
 }
 
-fn step_component_refinement(pending: &mut DependentPending, backend: &WgpuBackend, fail: bool) {
+pub(super) fn step_component_refinement(
+    pending: &mut DependentPending,
+    backend: &WgpuBackend,
+    fail: bool,
+) {
     let Some(Stage::Refinement {
         compositor,
         resume,

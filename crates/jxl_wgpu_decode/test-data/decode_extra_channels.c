@@ -3,7 +3,8 @@
  * --preview prints only the independent preview RGBA image, without extra planes.
  * cc decode_extra_channels.c $(pkg-config --cflags --libs libjxl libjxl_cms) -o /tmp/jxl-extra-oracle
  * --prefix flushes one incomplete frame at the supplied physical section boundary.
- * /tmp/jxl-extra-oracle INPUT.jxl [--preview] [--prefix] [--preserve-alpha] [--linear] [--keep-orientation] [--render-spots] > CHANNELS.f32
+ * --xyb requests libjxl's scaled XYB output for offline component-domain references.
+ * /tmp/jxl-extra-oracle INPUT.jxl [--preview] [--prefix] [--preserve-alpha] [--linear|--xyb] [--keep-orientation] [--render-spots] > CHANNELS.f32
  */
 #include <jxl/decode.h>
 #include <jxl/encode.h>
@@ -16,16 +17,18 @@
 
 int main(int argc, char** argv) {
   if (argc < 2) return 2;
-  int unpremultiply = 1, linear = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
+  int unpremultiply = 1, linear = 0, xyb = 0, keep_orientation = 0, render_spots = 0, preview = 0, prefix = 0;
   for (int i=2; i<argc; ++i) {
     if (!strcmp(argv[i], "--preserve-alpha")) unpremultiply = 0;
     else if (!strcmp(argv[i], "--linear")) linear = 1;
+    else if (!strcmp(argv[i], "--xyb")) xyb = 1;
     else if (!strcmp(argv[i], "--keep-orientation")) keep_orientation = 1;
     else if (!strcmp(argv[i], "--render-spots")) render_spots = 1;
     else if (!strcmp(argv[i], "--preview")) preview = 1;
     else if (!strcmp(argv[i], "--prefix")) prefix = 1;
     else return 2;
   }
+  if (xyb && linear) return 2;
   FILE* in = fopen(argv[1], "rb"); if (!in) return 2;
   if (fseek(in, 0, SEEK_END)) return 2;
   long length = ftell(in); if (length <= 0) return 2;
@@ -53,8 +56,14 @@ int main(int argc, char** argv) {
       extras = calloc(info.num_extra_channels ? info.num_extra_channels : 1, sizeof(*extras));
       if (!extras) return 2;
     } else if (status == JXL_DEC_COLOR_ENCODING) {
-      if (linear) {
+      if (linear || xyb) {
         JxlColorEncoding color; JxlColorEncodingSetToLinearSRGB(&color, info.num_color_channels == 1);
+        if (xyb) {
+          color.color_space = JXL_COLOR_SPACE_XYB;
+          color.transfer_function = JXL_TRANSFER_FUNCTION_GAMMA;
+          color.gamma = 1.0 / 3.0;
+          color.rendering_intent = JXL_RENDERING_INTENT_PERCEPTUAL;
+        }
         if (JxlDecoderSetOutputColorProfile(dec, &color, NULL, 0) != JXL_DEC_SUCCESS) return 3;
       }
     } else if (status == JXL_DEC_NEED_PREVIEW_OUT_BUFFER) {

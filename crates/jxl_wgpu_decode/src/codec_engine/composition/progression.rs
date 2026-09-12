@@ -26,8 +26,10 @@ mod tests;
 pub(super) struct LfPreview {
     backend: WgpuBackend,
     config: ColorOutputConfig,
+    inverse_opsin: InverseOpsin,
     pub(super) layout: ImageLayout,
     pub(super) surface: Option<crate::frame_surface::FrameSurfaceLayout>,
+    pub(super) surface_encoding: Option<crate::frame_surface::FrameSurfaceEncoding>,
     pub(super) compositor: Option<Arc<super::gpu::Compositor>>,
     extra_count: usize,
     output_plan: ColorOutputPlan,
@@ -75,6 +77,9 @@ impl LfPreview {
             .clone()
             .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Linear);
         let render_request = if canonical { &working } else { request };
+        let inverse_opsin = InverseOpsin::from_image(image).ok_or(Error::EngineContract(
+            "LF presentation has no inverse opsin metadata",
+        ))?;
         let config = ColorOutputConfig {
             extent: Extent2d::new(image.width, image.height),
             orientation: render_request.orientation_policy().resolve(
@@ -84,9 +89,7 @@ impl LfPreview {
                     },
                 )?,
             ),
-            transform: ColorOutputTransform::Xyb(InverseOpsin::from_image(image).ok_or(
-                Error::EngineContract("LF presentation has no inverse opsin metadata"),
-            )?),
+            transform: ColorOutputTransform::Xyb(inverse_opsin),
             alpha_conversion: render_request.alpha_conversion(&image.extra_channels),
         };
         let layout = ImageLayout::packed(config.output_extent(), render_request.format().clone())?;
@@ -104,9 +107,11 @@ impl LfPreview {
         )?;
         let preview = Self {
             surface: None,
+            surface_encoding: None,
             compositor,
             extra_count: image.extra_channels.len(),
             config,
+            inverse_opsin,
             layout,
             output_plan,
             output_storage_bytes: output_plan.memory.output_storage_bytes,
@@ -141,7 +146,11 @@ impl LfPreview {
             extent,
             orientation: OutputOrientation::Identity,
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
-            ..self.config
+            transform: if encoding == crate::frame_surface::FrameSurfaceEncoding::Encoded {
+                ColorOutputTransform::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
+            } else {
+                ColorOutputTransform::Xyb(self.inverse_opsin)
+            },
         };
         config.validate_layout(&surface.color)?;
         let output_plan =
@@ -150,6 +159,7 @@ impl LfPreview {
             config,
             layout: surface.color.clone(),
             surface: Some(surface.clone()),
+            surface_encoding: Some(encoding),
             output_plan,
             output_storage_bytes: surface.storage_bytes,
             ..self.clone()
