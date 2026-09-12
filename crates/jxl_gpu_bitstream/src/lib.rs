@@ -98,7 +98,9 @@ mod test_fixtures {
             .collect::<Vec<_>>();
         assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
         digits
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
             .collect()
     }

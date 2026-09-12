@@ -1,8 +1,7 @@
 //! Offline libjxl fixture generation; this example never invokes the production GPU decoder.
 //! Run `cargo run -p jxl_wgpu_decode --example regenerate_floating -- [output-directory]`.
 
-#[path = "support/offline.rs"]
-mod offline;
+use jxl_test_support::offline;
 use offline::{compile, extra_references, generate_extras, hex, run};
 use std::path::{Path, PathBuf};
 use std::process::Command;

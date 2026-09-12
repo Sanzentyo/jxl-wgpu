@@ -1,19 +1,17 @@
 use super::*;
 
-#[path = "progression/extras.rs"]
 mod extras;
-#[path = "progression/lf.rs"]
 mod lf;
-#[path = "progression/sequence.rs"]
 mod sequence;
-#[path = "progression/sequence_oracle.rs"]
 mod sequence_oracle;
 
 fn encoded(hex: &str) -> Vec<u8> {
     let compact = hex.split_whitespace().collect::<String>();
     compact
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -46,63 +44,63 @@ fn owned(frame: &jxl_wgpu::GpuImageFrame) -> jxl_wgpu::GpuImageFrame {
     }
 }
 
-use common::progressive_oracle::*;
+use jxl_test_support::oracles::progressive::*;
 
 fn direct_progressive_cases() -> Vec<(&'static str, Vec<u8>, usize)> {
     vec![
         (
             "raw_progressive",
-            common::vardct_progressive_raw_matrix(),
+            corpus::vardct_progressive_raw_matrix(),
             3,
         ),
         (
             "spectral",
-            common::vardct_progressive_spectral().to_vec(),
+            corpus::vardct_progressive_spectral().to_vec(),
             3,
         ),
         (
             "quantized",
-            common::vardct_progressive_quantized().to_vec(),
+            corpus::vardct_progressive_quantized().to_vec(),
             2,
         ),
-        ("multilf", common::vardct_progressive_multilf().to_vec(), 3),
-        ("jpeg_odd003", common::jpeg_dc_edge_case("003"), 1),
-        ("jpeg_odd321", common::jpeg_dc_edge_case("321"), 1),
-        ("jpeg_odd111", common::jpeg_dc_edge_case("111"), 1),
-        ("jpeg444", common::jpeg_transcode_444().to_vec(), 1),
-        ("jpeg422", common::jpeg_transcode_422().to_vec(), 1),
-        ("jpeg440", common::jpeg_transcode_440().to_vec(), 1),
-        ("jpeg_raw", common::jpeg_transcode_raw_matrix().to_vec(), 1),
+        ("multilf", corpus::vardct_progressive_multilf().to_vec(), 3),
+        ("jpeg_odd003", corpus::jpeg_dc_edge_case("003"), 1),
+        ("jpeg_odd321", corpus::jpeg_dc_edge_case("321"), 1),
+        ("jpeg_odd111", corpus::jpeg_dc_edge_case("111"), 1),
+        ("jpeg444", corpus::jpeg_transcode_444().to_vec(), 1),
+        ("jpeg422", corpus::jpeg_transcode_422().to_vec(), 1),
+        ("jpeg440", corpus::jpeg_transcode_440().to_vec(), 1),
+        ("jpeg_raw", corpus::jpeg_transcode_raw_matrix().to_vec(), 1),
         (
             "jpeg_raw_local",
-            common::jpeg_transcode_raw_matrix_local().to_vec(),
+            corpus::jpeg_transcode_raw_matrix_local().to_vec(),
             1,
         ),
         (
             "jpeg_raw_packets",
-            common::jpeg_transcode_raw_matrix_local_packets().to_vec(),
+            corpus::jpeg_transcode_raw_matrix_local_packets().to_vec(),
             1,
         ),
-        ("gray_progressive", common::vardct_gray("progressive"), 2),
-        ("gray_multilf", common::vardct_gray("multilf"), 3),
-        ("gray_upsample", common::vardct_gray("upsample"), 3),
+        ("gray_progressive", corpus::vardct_gray("progressive"), 2),
+        ("gray_multilf", corpus::vardct_gray("multilf"), 3),
+        ("gray_upsample", corpus::vardct_gray("upsample"), 3),
         (
             "custom_up4",
-            common::with_custom_upsampling_weights(&common::vardct_upsampling("4")),
+            corpus::with_custom_upsampling_weights(&corpus::vardct_upsampling("4")),
             3,
         ),
         (
             "custom_up8",
-            common::with_custom_upsampling_weights(&common::vardct_upsampling("8")),
+            corpus::with_custom_upsampling_weights(&corpus::vardct_upsampling("8")),
             1,
         ),
-        ("orientation6", common::vardct_orientation(6), 3),
-        ("upsample2", common::vardct_upsampling("2"), 1),
-        ("upsample4", common::vardct_upsampling("4"), 3),
-        ("upsample8", common::vardct_upsampling("8"), 1),
+        ("orientation6", corpus::vardct_orientation(6), 3),
+        ("upsample2", corpus::vardct_upsampling("2"), 1),
+        ("upsample4", corpus::vardct_upsampling("4"), 3),
+        ("upsample8", corpus::vardct_upsampling("8"), 1),
         (
             "upsample_multilf",
-            common::vardct_upsampling("2_multilf"),
+            corpus::vardct_upsampling("2_multilf"),
             1,
         ),
     ]
@@ -183,11 +181,14 @@ fn gpu_dc_and_ac_images_match_native_libjxl_flushes() {
                 let mut max_sample = (0.0_f32, 0.0_f32);
                 let mut normalized_error = 0.0_f32;
                 let mut max_code_error = 0_u32;
-                for (actual, expected) in
-                    actual.chunks_exact(4).zip(expected.pixels.chunks_exact(4))
+                for (actual, expected) in actual
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(expected.pixels.as_chunks::<4>().0.iter())
                 {
-                    let actual = f32::from_le_bytes(actual.try_into().unwrap());
-                    let expected = f32::from_le_bytes(expected.try_into().unwrap());
+                    let actual = f32::from_le_bytes(*actual);
+                    let expected = f32::from_le_bytes(*expected);
                     assert!(actual.is_finite() && expected.is_finite());
                     let difference = (linear(actual) - linear(expected)).abs();
                     if difference > max_error {
@@ -396,7 +397,7 @@ fn pass_outputs_keep_validation_local_and_admission_and_cancellation_release_the
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
-    let encoded = common::vardct_progressive_quantized();
+    let encoded = corpus::vardct_progressive_quantized();
     let inventory = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
         .unwrap()
         .codestream_inventory(InventoryLimits::default())
@@ -544,12 +545,12 @@ fn single_entry_dc_survives_deferred_hf_and_final_only_consumers_skip_updates() 
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
     for (name, encoded) in [
-        ("custom", common::vardct_upsampling("8_custom")),
-        ("thin", common::vardct_upsampling("4_thin")),
-        ("single", common::vardct_upsampling("8_single")),
-        ("gray", common::vardct_gray("single")),
-        ("gray_jpeg", common::vardct_gray("jpeg")),
-        ("oriented_jpeg", common::vardct_oriented_jpeg()),
+        ("custom", corpus::vardct_upsampling("8_custom")),
+        ("thin", corpus::vardct_upsampling("4_thin")),
+        ("single", corpus::vardct_upsampling("8_single")),
+        ("gray", corpus::vardct_gray("single")),
+        ("gray_jpeg", corpus::vardct_gray("jpeg")),
+        ("oriented_jpeg", corpus::vardct_oriented_jpeg()),
     ] {
         let mut whole = None;
         for cap in [u64::MAX, 40] {

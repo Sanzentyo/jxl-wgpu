@@ -95,7 +95,7 @@ jobs:
       - name: Install workspace MSRV
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: 1.89.0
+          toolchain: 1.98.0
 
       - name: Check optional GPU crates on MSRV
         run: cargo check --workspace --all-targets

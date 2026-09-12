@@ -279,7 +279,7 @@ fn custom_resampling_weights_reach_both_gpu_output_producers() {
         .filter(|(name, _, _, _)| !name.contains("shift"))
     {
         eprintln!("custom {name}");
-        let data = common::with_custom_upsampling_weights(&encoded(hex));
+        let data = corpus::with_custom_upsampling_weights(&encoded(hex));
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())

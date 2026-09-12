@@ -161,7 +161,11 @@ pub(super) fn prepare_presentation(
         ),
     };
     let output_config = ColorOutputConfig {
-        extent: Extent2d::new(profile.output_width, profile.output_height),
+        extent: if request.defers_frame_features() {
+            Extent2d::new(profile.width, profile.height)
+        } else {
+            Extent2d::new(profile.output_width, profile.output_height)
+        },
         orientation,
         transform: if request.retains_frame_surface()
             && request.frame_surface_encoding()

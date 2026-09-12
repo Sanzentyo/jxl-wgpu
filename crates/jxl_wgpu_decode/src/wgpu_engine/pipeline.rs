@@ -298,6 +298,11 @@ impl WgpuSubmissionEngine {
         let internal_request = GpuOutputRequest::color(format)?
             .with_max_frame_slots(request.max_frame_slots())
             .with_lf_extras(request.retains_lf_extras());
+        let internal_request = if request.defers_frame_features() {
+            internal_request.before_frame_features()
+        } else {
+            internal_request
+        };
         self.open_profile(codestream, &internal_request, profile)
     }
 
@@ -434,7 +439,15 @@ impl WgpuSubmissionEngine {
             })
             .transpose()?;
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
-        let extent = Extent2d::new(profile.output_width, profile.output_height);
+        let deferred_factor = if request.defers_frame_features() {
+            profile.channel_upsampling[0]
+        } else {
+            1
+        };
+        let extent = Extent2d::new(
+            profile.output_width.div_ceil(deferred_factor),
+            profile.output_height.div_ceil(deferred_factor),
+        );
         let mut output = OutputPlan::new(
             extent,
             profile.orientation,
@@ -458,7 +471,7 @@ impl WgpuSubmissionEngine {
             .source_channels
             .indices
             .iter()
-            .map(|&index| profile.channel_upsampling[index])
+            .map(|&index| profile.channel_upsampling[index] / deferred_factor)
             .collect();
         let color_render = request
             .extra_channel()
@@ -471,6 +484,11 @@ impl WgpuSubmissionEngine {
         {
             output.transfer = 0;
             color_render.map(crate::modular_render::ModularColorConfig::for_encoded_output)
+        } else {
+            color_render
+        };
+        let color_render = if request.defers_frame_features() {
+            color_render.map(crate::modular_render::ModularColorConfig::before_frame_features)
         } else {
             color_render
         };

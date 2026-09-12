@@ -199,10 +199,16 @@ impl std::fmt::Debug for GpuBufferSubmissionGuard {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 enum BufferAccess {
     Idle,
     GpuSubmissions(usize),
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "browser direct mapping is rejected; shared access guards still match this native-only state"
+        )
+    )]
     DirectMap,
 }
 
@@ -338,7 +344,13 @@ pub(crate) struct PackedImageOutput {
 }
 
 #[derive(Debug)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        dead_code,
+        reason = "browser synchronous readback is rejected; queued requests retain their buffer and native output metadata until release"
+    )
+)]
 pub(crate) struct ImageReadbackRequest {
     id: OutputId,
     layout: ImageLayout,

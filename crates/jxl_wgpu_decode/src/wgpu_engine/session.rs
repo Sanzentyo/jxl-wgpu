@@ -87,6 +87,15 @@ impl GpuSubmissionSession for WgpuDecodeSession {
 }
 
 impl WgpuDecodeSession {
+    pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
+        self.source
+            .as_ref()?
+            .profile
+            .color_render
+            .as_ref()?
+            .noise_parameters()
+    }
+
     #[must_use]
     pub const fn memory_stats(&self) -> WgpuDecodeMemoryStats {
         self.memory_stats

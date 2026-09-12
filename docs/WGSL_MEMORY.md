@@ -843,8 +843,33 @@ and execute their features without publishing a prediction version. Dictionary/b
 cancellation, blocking/async final draining and allocation failure preserve committed references
 and release exact reservations. Existing patch shader layouts and binding counts are unchanged.
 
-Patch combinations with frame upsampling, noise and subsampled YCbCr still require render-stage
-integration and conformance tests.
+`FrameRenderStage` distinguishes complete components from components before frame features,
+independently of `FrameSurfaceEncoding`. A patch-bearing producer stops after reconstruction,
+restoration and any early extra resampling. The common executor applies the validated dictionary,
+late color/extra upsampling and noise in that order, then stores prediction or pre-transform
+references before color conversion. The original physical inventory remains authoritative;
+producer projection removes only the patch flag and dictionary bits, retaining the noise model,
+physical seeds and upsampling metadata. The deferred plan captures bounded noise parameters
+before the producer is consumed. An all-zero model needs no noise allocation or dispatch.
+
+Feature completion writes a fresh all-channel surface. Its reservation contains exact aligned
+output storage, uploaded kernel weights, one upsample uniform per channel, the existing resident
+noise scratch/uniform bytes and the completion fence. LF completion instead retains three compact
+XYB outputs of `width * height * 4` bytes and a separate aligned extra allocation. All extras
+participate in late resampling, including final-only requests; their allocation is released after
+GPU completion unless a preview retains it. Prediction slots cannot prolong its lifetime.
+Color-factor-one frames perform independent extra expansion before patches. A patch-bearing frame
+with color upsampling requires equal extra factors; mismatches fail admission before GPU work.
+
+Pass and LF preview feature submissions never overwrite their input surfaces, dictionaries or
+committed reference versions. Final-only switching drains already submitted work before resuming
+the producer. The shared completion owner releases input leases and scratch reservations exactly
+once, before signaling success or native poll failure. A poller's retained failure callback owns
+only the empty lifetime container after successful completion; it cannot keep released bytes
+charged while the next frame is admitted. Browser completion retains its four-byte mapped fence
+until the callback, without mapping image samples.
+
+Subsampled-YCbCr patches, mixed-mode conformance and spline interactions remain open.
 
 ## Alpha association at output
 

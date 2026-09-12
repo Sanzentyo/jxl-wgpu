@@ -802,7 +802,9 @@ fn flatten_resource(resource: &VarDctResource) -> Result<ResourceLayout> {
     let afv_basis_offset = u32::try_from(vectors.len()).map_err(|_| Error::BufferSizeOverflow)?;
     vectors.extend(
         VAR_DCT_AFV_BASIS
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|values| GpuResourceVector([values[0], values[1], values[2], values[3]])),
     );
     Ok(ResourceLayout {
@@ -1842,7 +1844,7 @@ mod tests {
         for ((&transform, task), coefficient_block) in transforms
             .iter()
             .zip(&tasks)
-            .zip(coefficients.chunks_exact(384))
+            .zip(coefficients.as_chunks::<384>().0.iter())
         {
             let block = reference_block(transform, task, coefficient_block, &resource);
             let block_extent = transform.pixel_extent();
@@ -1972,7 +1974,7 @@ mod tests {
             .iter()
             .zip(&tasks)
             .zip(&origins)
-            .zip(coefficients.chunks_exact(192))
+            .zip(coefficients.as_chunks::<192>().0.iter())
         {
             let block = reference_block(transform, task, coefficient_block, &resource);
             for channel in 0..3 {
@@ -2096,7 +2098,7 @@ mod tests {
             .iter()
             .zip(&tasks)
             .zip(&origins)
-            .zip(coefficients.chunks_exact(192))
+            .zip(coefficients.as_chunks::<192>().0.iter())
         {
             let block = reference_block(transform, task, coefficient_block, &resource);
             for channel in 0..3 {

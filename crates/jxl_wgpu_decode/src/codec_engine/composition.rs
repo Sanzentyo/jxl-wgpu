@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod blend;
+mod features;
 mod gpu;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lf_tests;
@@ -39,6 +40,8 @@ mod progression;
 mod refinement_tests;
 mod spot;
 mod submission;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod test_support;
 mod transform;
 use gpu::{Compositor, Surface};
 use progression::LfPreview;
@@ -150,14 +153,20 @@ struct Carry {
 
 #[derive(Debug)]
 enum PreparedPhysical {
-    Codec(WgpuDecodeSubmissionSession),
+    Codec {
+        session: WgpuDecodeSubmissionSession,
+        features: Option<Arc<features::Plan>>,
+    },
     Patches(Box<patches::Plan>),
 }
 
 impl PreparedPhysical {
     fn submit(&mut self, source: &SequenceSource) -> Result<(Stage, usize)> {
         match self {
-            Self::Codec(producer) => {
+            Self::Codec {
+                session: producer,
+                features,
+            } => {
                 let pending = producer
                     .submit_next()?
                     .ok_or(Error::EngineContract("physical producer returned no frame"))?;
@@ -168,6 +177,7 @@ impl PreparedPhysical {
                         pending: Box::new(pending),
                         count,
                         lf: None,
+                        features: features.clone(),
                     }),
                     submissions,
                 ))
@@ -246,7 +256,6 @@ impl Carry {
             )?)));
         }
         self.prepare_codec(index, node, progressive, None)
-            .map(PreparedPhysical::Codec)
     }
 
     fn prepare_codec(
@@ -255,7 +264,7 @@ impl Carry {
         node: &crate::FrameExecutionNode,
         progressive: bool,
         patch_end: Option<u64>,
-    ) -> Result<WgpuDecodeSubmissionSession> {
+    ) -> Result<PreparedPhysical> {
         let mut session = self
             .source
             .prepare_physical_after_features(index, progressive, patch_end)?
@@ -275,7 +284,18 @@ impl Carry {
             };
             producer.set_progressive_dc_source(planes.planes.clone())?;
         }
-        Ok(session)
+        let features = (self.source.inventory.frames[index].flags & 2 != 0)
+            .then(|| {
+                features::Plan::new(
+                    &self.source.inventory.image_header,
+                    &self.source.inventory.frames[index],
+                    session.noise_parameters(),
+                    &self.source.engine.backend().device().limits(),
+                )
+            })
+            .transpose()?
+            .flatten();
+        Ok(PreparedPhysical::Codec { session, features })
     }
 }
 
@@ -408,9 +428,15 @@ impl DependentSession {
             .map(|preview| {
                 if let Some(encodings) = &carry.source.surface_encodings {
                     let frame = &carry.source.inventory.frames[last];
-                    preview
-                        .for_surface(Extent2d::new(frame.width, frame.height), encodings[last])
-                        .map(Arc::new)
+                    let extent = if frame.flags & 2 != 0 {
+                        let (width, height) = frame
+                            .color_sample_extent()
+                            .ok_or(Error::EngineContract("LF preview coded extent overflow"))?;
+                        Extent2d::new(width, height)
+                    } else {
+                        Extent2d::new(frame.width, frame.height)
+                    };
+                    preview.for_surface(extent, encodings[last]).map(Arc::new)
                 } else {
                     Ok(Arc::clone(preview))
                 }
@@ -439,6 +465,7 @@ impl DependentSession {
             physical,
             stage: Some(stage),
             patches: None,
+            features: None,
             submissions: Arc::clone(&self.submissions),
             completed_submissions: 0,
             finished: false,
@@ -551,12 +578,17 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
         .into());
     }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
-        if frame.flags & 2 != 0 && (frame.upsampling != 1 || frame.flags & 1 != 0) {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::Patches,
-                "patch rendering with frame upsampling or noise is not yet connected",
-            )
-            .into());
+        if frame.flags & 2 != 0 && frame.upsampling != 1 {
+            for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
+                if factor != frame.upsampling {
+                    return Err(Error::PatchExtraUpsampling {
+                        frame_index: frame.frame_index,
+                        channel: channel as u32,
+                        color_factor: frame.upsampling,
+                        extra_factor: factor,
+                    });
+                }
+            }
         }
         if (frame.flags & 2 != 0
             || (node.save_reference.is_some() && frame.save_before_color_transform))
@@ -622,10 +654,15 @@ struct PhysicalPending {
     pending: Box<WgpuDecodePendingFrame>,
     count: Arc<AtomicUsize>,
     lf: Option<crate::progressive_dc::ProgressiveDcOutput>,
+    features: Option<Arc<features::Plan>>,
 }
 
 #[derive(Debug)]
 enum RefinementRender {
+    Features {
+        work: GpuWork<Surface>,
+        index: usize,
+    },
     Patches {
         work: GpuWork,
         source: Surface,
@@ -667,6 +704,8 @@ struct LfUpdate {
 enum Stage {
     PatchDictionary(Box<patches::Pending>),
     LfPatchRender(GpuWork<crate::progressive_dc::ProgressiveDcOutput>),
+    LfFeatures(GpuWork<crate::progressive_dc::ProgressiveDcOutput>),
+    Features(GpuWork<Surface>),
     PatchRender {
         work: GpuWork,
         source: Surface,
@@ -705,6 +744,7 @@ pub(super) struct DependentPending {
     physical: usize,
     stage: Option<Stage>,
     patches: Option<patches::Dictionary>,
+    features: Option<(usize, Arc<features::Plan>)>,
     submissions: Arc<AtomicUsize>,
     completed_submissions: usize,
     finished: bool,
@@ -745,6 +785,7 @@ impl DependentPending {
         self.completed_submissions =
             update_count(self.completed_submissions, count, &self.submissions)?;
         let preview = self.presents_lf(emit_intermediates);
+        let retain_feature_extras = self.features_for(self.physical).is_some();
         let carry = self
             .carry
             .as_mut()
@@ -775,14 +816,14 @@ impl DependentPending {
                         &carry.references,
                         &dictionary,
                         &carry.source.inventory.image_header.extra_channels,
-                        preview,
+                        preview || retain_feature_extras,
                     )?;
                     self.stage = Some(Stage::LfPatchRender(work));
                     self.count_submission();
                     return Ok(None);
                 }
             }
-            self.record_lf(lf, emit_intermediates)?;
+            self.complete_lf_features(lf, emit_intermediates)?;
             return Ok(None);
         }
         match &*self.output {
@@ -817,6 +858,38 @@ impl DependentPending {
             }
         }
         Ok(None)
+    }
+
+    fn features_for(&self, index: usize) -> Option<&Arc<features::Plan>> {
+        self.features
+            .as_ref()
+            .filter(|(physical, _)| *physical == index)
+            .map(|(_, plan)| plan)
+    }
+
+    fn complete_lf_features(
+        &mut self,
+        lf: Option<crate::progressive_dc::ProgressiveDcOutput>,
+        emit_intermediates: bool,
+    ) -> Result<()> {
+        if let Some(plan) = self.features_for(self.physical) {
+            let carry = self
+                .carry
+                .as_ref()
+                .ok_or(Error::EngineContract("LF feature carry was lost"))?;
+            let output = lf
+                .as_ref()
+                .ok_or(Error::EngineContract("LF feature inputs were lost"))?;
+            self.stage = Some(Stage::LfFeatures(plan.render_lf(
+                carry.source.engine.backend(),
+                output,
+                self.presents_lf(emit_intermediates),
+            )?));
+            self.count_submission();
+            Ok(())
+        } else {
+            self.record_lf(lf, emit_intermediates)
+        }
     }
 
     fn presents_lf(&self, emit_intermediates: bool) -> bool {
@@ -939,12 +1012,12 @@ impl DependentPending {
             .carry
             .as_ref()
             .ok_or(Error::EngineContract("patch carry was lost"))?;
-        let mut producer = PreparedPhysical::Codec(carry.prepare_codec(
+        let mut producer = carry.prepare_codec(
             self.physical,
             &self.nodes[self.physical - self.first],
             self.physical + 1 == self.end,
             Some(dictionary.end),
-        )?);
+        )?;
         let (stage, count) = producer.submit(&carry.source)?;
         self.submissions
             .store(self.completed_submissions + count, Ordering::Release);
@@ -967,6 +1040,22 @@ impl DependentPending {
     }
 
     fn reconstructed(&mut self, surface: Surface) -> Result<()> {
+        if let Some(plan) = self.features_for(self.physical) {
+            let carry = self
+                .carry
+                .as_ref()
+                .ok_or(Error::EngineContract("frame feature carry was lost"))?;
+            self.stage = Some(Stage::Features(
+                plan.render(carry.source.engine.backend(), &surface)?,
+            ));
+            self.count_submission();
+            Ok(())
+        } else {
+            self.feature_complete(surface)
+        }
+    }
+
+    fn feature_complete(&mut self, surface: Surface) -> Result<()> {
         if surface.encoding != FrameSurfaceEncoding::Encoded {
             return self.transformed(surface);
         }
@@ -1111,7 +1200,23 @@ impl DependentPending {
                         Poll::Ready(result) => result?,
                     };
                     self.stage = None;
+                    self.complete_lf_features(Some(planes), emit_intermediates)?;
+                }
+                Stage::LfFeatures(work) => {
+                    let planes = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    self.stage = None;
                     self.record_lf(Some(planes), emit_intermediates)?;
+                }
+                Stage::Features(work) => {
+                    let surface = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    self.stage = None;
+                    self.feature_complete(surface)?;
                 }
                 Stage::PatchRender { work, source } => {
                     let buffer = match work.poll(context) {
@@ -1133,7 +1238,13 @@ impl DependentPending {
                     self.stage = None;
                     self.transformed(surface)?;
                 }
-                Stage::Decode(PhysicalPending { pending, lf, count }) => {
+                Stage::Decode(PhysicalPending {
+                    pending,
+                    lf,
+                    count,
+                    features,
+                }) => {
+                    self.features = features.clone().map(|plan| (self.physical, plan));
                     if needs_lf_output && lf.is_none() {
                         if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
                             let result = pending.poll_until_dependency_submitted(context);
@@ -1197,6 +1308,36 @@ impl DependentPending {
                     };
                     self.stage = None;
                     return Poll::Ready(self.finish(buffer).map(SubmittedGpuUpdate::Complete));
+                }
+                Stage::Refinement {
+                    render: RefinementRender::Features { work, index },
+                    ..
+                } => {
+                    let surface = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
+                    };
+                    let index = *index;
+                    let Some(Stage::Refinement {
+                        compositor,
+                        resume,
+                        progression,
+                        ..
+                    }) = self.stage.take()
+                    else {
+                        unreachable!()
+                    };
+                    if emit_intermediates {
+                        self.refinement_features_complete(
+                            compositor,
+                            surface,
+                            index,
+                            resume,
+                            progression,
+                        )?;
+                    } else {
+                        self.stage = Some(resume.stage());
+                    }
                 }
                 Stage::Refinement {
                     render:
@@ -1290,6 +1431,7 @@ impl DependentPending {
                     let Some(Stage::LfPreviews(decode)) = self.stage.take() else {
                         unreachable!()
                     };
+                    self.features = decode.features.clone().map(|plan| (self.physical, plan));
                     if self.lf_pending.is_empty() {
                         self.stage = Some(Stage::Decode(decode));
                     } else {
@@ -1374,7 +1516,11 @@ impl DependentPending {
                     let (dictionary, count) = pending.wait()?;
                     self.dictionary_decoded(dictionary, count)?;
                 }
-                Stage::LfPatchRender(work) => self.record_lf(Some(work.wait()?), false)?,
+                Stage::LfPatchRender(work) => {
+                    self.complete_lf_features(Some(work.wait()?), false)?
+                }
+                Stage::LfFeatures(work) => self.record_lf(Some(work.wait()?), false)?,
+                Stage::Features(work) => self.feature_complete(work.wait()?)?,
                 Stage::PatchRender { work, mut source } => {
                     source.buffer = work.wait()?;
                     self.reconstructed(source)?;
@@ -1387,7 +1533,9 @@ impl DependentPending {
                     mut pending,
                     count,
                     mut lf,
+                    features,
                 }) => {
+                    self.features = features.map(|plan| (self.physical, plan));
                     if needs_lf_output && lf.is_none() {
                         if let WgpuDecodePendingFrame::VarDct(pending) = pending.as_mut() {
                             pending.wait_until_dependency_submitted()?;
@@ -1405,11 +1553,13 @@ impl DependentPending {
                 Stage::Refinement { resume, render, .. } => {
                     // Final-only completion drains the render, then resumes physical execution.
                     // A blend which has not yet been packed needs no additional presentation work.
-                    let (RefinementRender::Patches { work, .. }
-                    | RefinementRender::Transform { work, .. }
-                    | RefinementRender::Blend(work)
-                    | RefinementRender::Pack(work)) = render;
-                    drop(work.wait()?);
+                    match render {
+                        RefinementRender::Features { work, .. } => drop(work.wait()?),
+                        RefinementRender::Patches { work, .. }
+                        | RefinementRender::Transform { work, .. }
+                        | RefinementRender::Blend(work)
+                        | RefinementRender::Pack(work) => drop(work.wait()?),
+                    }
                     self.stage = Some(resume.stage());
                 }
                 Stage::LfPreview { work, resume, .. } => {
@@ -1485,6 +1635,36 @@ impl DependentPending {
     }
 
     fn render_refinement(
+        &mut self,
+        compositor: Arc<Compositor>,
+        surface: Surface,
+        index: usize,
+        resume: Resume,
+        progression: FrameProgression,
+    ) -> Result<()> {
+        if surface.encoding == FrameSurfaceEncoding::Encoded
+            && let Some(plan) = self.features_for(index)
+        {
+            let carry = self
+                .carry
+                .as_ref()
+                .ok_or(Error::EngineContract("refinement feature carry was lost"))?;
+            self.stage = Some(Stage::Refinement {
+                compositor,
+                resume,
+                progression,
+                render: RefinementRender::Features {
+                    work: plan.render(carry.source.engine.backend(), &surface)?,
+                    index,
+                },
+            });
+            self.count_submission();
+            return Ok(());
+        }
+        self.refinement_features_complete(compositor, surface, index, resume, progression)
+    }
+
+    fn refinement_features_complete(
         &mut self,
         compositor: Arc<Compositor>,
         surface: Surface,

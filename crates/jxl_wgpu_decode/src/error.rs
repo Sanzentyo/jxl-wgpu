@@ -222,6 +222,8 @@ pub enum Error {
     #[error(transparent)]
     FrameUpsample(#[from] jxl_wgpu::ResidentUpsampleError),
     #[error(transparent)]
+    FrameNoise(#[from] jxl_wgpu::ResidentNoiseError),
+    #[error(transparent)]
     ModularFinalize(#[from] crate::modular_finalize::ModularFinalizeError),
     #[error(transparent)]
     ModularRender(#[from] crate::ModularRenderError),
@@ -235,6 +237,15 @@ pub enum Error {
     Backend(String),
     #[error("GPU patch dictionary validation failed with code {code}")]
     PatchDictionary { code: u32 },
+    #[error(
+        "frame {frame_index} patch extra channel {channel} upsamples by {extra_factor}, color by {color_factor}"
+    )]
+    PatchExtraUpsampling {
+        frame_index: u32,
+        channel: u32,
+        color_factor: u32,
+        extra_factor: u32,
+    },
     #[error(
         "the bounded entropy stream window is {limit_bytes} bytes, but at least {minimum_bytes} bytes are required"
     )]

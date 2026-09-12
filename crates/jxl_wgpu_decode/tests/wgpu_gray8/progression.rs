@@ -2,13 +2,10 @@
 use super::*;
 use jxl_wgpu_decode::FrameProgression;
 
-#[path = "progression_lifecycle.rs"]
 mod lifecycle;
 
-#[path = "progression_schedules.rs"]
 mod schedules;
 
-#[path = "progression_composition.rs"]
 mod composition;
 
 fn fixture(width: u32, height: u32) -> Option<Vec<u8>> {
@@ -74,7 +71,9 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
     let digits = hex.split_whitespace().collect::<String>();
     digits
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -288,9 +287,12 @@ fn modular_pass_images_match_native_prefixes_and_remain_immutable() {
                 })
                 .min()
                 .unwrap();
-            let Some(updates) =
-                common::progressive_oracle::native_updates_options(&data[..end], false, true, true)
-            else {
+            let Some(updates) = jxl_test_support::oracles::progressive::native_updates_options(
+                &data[..end],
+                false,
+                true,
+                true,
+            ) else {
                 return;
             };
             prefixes.push(updates.last().unwrap().pixels.clone());
@@ -337,13 +339,11 @@ fn modular_pass_images_match_native_prefixes_and_remain_immutable() {
                 let expected = &prefixes[usize::from(completed)];
                 assert_eq!(actual.len(), expected.len());
                 let error = actual
-                    .chunks_exact(4)
-                    .zip(expected.chunks_exact(4))
-                    .map(|(a, b)| {
-                        (f32::from_le_bytes(a.try_into().unwrap())
-                            - f32::from_le_bytes(b.try_into().unwrap()))
-                        .abs()
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(expected.as_chunks::<4>().0.iter())
+                    .map(|(a, b)| (f32::from_le_bytes(*a) - f32::from_le_bytes(*b)).abs())
                     .fold(0_f32, f32::max);
                 assert!(
                     error < 2e-6,

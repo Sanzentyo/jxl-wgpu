@@ -135,7 +135,7 @@ pub(super) fn unpack(layout: &ImageLayout, bytes: &[u8], planar: bool) -> Vec<f3
 }
 
 pub(super) fn associate(values: &mut [f32], policy: AlphaOutputPolicy, source_associated: bool) {
-    for pixel in values.chunks_exact_mut(4) {
+    for pixel in values.as_chunks_mut::<4>().0.iter_mut() {
         let alpha = pixel[3].max(1.0 / 67108864.0);
         let factor = match (policy, source_associated) {
             (AlphaOutputPolicy::Unassociated, true) => 1.0 / alpha,
@@ -149,7 +149,7 @@ pub(super) fn associate(values: &mut [f32], policy: AlphaOutputPolicy, source_as
 }
 
 pub(super) fn linearize(values: &mut [f32]) {
-    for pixel in values.chunks_exact_mut(4) {
+    for pixel in values.as_chunks_mut::<4>().0.iter_mut() {
         for value in &mut pixel[..3] {
             let magnitude = value.abs();
             *value = if magnitude <= 0.04045 {
@@ -328,8 +328,10 @@ fn verify_integer(
         let samples: Vec<u16> = if bits > 8 {
             frames[0]
                 .1
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| u16::from_le_bytes(*v))
                 .collect()
         } else {
             frames[0].1.iter().map(|v| u16::from(*v)).collect()
@@ -465,8 +467,9 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
                 .with_alpha_output_policy(policy);
                 let rgba = decode(&backend, &data, floating, false);
                 let values = oracle::floats(&rgba[0].1);
-                let planes: [Vec<f32>; 3] =
-                    std::array::from_fn(|c| values.chunks_exact(4).map(|p| p[c]).collect());
+                let planes: [Vec<f32>; 3] = std::array::from_fn(|c| {
+                    values.as_chunks::<4>().0.iter().map(|p| p[c]).collect()
+                });
                 let expected = if format.color_spec == cl {
                     p010_cl(&values, rgba[0].0.extent, &format)
                 } else {
@@ -535,7 +538,9 @@ pub(super) fn p010_cl(
         mapped.copysign(value)
     }
     let yuv: Vec<[f64; 3]> = values
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             let rgb = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
             let linear = rgb.map(|v| transfer(v, false));
@@ -699,9 +704,11 @@ fn associated_composition_keeps_reference_values_until_final_packing() {
                         let mut a = Vec::new();
                         let mut b = Vec::new();
                         for ((source, actual), expected) in original
-                            .chunks_exact(4)
-                            .zip(actual.chunks_exact(4))
-                            .zip(expected.chunks_exact(4))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(actual.as_chunks::<4>().0.iter())
+                            .zip(expected.as_chunks::<4>().0.iter())
                         {
                             if source[..3].iter().all(|v| (0.0..=1.0).contains(v)) {
                                 a.extend_from_slice(actual);

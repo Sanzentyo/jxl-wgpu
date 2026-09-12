@@ -150,12 +150,18 @@ static void conformance(const char* directory, int geometry) {
     {"shifted_thin_float", 193, 65, 1, 3, 24, 7, 32, 8, 32, 8, 0, 3, 1, 8, 3, 3, 1},
     {"signed_float", 65, 33, 3, 3, 24, 7, 16, 5, 24, 7, 0, 5, 1, 1, 0, 0, 1},
   };
+  const Case patch_cases[] = {
+    {"equal_up2", 65, 33, 1, 3, 16, 0, 16, 0, 20, 0, 1, 1, 2, 2, 0, 0, 0},
+    {"equal_up4", 65, 33, 1, 3, 16, 0, 16, 0, 20, 0, 1, 1, 4, 4, 0, 0, 0},
+    {"equal_up8", 65, 33, 1, 3, 16, 0, 16, 0, 20, 0, 1, 1, 8, 8, 0, 0, 0},
+  };
   char path[4096];
   if (snprintf(path, sizeof(path), "%s/conformance.txt", directory) >= (int)sizeof(path)) abort();
   FILE* manifest = fopen(path, "w"); if (!manifest) abort();
-  const size_t count = geometry ? sizeof(geometry_cases) / sizeof(*geometry_cases) : sizeof(cases) / sizeof(*cases);
+  const size_t count = geometry == 2 ? sizeof(patch_cases) / sizeof(*patch_cases)
+      : geometry ? sizeof(geometry_cases) / sizeof(*geometry_cases) : sizeof(cases) / sizeof(*cases);
   for (size_t i = 0; i < count; ++i) {
-    const Case* config = geometry ? &geometry_cases[i] : &cases[i];
+    const Case* config = geometry == 2 ? &patch_cases[i] : geometry ? &geometry_cases[i] : &cases[i];
     fprintf(manifest, "%s %u\n", config->name, config->levels);
     for (uint32_t level = 0; level <= config->levels; ++level) {
       uint32_t factor = 1u << (3 * level);
@@ -168,7 +174,7 @@ static void conformance(const char* directory, int geometry) {
             level == config->levels);
       }
     }
-    if (geometry) {
+    if (geometry == 1) {
       char name[4096];
       if (snprintf(name, sizeof(name), "%s_crop", config->name) >= (int)sizeof(name)) abort();
       generate_case(directory, name, config->width - 12, config->height - 8,
@@ -179,6 +185,10 @@ static void conformance(const char* directory, int geometry) {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--patch-features")) {
+    conformance(argv[1], 2);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--conformance")) {
     conformance(argv[1], 0);
     return 0;

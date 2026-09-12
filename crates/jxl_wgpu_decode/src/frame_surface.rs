@@ -6,6 +6,14 @@ use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, Sample
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region};
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
+/// A component surface can leave the producer before or after frame features. This is
+/// independent of its sample domain: saved encoded references have completed all features.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameRenderStage {
+    Complete,
+    BeforeFeatures,
+}
+
 /// The sample domain at the post-reconstruction boundary. Patch references retain codec
 /// components, frame blending uses the original encoding, and an unreferenced XYB presentation
 /// can retain linear RGB until output.

@@ -1,7 +1,6 @@
 //! Reproduce independently decoded lossy Modular color and every-plane references offline.
+use jxl_test_support::offline;
 use std::path::PathBuf;
-#[path = "support/offline.rs"]
-mod offline;
 
 fn main() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");

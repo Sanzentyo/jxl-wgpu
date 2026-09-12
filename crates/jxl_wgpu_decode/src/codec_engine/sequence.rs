@@ -111,6 +111,11 @@ impl SequenceSource {
                     && (self.request.progressive_output()
                         || self.inventory.frames[index].flags & 2 != 0),
             );
+        let request = if self.inventory.frames[index].flags & 2 != 0 {
+            request.before_frame_features()
+        } else {
+            request
+        };
         let mut projected = project_frame_inventory(&self.inventory, frame_index)?;
         if let Some(cursor) = patch_end {
             // The common GPU feature frontend owns this prefix. Keep the original inventory
@@ -163,9 +168,14 @@ impl SequenceSource {
             }
             FrameEncoding::VarDct => {
                 let request = if projected.frames[0].frame_type == FrameType::LowFrequency {
-                    GpuOutputRequest::color(crate::vardct_rgb8_format())?
+                    let lf_request = GpuOutputRequest::color(crate::vardct_rgb8_format())?
                         .with_max_frame_slots(request.max_frame_slots())
-                        .with_lf_extras(request.retains_lf_extras())
+                        .with_lf_extras(request.retains_lf_extras());
+                    if request.defers_frame_features() {
+                        lf_request.before_frame_features()
+                    } else {
+                        lf_request
+                    }
                 } else {
                     request
                 };

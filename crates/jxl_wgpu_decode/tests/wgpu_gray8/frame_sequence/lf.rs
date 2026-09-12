@@ -518,7 +518,7 @@ fn lf_root(
 
 #[test]
 fn vardct_lf_roots_and_skip_progressive_consumers_match_both_reference_decoders() {
-    let Some(original) = crate::common::cjxl_progressive_dc_codestream(2) else {
+    let Some(original) = crate::corpus::cjxl_progressive_dc_codestream(2) else {
         return;
     };
     let parsed = parse(&original, Default::default()).unwrap();
@@ -616,7 +616,7 @@ fn vardct_lf_roots_and_skip_progressive_consumers_match_both_reference_decoders(
 
 #[test]
 fn modular_lf_restoration_and_upsampling_match_both_reference_decoders() {
-    let Some(original) = crate::common::cjxl_progressive_dc_codestream(2) else {
+    let Some(original) = crate::corpus::cjxl_progressive_dc_codestream(2) else {
         return;
     };
     let Some(backend) = backend() else {

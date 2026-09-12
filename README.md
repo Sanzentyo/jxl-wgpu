@@ -24,6 +24,8 @@ not production dependencies or fallback paths.
 - `jxl_gpu_harness`: correctness, capture/replay, sequential/concurrent timing, output-path, and
   CPU-readback evidence with explicit submission, wait, logical-byte, and staging-byte counters.
   Host-thread fan-out is labelled separately from coalesced GPU batching.
+- `jxl_test_support`: unpublished development support shared by integration tests and offline
+  fixture tools, with explicit fixture, oracle and GPU transport modules.
 
 ## Execution contract
 
@@ -203,9 +205,12 @@ pass updates apply the same dictionary to fresh surfaces without changing saved 
 native prefix snapshots cover color and every extra channel. Separate LF previews of patch
 consumers apply the dictionary to fresh component surfaces before presentation. Both LF producer
 modes also apply patches before publishing prediction XYB, with independently retained preview
-extras; unused and overwritten producers still validate and execute their features. Patch
-combinations with frame upsampling/noise/subsampled YCbCr, mixed-mode patch conformance and broader
-original color domains remain pending.
+extras; unused and overwritten producers still validate and execute their features. The common
+executor applies patches before 2×/4×/8× frame upsampling and noise, then publishes LF prediction
+or pre-transform references before color conversion. Both coding modes, equal-rate and early
+extra resampling, LF previews, custom weights and reference overwrites have 140 native-reference
+fixtures. Subsampled-YCbCr patches, mixed-mode patch conformance, splines and broader original
+color domains remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular
@@ -403,10 +408,19 @@ reference-only frames use the shared GPU compositor.
 
 ## Build and validate
 
+Rust 1.98 or later is required. Earlier compiler versions are outside the supported build matrix.
+
+Shared test fixtures, GPU test transport and offline CPU oracles live in the unpublished
+[`jxl_test_support`](tools/jxl_test_support/README.md) development crate. Integration targets use
+`tests/<target>/main.rs` with ordinary child modules. The workspace denies `dead_code` and `unused`;
+necessary platform and ownership exceptions use narrow, reason-bearing `expect` attributes.
+
 ```console
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+cargo test --workspace --all-features --doc
 cargo run -p jxl_gpu_harness -- verify --backend reference
 cargo run -p jxl_gpu_harness -- codec fixtures/gpu_gray8_lossless.jxl \
   --format u8 --output-target cpu-readback

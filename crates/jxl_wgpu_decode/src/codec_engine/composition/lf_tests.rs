@@ -1,35 +1,8 @@
 use super::*;
 
 mod producer_patches;
-use jxl_wgpu::{ImageReadbackPipeline, WgpuBackend};
-
-fn fixture(name: &str) -> Arc<[u8]> {
-    std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("test-data/{name}.jxl.hex")),
-    )
-    .unwrap()
-    .split_whitespace()
-    .collect::<String>()
-    .as_bytes()
-    .chunks_exact(2)
-    .map(|v| u8::from_str_radix(std::str::from_utf8(v).unwrap(), 16).unwrap())
-    .collect::<Vec<_>>()
-    .into()
-}
-
-fn drain(backend: &WgpuBackend) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while backend.transient_memory_budget().snapshot().reserved_bytes != 0
-        && std::time::Instant::now() < deadline
-    {
-        backend.device().poll(wgpu::PollType::Poll).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    assert_eq!(
-        backend.transient_memory_budget().snapshot().reserved_bytes,
-        0
-    );
-}
+use super::test_support::{drain, fixture, read};
+use jxl_wgpu::WgpuBackend;
 
 fn data(deferred: bool) -> Vec<u8> {
     let text = include_str!("../../../test-data/composition_vardct_dc.jxl.hex")
@@ -37,7 +10,9 @@ fn data(deferred: bool) -> Vec<u8> {
         .collect::<String>();
     let data: Vec<_> = text
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
         .collect();
     if !deferred {
@@ -97,18 +72,6 @@ fn patch_consumers_negotiate_component_surfaces_for_lf_previews() {
         backend.transient_memory_budget().snapshot().reserved_bytes,
         0
     );
-}
-
-fn read(backend: &WgpuBackend, frame: &GpuImageFrame) -> Vec<u8> {
-    ImageReadbackPipeline::new(backend)
-        .submit(frame)
-        .unwrap()
-        .wait()
-        .unwrap()
-        .frame
-        .outputs[0]
-        .bytes
-        .clone()
 }
 
 fn decode(pending: &mut DependentPending) {
@@ -320,7 +283,9 @@ fn lf_extra_queued_render_blend_and_pack_stages_release_exact_reservations() {
             .collect::<String>();
             let data = text
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|v| u8::from_str_radix(std::str::from_utf8(v).unwrap(), 16).unwrap())
                 .collect::<Vec<_>>();
             let inventory = jxl_gpu_bitstream::parse(&data, Default::default())

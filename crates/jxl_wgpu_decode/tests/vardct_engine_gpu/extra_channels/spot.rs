@@ -1,7 +1,6 @@
 use super::*;
 use jxl_wgpu_decode::AlphaOutputPolicy;
 
-#[path = "spot_output.rs"]
 mod output;
 
 fn cases() -> [(&'static str, &'static str); 11] {
@@ -196,7 +195,7 @@ fn formula(
         } = extra.channel_type
         {
             let ink = [red.to_f32(), green.to_f32(), blue.to_f32()];
-            for (pixel, output) in color.chunks_exact_mut(4).enumerate() {
+            for (pixel, output) in color.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let mix = solidity.to_f32() * planes[pixels * (4 + index) + pixel];
                 for (output, ink) in output[..3].iter_mut().zip(ink) {
                     *output = mix * ink + (1.0 - mix) * *output;
@@ -208,7 +207,7 @@ fn formula(
         associated::linearize(&mut color);
     }
     if !linear && image.xyb_encoded {
-        for pixel in color.chunks_exact_mut(4) {
+        for pixel in color.as_chunks_mut::<4>().0.iter_mut() {
             for c in &mut pixel[..3] {
                 let value = c.abs();
                 *c = if value <= 0.0031308 {
@@ -269,7 +268,12 @@ fn multiple_spots_preserve_declaration_order_extended_values_and_alpha_policy() 
                     let mut actual = associated::unpack(&whole[0].0, &whole[0].1, keep);
                     if associated && policy == AlphaOutputPolicy::Unassociated {
                         // Measure reconstruction before near-zero alpha magnifies the error.
-                        for (a, b) in actual.chunks_exact_mut(4).zip(expected.chunks_exact_mut(4)) {
+                        for (a, b) in actual
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .zip(expected.as_chunks_mut::<4>().0.iter_mut())
+                        {
                             let scale = b[3].max(1.0 / 67108864.0);
                             for c in 0..3 {
                                 a[c] *= scale;

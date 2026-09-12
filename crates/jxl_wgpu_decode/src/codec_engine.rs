@@ -246,6 +246,14 @@ pub enum WgpuDecodeSubmissionSession {
 }
 
 impl WgpuDecodeSubmissionSession {
+    pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
+        match self {
+            Self::Modular(session) => session.noise_parameters(),
+            Self::VarDct(session) => session.noise_parameters(),
+            Self::Sequence(_) => None,
+        }
+    }
+
     #[must_use]
     pub const fn modular(&self) -> Option<&WgpuDecodeSession> {
         match self {

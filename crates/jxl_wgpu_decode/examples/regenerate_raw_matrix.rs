@@ -17,8 +17,7 @@ use jxl_oxide_common::Bundle;
 use jxl_vardct::{HfMetadata, HfMetadataParams, LfCoeff, LfCoeffParams};
 use jxl_wgpu_decode::vardct::frontend::LfGlobalPrefix;
 
-#[path = "support/offline/hex.rs"]
-mod offline;
+use jxl_test_support::offline::hex as offline;
 
 fn copy_bits(writer: &mut BitWriter, bytes: &[u8], range: Range<u64>) {
     let mut reader = BitReader::new(bytes);

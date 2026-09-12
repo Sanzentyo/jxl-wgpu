@@ -5,11 +5,8 @@ use std::process::Command;
 use jxl_gpu_bitstream::{BitReader, BitWriter};
 use jxl_oxide_common::Bundle;
 
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[path = "../tests/support/jpeg_sampling.rs"]
-mod sampling;
+use jxl_test_support::fixtures::jpeg_sampling as sampling;
+use jxl_test_support::offline;
 
 fn crop_aligned(data: &[u8]) -> Vec<u8> {
     let original = jxl_gpu_bitstream::parse(data, Default::default())

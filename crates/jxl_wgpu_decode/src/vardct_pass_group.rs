@@ -887,5 +887,4 @@ mod tests {
 mod gpu_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[path = "vardct_pass_group/tests.rs"]
 mod continuation_tests;

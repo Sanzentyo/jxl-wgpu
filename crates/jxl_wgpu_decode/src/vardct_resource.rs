@@ -176,7 +176,7 @@ impl VarDctResourceLayout {
         }
         for (destination, basis) in values[self.afv_basis_offset as usize..]
             .iter_mut()
-            .zip(VAR_DCT_AFV_BASIS.chunks_exact(4))
+            .zip(VAR_DCT_AFV_BASIS.as_chunks::<4>().0.iter())
         {
             destination.copy_from_slice(basis);
         }

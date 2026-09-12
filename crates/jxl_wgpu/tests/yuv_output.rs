@@ -483,11 +483,13 @@ fn floating_rgb_output_preserves_extended_values_and_color_conversion() {
                 assert_eq!(actual.layout, expected.layout);
                 for (actual, expected) in actual
                     .bytes
-                    .chunks_exact(4)
-                    .zip(expected.bytes.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(expected.bytes.as_chunks::<4>().0.iter())
                 {
-                    let actual = f32::from_le_bytes(actual.try_into().unwrap());
-                    let expected = f32::from_le_bytes(expected.try_into().unwrap());
+                    let actual = f32::from_le_bytes(*actual);
+                    let expected = f32::from_le_bytes(*expected);
                     if transfer == TransferFunction::Linear {
                         assert_eq!(
                             actual.to_bits(),
@@ -519,8 +521,8 @@ fn floating_rgb_output_preserves_extended_values_and_color_conversion() {
             samples,
         )
         .unwrap();
-        for (actual, expected) in bytes.chunks_exact(4).zip(expected) {
-            let actual = f32::from_le_bytes(actual.try_into().unwrap());
+        for (actual, expected) in bytes.as_chunks::<4>().0.iter().zip(expected) {
+            let actual = f32::from_le_bytes(*actual);
             assert!(
                 (actual - expected).abs() < 2e-6,
                 "float primary transform {space:?}: {actual} != {expected}"

@@ -2,12 +2,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[allow(dead_code)]
-#[path = "../tests/support/preview.rs"]
-mod preview;
+use jxl_test_support::fixtures::preview;
+use jxl_test_support::offline;
 
 fn source(root: &Path, name: &str) -> Vec<u8> {
     offline::unhex(&std::fs::read_to_string(root.join(format!("{name}.jxl.hex"))).unwrap())

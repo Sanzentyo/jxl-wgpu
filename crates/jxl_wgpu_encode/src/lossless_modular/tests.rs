@@ -98,7 +98,9 @@ mod native_tests {
             .collect::<Vec<_>>();
         assert_eq!(digits.len() % 2, 0, "fixture hex must contain whole bytes");
         digits
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
             .collect()
     }
@@ -1320,7 +1322,9 @@ mod native_tests {
             bytes.into_iter().map(u16::from).collect()
         } else {
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
                 .collect()
         };
@@ -1429,7 +1433,9 @@ mod native_tests {
             pixels.iter().copied().map(u16::from).collect()
         } else {
             pixels
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|sample| u16::from_be_bytes([sample[0], sample[1]]))
                 .collect()
         })

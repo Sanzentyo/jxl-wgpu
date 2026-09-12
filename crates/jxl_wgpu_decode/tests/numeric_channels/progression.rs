@@ -1,8 +1,8 @@
 use super::*;
 use std::num::NonZeroUsize;
 
-use common::progressive_oracle::native_updates_with_spots;
 use jxl_gpu_bitstream::FrameSectionKind;
+use jxl_test_support::oracles::progressive::native_updates_with_spots;
 use jxl_wgpu_decode::{OrientationPolicy, PrefetchBackpressure, VarDctDecodeError};
 
 fn request(depth: SampleBitDepth, channel: u32) -> GpuOutputRequest {
@@ -44,8 +44,10 @@ fn native_stages(
                 .last()
                 .unwrap()
                 .pixels
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect(),
         );
     }
@@ -55,8 +57,10 @@ fn native_stages(
             .last()
             .unwrap()
             .pixels
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect(),
     );
     Some(stages)
@@ -100,7 +104,7 @@ fn numeric_color_refinements_match_native_prefixes_and_final_only_delivery() {
                     let reference = &expected[stage];
                     assert_eq!(actual.len() * 4, reference.len());
                     let mut max = 0_f32;
-                    for (&actual, pixel) in actual.iter().zip(reference.chunks_exact(4)) {
+                    for (&actual, pixel) in actual.iter().zip(reference.as_chunks::<4>().0.iter()) {
                         let actual = f32::from_bits(actual);
                         let reference = f32::from_bits(pixel[channel as usize]);
                         assert!(actual.is_finite() && reference.is_finite());
@@ -318,14 +322,14 @@ fn cropped_lf_numeric_previews_select_original_color_after_reference_composition
                 assert_eq!(update.metadata, *metadata);
                 let actual = read(&backend, &update.output().outputs[0]);
                 assert_eq!(actual.len() * 4, rgb.len());
-                for (&word, pixel) in actual.iter().zip(rgb.chunks_exact(4)) {
+                for (&word, pixel) in actual.iter().zip(rgb.as_chunks::<4>().0.iter()) {
                     let actual = f32::from_bits(word);
                     let expected = f32::from_bits(pixel[channel as usize]);
                     assert!(actual.is_finite() && expected.is_finite());
                     assert!((actual - expected).abs() / expected.abs().max(1.0) < 5e-6);
                 }
                 if update.is_complete() {
-                    for (&word, pixel) in actual.iter().zip(reference.chunks_exact(4)) {
+                    for (&word, pixel) in actual.iter().zip(reference.as_chunks::<4>().0.iter()) {
                         let expected = pixel[channel as usize];
                         assert!(expected.is_finite());
                         assert!(

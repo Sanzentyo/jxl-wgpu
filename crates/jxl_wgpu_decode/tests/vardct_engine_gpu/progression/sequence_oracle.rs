@@ -4,7 +4,7 @@
 use super::*;
 use jxl_gpu_bitstream::{CodestreamInventory, FrameBlendMode, FrameType};
 
-pub(super) use common::progressive_layers as layers;
+pub(super) use jxl_test_support::fixtures::progressive_layers as layers;
 
 pub(super) fn present(pixels: &[f64], width: usize, height: usize, orientation: u32) -> Vec<u8> {
     let mut output = vec![0; pixels.len() * 4];
@@ -87,7 +87,9 @@ fn lf1_pixels(data: &[u8]) -> Vec<u8> {
             .unwrap()
     );
     pixels
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .flat_map(|rgb| rgb.iter().copied().chain(1_f32.to_le_bytes()))
         .collect()
 }
@@ -190,8 +192,10 @@ pub(super) fn composed_with_lf(
                     );
                     let oracle: Vec<_> = oracle
                         .pixels
-                        .chunks_exact(4)
-                        .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f64::from(f32::from_le_bytes(*b)))
                         .collect();
                     let error = sequence::relative_error(
                         &present(&composed, width, height, 1),

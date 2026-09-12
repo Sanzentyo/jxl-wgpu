@@ -804,6 +804,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fb521e862fff1898373196c7c884f563210d2dba066d5dc08f36fc6cab35f17"
 
 [[package]]
+name = "jxl_test_support"
+version = "0.1.0"
+dependencies = [
+ "jxl",
+ "jxl-bitstream",
+ "jxl-image",
+ "jxl-oxide-common",
+ "jxl_gpu_bitstream",
+ "jxl_gpu_formats",
+ "jxl_gpu_protocol",
+ "jxl_wgpu",
+ "jxl_wgpu_decode",
+ "jxl_wgpu_encode",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "jxl_transforms"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +866,7 @@ dependencies = [
  "jxl_gpu_bitstream",
  "jxl_gpu_formats",
  "jxl_gpu_protocol",
+ "jxl_test_support",
  "jxl_wgpu",
  "jxl_wgpu_encode",
  "naga",

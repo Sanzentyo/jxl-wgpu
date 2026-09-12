@@ -18,7 +18,6 @@ use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, GpuOutputRequest, Result};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[path = "gpu_tests.rs"]
 mod tests;
 
 /// Unrounded RGB in an explicit domain, followed by independently normalized extra planes.

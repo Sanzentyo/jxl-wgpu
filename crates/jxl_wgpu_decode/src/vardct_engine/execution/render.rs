@@ -286,8 +286,8 @@ pub(super) fn encode_frame_render(
                 // requires expanded components or a zero noise model elides that expansion.
                 *channel_shifts = presentation_shifts;
             }
-            let output_width = source.packet.profile.output_width;
-            let output_height = source.packet.profile.output_height;
+            let output_width = config.extent.width;
+            let output_height = config.extent.height;
             let presentation_stride = if frame_upsample_planes.is_some() {
                 output_width
             } else {
@@ -386,8 +386,8 @@ pub(super) fn encode_frame_render(
                 },
             )?;
             debug_assert_eq!(output_scratch.plan, plan);
-            // An LF slot contains the complete pre-color-transform image, including restoration
-            // and frame upsampling. Retain only these final allocations after validation.
+            // The frame executor completes deferred features before publishing an LF slot.
+            // Retain only the allocations at the requested reconstruction boundary.
             let lf_output = if source.packet.profile.lf_level != 0 {
                 let mut tracked = |buffer: &wgpu::Buffer| {
                     let permit = transient_permit

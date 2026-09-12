@@ -145,7 +145,9 @@ fn multiply_clamps_foreground_and_retains_extended_reference_values() {
     while let Some(frame) = session.next_frame().unwrap() {
         let data = read_output(&backend, &frame.output().outputs[0]);
         let gray = data
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|p| f32::from_le_bytes(p[..4].try_into().unwrap()))
             .collect::<Vec<_>>();
         if let Some(djxl) = &djxl {

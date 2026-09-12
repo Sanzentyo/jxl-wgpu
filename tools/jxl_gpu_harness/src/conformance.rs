@@ -516,7 +516,11 @@ impl<'a> LazyImage<'a> {
                     .write_all(row.active())
                     .map_err(|source| Error::io("<generated PNM>", source))?;
             } else {
-                for sample in row.bytes[..row.active_len].chunks_exact_mut(2) {
+                for sample in row.bytes[..row.active_len]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                {
                     sample.swap(0, 1);
                 }
                 writer
@@ -1617,7 +1621,7 @@ fn read_pnm_pixel_hash(
         if sample_bytes == 1 {
             hasher.update(&row);
         } else {
-            for sample in row.chunks_exact(2) {
+            for sample in row.as_chunks::<2>().0.iter() {
                 hasher.update(&[sample[1], sample[0]]);
             }
         }

@@ -3,9 +3,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use jxl_test_support::fixtures::progressive_layers;
 use progressive_layers::hex;
-#[path = "../tests/common/progressive_layers.rs"]
-mod progressive_layers;
 
 fn run(command: &mut Command) -> Vec<u8> {
     let result = command.output().unwrap();

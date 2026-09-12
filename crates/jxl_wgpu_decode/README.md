@@ -96,13 +96,13 @@ The budget counts logical retained ranges, not allocator capacity or unrelated b
 caller allocation. `IncrementalInputBudget::with_limits` bounds both bytes and span count;
 `new` defaults to 1,048,576 spans. Either admission failure leaves its input event retryable.
 
-`tests/preview.rs` checks 48 reproducible streams against native libjxl's preview API and
+`tests/preview/main.rs` checks 48 reproducible streams against native libjxl's preview API and
 independent main-image controls, with byte-identical whole/bounded output. It includes all
 16 dimension encodings in both modes, alpha, JPEG sampling, floating samples, resampling,
 non-final preview headers, main animations and recursive LF, syntax/entropy failures,
 one-byte inventory delivery, admission retry and cancellation. All 48 streams also produce GPU
 preview before any main frame bytes arrive, then finish every main presentation with the preview
-lease still live. `tests/stream_preview.rs` audits every raw/jxlc/jxlp two-chunk split, auxiliary
+lease still live. `tests/stream_preview/main.rs` audits every raw/jxlc/jxlp two-chunk split, auxiliary
 payload preservation, prefix clipping, delayed takes, admission retry and independent source lifetimes.
 `cargo run -p jxl_wgpu_decode --example regenerate_previews` reproduces the corpus with offline
 libjxl 0.12 tools. No production CPU pixel codec or new shader ABI is introduced.
@@ -312,7 +312,7 @@ additional rounding loss from F32 multiplication; it does not recover precision 
 filtering, blending or VarDCT reconstruction. Wide-source RGB8 and other converted color formats
 use the common accounted F32 presentation surface. Non-XYB YCbCr remains an 8-bit source profile.
 
-`tests/integer_samples.rs` checks 42 exact-source fixtures and 40 libjxl rendering cases, including
+`tests/integer_samples/main.rs` checks 42 exact-source fixtures and 40 libjxl rendering cases, including
 all source precisions, large predictor residuals, real RCT/Squeeze, independently coded alpha,
 orientations, 2×/4×/8× reconstruction, progressive DC and animation. Whole and bounded fragmented
 output must agree. `cargo run -p jxl_wgpu_decode --example regenerate_integer` reproduces the corpus;
@@ -342,7 +342,7 @@ surfaces and GPU packer; lossless Modular stills select a resident source plane 
 all integer bits and floating payloads. VarDCT unsigned output clamps and rounds the reconstructed
 value once at the declared depth; it cannot recover the original lossy input.
 
-`tests/numeric_channels.rs` checks native libjxl components, direct 17/31-bit Modular codes,
+`tests/numeric_channels/main.rs` checks native libjxl components, direct 17/31-bit Modular codes,
 XYB/original-RGB/JPEG reconstruction, associated alpha, spots, resampling, progressive prefixes,
 cropped LF composition, exact final integer rounding, cancellation, corruption and admission
 retry. Whole and bounded fragmented output agree. VarDCT and composed legacy `NormalizedGray8`
@@ -371,7 +371,7 @@ alpha, spot inks, Squeeze/Palette/RCT, group distribution, orientation, resampli
 Floating VarDCT source precision describes the original image; it does not reinterpret reconstructed
 XYB coefficients or the integer Modular words used by progressive-DC dependencies.
 
-`tests/floating_samples.rs` checks all 154 precisions against independently decoded libjxl words,
+`tests/floating_samples/main.rs` checks all 154 precisions against independently decoded libjxl words,
 plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
 Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
 `cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
@@ -628,7 +628,7 @@ retain linear RGB so spot colors are applied before transfer conversion; referen
 frames retain original sRGB. All temporary color/filter/upsampling planes and uniforms participate
 in `modular_render_bytes` and the backend's shared memory reservation.
 
-`tests/lossy_modular.rs` checks 19 libjxl streams, all delivered extra planes and presentations,
+`tests/lossy_modular/main.rs` checks 19 libjxl streams, all delivered extra planes and presentations,
 whole versus 256-byte bounded fragmented input, requested RGB8/RGBA8/16-bit quantization and
 reservation release. Fifteen stills and the initial Replace presentation of four animations also
 match Rust `jxl`; subsequent reference chains use libjxl because of the documented Rust oracle's
@@ -653,8 +653,14 @@ bounded delivery, cancellation, allocation failure and late entropy errors. LF p
 also apply patches to every reconstructed component before saving the prediction version,
 including producers overwritten before use. One GPU submission copies and patches the planes;
 prediction and preview extras retain separate allocations. Dictionary bounds use reduced coded
-geometry, including VarDCT padding. Patch combinations with frame upsampling, noise or subsampled
-YCbCr, and mixed coding-mode patch conformance remain open.
+geometry, including VarDCT padding. The producer boundary distinguishes component encoding from
+completion of frame features. Patched producers defer frame upsampling and noise to the common
+executor, which applies them after patches on fresh GPU surfaces, before LF prediction or
+pre-transform reference publication. Equal-rate extras share late resampling; independently
+upsampled extras of color-factor-one frames are expanded before patches. Noise metadata and
+physical seeds survive producer projection. Native comparisons cover 140 images, including
+2×/4×/8× factors, custom weights, both LF root modes, noisy LF consumers and reference overwrites.
+Subsampled-YCbCr patches, mixed coding-mode patch conformance and spline interactions remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before
@@ -663,7 +669,7 @@ color conversion.
 projected into a producer. SplitMix64/Xorshift128Plus execute as portable WGSL u32 pairs; no CPU
 random image is uploaded. Three random F32 planes and one 96-byte uniform join the same frame
 reservation and callback lifetime. An all-zero model skips noise allocation and dispatch.
-`tests/noise.rs` covers 37 fixtures and their zero-model variants, including all four Modular
+`tests/noise/main.rs` covers 37 fixtures and their zero-model variants, including all four Modular
 group sizes, all four ordinary JPEG sampling layouts, grayscale, 2×/4×/8× upsampling, rotated
 Gray16, F32 RGB and two five-frame sequences with three presentations each. Thirty-four
 use Rust jxl and optional live libjxl F32 references. Two custom base/LF correlation fixtures use
@@ -674,15 +680,16 @@ admission retry and cancellation cleanup cover both XYB and original color, incl
 normalization allocations introduced by nonzero Modular noise. Subsampled VarDCT allocates padded
 full-resolution destinations only for shifted components before noise; output conversion derives
 its sampling geometry from those actual planes, avoiding a second interpolation. Zero models
-retain the fused component-upsampling/output path. `tests/noise_combinations.rs` adds 27 streams:
+retain the fused component-upsampling/output path. `tests/noise_combinations/main.rs` adds 27 streams:
 20 JPEG streams with Gaborish/active EPF 1–3, and seven LF chains with both root encodings,
 independent nested models, progressive AC and alpha/depth preservation. Every output is identical
 under whole and bounded fragmented delivery; cancellation checks intermediate LF ownership.
 A pinned, development-only jxl-oxide oracle and independent scalar Gaborish calculation cover
 vertical-subsampling defects in the other references. LF color uses the existing Rust sRGB and
 native sRGB/linear tolerances; scalar extras remain exact. See the conformance corpus for the
-reference selection and observed errors. Reference-only, patch/spline combinations and
-broader LF filter/resampling combinations need further coverage.
+reference selection and observed errors. The patch-feature corpus adds reference-only noise,
+overwritten reference chains and LF patch/resampling/noise combinations. Spline interactions,
+broader LF restoration cross-products and ISO precision coverage remain open.
 
 `FrameExecutionPlan` separates physical decode nodes from coalesced presentations. Nodes retain
 exact earlier LF producers and their last consumers, the four reference-slot versions before each frame, save-before/after
@@ -865,7 +872,7 @@ Adaptive LF smoothing requires equal component sampling factors. The shared fram
 rejects unequal factors with `InventoryError::SubsampledAdaptiveLfSmoothing` before the TOC,
 section delivery or GPU admission; public inventory negotiation reuses that validation. All four
 equal-selector triples remain valid 4:4:4, including nonzero selectors with additional MCU padding.
-`tests/jpeg_sampling.rs` verifies all 64 triples at both 272×32 and 257×17, with nonzero/zero noise,
+`tests/jpeg_sampling/main.rs` verifies all 64 triples at both 272×32 and 257×17, with nonzero/zero noise,
 independent native/Rust F32 references and exact whole/bounded input equality. Equal factors also
 exercise adaptive LF smoothing. Eight additional streams with nonzero LF correlation guard
 equal nonzero selectors: LF dequantization now applies correlation based on the actual channel

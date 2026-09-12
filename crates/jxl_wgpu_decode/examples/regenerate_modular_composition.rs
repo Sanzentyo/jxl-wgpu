@@ -2,10 +2,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-#[path = "../tests/common/progressive_layers.rs"]
-mod layers;
-#[path = "support/offline/process.rs"]
-mod process;
+use jxl_test_support::fixtures::progressive_layers as layers;
+use jxl_test_support::offline::process;
 
 fn main() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");

@@ -376,7 +376,7 @@ fn fixed_control_plane_accepts_nonzero_quantized_xyb_dc() {
     let mut codestream = image_header(8, 8).unwrap().bytes().to_vec();
     codestream.extend_from_slice(frame.bytes());
     let decoded = decode_rgb8(&codestream);
-    for pixel in decoded.chunks_exact(3) {
+    for pixel in decoded.as_chunks::<3>().0.iter() {
         assert!(pixel[0] > 240, "red={}", pixel[0]);
         assert!(pixel[1] < 16, "green={}", pixel[1]);
         assert!(pixel[2] < 16, "blue={}", pixel[2]);
@@ -1135,7 +1135,7 @@ fn gpu_profile_is_same_device_deterministic_and_bounded_quality() {
     let decoded_red = decode_rgb8(&red_stream);
     let red_quality = psnr(&red, &decoded_red);
     assert!(red_quality > 30.0, "solid-red PSNR={red_quality}");
-    for pixel in decoded_red.chunks_exact(3) {
+    for pixel in decoded_red.as_chunks::<3>().0.iter() {
         assert!(pixel[0] > 248);
         assert!(pixel[1] < 8);
         assert!(pixel[2] < 8);

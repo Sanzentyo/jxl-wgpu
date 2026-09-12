@@ -2,15 +2,9 @@ use super::super::refinement_tests::{references, require_allocation_failure};
 use super::*;
 use crate::progressive_dc::ProgressiveDcOutput;
 
-#[allow(dead_code)]
-#[path = "../../../../tests/support/patches.rs"]
-mod fixtures;
-#[allow(dead_code)]
-#[path = "../../../../tests/support/lf_oracle.rs"]
-mod lf_oracle;
-#[allow(dead_code)]
-#[path = "../../../../examples/support/patch_oracle.rs"]
-mod patch_oracle;
+use jxl_test_support::fixtures::patches as fixtures;
+use jxl_test_support::oracles::lf as lf_oracle;
+use jxl_test_support::oracles::patches as patch_oracle;
 
 fn open(
     backend: &WgpuBackend,
@@ -96,8 +90,10 @@ fn read_buffer(backend: &WgpuBackend, buffer: &jxl_wgpu::GpuBufferLease) -> Vec<
         changed: Default::default(),
     };
     read(backend, &frame)
-        .chunks_exact(4)
-        .map(|word| f64::from(f32::from_le_bytes(word.try_into().unwrap())))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f64::from(f32::from_le_bytes(*word)))
         .collect()
 }
 

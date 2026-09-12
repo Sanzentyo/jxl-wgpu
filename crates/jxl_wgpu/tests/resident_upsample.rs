@@ -140,8 +140,8 @@ fn strided_scalar_views_match_planar_filtering_for_all_factors_and_mirrored_edge
             let mapped = staging.slice(..).get_mapped_range().unwrap();
             let (expected, actual) = mapped.split_at(output_bytes as usize);
             assert_eq!(actual, expected, "{factor}x, {width}x{height}");
-            for value in actual.chunks_exact(4) {
-                assert!(f32::from_le_bytes(value.try_into().unwrap()).is_finite());
+            for value in actual.as_chunks::<4>().0.iter() {
+                assert!(f32::from_le_bytes(*value).is_finite());
             }
             drop(mapped);
             staging.unmap();

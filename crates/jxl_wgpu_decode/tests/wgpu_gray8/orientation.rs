@@ -66,7 +66,9 @@ impl Case {
             .filter(|byte| !byte.is_ascii_whitespace())
             .collect();
         digits
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
@@ -303,7 +305,12 @@ fn floating_rgb_normalizes_every_integer_modular_source_depth() {
             assert_eq!(actual.len(), 257 * 3 * 16);
             let maximum = ((1u32 << bits) - 1) as f32;
             let count = format.channel_count() as usize;
-            for (actual, pixel) in actual.chunks_exact(16).zip(samples.chunks_exact(count)) {
+            for (actual, pixel) in actual
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .zip(samples.chunks_exact(count))
+            {
                 for channel in 0..4 {
                     let actual = f32::from_le_bytes(
                         actual[channel * 4..channel * 4 + 4].try_into().unwrap(),
@@ -441,7 +448,9 @@ fn djxl_samples(case: &Case, encoded: &[u8]) -> Option<Vec<u16>> {
         bytes[cursor..].iter().copied().map(u16::from).collect()
     } else {
         bytes[cursor..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|sample| u16::from_be_bytes([sample[0], sample[1]]))
             .collect()
     })
@@ -458,8 +467,10 @@ fn assert_color_precision(name: &str, bytes: &[u8], expected: &[u8], layout: &Im
     );
     let maximum = if wide {
         bytes
-            .chunks_exact(2)
-            .zip(expected.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<2>().0.iter())
             .map(|(actual, expected)| {
                 u16::from_le_bytes([actual[0], actual[1]])
                     .abs_diff(u16::from_le_bytes([expected[0], expected[1]]))
@@ -530,7 +541,9 @@ fn native_modular_orientation_matches_sources_and_both_decoders() {
         if let Some(djxl) = djxl_samples(case, &encoded) {
             let color = if case.format.has_alpha() {
                 expected
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|pixel| pixel[..3].iter().copied())
                     .collect()
             } else {

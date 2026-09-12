@@ -1316,7 +1316,7 @@ The original six have a single TOC entry and their extra samples reside in the g
 then uses the same resident executor as the production raw matrix path. All extra integer planes
 equal the deterministic original codes exactly. Once normalized by each declaration's maximum,
 they agree with both Rust `jxl` 0.6.0 and optional native libjxl within `2e-7` absolute. The shared
-test-only CPU helpers are in `tests/common/extra_channel_oracle.rs`; orientation is reversed only
+test-only CPU helpers are in `tools/jxl_test_support/src/oracles/extra_channels.rs`; orientation is reversed only
 for reference lookup, while the resident planes remain in codestream coordinates.
 
 The GPU validates entropy termination and returns an absolute bit cursor without byte alignment;
@@ -1897,7 +1897,7 @@ U8 readback case passes. All 416 floating-corpus files regenerate byte-identical
 `cargo run -p jxl_wgpu_decode --example regenerate_integer -- [output-directory]`.
 The C generators are compiled offline with `-std=c11 -Wall -Wextra -Werror`; production never
 links or selects the CPU codec. Integer and floating generation now share checked subprocess,
-hex, and independent extra-plane oracle utilities in `examples/support/offline.rs`.
+hex, and independent extra-plane oracle utilities in `tools/jxl_test_support/src/offline.rs`.
 
 The 42 precision fixtures consist of 31 grayscale declarations, six independently declared
 RGB/alpha combinations, three large 31-bit predictor cases and two 29-bit RCT cases. Their source
@@ -1933,7 +1933,7 @@ the reconstructed color.
 Rendering covers two independently associated alphas, depth, selection, spot, CFA, thermal,
 black and optional planes, all five blend modes, 2×/4×/8× color and extra reconstruction, dimension
 shifts, orientation, Squeeze/distributed streams, recursive progressive DC and seven nine-layer
-animations. The shared `tests/support/rendering.rs` checks every selected extra, base RGBA, spots
+animations. The shared `tools/jxl_test_support/src/gpu/rendering.rs` checks every selected extra, base RGBA, spots
 and preserved alpha association against libjxl. Scalar/alpha tolerance is `2e-6 * (1 + abs(reference))`;
 Modular color uses `2e-5` and VarDCT color uses `0.003`, with the established inverse-alpha
 amplification adjustment. Whole and bounded fragmented outputs must be byte-identical; frame
@@ -1989,7 +1989,7 @@ XYB/original color distinction, every EPF iteration count and real multi-group S
 that filtering has a frame arena when group boundaries are crossed. Compared with EPF disabled,
 the EPF1/2/3 references change 67/130/132 color words; the corpus actually exercises the filters.
 
-`tests/lossy_modular.rs` compares every delivered extra plane, base RGBA, spot presentation and
+`tests/lossy_modular/main.rs` compares every delivered extra plane, base RGBA, spot presentation and
 preserved alpha against checked-in libjxl output. All presentations must match between complete
 input and 256-byte entropy windows supplied in 43-byte transport chunks. Color tolerance is
 `1e-4 * (1 + abs(reference))`; extras and alpha retain `2e-6`. For unpremultiplied RGB, error is
@@ -2069,7 +2069,7 @@ libjxl 0.12.0. It uses distance 2, effort 1, disabled patches/dots/progressive D
 enabled noise and photon ISO 800. Source RGB8 (or single-channel gray) samples are
 `32 + ((x * (c + 2) + y * (7 - c) + frame * 11) % 192)` for channels 0 through 2.
 The original-color corpus declares D65 sRGB and disables channel palettes except in the dedicated
-palette case. `examples/regenerate_noise.rs` also replaces the default LF-global correlation
+palette case. `examples/regenerate_noise/main.rs` also replaces the default LF-global correlation
 bundle in the original VarDCT fixture, rewrites section padding/TOC sizes, and generates two
 custom-correlation codestreams plus noisy/zero-model native linear F32 references. No image
 entropy is re-encoded by that header rewrite. The driver also transcodes five deterministic
@@ -2119,7 +2119,7 @@ cargo test -p jxl_wgpu_decode --test noise --test noise_combinations -- --test-t
 cargo test -p jxl_wgpu resident_noise:: --lib -- --test-threads=1
 ```
 
-`tests/noise.rs` parses the real signaled model and also clears exactly its ten bytes to compare
+`tests/noise/main.rs` parses the real signaled model and also clears exactly its ten bytes to compare
 the same entropy with a zero model. Every noisy result must differ from its zero-model result.
 Whole input and 43-byte source chunks under a 256-byte GPU window cap must produce bit-identical
 F32 RGBA output for every presentation. For 34 cases, both variants are compared against independent
@@ -2189,7 +2189,7 @@ four linear F32 references regenerate byte-identically with libjxl 0.12.0 and cj
 
 ### LF noise and subsampled restoration
 
-`examples/support/noise_frames.rs`, called by `regenerate_noise`, adds 27 codestreams without
+`examples/regenerate_noise/noise_frames.rs`, called by `regenerate_noise`, adds 27 codestreams without
 decoding or re-encoding their image entropy. It rewrites explicit frame headers and TOC sizes,
 then reparses the result and requires every original section payload to remain byte-identical
 (after an inserted ten-byte LF noise model where applicable). Image metadata, component geometry,
@@ -2210,7 +2210,7 @@ from its corresponding unfiltered or Gaborish-only reference by more than 0.01 i
 F32 sample. Merely dispatching an identity filter cannot pass. Every stream also has a zero-noise
 control, and noise must independently change the output.
 
-`tests/noise_combinations.rs` compares the four color sampling layouts against a pinned,
+`tests/noise_combinations/main.rs` compares the four color sampling layouts against a pinned,
 development-only jxl-oxide 0.12.6 decoder, below maxAE 1e-5. For 4:4:4, 4:2:2 and gray it also
 uses Rust jxl below 1e-5. Live libjxl remains a reference at the existing 1/1024 bound for those
 layouts and for vertically subsampled EPF1/Gaborish+EPF2. Gray uses the two pixel-format oracles:
@@ -2290,7 +2290,7 @@ block grid. The generator reparses every output and checks metadata, dimensions,
 and byte-identical entropy payloads. This synthesis does not decode or encode image samples on
 the production CPU path.
 
-`tests/jpeg_sampling.rs` checks both the signaled and zeroed noise models for all 128 streams.
+`tests/jpeg_sampling/main.rs` checks both the signaled and zeroed noise models for all 128 streams.
 Each of the eight equal-factor streams also enables adaptive LF smoothing. This gives 272
 independent output comparisons against each of Rust jxl 0.6 and live native libjxl, with the
 existing bounds of 1e-5 and 1/1024 respectively. Every output must be bit-identical between whole
@@ -2399,7 +2399,7 @@ Thus the recursive fixture uses `[0,1], [0,2], [0,3], [1,0]`. Resetting the coun
 produced native linear-F32 maxAE 0.39835846; preserving it reduces that error to 0.000107646.
 LF/reference image slots remain separate between the preview and main domains.
 
-`tests/preview.rs` checks all 48 noisy/original previews and 46 zero-model controls against
+`tests/preview/main.rs` checks all 48 noisy/original previews and 46 zero-model controls against
 `JxlDecoderSetPreviewOutBuffer`/`JXL_DEC_PREVIEW_IMAGE` via the optional native C oracle.
 The 94 comparisons retain the 1/1024 F32 bound; the observed maximum is 0.000299241.
 Every signaled preview noise model must change pixels. Whole input and 43-byte transport chunks under
@@ -2452,7 +2452,7 @@ numeric-alpha/Keep-orientation versus main-color/Apply requests, full-budget bac
 cancellation before/during/after submission in both directions, and corrupt preview/main entropy
 without invalidating the other image. No host pixel codec or shader ABI change is introduced.
 
-`tests/stream_preview.rs` audits both coding modes at every two-chunk split of raw, jxlc and
+`tests/stream_preview/main.rs` audits both coding modes at every two-chunk split of raw, jxlc and
 fragmented jxlp transports with auxiliary payloads. It checks original prefix bytes and physical
 metadata, final main inventory, incomplete readiness, single successful take, engine-open retry,
 missing previews, incomplete finish and poisoned later input. Delayed takes and chunks crossing
@@ -2696,7 +2696,7 @@ generator's normal mode reproduces all 11 original composition fixtures unchange
 
 ### Composed LF dependency images
 
-`tests/vardct_engine_gpu/progression/sequence_lf.rs` uses the existing 15-physical-frame,
+`tests/vardct_engine_gpu/progression/sequence/lf.rs` uses the existing 15-physical-frame,
 nine-layer, six-presentation `composition_vardct_dc` sequence. A second runtime order moves
 original zero-duration frame 8 between LF1 frame 6 and its visible consumer, original frame 7.
 The new physical frame 7 writes reference slot 1, which the new physical frame 8 reads. All
@@ -2931,7 +2931,7 @@ entropy into its standalone headers must reproduce the independently encoded nat
 exactly. All three transports and 27 headers regenerate byte-for-byte. Existing associated VarDCT
 fixtures and standalone headers provide a fourth family without duplicating its entropy.
 
-`tests/common/composed_oracle.rs` combines native standalone prefix flushes with independent F64
+`tools/jxl_test_support/src/oracles/composed.rs` combines native standalone prefix flushes with independent F64
 encoded-sRGB crop/reference/associated-alpha blending. Each scalar final must also agree with the
 original native coalesced animation within 3e-6 normalized error. This avoids relying on native
 FlushImage support for unfinished cropped/blended frames. Both coding modes use the original
@@ -3170,7 +3170,7 @@ dictionary identity and all four committed reference identities must remain unch
 
 At that checkpoint, separate LF previews of patch consumers required a component-domain preview
 path and were rejected before submission. LF producer patches, upsampled/noisy/subsampled-YCbCr consumers,
-mixed coding-mode references, spline interactions and official precision conformance remain open.
+mixed coding-mode references, spline interactions and official precision conformance remained open at that checkpoint.
 
 The completed local regression passes 862 tests across 48 all-feature/all-target workspace targets
 on Apple M5/Metal, plus five doctests; one existing manual benchmark remains ignored. Formatting,
@@ -3228,7 +3228,7 @@ publish no LF output; corrupt terminal AC preserves previously validated LF/CID 
 production path still maps only dictionary/control status and performs no host image reconstruction.
 
 LF producer patches, patch consumers with frame upsampling/noise/subsampled YCbCr, mixed coding-mode
-patch references, broader LF color/precision cases and the remaining roadmap items remain open.
+patch references, broader LF color/precision cases and the remaining roadmap items remained open at that checkpoint.
 
 The completed local regression passes 868 tests across 49 all-feature/all-target workspace targets
 (one existing ignored test), plus five doctests. Formatting, workspace checks, Clippy with warnings
@@ -3286,7 +3286,7 @@ unused producers, before any LF output. Four later-LF entropy failures preserve 
 validated LF2 image and release every other source/GPU reservation.
 
 Patch combinations with frame upsampling, noise or subsampled YCbCr, mixed coding-mode patch
-references, broader LF color/precision coverage, splines and the remaining roadmap items remain open.
+references, broader LF color/precision coverage, splines and the remaining roadmap items remained open at that checkpoint.
 
 The complete serial workspace run passes 872 tests across 50 targets, with zero failures, no
 filtered tests and one existing ignored allocation benchmark; all five doctests pass. Formatting,
@@ -3296,3 +3296,92 @@ cases; the Gray8 codec readback passes with 221 bytes, direct mapping and no sta
 All 114 basic, pass-progressive, LF-consumer and LF-producer patch fixture files regenerate
 identically. Hashes confirm that the full run used one unchanged source snapshot; only
 documentation corrections and this validation record were written afterward.
+
+### GPU patches with frame upsampling and noise (2026-09-12)
+
+`patches/features/` adds 140 images and 140 native final F32 snapshots from forty source families.
+The shared manifest is `tools/jxl_test_support/src/fixtures/patch_features.rs`. Empty/nonempty
+pairs retain the source entropy, complete physical inventory and exact feature flags. Overlapping
+sixteen-occurrence dictionaries cover all eight patch modes, independently selected alpha/depth
+and clamping. Zero-model controls and injected nonzero models distinguish noise execution from
+patch algebra. Every new image is accepted by native libjxl 0.12.0.
+
+The corpus covers XYB and original-RGB Modular/VarDCT, odd and group-crossing extents, 2×/4×/8×
+frame factors, custom weights, base/LF noise correlation, independently upsampled extras before
+patches, and equal-rate extras after patches. Single and nested LF producers in both coding modes
+run the same deferred stages before prediction. Noisy LF consumers cover separate previews and
+progressive AC. VarDCT variants place destinations inside padded blocks across the final visible
+row/column. Four additional chains overwrite pre-transform slot three twice before the final
+patched frame, with noise and alpha/depth variants.
+
+Twelve seed files in `lf_patch_features/` contain full LF chains and independent `.lf1` inputs:
+65×33 RGB16, associated alpha16 and depth20, with both root codecs and equal 2×/4×/8× color/extra
+factors. The final consumer uses factor one. Regenerate seeds and feature fixtures in this order:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- \
+  crates/jxl_wgpu_decode/test-data/lf_patch_features --patch-features
+cargo run -p jxl_wgpu_decode --example regenerate_patch_features
+```
+
+The offline oracle requests native linear F32 output with alpha association and orientation
+preserved. Each snapshot stores packed RGBA followed by independent scalar extra planes. Public
+tests compare native and GPU **linear-light** color with normalized error
+`abs(actual - expected) / (1 + abs(expected)) <= 1/1024`. sRGB delivery is independently checked
+against the analytic sign-preserving OETF of the already validated GPU linear result, with a
+2e-6 bound. This separates reconstruction precision from nonlinear transfer consistency:
+small native/GPU reconstruction differences near black can be amplified by the sRGB curve.
+It does not claim a native sRGB precision bound or ISO 18181-3 certification. Existing corpus
+bounds are unchanged. All selected extras compare directly to native within 2e-6.
+
+The targeted Metal run covers 280 native linear comparisons, 280 analytic sRGB comparisons and
+172 scalar extra comparisons. Their maximum normalized errors are respectively 5.354e-4,
+5.355e-7 and 6.456e-8. Whole input and 43-byte fragments with 256-byte GPU windows return identical
+words for every delivered update. Final-only output equals the final update; progression metadata,
+finite samples, held-image immutability and full source/GPU budget release are checked. No
+independent native intermediate LF/CID snapshots are claimed for this feature corpus.
+
+The runtime follows the ordered stages in
+[libjxl dec_cache.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_cache.cc):
+reconstruction/restoration, early extra expansion when color factor is one, patches, late
+color/equal-extra upsampling, noise, prediction/reference storage, then color conversion.
+A separate internal render-stage tag keeps this progress independent of the component encoding.
+GPU dictionary parsing projects only its end cursor and patch flag; the original noise model,
+physical seed and inventory survive. Both producer modes and their internal LF requests carry
+the deferred stage, preventing duplicate LF noise. Color upsampling with mismatched extra factors
+and the patch flag is malformed, even for an empty dictionary; eight admission cases verify the
+rule from [dec_frame.cc](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc) before
+any GPU allocation.
+
+Private GPU tests stop at submitted normal/LF feature stages for thirty-two cancellation,
+blocking/async final-draining and forced-allocation-failure cases. Fifteen pass/LF refinement cases
+also check intermediate delivery, held images, dictionaries and committed reference identities.
+Three exact-memory cases prove that LF completion retains only prediction XYB and committed
+references, releasing final-only extras and feature scratch. These tests exposed a completion
+race: the poller's failure callback could retain scratch after successful work had signaled.
+The shared submission owner now releases those resources exactly once before signaling, while
+abandoned GPU work retains them until completion.
+
+Integration targets now use `tests/<target>/main.rs` and ordinary child modules. Shared fixtures,
+GPU test transport and offline references live in the unpublished `jxl_test_support` development
+crate, without `#[path]` includes or blanket dead-code allowances. The workspace denies
+`dead_code` and `unused`; five necessary Wasm platform/ownership exceptions have narrow,
+reason-bearing expectations. Fixed-size byte/block traversal uses array chunks, preserving
+remainder validation and avoiding fallible conversions for statically sized words on Rust 1.98.
+The workspace minimum is now Rust 1.98; earlier compiler compatibility is no longer required.
+Historical validation records above describe the toolchains used at those checkpoints.
+
+Subsampled-YCbCr patches, mixed coding-mode patch conformance, splines, broader LF restoration
+cross-products, official precision coverage and the other full JPEG XL roadmap items remain open.
+
+The complete serial regression finished on 2026-09-13 with Rust 1.98.1 and Apple M5/Metal:
+878 tests pass across 52 all-target/all-feature workspace targets, with zero failures, no filtered
+tests and one existing ignored allocation benchmark. All 873 previously listed tests remain;
+the six additions cover deferred features, exact ownership and malformed admission. Five doctests
+pass. Formatting, workspace check, Clippy and rustdoc with warnings denied, and six-library
+all-feature WebAssembly compilation pass without warnings or unfulfilled lint expectations.
+Reference and Metal harnesses each pass 18/18 cases. The Gray8 codec readback passes with 221 bytes,
+direct mapping and no staging allocation. All 406 patch/feature/seed fixture files regenerate
+identically. Source hashes confirm that the full run used one unchanged implementation snapshot;
+only this validation record and development documentation were updated afterward. The full JPEG XL
+goal remains active.

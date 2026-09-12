@@ -7,13 +7,14 @@ members = [
   "crates/jxl_wgpu_decode",
   "crates/jxl_wgpu_encode",
   "tools/jxl_gpu_harness",
+  "tools/jxl_test_support",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "BSD-3-Clause"
-rust-version = "1.89.0"
+rust-version = "1.98.0"
 
 [workspace.dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -35,6 +36,7 @@ jxl_transforms = { version = "=0.6.0" }
 jxl_wgpu = { path = "crates/jxl_wgpu", version = "=0.1.0" }
 jxl_wgpu_decode = { path = "crates/jxl_wgpu_decode", version = "=0.1.0" }
 jxl_wgpu_encode = { path = "crates/jxl_wgpu_encode", version = "=0.1.0" }
+jxl_test_support = { path = "tools/jxl_test_support" }
 sha2 = { version = "0.11.0", default-features = false }
 
 [workspace.lints.clippy]
@@ -42,6 +44,8 @@ missing_safety_doc = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [workspace.lints.rust]
+dead_code = "deny"
+unused = { level = "deny", priority = -1 }
 unsafe_op_in_unsafe_fn = "deny"
 
 [profile.dev]

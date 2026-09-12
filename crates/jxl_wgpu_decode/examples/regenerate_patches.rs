@@ -2,12 +2,8 @@
 use std::path::Path;
 use std::process::Command;
 
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[allow(dead_code)]
-#[path = "../tests/support/patches.rs"]
-mod patches;
+use jxl_test_support::fixtures::patches;
+use jxl_test_support::offline;
 
 fn main() {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data");

@@ -3,15 +3,10 @@ use jxl_gpu_bitstream::{ContainerStreamScanner, InventoryLimits, parse};
 use jxl_wgpu_decode::{DecodeProfile, FrameExecutionPlan, FramePlanError, WgpuDecodeEngine};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[path = "frame_sequence/composition.rs"]
 mod composition;
-#[path = "frame_sequence/independent.rs"]
 mod independent;
-#[path = "frame_sequence/lf.rs"]
 mod lf;
-#[path = "frame_sequence/lf_extra.rs"]
 mod lf_extra;
-#[path = "frame_sequence/reference.rs"]
 mod reference;
 
 struct Case {
@@ -288,7 +283,9 @@ fn encoded(case: &Case) -> Vec<u8> {
     let digits = case.hex.split_whitespace().collect::<String>();
     digits
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -313,7 +310,9 @@ fn samples(bytes: &[u8], bits: u8) -> Vec<u16> {
         bytes.iter().copied().map(u16::from).collect()
     } else {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect()
     }
@@ -434,8 +433,10 @@ fn rust_float_frames(encoded: &[u8], format: LosslessModularFormat) -> Vec<Vec<f
         decoder = result;
         frames.push(
             bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
         );
         if !decoder.has_more_frames() {
@@ -508,7 +509,9 @@ fn djxl_frames(case: &Case, encoded: &[u8]) -> Option<Vec<Vec<u16>>> {
                     .collect::<Vec<_>>()
             } else {
                 data[end..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| u16::from_be_bytes([b[0], b[1]]))
                     .collect()
             };
@@ -774,7 +777,9 @@ fn floating_frame_sequences_can_keep_codestream_coordinates() {
                     inventory.image_header.orientation,
                 );
                 for (actual, expected) in bytes
-                    .chunks_exact(16)
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
                     .zip(expected.chunks_exact(source_channels))
                 {
                     for channel in 0..4 {

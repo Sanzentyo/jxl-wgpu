@@ -156,36 +156,40 @@ pub(super) fn submit_recorded<
         encoder.clear_buffer(&fence, 0, None);
         fence
     };
-    let lifetime = Arc::new(WorkLifetime {
+    // Completion releases the resources exactly once before waking the consumer. The poller's
+    // failure callback may outlive a successful work-done callback; its Arc must not prolong
+    // reservations after wait/poll has reported completion.
+    let lifetime = Arc::new(Mutex::new(Some(WorkLifetime {
         _buffers: inputs,
         _resources: (resources, output.clone()),
         _permit: permit,
         #[cfg(target_arch = "wasm32")]
-        completion_fence,
-    });
+        _completion_fence: completion_fence.clone(),
+    })));
     let done = Arc::clone(&completion);
     let retained = Arc::clone(&lifetime);
     #[cfg(not(target_arch = "wasm32"))]
     encoder.on_submitted_work_done(move || {
-        drop(retained);
+        drop(super::lock(&retained).take());
         done.complete(Ok(()));
     });
     let submission = backend.queue().submit([encoder.finish()]);
     drop(guards);
     #[cfg(target_arch = "wasm32")]
-    lifetime
-        .completion_fence
-        .map_async(wgpu::MapMode::Read, .., move |result| {
+    {
+        let fence_for_callback = completion_fence.clone();
+        completion_fence.map_async(wgpu::MapMode::Read, .., move |result| {
             if result.is_ok() {
-                retained.completion_fence.unmap();
+                fence_for_callback.unmap();
             }
-            drop(retained);
+            drop(super::lock(&retained).take());
             done.complete(result.map_err(|error| error.to_string()));
         });
+    }
     let failed = Arc::clone(&completion);
     poll.register(submission, move |error| {
         #[cfg(not(target_arch = "wasm32"))]
-        drop(lifetime);
+        drop(super::lock(&lifetime).take());
         failed.complete(Err(error));
     })?;
     Ok(GpuWork {
@@ -219,7 +223,7 @@ struct WorkLifetime<R> {
     _resources: R,
     _permit: MemoryPermit,
     #[cfg(target_arch = "wasm32")]
-    completion_fence: wgpu::Buffer,
+    _completion_fence: wgpu::Buffer,
 }
 
 pub(super) const fn completion_fence_bytes() -> u64 {

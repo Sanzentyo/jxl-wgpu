@@ -428,6 +428,7 @@ impl VarDctDecodeMemoryStats {
     pub(super) fn plan(inputs: VarDctDecodeMemoryInputs<'_>) -> Result<Self, VarDctDecodeError> {
         let VarDctDecodeMemoryInputs {
             noise,
+            frame_upsample,
             stream_limit,
             codestream_len,
             packet,
@@ -714,8 +715,8 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let expand_components = render_color
-            && (restoration_scratch || packet.profile.upsampling != 1 || noise.is_some());
+        let expand_components =
+            render_color && (restoration_scratch || frame_upsample || noise.is_some());
         let pre_restoration_upsample_bytes = if expand_components {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
@@ -769,7 +770,7 @@ impl VarDctDecodeMemoryStats {
             "resident VarDCT transient bytes",
         )?;
         let (frame_upsample_bytes, frame_upsample_weight_bytes, frame_upsample_uniform_bytes) =
-            if !render_color || packet.profile.upsampling == 1 {
+            if !frame_upsample {
                 (0, 0, 0)
             } else {
                 let bytes = u64::from(packet.profile.output_width)
@@ -925,6 +926,7 @@ impl VarDctDecodeMemoryStats {
 
 pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) noise: Option<&'a jxl_wgpu::ResidentNoisePlan>,
+    pub(super) frame_upsample: bool,
     pub(super) stream_limit: u64,
     pub(super) codestream_len: usize,
     pub(super) packet: &'a BoundedVarDctPacketPlan,

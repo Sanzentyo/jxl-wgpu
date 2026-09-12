@@ -1,7 +1,5 @@
 use super::*;
-#[path = "sequence_lf.rs"]
 mod lf;
-#[path = "sequence_lifecycle.rs"]
 mod lifecycle;
 use jxl_gpu_bitstream::{FrameEncoding, FrameType};
 use jxl_wgpu_decode::{FrameExecutionPlan, FrameProgression, OrientationPolicy};
@@ -63,11 +61,13 @@ pub(super) fn request(keep: bool) -> GpuOutputRequest {
 pub(super) fn relative_error(actual: &[u8], expected: &[u8]) -> f32 {
     assert_eq!(actual.len(), expected.len());
     actual
-        .chunks_exact(4)
-        .zip(expected.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0.iter())
         .map(|(a, b)| {
-            let a = f32::from_le_bytes(a.try_into().unwrap());
-            let b = f32::from_le_bytes(b.try_into().unwrap());
+            let a = f32::from_le_bytes(*a);
+            let b = f32::from_le_bytes(*b);
             assert!(a.is_finite() && b.is_finite());
             (a - b).abs() / b.abs().max(1.0)
         })
@@ -131,8 +131,10 @@ fn animated_and_composed_coefficient_updates_preserve_presentations_and_match_li
                     let actual = read(&backend, update.output());
                     assert!(
                         actual
-                            .chunks_exact(4)
-                            .all(|v| f32::from_le_bytes(v.try_into().unwrap()).is_finite())
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|v| f32::from_le_bytes(*v).is_finite())
                     );
                     eprintln!(
                         "{name} keep{keep} cap{cap} presentation{presentation}: {:?}",

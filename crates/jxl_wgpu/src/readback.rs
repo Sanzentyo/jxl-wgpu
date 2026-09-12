@@ -24,7 +24,13 @@ use crate::{
 };
 
 #[derive(Debug)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        dead_code,
+        reason = "browser synchronous readback is rejected; staged requests retain their buffer and native output metadata until release"
+    )
+)]
 pub(crate) struct ReadbackRequest {
     pub id: OutputId,
     pub extent: Extent2d,

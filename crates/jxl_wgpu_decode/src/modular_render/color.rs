@@ -80,6 +80,15 @@ impl ModularColorConfig {
         self.encoded_output = true;
         self
     }
+
+    pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
+        self.noise
+    }
+
+    pub(crate) fn before_frame_features(mut self) -> Self {
+        self.noise = None;
+        self
+    }
 }
 
 #[repr(C, align(16))]

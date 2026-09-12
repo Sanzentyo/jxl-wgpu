@@ -12,7 +12,9 @@ fn source_rgb_for_target(samples: &[f32], format: &PixelFormat) -> [Vec<f32>; 3]
     assert_eq!(color.space, ColorSpace::Bt709);
     std::array::from_fn(|channel| {
         samples
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| {
                 let value = pixel[channel];
                 if matches!(
@@ -91,9 +93,14 @@ fn assert_color_codes(
         };
         let mut maximum = 0.0f32;
         let mut maximum_encoded = 0.0f32;
-        for (actual, expected) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
-            let actual = f32::from_le_bytes(actual.try_into().unwrap());
-            let expected = f32::from_le_bytes(expected.try_into().unwrap());
+        for (actual, expected) in actual
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<4>().0.iter())
+        {
+            let actual = f32::from_le_bytes(*actual);
+            let expected = f32::from_le_bytes(*expected);
             assert!(actual.is_finite() && expected.is_finite());
             maximum_encoded = maximum_encoded.max((actual - expected).abs());
             maximum = maximum.max((to_linear(actual) - to_linear(expected)).abs());
@@ -252,7 +259,9 @@ fn check_formats(
             .map(|samples| {
                 let planes: [Vec<f32>; 3] = std::array::from_fn(|channel| {
                     samples
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .map(|pixel| pixel[channel])
                         .collect()
                 });
@@ -266,13 +275,11 @@ fn check_formats(
         {
             let maximum = expected
                 .bytes
-                .chunks_exact(4)
-                .zip(djxl.bytes.chunks_exact(4))
-                .map(|(a, b)| {
-                    (f32::from_le_bytes(a.try_into().unwrap())
-                        - f32::from_le_bytes(b.try_into().unwrap()))
-                    .abs()
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(djxl.bytes.as_chunks::<4>().0.iter())
+                .map(|(a, b)| (f32::from_le_bytes(*a) - f32::from_le_bytes(*b)).abs())
                 .fold(0.0f32, f32::max);
             eprintln!("{name}/{label}: Rust-djxl F32 reference disagreement {maximum}");
         }
@@ -352,7 +359,7 @@ fn generic_color_outputs_preserve_oriented_high_depth_vardct_precision() {
     check_formats(
         &backend,
         "RGB16",
-        &common::vardct_depth_combined("rgb_16_multilf"),
+        &corpus::vardct_depth_combined("rgb_16_multilf"),
         Extent2d::new(17, 2056),
         &output_cases(),
     );
@@ -377,17 +384,17 @@ fn generic_color_output_combines_jpeg_gray_resampling_and_recursive_dc() {
     for (name, encoded, extent) in [
         (
             "gray12-up4",
-            common::vardct_depth_combined("gray_12_upsample"),
+            corpus::vardct_depth_combined("gray_12_upsample"),
             Extent2d::new(259, 515),
         ),
         (
             "gray16-dc",
-            common::vardct_depth_combined("gray_16_dc"),
+            corpus::vardct_depth_combined("gray_16_dc"),
             Extent2d::new(128, 1024),
         ),
         (
             "jpeg420",
-            common::vardct_oriented_jpeg(),
+            corpus::vardct_oriented_jpeg(),
             Extent2d::new(101, 173),
         ),
     ] {
@@ -407,7 +414,7 @@ fn generic_color_output_converts_d65_primaries_against_djxl() {
             .unwrap()
             .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
     );
-    let encoded = common::vardct_depth_combined("rgb_16_multilf");
+    let encoded = corpus::vardct_depth_combined("rgb_16_multilf");
     let extent = Extent2d::new(17, 2056);
     for (space, transfer, profile) in [
         (
@@ -435,7 +442,9 @@ fn generic_color_output_converts_d65_primaries_against_djxl() {
         );
         let rgb: [Vec<f32>; 3] = std::array::from_fn(|channel| {
             samples
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|pixel| pixel[channel])
                 .collect()
         });

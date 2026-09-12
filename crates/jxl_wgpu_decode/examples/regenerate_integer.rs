@@ -2,8 +2,7 @@
 //! `cargo run -p jxl_wgpu_decode --example regenerate_integer -- [output-directory]`
 
 use jxl_gpu_bitstream::{BitWriter, SampleBitDepth};
-#[path = "support/offline.rs"]
-mod offline;
+use jxl_test_support::offline;
 use offline::{compile, extra_references, float_hex, generate_extras, hex, run};
 use std::path::{Path, PathBuf};
 use std::process::Command;

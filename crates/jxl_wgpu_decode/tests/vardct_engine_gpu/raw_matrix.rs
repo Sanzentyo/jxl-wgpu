@@ -8,11 +8,11 @@ fn raw_matrix_windowed_public_decode_matches_both_oracles_and_releases_memory() 
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
     let extent = Extent2d::new(264, 64);
-    let expected = rust_jxl_rgb8(common::jpeg_transcode_raw_matrix(), extent);
+    let expected = rust_jxl_rgb8(corpus::jpeg_transcode_raw_matrix(), extent);
     for encoded in [
-        common::jpeg_transcode_raw_matrix(),
-        common::jpeg_transcode_raw_matrix_local(),
-        common::jpeg_transcode_raw_matrix_local_packets(),
+        corpus::jpeg_transcode_raw_matrix(),
+        corpus::jpeg_transcode_raw_matrix_local(),
+        corpus::jpeg_transcode_raw_matrix_local_packets(),
     ] {
         assert_eq!(
             rust_jxl_rgb8(encoded, extent),

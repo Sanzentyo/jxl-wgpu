@@ -374,6 +374,7 @@ pub struct GpuOutputRequest {
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
+    frame_stage: crate::frame_surface::FrameRenderStage,
     lf_extras: bool,
 }
 
@@ -517,6 +518,7 @@ impl GpuOutputRequest {
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
             frame_surface: None,
+            frame_stage: crate::frame_surface::FrameRenderStage::Complete,
             lf_extras: false,
         }
     }
@@ -574,6 +576,19 @@ impl GpuOutputRequest {
         self.spot_colors = SpotColorPolicy::Preserve;
         self.orientation = OrientationPolicy::Keep;
         self
+    }
+
+    /// Hand restored components to the frame executor before patches, upsampling and noise.
+    pub(crate) const fn before_frame_features(mut self) -> Self {
+        self.frame_stage = crate::frame_surface::FrameRenderStage::BeforeFeatures;
+        self
+    }
+
+    pub(crate) const fn defers_frame_features(&self) -> bool {
+        matches!(
+            self.frame_stage,
+            crate::frame_surface::FrameRenderStage::BeforeFeatures
+        )
     }
 
     /// Retain normalized LF extras for producer features or intermediate presentation.

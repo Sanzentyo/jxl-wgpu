@@ -34,7 +34,9 @@ fn encoded(hex: &str) -> Vec<u8> {
     let digits = hex.split_whitespace().collect::<String>();
     digits
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -76,9 +78,8 @@ fn rust_planes(encoded: &[u8], apply: bool) -> (Vec<f32>, Vec<Vec<f32>>) {
     (color, extras)
 }
 
-#[path = "../common/extra_channel_oracle.rs"]
-pub(super) mod extra_channel_oracle;
 use extra_channel_oracle::{floats, libjxl_planes};
+pub(super) use jxl_test_support::oracles::extra_channels as extra_channel_oracle;
 
 #[test]
 fn arbitrary_modular_extra_channels_preserve_native_codes_and_independent_precision() {
@@ -283,8 +284,10 @@ fn gray_alpha_and_multiple_extras_select_color_and_first_alpha_without_colorizin
             bytes.iter().copied().map(u32::from).collect()
         } else {
             bytes
-                .chunks_exact(2)
-                .map(|v| u32::from(u16::from_le_bytes(v.try_into().unwrap())))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| u32::from(u16::from_le_bytes(*v)))
                 .collect()
         };
         assert_eq!(native.len(), expected.len());

@@ -556,7 +556,9 @@ fn operation_nodes(
             let factor = factor as u8;
             let mut weights = vec![0.0_f32; usize::from(factor) * usize::from(factor) * 25];
             weights
-                .chunks_exact_mut(25)
+                .as_chunks_mut::<25>()
+                .0
+                .iter_mut()
                 .for_each(|phase| phase[12] = 1.0);
             let params = UpsampleParams {
                 factor,

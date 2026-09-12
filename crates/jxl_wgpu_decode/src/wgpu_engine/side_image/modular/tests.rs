@@ -6,8 +6,7 @@ use jxl_gpu_bitstream::{
     BitReader, FrameEncoding, FrameSectionKind, InventoryLimits, SampleBitDepth,
 };
 
-#[path = "../../../../tests/common/extra_channel_oracle.rs"]
-mod oracle;
+use jxl_test_support::oracles::extra_channels as oracle;
 
 fn fixtures() -> [(&'static str, &'static str); 6] {
     [
@@ -49,7 +48,9 @@ fn vardct_global_extra_planes_and_the_following_lf_cursor_are_reconstructed_on_g
         let hex = hex.split_whitespace().collect::<String>();
         let encoded = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|v| u8::from_str_radix(std::str::from_utf8(v).unwrap(), 16).unwrap())
             .collect::<Vec<_>>();
         let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();

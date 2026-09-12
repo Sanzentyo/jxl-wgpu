@@ -281,8 +281,10 @@ fn native_31_bit_layers_reuse_one_producer_budget_and_count_every_submission() {
                 count * first_count
             );
             let pixels: Vec<_> = read_output(&backend, &frame.output().outputs[0])
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
                 .collect();
             assert_eq!(pixels, expected, "{count} layers, bounded={bounded}");
             assert_eq!(

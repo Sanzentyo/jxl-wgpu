@@ -341,7 +341,7 @@ fn rgb_and_nv12_become_queue_ordered_display_textures() {
     drop(yuv_output);
     let rgba = read_texture(&backend, &submitted.texture);
     let expected_gray = bt709_linear_code(0.5);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0.iter() {
         assert!(
             pixel[0].abs_diff(expected_gray) <= 2,
             "red channel: {pixel:?}"
@@ -508,7 +508,7 @@ fn floating_rgb_display_preserves_alpha_and_extended_values_in_unaligned_planes(
                     .submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr())
                     .unwrap();
                 let bytes = read_texture(&backend, &submitted.texture);
-                for (index, actual) in bytes.chunks_exact(8).enumerate() {
+                for (index, actual) in bytes.as_chunks::<8>().0.iter().enumerate() {
                     let actual = rgba16f(actual);
                     let pixel = pixels[(index % 3 + index / 3) % 2];
                     for channel in 0..4 {
@@ -738,7 +738,7 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
             .expect("submit generic display conversion");
         let rgba = read_texture(&backend, &submitted.texture);
         let expected_gray = bt709_linear_code(0.5);
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0.iter() {
             assert!(
                 pixel[0].abs_diff(expected_gray) <= 4,
                 "red {format:?}: {pixel:?}"
@@ -802,7 +802,7 @@ fn odd_width_packed_422_preserves_color_and_tail_luma_order() {
             .expect("submit packed 4:2:2 display conversion");
         let rgba = read_texture(&backend, &submitted.texture);
         let expected = encoded_rgb.map(bt709_linear_code);
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0.iter() {
             for channel in 0..3 {
                 assert!(
                     pixel[channel].abs_diff(expected[channel]) <= 7,

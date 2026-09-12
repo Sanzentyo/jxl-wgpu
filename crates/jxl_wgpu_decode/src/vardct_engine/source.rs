@@ -47,6 +47,7 @@ pub(super) struct VarDctIntermediateOutput {
 pub(super) struct VarDctSource {
     pub(super) intermediate_outputs: Vec<VarDctIntermediateOutput>,
     pub(super) noise: Option<jxl_wgpu::ResidentNoisePlan>,
+    pub(super) noise_parameters: Option<jxl_wgpu::ResidentNoiseParameters>,
     pub(super) codestream: GpuCodestream,
     pub(super) packet: BoundedVarDctPacketPlan,
     pub(super) groups: Vec<VarDctGroupSource>,
@@ -182,7 +183,10 @@ pub(super) fn prepare_packet_source(
         options.output_variant,
     )?;
     let render_color = output.is_color();
-    let noise = if render_color {
+    let noise_parameters = packet
+        .noise
+        .and_then(|noise| noise.parameters(frame, packet.lf_correlation.base));
+    let noise = if render_color && !request.defers_frame_features() {
         packet
             .noise
             .map(|noise| {
@@ -343,33 +347,34 @@ pub(super) fn prepare_packet_source(
         .iter()
         .map(|group| group.artifact_layout)
         .collect::<Vec<_>>();
-    let frame_upsample = if !render_color || packet.profile.upsampling == 1 {
-        None
-    } else {
-        let weights = &inventory.image_header.upsampling_weights;
-        let compact = match packet.profile.upsampling {
-            2 => weights
-                .up2
-                .iter()
-                .map(|value| value.to_f32())
-                .collect::<Vec<_>>(),
-            4 => weights
-                .up4
-                .iter()
-                .map(|value| value.to_f32())
-                .collect::<Vec<_>>(),
-            8 => weights
-                .up8
-                .iter()
-                .map(|value| value.to_f32())
-                .collect::<Vec<_>>(),
-            _ => unreachable!("frame profile validates upsampling factors"),
+    let frame_upsample =
+        if !render_color || request.defers_frame_features() || packet.profile.upsampling == 1 {
+            None
+        } else {
+            let weights = &inventory.image_header.upsampling_weights;
+            let compact = match packet.profile.upsampling {
+                2 => weights
+                    .up2
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                4 => weights
+                    .up4
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                8 => weights
+                    .up8
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+                _ => unreachable!("frame profile validates upsampling factors"),
+            };
+            Some(ResidentUpsampleKernel::from_compact(
+                packet.profile.upsampling,
+                &compact,
+            )?)
         };
-        Some(ResidentUpsampleKernel::from_compact(
-            packet.profile.upsampling,
-            &compact,
-        )?)
-    };
     let extra_indices = super::output::selected_extra_indices(
         request,
         &inventory.image_header.extra_channels,
@@ -406,15 +411,20 @@ pub(super) fn prepare_packet_source(
                 ))
             })
             .collect::<Result<Vec<_>, crate::modular_render::ModularRenderError>>()?;
+        let deferred_factor = if request.defers_frame_features() {
+            packet.profile.upsampling
+        } else {
+            1
+        };
         Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
             jxl_gpu_protocol::Extent2d::new(
-                packet.profile.output_width,
-                packet.profile.output_height,
+                packet.profile.output_width.div_ceil(deferred_factor),
+                packet.profile.output_height.div_ceil(deferred_factor),
             ),
             sources,
             extra_indices
                 .iter()
-                .map(|&index| frame.extra_channel_upsampling[index])
+                .map(|&index| frame.extra_channel_upsampling[index] / deferred_factor)
                 .collect(),
             &inventory.image_header.upsampling_weights,
             &backend.device().limits(),
@@ -496,6 +506,7 @@ pub(super) fn prepare_packet_source(
             };
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
                 noise: noise.as_ref(),
+                frame_upsample: frame_upsample.is_some(),
                 stream_limit,
                 codestream_len,
                 packet: &packet,
@@ -582,6 +593,7 @@ pub(super) fn prepare_packet_source(
         deferred_hf,
         gaborish,
         noise,
+        noise_parameters,
         epf,
         frame_upsample,
         output,

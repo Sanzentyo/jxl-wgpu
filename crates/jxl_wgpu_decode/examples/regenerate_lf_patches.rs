@@ -1,20 +1,11 @@
 //! Assemble separate-LF patch consumers and freeze native final/scalar LF presentation oracles.
 use std::path::Path;
 
-#[allow(dead_code)]
-#[path = "../tests/support/lf_oracle.rs"]
-mod lf_oracle;
-#[allow(dead_code)]
-#[path = "../tests/common/extra_channel_oracle.rs"]
-mod native;
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[path = "support/patch_oracle.rs"]
-mod patch_oracle;
-#[path = "../tests/support/patches.rs"]
-#[allow(dead_code)]
-mod patches;
+use jxl_test_support::fixtures::patches;
+use jxl_test_support::offline;
+use jxl_test_support::oracles::extra_channels as native;
+use jxl_test_support::oracles::lf as lf_oracle;
+use jxl_test_support::oracles::patches as patch_oracle;
 
 fn parse_inventory(data: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
     jxl_gpu_bitstream::parse(data, Default::default())

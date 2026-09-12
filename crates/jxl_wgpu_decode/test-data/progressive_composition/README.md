@@ -8,7 +8,7 @@ in the existing `composition_vardct`, `composition_vardct_gray`, `composition_va
 Each file contains an `image HEX` prefix followed by `frame BIT_LENGTH HEX` records. These are
 metadata fragments, not complete codestreams; LF-dependent layers include their LF headers.
 
-`tests/common/progressive_layers.rs` copies the original fixture entropy unchanged and rebuilds
+`tools/jxl_test_support/src/fixtures/progressive_layers.rs` copies the original fixture entropy unchanged and rebuilds
 the TOC under these standalone headers. It checks the original color/restoration metadata and
 all frame fields affecting entropy interpretation. Only presentation metadata, origins, blend
 references and container-relative positions may differ. Noise/patch-dependent inputs are excluded.

@@ -45,18 +45,20 @@ fn lf_dependencies_publish_immutable_images_before_consumers_and_match_oracles()
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
     for (name, encoded) in [
-        ("dc_ac", common::vardct_progressive_dc_ac().to_vec()),
-        ("gray_oriented", common::vardct_gray("dc_ac")),
+        ("dc_ac", corpus::vardct_progressive_dc_ac().to_vec()),
+        ("gray_oriented", corpus::vardct_gray("dc_ac")),
         (
             "custom",
-            common::with_custom_upsampling_weights(common::vardct_progressive_dc_ac()),
+            corpus::with_custom_upsampling_weights(corpus::vardct_progressive_dc_ac()),
         ),
         ("noise", {
             let text = include_str!("../../../test-data/noise/lf_progressive_ac.jxl.hex")
                 .split_whitespace()
                 .collect::<String>();
             text.as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect()
         }),
@@ -103,17 +105,20 @@ fn lf_dependencies_publish_immutable_images_before_consumers_and_match_oracles()
                 let actual = read(&backend, update.output());
                 assert!(
                     actual
-                        .chunks_exact(4)
-                        .all(|v| f32::from_le_bytes(v.try_into().unwrap()).is_finite())
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|v| f32::from_le_bytes(*v).is_finite())
                 );
                 if let Some(FrameProgression::LowFrequency { level: 1, .. }) = update.progression()
                 {
                     let rgb = actual
-                        .chunks_exact(16)
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
                         .flat_map(|p| {
-                            p[..12].chunks_exact(4).map(|v| {
-                                let value =
-                                    f32::from_le_bytes(v.try_into().unwrap()).clamp(0.0, 1.0);
+                            p[..12].as_chunks::<4>().0.iter().map(|v| {
+                                let value = f32::from_le_bytes(*v).clamp(0.0, 1.0);
                                 let srgb = if value <= 0.0031308 {
                                     value * 12.92
                                 } else {
@@ -138,12 +143,14 @@ fn lf_dependencies_publish_immutable_images_before_consumers_and_match_oracles()
                     assert_eq!(update.is_complete(), expected.complete);
                     assert_eq!(actual.len(), expected.pixels.len());
                     let error = actual
-                        .chunks_exact(4)
-                        .zip(expected.pixels.chunks_exact(4))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(expected.pixels.as_chunks::<4>().0.iter())
                         .map(|(a, b)| {
-                            let reference = f32::from_le_bytes(b.try_into().unwrap());
+                            let reference = f32::from_le_bytes(*b);
                             assert!(reference.is_finite());
-                            (f32::from_le_bytes(a.try_into().unwrap()) - reference).abs()
+                            (f32::from_le_bytes(*a) - reference).abs()
                         })
                         .fold(0_f32, f32::max);
                     eprintln!("{name} stage {stage}: native linear error {error}");
@@ -214,7 +221,7 @@ fn lf_publication_defers_admission_and_survives_late_corruption_and_cancellation
     };
     let backend =
         WgpuBackend::from_device(device, queue, info, WgpuBackendConfig::default()).unwrap();
-    let encoded = common::vardct_progressive_dc_ac();
+    let encoded = corpus::vardct_progressive_dc_ac();
     let inventory = jxl_gpu_bitstream::parse(encoded, ParseLimits::default())
         .unwrap()
         .codestream_inventory(InventoryLimits::default())

@@ -481,6 +481,15 @@ pub(crate) struct PendingGlobalModular {
 }
 
 impl PendingGlobalModular {
+    pub(crate) fn noise_parameters(
+        &self,
+        frame: &jxl_gpu_bitstream::FrameInventory,
+    ) -> Option<jxl_wgpu::ResidentNoiseParameters> {
+        self.prefix
+            .noise
+            .and_then(|noise| noise.parameters(frame, self.prefix.lf_global.lf_correlation.base))
+    }
+
     pub(crate) fn has_distributed_extras(&self) -> bool {
         self.prefix.extra_channels.is_some()
     }
@@ -2005,7 +2014,9 @@ fn expand_hf_dequant_matrices(
                 {
                     let matrix = dct_weights(dct, 8, 4, matrix)?;
                     *output = matrix
-                        .chunks_exact(8)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
                         .flat_map(|row| [row, row])
                         .flatten()
                         .copied()
@@ -2051,17 +2062,23 @@ fn expand_hf_dequant_matrices(
                         }
                     }
                     for (y, ((rows, weights_8), weights_4)) in output
-                        .chunks_exact_mut(16)
-                        .zip(weights_4x8.chunks_exact(8))
-                        .zip(weights_4x4.chunks_exact(4))
+                        .as_chunks_mut::<16>()
+                        .0
+                        .iter_mut()
+                        .zip(weights_4x8.as_chunks::<8>().0.iter())
+                        .zip(weights_4x4.as_chunks::<4>().0.iter())
                         .enumerate()
                     {
                         let (row0, row1) = rows.split_at_mut(8);
                         for (x, (value, &weight)) in row1.iter_mut().zip(weights_8).enumerate() {
                             *value = if y == 0 && x == 0 { params[0] } else { weight };
                         }
-                        for (x, (pair, &weight)) in
-                            row0.chunks_exact_mut(2).zip(weights_4).enumerate()
+                        for (x, (pair, &weight)) in row0
+                            .as_chunks_mut::<2>()
+                            .0
+                            .iter_mut()
+                            .zip(weights_4)
+                            .enumerate()
                         {
                             pair[1] = if y == 0 && x == 0 { params[1] } else { weight };
                         }
@@ -3347,7 +3364,9 @@ mod tests {
             .filter(u8::is_ascii_hexdigit)
             .collect::<Vec<_>>();
         digits
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let high = (pair[0] as char).to_digit(16).unwrap();
                 let low = (pair[1] as char).to_digit(16).unwrap();

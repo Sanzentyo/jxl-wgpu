@@ -628,15 +628,16 @@ pub fn encode_f32(values: &[f32]) -> Vec<u8> {
 }
 
 pub fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(Error::InvalidTensor(format!(
             "f32 payload length {} is not divisible by four",
             bytes.len()
         )));
     }
     Ok(chunks
-        .map(|chunk| f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap())))
+        .iter()
+        .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
         .collect())
 }
 
@@ -648,15 +649,16 @@ pub fn encode_i32(values: &[i32]) -> Vec<u8> {
 }
 
 pub fn decode_i32(bytes: &[u8]) -> Result<Vec<i32>> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(Error::InvalidTensor(format!(
             "i32 payload length {} is not divisible by four",
             bytes.len()
         )));
     }
     Ok(chunks
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk))
         .collect())
 }
 

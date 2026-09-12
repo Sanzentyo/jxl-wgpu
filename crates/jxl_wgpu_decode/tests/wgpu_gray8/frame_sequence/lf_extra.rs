@@ -491,5 +491,4 @@ fn cancelling_lf_extra_channels_releases_producer_planes_global_arenas_and_input
     }
 }
 
-#[path = "lf_extra_progression.rs"]
 mod progression;

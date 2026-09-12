@@ -1001,7 +1001,9 @@ fn validate_artifact<'a>(
     }
     if artifact
         .forward_xyb_bits
-        .chunks_exact(MAX_COEFFICIENTS)
+        .as_chunks::<MAX_COEFFICIENTS>()
+        .0
+        .iter()
         .flat_map(|channel| &channel[..coefficient_count])
         .any(|&bits| !f32::from_bits(bits).is_finite())
     {
@@ -1111,15 +1113,16 @@ fn validate_fixed_ac_artifact(
         }
         return Ok(());
     }
-    let coefficient_nonzero =
-        artifact
-            .quantized_xyb
-            .chunks_exact(MAX_COEFFICIENTS)
-            .any(|channel| {
-                channel[1..DCT8_COEFFICIENTS]
-                    .iter()
-                    .any(|&value| value != 0)
-            });
+    let coefficient_nonzero = artifact
+        .quantized_xyb
+        .as_chunks::<MAX_COEFFICIENTS>()
+        .0
+        .iter()
+        .any(|channel| {
+            channel[1..DCT8_COEFFICIENTS]
+                .iter()
+                .any(|&value| value != 0)
+        });
     if !coefficient_nonzero {
         if artifact.ac_fragment_bit_len != 0
             || artifact.ac_token_count != 0

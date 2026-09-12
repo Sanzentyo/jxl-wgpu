@@ -277,8 +277,11 @@ fn composed_color_output_uses_the_first_alpha_after_independent_channel_blending
                 associated::associate(&mut expected, policy, source_associated);
                 if source_associated && policy == AlphaOutputPolicy::Unassociated {
                     // Evaluate reconstruction error before division by near-zero alpha.
-                    for (actual, expected) in
-                        values.chunks_exact_mut(4).zip(expected.chunks_exact_mut(4))
+                    for (actual, expected) in values
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(expected.as_chunks_mut::<4>().0.iter_mut())
                     {
                         let scale = expected[3].max(1.0 / 67108864.0);
                         for channel in 0..3 {

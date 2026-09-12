@@ -56,7 +56,9 @@ fn plan(bits: BitWriter) -> (Plan, Arc<GpuCodestream>) {
         .collect::<String>();
     let fixture: Vec<_> = compact
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
         .collect();
     let parsed = jxl_gpu_bitstream::parse(&fixture, Default::default()).unwrap();
@@ -106,8 +108,10 @@ fn words(backend: &WgpuBackend, dictionary: &Dictionary) -> Vec<u32> {
         .frame
         .outputs[0]
         .bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect()
 }
 

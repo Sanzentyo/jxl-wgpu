@@ -1,15 +1,9 @@
 //! Reuse native LF entropy with component-reference patch dictionaries in the LF producers.
 use std::path::Path;
 
-#[allow(dead_code)]
-#[path = "../tests/common/extra_channel_oracle.rs"]
-mod native;
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[allow(dead_code)]
-#[path = "../tests/support/patches.rs"]
-mod patches;
+use jxl_test_support::fixtures::patches;
+use jxl_test_support::offline;
+use jxl_test_support::oracles::extra_channels as native;
 
 fn main() {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data");

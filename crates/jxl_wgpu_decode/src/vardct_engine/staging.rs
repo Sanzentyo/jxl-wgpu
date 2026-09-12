@@ -94,6 +94,15 @@ pub struct VarDctDecodeSession {
 }
 
 impl VarDctDecodeSession {
+    pub(crate) fn noise_parameters(&self) -> Option<jxl_wgpu::ResidentNoiseParameters> {
+        match self.prepared.as_ref()? {
+            PreparedStage::Frame(session) => session.source.as_ref()?.noise_parameters,
+            PreparedStage::Global(source) => {
+                source.packet.noise_parameters(&source.inventory.frames[0])
+            }
+        }
+    }
+
     pub(super) fn ready(session: FrameDecodeSession) -> Self {
         Self {
             backend: session.backend.clone(),

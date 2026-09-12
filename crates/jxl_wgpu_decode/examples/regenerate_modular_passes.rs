@@ -2,12 +2,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-#[allow(dead_code)]
-#[path = "../tests/common/modular_passes.rs"]
-mod modular_passes;
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
+use jxl_test_support::fixtures::modular_passes;
+use jxl_test_support::offline;
 
 fn main() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");

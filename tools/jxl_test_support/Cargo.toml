@@ -1,0 +1,25 @@
+[package]
+name = "jxl_test_support"
+description = "Shared JPEG XL conformance fixtures, offline oracles, and GPU test transport"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jxl.workspace = true
+jxl-bitstream.workspace = true
+jxl-image.workspace = true
+jxl-oxide-common.workspace = true
+jxl_gpu_bitstream.workspace = true
+jxl_gpu_formats = { workspace = true, features = ["cpu-reference"] }
+jxl_gpu_protocol.workspace = true
+jxl_wgpu.workspace = true
+jxl_wgpu_decode.workspace = true
+jxl_wgpu_encode.workspace = true
+pollster = "1.0.1"
+wgpu = "30.0.1"
+
+[lints]
+workspace = true

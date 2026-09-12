@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!(values.len() % 2, 0);
         let mut words = Vec::with_capacity(values.len() / 2);
         let mut overflow = Vec::new();
-        for (word_index, pair) in values.chunks_exact(2).enumerate() {
+        for (word_index, pair) in values.as_chunks::<2>().0.iter().enumerate() {
             let mut lanes = [0_u16; 2];
             for (lane_index, value) in pair.iter().copied().enumerate() {
                 if let Ok(value) = i16::try_from(value) {

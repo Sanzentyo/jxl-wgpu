@@ -105,10 +105,22 @@ enum PendingSubmission {
         memory_permit: MemoryPermit,
     },
     GpuOnly {
-        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        #[cfg_attr(
+            target_arch = "wasm32",
+            expect(
+                dead_code,
+                reason = "browser wait_gpu returns Unsupported and preserves the pending native submission token"
+            )
+        )]
         submission: wgpu::SubmissionIndex,
         transient_bytes: u64,
-        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        #[cfg_attr(
+            target_arch = "wasm32",
+            expect(
+                dead_code,
+                reason = "browser wait_gpu preserves the reservation; dropping the pending submission releases this permit"
+            )
+        )]
         memory_permit: MemoryPermit,
     },
 }
@@ -1052,8 +1064,10 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn f32_values(bytes: &[u8]) -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte f32")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect()
     }
 
@@ -2979,7 +2993,7 @@ mod tests {
         let PlaneData::F32(values) = &rendered.outputs[0].data else {
             panic!("expected F32 shader output");
         };
-        for pixel in values.chunks_exact(4) {
+        for pixel in values.as_chunks::<4>().0.iter() {
             let expected_color = 0.5 * (128.0 / 255.0);
             assert!((pixel[0] - expected_color).abs() < 1.0e-6);
             assert!((pixel[1] - expected_color).abs() < 1.0e-6);

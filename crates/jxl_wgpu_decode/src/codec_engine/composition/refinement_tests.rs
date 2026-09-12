@@ -36,6 +36,7 @@ fn next_intermediate(pending: &mut DependentPending) -> (GpuImageFrame, FramePro
                 pending: producer,
                 count,
                 lf,
+                ..
             }) => {
                 assert!(lf.is_none());
                 let frame = producer.wait().unwrap();
@@ -191,7 +192,9 @@ fn exercise_submitted_refinements(backend: &WgpuBackend, hex: &str, numeric: boo
     let compact = hex.split_whitespace().collect::<String>();
     let encoded: Vec<u8> = compact
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
@@ -274,7 +277,9 @@ fn encoded_refinements_transform_for_display_without_committing_references() {
         .collect::<String>();
     let encoded: Vec<_> = compact
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let parsed = jxl_gpu_bitstream::parse(&encoded, Default::default()).unwrap();
@@ -361,9 +366,14 @@ fn encoded_refinements_transform_for_display_without_committing_references() {
 
 fn assert_float_bytes(actual: &[u8], expected: &[u8]) {
     assert_eq!(actual.len(), expected.len());
-    for (a, b) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
-        let a = f32::from_le_bytes(a.try_into().unwrap());
-        let b = f32::from_le_bytes(b.try_into().unwrap());
+    for (a, b) in actual
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0.iter())
+    {
+        let a = f32::from_le_bytes(*a);
+        let b = f32::from_le_bytes(*b);
         assert!(
             a.is_finite() && (a - b).abs() < 1e-5 * (1.0 + b.abs()),
             "{a} vs {b}"
@@ -415,7 +425,9 @@ fn patch_refinements_preserve_dictionary_and_references_across_cancel_drain_and_
         .collect::<String>();
     let data: Arc<[u8]> = compact
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>()
         .into();

@@ -1,15 +1,9 @@
 //! Freeze native libjxl flushes of independently assembled patch-bearing pass prefixes.
 use std::path::Path;
 
-#[allow(dead_code)]
-#[path = "support/offline.rs"]
-mod offline;
-#[allow(dead_code)]
-#[path = "../tests/common/progressive_oracle.rs"]
-mod oracle;
-#[allow(dead_code)]
-#[path = "../tests/support/patches.rs"]
-mod patches;
+use jxl_test_support::fixtures::patches;
+use jxl_test_support::offline;
+use jxl_test_support::oracles::progressive as oracle;
 
 fn main() {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data");

@@ -3,19 +3,12 @@ use jxl_gpu_bitstream::ExtraChannelTypeInventory;
 use jxl_gpu_formats::RgbChannelOrder;
 use jxl_wgpu_decode::{OrientationPolicy, SpotColorPolicy};
 
-#[path = "extra_channels/associated.rs"]
 mod associated;
-#[path = "extra_channels/composition.rs"]
 mod composition;
-#[path = "extra_channels/distributed.rs"]
 mod distributed;
-#[path = "../common/extra_channel_oracle.rs"]
-mod oracle;
-#[path = "extra_channels/resampled.rs"]
+use jxl_test_support::oracles::extra_channels as oracle;
 mod resampled;
-#[path = "extra_channels/scalar.rs"]
 mod scalar;
-#[path = "extra_channels/spot.rs"]
 mod spot;
 
 fn fixtures() -> [(&'static str, &'static str); 7] {
@@ -55,7 +48,9 @@ fn encoded(hex: &str) -> Vec<u8> {
     hex.split_whitespace()
         .collect::<String>()
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -181,7 +176,13 @@ fn global_modular_extras_resume_vardct_color_and_independent_alpha_on_gpu() {
                 .iter()
                 .any(|extra| matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. }))
             {
-                assert!(actual.chunks_exact(4).all(|pixel| pixel[3] == 1.0));
+                assert!(
+                    actual
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 1.0)
+                );
             }
             drop(readback);
             drop(frame);

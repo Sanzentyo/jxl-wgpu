@@ -216,7 +216,7 @@ fn async_updates_survive_future_cancellation_and_keep_prefetched_presentations_o
         held.push(update);
     }
     assert_eq!(held.len(), 6);
-    for (index, updates) in held.chunks_exact(3).enumerate() {
+    for (index, updates) in held.as_chunks::<3>().0.iter().enumerate() {
         assert!(updates.iter().all(|u| u.metadata == updates[0].metadata));
         assert_eq!(updates[0].metadata.index, index);
         assert_eq!(updates[0].metadata.presentation_ticks, index as u64 * 20);

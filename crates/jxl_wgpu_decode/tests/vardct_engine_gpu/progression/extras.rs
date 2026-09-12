@@ -2,11 +2,8 @@
 //! provides an independent oracle at each physical pass boundary, with original alpha association.
 use super::*;
 use jxl_wgpu_decode::{AlphaOutputPolicy, FrameProgression, OrientationPolicy};
-#[path = "extras_composition.rs"]
 mod composition;
-#[path = "extras_lifecycle.rs"]
 mod lifecycle;
-#[path = "extras_output.rs"]
 mod output;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -82,7 +79,12 @@ fn prefix_images_options(
 fn compare(name: &str, actual: &[u8], expected: &[u8], completed: usize) {
     assert_eq!(actual.len(), expected.len());
     let mut max = [0_f32; 4];
-    for (a, b) in actual.chunks_exact(16).zip(expected.chunks_exact(16)) {
+    for (a, b) in actual
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<16>().0.iter())
+    {
         for c in 0..4 {
             let a = f32::from_le_bytes(a[c * 4..c * 4 + 4].try_into().unwrap());
             let b = f32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().unwrap());
