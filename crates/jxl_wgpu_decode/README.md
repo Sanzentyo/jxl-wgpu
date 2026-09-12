@@ -660,7 +660,14 @@ pre-transform reference publication. Equal-rate extras share late resampling; in
 upsampled extras of color-factor-one frames are expanded before patches. Noise metadata and
 physical seeds survive producer projection. Native comparisons cover 140 images, including
 2×/4×/8× factors, custom weights, both LF root modes, noisy LF consumers and reference overwrites.
-Subsampled-YCbCr patches, mixed coding-mode patch conformance and spline interactions remain open.
+VarDCT retains full-resolution JPEG component surfaces even when restoration, frame upsampling
+and noise need no expansion. Only shifted components allocate new planes, before patches; the
+same expansion is shared with restoration when enabled. A separate 276-image corpus covers all
+64 JPEG selector triples at odd extents, filtered and noisy JPEG references, mixed Modular/VarDCT
+sources with resampling and extras, LF root changes, RGB/YCbCr crossings and all four overwritten
+reference slots. Whole/fragmented progression, final-only equality and exact reservation/release
+are checked. The corpus records native fast-renderer and extended-range CMS limitations with
+explicit independent references. Splines, Modular YCbCr and broader original color domains remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before

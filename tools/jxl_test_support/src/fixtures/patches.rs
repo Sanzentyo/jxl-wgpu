@@ -99,6 +99,21 @@ fn dictionary_config(values: &[u32], split: u32, msb: u32, lsb: u32) -> Option<B
 }
 
 pub fn values(frame: &FrameInventory, extras: usize, count: u32) -> Vec<u32> {
+    values_using_modes(frame, extras, count, [0, 1, 2, 3, 4, 5, 6, 7])
+}
+
+/// Equivalent RGB operations for an image without any alpha or extra channels. Source-over
+/// reduces to replacement and multiply-add reduces to addition when alpha is implicitly one.
+pub fn arithmetic_values(frame: &FrameInventory, count: u32) -> Vec<u32> {
+    values_using_modes(frame, 0, count, [0, 1, 2, 3, 1, 1, 2, 2])
+}
+
+fn values_using_modes(
+    frame: &FrameInventory,
+    extras: usize,
+    count: u32,
+    modes: [u32; 8],
+) -> Vec<u32> {
     if count == 0 {
         return vec![0];
     }
@@ -122,7 +137,7 @@ pub fn values(frame: &FrameInventory, extras: usize, count: u32) -> Vec<u32> {
         }
         previous = position;
         for channel in 0..=extras {
-            let mode = (index + channel as u32) % 8;
+            let mode = modes[(index as usize + channel) % 8];
             result.push(mode);
             if mode >= 4 && extras > 1 {
                 result.push((index as usize + channel) as u32 % extras as u32);
@@ -297,51 +312,85 @@ fn header(
         writer.write_bits(u64::from(before_color), 1).unwrap();
     }
     writer.write_bits(0, 2).unwrap(); // Empty frame name.
-    match source.restoration_filter {
-        RestorationFilterInventory::Default => writer.write_bits(1, 1).unwrap(),
-        RestorationFilterInventory::Custom {
-            gaborish: jxl_gpu_bitstream::GaborishInventory::Disabled,
-            epf: jxl_gpu_bitstream::EdgePreservingFilterInventory::Disabled,
-        } => writer.write_bits(0, 6).unwrap(),
-        RestorationFilterInventory::Custom {
-            gaborish: jxl_gpu_bitstream::GaborishInventory::Default,
-            epf: jxl_gpu_bitstream::EdgePreservingFilterInventory::Disabled,
-        } => {
-            writer.write_bits(0, 1).unwrap();
-            writer.write_bits(1, 2).unwrap();
-            writer.write_bits(0, 4).unwrap();
-        }
-        RestorationFilterInventory::Custom {
-            gaborish,
-            epf:
-                jxl_gpu_bitstream::EdgePreservingFilterInventory::Enabled {
-                    iterations,
-                    sharp_lut: None,
-                    weights: None,
-                    sigma: None,
-                    sigma_for_modular,
-                },
-        } => {
-            writer.write_bits(0, 1).unwrap();
-            match gaborish {
-                jxl_gpu_bitstream::GaborishInventory::Disabled => writer.write_bits(0, 1).unwrap(),
-                jxl_gpu_bitstream::GaborishInventory::Default => writer.write_bits(1, 2).unwrap(),
-                _ => panic!("custom fixture Gaborish weights"),
-            }
-            writer.write_bits(u64::from(iterations), 2).unwrap();
-            if source.encoding == FrameEncoding::VarDct {
-                writer.write_bits(0, 1).unwrap();
-            }
-            writer.write_bits(0, 2).unwrap();
-            if let Some(sigma) = sigma_for_modular {
-                writer.write_bits(u64::from(sigma.to_bits()), 16).unwrap();
-            }
-            writer.write_bits(0, 2).unwrap();
-        }
-        other => panic!("unhandled fixture restoration {other:?}"),
-    }
+    restoration(&mut writer, source.restoration_filter, source.encoding);
     writer.write_bits(0, 2).unwrap();
     BitFragment::new(writer.as_bytes().to_vec(), writer.bit_len()).unwrap()
+}
+
+fn restoration(
+    writer: &mut BitWriter,
+    filter: RestorationFilterInventory,
+    encoding: FrameEncoding,
+) {
+    use jxl_gpu_bitstream::{EdgePreservingFilterInventory as Epf, GaborishInventory as Gaborish};
+    let RestorationFilterInventory::Custom { gaborish, epf } = filter else {
+        writer.write_bits(1, 1).unwrap();
+        return;
+    };
+    writer.write_bits(0, 1).unwrap();
+    match gaborish {
+        Gaborish::Disabled => writer.write_bits(0, 1).unwrap(),
+        Gaborish::Default => writer.write_bits(1, 2).unwrap(),
+        Gaborish::Custom { weights } => {
+            writer.write_bits(3, 2).unwrap();
+            for value in weights.into_iter().flatten() {
+                writer.write_bits(u64::from(value.to_bits()), 16).unwrap();
+            }
+        }
+    }
+    match epf {
+        Epf::Disabled => writer.write_bits(0, 2).unwrap(),
+        Epf::Enabled {
+            iterations,
+            sharp_lut,
+            weights,
+            sigma,
+            sigma_for_modular,
+        } => {
+            writer.write_bits(u64::from(iterations), 2).unwrap();
+            if encoding == FrameEncoding::VarDct {
+                writer
+                    .write_bits(u64::from(sharp_lut.is_some()), 1)
+                    .unwrap();
+                if let Some(lut) = sharp_lut {
+                    for value in lut {
+                        writer.write_bits(u64::from(value.to_bits()), 16).unwrap();
+                    }
+                }
+            } else {
+                assert!(sharp_lut.is_none());
+            }
+            writer.write_bits(u64::from(weights.is_some()), 1).unwrap();
+            if let Some(weights) = weights {
+                for value in weights
+                    .channel_scale
+                    .into_iter()
+                    .chain([weights.pass1_zeroflush, weights.pass2_zeroflush])
+                {
+                    writer.write_bits(u64::from(value.to_bits()), 16).unwrap();
+                }
+            }
+            writer.write_bits(u64::from(sigma.is_some()), 1).unwrap();
+            if let Some(sigma) = sigma {
+                assert_eq!(sigma.quant_mul.is_some(), encoding == FrameEncoding::VarDct);
+                for value in sigma.quant_mul.into_iter().chain([
+                    sigma.pass0_sigma_scale,
+                    sigma.pass2_sigma_scale,
+                    sigma.border_sad_mul,
+                ]) {
+                    writer.write_bits(u64::from(value.to_bits()), 16).unwrap();
+                }
+            }
+            assert_eq!(
+                sigma_for_modular.is_some(),
+                encoding == FrameEncoding::Modular
+            );
+            if let Some(value) = sigma_for_modular {
+                writer.write_bits(u64::from(value.to_bits()), 16).unwrap();
+            }
+        }
+    }
+    writer.write_bits(0, 2).unwrap(); // No restoration extensions.
 }
 
 fn passes(writer: &mut BitWriter, frame: &FrameInventory) {
@@ -375,55 +424,91 @@ fn passes(writer: &mut BitWriter, frame: &FrameInventory) {
 }
 
 pub fn assemble(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
-    assemble_frames(
-        bytes,
-        &[(Some((3, true)), None), (None, Some(patch_values))],
-    )
+    assemble_frames(&[
+        Frame {
+            codestream: bytes,
+            reference: Some((3, true)),
+            patches: None,
+        },
+        Frame {
+            codestream: bytes,
+            reference: None,
+            patches: Some(patch_values),
+        },
+    ])
 }
 
 /// LF dependencies precede both the hidden patch reference and its visible consumer.
 pub fn assemble_shared_lf(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
     assemble_frame_sequence(
-        bytes,
-        &[(Some((3, true)), None), (None, Some(patch_values))],
+        &[
+            Frame {
+                codestream: bytes,
+                reference: Some((3, true)),
+                patches: None,
+            },
+            Frame {
+                codestream: bytes,
+                reference: None,
+                patches: Some(patch_values),
+            },
+        ],
         false,
     )
 }
 
-pub type FixtureFrame<'a> = (Option<(u32, bool)>, Option<&'a [u32]>);
+pub struct Frame<'a> {
+    pub codestream: &'a [u8],
+    pub reference: Option<(u32, bool)>,
+    pub patches: Option<&'a [u32]>,
+}
 
 /// Reuse native image entropy while exercising successive reference-slot versions. Every frame
 /// except the final presentation is hidden; an optional dictionary precedes its body.
-pub fn assemble_frames(bytes: &[u8], frames: &[FixtureFrame<'_>]) -> Vec<u8> {
-    assemble_frame_sequence(bytes, frames, true)
+pub fn assemble_frames(frames: &[Frame<'_>]) -> Vec<u8> {
+    assemble_frame_sequence(frames, true)
 }
 
-fn assemble_frame_sequence(bytes: &[u8], frames: &[FixtureFrame<'_>], repeat_lf: bool) -> Vec<u8> {
-    let parsed = jxl_gpu_bitstream::parse(bytes, Default::default()).unwrap();
-    let inventory = parsed.codestream_inventory(Default::default()).unwrap();
-    assert!(!inventory.frames.is_empty());
-    assert!(
-        inventory.frames[..inventory.frames.len() - 1]
-            .iter()
-            .all(|frame| frame.frame_type == jxl_gpu_bitstream::FrameType::LowFrequency)
-    );
-    let image = &inventory.image_header;
-    let frame = inventory.frames.last().unwrap();
-    let bytes = parsed.codestream();
-    let image_end = inventory.frames[0].header_bits.offset as usize / 8;
-    let dependencies = &bytes[image_end..frame.header_bits.offset as usize / 8];
-    let mut result = bytes[..image_end].to_vec();
-    for (index, &(reference, patch_values)) in frames.iter().enumerate() {
+fn assemble_frame_sequence(frames: &[Frame<'_>], repeat_lf: bool) -> Vec<u8> {
+    assert!(!frames.is_empty());
+    let mut common_image: Option<ImageHeaderInventory> = None;
+    let mut result = Vec::new();
+    for (index, input) in frames.iter().enumerate() {
+        let parsed = jxl_gpu_bitstream::parse(input.codestream, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        let frame = inventory.frames.last().unwrap();
+        assert!(
+            inventory.frames[..inventory.frames.len() - 1]
+                .iter()
+                .all(|frame| frame.frame_type == jxl_gpu_bitstream::FrameType::LowFrequency)
+        );
+        let bytes = parsed.codestream();
+        let image_end = inventory.frames[0].header_bits.offset as usize / 8;
+        let mut image = inventory.image_header;
+        if let Some(common) = &common_image {
+            // Header offsets and redundant bit encodings may differ; every decoded image
+            // parameter, including transforms, extra declarations and ICC, must agree.
+            image.bit_range = common.bit_range;
+            assert_eq!(&image, common, "incompatible patch frame image metadata");
+        } else {
+            result.extend_from_slice(&bytes[..image_end]);
+            common_image = Some(image.clone());
+        }
         // LF slot identities are implicit in the stream. Copying the dependency chain before
         // each consumer establishes a new validated version without changing its entropy.
         if index == 0 || repeat_lf {
-            result.extend_from_slice(dependencies);
+            result.extend_from_slice(&bytes[image_end..frame.header_bits.offset as usize / 8]);
+        } else {
+            assert_eq!(
+                input.codestream, frames[0].codestream,
+                "shared LF sequence changed source"
+            );
         }
         result.extend(packet_frame(
             bytes,
             frame,
-            header(image, frame, reference, patch_values.is_some()),
-            patch_values,
+            header(&image, frame, input.reference, input.patches.is_some()),
+            input.patches,
         ));
     }
     result

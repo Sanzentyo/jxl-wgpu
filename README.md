@@ -209,8 +209,12 @@ extras; unused and overwritten producers still validate and execute their featur
 executor applies patches before 2×/4×/8× frame upsampling and noise, then publishes LF prediction
 or pre-transform references before color conversion. Both coding modes, equal-rate and early
 extra resampling, LF previews, custom weights and reference overwrites have 140 native-reference
-fixtures. Subsampled-YCbCr patches, mixed-mode patch conformance, splines and broader original
-color domains remain pending.
+fixtures. VarDCT also expands subsampled JPEG components before retaining patch references or
+applying patches. Another 276-image corpus covers all 64 sampling selector triples at odd extents,
+mixed Modular/VarDCT sources, RGB/YCbCr component references and reference-slot overwrites.
+Independent reference selection and precision limits are documented in
+[the conformance corpus](docs/CONFORMANCE_CORPUS.md#subsampled-and-mixed-component-patch-references-2026-09-13).
+Splines, Modular YCbCr and broader original color domains remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

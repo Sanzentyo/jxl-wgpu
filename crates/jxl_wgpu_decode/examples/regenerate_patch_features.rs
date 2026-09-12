@@ -75,15 +75,28 @@ fn main() {
             } else {
                 let values = dictionary(info.frames.last().unwrap());
                 if suffix == "_chain" {
-                    patches::assemble_frames(
-                        &source,
-                        &[
-                            (Some((3, true)), None),
-                            (Some((3, true)), Some(&values)),
-                            (Some((3, true)), Some(&values)),
-                            (None, Some(&values)),
-                        ],
-                    )
+                    patches::assemble_frames(&[
+                        patches::Frame {
+                            codestream: &source,
+                            reference: Some((3, true)),
+                            patches: None,
+                        },
+                        patches::Frame {
+                            codestream: &source,
+                            reference: Some((3, true)),
+                            patches: Some(&values),
+                        },
+                        patches::Frame {
+                            codestream: &source,
+                            reference: Some((3, true)),
+                            patches: Some(&values),
+                        },
+                        patches::Frame {
+                            codestream: &source,
+                            reference: None,
+                            patches: Some(&values),
+                        },
+                    ])
                 } else {
                     patches::assemble(&source, &values)
                 }

@@ -71,10 +71,22 @@ impl Plan {
         let token_end = section.bits.end().ok_or_else(overflow)?;
         let (mut width, mut height) = frame.color_sample_extent().ok_or_else(overflow)?;
         if frame.encoding == jxl_gpu_bitstream::FrameEncoding::VarDct {
-            // Patches address the coded, padded image before frame upsampling. Subsampled
-            // YCbCr is rejected by composition admission until its feature graph is connected.
-            width = width.div_ceil(8).checked_mul(8).ok_or_else(overflow)?;
-            height = height.div_ceil(8).checked_mul(8).ok_or_else(overflow)?;
+            // Dictionary bounds include JPEG-aligned padding before frame upsampling.
+            // Equal raw sampling factors can require 16-pixel alignment without any shifted
+            // components, so normalized chroma shifts cannot determine these bounds.
+            frame.validate_jpeg_sampling()?;
+            let [horizontal, vertical] =
+                crate::vardct_frontend::jpeg_block_alignment(frame.jpeg_upsampling);
+            let block_width = 8 << horizontal;
+            let block_height = 8 << vertical;
+            width = width
+                .div_ceil(block_width)
+                .checked_mul(block_width)
+                .ok_or_else(overflow)?;
+            height = height
+                .div_ceil(block_height)
+                .checked_mul(block_height)
+                .ok_or_else(overflow)?;
         }
         let max_ref = u64::from(width)
             .checked_mul(u64::from(height))

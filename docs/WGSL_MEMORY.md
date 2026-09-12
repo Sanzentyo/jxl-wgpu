@@ -869,7 +869,24 @@ only the empty lifetime container after successful completion; it cannot keep re
 charged while the next frame is admitted. Browser completion retains its four-byte mapped fence
 until the callback, without mapping image samples.
 
-Subsampled-YCbCr patches, mixed-mode conformance and spline interactions remain open.
+Retained VarDCT component surfaces also require early JPEG chroma expansion, including when the
+noise model is zero and restoration is disabled. The explicit encoded-surface request joins the
+existing expansion decision; frame-feature deferral cannot remove this requirement. The plan
+reserves one full padded F32 plane and one 32-byte interpolation uniform per component with a
+nonzero normalized shift. Unshifted components reuse their resident planes. Equal nonzero raw
+sampling selectors still require no expansion; raw JPEG block alignment remains authoritative
+for allocation extents. The dictionary uses this same raw block alignment for destination bounds,
+including valid positions outside the visible rectangle; render dispatches still clip to their
+actual output surface. Restoration, patches and noise share the single expansion instead of
+allocating or interpolating again. Presentation receives zero shifts after this stage.
+
+The added buffers participate in the existing aggregate transient reservation and completion
+lifetime; no shader ABI or binding count changes. Private tests check all 64 selectors with whole
+and 256-byte windows, exact one-byte-short admission, retry rollback, completed output ownership,
+cancellation and decoding again after release. Public tests also reject post-transform YCbCr
+references and verify source/GPU budget release. Mixed codec and component-domain references use
+the same explicitly tagged surface and four versioned slots. Spline interactions and broader
+color-domain integration remain open.
 
 ## Alpha association at output
 

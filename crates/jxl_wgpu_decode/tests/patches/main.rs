@@ -8,6 +8,7 @@ mod lf_producers;
 use jxl_test_support::gpu::planes;
 use jxl_test_support::oracles::extra_channels as oracle;
 mod progression;
+mod references;
 
 use jxl_gpu_formats::{PixelFormat, RgbChannelOrder};
 use jxl_wgpu::{WgpuBackend, WgpuBackendConfig};
@@ -374,17 +375,38 @@ fn patches_use_all_four_reference_slots_and_the_latest_completed_version() {
             values
         })
         .collect();
-    let data = fixtures::assemble_frames(
-        &original,
-        &[
-            (Some((0, true)), None),
-            (Some((1, true)), Some(&dictionaries[0])),
-            (Some((2, true)), Some(&dictionaries[1])),
-            (Some((3, true)), Some(&dictionaries[2])),
-            (Some((0, true)), Some(&dictionaries[3])),
-            (None, Some(&dictionaries[0])),
-        ],
-    );
+    let data = fixtures::assemble_frames(&[
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((0, true)),
+            patches: None,
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((1, true)),
+            patches: Some(&dictionaries[0]),
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((2, true)),
+            patches: Some(&dictionaries[1]),
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((3, true)),
+            patches: Some(&dictionaries[2]),
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((0, true)),
+            patches: Some(&dictionaries[3]),
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: None,
+            patches: Some(&dictionaries[0]),
+        },
+    ]);
     let expected = oracle::libjxl_output(&data, &["--preserve-alpha"]);
     let mut previous = None;
     for limit in [None, NonZeroU64::new(40)] {
@@ -412,10 +434,18 @@ fn patches_use_all_four_reference_slots_and_the_latest_completed_version() {
         drop((frame, session));
         assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
     }
-    let data = fixtures::assemble_frames(
-        &original,
-        &[(Some((0, false)), None), (None, Some(&dictionaries[0]))],
-    );
+    let data = fixtures::assemble_frames(&[
+        fixtures::Frame {
+            codestream: &original,
+            reference: Some((0, false)),
+            patches: None,
+        },
+        fixtures::Frame {
+            codestream: &original,
+            reference: None,
+            patches: Some(&dictionaries[0]),
+        },
+    ]);
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
     let mut session = decoder.open(&data, request()).unwrap();
     assert!(matches!(

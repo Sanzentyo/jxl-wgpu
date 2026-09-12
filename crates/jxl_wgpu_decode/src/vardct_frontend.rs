@@ -1189,7 +1189,8 @@ fn align_up_power_of_two(value: u32, shift: u32) -> Result<u32, VarDctFrontendEr
         })
 }
 
-fn jpeg_block_alignment(jpeg_upsampling: [u32; 3]) -> [u32; 2] {
+/// Block alignment of selectors already checked by `FrameInventory::validate_jpeg_sampling`.
+pub(crate) fn jpeg_block_alignment(jpeg_upsampling: [u32; 3]) -> [u32; 2] {
     const HORIZONTAL: [u32; 4] = [0, 1, 1, 0];
     const VERTICAL: [u32; 4] = [0, 1, 0, 1];
     jpeg_upsampling.into_iter().fold([0, 0], |maximum, value| {

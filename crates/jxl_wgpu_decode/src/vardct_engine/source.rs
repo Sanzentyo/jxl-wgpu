@@ -507,6 +507,9 @@ pub(super) fn prepare_packet_source(
             let memory = VarDctDecodeMemoryStats::plan(VarDctDecodeMemoryInputs {
                 noise: noise.as_ref(),
                 frame_upsample: frame_upsample.is_some(),
+                encoded_surface: request.retains_frame_surface()
+                    && request.frame_surface_encoding()
+                        == crate::frame_surface::FrameSurfaceEncoding::Encoded,
                 stream_limit,
                 codestream_len,
                 packet: &packet,

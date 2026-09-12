@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+mod chroma;
+
 use jxl_gpu_bitstream::{
     EdgePreservingFilterInventory, GaborishInventory, RestorationFilterInventory, StreamSlice,
 };

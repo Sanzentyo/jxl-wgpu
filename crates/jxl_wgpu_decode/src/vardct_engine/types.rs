@@ -300,7 +300,7 @@ pub struct VarDctDecodeMemoryStats {
     /// physically smaller buffers rather than full-resolution padding.
     pub resident_plane_bytes: [u64; 3],
     pub resident_image_bytes: u64,
-    /// Full-resolution destinations for shifted components before restoration, resampling or noise.
+    /// Full-resolution shifted components for restoration, resampling, noise or retained patches.
     pub pre_restoration_upsample_bytes: u64,
     /// One 32-byte interpolation uniform for each shifted component.
     pub pre_restoration_upsample_uniform_bytes: u64,
@@ -429,6 +429,7 @@ impl VarDctDecodeMemoryStats {
         let VarDctDecodeMemoryInputs {
             noise,
             frame_upsample,
+            encoded_surface,
             stream_limit,
             codestream_len,
             packet,
@@ -715,8 +716,10 @@ impl VarDctDecodeMemoryStats {
             .into_iter()
             .filter(|shift| shift.is_subsampled())
             .count() as u64;
-        let expand_components =
-            render_color && (restoration_scratch || frame_upsample || noise.is_some());
+        // Retained component surfaces have one common geometry. Patches consume these planes
+        // before frame upsampling and noise, even when no restoration stage needs them.
+        let expand_components = render_color
+            && (restoration_scratch || frame_upsample || noise.is_some() || encoded_surface);
         let pre_restoration_upsample_bytes = if expand_components {
             full_plane_bytes.checked_mul(shifted_channel_count).ok_or(
                 VarDctDecodeError::ArithmeticOverflow {
@@ -927,6 +930,7 @@ impl VarDctDecodeMemoryStats {
 pub(super) struct VarDctDecodeMemoryInputs<'a> {
     pub(super) noise: Option<&'a jxl_wgpu::ResidentNoisePlan>,
     pub(super) frame_upsample: bool,
+    pub(super) encoded_surface: bool,
     pub(super) stream_limit: u64,
     pub(super) codestream_len: usize,
     pub(super) packet: &'a BoundedVarDctPacketPlan,

@@ -3385,3 +3385,79 @@ direct mapping and no staging allocation. All 406 patch/feature/seed fixture fil
 identically. Source hashes confirm that the full run used one unchanged implementation snapshot;
 only this validation record and development documentation were updated afterward. The full JPEG XL
 goal remains active.
+
+### Subsampled and mixed component patch references (2026-09-13)
+
+`examples/regenerate_patch_references.rs` and the explicit
+`jxl_test_support::fixtures::patch_references` manifest generate 276 streams in
+`test-data/patches/references/`, with one packed linear RGBA plus scalar-extra F32 reference each.
+The 552 files reuse checked-in native image entropy. One frame recipe carries its codestream,
+reference slot/domain and optional dictionary; the shared assembler requires identical decoded
+image metadata, preserves each source's LF chain and writes complete restoration declarations,
+including custom sharpness, weights and sigma parameters. Physical noise seeds follow the new
+sequence. Existing patch generators use this same frame API.
+
+| Cases | Coverage |
+|---:|---|
+| 128 | All 64 raw JPEG sampling selector triples at 257×17, with nonzero and zero noise; producer and consumer rotate their selector triples to exercise different component strides |
+| 64 | A 2×2 destination exactly against the JPEG-padded corner for every raw sampling triple, including equal nonzero factors requiring 16-pixel alignment |
+| 12 | 4:2:2, 4:4:0 and 4:2:0 with Gaborish, effective EPF1, Gaborish+EPF2 and Gaborish+EPF3 after component expansion |
+| 6 | Empty dictionaries and destinations crossing the visible right/bottom edges inside VarDCT padding, for each of those three layouts |
+| 56 | Both reference directions, empty/nonempty dictionaries, across fourteen pairs: XYB and original RGB with 1×/2×/4×/8× factors, two independent extras with 2×/4×/8× factors, mixed LF roots, Modular RGB/JPEG YCbCr, and VarDCT RGB/JPEG YCbCr |
+| 10 | Six-frame alternating chains that overwrite all four reference slots and consume the second completed version of slot zero |
+
+All 276 original streams must be accepted by native libjxl. The independent reference source is
+fixed in the manifest; test execution does not select an oracle from observed GPU errors:
+
+- 260 images freeze native linear output, with normalized error `abs(a-b)/(1+abs(b)) <= 1/1024`.
+- Twelve RGB/YCbCr-crossing images use native unconverted sRGB and the independent f64 signed
+  sRGB EOTF, with the same linear error bound. These patches can produce sRGB values above two.
+  Native CMS linear output approximates that extended curve: one observed native sRGB value
+  2.3093302 maps to 6.935753 by the specified formula, while native CMS returns 6.924666. The
+  corresponding GPU value is 6.935755. This reference does not claim equality with native CMS.
+- Four vertically subsampled Gaborish/Gaborish+EPF3 images use pinned jxl-oxide 0.12.6 linear output
+  below normalized error 1e-5. The preceding **LF noise and subsampled restoration** section
+  documents native libjxl's fast-renderer defect and its independent scalar f64 Gaborish check.
+  jxl-oxide separately rejects modes 4–7 with implicit alpha, so its input uses mathematically
+  equivalent replacement/addition commands. The generator first requires native F32 output of
+  the original and arithmetic-equivalent streams to be bit-identical. Every GPU input retains
+  the original all-eight-mode dictionary. Native fast-renderer differences in these four streams
+  reach maxAE 0.203 in linear light; pixel bounds are not widened to accept them.
+
+The public patch harness compares the GPU's sRGB output to an independent f64 OETF of its validated
+linear output below normalized error 2e-6, and selected extras directly to their reference below
+2e-6. Whole input and 43-byte fragments with 256-byte GPU windows must return identical words for
+every update. Final-only output equals the final update. Progression metadata, finite values,
+held-image immutability and complete source/GPU memory release are checked. Nonempty dictionaries
+and nonzero noise must change their paired controls. Independent native LF/CID intermediate
+snapshots and ISO 18181-3 certification are not claimed for this corpus.
+
+The targeted Metal run passes 552 linear comparisons, 552 analytic sRGB comparisons and 36
+scalar extra comparisons. Maximum normalized errors are respectively 3.660e-4, 6.990e-7 and
+5.953e-8. The 64 padded-corner images are included in those counts.
+
+Production now expands only normalized shifted JPEG components before retaining encoded surfaces,
+even when restoration and noise do not require expansion. The existing chroma pipeline and
+aggregate reservation also serve patched producers before deferred frame features; filtering does
+not trigger a second expansion. A private actual-adapter test checks all 64 layouts under whole
+and bounded admission, exact plane/uniform bytes, one-byte-short retry rollback, output ownership,
+cancellation and successful reuse. A public negative test rejects YCbCr references stored after
+color conversion, with input and GPU reservations released. Thirty-two negative cases also reject
+a destination one pixel beyond the JPEG-padded width or height, covering all four equal triples,
+4:2:2/4:4:0/4:2:0 and asymmetric factors under whole and bounded input. Dictionary geometry now
+shares the producer's raw JPEG block alignment; component normalization does not change padding.
+
+Modular YCbCr, spline interactions, broader color domains, official precision conformance and the
+other full JPEG XL roadmap items remain open. Rust 1.98 remains the minimum supported compiler.
+
+The complete serial regression finished on 2026-09-13 with Rust 1.98.1 and Apple M5/Metal:
+883 tests pass across 53 all-target/all-feature workspace targets, with zero failures, no filtered
+tests and one existing ignored allocation benchmark. All 879 previously listed tests remain;
+the five additions cover component-reference output, padded bounds, reference-domain rejection
+and exact memory ownership. Five doctests pass. Formatting, workspace check, Clippy and rustdoc
+with warnings denied, and six-library all-feature WebAssembly compilation pass. Reference and
+Metal harnesses each pass 18/18 cases. Gray8 codec readback returns 221 bytes through direct
+mapping with no staging allocation. All 958 patch/feature/seed fixture files regenerate
+identically, including the 406 existing files and 552 additions. Source and fixture hashes confirm
+one unchanged implementation throughout the complete run; only this validation record was
+appended afterward. The full JPEG XL goal remains active.

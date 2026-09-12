@@ -590,17 +590,6 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
                 }
             }
         }
-        if (frame.flags & 2 != 0
-            || (node.save_reference.is_some() && frame.save_before_color_transform))
-            && frame.do_ycbcr
-            && frame.jpeg_upsampling != [0; 3]
-        {
-            return Err(UnsupportedProfile::new(
-                UnsupportedCodestreamFeature::Patches,
-                "subsampled YCbCr patch components are not yet connected",
-            )
-            .into());
-        }
         if !node.needs_composition {
             continue;
         }
