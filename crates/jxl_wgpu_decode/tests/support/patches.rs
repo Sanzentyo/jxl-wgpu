@@ -156,12 +156,16 @@ fn header(
     reference: Option<(u32, bool)>,
     patches: bool,
 ) -> BitFragment {
-    assert!(!source.have_crop && !source.toc_permuted && source.num_passes == 1);
+    assert!(!source.have_crop && source.lf_level == 0);
     assert!(source.flags & !0x80 == 0 && source.upsampling == 1);
+    assert!(image.animation.is_none());
+    // Reference-only headers imply one pass. Multipass producers remain hidden regular frames
+    // with duration zero, preserving the complete native pass schedule and entropy packets.
+    let reference_only = reference.is_some() && source.num_passes == 1;
     let mut writer = BitWriter::new();
     writer.write_bits(0, 1).unwrap();
     writer
-        .write_bits(if reference.is_some() { 2 } else { 0 }, 2)
+        .write_bits(if reference_only { 2 } else { 0 }, 2)
         .unwrap();
     writer
         .write_bits(u64::from(source.encoding == FrameEncoding::Modular), 1)
@@ -193,19 +197,21 @@ fn header(
         writer.write_bits(u64::from(source.x_qm_scale), 3).unwrap();
         writer.write_bits(u64::from(source.b_qm_scale), 3).unwrap();
     }
-    if reference.is_none() {
-        writer.write_bits(0, 2).unwrap();
+    if !reference_only {
+        passes(&mut writer, source);
     }
     writer.write_bits(0, 1).unwrap(); // Full canvas.
-    if let Some((slot, before_color)) = reference {
-        writer.write_bits(u64::from(slot), 2).unwrap();
-        writer.write_bits(u64::from(before_color), 1).unwrap();
-    } else {
+    if !reference_only {
         for _ in 0..=image.extra_channels.len() {
             writer.write_bits(0, 2).unwrap();
         }
-        assert!(image.animation.is_none());
-        writer.write_bits(1, 1).unwrap();
+        writer
+            .write_bits(u64::from(reference.is_none()), 1)
+            .unwrap(); // Is last.
+    }
+    if let Some((slot, before_color)) = reference {
+        writer.write_bits(u64::from(slot), 2).unwrap();
+        writer.write_bits(u64::from(before_color), 1).unwrap();
     }
     writer.write_bits(0, 2).unwrap(); // Empty frame name.
     match source.restoration_filter {
@@ -247,6 +253,36 @@ fn header(
     BitFragment::new(writer.as_bytes().to_vec(), writer.bit_len()).unwrap()
 }
 
+fn passes(writer: &mut BitWriter, frame: &FrameInventory) {
+    let count = frame.num_passes;
+    writer.write_bits(u64::from((count - 1).min(3)), 2).unwrap();
+    if count >= 4 {
+        writer.write_bits(u64::from(count - 4), 3).unwrap();
+    }
+    if count == 1 {
+        return;
+    }
+    let passes = &frame.progressive_passes;
+    assert_eq!(passes.shifts.len(), count as usize - 1);
+    let downsample = passes.downsampling.len();
+    writer.write_bits(downsample.min(3) as u64, 2).unwrap();
+    if downsample >= 3 {
+        writer.write_bits((downsample - 3) as u64, 1).unwrap();
+    }
+    for &shift in &passes.shifts {
+        writer.write_bits(u64::from(shift), 2).unwrap();
+    }
+    for &divisor in &passes.downsampling {
+        writer.write_bits(u64::from(divisor.ilog2()), 2).unwrap();
+    }
+    for &last in &passes.last_pass {
+        writer.write_bits(u64::from(last.min(3)), 2).unwrap();
+        if last >= 3 {
+            writer.write_bits(u64::from(last), 3).unwrap();
+        }
+    }
+}
+
 pub fn assemble(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
     assemble_frames(
         bytes,
@@ -257,7 +293,7 @@ pub fn assemble(bytes: &[u8], patch_values: &[u32]) -> Vec<u8> {
 pub type FixtureFrame<'a> = (Option<(u32, bool)>, Option<&'a [u32]>);
 
 /// Reuse native image entropy while exercising successive reference-slot versions. Every frame
-/// except the final presentation is reference-only; an optional dictionary precedes its body.
+/// except the final presentation is hidden; an optional dictionary precedes its body.
 pub fn assemble_frames(bytes: &[u8], frames: &[FixtureFrame<'_>]) -> Vec<u8> {
     let parsed = jxl_gpu_bitstream::parse(bytes, Default::default()).unwrap();
     let inventory = parsed.codestream_inventory(Default::default()).unwrap();

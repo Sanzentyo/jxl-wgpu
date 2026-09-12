@@ -184,6 +184,27 @@ impl PreparedPhysical {
 }
 
 impl Carry {
+    fn render_patches(
+        &self,
+        surface: &Surface,
+        dictionary: &patches::Dictionary,
+    ) -> Result<GpuWork> {
+        let image = &self.source.inventory.image_header;
+        patches::render(
+            self.source.engine.backend(),
+            surface,
+            &self.references,
+            dictionary,
+            image.extra_channel_count,
+            image.extra_channels.iter().any(|extra| {
+                matches!(
+                    extra.channel_type,
+                    jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
+                )
+            }),
+        )
+    }
+
     fn prepare(
         &self,
         index: usize,
@@ -447,10 +468,15 @@ fn composed_source(
     plan: &FrameExecutionPlan,
 ) -> Result<(SequenceSource, Arc<Compositor>)> {
     validate(inventory, plan)?;
-    if request.progressive_output() && inventory.frames.iter().any(|frame| frame.flags & 2 != 0) {
+    if request.progressive_output()
+        && plan.presentations.iter().any(|presentation| {
+            let frame = &inventory.frames[presentation.physical_frames.end - 1];
+            frame.flags & 2 != 0 && frame.lf_source_frame.is_some()
+        })
+    {
         return Err(UnsupportedProfile::new(
             UnsupportedCodestreamFeature::Patches,
-            "progressive patch rendering is not yet connected",
+            "patch rendering of separate low-frequency previews is not yet connected",
         )
         .into());
     }
@@ -630,6 +656,11 @@ struct PhysicalPending {
 
 #[derive(Debug)]
 enum RefinementRender {
+    Patches {
+        work: GpuWork,
+        source: Surface,
+        index: usize,
+    },
     Transform {
         work: GpuWork,
         source: Surface,
@@ -806,20 +837,7 @@ impl DependentPending {
                     .take()
                     .filter(|dictionary| dictionary.count != 0)
                 {
-                    let image = &carry.source.inventory.image_header;
-                    let work = patches::render(
-                        carry.source.engine.backend(),
-                        &surface,
-                        &carry.references,
-                        &dictionary,
-                        image.extra_channel_count,
-                        image.extra_channels.iter().any(|extra| {
-                            matches!(
-                                extra.channel_type,
-                                jxl_gpu_bitstream::ExtraChannelTypeInventory::Alpha { .. }
-                            )
-                        }),
-                    )?;
+                    let work = carry.render_patches(&surface, &dictionary)?;
                     self.stage = Some(Stage::PatchRender {
                         work,
                         source: surface,
@@ -1128,7 +1146,12 @@ impl DependentPending {
                 }
                 Stage::Refinement {
                     render:
-                        RefinementRender::Transform {
+                        RefinementRender::Patches {
+                            work,
+                            source,
+                            index,
+                        }
+                        | RefinementRender::Transform {
                             work,
                             source,
                             index,
@@ -1300,7 +1323,8 @@ impl DependentPending {
                 Stage::Refinement { resume, render, .. } => {
                     // Final-only completion drains the render, then resumes physical execution.
                     // A blend which has not yet been packed needs no additional presentation work.
-                    let (RefinementRender::Transform { work, .. }
+                    let (RefinementRender::Patches { work, .. }
+                    | RefinementRender::Transform { work, .. }
                     | RefinementRender::Blend(work)
                     | RefinementRender::Pack(work)) = render;
                     drop(work.wait()?);
@@ -1329,6 +1353,31 @@ impl DependentPending {
                 "refinement has no pending physical producer",
             ));
         };
+        if let Some(dictionary) = self
+            .patches
+            .as_ref()
+            .filter(|dictionary| dictionary.count != 0)
+        {
+            let carry = self
+                .carry
+                .as_ref()
+                .ok_or(Error::EngineContract("patch refinement carry was lost"))?;
+            let work = carry.render_patches(&surface, dictionary)?;
+            // Each refinement owns a fresh patched surface. Keep the dictionary and committed
+            // reference versions available for subsequent passes and the final reconstruction.
+            self.stage = Some(Stage::Refinement {
+                compositor: Arc::clone(self.output.compositor()?),
+                resume: Resume::Decode(decode),
+                render: RefinementRender::Patches {
+                    work,
+                    source: surface,
+                    index: self.physical,
+                },
+                progression,
+            });
+            self.count_submission();
+            return Ok(());
+        }
         self.render_refinement(
             Arc::clone(self.output.compositor()?),
             surface,

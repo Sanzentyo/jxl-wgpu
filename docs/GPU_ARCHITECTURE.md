@@ -374,8 +374,11 @@ references. This is an explicit private surface domain, independent of the RGB o
 Patch dictionaries execute in bounded GPU count/validate and command-emission passes; the host
 receives only allocation/status/cursor control. The common executor resumes the remaining
 LF-global body at that cursor, renders ordered patches from four immutable reference versions,
-then converts color and applies ordinary frame composition. Every extra plane remains resident
-through the same stages. The detailed contracts and remaining combination limits are recorded
+then converts color and applies ordinary frame composition. Pass refinements reuse the validated
+dictionary and references, producing a fresh patched surface before display conversion and packing.
+They neither commit reference versions nor consume the dictionary needed by later passes. A final-only
+consumer drains submitted presentation work and resumes the physical producer. Every extra plane
+remains resident through the same stages. The detailed contracts and remaining combination limits are recorded
 in [WGSL memory](WGSL_MEMORY.md#patch-dictionary-and-pre-transform-reference-abi).
 
 Sync and async animation frontends drive one GPU codec state machine. Stream metadata carries the

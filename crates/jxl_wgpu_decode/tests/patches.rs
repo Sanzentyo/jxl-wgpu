@@ -10,6 +10,8 @@ mod hex;
 mod oracle;
 #[path = "support/planes.rs"]
 mod planes;
+#[path = "patches/progression.rs"]
+mod progression;
 
 use jxl_gpu_formats::{PixelFormat, RgbChannelOrder};
 use jxl_wgpu::{WgpuBackend, WgpuBackendConfig};

@@ -198,9 +198,11 @@ Seven nine-layer fixtures cover nine independently typed/depth-coded extras, two
 Gray/RGB, both coding modes, distributed groups and shifted resampling. Patch dictionaries now
 decode on the GPU with Prefix/ANS and LZ77, bounded input windows, and four explicitly tagged
 pre-transform reference slots. Ordered rendering supports all eight patch modes, independently
-selected alpha/extra channels and clamping before inverse color conversion. Patches in LF
-producers, consumers with frame upsampling/noise/subsampled YCbCr, progressive patch output,
-mixed-mode patch conformance and broader original color domains remain pending.
+selected alpha/extra channels and clamping before inverse color conversion. Modular and VarDCT
+pass updates apply the same dictionary to fresh surfaces without changing saved references;
+native prefix snapshots cover color and every extra channel. Patches in LF producers, separate
+LF previews of patch consumers, frame upsampling/noise/subsampled YCbCr, mixed-mode patch
+conformance and broader original color domains remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

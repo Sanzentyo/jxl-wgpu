@@ -812,10 +812,15 @@ Inputs, output, commands and scratch remain owned by completion callbacks after 
 The physical executor projects the GPU-validated end cursor into the remaining LF-global bit
 range without rewriting the authoritative inventory. Modular and VarDCT producers retain
 reconstructed codec components; patch rendering precedes inverse color conversion and ordinary
-frame blending. A saved pre-transform reference keeps those exact component planes. Intermediate
-displays can inverse-transform a separate surface without publishing a reference version.
-The current path rejects LF producer patches, frame upsampling, noise, subsampled YCbCr and progressive
-patch output; their render-stage ordering still needs integration and conformance tests.
+frame blending. A saved pre-transform reference keeps those exact component planes. Each pass
+refinement reuses the validated dictionary and committed references to produce a fresh patched
+surface, followed by inverse color conversion and presentation. No intermediate commits a reference
+or consumes the dictionary needed by later passes. Switching to final-only completion drains only
+submitted presentation work before resuming the physical producer. Patch, conversion and packing
+boundaries have cancellation, exact-reference-identity and allocation-failure coverage.
+The current path rejects LF producer patches, separate LF previews of patch consumers, frame
+upsampling, noise and subsampled YCbCr; their render-stage ordering still needs integration and
+conformance tests.
 
 ## Alpha association at output
 

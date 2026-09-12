@@ -3115,8 +3115,8 @@ failure. Naga validates both shaders with portable capabilities. A separate prog
 contract test checks inverse conversion of displayed pre-transform refinements, unchanged
 reference versions, cancellation and final-only draining.
 
-The path currently rejects LF producer patches, frame upsampling, noise, subsampled YCbCr and progressive
-patch output. Mixed coding-mode patch references, source resampling/crop combinations, spline
+At this checkpoint the path rejected LF producer patches, frame upsampling, noise, subsampled YCbCr and
+progressive patch output. Mixed coding-mode patch references, source resampling/crop combinations, spline
 interactions and official precision fixtures remain open. The normative blend ordering and
 alpha behavior follow [libjxl blending](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/blending.cc);
 [the patch dictionary decoder](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_patch_dictionary.cc)
@@ -3129,3 +3129,53 @@ checks pass. Reference and Metal harnesses each pass 18/18 cases, and the Gray8 
 gate passes. All 54 fixture files regenerate identically. An earlier validation run was stopped
 when review found that LF producer patches could bypass the render stage; an explicit unsupported
 guard and regression test were added before rerunning the complete suite on the final code.
+
+### Progressive GPU patch presentation (2026-09-12)
+
+`patches/progressive/` adds eight streams and eight concatenated F32 snapshot files. Each of four
+families has an empty dictionary and sixteen overlapping occurrences: three-pass VarDCT RGBA,
+two-pass VarDCT gray, two-pass original Modular Squeeze, and three-pass floating VarDCT with nine
+extra channels. The shared assembler retains native image entropy and the complete pass schedule.
+Multipass reference producers use hidden regular frames with zero duration because reference-only
+headers imply one pass. Packet assembly canonicalizes the source TOC order without changing payloads.
+
+Regenerate with the offline libjxl oracle:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_progressive_patches
+```
+
+For every prefix before pass zero through the final pass, the oracle cuts the codestream at the
+first omitted pass-group section and flushes the public native decoder. It also records complete
+decoding. This yields 28 snapshots. Each contains packed RGBA followed by every independent scalar
+extra plane, all F32; XYB sources use native linear output, while original Modular keeps sRGB.
+Snapshot files concatenate these complete images in progression order. The optional `extras`
+argument of `decode_progressive.c` enables scalar-plane output without changing existing callers.
+Prefix flushing follows [libjxl's frame decoder](https://github.com/libjxl/libjxl/blob/v0.12.0/lib/jxl/dec_frame.cc#L694).
+
+Public tests compare color and every extra at each declared pass, including analytic extended
+sRGB presentation of native linear samples. Whole input and 43-byte fragmented transport with
+256-byte GPU windows produce identical words; final-only delivery matches the final update.
+Held output leases remain immutable after later updates, cancellation and deliberate corruption
+of the final AC packet. The latter must fail without retracting valid earlier images. On Metal,
+the Modular family matches exactly, maximum normalized VarDCT color error is below 5.7e-4, and
+extra-channel error is below 1e-7. The existing acceptance bounds remain 3e-3 for VarDCT color and
+2e-6 for alpha/extras; Modular uses 1e-5. These comparisons do not certify ISO precision.
+
+The executor retains one validated dictionary through all refinements. Patch rendering creates
+a fresh component surface before inverse color conversion, blend and pack. Only final physical
+reconstruction publishes references. Private GPU tests stop at submitted patch, conversion and
+pack stages to exercise cancellation, blocking/async final-only draining and allocation failure;
+dictionary identity and all four committed reference identities must remain unchanged.
+
+Separate LF previews of patch consumers still require a component-domain preview path and are
+rejected before submission. LF producer patches, upsampled/noisy/subsampled-YCbCr consumers,
+mixed coding-mode references, spline interactions and official precision conformance remain open.
+
+The completed local regression passes 862 tests across 48 all-feature/all-target workspace targets
+on Apple M5/Metal, plus five doctests; one existing manual benchmark remains ignored. Formatting,
+workspace check, warnings-denied Clippy/rustdoc, Rust 1.89 and six-crate all-feature WebAssembly
+checks pass. Reference and Metal harnesses each pass 18/18 cases, the Gray8 codec readback gate
+passes, and all 70 patch fixture files regenerate identically. The complete test run used one
+unchanged source snapshot; only this validation record and two documentation clarifications
+were applied afterward.

@@ -41,6 +41,27 @@ pub fn native_updates_with_spots(
     flush_prefix: bool,
     render_spots: bool,
 ) -> Option<Vec<NativeUpdate>> {
+    decode_updates(encoded, linear, keep, flush_prefix, render_spots, false)
+}
+
+/// Each snapshot contains packed RGBA followed by every extra channel as a separate f32 plane.
+pub fn native_updates_all_channels(
+    encoded: &[u8],
+    linear: bool,
+    keep: bool,
+    flush_prefix: bool,
+) -> Option<Vec<NativeUpdate>> {
+    decode_updates(encoded, linear, keep, flush_prefix, false, true)
+}
+
+fn decode_updates(
+    encoded: &[u8],
+    linear: bool,
+    keep: bool,
+    flush_prefix: bool,
+    render_spots: bool,
+    extra_planes: bool,
+) -> Option<Vec<NativeUpdate>> {
     use std::process::Command;
     static BINARY: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -103,6 +124,9 @@ pub fn native_updates_with_spots(
     }
     if !render_spots {
         command.arg("no-spots");
+    }
+    if extra_planes {
+        command.arg("extras");
     }
     let decoded = command.output().unwrap();
     assert!(

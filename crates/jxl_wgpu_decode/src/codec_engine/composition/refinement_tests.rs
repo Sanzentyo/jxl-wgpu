@@ -24,8 +24,14 @@ fn references(pending: &DependentPending) -> [Option<wgpu::Buffer>; 4] {
 // Drive real hidden producers and stop at the exact submitted refinement boundary. This avoids
 // relying on a poll happening to catch a short GPU blend or pack before its callback completes.
 fn next_intermediate(pending: &mut DependentPending) -> (GpuImageFrame, FrameProgression) {
-    while pending.physical + 1 != pending.end {
+    while pending.physical + 1 != pending.end
+        || matches!(pending.stage, Some(Stage::PatchDictionary(_)))
+    {
         match pending.stage.take().unwrap() {
+            Stage::PatchDictionary(parser) => {
+                let (dictionary, count) = parser.wait().unwrap();
+                pending.dictionary_decoded(dictionary, count).unwrap();
+            }
             Stage::Decode(PhysicalPending {
                 pending: producer,
                 count,
@@ -359,5 +365,167 @@ fn assert_float_bytes(actual: &[u8], expected: &[u8]) {
             a.is_finite() && (a - b).abs() < 1e-5 * (1.0 + b.abs()),
             "{a} vs {b}"
         );
+    }
+}
+
+fn step_component_refinement(pending: &mut DependentPending, backend: &WgpuBackend, fail: bool) {
+    let Some(Stage::Refinement {
+        compositor,
+        resume,
+        render,
+        progression,
+    }) = pending.stage.take()
+    else {
+        panic!("expected component refinement");
+    };
+    let (RefinementRender::Patches {
+        work,
+        mut source,
+        index,
+    }
+    | RefinementRender::Transform {
+        work,
+        mut source,
+        index,
+    }) = render
+    else {
+        panic!("expected patch or transform work");
+    };
+    source.buffer = work.wait().unwrap();
+    let next = || pending.render_refinement(compositor, source, index, resume, progression);
+    if fail {
+        require_allocation_failure(backend, next);
+    } else {
+        next().unwrap();
+    }
+}
+
+#[test]
+fn patch_refinements_preserve_dictionary_and_references_across_cancel_drain_and_admission() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let compact = include_str!("../../../test-data/patches/progressive/vardct.jxl.hex")
+        .split_whitespace()
+        .collect::<String>();
+    let data: Arc<[u8]> = compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>()
+        .into();
+    let inventory = jxl_gpu_bitstream::parse(&data, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    let plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
+    let source = Arc::new(GpuCodestream::from_shared(data.clone(), 0..data.len(), false).unwrap());
+    let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    let request = GpuOutputRequest::color(jxl_gpu_formats::PixelFormat::rgb_f32(
+        jxl_gpu_formats::RgbChannelOrder::Rgba,
+        false,
+        crate::vardct_rgb8_format().color_spec,
+    ))
+    .unwrap()
+    .with_progressive_output(true);
+    let session = || {
+        DependentSession::new(engine.clone(), source.clone(), &inventory, &request, &plan).unwrap()
+    };
+    let mut baseline = session();
+    let mut pending = baseline.submit(&plan, 0).unwrap();
+    let update =
+        pollster::block_on(std::future::poll_fn(|cx| pending.poll_update(cx, true))).unwrap();
+    let SubmittedGpuUpdate::Intermediate { frame, .. } = update else {
+        panic!("expected CID")
+    };
+    let expected_update = bytes(&frame.output, &backend);
+    drop(frame);
+    let frame = pending.wait().unwrap();
+    let expected = (frame.metadata.clone(), bytes(&frame.output, &backend));
+    drop((frame, baseline));
+    for boundary in 0..3 {
+        for action in 0..5 {
+            let mut session = session();
+            let mut pending = session.submit(&plan, 0).unwrap();
+            let (frame, progression) = next_intermediate(&mut pending);
+            let references_before = references(&pending);
+            let dictionary_before = pending
+                .patches
+                .as_ref()
+                .unwrap()
+                .commands
+                .as_wgpu_buffer()
+                .clone();
+            assert_eq!(references_before.iter().filter(|r| r.is_some()).count(), 1);
+            if action == 4 && boundary == 0 {
+                require_allocation_failure(&backend, || pending.refine(frame, progression));
+            } else {
+                pending.refine(frame, progression).unwrap();
+                assert!(matches!(
+                    &pending.stage,
+                    Some(Stage::Refinement {
+                        render: RefinementRender::Patches { .. },
+                        ..
+                    })
+                ));
+                for step in 0..boundary {
+                    step_component_refinement(
+                        &mut pending,
+                        &backend,
+                        action == 4 && step + 1 == boundary,
+                    );
+                }
+            }
+            assert_eq!(references(&pending), references_before);
+            assert_eq!(
+                pending.patches.as_ref().unwrap().commands.as_wgpu_buffer(),
+                &dictionary_before
+            );
+            assert!(matches!(
+                pending.unvalidated(),
+                Err(Error::UnvalidatedOutputNotSubmitted)
+            ));
+            if action == 0 || action == 4 {
+                drop(pending);
+                assert!(matches!(
+                    session.submit(&plan, 0),
+                    Err(Error::SessionPoisoned)
+                ));
+            } else {
+                if action == 3 {
+                    let update = pollster::block_on(std::future::poll_fn(|cx| {
+                        pending.poll_update(cx, true)
+                    }))
+                    .unwrap();
+                    let SubmittedGpuUpdate::Intermediate { frame, .. } = update else {
+                        panic!("expected patched CID")
+                    };
+                    assert_eq!(bytes(&frame.output, &backend), expected_update);
+                    assert_eq!(references(&pending), references_before);
+                    assert_eq!(
+                        pending.patches.as_ref().unwrap().commands.as_wgpu_buffer(),
+                        &dictionary_before
+                    );
+                }
+                let frame = if action == 2 {
+                    pollster::block_on(std::future::poll_fn(|cx| pending.poll(cx))).unwrap()
+                } else {
+                    pending.wait().unwrap()
+                };
+                assert_eq!(frame.metadata, expected.0);
+                assert_eq!(bytes(&frame.output, &backend), expected.1);
+            }
+            drop(session);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while backend.transient_memory_budget().snapshot().reserved_bytes != 0
+                && std::time::Instant::now() < deadline
+            {
+                backend.device().poll(wgpu::PollType::Poll).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(
+                backend.transient_memory_budget().snapshot().reserved_bytes,
+                0,
+                "boundary {boundary}, action {action}"
+            );
+        }
     }
 }

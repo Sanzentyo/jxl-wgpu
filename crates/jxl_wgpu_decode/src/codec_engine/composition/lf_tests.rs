@@ -53,6 +53,38 @@ fn lf_patch_flags_are_rejected_before_the_dependency_path_can_skip_rendering() {
     assert!(checked > 0);
 }
 
+#[test]
+fn patch_consumers_reject_rgb_lf_previews_before_any_submission() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    let bytes: Arc<[u8]> = data(false).into();
+    let mut inventory = jxl_gpu_bitstream::parse(&bytes, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    let plan = FrameExecutionPlan::negotiate(&inventory).unwrap();
+    let consumer = plan
+        .presentations
+        .iter()
+        .map(|p| p.physical_frames.end - 1)
+        .find(|&index| inventory.frames[index].lf_source_frame.is_some())
+        .unwrap();
+    // A metadata admission check: no patch symbols are decoded from this unmodified fixture.
+    inventory.frames[consumer].flags |= 2;
+    let source =
+        Arc::new(GpuCodestream::from_shared(bytes.clone(), 0..bytes.len(), false).unwrap());
+    let engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+    let request = GpuOutputRequest::color(crate::vardct_rgb8_format()).unwrap();
+    assert!(composed_source(engine.clone(), source.clone(), &inventory, &request, &plan).is_ok());
+    assert!(
+        matches!(composed_source(engine, source, &inventory, &request.with_progressive_output(true), &plan),
+        Err(Error::UnsupportedProfile(error)) if error.feature == UnsupportedCodestreamFeature::Patches)
+    );
+    assert_eq!(
+        backend.transient_memory_budget().snapshot().reserved_bytes,
+        0
+    );
+}
+
 fn read(backend: &WgpuBackend, frame: &GpuImageFrame) -> Vec<u8> {
     ImageReadbackPipeline::new(backend)
         .submit(frame)

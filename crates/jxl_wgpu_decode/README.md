@@ -642,8 +642,11 @@ patch modes, independent alpha/extra-channel selection, clamping and association
 occurrence order from four resident reference versions. GPU inverse color conversion and ordinary
 frame blending follow patch rendering. Native fixtures cover empty/nonempty dictionaries,
 original and XYB color, integer/F32 samples and straight/associated alpha under whole and bounded
-fragmented input. LF producer patches, frame-upsampled/noisy/subsampled-YCbCr consumers,
-progressive patch output and mixed coding-mode patch conformance remain open.
+fragmented input. Modular and VarDCT pass updates apply the same dictionary to fresh surfaces
+without changing saved references. Native prefix snapshots cover color and every extra channel;
+cancellation, final-only switching and staged allocation failure preserve committed versions.
+LF producer patches, separate LF previews of patch consumers, frame-upsampled/noisy/subsampled-YCbCr
+consumers and mixed coding-mode patch conformance remain open.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and
 use the shared `jxl_wgpu::ResidentNoisePipeline` after restoration and frame upsampling, before

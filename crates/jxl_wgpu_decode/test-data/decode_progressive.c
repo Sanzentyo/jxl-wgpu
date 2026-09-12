@@ -1,4 +1,4 @@
-/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear] [keep] [prefix] [no-spots]]].
+/* Offline libjxl oracle: INPUT [CHUNK_BYTES [SNAPSHOT_PREFIX [linear] [keep] [prefix] [no-spots] [extras]]].
  * Production decoding does not link to this helper. Use whole input for noisy
  * images: libjxl 0.12.0 retries incomplete frame headers without rolling back
  * its persistent noise-frame counters. GPU fragmented input is tested separately.
@@ -14,13 +14,14 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
-  if (argc < 2 || argc > 8) return 2;
-  int linear = 0, keep = 0, flush_prefix = 0, spots = 1;
+  if (argc < 2 || argc > 9) return 2;
+  int linear = 0, keep = 0, flush_prefix = 0, spots = 1, extras = 0;
   for (int arg = 4; arg < argc; ++arg) {
     if (strcmp(argv[arg], "linear") == 0) linear = 1;
     else if (strcmp(argv[arg], "keep") == 0) keep = 1;
     else if (strcmp(argv[arg], "prefix") == 0) flush_prefix = 1;
     else if (strcmp(argv[arg], "no-spots") == 0) spots = 0;
+    else if (strcmp(argv[arg], "extras") == 0) extras = 1;
     else return 2;
   }
   FILE *input = fopen(argv[1], "rb");
@@ -41,8 +42,9 @@ int main(int argc, char **argv) {
   if (JxlDecoderSetRenderSpotcolors(decoder, spots) != JXL_DEC_SUCCESS) return 3;
   JxlBasicInfo info;
   const JxlPixelFormat format = {4, JXL_TYPE_FLOAT, JXL_LITTLE_ENDIAN, 0};
+  const JxlPixelFormat scalar_format = {1, JXL_TYPE_FLOAT, JXL_LITTLE_ENDIAN, 0};
   float *pixels = NULL;
-  size_t output_bytes = 0, frame = 0, step = 0;
+  size_t output_bytes = 0, storage_bytes = 0, frame = 0, step = 0;
   int closed = 0;
   for (;;) {
     JxlDecoderStatus status = JxlDecoderProcessInput(decoder);
@@ -62,9 +64,24 @@ int main(int argc, char **argv) {
       printf("frame,%zu,%u,%u,%u\n", frame, header.duration, header.timecode, header.is_last);
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
       if (JxlDecoderImageOutBufferSize(decoder, &format, &output_bytes) != JXL_DEC_SUCCESS) return 3;
+      storage_bytes = output_bytes;
+      if (extras) {
+        for (uint32_t c = 0; c < info.num_extra_channels; ++c) {
+          size_t plane_bytes;
+          if (JxlDecoderExtraChannelBufferSize(decoder, &scalar_format, &plane_bytes, c) != JXL_DEC_SUCCESS || plane_bytes != output_bytes / 4 || plane_bytes > SIZE_MAX - storage_bytes) return 3;
+          storage_bytes += plane_bytes;
+        }
+      }
       free(pixels);
-      pixels = calloc(1, output_bytes);
+      pixels = calloc(1, storage_bytes);
       if (!pixels || JxlDecoderSetImageOutBuffer(decoder, &format, pixels, output_bytes) != JXL_DEC_SUCCESS) return 3;
+      if (extras) {
+        for (uint32_t c = 0; c < info.num_extra_channels; ++c) {
+          size_t plane_bytes = output_bytes / 4;
+          unsigned char *plane = (unsigned char *)pixels + output_bytes + c * plane_bytes;
+          if (JxlDecoderSetExtraChannelBuffer(decoder, &scalar_format, plane, plane_bytes, c) != JXL_DEC_SUCCESS) return 3;
+        }
+      }
     } else if (status == JXL_DEC_FRAME_PROGRESSION || status == JXL_DEC_FULL_IMAGE ||
                (flush_prefix && status == JXL_DEC_NEED_MORE_INPUT && delivered == (size_t)length)) {
       int final = status == JXL_DEC_FULL_IMAGE;
@@ -75,8 +92,8 @@ int main(int argc, char **argv) {
       }
       uint64_t hash = UINT64_C(14695981039346656037);
       size_t nonfinite = 0;
-      for (size_t i = 0; i < output_bytes / sizeof(float); ++i) if (!isfinite(pixels[i])) ++nonfinite;
-      for (size_t i = 0; i < output_bytes; ++i) { hash ^= ((unsigned char*)pixels)[i]; hash *= UINT64_C(1099511628211); }
+      for (size_t i = 0; i < storage_bytes / sizeof(float); ++i) if (!isfinite(pixels[i])) ++nonfinite;
+      for (size_t i = 0; i < storage_bytes; ++i) { hash ^= ((unsigned char*)pixels)[i]; hash *= UINT64_C(1099511628211); }
       size_t remaining = JxlDecoderReleaseInput(decoder);
       size_t consumed = delivered - remaining;
       printf("%s,%zu,%zu,%zu,%zu,%zu,%016llx\n", final ? "final" : "progress", frame, step++, final ? 1 : JxlDecoderGetIntendedDownsamplingRatio(decoder), consumed, nonfinite, (unsigned long long)hash);
@@ -86,7 +103,7 @@ int main(int argc, char **argv) {
         int count = snprintf(output_path, sizeof(output_path), "%s-frame%zu-step%zu-%s.f32", argv[3], frame, step - 1, final ? "final" : "progress");
         if (count < 0 || (size_t)count >= sizeof(output_path)) return 2;
         FILE *output = fopen(output_path, "wb");
-        if (!output || fwrite(pixels, 1, output_bytes, output) != output_bytes || fclose(output)) return 2;
+        if (!output || fwrite(pixels, 1, storage_bytes, output) != storage_bytes || fclose(output)) return 2;
       }
       if (prefix_end) break;
       if (final) ++frame;
