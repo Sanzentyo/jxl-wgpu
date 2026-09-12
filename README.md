@@ -218,8 +218,9 @@ GPU spline entropy decoding, bounded Catmull–Rom geometry and ordered tile ren
 after patches and before frame upsampling/noise. Both codecs, LF producers/consumers, numeric
 extras and immutable progressive updates have dedicated coverage. The official 60-frame
 `animation_spline` float32 reference passes its per-frame RMSE and peak-error limits under whole
-and bounded fragmented input. Modular YCbCr, broader original color domains and unequal late
-color/extra resampling remain pending.
+and bounded fragmented input. Independent plane extents now support unequal color/extra factors:
+extras use one complete interpolation filter before splines while color is expanded afterward.
+Modular YCbCr and broader original color domains remain pending.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

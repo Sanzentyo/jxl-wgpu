@@ -78,6 +78,35 @@ pub(super) fn generate_patch_seeds(temporary: &Path, output: &Path, decoder: &Pa
     }
 }
 
+/// Unmodified native progressive frames with unequal color/extra interpolation factors.
+pub(super) fn generate_resampling_seeds(temporary: &Path, output: &Path, decoder: &Path) {
+    let manifest = std::fs::read_to_string(temporary.join("resampling.txt")).unwrap();
+    for name in manifest.lines() {
+        let data = std::fs::read(temporary.join(format!("{name}.jxl"))).unwrap();
+        let parsed = jxl_gpu_bitstream::parse(&data, Default::default()).unwrap();
+        let inventory = parsed.codestream_inventory(Default::default()).unwrap();
+        assert_eq!(inventory.frames.len(), 1);
+        let frame = &inventory.frames[0];
+        assert!(frame.num_passes > 1, "{name}: {} passes", frame.num_passes);
+        assert!(
+            frame
+                .extra_channel_upsampling
+                .iter()
+                .all(|&factor| factor > frame.upsampling)
+        );
+        validate(decoder, temporary, parsed.codestream());
+        std::fs::write(
+            output.join(format!("{name}.jxl.hex")),
+            hex::hex(parsed.codestream()),
+        )
+        .unwrap();
+        eprintln!(
+            "{name}: color {}, extras {:?}, {} passes",
+            frame.upsampling, frame.extra_channel_upsampling, frame.num_passes
+        );
+    }
+}
+
 fn crops(
     temporary: &Path,
     output: &Path,

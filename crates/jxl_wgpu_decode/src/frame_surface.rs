@@ -1,6 +1,6 @@
 //! Private frame storage with an explicit codec-component or RGB domain. All planes share one
-//! accounted allocation; output
-//! views carry their actual offsets instead of hiding extra samples beyond an RGB layout.
+//! accounted allocation; each view carries its own extent and offset, including extra channels
+//! that have already been upsampled while color components still await frame features.
 
 use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, SampleKind};
 use jxl_gpu_protocol::{ChangedRegions, Extent2d, OutputId, Region};
@@ -67,7 +67,7 @@ pub enum FrameSurfaceError {
 pub(crate) struct FrameSurfaceLayout {
     pub color: ImageLayout,
     pub extras: Vec<ImageLayout>,
-    pub plane_bytes: u64,
+    pub color_plane_bytes: u64,
     pub storage_bytes: u64,
 }
 
@@ -86,9 +86,22 @@ impl FrameSurfaceLayout {
         encoding: FrameSurfaceEncoding,
         limits: &wgpu::Limits,
     ) -> Result<Self, FrameSurfaceError> {
+        Self::with_extra_extents(
+            extent,
+            std::iter::repeat_n(extent, extra_count),
+            encoding,
+            limits,
+        )
+    }
+
+    pub(crate) fn with_extra_extents(
+        extent: Extent2d,
+        extra_extents: impl ExactSizeIterator<Item = Extent2d> + Clone,
+        encoding: FrameSurfaceEncoding,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, FrameSurfaceError> {
         let format = encoding.format();
         let color = ImageLayout::packed(extent, format)?;
-        let scalar_bytes = color.planes[0].end_offset()?;
         let alignment = u64::from(limits.min_storage_buffer_offset_alignment).max(4);
         let available = limits
             .max_buffer_size
@@ -99,14 +112,40 @@ impl FrameSurfaceLayout {
             required: u64::MAX,
             available,
         };
-        let plane_bytes = scalar_bytes
-            .checked_add(alignment - 1)
-            .map(|bytes| bytes / alignment * alignment)
-            .ok_or_else(overflow)?;
-        let storage_bytes = (extra_count as u64)
+        let aligned_bytes = |bytes: u64| {
+            bytes
+                .checked_add(alignment - 1)
+                .map(|bytes| bytes / alignment * alignment)
+                .ok_or_else(overflow)
+        };
+        let color_plane_bytes = aligned_bytes(color.planes[0].end_offset()?)?;
+        // Reject an impossible channel count before walking the iterator or allocating views.
+        let minimum_bytes = (extra_extents.len() as u64)
             .checked_add(3)
-            .and_then(|count| count.checked_mul(plane_bytes))
+            .and_then(|count| count.checked_mul(alignment))
             .ok_or_else(overflow)?;
+        if minimum_bytes > available {
+            return Err(FrameSurfaceError::Limit {
+                resource: "storage",
+                required: minimum_bytes,
+                available,
+            });
+        }
+        let scalar_format = PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]);
+        let mut storage_bytes = color_plane_bytes.checked_mul(3).ok_or_else(overflow)?;
+        for extra_extent in extra_extents.clone() {
+            let scalar = ImageLayout::packed(extra_extent, scalar_format.clone())?;
+            storage_bytes = storage_bytes
+                .checked_add(aligned_bytes(scalar.logical_size)?)
+                .ok_or_else(overflow)?;
+            if storage_bytes > available {
+                return Err(FrameSurfaceError::Limit {
+                    resource: "storage",
+                    required: storage_bytes,
+                    available,
+                });
+            }
+        }
         if storage_bytes > available {
             return Err(FrameSurfaceError::Limit {
                 resource: "storage",
@@ -119,32 +158,44 @@ impl FrameSurfaceLayout {
             .into_iter()
             .enumerate()
             .map(|(index, mut plane)| {
-                plane.offset = index as u64 * plane_bytes;
+                plane.offset = index as u64 * color_plane_bytes;
                 plane
             })
             .collect();
         let color = ImageLayout::from_planes(extent, color.format, planes)?;
-        let scalar = ImageLayout::packed(
-            extent,
-            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
-        )?;
-        let extras = (0..extra_count)
-            .map(|index| {
-                let mut planes = scalar.planes.clone();
-                planes[0].offset = (3 + index as u64) * plane_bytes;
-                ImageLayout::from_planes(extent, scalar.format.clone(), planes)
+        let mut offset = 3 * color_plane_bytes;
+        let extras = extra_extents
+            .map(|extra_extent| {
+                let mut scalar = ImageLayout::packed(extra_extent, scalar_format.clone())?;
+                scalar.planes[0].offset = offset;
+                offset += aligned_bytes(scalar.logical_size)?;
+                Ok::<_, FrameSurfaceError>(ImageLayout::from_planes(
+                    extra_extent,
+                    scalar.format,
+                    scalar.planes,
+                )?)
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
             color,
             extras,
-            plane_bytes,
+            color_plane_bytes,
             storage_bytes,
         })
     }
 
     pub(crate) fn layouts(&self) -> impl Iterator<Item = &ImageLayout> {
         std::iter::once(&self.color).chain(&self.extras)
+    }
+
+    pub(crate) fn has_uniform_extent(&self) -> bool {
+        self.extras
+            .iter()
+            .all(|extra| extra.extent == self.color.extent)
+    }
+
+    pub(crate) fn set_encoding(&mut self, encoding: FrameSurfaceEncoding) {
+        self.color.format = encoding.format();
     }
 }
 
@@ -249,5 +300,59 @@ mod tests {
                 .len(),
             10
         );
+    }
+
+    #[test]
+    fn early_extra_resampling_has_independent_extents_and_checked_offsets() {
+        let limits = wgpu::Limits::default();
+        let color = Extent2d::new(13, 9);
+        let extra = Extent2d::new(25, 17);
+        let layout = FrameSurfaceLayout::with_extra_extents(
+            color,
+            [extra, color].into_iter(),
+            FrameSurfaceEncoding::Encoded,
+            &limits,
+        )
+        .unwrap();
+        assert!(!layout.has_uniform_extent());
+        assert_eq!(layout.extras[0].extent, extra);
+        assert_eq!(layout.extras[1].extent, color);
+        assert_eq!(
+            layout.extras[0].planes[0].offset,
+            layout.color_plane_bytes * 3
+        );
+        assert_eq!(
+            layout.extras[1].planes[0].offset,
+            layout.color_plane_bytes * 3 + 1792
+        );
+        assert_eq!(layout.storage_bytes, layout.color_plane_bytes * 4 + 1792);
+        let changed = changed_regions(&layout.color, Some(&layout));
+        assert_eq!(changed.outputs[&OutputId(1)], [Region::new(0, 0, 25, 17)]);
+        let exact = wgpu::Limits {
+            max_buffer_size: layout.storage_bytes,
+            ..limits.clone()
+        };
+        assert!(
+            FrameSurfaceLayout::with_extra_extents(
+                color,
+                [extra, color].into_iter(),
+                FrameSurfaceEncoding::Encoded,
+                &exact
+            )
+            .is_ok()
+        );
+        let too_small = wgpu::Limits {
+            max_buffer_size: layout.storage_bytes - 1,
+            ..limits
+        };
+        assert!(matches!(
+            FrameSurfaceLayout::with_extra_extents(
+                color,
+                [extra, color].into_iter(),
+                FrameSurfaceEncoding::Encoded,
+                &too_small
+            ),
+            Err(FrameSurfaceError::Limit { .. })
+        ));
     }
 }

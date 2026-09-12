@@ -27,9 +27,15 @@ pub(super) fn convert(
             "inverse color transform requires codec components",
         ));
     }
+    let plane_words = source.uniform_plane_words()?;
+    if source.layout.extras.len() != image.extra_channels.len() {
+        return Err(Error::EngineContract(
+            "inverse color transform extra channel count",
+        ));
+    }
     let device = backend.device();
     let layout = FrameSurfaceLayout::with_encoding(
-        source.extent,
+        source.extent(),
         image.extra_channels.len(),
         encoding,
         &device.limits(),
@@ -57,15 +63,15 @@ pub(super) fn convert(
     let planes = [0u64, 1, 2].map(|channel| ColorOutputPlane {
         storage: ResidentStorageBinding {
             buffer: source.buffer.as_wgpu_buffer(),
-            offset: channel * u64::from(source.plane_words) * 4,
-            size: NonZeroU64::new(u64::from(source.plane_words) * 4).expect("nonempty component"),
+            offset: channel * u64::from(plane_words) * 4,
+            size: NonZeroU64::new(u64::from(plane_words) * 4).expect("nonempty component"),
         },
-        width: source.extent.width,
-        height: source.extent.height,
-        stride: source.extent.width,
+        width: source.extent().width,
+        height: source.extent().height,
+        stride: source.extent().width,
     });
     let config = ColorOutputConfig {
-        extent: source.extent,
+        extent: source.extent(),
         orientation: OutputOrientation::Identity,
         transform: if image.xyb_encoded {
             ColorOutputTransform::Xyb(
@@ -103,7 +109,7 @@ pub(super) fn convert(
             plane.offset,
             output.as_wgpu_buffer(),
             plane.offset,
-            u64::from(source.extent.width) * u64::from(source.extent.height) * 4,
+            u64::from(source.extent().width) * u64::from(source.extent().height) * 4,
         );
     }
     submit_recorded(

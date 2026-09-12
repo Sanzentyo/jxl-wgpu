@@ -9,7 +9,8 @@ fn spline_and_patch_passes_match_native_prefixes_and_keep_prior_images_immutable
     let backend = backend();
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/splines/progressive");
-    for &(name, _) in splines::PROGRESSIVE_SOURCES {
+    for case in splines::progressive_cases() {
+        let name = &case.name;
         let data =
             hex::unhex(&std::fs::read_to_string(root.join(format!("{name}.jxl.hex"))).unwrap());
         let info = jxl_gpu_bitstream::parse(&data, Default::default())
@@ -77,7 +78,7 @@ fn spline_and_patch_passes_match_native_prefixes_and_keep_prior_images_immutable
                 let mut held = Vec::new();
                 let mut outputs = Vec::new();
                 while let Some(update) = pollster::block_on(session.next_update_async()).unwrap() {
-                    let index = held.len();
+                    let index = usize::from(case.first_pass) + held.len();
                     if let Some(progression) = update.progression() {
                         assert_eq!(progression.physical_frame_index(), main.frame_index);
                         assert_eq!(progression.completed_passes(), Some(index as u8));
@@ -103,7 +104,10 @@ fn spline_and_patch_passes_match_native_prefixes_and_keep_prior_images_immutable
                     outputs.push(actual);
                     held.push(update);
                 }
-                assert_eq!(held.len(), main.num_passes as usize + 1);
+                assert_eq!(
+                    held.len(),
+                    (main.num_passes - u32::from(case.first_pass)) as usize + 1
+                );
                 for (update, expected) in held.iter().zip(&outputs) {
                     assert_eq!(
                         &planes::read(&backend, &update.output().outputs[0]),

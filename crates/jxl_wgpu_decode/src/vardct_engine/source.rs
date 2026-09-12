@@ -413,20 +413,24 @@ pub(super) fn prepare_packet_source(
                 ))
             })
             .collect::<Result<Vec<_>, crate::modular_render::ModularRenderError>>()?;
-        let deferred_factor = if request.defers_frame_features() {
-            packet.profile.upsampling
-        } else {
-            1
-        };
-        Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
+        let resampling = crate::frame_resampling::FrameResampling::new(
             jxl_gpu_protocol::Extent2d::new(
-                packet.profile.output_width.div_ceil(deferred_factor),
-                packet.profile.output_height.div_ceil(deferred_factor),
+                packet.profile.output_width,
+                packet.profile.output_height,
             ),
+            packet.profile.upsampling,
+            &frame.extra_channel_upsampling,
+        );
+        Ok::<_, VarDctDecodeError>(crate::modular_render::ModularRenderPlan::new(
             sources,
             extra_indices
                 .iter()
-                .map(|&index| frame.extra_channel_upsampling[index] / deferred_factor)
+                .map(|&index| {
+                    resampling.extra(
+                        frame.extra_channel_upsampling[index],
+                        request.frame_render_stage(),
+                    )
+                })
                 .collect(),
             &inventory.image_header.upsampling_weights,
             &backend.device().limits(),

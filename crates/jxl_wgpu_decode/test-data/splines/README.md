@@ -26,13 +26,17 @@ to recreate the compressed array.
 
 ## Generated feature and progression streams
 
-`features/` contains 58 explicit scenarios from
+`features/` contains 68 explicit scenarios from
 `jxl_test_support::fixtures::splines::cases()`: both coding modes, original/XYB color, positive and
 negative quantization adjustments, curved control points leaving/re-entering the frame, signed
 coefficients/thickness, patches and reference overwrites, noise, standard/custom upsampling,
 single/nested LF producers and consumers, independent extras and subsampled JPEG restoration.
-`progressive/` contains four two-frame patch/spline chains with native snapshots of every pass
-and final output, including Gray/RGBA and mixed-precision extra channels.
+Ten scenarios cover unequal 2/8 color/extra factors in ordinary images and LF roots, including
+integer/float extras and custom weights. `progressive/` contains four two-frame patch/spline
+chains plus eight spline-only streams with 2/4, 2/8 and 4/8 factors, signed float depth and
+standard/custom kernels. Native snapshots retain every pass and final output. Empty leading
+Modular prefixes have native reference snapshots but produce no GPU update until image samples
+have been validated; the manifest states the first emitted pass explicitly.
 
 Each `.jxl.hex` freezes the complete input. A feature `.f32.hex` contains final interleaved linear
 RGBA followed by one planar scalar array per declared extra. A progressive reference repeats
@@ -40,6 +44,12 @@ that layout for every native pass prefix and final frame; its color is linear fo
 and unchanged sRGB for original-color sources. All references preserve alpha and orientation.
 Run `cargo run -p jxl_wgpu_decode --example regenerate_splines` with the native libjxl oracle
 configured as described in `docs/CONFORMANCE_CORPUS.md` to regenerate these files.
+Generate the unequal progressive seeds first:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- \
+  crates/jxl_wgpu_decode/test-data/frame_resampling --resampling
+```
 
 Reference selection is fixed in the scenario manifest. Original-color feature streams use
 unconverted native sRGB and the analytic signed f64 EOTF because libjxl 0.12's CMS approximates

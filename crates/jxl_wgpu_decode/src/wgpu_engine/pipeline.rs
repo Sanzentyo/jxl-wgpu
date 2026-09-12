@@ -439,15 +439,14 @@ impl WgpuSubmissionEngine {
             })
             .transpose()?;
         let modular_metadata: Arc<[u32]> = modular_metadata.into();
-        let deferred_factor = if request.defers_frame_features() {
-            profile.channel_upsampling[0]
-        } else {
-            1
-        };
-        let extent = Extent2d::new(
-            profile.output_width.div_ceil(deferred_factor),
-            profile.output_height.div_ceil(deferred_factor),
+        let color_count = profile.channels.color_count() as usize;
+        let resampling = crate::frame_resampling::FrameResampling::new(
+            Extent2d::new(profile.output_width, profile.output_height),
+            profile.channel_upsampling[0],
+            &profile.channel_upsampling[color_count..],
         );
+        let stage = request.frame_render_stage();
+        let extent = resampling.color(stage).extent;
         let mut output = OutputPlan::new(
             extent,
             profile.orientation,
@@ -458,20 +457,28 @@ impl WgpuSubmissionEngine {
         )?;
         output.source_channels = output_channels;
         if request.retains_frame_surface() {
-            let surface = crate::frame_surface::FrameSurfaceLayout::with_encoding(
+            let surface = crate::frame_surface::FrameSurfaceLayout::with_extra_extents(
                 extent,
-                profile.extra_channels.len(),
+                profile.channel_upsampling[color_count..]
+                    .iter()
+                    .map(|&factor| resampling.extra(factor, stage).extent),
                 request.frame_surface_encoding(),
                 &self.backend.device().limits(),
             )?;
             output.layout = surface.color.clone();
             output.surface = Some(Arc::new(surface));
         }
-        let factors: Vec<_> = output
+        let channels: Vec<_> = output
             .source_channels
             .indices
             .iter()
-            .map(|&index| profile.channel_upsampling[index] / deferred_factor)
+            .map(|&index| {
+                if index < color_count {
+                    resampling.color(stage)
+                } else {
+                    resampling.extra(profile.channel_upsampling[index], stage)
+                }
+            })
             .collect();
         let color_render = request
             .extra_channel()
@@ -508,26 +515,24 @@ impl WgpuSubmissionEngine {
                 color_render.ok_or(Error::EngineContract(
                     "LF reconstruction configuration is missing",
                 ))?,
-                extent,
                 &output
                     .source_channels
                     .select(&inverse.final_gpu_layouts())?,
-                &factors,
+                &channels,
                 &profile.upsampling_weights,
                 &self.backend.device().limits(),
             )?);
-        } else if factors.iter().any(|&factor| factor != 1) || color_render.is_some() {
+        } else if channels.iter().any(|channel| channel.factor != 1) || color_render.is_some() {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
                 &frame.inverse_plan
             } else {
                 &profile.resident_entropy_plans[0].inverse_plan
             };
             let render = crate::modular_render::ModularRenderPlan::new(
-                extent,
                 output
                     .source_channels
                     .select(&inverse.final_gpu_layouts())?,
-                factors,
+                channels,
                 &profile.upsampling_weights,
                 &self.backend.device().limits(),
             )?;

@@ -184,9 +184,19 @@ pub(super) fn prepare_presentation(
     let surface = request
         .retains_frame_surface()
         .then(|| {
-            crate::frame_surface::FrameSurfaceLayout::with_encoding(
+            let frame = &inventory.frames[0];
+            let resampling = crate::frame_resampling::FrameResampling::new(
+                Extent2d::new(profile.output_width, profile.output_height),
+                profile.upsampling,
+                &frame.extra_channel_upsampling,
+            );
+            crate::frame_surface::FrameSurfaceLayout::with_extra_extents(
                 output_config.output_extent(),
-                inventory.image_header.extra_channels.len(),
+                frame.extra_channel_upsampling.iter().map(|&factor| {
+                    resampling
+                        .extra(factor, request.frame_render_stage())
+                        .extent
+                }),
                 request.frame_surface_encoding(),
                 &backend.device().limits(),
             )

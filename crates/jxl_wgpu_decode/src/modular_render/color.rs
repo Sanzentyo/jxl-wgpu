@@ -122,7 +122,11 @@ impl ColorPlan {
         if sources.len() < 3 || factors.len() != sources.len() || planes.len() != sources.len() {
             return invalid("color reconstruction requires three selected color planes");
         }
-        if factors[..3].iter().any(|&factor| factor != factors[0]) {
+        if factors[..3].iter().any(|&factor| factor != factors[0])
+            || planes[..3].iter().any(|plane| {
+                plane.layout.width != extent.width || plane.layout.height != extent.height
+            })
+        {
             return invalid("Modular color reconstruction requires equal color grids");
         }
         let output_config = ColorOutputConfig {
@@ -710,9 +714,8 @@ mod tests {
                     };
                     let plan = ModularLfPlan::new(
                         config,
-                        extent,
                         &[source; 3],
-                        &[factor; 3],
+                        &[crate::frame_resampling::ChannelResampling { extent, factor }; 3],
                         &weights,
                         &backend.device().limits(),
                     )

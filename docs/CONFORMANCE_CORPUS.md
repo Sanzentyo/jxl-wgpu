@@ -3519,8 +3519,8 @@ allocation failure preserve previously committed references and drain the shared
 
 Production parses feature prefixes through a shared bounded GPU runner, completes resident
 geometry before body submission, then renders patches, splines, upsampling and noise before LF
-prediction/reference publication. It introduces no CPU pixel-codec fallback. Unequal late
-color/extra upsampling, Modular YCbCr, broader original-color profiles and the rest of the official
+prediction/reference publication. It introduces no CPU pixel-codec fallback. Unequal color/extra
+upsampling is covered by the addition below. Modular YCbCr, broader original-color profiles and the rest of the official
 conformance corpus remain open under the active full JPEG XL goal. Rust 1.98 is the minimum
 supported compiler.
 
@@ -3536,3 +3536,70 @@ identically. Source and fixture hashes confirm one unchanged implementation duri
 48.2-minute workspace test run; only documentation was updated afterward. The decoder's production
 dependency tree is unchanged, with the new gzip reader confined to development dependencies.
 The full JPEG XL goal remains active.
+
+## Independent channel resampling around frame features (2026-09-13)
+
+`FrameResampling` shares the early/late schedule between Modular, VarDCT and common feature
+completion. If any extra factor differs from color, every extra channel uses its complete
+interpolation factor before splines, and only color expands afterward. Equal-rate extras may
+share late interpolation. This follows the reference stage order in
+[libjxl dec_cache.cc](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/dec_cache.cc#L172).
+Splitting one extra filter into an early quotient and a late color factor is numerically different.
+The patch-specific restriction in
+[libjxl dec_frame.cc](https://github.com/libjxl/libjxl/blob/a7a9c787341cf703dede03c2009fa460cae5e5df/lib/jxl/dec_frame.cc#L272)
+still applies: resampled patch-bearing frames require equal color/extra factors. The public
+admission error is `PatchExtraUpsampling`.
+
+`FrameSurfaceLayout` now carries actual per-plane extents, strides and aligned offsets. Coded
+color and fully expanded extras coexist in one checked allocation. Completed references,
+blending and presentation require uniform extents. Modular normalization, LF-extra reconstruction
+and finalization all use the selected channel's actual target grid. Feature completion copies
+already-expanded extras, reserving interpolation uniforms only for color. LF predictions still
+retain three compact XYB planes separately from presentation extras.
+
+Ten new feature streams extend the feature manifest from 58 to 68 cases. Native seeds from
+`lf_conformance/` cover color factor 2 with extra factor 8, ordinary and LF frames, both coding
+modes, integer/float extras, alpha association and custom kernels. Six unmodified native
+progressive seeds in `frame_resampling/` cover 2/4, 2/8 and 4/8 factors in both modes. Their
+257×33 or 513×33 images cross a 128-pixel Modular group boundary, so their two passes contain
+actual residual work. All have float alpha and signed float depth. The spline manifest adds
+these six streams plus two custom-kernel variants, increasing progressive cases from four to
+twelve. All original fixture bytes remain unchanged.
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_lf_extra_channels -- \
+  crates/jxl_wgpu_decode/test-data/frame_resampling --resampling
+cargo run -p jxl_wgpu_decode --example regenerate_splines
+cargo test -p jxl_wgpu_decode --test splines -- --test-threads=1
+```
+
+Native prefix references retain linear RGBA and every extra plane. The same existing limits
+apply: normalized color error ≤ 1/1024 and alpha/scalar error ≤ 2e-6; no clipping or integer
+conversion is used. Whole and bounded fragmented results must agree bit-for-bit. The first
+Modular prefix in these new streams contains no validated image samples, so its native flush
+snapshot is retained as evidence but the GPU publishes its first update after pass one. The
+manifest explicitly states this first boundary; every emitted pass is checked against the
+corresponding independent reference. Held images remain immutable, and switching to final-only
+consumption converges to the same bits. LF updates additionally check readiness, level order
+and ownership; their intermediate pixel values are not independent LF goldens.
+
+Private tests check mixed `[2,8]` extra schedules, odd target dimensions, aligned offsets and
+exact allocation limits. GPU tests observe coded 13×9 color alongside full 25×17 extras in both
+ordinary and LF producers, then exercise feature-admission failure, cancellation and successful
+completion without early output/reference publication or leaked reservations. This change adds
+no production dependencies, CPU image-codec fallback, ad hoc module paths or unused-code allows.
+The full JPEG XL goal remains active; broader color profiles, Modular YCbCr and the remaining
+official conformance cases are separate open gates.
+
+Final validation with Rust 1.98.1 passed workspace/all-target/all-feature checks, strict Clippy,
+warnings-as-errors rustdoc, formatting and the six production libraries' Wasm build. The serial
+workspace run passed 900 tests across 55 targets, with zero failures, zero filtered tests and one
+unchanged pre-existing ignored test. All 897 previous test entries remain, and four new entries
+exercise the shared schedule, independent layouts, exact planning and GPU feature ownership.
+Five doctests passed; the reference and Apple M5/Metal harnesses each passed 18/18 cases, and
+the CPU-readback smoke delivered 221 bytes. All 1,124 fixture files regenerated identically.
+Hashes verify that source and fixtures stayed unchanged throughout the 49.8-minute workspace
+test run and subsequent checks; only this validation record was added afterward. The production
+dependency tree is unchanged. The Rust module/lint audit found no ad hoc module paths or
+unjustified unused-code suppression; the five existing, documented Wasm-only dead-code
+expectations remain unchanged.

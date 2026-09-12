@@ -853,13 +853,24 @@ physical seeds and upsampling metadata. The deferred plan captures bounded noise
 before the producer is consumed. An all-zero model needs no noise allocation or dispatch.
 
 Feature completion writes a fresh all-channel surface. Its reservation contains exact aligned
-output storage, uploaded kernel weights, one upsample uniform per channel, the existing resident
+output storage, uploaded kernel weights, one upsample uniform per interpolated channel, the existing resident
 noise scratch/uniform bytes and the completion fence. LF completion instead retains three compact
 XYB outputs of `width * height * 4` bytes and a separate aligned extra allocation. All extras
-participate in late resampling, including final-only requests; their allocation is released after
+reach output resolution, including final-only requests; their allocation is released after
 GPU completion unless a preview retains it. Prediction slots cannot prolong its lifetime.
 Color-factor-one frames perform independent extra expansion before patches. A patch-bearing frame
 with color upsampling requires equal extra factors; mismatches fail admission before GPU work.
+
+`FrameResampling` selects one full filter for each channel across the feature boundary. If any
+extra factor differs from color, all extras expand before features; color alone expands afterward.
+Otherwise the extras share the color factor after features. Two successive quotient/color filters
+are never substituted for a single extra filter. `FrameSurfaceLayout` records each plane's extent,
+stride and aligned byte offset in one checked allocation. `color_plane_bytes` applies only to the
+three equal-sized color components; extra offsets are cumulative aligned plane sizes. Imported
+component surfaces preserve these layouts, while patch/blend/output operations explicitly require
+uniform extents. Modular normalization and LF-extra reconstruction allocate distinct target grids;
+their finalizers use each extra's actual extent. Feature completion copies already-expanded extras
+and reserves only three upsample uniforms in that case. No shader ABI or binding count changes.
 
 Pass and LF preview feature submissions never overwrite their input surfaces, dictionaries or
 committed reference versions. Final-only switching drains already submitted work before resuming

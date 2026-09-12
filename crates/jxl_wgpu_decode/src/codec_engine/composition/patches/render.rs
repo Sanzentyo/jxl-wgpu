@@ -29,6 +29,7 @@ struct Render<'a> {
     plane_words: u32,
     channels: u32,
     references: &'a [Option<Surface>; 4],
+    reference_geometry: [[u32; 4]; 4],
     dictionary: &'a Dictionary,
     has_alpha: bool,
     shape: [u32; 2],
@@ -51,12 +52,24 @@ impl<'a> Render<'a> {
             .ok_or_else(|| Error::backend("patch channels overflow"))?;
         let size = u64::from(plane_words) * u64::from(channels) * 4;
         validate_size(backend.device(), size)?;
+        let mut reference_geometry = [[0; 4]; 4];
+        for (geometry, reference) in reference_geometry.iter_mut().zip(references) {
+            if let Some(surface) = reference {
+                *geometry = [
+                    surface.extent().width,
+                    surface.extent().height,
+                    surface.uniform_plane_words()?,
+                    1,
+                ];
+            }
+        }
         Ok(Self {
             backend,
             extent,
             plane_words,
             channels,
             references,
+            reference_geometry,
             dictionary,
             has_alpha,
             shape: dispatch(
@@ -115,16 +128,7 @@ impl<'a> Render<'a> {
                         self.shape[0] * 64,
                     ],
                     flags: [u32::from(self.has_alpha), 0, 0, 0],
-                    references: self.references.each_ref().map(|slot| {
-                        slot.as_ref().map_or([0; 4], |surface| {
-                            [
-                                surface.extent.width,
-                                surface.extent.height,
-                                surface.plane_words,
-                                1,
-                            ]
-                        })
-                    }),
+                    references: self.reference_geometry,
                 };
                 let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("JPEG XL patch batch"),
@@ -199,8 +203,8 @@ pub(in super::super) fn render(
     }
     let render = Render::new(
         backend,
-        source.extent,
-        source.plane_words,
+        source.extent(),
+        source.uniform_plane_words()?,
         references,
         dictionary,
         extra_count,
@@ -263,7 +267,7 @@ pub(in super::super) fn render_lf(
     let render = Render::new(
         backend,
         extent,
-        (layout.plane_bytes / 4) as u32,
+        (layout.color_plane_bytes / 4) as u32,
         references,
         dictionary,
         extras.len() as u32,
@@ -307,7 +311,7 @@ pub(in super::super) fn render_lf(
     }
     let plane_bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
     let extra_bytes = if retain_extras {
-        layout.plane_bytes * extras.len() as u64
+        layout.color_plane_bytes * extras.len() as u64
     } else {
         0
     };
@@ -340,7 +344,7 @@ pub(in super::super) fn render_lf(
                     .enumerate()
                     .map(
                         |(index, plane)| crate::modular_transform::GpuModularChannelLayout {
-                            word_offset: index as u32 * (layout.plane_bytes / 4) as u32,
+                            word_offset: index as u32 * (layout.color_plane_bytes / 4) as u32,
                             row_stride_words: extent.width,
                             ..*plane
                         },
@@ -355,7 +359,7 @@ pub(in super::super) fn render_lf(
     let scratch = storage(device, "JPEG XL LF patch channel snapshot", render.size);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     for (channel, plane) in inputs.iter().enumerate() {
-        let destination = channel as u64 * layout.plane_bytes;
+        let destination = channel as u64 * layout.color_plane_bytes;
         if plane.stride == extent.width {
             encoder.copy_buffer_to_buffer(
                 plane.buffer.as_wgpu_buffer(),
@@ -385,7 +389,7 @@ pub(in super::super) fn render_lf(
     for (channel, plane) in output.xyb.planes.iter().enumerate() {
         encoder.copy_buffer_to_buffer(
             &working,
-            channel as u64 * layout.plane_bytes,
+            channel as u64 * layout.color_plane_bytes,
             plane.buffer.as_wgpu_buffer(),
             0,
             plane_bytes,
@@ -395,7 +399,7 @@ pub(in super::super) fn render_lf(
         for (channel, plane) in extra.planes.iter().enumerate() {
             encoder.copy_buffer_to_buffer(
                 &working,
-                (3 + channel) as u64 * layout.plane_bytes,
+                (3 + channel) as u64 * layout.color_plane_bytes,
                 extra.buffer.as_wgpu_buffer(),
                 u64::from(plane.word_offset) * 4,
                 plane_bytes,

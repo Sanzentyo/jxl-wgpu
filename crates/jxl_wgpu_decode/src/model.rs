@@ -591,6 +591,10 @@ impl GpuOutputRequest {
         )
     }
 
+    pub(crate) const fn frame_render_stage(&self) -> crate::frame_surface::FrameRenderStage {
+        self.frame_stage
+    }
+
     /// Retain normalized LF extras for producer features or intermediate presentation.
     pub(crate) const fn with_lf_extras(mut self, enabled: bool) -> Self {
         self.lf_extras = enabled;

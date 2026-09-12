@@ -358,7 +358,9 @@ fn main() {
     let option = std::env::args().nth(2);
     assert!(matches!(
         option.as_deref(),
-        None | Some("--distributed" | "--conformance" | "--geometry" | "--patch-features")
+        None | Some(
+            "--distributed" | "--conformance" | "--geometry" | "--patch-features" | "--resampling"
+        )
     ));
     let distributed = option.as_deref() == Some("--distributed");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
@@ -384,6 +386,11 @@ fn main() {
         &decoder,
         &["libjxl", "libjxl_cms"],
     );
+    if option.as_deref() == Some("--resampling") {
+        lf_conformance::generate_resampling_seeds(&temporary, &output, &decoder);
+        std::fs::remove_dir_all(temporary).unwrap();
+        return;
+    }
     if option.as_deref() == Some("--patch-features") {
         lf_conformance::generate_patch_seeds(&temporary, &output, &decoder);
         std::fs::remove_dir_all(temporary).unwrap();

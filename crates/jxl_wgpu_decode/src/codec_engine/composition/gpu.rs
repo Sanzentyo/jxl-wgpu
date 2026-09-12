@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_bitstream::{
@@ -24,9 +25,30 @@ mod tests;
 #[derive(Clone, Debug)]
 pub(super) struct Surface {
     pub(super) buffer: GpuBufferLease,
-    pub(super) extent: Extent2d,
-    pub(super) plane_words: u32,
+    pub(super) layout: Arc<FrameSurfaceLayout>,
     pub(super) encoding: FrameSurfaceEncoding,
+}
+
+impl Surface {
+    pub(super) fn extent(&self) -> Extent2d {
+        self.layout.color.extent
+    }
+
+    /// Uniform strides are only valid after channel-specific resampling has finished.
+    pub(super) fn uniform_plane_words(&self) -> Result<u32> {
+        if !self.layout.has_uniform_extent() {
+            return Err(Error::EngineContract(
+                "frame operation requires equal channel extents",
+            ));
+        }
+        Ok((self.layout.color_plane_bytes / 4) as u32)
+    }
+
+    pub(super) fn with_encoding(mut self, encoding: FrameSurfaceEncoding) -> Self {
+        Arc::make_mut(&mut self.layout).set_encoding(encoding);
+        self.encoding = encoding;
+        self
+    }
 }
 
 #[repr(C, align(16))]
@@ -156,7 +178,7 @@ impl Compositor {
             .into());
         }
         let spots = if request.renders_spot_colors(extras) {
-            spot_colors(extras, (surface.plane_bytes / 4) as u32)
+            spot_colors(extras, (surface.color_plane_bytes / 4) as u32)
         } else {
             Vec::new()
         };
@@ -242,7 +264,7 @@ impl Compositor {
                         alpha_conversion as u32,
                     ],
                     source: [
-                        (surface.plane_bytes / 4) as u32,
+                        (surface.color_plane_bytes / 4) as u32,
                         alpha_channel,
                         selected.map_or(color_channel.unwrap_or(0), |(index, _)| index),
                         u32::from(scalar_float),
@@ -292,7 +314,10 @@ impl Compositor {
             vec![
                 ("wg_x", 64.0),
                 ("wg_y", 1.0),
-                ("surface_plane_words", (surface.plane_bytes / 4) as f64),
+                (
+                    "surface_plane_words",
+                    (surface.color_plane_bytes / 4) as f64,
+                ),
                 ("surface_alpha_channel", f64::from(alpha_channel)),
             ]
         } else {
@@ -333,13 +358,14 @@ impl Compositor {
             .ok_or(Error::EngineContract(
                 "physical producer returned an unknown RGB surface encoding",
             ))?;
-        let expected = FrameSurfaceLayout::with_encoding(
+        let expected = FrameSurfaceLayout::with_extra_extents(
             extent,
-            self.extras.len(),
+            outputs.iter().skip(1).map(|output| output.layout.extent),
             encoding,
             &self.backend.device().limits(),
         )?;
         if outputs.len() != 1 + self.extras.len()
+            || (encoding != FrameSurfaceEncoding::Encoded && !expected.has_uniform_extent())
             || outputs.iter().zip(expected.layouts()).enumerate().any(
                 |(index, (output, layout))| {
                     output.id != jxl_gpu_protocol::OutputId(index as u32)
@@ -355,8 +381,7 @@ impl Compositor {
         }
         Ok(Surface {
             buffer: outputs.remove(0).buffer,
-            extent,
-            plane_words: (expected.plane_bytes / 4) as u32,
+            layout: Arc::new(expected),
             encoding,
         })
     }
@@ -364,8 +389,7 @@ impl Compositor {
     pub(super) fn completed_surface(&self, buffer: GpuBufferLease) -> Surface {
         Surface {
             buffer,
-            extent: self.canvas,
-            plane_words: (self.surface.plane_bytes / 4) as u32,
+            layout: Arc::new(self.surface.clone()),
             encoding: FrameSurfaceEncoding::Srgb,
         }
     }
@@ -393,14 +417,26 @@ impl Compositor {
                 "blending requires original-encoding RGB surfaces",
             ));
         }
-        if foreground.extent != Extent2d::new(frame.width, frame.height)
+        if foreground.extent() != Extent2d::new(frame.width, frame.height)
             || references.iter().flatten().any(|base| {
-                base.extent.width < self.canvas.width || base.extent.height < self.canvas.height
+                base.extent().width < self.canvas.width || base.extent().height < self.canvas.height
             })
         {
             return Err(Error::EngineContract(
                 "composition surface geometry disagrees with the frame plan",
             ));
+        }
+        let foreground_words = foreground.uniform_plane_words()?;
+        let mut reference_geometry = [[0; 4]; 4];
+        for (geometry, reference) in reference_geometry.iter_mut().zip(references) {
+            if let Some(surface) = reference {
+                *geometry = [
+                    surface.extent().width,
+                    surface.extent().height,
+                    surface.uniform_plane_words()?,
+                    1,
+                ];
+            }
         }
         let channels = blend_channels(frame, &self.extras)?;
         let (intersection, origin) = intersection(self.canvas, frame);
@@ -408,27 +444,18 @@ impl Compositor {
             canvas: [
                 self.canvas.width,
                 self.canvas.height,
-                (self.surface.plane_bytes / 4) as u32,
+                (self.surface.color_plane_bytes / 4) as u32,
                 3 + self.extras.len() as u32,
             ],
             intersection,
             source: [
                 origin[0],
                 origin[1],
-                foreground.extent.width,
-                foreground.plane_words,
+                foreground.extent().width,
+                foreground_words,
             ],
             dispatch: [self.blend_dispatch[0] * 64, 0, 0, 0],
-            references: std::array::from_fn(|index| {
-                references[index].as_ref().map_or([0; 4], |surface| {
-                    [
-                        surface.extent.width,
-                        surface.extent.height,
-                        surface.plane_words,
-                        1,
-                    ]
-                })
-            }),
+            references: reference_geometry,
         };
         let inputs: Vec<_> = std::iter::once((0, &foreground.buffer))
             .chain(references.iter().enumerate().map(|(index, reference)| {
@@ -459,8 +486,8 @@ impl Compositor {
                 "codec components cannot be presented as RGB",
             ));
         }
-        if source.extent != self.canvas
-            || source.plane_words != (self.surface.plane_bytes / 4) as u32
+        if source.extent() != self.canvas
+            || source.uniform_plane_words()? != (self.surface.color_plane_bytes / 4) as u32
         {
             return Err(Error::EngineContract(
                 "presentation canvas has the wrong extent or plane stride",

@@ -1,7 +1,6 @@
 //! LF dependencies use the same reconstruction as presentation frames, before color conversion.
 
 use jxl_gpu_bitstream::UpsamplingWeightsInventory;
-use jxl_gpu_protocol::Extent2d;
 use jxl_wgpu::{
     GpuBufferLease, MemoryPermit, ResidentStorageBinding, ResidentUpsampleKernel,
     ResidentUpsampleWeights,
@@ -29,24 +28,28 @@ pub(crate) struct ModularLfPlan {
 impl ModularLfPlan {
     pub(crate) fn new(
         config: ModularColorConfig,
-        extent: Extent2d,
         sources: &[ModularOutputPlane],
-        factors: &[u32],
+        resampling: &[crate::frame_resampling::ChannelResampling],
         weights: &UpsamplingWeightsInventory,
         limits: &wgpu::Limits,
     ) -> Result<Self> {
-        if sources.len() < 3 || sources.len() != factors.len() {
+        if sources.len() < 3 || sources.len() != resampling.len() {
             return invalid("LF reconstruction requires three color planes and matching factors");
         }
-        let factor = factors[0];
+        if resampling[..3]
+            .iter()
+            .any(|channel| *channel != resampling[0])
+        {
+            return invalid("LF color resampling grids differ");
+        }
+        let crate::frame_resampling::ChannelResampling { extent, factor } = resampling[0];
         let reconstruction =
             ReconstructionPlan::new(config, extent, &sources[..3], factor, limits)?;
         let extras = (sources.len() > 3)
             .then(|| {
                 super::ModularRenderPlan::new(
-                    extent,
                     sources[3..].to_vec(),
-                    factors[3..].to_vec(),
+                    resampling[3..].to_vec(),
                     weights,
                     limits,
                 )

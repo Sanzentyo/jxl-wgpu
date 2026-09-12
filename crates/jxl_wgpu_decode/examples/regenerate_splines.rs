@@ -94,11 +94,13 @@ fn main() {
     }
     let output = root.join("splines/progressive");
     std::fs::create_dir_all(&output).unwrap();
-    for &(name, source) in splines::PROGRESSIVE_SOURCES {
+    for case in splines::progressive_cases() {
+        let name = &case.name;
+        let source = &case.source;
         let source = offline::unhex(
             &std::fs::read_to_string(root.join(format!("{source}.jxl.hex"))).unwrap(),
         );
-        let encoded = splines::progressive(&source);
+        let encoded = case.assemble(&source);
         let info = jxl_gpu_bitstream::parse(&encoded, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())
@@ -127,7 +129,12 @@ fn main() {
             )
             .expect("libjxl must independently decode each spline-bearing pass prefix");
             let last = updates.last().unwrap();
-            assert_eq!(last.complete, completed == frame.num_passes);
+            assert_eq!(
+                last.complete,
+                completed == frame.num_passes,
+                "{name} pass {completed}, prefix {end}/{}",
+                encoded.len()
+            );
             snapshots.extend_from_slice(&last.pixels);
         }
         std::fs::write(

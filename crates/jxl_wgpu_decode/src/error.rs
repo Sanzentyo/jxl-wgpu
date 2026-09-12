@@ -258,9 +258,9 @@ pub enum Error {
     #[error("GPU spline geometry validation failed with code {code}")]
     SplineGeometry { code: u32 },
     #[error(
-        "frame {frame_index} deferred extra channel {channel} upsamples by {extra_factor}, color by {color_factor}"
+        "frame {frame_index} patched extra channel {channel} upsamples by {extra_factor}, color by {color_factor}"
     )]
-    FrameFeatureExtraUpsampling {
+    PatchExtraUpsampling {
         frame_index: u32,
         channel: u32,
         color_factor: u32,

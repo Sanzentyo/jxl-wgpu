@@ -680,17 +680,24 @@ geometry-work and device-storage limits return typed errors.
 
 The common frame executor renders patches, splines, late upsampling and noise in that order,
 then publishes LF prediction or pre-transform references. Splines affect only the three codec
-components; alpha and other extras preserve their independent paths. VarDCT base correlation is
+components. `FrameResampling` gives Modular, VarDCT and feature completion the same schedule:
+when any extra factor differs from the color factor, all extras use their full interpolation
+factor before features; only color is expanded afterward. Equal-rate extras can share late
+upsampling. Each resident plane carries its actual extent and offset in `FrameSurfaceLayout`,
+and completed reference/blending/output operations require equal plane extents. Resampled
+patch-bearing frames still require equal color/extra factors, as specified by JPEG XL.
+VarDCT base correlation is
 available even without a noise model. Pass and LF updates reuse the completed spline cache and
 write fresh surfaces; held output images remain immutable. The cache and continuation allocations
 follow the shared byte budget through completion, cancellation and late allocation failure.
 
 `tests/splines/main.rs` checks the official 60-frame float32 `animation_spline` reference with
-per-frame maximum channel RMSE ≤ 0.0001 and peak error ≤ 0.004. Another 58 generated streams cover
+per-frame maximum channel RMSE ≤ 0.0001 and peak error ≤ 0.004. Another 68 generated streams cover
 both modes, original/XYB color, patches, noise, standard/custom 2×/4×/8× upsampling, LF chains,
-extras and JPEG component restoration. Four progressive streams have independent native
+extras and JPEG component restoration. Twelve progressive streams have independent native
 snapshots for color and every extra channel. Whole and bounded fragmented output must agree
-bit-for-bit. Unequal late color/extra upsampling and broader original-color profiles remain open;
+bit-for-bit. Unequal 2/4, 2/8 and 4/8 factors include native float extras and custom kernels;
+LF roots cover both codecs, integer/float extras and feature admission/cancellation. Broader original-color profiles remain open;
 these results do not establish full JPEG XL conformance.
 
 Both XYB and original-sRGB coding modes, plus JPEG YCbCr VarDCT, parse the bounded 80-bit `NoiseModel` and

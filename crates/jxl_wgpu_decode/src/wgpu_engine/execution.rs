@@ -975,7 +975,7 @@ fn modular_render_finalize_params(
     build_modular_finalizers(
         output,
         ModularFinalizeRegion {
-            source_extent: render.extent,
+            source_extent: render.output_extent(),
             canvas_extent: output.source_extent,
             orientation: output.orientation,
             origin_x: 0,
@@ -1024,7 +1024,11 @@ fn build_modular_finalizers(
             let destination = &layout.planes[0];
             result.push(
                 ModularFinalizeParams::new(
-                    region,
+                    ModularFinalizeRegion {
+                        source_extent: Extent2d::new(source.layout.width, source.layout.height),
+                        canvas_extent: layout.extent,
+                        ..region
+                    },
                     std::slice::from_ref(source),
                     arena_words,
                     ModularFinalizeOutput {

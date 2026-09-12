@@ -263,8 +263,8 @@ impl Carry {
             let references = self.references.each_ref().map(|slot| {
                 slot.as_ref().map_or([0; 4], |surface| {
                     [
-                        surface.extent.width,
-                        surface.extent.height,
+                        surface.extent().width,
+                        surface.extent().height,
                         1,
                         u32::from(surface.encoding == FrameSurfaceEncoding::Encoded),
                     ]
@@ -619,10 +619,10 @@ fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Resul
         .into());
     }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
-        if frame.flags & 0x12 != 0 && frame.upsampling != 1 {
+        if frame.flags & 2 != 0 && frame.upsampling != 1 {
             for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
                 if factor != frame.upsampling {
-                    return Err(Error::FrameFeatureExtraUpsampling {
+                    return Err(Error::PatchExtraUpsampling {
                         frame_index: frame.frame_index,
                         channel: channel as u32,
                         color_factor: frame.upsampling,
@@ -1203,10 +1203,7 @@ impl DependentPending {
         )?;
         self.stage = Some(Stage::ColorTransform {
             work,
-            source: Surface {
-                encoding,
-                ..surface
-            },
+            source: surface.with_encoding(encoding),
         });
         self.count_submission();
         Ok(())
@@ -1842,10 +1839,7 @@ impl DependentPending {
                     frame,
                     encoding,
                 )?,
-                source: Surface {
-                    encoding,
-                    ..surface
-                },
+                source: surface.with_encoding(encoding),
                 index,
             }
         } else if node.needs_composition {

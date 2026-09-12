@@ -391,6 +391,15 @@ frame upsampling and noise before prediction/reference publication. LF previews 
 passes share the completed cache while writing independent surfaces. Their buffers and cache
 leases use the same completion lifetime and byte budget; no CPU image reconstruction is involved.
 
+The shared `FrameResampling` plan places each extra channel's complete interpolation filter on
+one side of the feature boundary. Unequal color/extra factors expand all extras before splines;
+equal-rate extras can remain alongside coded color for late expansion. Resident surfaces carry
+`FrameSurfaceLayout` with per-plane extents, strides and aligned offsets. Modular and VarDCT
+therefore preserve full-sized extras while color still has its coded extent, without composing
+two interpolation filters. Feature completion creates a fresh uniform surface before prediction,
+color conversion, reference publication or blending. Resampled patch-bearing frames retain the
+format's equal-factor requirement.
+
 Sync and async animation frontends drive one GPU codec state machine. Stream metadata carries the
 timebase, loop count, and whether frame timecodes exist. A frame carries its index, exact duration,
 cumulative presentation-start ticks, optional bitstream timecode, and composed output.

@@ -167,13 +167,13 @@ fn lf_patch_planes_match_scalar_algebra_and_release_extras_independently_of_pred
             let carry = pending.carry.as_ref().unwrap();
             let reference = carry.references[3].as_ref().unwrap();
             let data = read_buffer(&backend, &reference.buffer);
-            let pixels = reference.extent.width as usize * reference.extent.height as usize;
+            let pixels = reference.extent().width as usize * reference.extent().height as usize;
             let reference_planes = lf_oracle::Planes {
-                width: reference.extent.width as usize,
-                height: reference.extent.height as usize,
+                width: reference.extent().width as usize,
+                height: reference.extent().height as usize,
                 channels: (0..expected.channels.len())
                     .map(|channel| {
-                        let offset = channel * reference.plane_words as usize;
+                        let offset = channel * reference.uniform_plane_words().unwrap() as usize;
                         data[offset..offset + pixels].to_vec()
                     })
                     .collect(),

@@ -55,7 +55,12 @@ static void generate_case(const char* directory, const char* name, uint32_t widt
   JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(encoder, NULL);
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR, modular));
   if (responsive >= 0)
-    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, responsive));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_RESPONSIVE, responsive > 0));
+  if (responsive == 2) {
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC, 1));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_QPROGRESSIVE_AC, 1));
+    check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_MODULAR_GROUP_SIZE, 0));
+  }
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EFFORT, 7));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_EPF, 0));
   check(JxlEncoderFrameSettingsSetOption(settings, JXL_ENC_FRAME_SETTING_GABORISH, 0));
@@ -184,7 +189,31 @@ static void conformance(const char* directory, int geometry) {
   if (fclose(manifest)) abort();
 }
 
+static void resampling(const char* directory) {
+  const Case cases[] = {
+    {"up2_extra4", 257, 33, 0, 3, 32, 8, 32, 8, 32, 8, 0, 1, 2, 4, 0, 0, 1},
+    {"up2_extra8", 257, 33, 0, 3, 32, 8, 32, 8, 32, 8, 0, 1, 2, 8, 0, 0, 1},
+    {"up4_extra8", 513, 33, 0, 3, 32, 8, 32, 8, 32, 8, 0, 1, 4, 8, 0, 0, 1},
+  };
+  char path[4096];
+  if (snprintf(path, sizeof(path), "%s/resampling.txt", directory) >= (int)sizeof(path)) abort();
+  FILE* manifest = fopen(path, "w"); if (!manifest) abort();
+  for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+    for (int modular = 0; modular <= 1; ++modular) {
+      char name[128];
+      snprintf(name, sizeof(name), "%s_%s", cases[i].name, modular ? "modular" : "vardct");
+      generate_case(directory, name, cases[i].width, cases[i].height, modular, 2, 2, &cases[i], 0, 1);
+      fprintf(manifest, "%s\n", name);
+    }
+  }
+  if (fclose(manifest)) abort();
+}
+
 int main(int argc, char** argv) {
+  if (argc == 3 && !strcmp(argv[2], "--resampling")) {
+    resampling(argv[1]);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[2], "--patch-features")) {
     conformance(argv[1], 2);
     return 0;

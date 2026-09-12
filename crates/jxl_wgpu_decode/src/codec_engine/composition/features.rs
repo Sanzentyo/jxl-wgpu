@@ -14,7 +14,8 @@ use jxl_wgpu::{
 use super::gpu::Surface;
 use super::splines;
 use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
-use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
+use crate::frame_resampling::FrameResampling;
+use crate::frame_surface::{FrameRenderStage, FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::progressive_dc::{
     ProgressiveDcExtras, ProgressiveDcGpuError, ProgressiveDcOutput, ProgressiveDcXybPlanes,
 };
@@ -26,8 +27,10 @@ mod tests;
 #[derive(Debug)]
 pub(super) struct Plan {
     input_extent: Extent2d,
+    extra_input_extent: Extent2d,
     output_extent: Extent2d,
     extra_count: usize,
+    late_upsample_count: usize,
     upsample: Option<ResidentUpsampleKernel>,
     noise: Option<ResidentNoisePlan>,
     splines: Option<Arc<splines::Cache>>,
@@ -49,10 +52,22 @@ impl Plan {
             frame.width.div_ceil(divisor),
             frame.height.div_ceil(divisor),
         );
-        let input_extent = Extent2d::new(
-            output_extent.width.div_ceil(frame.upsampling),
-            output_extent.height.div_ceil(frame.upsampling),
+        let resampling = FrameResampling::new(
+            output_extent,
+            frame.upsampling,
+            &frame.extra_channel_upsampling,
         );
+        let input_extent = resampling.color(FrameRenderStage::BeforeFeatures).extent;
+        let extra_input_extent = resampling.extra_extent(FrameRenderStage::BeforeFeatures);
+        let late_upsample_count = if frame.upsampling == 1 {
+            0
+        } else {
+            3 + if resampling.late_extra_factor() == 1 {
+                0
+            } else {
+                image.extra_channels.len()
+            }
+        };
         let upsample = (frame.upsampling != 1)
             .then(|| {
                 crate::modular_render::upsample_kernel(&image.upsampling_weights, frame.upsampling)
@@ -63,8 +78,10 @@ impl Plan {
             .transpose()?;
         Ok(Some(Arc::new(Self {
             input_extent,
+            extra_input_extent,
             output_extent,
             extra_count: image.extra_channels.len(),
+            late_upsample_count,
             upsample,
             noise,
             splines,
@@ -75,7 +92,7 @@ impl Plan {
         completion_fence_bytes()
             + self.upsample.as_ref().map_or(0, |kernel| {
                 kernel.weight_bytes()
-                    + (3 + self.extra_count) as u64 * ResidentUpsamplePipeline::UNIFORM_BYTES
+                    + self.late_upsample_count as u64 * ResidentUpsamplePipeline::UNIFORM_BYTES
             })
             + self
                 .noise
@@ -107,7 +124,8 @@ impl Plan {
         backend: &WgpuBackend,
         source: &Surface,
     ) -> Result<GpuWork<Surface>> {
-        if source.encoding != FrameSurfaceEncoding::Encoded || source.extent != self.input_extent {
+        if source.encoding != FrameSurfaceEncoding::Encoded || source.extent() != self.input_extent
+        {
             return Err(Error::EngineContract(
                 "deferred features require coded component geometry",
             ));
@@ -119,12 +137,11 @@ impl Plan {
             .try_reserve(layout.storage_bytes + self.scratch_bytes())?;
         let output = Surface {
             buffer: retained(backend.device(), &mut permit, layout.storage_bytes)?,
-            extent: self.output_extent,
-            plane_words: (layout.plane_bytes / 4) as u32,
+            layout: Arc::new(layout),
             encoding: FrameSurfaceEncoding::Encoded,
         };
-        let input_planes = surface_planes(source, 3 + self.extra_count);
-        let output_planes = surface_planes(&output, 3 + self.extra_count);
+        let input_planes = surface_planes(source);
+        let output_planes = surface_planes(&output);
         let mut encoder = backend.device().create_command_encoder(&Default::default());
         let resources = self.record(backend, &mut encoder, &input_planes, &output_planes)?;
         submit_recorded(
@@ -153,9 +170,9 @@ impl Plan {
         let layout = self.layout(backend)?;
         let color_bytes =
             u64::from(self.output_extent.width) * u64::from(self.output_extent.height) * 4;
-        // Every extra participates in late upsampling. Final-only completion drops its separate
+        // Every extra is delivered at output resolution. Final-only completion drops its separate
         // output after the submission, rather than keeping it charged through an LF prediction.
-        let extra_bytes = layout.plane_bytes * self.extra_count as u64;
+        let extra_bytes = layout.color_plane_bytes * self.extra_count as u64;
         let poll = backend.submission_poller().try_reserve()?;
         let mut permit = backend
             .transient_memory_budget()
@@ -183,7 +200,8 @@ impl Plan {
                                     width: self.output_extent.width,
                                     height: self.output_extent.height,
                                     row_stride_words: self.output_extent.width,
-                                    word_offset: index as u32 * (layout.plane_bytes / 4) as u32,
+                                    word_offset: index as u32
+                                        * (layout.color_plane_bytes / 4) as u32,
                                     ..*plane
                                 }
                             })
@@ -228,11 +246,26 @@ impl Plan {
         if inputs.len() != 3 + self.extra_count || outputs.len() != inputs.len() {
             return Err(Error::EngineContract("deferred feature channel count"));
         }
-        for (planes, extent, usage) in [
-            (inputs, self.input_extent, wgpu::BufferUsages::COPY_SRC),
-            (outputs, self.output_extent, wgpu::BufferUsages::COPY_DST),
+        for (planes, color_extent, extra_extent, usage) in [
+            (
+                inputs,
+                self.input_extent,
+                self.extra_input_extent,
+                wgpu::BufferUsages::COPY_SRC,
+            ),
+            (
+                outputs,
+                self.output_extent,
+                self.output_extent,
+                wgpu::BufferUsages::COPY_DST,
+            ),
         ] {
-            for plane in planes {
+            for (index, plane) in planes.iter().enumerate() {
+                let extent = if index < 3 {
+                    color_extent
+                } else {
+                    extra_extent
+                };
                 let storage = plane.storage;
                 let bytes = u64::from(plane.height.saturating_sub(1))
                     .checked_mul(u64::from(plane.stride))
@@ -308,7 +341,11 @@ impl Plan {
         }
         if let Some(weights) = &weights {
             let pipeline = ResidentUpsamplePipeline::new(device)?;
-            for (&input, &output) in rendered_inputs.iter().zip(outputs) {
+            for (index, (&input, &output)) in rendered_inputs.iter().zip(outputs).enumerate() {
+                if index >= self.late_upsample_count {
+                    copy_plane(encoder, input, output);
+                    continue;
+                }
                 uniforms.push(pipeline.encode(
                     device,
                     encoder,
@@ -403,18 +440,28 @@ fn retained(
     ))
 }
 
-fn surface_planes(surface: &Surface, count: usize) -> Vec<ResidentF32Plane<'_>> {
-    (0..count)
-        .map(|index| ResidentF32Plane {
+fn surface_planes(surface: &Surface) -> Vec<ResidentF32Plane<'_>> {
+    surface
+        .layout
+        .layouts()
+        .flat_map(|layout| {
+            layout
+                .planes
+                .iter()
+                .map(move |plane| (layout.extent, plane))
+        })
+        .map(|(extent, plane)| ResidentF32Plane {
             storage: ResidentStorageBinding {
                 buffer: surface.buffer.as_wgpu_buffer(),
-                offset: index as u64 * u64::from(surface.plane_words) * 4,
-                size: NonZeroU64::new(u64::from(surface.plane_words) * 4)
-                    .expect("nonempty surface"),
+                offset: plane.offset,
+                size: NonZeroU64::new(
+                    plane.end_offset().expect("validated surface plane") - plane.offset,
+                )
+                .expect("nonempty surface"),
             },
-            width: surface.extent.width,
-            height: surface.extent.height,
-            stride: surface.extent.width,
+            width: extent.width,
+            height: extent.height,
+            stride: (plane.row_stride / 4) as u32,
         })
         .collect()
 }

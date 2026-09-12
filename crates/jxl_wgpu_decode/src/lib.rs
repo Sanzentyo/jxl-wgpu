@@ -33,6 +33,7 @@ mod entropy;
 mod entropy_window;
 mod error;
 mod frame_plan;
+mod frame_resampling;
 mod frame_surface;
 mod image_selection;
 mod inflight;

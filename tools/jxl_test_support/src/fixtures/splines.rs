@@ -15,37 +15,92 @@ pub enum ReferenceSource {
     JxlOxide,
 }
 
-pub const PROGRESSIVE_SOURCES: &[(&str, &str)] = &[
-    ("vardct", "vardct_extras_rgba_progressive"),
-    ("gray", "testsrc_vardct_gray_progressive"),
-    ("modular", "modular_passes/squeeze"),
-    ("float", "floating/vardct_extras_float_squeeze"),
-];
+pub struct ProgressiveCase {
+    pub name: String,
+    pub source: String,
+    pub patches: bool,
+    pub custom_weights: bool,
+    /// Empty Modular prefixes contain no validated image samples and produce no GPU update.
+    pub first_pass: u8,
+}
 
-pub fn progressive(source: &[u8]) -> Vec<u8> {
-    let info = jxl_gpu_bitstream::parse(source, Default::default())
-        .unwrap()
-        .codestream_inventory(Default::default())
-        .unwrap();
-    assert_eq!(info.frames.len(), 1);
-    let frame = &info.frames[0];
-    assert!(frame.num_passes > 1);
-    let spline = values(frame, 8);
-    let patches = super::patches::values(frame, info.image_header.extra_channels.len(), 16);
-    super::frame_features::assemble_frames(&[
-        super::frame_features::Frame {
-            codestream: source,
-            reference: Some((3, true)),
-            patches: None,
-            splines: Some(&spline),
-        },
-        super::frame_features::Frame {
-            codestream: source,
-            reference: None,
-            patches: Some(&patches),
-            splines: Some(&spline),
-        },
-    ])
+pub fn progressive_cases() -> Vec<ProgressiveCase> {
+    let mut cases: Vec<_> = [
+        ("vardct", "vardct_extras_rgba_progressive"),
+        ("gray", "testsrc_vardct_gray_progressive"),
+        ("modular", "modular_passes/squeeze"),
+        ("float", "floating/vardct_extras_float_squeeze"),
+    ]
+    .into_iter()
+    .map(|(name, source)| ProgressiveCase {
+        name: name.into(),
+        source: source.into(),
+        patches: true,
+        custom_weights: false,
+        first_pass: 0,
+    })
+    .collect();
+    for mode in ["modular", "vardct"] {
+        for factors in ["up2_extra4", "up2_extra8", "up4_extra8"] {
+            for custom_weights in [false, true]
+                .into_iter()
+                .filter(|&custom| !custom || factors == "up2_extra8")
+            {
+                cases.push(ProgressiveCase {
+                    name: format!(
+                        "{factors}_{mode}{}",
+                        if custom_weights { "_custom" } else { "" }
+                    ),
+                    source: format!("frame_resampling/{factors}_{mode}"),
+                    patches: false,
+                    custom_weights,
+                    first_pass: u8::from(mode == "modular"),
+                });
+            }
+        }
+    }
+    cases
+}
+
+impl ProgressiveCase {
+    pub fn assemble(&self, source: &[u8]) -> Vec<u8> {
+        let custom = self
+            .custom_weights
+            .then(|| crate::corpus::with_custom_upsampling_weights(source));
+        let source = custom.as_deref().unwrap_or(source);
+        let info = jxl_gpu_bitstream::parse(source, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap();
+        assert_eq!(info.frames.len(), 1);
+        let frame = &info.frames[0];
+        assert!(frame.num_passes > 1);
+        let spline = values(frame, 8);
+        if !self.patches {
+            assert!(
+                frame
+                    .extra_channel_upsampling
+                    .iter()
+                    .any(|&factor| factor != frame.upsampling)
+            );
+            return insert(source, &[Some(&spline)]);
+        }
+        let patches = super::patches::values(frame, info.image_header.extra_channels.len(), 16);
+        super::frame_features::assemble_frames(&[
+            super::frame_features::Frame {
+                codestream: source,
+                reference: Some((3, true)),
+                patches: None,
+                splines: Some(&spline),
+            },
+            super::frame_features::Frame {
+                codestream: source,
+                reference: None,
+                patches: Some(&patches),
+                splines: Some(&spline),
+            },
+        ])
+    }
 }
 
 pub struct Case {
@@ -54,6 +109,7 @@ pub struct Case {
     pub scenario: Scenario,
     pub adjustment: i32,
     pub reference: ReferenceSource,
+    pub custom_weights: bool,
 }
 
 pub fn cases() -> Vec<Case> {
@@ -81,6 +137,7 @@ pub fn cases() -> Vec<Case> {
                         scenario,
                         adjustment,
                         reference: ReferenceSource::Native,
+                        custom_weights: false,
                     });
                 }
             }
@@ -96,6 +153,7 @@ pub fn cases() -> Vec<Case> {
                     scenario,
                     adjustment: 0,
                     reference: ReferenceSource::Native,
+                    custom_weights: false,
                 });
             }
         }
@@ -107,7 +165,31 @@ pub fn cases() -> Vec<Case> {
                 scenario: Scenario::LowFrequency,
                 adjustment: 8,
                 reference: ReferenceSource::Native,
+                custom_weights: false,
             });
+        }
+        for precision in ["resampled_associated", "floating_resampled"] {
+            for (scenario, extension, role) in [
+                (Scenario::Main, ".lf1", "frame"),
+                (Scenario::LowFrequency, "", "lf"),
+            ] {
+                for custom_weights in [false, true].into_iter().filter(|&custom| {
+                    !custom
+                        || (precision == "floating_resampled" && scenario == Scenario::LowFrequency)
+                }) {
+                    cases.push(Case {
+                        name: format!(
+                            "{mode}_{precision}_{role}{}",
+                            if custom_weights { "_custom" } else { "" }
+                        ),
+                        source: format!("lf_conformance/{precision}_{mode}{extension}"),
+                        scenario,
+                        adjustment: 0,
+                        reference: ReferenceSource::Native,
+                        custom_weights,
+                    });
+                }
+            }
         }
     }
     for (name, source, scenario) in [
@@ -149,6 +231,7 @@ pub fn cases() -> Vec<Case> {
             scenario,
             adjustment: -8,
             reference: ReferenceSource::Native,
+            custom_weights: false,
         });
     }
     // libjxl 0.12 and Rust jxl share a vertical-subsampling restoration defect already
@@ -164,6 +247,7 @@ pub fn cases() -> Vec<Case> {
             scenario: Scenario::Main,
             adjustment: 0,
             reference,
+            custom_weights: false,
         });
     }
     cases
@@ -171,6 +255,10 @@ pub fn cases() -> Vec<Case> {
 
 impl Case {
     pub fn assemble(&self, source: &[u8]) -> Vec<u8> {
+        let custom = self
+            .custom_weights
+            .then(|| crate::corpus::with_custom_upsampling_weights(source));
+        let source = custom.as_deref().unwrap_or(source);
         let info = jxl_gpu_bitstream::parse(source, Default::default())
             .unwrap()
             .codestream_inventory(Default::default())

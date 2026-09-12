@@ -508,6 +508,14 @@ pub(super) fn encode_frame_render(
         }
         for (plane, layout) in plan.planes().iter().zip(&surface.extras) {
             let plane = plane.layout;
+            if plane.width != layout.extent.width
+                || plane.height != layout.extent.height
+                || plane.row_stride_words != plane.width
+            {
+                return Err(VarDctDecodeError::EntropyWindowContract {
+                    detail: "frame surface extra plane geometry changed",
+                });
+            }
             commands.copy_buffer_to_buffer(
                 &buffers.output,
                 u64::from(plane.word_offset) * 4,
