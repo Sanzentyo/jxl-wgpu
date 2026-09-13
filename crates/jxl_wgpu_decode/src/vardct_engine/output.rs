@@ -148,6 +148,15 @@ pub(super) fn prepare_presentation(
         ),
     };
     let output_config = ColorOutputConfig {
+        linear_black_threshold: if inventory.image_header.xyb_encoded {
+            crate::image_color::reconstruction_black_threshold(
+                original,
+                request.format().color_spec,
+            )
+        } else {
+            None
+        },
+        white_point_adaptation: request.white_point_adaptation(),
         extent: if request.defers_frame_features() {
             Extent2d::new(profile.width, profile.height)
         } else {

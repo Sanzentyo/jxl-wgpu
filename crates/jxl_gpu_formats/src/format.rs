@@ -35,7 +35,23 @@ pub enum ColorSpace {
     Bt709,
     Bt2020,
     DisplayP3,
+    CustomRgb(jxl_gpu_protocol::RgbChromaticities),
     Undefined,
+}
+
+impl ColorSpace {
+    /// Returns the RGB primaries and reference white represented by this color space.
+    #[must_use]
+    pub const fn rgb_space(self) -> Option<jxl_gpu_protocol::RgbColorSpace> {
+        use jxl_gpu_protocol::RgbColorSpace;
+        match self {
+            Self::Bt709 => Some(RgbColorSpace::Bt709),
+            Self::Bt2020 => Some(RgbColorSpace::Bt2020),
+            Self::DisplayP3 => Some(RgbColorSpace::DisplayP3),
+            Self::CustomRgb(value) => Some(RgbColorSpace::Custom(value)),
+            Self::Sensor | Self::Bt601 | Self::Undefined => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,12 +69,33 @@ pub enum TransferFunction {
     Undefined,
     Linear,
     Srgb,
+    Gamma(jxl_gpu_protocol::GammaExponent),
+    /// DCI power curve with a linear extension below zero.
+    Dci,
     Sycc,
     Pq,
     Hlg,
     Bt709,
     Bt2020,
     Smpte240M,
+}
+
+impl TransferFunction {
+    #[must_use]
+    pub const fn rgb_transfer(self) -> Option<jxl_gpu_protocol::TransferFunction> {
+        use jxl_gpu_protocol::TransferFunction as Transfer;
+        match self {
+            Self::Linear => Some(Transfer::Linear),
+            Self::Srgb | Self::Sycc => Some(Transfer::Srgb),
+            Self::Gamma(value) => Some(Transfer::Gamma(value)),
+            Self::Dci => Some(Transfer::Dci),
+            Self::Bt709 => Some(Transfer::Bt709),
+            Self::Bt2020 => Some(Transfer::Bt2020),
+            Self::Pq => Some(Transfer::Pq),
+            Self::Hlg => Some(Transfer::Hlg),
+            Self::Undefined | Self::Smpte240M => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

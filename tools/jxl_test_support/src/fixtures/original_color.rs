@@ -11,6 +11,9 @@ use jxl_gpu_formats::{
 
 use super::frame_features;
 
+mod analytic;
+pub use analytic::cases as analytic_cases;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     ModularRgb,
@@ -51,6 +54,7 @@ pub struct Profile {
     pub name: &'static str,
     pub primaries: PrimariesInventory,
     pub grayscale: bool,
+    pub white: WhitePointInventory,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Transfer {
@@ -72,21 +76,25 @@ const PROFILES: [Profile; 4] = [
         name: "bt709",
         primaries: PrimariesInventory::Srgb,
         grayscale: false,
+        white: WhitePointInventory::D65,
     },
     Profile {
         name: "bt2020",
         primaries: PrimariesInventory::Bt2100,
         grayscale: false,
+        white: WhitePointInventory::D65,
     },
     Profile {
         name: "p3",
         primaries: PrimariesInventory::P3,
         grayscale: false,
+        white: WhitePointInventory::D65,
     },
     Profile {
         name: "gray",
         primaries: PrimariesInventory::Srgb,
         grayscale: true,
+        white: WhitePointInventory::D65,
     },
 ];
 const TRANSFERS: [Transfer; 3] = [
@@ -166,16 +174,24 @@ impl Case {
         let ColorSpecification::Defined(ref mut spec) = color else {
             unreachable!()
         };
-        spec.space = match self.profile.primaries {
-            PrimariesInventory::Srgb => ColorSpace::Bt709,
-            PrimariesInventory::Bt2100 => ColorSpace::Bt2020,
-            PrimariesInventory::P3 => ColorSpace::DisplayP3,
-            _ => unreachable!(),
-        };
+        spec.space = self.profile.space();
         spec.transfer = match self.transfer.transfer {
             TransferFunctionInventory::Linear => TransferFunction::Linear,
             TransferFunctionInventory::Srgb => TransferFunction::Srgb,
             TransferFunctionInventory::Bt709 => TransferFunction::Bt709,
+            TransferFunctionInventory::Dci => TransferFunction::Dci,
+            TransferFunctionInventory::Gamma {
+                scaled_gamma,
+                inverted,
+            } => {
+                let gamma = scaled_gamma as f64 / 10_000_000.0;
+                TransferFunction::Gamma(
+                    jxl_gpu_protocol::GammaExponent::new(
+                        (if inverted { gamma } else { 1.0 / gamma }) as f32,
+                    )
+                    .unwrap(),
+                )
+            }
             _ => unreachable!(),
         };
         PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color)
@@ -206,7 +222,7 @@ impl Case {
                 } else {
                     ColourSpaceInventory::Rgb
                 },
-                white_point: WhitePointInventory::D65,
+                white_point: self.profile.white,
                 primaries: self.profile.primaries,
                 transfer_function: self.transfer.transfer,
                 rendering_intent: RenderingIntentInventory::Relative,
@@ -303,4 +319,40 @@ fn read_bytes(name: &str) -> Vec<u8> {
     crate::offline::unhex(
         &std::fs::read_to_string(directory().join(format!("{name}.jxl.hex"))).unwrap(),
     )
+}
+
+impl Profile {
+    pub fn space(self) -> ColorSpace {
+        use jxl_gpu_protocol::{Chromaticity, RgbChromaticities};
+        let xy = |point: jxl_gpu_bitstream::ChromaticityInventory| {
+            Chromaticity::new(
+                f64::from(point.x) / 1_000_000.0,
+                f64::from(point.y) / 1_000_000.0,
+            )
+            .unwrap()
+        };
+        let mut color = match self.primaries {
+            PrimariesInventory::Srgb => RgbChromaticities::BT709,
+            PrimariesInventory::Bt2100 => RgbChromaticities::BT2020,
+            PrimariesInventory::P3 => RgbChromaticities::DISPLAY_P3,
+            PrimariesInventory::Custom { red, green, blue } => RgbChromaticities {
+                red: xy(red),
+                green: xy(green),
+                blue: xy(blue),
+                white: Chromaticity::D65,
+            },
+        };
+        color.white = match self.white {
+            WhitePointInventory::D65 => Chromaticity::D65,
+            WhitePointInventory::E => Chromaticity::E,
+            WhitePointInventory::Dci => Chromaticity::DCI,
+            WhitePointInventory::Custom(point) => xy(point),
+        };
+        match color {
+            RgbChromaticities::BT709 => ColorSpace::Bt709,
+            RgbChromaticities::BT2020 => ColorSpace::Bt2020,
+            RgbChromaticities::DISPLAY_P3 => ColorSpace::DisplayP3,
+            value => ColorSpace::CustomRgb(value),
+        }
+    }
 }

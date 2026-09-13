@@ -67,6 +67,8 @@ pub enum ColorOutputTransform {
 /// JPEG XL inverse-opsin fields used by the fused output kernel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseOpsin {
+    /// Chromaticities of the linear RGB produced by the inverse matrix.
+    pub rgb_space: jxl_gpu_protocol::RgbColorSpace,
     /// Per-LMS opsin biases from the codestream image metadata.
     pub opsin_bias: [f32; 3],
     /// Row-major matrix mapping reconstructed LMS into linear RGB.
@@ -78,6 +80,7 @@ pub struct InverseOpsin {
 impl From<&XybParams> for InverseOpsin {
     fn from(value: &XybParams) -> Self {
         Self {
+            rgb_space: jxl_gpu_protocol::RgbColorSpace::Bt709,
             opsin_bias: value.opsin_bias,
             inverse_opsin_matrix: value.inverse_opsin_matrix,
             intensity_target: value.intensity_target,
@@ -104,6 +107,23 @@ impl InverseOpsin {
             matrix
         };
         Some(Self {
+            // libjxl's original-profile XYB conversion derives its RGB matrix from these
+            // ICC-calibrated sRGB chromaticities. Its direct sRGB and Gray paths use the
+            // inverse matrix without that calibration. Keep this producer distinction explicit.
+            rgb_space: if !image.grayscale
+                && crate::image_color::original_encoding(image)?.space
+                    != jxl_gpu_protocol::RgbColorSpace::Bt709
+            {
+                use jxl_gpu_protocol::{Chromaticity, RgbChromaticities, RgbColorSpace};
+                RgbColorSpace::Custom(RgbChromaticities {
+                    red: Chromaticity::new(0.639998686, 0.330010138)?,
+                    green: Chromaticity::new(0.300003784, 0.600003357)?,
+                    blue: Chromaticity::new(0.150002046, 0.059997204)?,
+                    white: Chromaticity::D65,
+                })
+            } else {
+                jxl_gpu_protocol::RgbColorSpace::Bt709
+            },
             opsin_bias: opsin.opsin_bias.map(|value| value.to_f32()),
             inverse_opsin_matrix,
             intensity_target: image.tone_mapping.intensity_target.to_f32(),
@@ -119,6 +139,10 @@ pub struct ColorOutputConfig {
     /// Maps input coordinates into the display-oriented packed output.
     pub orientation: OutputOrientation,
     pub transform: ColorOutputTransform,
+    /// Colorimetric treatment of differing source and target reference whites.
+    pub white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
+    /// Optional codec reconstruction floor before the requested OETF.
+    pub linear_black_threshold: Option<f32>,
     /// Conversion in the requested RGB encoding, after reconstruction and color conversion.
     pub alpha_conversion: jxl_wgpu::AlphaConversion,
 }
@@ -145,7 +169,7 @@ impl ColorOutputConfig {
         {
             return Err(ColorOutputError::HdrLuminanceMappingRequired);
         }
-        Ok(ImageOutputParams::new(
+        let params = ImageOutputParams::new(
             layout,
             ImageOutputSource {
                 extent: self.extent,
@@ -153,13 +177,22 @@ impl ColorOutputConfig {
                 strides,
                 encoding: match self.transform {
                     ColorOutputTransform::Rgb(encoding) => encoding,
-                    ColorOutputTransform::Xyb(_) => RgbColorEncoding::LINEAR_BT709,
+                    ColorOutputTransform::Xyb(opsin) => RgbColorEncoding {
+                        space: opsin.rgb_space,
+                        transfer: jxl_gpu_protocol::TransferFunction::Linear,
+                    },
                     ColorOutputTransform::Ycbcr { encoding, .. } => encoding,
                 },
             },
             dispatch_width,
+            self.white_point_adaptation,
         )?
-        .with_alpha_conversion(self.alpha_conversion))
+        .with_alpha_conversion(self.alpha_conversion);
+        Ok(if let Some(threshold) = self.linear_black_threshold {
+            params.with_linear_black_threshold(threshold)?
+        } else {
+            params
+        })
     }
 }
 
@@ -361,7 +394,7 @@ fn validate_storage_bindings(limits: &wgpu::Limits) -> Result<(), ColorOutputErr
 /// Uniform allocation that must remain live through command submission.
 #[derive(Debug)]
 pub struct ColorOutputScratch {
-    /// The shared 192-byte color/layout parameter buffer.
+    /// The shared 208-byte color/layout parameter buffer.
     pub uniform: wgpu::Buffer,
     /// The 160-byte inverse-opsin/JPEG and alpha source parameter buffer.
     pub source_uniform: wgpu::Buffer,
@@ -477,7 +510,7 @@ pub enum ColorOutputError {
         required: u64,
         available: u64,
     },
-    /// The 192-byte uniform exceeds an unusual device limit.
+    /// The 208-byte uniform exceeds an unusual device limit.
     #[error(
         "reconstructed color uniform needs {required} bytes, uniform binding limit is {available}"
     )]
@@ -983,6 +1016,7 @@ mod tests {
 
     fn inverse_opsin() -> InverseOpsin {
         InverseOpsin {
+            rgb_space: jxl_gpu_protocol::RgbColorSpace::Bt709,
             opsin_bias: [-0.003_793_073_4; 3],
             inverse_opsin_matrix: [
                 [11.031_567, -9.866_944, -0.164_622_99],
@@ -1032,9 +1066,9 @@ mod tests {
         let memory = ColorOutputMemoryPlan::new(&rgb_layout(5, 3)).unwrap();
         assert_eq!(memory.logical_output_bytes, 45);
         assert_eq!(memory.output_storage_bytes, 48);
-        assert_eq!(memory.uniform_bytes, 352);
-        assert_eq!(memory.transient_bytes, 352);
-        assert_eq!(memory.total_bytes, 400);
+        assert_eq!(memory.uniform_bytes, 368);
+        assert_eq!(memory.transient_bytes, 368);
+        assert_eq!(memory.total_bytes, 416);
 
         let plan = ColorOutputPlan::for_limits(&rgb_layout(5, 3), &generous_limits()).unwrap();
         assert_eq!(plan.output_words, 12);
@@ -1111,6 +1145,8 @@ mod tests {
     #[test]
     fn output_contract_rejects_inconsistent_layout_and_unmapped_hdr() {
         let config = ColorOutputConfig {
+            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
+            linear_black_threshold: None,
             extent: Extent2d::new(5, 3),
             orientation: OutputOrientation::from_exif_value(6).unwrap(),
             transform: ColorOutputTransform::Xyb(inverse_opsin()),
@@ -1307,6 +1343,9 @@ mod tests {
                         output: binding(&output),
                         layout: &layout,
                         config: ColorOutputConfig {
+                            linear_black_threshold: None,
+                            white_point_adaptation:
+                                jxl_gpu_protocol::WhitePointAdaptation::Bradford,
                             extent,
                             orientation,
                             transform: ColorOutputTransform::Xyb(inverse_opsin()),
@@ -1337,7 +1376,7 @@ mod tests {
                         scratch.plan.memory.output_storage_bytes,
                         layout.logical_size.div_ceil(4) * 4
                     );
-                    assert_eq!(scratch.uniform.size(), 192);
+                    assert_eq!(scratch.uniform.size(), 208);
                     assert_eq!(scratch.source_uniform.size(), 160);
                     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, 128);
                     let submission = queue.submit([encoder.finish()]);

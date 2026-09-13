@@ -308,9 +308,9 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
     fn submit_next(&mut self) -> Result<Option<Self::Pending>> {
         match self {
             Self::Sequence(session) => session.submit_next(),
-            Self::Modular(session) => session
-                .submit_next()
-                .map(|pending| pending.map(WgpuDecodePendingFrame::Modular)),
+            Self::Modular(session) => session.submit_next().map(|pending| {
+                pending.map(|pending| WgpuDecodePendingFrame::Modular(Box::new(pending)))
+            }),
             Self::VarDct(session) => session.submit_next().map(|pending| {
                 pending.map(|pending| WgpuDecodePendingFrame::VarDct(Box::new(pending)))
             }),
@@ -321,7 +321,7 @@ impl GpuSubmissionSession for WgpuDecodeSubmissionSession {
 /// One submitted frame from either stock GPU coding-mode pipeline.
 pub enum WgpuDecodePendingFrame {
     Sequence(Box<FrameSequencePending>),
-    Modular(WgpuPendingFrame),
+    Modular(Box<WgpuPendingFrame>),
     VarDct(Box<VarDctPendingFrame>),
 }
 
@@ -364,7 +364,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<crate::SubmittedGpuUpdate<Self::Frame>>> {
         match self.get_mut() {
             Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
-            Self::Modular(pending) => Pin::new(pending).poll_next_update(context),
+            Self::Modular(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
         }
     }
@@ -375,7 +375,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
             Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_complete(context),
-            Self::Modular(pending) => Pin::new(pending).poll_complete(context),
+            Self::Modular(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
         }
     }
@@ -391,7 +391,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<crate::SubmittedGpuUpdate<Self::Frame>>> {
         match self.get_mut() {
             Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
-            Self::Modular(pending) => Pin::new(pending).poll_next_update(context),
+            Self::Modular(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_next_update(context),
         }
     }
@@ -402,7 +402,7 @@ impl GpuPendingFrame for WgpuDecodePendingFrame {
     ) -> Poll<Result<SubmittedGpuFrame<Self::Frame>>> {
         match self.get_mut() {
             Self::Sequence(pending) => Pin::new(pending.as_mut()).poll_complete(context),
-            Self::Modular(pending) => Pin::new(pending).poll_complete(context),
+            Self::Modular(pending) => Pin::new(pending.as_mut()).poll_complete(context),
             Self::VarDct(pending) => Pin::new(pending.as_mut()).poll_complete(context),
         }
     }

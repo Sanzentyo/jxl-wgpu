@@ -373,6 +373,7 @@ pub struct GpuOutputRequest {
     numeric_channel: Option<NumericChannel>,
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
+    white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
     frame_stage: crate::frame_surface::FrameRenderStage,
     lf_extras: bool,
@@ -517,6 +518,7 @@ impl GpuOutputRequest {
             numeric_channel: None,
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
+            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             frame_surface: None,
             frame_stage: crate::frame_surface::FrameRenderStage::Complete,
             lf_extras: false,
@@ -575,6 +577,26 @@ impl GpuOutputRequest {
     #[must_use]
     pub const fn alpha_output_policy(&self) -> AlphaOutputPolicy {
         self.alpha
+    }
+
+    /// Choose colorimetric white-point adaptation for the requested output. Original-domain
+    /// numeric samples and internal reference frames retain their original encoding.
+    #[must_use]
+    pub const fn with_white_point_adaptation(
+        mut self,
+        adaptation: jxl_gpu_protocol::WhitePointAdaptation,
+    ) -> Self {
+        self.white_point_adaptation = adaptation;
+        self
+    }
+
+    #[must_use]
+    pub const fn white_point_adaptation(&self) -> jxl_gpu_protocol::WhitePointAdaptation {
+        if self.frame_surface.is_some() {
+            jxl_gpu_protocol::WhitePointAdaptation::Bradford
+        } else {
+            self.white_point_adaptation
+        }
     }
 
     pub(crate) fn for_frame_surface(

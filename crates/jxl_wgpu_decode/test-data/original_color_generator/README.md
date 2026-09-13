@@ -57,7 +57,8 @@ separate `5e-6*(1+abs(reference))` packing error and one integer code where quan
 linear BT.709 F32, sRGB RGBA8, original RGBA12, original numeric color and independent numeric alpha.
 
 The numeric regression test additionally re-encodes only the image color metadata of three existing
-exact-word integer fixtures across all nine RGB profiles. The resulting 27 variants retain
+exact-word integer fixtures across the nine original and four additional analytic RGB profiles.
+The resulting 39 variants retain
 byte-identical physical frames. Native RGB and each scalar selection must preserve 17/31-bit color
 and independent 5/24/31-bit alpha exactly, both for whole input and bounded fragmented input. This
 guards against metadata-only color conversion rounding native words through F32.
@@ -83,6 +84,53 @@ now use the linear negative extension for interoperability. BT.709 itself specif
 nonnegative range; the negative extension is an explicit implementation contract. sRGB, PQ,
 HLG and BT.2020 retain their existing sign-reflected extensions.
 
-This corpus covers original color plumbing and frame composition. ICC, custom chromaticities,
-gamma/DCI, HDR luminance mapping, wide-gamut spot/patch/spline/LF combinations and full ISO
+This corpus covers original color plumbing and frame composition. ICC, complete rendering intents,
+HDR luminance mapping, wide-gamut spot/patch/spline/LF combinations and full ISO
 conformance remain separate roadmap work.
+
+## Analytic profiles
+
+The additional `--analytic` case family preserves every original fixture and adds 80 streams:
+40 stills and 40 six-frame sequences, 200 presentations and 168 files (including eight explicit
+YCbCr component sources). The combined corpus has 228 streams, 570 presentations and 500 files.
+Run the native generator and Rust completion tool with `--analytic`:
+
+```sh
+./generate-original-color ../original_color --analytic
+cargo run -p jxl_wgpu_decode --example regenerate_original_color -- --analytic
+```
+
+`tools/jxl_test_support/src/fixtures/original_color/analytic.rs` declares each profile explicitly:
+BT.709/E/sRGB; P3/DCI/DCI; custom Adobe-RGB primaries/custom D50/gamma 0.4545455; custom wide primaries/
+D65/Linear; Gray/E/gamma 0.5; Gray/DCI/DCI. The four RGB/XYB codec modes cover all six profiles and
+both still/sequence forms. P3/DCI, Adobe/D50 and Gray/E also have F32 sources above one. Both YCbCr
+modes cover the first two RGB profiles. Color is 12-bit, F32, or 8-bit YCbCr components; independent
+alpha is 10-bit. The original reconstruction and output error bounds above are unchanged.
+
+The native decoder is configured with its CMS for the new RGB/XYB family. libjxl v0.12.0
+`dec_xyb.cc::CanOutputToColorEncoding` rejects an explicit non-D65 Gray request for a non-XYB image,
+even when it is already in that original profile. The generator keeps the decoder's original output
+for those Gray inputs, asserts the actual original metadata and checks every resulting reference.
+
+`stage_from_linear.cc::OpGamma` zeros values at or below `1e-5` before the original Gamma/DCI OETF.
+This includes negative values and occurs before blending and reference storage. The general native
+CMS is different: ICC Gamma para-0 clamps negatives, whereas DCI para-3 has a unit-slope negative
+branch. `probe.cpp` independently reproduces both CMS directions with negative, zero and extended
+F32 inputs using the public libjxl API. Compile it with the same pinned libraries and strict flags
+as `main.cpp`. The GPU keeps these reconstruction and general color-conversion contracts explicit.
+
+For XYB original RGB profiles requiring a primary/white conversion, libjxl's
+`ColorEncoding::GetPrimaries(kSRGB)` uses the ICC-calibrated coordinates
+`(.639998686,.330010138), (.300003784,.600003357), (.150002046,.059997204)`.
+`OutputEncodingInfo::SetColorEncoding` uses those coordinates to derive its matrix; direct sRGB
+and Gray skip that calibration. The inverse-opsin producer now declares its linear RGB space
+explicitly. Generic BT.709 matrices continue to use the standard coordinates.
+
+All 40 additional stills have an independent jxl-oxide comparison. XYB uses unbounded linear output,
+independent F64 colorimetry, and the original OETF/black floor. Requested linear or sRGB output of
+unreferenced Gamma/DCI XYB stills uses independent pre-OETF values: the original zeroed samples
+cannot reconstruct their negative linear values. Sequence references remain native due to the
+extra-channel source-selector defect described above. An additional absolute-XYZ output is checked
+for all 80 new cases; this is an output policy and does not claim support for non-relative intents
+in non-D65 original metadata. ICC/LUT/CMYK, those intents, HDR luminance mapping and wide-gamut
+feature/LF combinations remain open in the full JPEG XL roadmap.

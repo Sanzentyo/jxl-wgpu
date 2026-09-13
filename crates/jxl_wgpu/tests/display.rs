@@ -163,8 +163,17 @@ fn display_to_linear(value: f32, transfer: TransferFunction) -> f32 {
     if transfer == TransferFunction::Bt709 && value <= 0.081 {
         return value / 4.5;
     }
+    if matches!(transfer, TransferFunction::Gamma(_) | TransferFunction::Dci) && value <= 0.0 {
+        return if transfer == TransferFunction::Dci {
+            value
+        } else {
+            0.0
+        };
+    }
     signed_map(value, |value| match transfer {
         TransferFunction::Linear => value,
+        TransferFunction::Dci => value.powf(2.6),
+        TransferFunction::Gamma(exponent) => value.powf(1.0 / exponent.value()),
         TransferFunction::Srgb | TransferFunction::Sycc => {
             if value <= 0.040_45 {
                 value / 12.92
@@ -431,6 +440,55 @@ fn wide_gamut_and_hdr_images_become_linear_float_textures() {
             );
         }
         assert!((actual[3] - f32::from(stored[3]) / 255.0).abs() <= 0.001);
+    }
+}
+
+#[test]
+fn custom_white_gamma_and_dci_preserve_their_float_display_contract() {
+    use jxl_gpu_protocol::{Chromaticity, GammaExponent, RgbChromaticities};
+    let backend = test_backend().expect("color conformance requires an adapter");
+    let display = DisplayPipeline::new(&backend);
+    for transfer in [
+        TransferFunction::Gamma(GammaExponent::new(0.5).unwrap()),
+        TransferFunction::Dci,
+    ] {
+        let color = ColorSpecification::Defined(ColorSpec {
+            space: ColorSpace::CustomRgb(RgbChromaticities {
+                white: Chromaticity::E,
+                ..RgbChromaticities::BT709
+            }),
+            encoding: YcbcrEncoding::Undefined,
+            transfer,
+            range: ColorRange::Full,
+            chroma_location: ChromaLocation2d::BOTH,
+        });
+        let samples = [-0.25f32, 0.25, 1.25];
+        let values: Vec<_> = samples.iter().flat_map(|&v| [v, v, v, 0.5]).collect();
+        let layout = jxl_wgpu::ImageLayout::packed(
+            Extent2d::new(3, 1),
+            PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color),
+        )
+        .unwrap();
+        let source = gpu_image(
+            &backend,
+            layout,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+        let submission = display
+            .submit_image(&source, DisplayTextureDescriptor::linear_bt709_hdr())
+            .unwrap();
+        let bytes = read_texture(&backend, &submission.texture);
+        for (stored, value) in bytes.as_chunks::<8>().0.iter().zip(samples) {
+            let actual = rgba16f(stored);
+            let expected = display_to_linear(value, transfer);
+            for actual in &actual[..3] {
+                assert!(
+                    (actual - expected).abs() <= 0.001 * (1.0 + expected.abs()),
+                    "{transfer:?}: {actual} != {expected}"
+                );
+            }
+            assert_eq!(actual[3], 0.5);
+        }
     }
 }
 

@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+mod analytic;
+
 use jxl_gpu_formats::convert_rgb_f32;
 use jxl_gpu_protocol::{
     Border2d, Extent2d, FrameSessionDesc, GroupId, GroupPayload, HostPlane, MemoryMode, OutputDesc,
@@ -15,7 +17,7 @@ use jxl_gpu_protocol::{
 use jxl_wgpu::{
     ChromaLocation2d, ColorRange, ColorSpace, ColorSpec, ColorSpecification, Error, ImageLayout,
     ImageOutputRequest, OutputColorEncoding, Packed422Order, PixelFormat, RgbChannelOrder,
-    RgbColorEncoding, RgbPrimaries, TransferFunction, WgpuBackend, WgpuBackendConfig,
+    RgbColorEncoding, RgbColorSpace, TransferFunction, WgpuBackend, WgpuBackendConfig,
     YcbcrEncoding,
 };
 
@@ -277,27 +279,28 @@ fn apply_matrix(matrix: Matrix3, value: [f32; 3]) -> [f32; 3] {
 }
 
 fn scalar_primaries_transform(
-    source: RgbPrimaries,
+    source: RgbColorSpace,
     target: ColorSpace,
     value: [f32; 3],
 ) -> [f32; 3] {
     let source_to_xyz = match source {
-        RgbPrimaries::Bt709 => [
+        RgbColorSpace::Bt709 => [
             [0.4123908, 0.3575843, 0.1804808],
             [0.212_639, 0.7151687, 0.0721923],
             [0.0193308, 0.1191948, 0.9505322],
         ],
-        RgbPrimaries::Bt2020 => [
+        RgbColorSpace::Bt2020 => [
             [0.636_958, 0.144_616_9, 0.168_881],
             [0.262_700_2, 0.677_998_1, 0.059_301_7],
             [0.0, 0.028_072_7, 1.060_985_1],
         ],
-        RgbPrimaries::DisplayP3 => [
+        RgbColorSpace::DisplayP3 => [
             [0.486_570_95, 0.265_667_7, 0.198_217_29],
             [0.228_974_57, 0.691_738_55, 0.079_286_91],
             [0.0, 0.045_113_38, 1.043_944_4],
         ],
-        RgbPrimaries::Undefined => panic!("undefined primaries are not an oracle input"),
+        RgbColorSpace::Undefined => panic!("undefined primaries are not an oracle input"),
+        RgbColorSpace::Custom(_) => panic!("this oracle contains only standard RGB matrices"),
     };
     let xyz_to_target = match target {
         ColorSpace::Bt709 => [
@@ -332,9 +335,25 @@ fn scalar_color_transform(
         SourceTransferFunction::Bt709 => bt709_to_linear(value),
         SourceTransferFunction::Pq => pq_to_linear(value),
         SourceTransferFunction::Hlg => hlg_to_linear(value),
-        SourceTransferFunction::Gamma => panic!("gamma exponent is not available"),
+        SourceTransferFunction::Gamma(exponent) => value.max(0.0).powf(1.0 / exponent.value()),
+        SourceTransferFunction::Dci => {
+            if value <= 0.0 {
+                value
+            } else {
+                value.powf(2.6)
+            }
+        }
+        SourceTransferFunction::Bt2020 => signed_map(value, |v| {
+            let alpha = 1.099_296_8;
+            let beta = 0.018_053_97;
+            if v < 4.5 * beta {
+                v / 4.5
+            } else {
+                ((v + alpha - 1.0) / alpha).powf(1.0 / 0.45)
+            }
+        }),
     });
-    let target_linear = scalar_primaries_transform(source.primaries, target_space, source_linear);
+    let target_linear = scalar_primaries_transform(source.space, target_space, source_linear);
     target_linear.map(|value| {
         quantize8(match target_transfer {
             TransferFunction::Linear => value,
@@ -349,6 +368,14 @@ fn scalar_color_transform(
             TransferFunction::Pq => pq_from_linear(value),
             TransferFunction::Hlg => hlg_from_linear(value),
             TransferFunction::Bt2020 => bt2020_from_linear(value),
+            TransferFunction::Gamma(exponent) => value.max(0.0).powf(exponent.value()),
+            TransferFunction::Dci => {
+                if value <= 0.0 {
+                    value
+                } else {
+                    value.powf(1.0 / 2.6)
+                }
+            }
             TransferFunction::Undefined | TransferFunction::Smpte240M => {
                 panic!("unsupported oracle transfer")
             }
@@ -508,7 +535,7 @@ fn floating_rgb_output_preserves_extended_values_and_color_conversion() {
     }
     for space in [ColorSpace::DisplayP3, ColorSpace::Bt2020] {
         let samples = [-0.25, 1.5, 0.018];
-        let expected = scalar_primaries_transform(RgbPrimaries::Bt709, space, samples);
+        let expected = scalar_primaries_transform(RgbColorSpace::Bt709, space, samples);
         let (_, bytes) = submit_format(
             &backend,
             RgbColorEncoding::LINEAR_BT709,
@@ -647,7 +674,7 @@ fn gpu_output_converts_wide_gamut_and_hdr_contracts() {
         (
             "BT.2020 linear to BT.709 linear",
             RgbColorEncoding {
-                primaries: RgbPrimaries::Bt2020,
+                space: RgbColorSpace::Bt2020,
                 transfer: SourceTransferFunction::Linear,
             },
             ColorSpace::Bt709,
@@ -657,7 +684,7 @@ fn gpu_output_converts_wide_gamut_and_hdr_contracts() {
         (
             "Display-P3 linear to BT.709 sRGB",
             RgbColorEncoding {
-                primaries: RgbPrimaries::DisplayP3,
+                space: RgbColorSpace::DisplayP3,
                 transfer: SourceTransferFunction::Linear,
             },
             ColorSpace::Bt709,
@@ -667,7 +694,7 @@ fn gpu_output_converts_wide_gamut_and_hdr_contracts() {
         (
             "BT.2020 PQ to BT.2020 linear",
             RgbColorEncoding {
-                primaries: RgbPrimaries::Bt2020,
+                space: RgbColorSpace::Bt2020,
                 transfer: SourceTransferFunction::Pq,
             },
             ColorSpace::Bt2020,
@@ -684,7 +711,7 @@ fn gpu_output_converts_wide_gamut_and_hdr_contracts() {
         (
             "Display-P3 HLG to Display-P3 linear",
             RgbColorEncoding {
-                primaries: RgbPrimaries::DisplayP3,
+                space: RgbColorSpace::DisplayP3,
                 transfer: SourceTransferFunction::Hlg,
             },
             ColorSpace::DisplayP3,
@@ -701,7 +728,7 @@ fn gpu_output_converts_wide_gamut_and_hdr_contracts() {
         (
             "BT.2020 linear to BT.2020 OETF",
             RgbColorEncoding {
-                primaries: RgbPrimaries::Bt2020,
+                space: RgbColorSpace::Bt2020,
                 transfer: SourceTransferFunction::Linear,
             },
             ColorSpace::Bt2020,
@@ -736,7 +763,7 @@ fn gpu_output_implements_both_bt2020_ycbcr_matrices() {
         return;
     };
     let source = RgbColorEncoding {
-        primaries: RgbPrimaries::Bt2020,
+        space: RgbColorSpace::Bt2020,
         transfer: SourceTransferFunction::Linear,
     };
     let samples = [0.18, 0.43, 0.72];
@@ -791,6 +818,9 @@ fn gpu_output_implements_both_bt2020_ycbcr_matrices() {
 
 #[test]
 fn generic_output_rejects_mismatched_or_unsupported_color_contracts() {
+    for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(jxl_gpu_protocol::GammaExponent::new(invalid).is_none());
+    }
     let Some(backend) = backend() else {
         return;
     };
@@ -809,16 +839,8 @@ fn generic_output_rejects_mismatched_or_unsupported_color_contracts() {
         (
             "undefined source primaries",
             RgbColorEncoding {
-                primaries: RgbPrimaries::Undefined,
+                space: RgbColorSpace::Undefined,
                 transfer: SourceTransferFunction::Linear,
-            },
-            supported_target,
-        ),
-        (
-            "source gamma without exponent",
-            RgbColorEncoding {
-                primaries: RgbPrimaries::Bt709,
-                transfer: SourceTransferFunction::Gamma,
             },
             supported_target,
         ),

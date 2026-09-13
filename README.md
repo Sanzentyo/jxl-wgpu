@@ -61,13 +61,14 @@ floating samples, nine extra channels and four nine-layer animations. Full JPEG 
 and the remaining color/render/container/encoder work are tracked in
 [`docs/FULL_JPEG_XL_ROADMAP.md`](docs/FULL_JPEG_XL_ROADMAP.md).
 
-Original SDR metadata now reaches both decoders and frame composition: D65 BT.709, BT.2020 and
-Display-P3 with Linear/sRGB/BT.709, plus gray, across RGB/XYB/YCbCr. An explicit surface domain
-preserves original primaries and transfer through references and blending. A 148-stream corpus
-checks native references, progressive lifetime, requested color conversion and numeric color/alpha;
-74 stills also match jxl-oxide. See the [original color corpus](crates/jxl_wgpu_decode/test-data/original_color_generator/README.md)
-for generation and remaining conformance limits. ICC/custom profiles and HDR luminance mapping
-remain incomplete.
+Original SDR metadata reaches both decoders and frame composition: standard and custom RGB
+chromaticities, D65/E/DCI/custom whites, Linear/sRGB/BT.709 and parameterized gamma/DCI, plus gray.
+Non-D65 profiles currently require relative intent. Explicit surface encodings preserve original
+color through references and blending. The 228-stream corpus checks native references, progressive
+lifetime, requested color conversion and numeric color/alpha; all 114 stills also match jxl-oxide.
+See the [original color corpus](crates/jxl_wgpu_decode/test-data/original_color_generator/README.md)
+for the original OETF and XYB calibration contracts. ICC, complete rendering intents and HDR
+luminance mapping remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.
@@ -184,7 +185,7 @@ F32 coverage, including signaled noise and zero-model controls.
 
 VarDCT output shares the render backend's GPU color conversion and packing. A single fused dispatch
 returns all 20 color VPI pitch-linear layouts, planar YUV, NV21/NV42, P010/P012/P016, and other
-classified color layouts with explicit SDR transfer, D65 primaries, range, and siting. No intermediate
+classified color layouts with explicit SDR transfer and RGB chromaticities, range, and siting. No intermediate
 RGB image or host pixel conversion is added. Tests cover 39 layout/transfer choices, grayscale,
 JPEG upsampling, recursive DC, and Display-P3/BT.2020 conversion. The common engine also delivers selected
 color components as native unsigned or scalar F32 samples through an accounted frame surface.
@@ -193,9 +194,8 @@ Legacy Gray8 numeric layout mappings and PQ/HLG luminance mapping remain unsuppo
 Both coding modes now return planar/interleaved F32 RGB/BGR/RGBA/BGRA through
 `PixelFormat::rgb_f32`. Modular normalizes 1–31-bit Gray/RGB/RGBA samples, preserving alpha;
 VarDCT keeps unclipped reconstructed color. Float outputs retain negative and greater-than-one
-values, use the existing GPU leases, and can feed an `Rgba16Float` display texture. Modular float
-conversion currently supports BT.709 primaries with sRGB, Linear, BT.709 or BT.2020 transfer;
-VarDCT uses the shared D65 primary conversion. `GpuOutputRequest::with_orientation_policy`
+values, use the existing GPU leases, and can feed an `Rgba16Float` display texture. Both codecs use
+the shared SDR transfer and RGB/white-point conversion. `GpuOutputRequest::with_orientation_policy`
 selects default `OrientationPolicy::Apply` or `Keep` for codestream coordinates, including mixed
 animation and recursive DC. The frame executor uses this unrounded boundary for GPU crop/blend
 composition and four post-transform reference slots. It handles negative/oversized/off-canvas

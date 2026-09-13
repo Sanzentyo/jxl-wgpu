@@ -71,6 +71,15 @@ pub(super) fn convert(
         stride: source.extent().width,
     });
     let config = ColorOutputConfig {
+        linear_black_threshold: if image.xyb_encoded {
+            crate::image_color::reconstruction_black_threshold(
+                crate::image_color::require_original_encoding(image)?,
+                layout.color.format.color_spec,
+            )
+        } else {
+            None
+        },
+        white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
         extent: source.extent(),
         orientation: OutputOrientation::Identity,
         transform: if image.xyb_encoded {

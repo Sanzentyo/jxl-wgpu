@@ -4,6 +4,7 @@
 #include <jxl/decode.h>
 #include <jxl/encode.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -18,19 +19,28 @@ void Require(bool condition, const char* operation) {
   if (!condition) { std::fprintf(stderr, "%s failed\n", operation); std::exit(1); }
 }
 void Enc(JxlEncoderStatus status) { Require(status == JXL_ENC_SUCCESS, "encode"); }
-void Dec(JxlDecoderStatus status) { Require(status == JXL_DEC_SUCCESS, "decode"); }
+void DecImpl(JxlDecoderStatus status, int line) {
+  if (status != JXL_DEC_SUCCESS) std::fprintf(stderr, "native decoder status %d at line %d\n", status, line);
+  Require(status == JXL_DEC_SUCCESS, "decode");
+}
+#define Dec(status) DecImpl(status, __LINE__)
 struct Mode { const char* name; bool modular, original, ycbcr; };
 constexpr Mode modes[] = {
     {"modular_rgb", true, true, false}, {"vardct_rgb", false, true, false},
     {"modular_xyb", true, false, false}, {"vardct_xyb", false, false, false},
     {"modular_ycbcr", true, true, true}, {"vardct_ycbcr", false, true, true},
 };
-struct Profile { const char* name; JxlPrimaries primaries; bool gray; };
+struct Profile {
+  const char* name; JxlPrimaries primaries; bool gray;
+  JxlWhitePoint white = JXL_WHITE_POINT_D65;
+  std::array<double, 2> white_xy = {.3127, .3290};
+  std::array<double, 6> rgb_xy = {.64, .33, .30, .60, .15, .06};
+};
 constexpr Profile profiles[] = {
     {"bt709", JXL_PRIMARIES_SRGB, false}, {"bt2020", JXL_PRIMARIES_2100, false},
     {"p3", JXL_PRIMARIES_P3, false}, {"gray", JXL_PRIMARIES_SRGB, true},
 };
-struct Transfer { const char* name; JxlTransferFunction value; };
+struct Transfer { const char* name; JxlTransferFunction value; double gamma = 0; };
 constexpr Transfer transfers[] = {
     {"linear", JXL_TRANSFER_FUNCTION_LINEAR}, {"srgb", JXL_TRANSFER_FUNCTION_SRGB},
     {"bt709", JXL_TRANSFER_FUNCTION_709},
@@ -61,7 +71,40 @@ std::vector<Case> Cases() {
   }
   return result;
 }
+std::vector<Case> AnalyticCases() {
+  const Profile profiles[] = {
+      {"e_bt709", JXL_PRIMARIES_SRGB, false, JXL_WHITE_POINT_E},
+      {"dci_p3", JXL_PRIMARIES_P3, false, JXL_WHITE_POINT_DCI},
+      {"d50_adobe", JXL_PRIMARIES_CUSTOM, false, JXL_WHITE_POINT_CUSTOM,
+          {.34567, .35850}, {.64, .33, .21, .71, .15, .06}},
+      {"d65_custom", JXL_PRIMARIES_CUSTOM, false, JXL_WHITE_POINT_D65,
+          {.3127, .3290}, {.7347, .2653, .1152, .8264, .1566, .0177}},
+      {"e_gray", JXL_PRIMARIES_SRGB, true, JXL_WHITE_POINT_E},
+      {"dci_gray", JXL_PRIMARIES_SRGB, true, JXL_WHITE_POINT_DCI},
+  };
+  const Transfer transfers[] = {
+      {"srgb", JXL_TRANSFER_FUNCTION_SRGB}, {"dci", JXL_TRANSFER_FUNCTION_DCI},
+      {"gamma22", JXL_TRANSFER_FUNCTION_GAMMA, .4545455},
+      {"linear", JXL_TRANSFER_FUNCTION_LINEAR},
+      {"gamma2", JXL_TRANSFER_FUNCTION_GAMMA, .5}, {"dci", JXL_TRANSFER_FUNCTION_DCI},
+  };
+  std::vector<Case> result;
+  for (const auto& mode : modes) for (size_t profile = 0; profile < 6; ++profile) {
+    if (mode.ycbcr && profile > 1) continue;
+    for (bool floating : {false, true}) {
+      if (floating && (mode.ycbcr || (profile != 1 && profile != 2 && profile != 4))) continue;
+      for (bool sequence : {false, true}) {
+        std::string name = std::string("analytic_") + mode.name + "_" + profiles[profile].name + "_" + transfers[profile].name;
+        name += floating ? "_float" : "";
+        name += sequence ? "_sequence" : "_still";
+        result.push_back({name, mode, profiles[profile], transfers[profile], sequence, floating});
+      }
+    }
+  }
+  return result;
+}
 struct Layer {
+
   int x, y;
   uint32_t width, height, duration, save, source;
   JxlBlendMode blend;
@@ -93,7 +136,13 @@ std::vector<uint8_t> Encode(const Case& test) {
   Enc(JxlEncoderSetBasicInfo(encoder, &info));
   JxlColorEncoding color;
   JxlColorEncodingSetToSRGB(&color, test.profile.gray);
-  color.primaries = test.profile.primaries;
+color.primaries = test.profile.primaries;
+color.white_point = test.profile.white;
+std::copy(test.profile.white_xy.begin(), test.profile.white_xy.end(), color.white_point_xy);
+std::copy_n(test.profile.rgb_xy.begin(), 2, color.primaries_red_xy);
+std::copy_n(test.profile.rgb_xy.begin() + 2, 2, color.primaries_green_xy);
+std::copy_n(test.profile.rgb_xy.begin() + 4, 2, color.primaries_blue_xy);
+color.gamma = test.transfer.gamma;
   color.transfer_function = test.transfer.value;
   color.rendering_intent = JXL_RENDERING_INTENT_RELATIVE;
   Enc(JxlEncoderSetColorEncoding(encoder, &color));
@@ -165,6 +214,7 @@ std::vector<uint8_t> Encode(const Case& test) {
 std::vector<float> DecodeOriginal(const std::vector<uint8_t>& encoded, const Case& test) {
   JxlDecoder* decoder = JxlDecoderCreate(nullptr);
   Require(decoder != nullptr, "decoder allocation");
+  if (test.name.rfind("analytic_", 0) == 0) Dec(JxlDecoderSetCms(decoder, *JxlGetDefaultCms()));
   Dec(JxlDecoderSubscribeEvents(decoder, JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE));
   Dec(JxlDecoderSetUnpremultiplyAlpha(decoder, JXL_FALSE));
   Dec(JxlDecoderSetRenderSpotcolors(decoder, JXL_FALSE));
@@ -178,10 +228,13 @@ std::vector<float> DecodeOriginal(const std::vector<uint8_t>& encoded, const Cas
     if (status == JXL_DEC_COLOR_ENCODING) {
       JxlColorEncoding original;
       Dec(JxlDecoderGetColorAsEncodedProfile(decoder, JXL_COLOR_PROFILE_TARGET_ORIGINAL, &original));
-      Require(original.transfer_function == test.transfer.value && original.white_point == JXL_WHITE_POINT_D65,
+      Require(original.transfer_function == test.transfer.value && original.white_point == test.profile.white,
           "original color metadata");
       Require(test.profile.gray || original.primaries == test.profile.primaries, "original primaries");
-      Dec(JxlDecoderSetOutputColorProfile(decoder, &original, nullptr, 0));
+      // libjxl rejects explicit non-D65 Gray requests for non-XYB streams, even
+      // when they already use exactly that original profile. Keep its original output.
+      if (!(test.profile.gray && test.profile.white != JXL_WHITE_POINT_D65 && test.mode.original))
+        Dec(JxlDecoderSetOutputColorProfile(decoder, &original, nullptr, 0));
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
       size_t bytes;
       Dec(JxlDecoderImageOutBufferSize(decoder, &format, &bytes));
@@ -223,7 +276,9 @@ int main(int argc, char** argv) {
   Require(JxlEncoderVersion() == 12000 && JxlDecoderVersion() == 12000, "libjxl 0.12.0 version");
   std::filesystem::create_directories(argv[1]);
   size_t count = 0;
-  for (const auto& test : Cases()) if (argc == 2 || test.name == argv[2]) { Write(argv[1], test); ++count; }
+const bool analytic = argc == 3 && std::string(argv[2]) == "--analytic";
+const auto cases = analytic ? AnalyticCases() : Cases();
+for (const auto& test : cases) if (argc == 2 || analytic || test.name == argv[2]) { Write(argv[1], test); ++count; }
   Require(count != 0, "selected cases");
   std::fprintf(stderr, "Generated %zu cases\n", count);
 }

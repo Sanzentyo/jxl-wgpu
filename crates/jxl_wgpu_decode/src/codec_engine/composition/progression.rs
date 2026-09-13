@@ -27,6 +27,7 @@ pub(super) struct LfPreview {
     backend: WgpuBackend,
     config: ColorOutputConfig,
     inverse_opsin: InverseOpsin,
+    original_encoding: jxl_gpu_protocol::RgbColorEncoding,
     pub(super) layout: ImageLayout,
     pub(super) surface: Option<crate::frame_surface::FrameSurfaceLayout>,
     pub(super) surface_encoding: Option<crate::frame_surface::FrameSurfaceEncoding>,
@@ -79,6 +80,11 @@ impl LfPreview {
             "LF presentation has no inverse opsin metadata",
         ))?;
         let config = ColorOutputConfig {
+            linear_black_threshold: crate::image_color::reconstruction_black_threshold(
+                crate::image_color::require_original_encoding(image)?,
+                render_request.format().color_spec,
+            ),
+            white_point_adaptation: render_request.white_point_adaptation(),
             extent: Extent2d::new(image.width, image.height),
             orientation: render_request.orientation_policy().resolve(
                 OutputOrientation::from_exif_value(image.orientation).ok_or(
@@ -110,6 +116,7 @@ impl LfPreview {
             extra_count: image.extra_channels.len(),
             config,
             inverse_opsin,
+            original_encoding: crate::image_color::require_original_encoding(image)?,
             layout,
             output_plan,
             output_storage_bytes: output_plan.memory.output_storage_bytes,
@@ -138,6 +145,17 @@ impl LfPreview {
             &self.backend.device().limits(),
         )?;
         let config = ColorOutputConfig {
+            linear_black_threshold: if encoding
+                == crate::frame_surface::FrameSurfaceEncoding::Encoded
+            {
+                None
+            } else {
+                crate::image_color::reconstruction_black_threshold(
+                    self.original_encoding,
+                    surface.color.format.color_spec,
+                )
+            },
+            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             extent,
             orientation: OutputOrientation::Identity,
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,

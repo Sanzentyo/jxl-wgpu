@@ -375,7 +375,7 @@ XYB coefficients or the integer Modular words used by progressive-DC dependencie
 plus 27 rendering fixtures including five nine-layer animations and a real progressive-DC dependency.
 Whole and 256-byte-window fragmented async output agree exactly, and reservations return to zero.
 `cargo run -p jxl_wgpu_decode --example regenerate_floating` reproduces the corpus using offline
-libjxl 0.12 tools; the production crates do not link that codec. ICC, custom chromaticities and HDR luminance mapping remain separate requirements.
+libjxl 0.12 tools; the production crates do not link that codec. ICC, complete rendering intents and HDR luminance mapping remain separate requirements.
 
 Codestream topology is separate from native pixel formats: `DecodeProfile::Modular`
 contains `ModularChannelCounts`, with `color_count()`, `extra_count()` and total `count()`.
@@ -604,7 +604,7 @@ streams in pass/group order, all use the same bounded-window executor and aggreg
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
 The low-level Modular producer requires patches and splines to be handled by the common frame
-executor. ICC, custom chromaticities, gamma/DCI and HDR original profiles remain typed unsupported profiles.
+executor. ICC and HDR original profiles remain typed unsupported profiles.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -612,15 +612,15 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 ### Original SDR color encodings
 
-Both decoders accept enumerated D65 BT.709, BT.2020 and Display-P3 primaries with Linear,
-sRGB or BT.709 transfer, plus D65 gray. Original Modular/VarDCT RGB and YCbCr carry this encoding
-through reconstruction, and XYB converts from its linear-BT.709 intermediate into the requested
-working primaries. Composition and post-transform references retain original encoding; an
-unreferenced XYB presentation can keep linear RGB in the original primaries. Numeric color
-selection returns original component values; numeric extras remain independent of color transfer.
+Both decoders accept standard or custom RGB chromaticities with D65/E/DCI/custom white points,
+Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. Non-D65 white points currently
+require relative rendering intent; ICC and HDR remain typed unsupported profiles. XYB inverse
+matrices carry their linear RGB chromaticities explicitly. Original RGB/YCbCr and post-transform
+references preserve the original transfer; unreferenced XYB can retain linear original RGB.
+`GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
+color output. Numeric samples retain their original domain regardless of this output policy.
 
-The shared image header resolver rejects ICC, custom chromaticities, gamma/DCI and HDR profiles
-until their full interpretation is connected. The private surface tag includes both RGB primaries
+The private surface tag includes both RGB primaries
 and transfer, with a separate codec-component variant. `ColorOutputTransform::Ycbcr` now requires
 an explicit original encoding. Native output with Default/Undefined color meaning uses the original
 encoding; explicit sRGB output converts to sRGB. Native depth conversion and non-portable native
@@ -628,16 +628,20 @@ VarDCT bit packings use the common surface and final quantizer.
 Color metadata alone does not introduce F32 conversion for native or numeric Modular output;
 unfiltered samples retain exact source words, including integer precision above 24 bits.
 
-`tests/original_color` covers 148 streams with independent native references: integer/F32, gray/RGBA,
+`tests/original_color` covers 228 streams with independent native references: integer/F32, gray/RGBA,
 RGB/XYB/YCbCr, cropped/hidden frames, all five blend modes and overwritten references. Whole and
 bounded async input, retained progressive images, final-only equality, linear BT.709 F32, sRGB
-RGBA8, original RGBA12 and numeric color/alpha are checked. jxl-oxide independently verifies the 74
+RGBA8, original RGBA12 and numeric color/alpha are checked. jxl-oxide independently verifies the 114
 stills; its extra-channel source-selector parsing defect prevents sequence comparison. A further
-27 metadata variants check exact 17/31-bit Modular color and independent 5/24/31-bit alpha through
+39 metadata variants check exact 17/31-bit Modular color and independent 5/24/31-bit alpha through
 native RGB and every scalar selection under whole and bounded fragmented input. The
 [generator notes](test-data/original_color_generator/README.md) record generation, precision,
 the second-oracle limitation and the explicit BT.709 linear extension below zero. Matrix conversion
-uses a common exact D65 white with host F64 multiplication and one F32 uniform lowering. Wide-gamut
+derives RGB/XYZ matrices and Bradford adaptation in host F64 and lowers once to F32. The original
+JPEG XL Gamma/DCI OETF applies the native 1e-5 linear black floor before blending/reference storage;
+general CMS conversion remains separate. XYB uses explicit native ICC-calibrated sRGB chromaticities
+when the original RGB profile requires conversion. See the generator notes for the independent
+unclipped linear oracle used when the original OETF loses negative samples. Wide-gamut
 spot/patch/spline/LF combinations and complete color management still require conformance work.
 
 ### Frame execution and animation
@@ -815,7 +819,7 @@ input/GPU reservations after callbacks retire.
 
 Sequences containing crops, blends, or reference-only frames use the same ordered LF/physical
 executor, including hidden zero-duration layers. The working surface is
-unrounded, unrotated planar F32 RGB in the validated original D65 SDR encoding, followed by
+unrounded, unrotated planar F32 RGB in the validated original enumerated SDR encoding, followed by
 every extra plane at its own normalized depth. Up to four reference
 slots retain accounted buffer leases; an overwritten slot releases its old version after any
 submitted consumer completes. Empty references are zero, with opaque presentation alpha for
@@ -904,7 +908,7 @@ executor above; the low-level standalone VarDCT entry point remains an uncropped
 All image orientations 1–8 are normalized before target chroma subsampling and packing. `ColorOutputConfig` explicitly
 separates the unrotated `extent` and typed `orientation`; `output_extent()` includes transposition.
 Coefficient grids, restoration, component/frame upsampling, and progressive-DC dependencies stay
-in codestream coordinates. The shared 192-byte output uniform carries geometry and orientation,
+in codestream coordinates. The shared 208-byte output uniform carries geometry and orientation,
 while a 160-byte source uniform describes XYB/JPEG reconstruction and independent alpha. No intermediate RGB image or
 additional submission is needed. Odd 257×17 three-pass fixtures cover
 every orientation; the packer also checks both one-pixel axes and zero tail padding.
@@ -1186,12 +1190,12 @@ and BT.2020. Output YCbCr selects BT.601/709/2020 NCL or BT.2020 constant lumina
 range, and supported centered/cosited chroma locations. RGB requires full range; the first alpha is reconstructed at its independent depth, with explicit
 Unassociated/Preserve/Associated output policy.
 
-The codec source fragment reconstructs unclipped linear BT.709 from XYB, or encoded sRGB from
+The codec source fragment reconstructs unclipped linear RGB from XYB, or original encoded RGB from
 JPEG components, inside the render backend's shared word-owned output shader. Chroma sampling
 therefore follows orientation and full-precision reconstruction before one final quantization.
 `ColorOutputInputs` takes an explicit checked `ImageLayout`; output planning uses its exact logical
-byte length and four-byte storage rounding. Separate 192-byte output and 160-byte source uniforms
-cost 352 bytes in total and are checked individually against binding limits. Padded rows, unaligned
+byte length and four-byte storage rounding. Separate 208-byte output and 160-byte source uniforms
+cost 368 bytes in total and are checked individually against binding limits. Padded rows, unaligned
 plane starts, last-row tails, opaque alpha, and unused sample/storage bits have actual-GPU coverage.
 Thirty integer layout/transfer cases match both float CPU oracles within one code at 8–12 bits and at most
 three codes at 16 bits on Apple M5. Dedicated Display-P3 and BT.2020 cases match requested `djxl`

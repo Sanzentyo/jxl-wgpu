@@ -15,6 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+mod color;
+pub use color::{Chromaticity, GammaExponent, RgbChromaticities, WhitePointAdaptation};
+
 /// Stable identifier for a logical image plane in a [`RenderPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlaneId(pub u32);
@@ -238,40 +241,55 @@ pub enum TransferFunction {
     Srgb,
     /// BT.709 with the linear toe extended below zero, matching libjxl color conversion.
     Bt709,
+    Bt2020,
     Pq,
     Hlg,
-    Gamma,
+    Gamma(GammaExponent),
+    /// DCI power curve with a linear extension below zero.
+    Dci,
 }
 
-/// RGB primary chromaticities attached to an output signal.
-///
-/// The portable backend converts BT.709, BT.2020, and D65 Display-P3 primaries.
+/// RGB primary chromaticities and their reference white point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RgbPrimaries {
+pub enum RgbColorSpace {
     Bt709,
     Bt2020,
     DisplayP3,
+    Custom(RgbChromaticities),
     Undefined,
 }
 
-/// Primaries and transfer function of three floating-point RGB channels.
+impl RgbColorSpace {
+    #[must_use]
+    pub const fn chromaticities(self) -> Option<RgbChromaticities> {
+        match self {
+            Self::Bt709 => Some(RgbChromaticities::BT709),
+            Self::Bt2020 => Some(RgbChromaticities::BT2020),
+            Self::DisplayP3 => Some(RgbChromaticities::DISPLAY_P3),
+            Self::Custom(value) => Some(value),
+            Self::Undefined => None,
+        }
+    }
+}
+
+/// Color space and transfer function of three floating-point RGB channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RgbColorEncoding {
-    pub primaries: RgbPrimaries,
+    pub space: RgbColorSpace,
     pub transfer: TransferFunction,
 }
 
 impl RgbColorEncoding {
     pub const LINEAR_BT709: Self = Self {
-        primaries: RgbPrimaries::Bt709,
+        space: RgbColorSpace::Bt709,
         transfer: TransferFunction::Linear,
     };
     pub const SRGB_BT709: Self = Self {
-        primaries: RgbPrimaries::Bt709,
+        space: RgbColorSpace::Bt709,
         transfer: TransferFunction::Srgb,
     };
     pub const BT709: Self = Self {
-        primaries: RgbPrimaries::Bt709,
+        space: RgbColorSpace::Bt709,
         transfer: TransferFunction::Bt709,
     };
 }
@@ -396,9 +414,6 @@ pub struct XybParams {
 #[derive(Clone, Debug)]
 pub struct TransferParams {
     pub function: TransferFunction,
-    /// Encoding exponent for [`TransferFunction::Gamma`]. JPEG XL stores the inverse display
-    /// gamma (for example, `1 / 2.2`), not the display gamma itself.
-    pub gamma: f32,
     pub intensity_target: f32,
     pub min_nits: f32,
     /// Linear-light RGB luminance coefficients used by the HLG inverse OOTF. Frontends must

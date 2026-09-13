@@ -1329,7 +1329,13 @@ impl OutputPlan {
                 return Err(Error::NumericMappingForColorOutput);
             }
             (PixelFormatClass::Color(color), GpuOutputMapping::Color) => {
-                let (transfer, limited_range) = color_conversion(&format)?;
+                let (transfer, limited_range) = if request.retains_frame_surface() {
+                    // Private F32 surfaces get their declared encoding from the common color
+                    // renderer. This finalizer copies those samples without another transfer.
+                    (0, false)
+                } else {
+                    color_conversion(&format)?
+                };
                 let (kind, channels, order, bits, storage_bits) = match color {
                     ColorFormatClass::Rgb {
                         sample,

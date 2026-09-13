@@ -7,14 +7,14 @@
 use crate::{Error, Result};
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpace, ColorSpecification,
-    ImageLayout, NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass,
-    RgbChannelOrder, RgbStorage, TransferFunction as ImageTransferFunction, WgslNumericCapability,
-    YcbcrEncoding, classify_pixel_format,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
+    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
+    TransferFunction as ImageTransferFunction, WgslNumericCapability, YcbcrEncoding,
+    classify_pixel_format,
 };
 use jxl_gpu_protocol::{
-    Extent2d, OutputOrientation, RgbColorEncoding, RgbPrimaries,
-    TransferFunction as SourceTransferFunction,
+    Extent2d, OutputOrientation, RgbColorEncoding, TransferFunction as SourceTransferFunction,
+    WhitePointAdaptation,
 };
 
 /// Shared WGSL declarations, color conversion, and word-owned output entry point `main`.
@@ -67,7 +67,7 @@ pub enum AlphaConversion {
     Premultiply = 2,
 }
 
-/// Fixed 192-byte uniform for the shared output shader.
+/// Fixed 208-byte uniform for the shared output shader.
 /// Construct it with [`Self::new`] to validate geometry, color, and packed addressing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -108,13 +108,28 @@ pub struct ImageOutputParams {
     pub(crate) primaries_g: [f32; 4],
     pub(crate) primaries_b: [f32; 4],
     pub(crate) alpha: [u32; 4],
+    pub(crate) transfer_parameters: [f32; 4],
 }
 impl ImageOutputParams {
+    /// Clamp target-linear components at or below a codec reconstruction threshold to zero.
+    /// This happens before the target transfer; it does not clamp encoded reference samples.
+    pub fn with_linear_black_threshold(mut self, threshold: f32) -> Result<Self> {
+        if !threshold.is_finite() || threshold < 0.0 {
+            return Err(Error::InvalidPayload(
+                "linear black threshold must be finite and nonnegative".into(),
+            ));
+        }
+        self.transfer_parameters[2] = threshold;
+        self.identity_color_transform = 0;
+        Ok(self)
+    }
+
     /// Lowers the requested layout and source metadata before any GPU submission.
     pub fn new(
         layout: &ImageLayout,
         source: ImageOutputSource,
         dispatch_width: u32,
+        adaptation: WhitePointAdaptation,
     ) -> Result<Self> {
         let prepared = prepare_image_output(layout)?;
         if source.extent.is_empty()
@@ -125,7 +140,7 @@ impl ImageOutputParams {
                 "image output source geometry or dispatch is invalid".into(),
             ));
         }
-        let color = image_color_transform(source.encoding, &layout.format)?;
+        let color = image_color_transform(source.encoding, &layout.format, adaptation)?;
         Ok(Self {
             width: layout.extent.width,
             height: layout.extent.height,
@@ -160,6 +175,7 @@ impl ImageOutputParams {
             target_transfer: color.target_transfer,
             identity_color_transform: u32::from(
                 color.source_transfer == color.target_transfer
+                    && color.source_gamma == color.target_gamma
                     && color.primaries
                         == IDENTITY_3.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]),
             ),
@@ -167,6 +183,7 @@ impl ImageOutputParams {
             primaries_g: color.primaries[1],
             primaries_b: color.primaries[2],
             alpha: [0; 4],
+            transfer_parameters: [color.source_gamma, color.target_gamma, -1.0, 0.0],
         })
     }
 
@@ -385,24 +402,25 @@ fn image_siting(location: ChromaLocation, divisor: u8) -> Result<u8> {
 pub(crate) struct ImageColorTransform {
     pub(crate) source_transfer: u32,
     pub(crate) target_transfer: u32,
+    pub(crate) source_gamma: f32,
+    pub(crate) target_gamma: f32,
     pub(crate) primaries: [[f32; 4]; 3],
 }
 
 pub(crate) fn image_color_transform(
     source: RgbColorEncoding,
     target: &PixelFormat,
+    adaptation: WhitePointAdaptation,
 ) -> Result<ImageColorTransform> {
     let source_transfer = match source.transfer {
         SourceTransferFunction::Linear => 0,
         SourceTransferFunction::Srgb => 1,
         SourceTransferFunction::Bt709 => 2,
+        SourceTransferFunction::Bt2020 => 5,
         SourceTransferFunction::Pq => 3,
         SourceTransferFunction::Hlg => 4,
-        unsupported => {
-            return Err(Error::Unsupported(format!(
-                "generic GPU output source transfer {unsupported:?} has no complete numeric contract"
-            )));
-        }
+        SourceTransferFunction::Gamma(_) => 6,
+        SourceTransferFunction::Dci => 7,
     };
     let target_color = match target.color_spec {
         ColorSpecification::Defined(color) => color,
@@ -419,111 +437,48 @@ pub(crate) fn image_color_transform(
         ImageTransferFunction::Pq => 3,
         ImageTransferFunction::Hlg => 4,
         ImageTransferFunction::Bt2020 => 5,
+        ImageTransferFunction::Gamma(_) => 6,
+        ImageTransferFunction::Dci => 7,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "generic GPU output target transfer {unsupported:?} is unsupported"
             )));
         }
     };
-    let primaries = primaries_transform(source.primaries, target_color.space)?;
+    let target_space = target_color.space.rgb_space().ok_or_else(|| {
+        Error::Unsupported("RGB output requires defined target chromaticities".into())
+    })?;
+    let primaries = rgb_color_matrix(source.space, target_space, adaptation)?;
     Ok(ImageColorTransform {
         source_transfer,
         target_transfer,
+        source_gamma: match source.transfer {
+            SourceTransferFunction::Gamma(exponent) => exponent.value(),
+            _ => 1.0,
+        },
+        target_gamma: match target_color.transfer {
+            ImageTransferFunction::Gamma(exponent) => exponent.value(),
+            _ => 1.0,
+        },
         primaries,
     })
 }
 
-type Matrix3 = [[f64; 3]; 3];
+mod matrix;
+use matrix::IDENTITY as IDENTITY_3;
+pub use matrix::rgb_color_matrix;
 
-const IDENTITY_3: Matrix3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-// All matrices use the same D65 xy = (0.3127, 0.3290). Mixing rounded XYZ
-// whites changes neutral RGB when crossing primaries, including original-domain blends.
-const BT709_TO_XYZ: Matrix3 = [
-    [0.412390799265959, 0.357584339383878, 0.180480788401834],
-    [0.21263900587151, 0.715168678767756, 0.0721923153607337],
-    [0.0193308187155918, 0.119194779794626, 0.950532152249661],
-];
-const BT2020_TO_XYZ: Matrix3 = [
-    [0.636958048301291, 0.144616903586208, 0.168880975164172],
-    [0.262700212011267, 0.677998071518871, 0.059301716469862],
-    [4.99410657446608e-17, 0.0280726930490874, 1.06098505771079],
-];
-const DISPLAY_P3_TO_XYZ: Matrix3 = [
-    [0.486570948648216, 0.265667693169093, 0.198217285234362],
-    [0.228974564069749, 0.691738521836506, 0.079286914093745],
-    [-3.97207551693349e-17, 0.0451133818589026, 1.04394436890098],
-];
-const XYZ_TO_BT709: Matrix3 = [
-    [3.24096994190452, -1.53738317757009, -0.498610760293003],
-    [-0.96924363628088, 1.87596750150772, 0.0415550574071756],
-    [0.0556300796969937, -0.203976958888977, 1.05697151424288],
-];
-const XYZ_TO_BT2020: Matrix3 = [
-    [1.71665118797127, -0.355670783776392, -0.25336628137366],
-    [-0.666684351832489, 1.61648123663494, 0.0157685458139111],
-    [0.0176398574453108, -0.0427706132578085, 0.942103121235474],
-];
-const XYZ_TO_DISPLAY_P3: Matrix3 = [
-    [2.49349691194142, -0.931383617919124, -0.402710784450717],
-    [-0.829488969561575, 1.76266406031835, 0.0236246858419436],
-    [0.0358458302437845, -0.0761723892680418, 0.956884524007687],
-];
-
-pub(crate) fn primaries_transform(
-    source: RgbPrimaries,
-    target: ColorSpace,
-) -> Result<[[f32; 4]; 3]> {
-    let source_index = match source {
-        RgbPrimaries::Bt709 => 0,
-        RgbPrimaries::Bt2020 => 1,
-        RgbPrimaries::DisplayP3 => 2,
-        RgbPrimaries::Undefined => {
-            return Err(Error::Unsupported(
-                "generic GPU output requires defined source RGB primaries".into(),
-            ));
-        }
-    };
-    let target_index = match target {
-        ColorSpace::Bt709 => 0,
-        ColorSpace::Bt2020 => 1,
-        ColorSpace::DisplayP3 => 2,
-        unsupported => {
-            return Err(Error::Unsupported(format!(
-                "generic GPU output target primaries {unsupported:?} are unsupported"
-            )));
-        }
-    };
-    let matrix = if source_index == target_index {
-        IDENTITY_3
-    } else {
-        let source_to_xyz = [BT709_TO_XYZ, BT2020_TO_XYZ, DISPLAY_P3_TO_XYZ][source_index];
-        let xyz_to_target = [XYZ_TO_BT709, XYZ_TO_BT2020, XYZ_TO_DISPLAY_P3][target_index];
-        multiply_matrix3(xyz_to_target, source_to_xyz)
-    };
-    Ok(matrix.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]))
-}
-
-fn multiply_matrix3(lhs: Matrix3, rhs: Matrix3) -> Matrix3 {
-    let mut product = [[0.0; 3]; 3];
-    for row in 0..3 {
-        for column in 0..3 {
-            product[row][column] = lhs[row][0] * rhs[0][column]
-                + lhs[row][1] * rhs[1][column]
-                + lhs[row][2] * rhs[2][column];
-        }
-    }
-    product
-}
 fn to_shader_u32(value: u64) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| Error::Unsupported("image output addressing exceeds WGSL u32".into()))
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<ImageOutputParams>() == 192);
+    assert!(std::mem::size_of::<ImageOutputParams>() == 208);
     assert!(std::mem::align_of::<ImageOutputParams>() == 4);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_r) == 128);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_g) == 144);
     assert!(std::mem::offset_of!(ImageOutputParams, primaries_b) == 160);
     assert!(std::mem::offset_of!(ImageOutputParams, alpha) == 176);
+    assert!(std::mem::offset_of!(ImageOutputParams, transfer_parameters) == 192);
 };

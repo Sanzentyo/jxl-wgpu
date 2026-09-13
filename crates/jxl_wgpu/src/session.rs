@@ -1318,14 +1318,18 @@ mod tests {
             (ProtocolTransferFunction::Linear, 1.0),
             (ProtocolTransferFunction::Srgb, 1.0),
             (ProtocolTransferFunction::Bt709, 1.0),
-            (ProtocolTransferFunction::Gamma, 0.5),
+            (ProtocolTransferFunction::Bt2020, 1.0),
+            (ProtocolTransferFunction::Dci, 1.0),
+            (
+                ProtocolTransferFunction::Gamma(jxl_gpu_protocol::GammaExponent::new(0.5).unwrap()),
+                0.5,
+            ),
             (ProtocolTransferFunction::Pq, 1.0),
             (ProtocolTransferFunction::Hlg, 1.0),
         ];
         for (function, gamma) in cases {
             let params = TransferParams {
                 function,
-                gamma,
                 intensity_target: 1000.0,
                 min_nits: 0.0,
                 luminance_rgb: [0.2126, 0.7152, 0.0722],
@@ -1428,9 +1432,23 @@ mod tests {
                         1.099 * value.powf(0.45) - 0.099
                     }
                 }
-                ProtocolTransferFunction::Gamma => {
-                    signed_map(value, |magnitude| magnitude.powf(gamma))
+                ProtocolTransferFunction::Gamma(_) => value.max(0.0).powf(gamma),
+                ProtocolTransferFunction::Dci => {
+                    if value <= 0.0 {
+                        value
+                    } else {
+                        value.powf(1.0 / 2.6)
+                    }
                 }
+                ProtocolTransferFunction::Bt2020 => signed_map(value, |magnitude| {
+                    let alpha = 1.099_296_8;
+                    let beta = 0.018_053_97;
+                    if magnitude < beta {
+                        4.5 * magnitude
+                    } else {
+                        alpha * magnitude.powf(0.45) - (alpha - 1.0)
+                    }
+                }),
                 ProtocolTransferFunction::Pq => signed_map(value, |magnitude| {
                     if magnitude == 0.0 {
                         return 0.0;

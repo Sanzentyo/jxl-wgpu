@@ -1,4 +1,4 @@
-fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
+fn transfer_to_linear(value: f32, transfer: u32, gamma: f32) -> f32 {
     // BT.709 extends its linear toe below zero, as in libjxl and jxl-oxide.
     // Test the signed input before pow so negative bases are never evaluated.
     if transfer == 2u {
@@ -7,6 +7,13 @@ fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
     }
     let magnitude = abs(value);
     var linear = magnitude;
+    if transfer == 6u {
+        return pow(max(value, 0.0), 1.0 / gamma);
+    }
+    if transfer == 7u {
+        if value <= 0.0 { return value; }
+        return pow(value, 2.6);
+    }
     if transfer == 1u {
         linear = select(pow((magnitude + 0.055) / 1.055, 2.4), magnitude / 12.92, magnitude <= 0.04045);
     } else if transfer == 3u {
@@ -36,13 +43,20 @@ fn transfer_to_linear(value: f32, transfer: u32) -> f32 {
     return select(linear, -linear, value < 0.0);
 }
 
-fn transfer_from_linear(value: f32, transfer: u32) -> f32 {
+fn transfer_from_linear(value: f32, transfer: u32, gamma: f32) -> f32 {
     if transfer == 2u {
         if value <= 0.018 { return 4.5 * value; }
         return 1.099 * pow(value, 0.45) - 0.099;
     }
     let magnitude = abs(value);
     var encoded = magnitude;
+    if transfer == 6u {
+        return pow(max(value, 0.0), gamma);
+    }
+    if transfer == 7u {
+        if value <= 0.0 { return value; }
+        return pow(value, 1.0 / 2.6);
+    }
     if transfer == 1u {
         encoded = select(1.055 * pow(magnitude, 1.0 / 2.4) - 0.055, 12.92 * magnitude, magnitude <= 0.0031308);
     } else if transfer == 3u {

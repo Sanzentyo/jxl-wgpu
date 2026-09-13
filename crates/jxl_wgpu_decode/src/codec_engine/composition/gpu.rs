@@ -289,9 +289,16 @@ impl Compositor {
                             jxl_gpu_protocol::TransferFunction::Linear => 0,
                             jxl_gpu_protocol::TransferFunction::Srgb => 1,
                             jxl_gpu_protocol::TransferFunction::Bt709 => 2,
+                            jxl_gpu_protocol::TransferFunction::Gamma(_) => 6,
+                            jxl_gpu_protocol::TransferFunction::Dci => 7,
                             _ => unreachable!("validated original transfer"),
                         },
-                        0,
+                        match original.transfer {
+                            jxl_gpu_protocol::TransferFunction::Gamma(exponent) => {
+                                exponent.value().to_bits()
+                            }
+                            _ => 1.0f32.to_bits(),
+                        },
                         0,
                         0,
                     ],
@@ -314,7 +321,7 @@ impl Compositor {
                 return Err(Error::UnsupportedOutputFormat("composed numeric samples require matching native unsigned or scalar normalized F32 output".into()));
             }
             let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
-                Ok(ImageOutputParams::new(
+                let params = ImageOutputParams::new(
                     &layout,
                     ImageOutputSource {
                         extent: canvas,
@@ -325,8 +332,25 @@ impl Compositor {
                             .ok_or(Error::EngineContract("packing requires RGB"))?,
                     },
                     output_dispatch[0] * 64,
+                    request.white_point_adaptation(),
                 )?
-                .with_alpha_conversion(alpha_conversion))
+                .with_alpha_conversion(alpha_conversion);
+                Ok(
+                    if encoding
+                        == FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(original))
+                    {
+                        if let Some(threshold) = crate::image_color::reconstruction_black_threshold(
+                            original,
+                            layout.format.color_spec,
+                        ) {
+                            params.with_linear_black_threshold(threshold)?
+                        } else {
+                            params
+                        }
+                    } else {
+                        params
+                    },
+                )
             };
             (
                 Packing::Color {

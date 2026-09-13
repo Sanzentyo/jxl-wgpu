@@ -106,13 +106,16 @@ tracking is required.
 
 `WgpuFrameSession::submit_gpu_image` converts the final F32 RGB planes directly into a checked
 `jxl_gpu_formats::PixelFormat`. The plan's `OutputDesc::color_encoding` and the request's
-`source_encoding` must agree. D65 BT.709, BT.2020, and Display-P3 primaries are converted as source
-EOTF -> linear-light primary matrix -> target OETF. Source Linear/sRGB/BT.709/PQ/HLG and target
-Linear/sRGB/BT.709/PQ/HLG/BT.2020 transfer contracts execute in WGSL; PQ uses the normalized
-`1.0 = 10,000 nit` domain and HLG uses scene-linear light. BT.2020 non-constant- and
-constant-luminance YCbCr matrices are supported alongside BT.601/709. Undefined primaries,
-transfer functions without enough numeric metadata (including source Gamma), and unsupported
-spaces return `Error::Unsupported`. `submit_image` plus `wait_image` provides the corresponding
+`source_encoding` must agree. `RgbColorSpace` includes BT.709, BT.2020, Display-P3 and custom
+`RgbChromaticities` with an explicit reference white. `GammaExponent` validates a positive finite
+OETF exponent and its inverse; `TransferFunction::Gamma(exponent)` carries its own parameter.
+The GPU applies source EOTF, a host-lowered RGB/white-point matrix, and target OETF. Linear,
+sRGB, BT.709, BT.2020, Gamma, DCI, PQ and HLG have explicit selectors. Gamma clamps negative inputs;
+DCI's general CMS curve keeps a unit-slope negative branch. PQ uses `1.0 = 10,000 nit` and HLG
+uses scene-linear light. `ImageOutputRequest::with_white_point_adaptation` selects Bradford
+(default) or absolute XYZ preservation. Undefined or singular profiles fail before submission.
+BT.601/709/2020 NCL/2020 CL YCbCr and the corresponding pitch-linear layouts share this conversion.
+`submit_image` plus `wait_image` provides the corresponding
 mapped transport. Supported layout families include:
 
 - unsigned luma at 8 or 16 storage bits;
@@ -149,8 +152,9 @@ subsampling footprint; cosited output uses the top-left luma position. Numeric r
 matrix, range, and siting are never inferred from an ambiguous descriptor.
 
 The render graph and VarDCT decoder share `ImageOutputParams`, `ImageOutputSource`, and
-`IMAGE_OUTPUT_SHADER`. The fixed 192-byte uniform validates target layout, source coordinates,
-color conversion, and WGSL addressing. `with_alpha_conversion` selects an explicit
+`IMAGE_OUTPUT_SHADER`. The fixed 208-byte uniform validates target layout, source coordinates,
+color conversion, and WGSL addressing. The appended 16-byte record carries both gamma exponents
+and an optional target-linear black threshold for codec reconstruction. `with_alpha_conversion` selects an explicit
 association adjustment after color conversion and before quantization or chroma subsampling.
 The common `ALPHA_OUTPUT_SHADER` uses the JPEG XL finite `2^-26` alpha floor; it never transforms
 the alpha component through an RGB transfer. Producers supply `source_rgb_at` and linear `source_alpha_at`
@@ -178,7 +182,7 @@ naturally eight-byte aligned.
 
 `DisplayPipeline` turns a `GpuOutputBuffer` or `GpuImageOutput` into a linear BT.709 storage texture
 with texture-binding, render-attachment, and copy usages. SDR BT.709 input can use the default
-`Rgba8Unorm` descriptor. D65 BT.2020/Display-P3 or PQ/HLG input requires
+`Rgba8Unorm` descriptor. F32 RGB, BT.2020/Display-P3, custom RGB or PQ/HLG input requires
 `DisplayTextureDescriptor::linear_bt709_hdr()`, producing `Rgba16Float` so gamut excursions are not
 implicitly clipped. The shader also implements BT.2020 non-constant- and constant-luminance YCbCr
 inverse conversion. The convenience submission uses the backend's queue and returns without a host
@@ -347,7 +351,7 @@ The current planner and scheduler execute these protocol stages:
 - all 27 JPEG XL VarDCT strategies: square and rectangular DCTs through 256x256, Hornuss,
   hierarchical DCT2, DCT4 variants, and all four AFV orientations, with GPU dequantization, color
   correlation, LF-grid reinterpretation, and inverse transform;
-- stream-defined inverse XYB-to-linear-RGB and Linear, sRGB, BT.709, Gamma, PQ, and HLG transfer
+- stream-defined inverse XYB-to-linear-RGB and Linear, sRGB, BT.709, BT.2020, Gamma, DCI, PQ, and HLG transfer
   functions;
 - all JPEG XL frame and patch blend modes for straight or associated alpha, including alpha-channel
   composition and the no-alpha fallbacks;

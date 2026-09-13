@@ -29,6 +29,7 @@ struct Params {
     primaries_r: vec4<f32>,
     primaries_g: vec4<f32>,
     primaries_b: vec4<f32>,
+    transfer_parameters: vec4<f32>, // gamma exponent, reserved
 };
 
 @group(0) @binding(0) var<storage, read> source: array<u32>;
@@ -174,7 +175,7 @@ fn yuv_rgb(pixel: vec2<u32>) -> vec3<f32> {
 }
 
 fn to_linear(encoded: f32) -> f32 {
-    return transfer_to_linear(encoded, params.transfer);
+    return transfer_to_linear(encoded, params.transfer, params.transfer_parameters.x);
 }
 
 fn constant_luminance_yuv_linear(pixel: vec2<u32>) -> vec3<f32> {

@@ -2,7 +2,12 @@
 use jxl_test_support::{fixtures::original_color as corpus, offline, oracles::extra_channels};
 
 fn main() {
-    for case in corpus::cases() {
+    let cases = if std::env::args().nth(1).as_deref() == Some("--analytic") {
+        corpus::analytic_cases()
+    } else {
+        corpus::cases()
+    };
+    for case in cases {
         let encoded = if case.mode.ycbcr() {
             let encoded = case.encode_ycbcr();
             let native = extra_channels::libjxl_output(

@@ -89,6 +89,14 @@ fn transfer_triplet(linear: vec3<f32>) -> vec3<f32> {
                 linear_to_bt709(linear.z),
             );
         }
+        case 6u: {
+            let magnitude = abs(linear);
+            let alpha = 1.09929682680944;
+            let beta = 0.018053968510807;
+            let encoded = select(alpha * pow(magnitude, vec3<f32>(0.45)) - (alpha - 1.0),
+                4.5 * magnitude, magnitude < vec3<f32>(beta));
+            return select(encoded, -encoded, linear < vec3<f32>(0.0));
+        }
         case 3u: {
             return vec3<f32>(
                 linear_to_pq(linear.x),
@@ -110,13 +118,11 @@ fn transfer_triplet(linear: vec3<f32>) -> vec3<f32> {
                 scene_to_hlg(scene.z),
             );
         }
-        default: {
-            return vec3<f32>(
-                signed_value(pow(abs(linear.x), params.gamma), linear.x),
-                signed_value(pow(abs(linear.y), params.gamma), linear.y),
-                signed_value(pow(abs(linear.z), params.gamma), linear.z),
-            );
+        case 7u: {
+            let powered = pow(max(linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.6));
+            return select(powered, linear, linear <= vec3<f32>(0.0));
         }
+        default: { return pow(max(linear, vec3<f32>(0.0)), vec3<f32>(params.gamma)); }
     }
 }
 

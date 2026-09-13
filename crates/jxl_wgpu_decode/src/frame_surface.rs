@@ -4,7 +4,7 @@
 
 use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, SampleKind};
 use jxl_gpu_protocol::{
-    ChangedRegions, Extent2d, OutputId, Region, RgbColorEncoding, RgbPrimaries,
+    ChangedRegions, Extent2d, OutputId, Region, RgbColorEncoding, RgbColorSpace,
 };
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
 
@@ -38,11 +38,12 @@ impl FrameSurfaceEncoding {
             .rgb_encoding()
             .unwrap_or(RgbColorEncoding::LINEAR_BT709);
         if let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color {
-            color.space = match encoding.primaries {
-                RgbPrimaries::Bt709 => jxl_gpu_formats::ColorSpace::Bt709,
-                RgbPrimaries::Bt2020 => jxl_gpu_formats::ColorSpace::Bt2020,
-                RgbPrimaries::DisplayP3 => jxl_gpu_formats::ColorSpace::DisplayP3,
-                RgbPrimaries::Undefined => unreachable!("validated frame RGB primaries"),
+            color.space = match encoding.space {
+                RgbColorSpace::Bt709 => jxl_gpu_formats::ColorSpace::Bt709,
+                RgbColorSpace::Bt2020 => jxl_gpu_formats::ColorSpace::Bt2020,
+                RgbColorSpace::DisplayP3 => jxl_gpu_formats::ColorSpace::DisplayP3,
+                RgbColorSpace::Custom(value) => jxl_gpu_formats::ColorSpace::CustomRgb(value),
+                RgbColorSpace::Undefined => unreachable!("validated frame RGB primaries"),
             };
             color.transfer = match encoding.transfer {
                 jxl_gpu_protocol::TransferFunction::Linear => {
@@ -52,33 +53,29 @@ impl FrameSurfaceEncoding {
                 jxl_gpu_protocol::TransferFunction::Bt709 => {
                     jxl_gpu_formats::TransferFunction::Bt709
                 }
-                _ => unreachable!("validated frame RGB transfer"),
+                jxl_gpu_protocol::TransferFunction::Gamma(exponent) => {
+                    jxl_gpu_formats::TransferFunction::Gamma(exponent)
+                }
+                jxl_gpu_protocol::TransferFunction::Bt2020 => {
+                    jxl_gpu_formats::TransferFunction::Bt2020
+                }
+                jxl_gpu_protocol::TransferFunction::Pq => jxl_gpu_formats::TransferFunction::Pq,
+                jxl_gpu_protocol::TransferFunction::Hlg => jxl_gpu_formats::TransferFunction::Hlg,
+                jxl_gpu_protocol::TransferFunction::Dci => jxl_gpu_formats::TransferFunction::Dci,
             };
         }
         PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
     }
 
     pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
-        [
-            RgbPrimaries::Bt709,
-            RgbPrimaries::Bt2020,
-            RgbPrimaries::DisplayP3,
-        ]
-        .into_iter()
-        .flat_map(|primaries| {
-            [
-                jxl_gpu_protocol::TransferFunction::Linear,
-                jxl_gpu_protocol::TransferFunction::Srgb,
-                jxl_gpu_protocol::TransferFunction::Bt709,
-            ]
-            .map(|transfer| {
-                Self::Rgb(RgbColorEncoding {
-                    primaries,
-                    transfer,
-                })
-            })
-        })
-        .find(|encoding| *format == encoding.format())
+        let jxl_gpu_formats::ColorSpecification::Defined(color) = format.color_spec else {
+            return None;
+        };
+        let encoding = Self::Rgb(RgbColorEncoding {
+            space: color.space.rgb_space()?,
+            transfer: color.transfer.rgb_transfer()?,
+        });
+        (*format == encoding.format()).then_some(encoding)
     }
 
     pub(crate) const fn rgb_encoding(self) -> Option<RgbColorEncoding> {
@@ -285,17 +282,25 @@ mod tests {
     #[test]
     fn canonical_rgb_layouts_round_trip_without_claiming_a_component_domain() {
         for primaries in [
-            RgbPrimaries::Bt709,
-            RgbPrimaries::Bt2020,
-            RgbPrimaries::DisplayP3,
+            RgbColorSpace::Bt709,
+            RgbColorSpace::Bt2020,
+            RgbColorSpace::DisplayP3,
+            RgbColorSpace::Custom(jxl_gpu_protocol::RgbChromaticities {
+                white: jxl_gpu_protocol::Chromaticity::DCI,
+                ..jxl_gpu_protocol::RgbChromaticities::DISPLAY_P3
+            }),
         ] {
             for transfer in [
                 jxl_gpu_protocol::TransferFunction::Linear,
                 jxl_gpu_protocol::TransferFunction::Srgb,
                 jxl_gpu_protocol::TransferFunction::Bt709,
+                jxl_gpu_protocol::TransferFunction::Dci,
+                jxl_gpu_protocol::TransferFunction::Gamma(
+                    jxl_gpu_protocol::GammaExponent::new(0.5).unwrap(),
+                ),
             ] {
                 let encoding = FrameSurfaceEncoding::Rgb(RgbColorEncoding {
-                    primaries,
+                    space: primaries,
                     transfer,
                 });
                 assert_eq!(

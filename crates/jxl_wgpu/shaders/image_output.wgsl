@@ -38,6 +38,7 @@ struct Params {
     primaries_g: vec4<f32>,
     primaries_b: vec4<f32>,
     alpha: vec4<u32>, // association conversion, reserved
+    transfer_parameters: vec4<f32>, // source gamma, converted_linear gamma, reserved
 };
 
 @group(0) @binding(0) var<storage, read> source_r: array<u32>;
@@ -55,24 +56,27 @@ fn source_coordinate(destination: vec2<u32>) -> vec2<u32> {
 fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
     let source = source_rgb_at(x, y);
     let source_linear = vec3<f32>(
-        transfer_to_linear(source.r, params.source_transfer),
-        transfer_to_linear(source.g, params.source_transfer),
-        transfer_to_linear(source.b, params.source_transfer),
+        transfer_to_linear(source.r, params.source_transfer, params.transfer_parameters.x),
+        transfer_to_linear(source.g, params.source_transfer, params.transfer_parameters.x),
+        transfer_to_linear(source.b, params.source_transfer, params.transfer_parameters.x),
     );
-    return vec3<f32>(
+    let converted_linear = vec3<f32>(
         dot(params.primaries_r.xyz, source_linear),
         dot(params.primaries_g.xyz, source_linear),
         dot(params.primaries_b.xyz, source_linear),
     );
+    let threshold = params.transfer_parameters.z;
+    if threshold >= 0.0 { return select(converted_linear, vec3<f32>(0.0), converted_linear <= vec3<f32>(threshold)); }
+    return converted_linear;
 }
 
 fn target_rgb_at(x: u32, y: u32) -> vec3<f32> {
     if params.identity_color_transform != 0u { return source_rgb_at(x, y); }
     let linear = target_linear_rgb_at(x, y);
     return vec3<f32>(
-        transfer_from_linear(linear.r, params.target_transfer),
-        transfer_from_linear(linear.g, params.target_transfer),
-        transfer_from_linear(linear.b, params.target_transfer),
+        transfer_from_linear(linear.r, params.target_transfer, params.transfer_parameters.y),
+        transfer_from_linear(linear.g, params.target_transfer, params.transfer_parameters.y),
+        transfer_from_linear(linear.b, params.target_transfer, params.transfer_parameters.y),
     );
 }
 
@@ -115,16 +119,16 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
     }
     var linear = target_linear_rgb_at(x, y);
     var encoded = vec3<f32>(
-        transfer_from_linear(linear.r, params.target_transfer),
-        transfer_from_linear(linear.g, params.target_transfer),
-        transfer_from_linear(linear.b, params.target_transfer),
+        transfer_from_linear(linear.r, params.target_transfer, params.transfer_parameters.y),
+        transfer_from_linear(linear.g, params.target_transfer, params.transfer_parameters.y),
+        transfer_from_linear(linear.b, params.target_transfer, params.transfer_parameters.y),
     );
     if params.alpha.x != 0u {
         encoded *= output_alpha_multiplier_at(x, y);
         linear = vec3<f32>(
-            transfer_to_linear(encoded.r, params.target_transfer),
-            transfer_to_linear(encoded.g, params.target_transfer),
-            transfer_to_linear(encoded.b, params.target_transfer),
+            transfer_to_linear(encoded.r, params.target_transfer, params.transfer_parameters.y),
+            transfer_to_linear(encoded.g, params.target_transfer, params.transfer_parameters.y),
+            transfer_to_linear(encoded.b, params.target_transfer, params.transfer_parameters.y),
         );
     }
     let coefficient = coefficients();
@@ -133,7 +137,7 @@ fn yuv_at(x: u32, y: u32) -> vec3<f32> {
     let kg = 1.0 - kr - kb;
     let y_encoded = transfer_from_linear(
         kr * linear.r + kg * linear.g + kb * linear.b,
-        params.target_transfer,
+        params.target_transfer, params.transfer_parameters.y,
     );
     let cb_divisor = select(1.9404, 1.5816, encoded.b > y_encoded);
     let cr_divisor = select(1.7184, 0.9936, encoded.r > y_encoded);

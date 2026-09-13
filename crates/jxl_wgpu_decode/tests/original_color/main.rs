@@ -38,8 +38,17 @@ fn compare(actual: &[u32], expected: &[f32], tolerance: f32, name: &str) {
 
 #[test]
 fn original_sdr_profiles_preserve_color_and_progressive_reference_frames() {
+    check_original_profiles(corpus::cases());
+}
+
+#[test]
+fn analytic_profiles_preserve_color_and_progressive_reference_frames() {
+    check_original_profiles(corpus::analytic_cases());
+}
+
+fn check_original_profiles(cases: Vec<corpus::Case>) {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
-    for case in corpus::cases() {
+    for case in cases {
         eprintln!("original profile {}", case.name);
         let data = case.bytes();
         let inventory = jxl_gpu_bitstream::parse(&data, Default::default())

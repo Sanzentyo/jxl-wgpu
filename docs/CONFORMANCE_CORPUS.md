@@ -204,11 +204,11 @@ uses normalized absolute luminance (`1.0 = 10,000 nit`) while HLG uses scene-lin
 separate planar I444 readback compares BT.2020 non-constant-luminance and constant-luminance YCbCr,
 including their sign-dependent chroma divisors. Every comparison executes an actual adapter and
 allows at most two eight-bit codes for shader/scalar floating-point differences. Mismatched source
-declarations, undefined primaries/specifications/transfers, sensor primaries, and source Gamma
-without an exponent must fail with typed errors before GPU submission.
+declarations, undefined primaries/specifications/transfers, sensor primaries, must fail with typed errors before GPU submission. Gamma now carries a validated exponent in its
+variant; an unspecified exponent cannot be constructed.
 
 The Rust/WGSL ABI gate parses the shader with Naga and reflects the complete uniform field order.
-Compile-time assertions independently fix `ImageOutputUniform` at 176 bytes and its three padded
+Compile-time assertions independently fix `ImageOutputUniform` at 208 bytes and its three padded
 matrix rows at offsets 128, 144, and 160. No test searches shader source text.
 
 The same-queue display gate then consumes stored BT.2020 PQ, BT.2020 SDR-OETF, Display-P3 HLG, and
@@ -218,7 +218,7 @@ compares transfer inversion, primary conversion, alpha, luminance-contract taggi
 constant-luminance reconstruction.
 Attempting the same wide/HDR inputs with the default `Rgba8Unorm` descriptor must return a typed
 error before submission. Naga semantically validates both generated storage-texture variants; the
-144-byte display uniform fixes matrix-row offsets 96, 112, and 128.
+160-byte display uniform fixes matrix-row offsets 96, 112, and 128.
 
 ## Procedural VarDCT encoder matrix
 
@@ -543,7 +543,7 @@ and explicit-sRGB `djxl` PFM is independently converted by the development-only 
 `jxl_gpu_formats::convert_rgb_f32` oracle after any required SDR transfer conversion.
 
 Every case runs whole-input blocking and fragmented-input async completion with a 256-byte entropy
-cap. Exact layout metadata, shared 352-byte output/source uniform accounting, four-byte-rounded
+cap. Exact layout metadata, shared 368-byte output/source uniform accounting, four-byte-rounded
 output leases, zero unused sample bits and plane gaps, equality between upload policies, and full
 budget release are required. Comparisons operate on stored sample codes rather than individual
 bytes, including 16-bit words and 10/12-bit alignment. On Apple M5/Metal (2026-09-07), the maximum
@@ -1627,7 +1627,7 @@ packing; NV12 and odd-width YUYV/UYVY use the shared scalar layout oracle, inclu
 final-luma alpha. Both compare within one stored code and check zero padding bits. Low-level output
 tests reject association conversion without an alpha
 binding before allocation, while existing ABI tests parse and validate the enlarged common
-192-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
+208-byte uniform. Production still has no CPU image-domain fallback. Floating source samples remain
 a completion gate; the all-channel composition extension below adds integer extras and
 associated/resampled composition cross-products.
 
@@ -1804,8 +1804,8 @@ alpha scaling removed before comparison. Native outputs use one code of Modular 
 and checks high-depth padding. No production CPU codec or image readback was introduced.
 
 A GPU unit test independently isolates the packer: output admission succeeds with one byte less
-than the required uniform+ink metadata, then metadata admission fails with exactly 352 bytes for
-five inks or 192 bytes for Preserve. Repeating failure rolls back output reservations; releasing
+than the required uniform+ink metadata, then metadata admission fails with exactly 368 bytes for
+five inks or 208 bytes for Preserve. Repeating failure rolls back output reservations; releasing
 pressure allows retry. Dropping pending work retains all inputs and metadata until GPU completion,
 then only a caller-held output lease remains. `SpotColor` has compile-time 32-byte size, 16-byte
 alignment and byte-16 RGBA offset checks. Preserve allocates no dummy table.
@@ -2140,7 +2140,7 @@ model, preserving the following packet data. Public admission tests compare zero
 force a one-byte capacity shortfall, retry and abandon submitted work. XYB 257×17 adds 52,524
 bytes for the random planes and uniform. Unfiltered original Modular RGB and gray also need normalization
 and aligned render destinations; at the tested 256-byte storage-offset alignment their complete
-increase is 158,376 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
+increase is 158,392 bytes. Original RGB VarDCT and 4:4:4/gray JPEG use the same 52,524-byte noise
 allocation as XYB. Subsampled JPEG needs two padded full-resolution chroma destinations plus two
 32-byte interpolation uniforms, for total increments of 104,812 bytes (4:2:2), 120,172 bytes
 (4:4:0), and 122,220 bytes (4:2:0). The zero model allocates none of those component destinations.
@@ -3814,7 +3814,7 @@ and independently decoded by libjxl before reference storage. There are 332 fixt
 | Requested output | Linear BT.709 F32, sRGB8, original RGBA12, selected original color F32 and independent alpha F32 for every case |
 | Exact native samples | 27 color-metadata variants of existing integer fixtures preserve byte-identical physical frames and exact 17/31-bit RGB and 5/24/31-bit alpha through native RGB and scalar selection, with whole and bounded fragmented input |
 | Colorimetry | Independent f64 primary matrices from CIE xy and a common D65; fixed source-error intervals propagated through signed matrices and piecewise transfer functions |
-| Metadata rejection | ICC, custom white/primaries, gamma/DCI/PQ/HLG/unknown transfer and inconsistent Gray/RGB inventories are rejected by the shared admission boundary |
+| Metadata rejection | ICC, PQ/HLG/unknown transfers, singular RGB/white geometry, invalid gamma, non-relative non-D65 profiles and inconsistent Gray/RGB inventories are rejected by shared admission |
 
 Source reconstruction uses normalized error `1e-5` for original Modular and `1/1024` for
 XYB/VarDCT; alpha is checked separately at `2e-6`. Conversion adds `5e-6*(1+abs(reference))` and one
@@ -3823,5 +3823,32 @@ libjxl and jxl-oxide; Rust jxl 0.6.0's reflected negative curve is not substitut
 Unchanged generic transfer tests check the other sign-reflected functions. Primary matrices now
 use the same exact D65 white in image output and display. See the
 [generator notes](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md) for pinned
-sources and reproduction. ICC/custom profiles, HDR luminance mapping, wide-gamut feature/LF
+sources and reproduction. ICC, complete rendering intents, HDR luminance mapping, wide-gamut feature/LF
 combinations and full conformance remain roadmap work.
+
+## Custom white points, primaries and Gamma/DCI
+
+The original-color corpus now also contains 80 analytic profiles, independently generated by
+libjxl 0.12.0 and declared in `fixtures/original_color/analytic.rs`. They add E/DCI/custom D50
+whites, custom RGB primaries, gamma 0.4545455/0.5 and DCI across both codecs, RGB/XYB/YCbCr,
+gray/RGBA, independent alpha, integer/F32, stills and six-frame compositions. Combined totals are
+228 streams, 114 independently checked stills, 570 presentations, and 500 fixture files.
+
+The original reconstruction bounds (`1e-5` Modular, `1/1024` XYB/VarDCT, alpha `2e-6`) remain
+unchanged. Every new case checks whole/bounded fragmented input, progressive immutability,
+final-only identity, original/native/scalar output, requested linear/sRGB output and absolute XYZ
+conversion. General GPU transfer tests independently cover negative/zero/extended Gamma and DCI,
+unequal gamma exponents, and Bradford versus absolute white. Float display checks custom whites,
+gamma/DCI and independent alpha. Invalid gamma/geometry fails before GPU submission.
+Independent CPU and GPU XYZ-basis checks retain valid zero-y primaries through absolute conversion;
+singular primary matrices and zero-y reference whites remain rejected.
+
+The exact-word metadata regression adds four RGB profiles to each of the three integer sources:
+12 new variants bring the total to 39. It checks custom white/primary coordinates and Gamma/DCI
+metadata without changing physical frame bytes or rounding native 17/31-bit samples through F32.
+
+The [generator notes](../crates/jxl_wgpu_decode/test-data/original_color_generator/README.md)
+explain native ICC-calibrated XYB RGB primaries, the original Gamma/DCI black floor, separate CMS
+negative extensions, and independent pre-OETF references for non-invertible original curves.
+ICC/LUT/CMYK, complete original rendering intents, HDR luminance mapping and wide-gamut feature/LF
+cross-products remain incomplete.

@@ -218,7 +218,9 @@ pub(in crate::scheduler) fn encode_transfer_function(
         SourceTransferFunction::Bt709 => 2,
         SourceTransferFunction::Pq => 3,
         SourceTransferFunction::Hlg => 4,
-        SourceTransferFunction::Gamma => 5,
+        SourceTransferFunction::Gamma(_) => 5,
+        jxl_gpu_protocol::TransferFunction::Dci => 7,
+        SourceTransferFunction::Bt2020 => 6,
     };
     let params = TransferUniform {
         width: extent.width,
@@ -230,7 +232,10 @@ pub(in crate::scheduler) fn encode_transfer_function(
         output_stride_g: stride(&output_g.desc),
         output_stride_b: stride(&output_b.desc),
         transfer: transfer_code,
-        gamma: transfer.gamma,
+        gamma: match transfer.function {
+            SourceTransferFunction::Gamma(exponent) => exponent.value(),
+            _ => 1.0,
+        },
         intensity_target: transfer.intensity_target,
         min_nits: transfer.min_nits,
         luminance_rgb: [

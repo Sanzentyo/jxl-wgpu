@@ -333,6 +333,7 @@ pub(in crate::scheduler) fn encode_image_save(
             encoding: source_encoding,
         },
         dispatch_width,
+        request.white_point_adaptation,
     )?;
     let (buffer, pooled) = allocate_output_buffer(
         factory,

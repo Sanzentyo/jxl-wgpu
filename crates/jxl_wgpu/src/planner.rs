@@ -842,12 +842,8 @@ fn validate_transfer_function(
         && params.min_nits.is_finite()
         && params.min_nits >= 0.0
         && params.min_nits <= params.intensity_target
-        && params.gamma.is_finite()
         && params.luminance_rgb.iter().all(|value| value.is_finite());
     let function_parameters_valid = match params.function {
-        jxl_gpu_protocol::TransferFunction::Gamma => {
-            (0.0..=1.0).contains(&params.gamma) && params.gamma > 0.0
-        }
         jxl_gpu_protocol::TransferFunction::Hlg => {
             params.luminance_rgb.iter().all(|&value| value >= 0.0)
                 && params.luminance_rgb.iter().sum::<f32>() > 0.0

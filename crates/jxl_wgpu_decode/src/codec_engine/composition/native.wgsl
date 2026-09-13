@@ -11,10 +11,15 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 fn surface_value(word: u32) -> f32 { return source[word]; }
-fn original_rgb(rgb: vec3<f32>) -> vec3<f32> {
+fn original_rgb(input: vec3<f32>) -> vec3<f32> {
+    var rgb = input;
     if (params.source.w & 2u) == 0u { return rgb; }
-    return vec3<f32>(transfer_from_linear(rgb.r, params.color.x),
-        transfer_from_linear(rgb.g, params.color.x), transfer_from_linear(rgb.b, params.color.x));
+    // Match the original JPEG XL gamma/DCI reconstruction before native packing.
+    if params.color.x == 6u || params.color.x == 7u {
+        rgb = select(rgb, vec3<f32>(0.0), rgb <= vec3<f32>(1e-5));
+    }
+    return vec3<f32>(transfer_from_linear(rgb.r, params.color.x, bitcast<f32>(params.color.y)),
+        transfer_from_linear(rgb.g, params.color.x, bitcast<f32>(params.color.y)), transfer_from_linear(rgb.b, params.color.x, bitcast<f32>(params.color.y)));
 }
 
 fn output_byte(offset: u32) -> u32 {

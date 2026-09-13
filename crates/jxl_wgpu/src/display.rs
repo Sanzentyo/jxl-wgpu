@@ -1321,6 +1321,8 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         TransferFunction::Pq => 3,
         TransferFunction::Hlg => 4,
         TransferFunction::Bt2020 => 5,
+        TransferFunction::Gamma(_) => 6,
+        TransferFunction::Dci => 7,
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "display transfer {unsupported:?} is unsupported"
@@ -1533,6 +1535,15 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
             primaries_r: primary_matrix[0],
             primaries_g: primary_matrix[1],
             primaries_b: primary_matrix[2],
+            transfer_parameters: [
+                match color.transfer {
+                    TransferFunction::Gamma(exponent) => exponent.value(),
+                    _ => 1.0,
+                },
+                0.0,
+                0.0,
+                0.0,
+            ],
         },
         binding_size,
         requires_float_output,
@@ -1542,11 +1553,12 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
 
 fn display_primary_matrix(space: jxl_gpu_formats::ColorSpace) -> Result<(u8, [[f32; 4]; 3])> {
     use jxl_gpu_formats::ColorSpace;
-    use jxl_gpu_protocol::RgbPrimaries;
+    use jxl_gpu_protocol::RgbColorSpace;
     let (code, primaries) = match space {
-        ColorSpace::Bt709 => (0, RgbPrimaries::Bt709),
-        ColorSpace::Bt2020 => (1, RgbPrimaries::Bt2020),
-        ColorSpace::DisplayP3 => (2, RgbPrimaries::DisplayP3),
+        ColorSpace::Bt709 => (0, RgbColorSpace::Bt709),
+        ColorSpace::Bt2020 => (1, RgbColorSpace::Bt2020),
+        ColorSpace::DisplayP3 => (2, RgbColorSpace::DisplayP3),
+        ColorSpace::CustomRgb(value) => (3, RgbColorSpace::Custom(value)),
         unsupported => {
             return Err(Error::Unsupported(format!(
                 "display conversion to linear BT.709 does not implement {unsupported:?} primaries"
@@ -1555,7 +1567,11 @@ fn display_primary_matrix(space: jxl_gpu_formats::ColorSpace) -> Result<(u8, [[f
     };
     Ok((
         code,
-        crate::image_output::primaries_transform(primaries, ColorSpace::Bt709)?,
+        crate::image_output::rgb_color_matrix(
+            primaries,
+            RgbColorSpace::Bt709,
+            jxl_gpu_protocol::WhitePointAdaptation::Bradford,
+        )?,
     ))
 }
 
@@ -1875,6 +1891,7 @@ struct DisplayImageParams {
     primaries_r: [f32; 4],
     primaries_g: [f32; 4],
     primaries_b: [f32; 4],
+    transfer_parameters: [f32; 4],
 }
 
 const _: () = {
@@ -1882,11 +1899,12 @@ const _: () = {
     assert!(std::mem::align_of::<DisplayRgbParams>() == 4);
     assert!(std::mem::size_of::<DisplayNumericParams>() == 64);
     assert!(std::mem::align_of::<DisplayNumericParams>() == 4);
-    assert!(std::mem::size_of::<DisplayImageParams>() == 144);
+    assert!(std::mem::size_of::<DisplayImageParams>() == 160);
     assert!(std::mem::align_of::<DisplayImageParams>() == 4);
     assert!(std::mem::offset_of!(DisplayImageParams, primaries_r) == 96);
     assert!(std::mem::offset_of!(DisplayImageParams, primaries_g) == 112);
     assert!(std::mem::offset_of!(DisplayImageParams, primaries_b) == 128);
+    assert!(std::mem::offset_of!(DisplayImageParams, transfer_parameters) == 144);
 };
 
 #[cfg(test)]
@@ -2117,7 +2135,7 @@ mod tests {
     fn display_uniform_abi_sizes_are_explicit_and_aligned() {
         assert_eq!(size_of::<DisplayRgbParams>(), 32);
         assert_eq!(size_of::<DisplayNumericParams>(), 64);
-        assert_eq!(size_of::<DisplayImageParams>(), 144);
+        assert_eq!(size_of::<DisplayImageParams>(), 160);
         assert_eq!(std::mem::align_of::<DisplayRgbParams>(), 4);
         assert_eq!(std::mem::align_of::<DisplayNumericParams>(), 4);
         assert_eq!(std::mem::align_of::<DisplayImageParams>(), 4);
@@ -2237,8 +2255,9 @@ mod tests {
                 f32::from_bits(35),
                 f32::from_bits(36),
             ],
+            transfer_parameters: [37, 38, 39, 40].map(f32::from_bits),
         };
-        let expected = (1..=36).collect::<Vec<_>>();
+        let expected = (1..=40).collect::<Vec<_>>();
         assert_eq!(abi_words(&image), expected);
         assert_wgsl_fields(
             &image_shader_source(wgpu::TextureFormat::Rgba8Unorm),
@@ -2271,6 +2290,7 @@ mod tests {
                 "primaries_r",
                 "primaries_g",
                 "primaries_b",
+                "transfer_parameters",
             ],
         );
     }

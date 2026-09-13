@@ -1,6 +1,7 @@
 use super::{corpus, planes};
 use jxl_gpu_bitstream::{
-    BitWriter, ColourEncodingInventory, ExtraChannelTypeInventory, SampleBitDepth,
+    BitWriter, ChromaticityInventory, ColourEncodingInventory, ExtraChannelTypeInventory,
+    PrimariesInventory, SampleBitDepth, TransferFunctionInventory, WhitePointInventory,
 };
 use jxl_wgpu::WgpuBackend;
 use jxl_wgpu_decode::{
@@ -26,6 +27,19 @@ fn enumeration(writer: &mut BitWriter, value: u64) {
     writer.write_bits(value.min(2), 2).unwrap();
     if value >= 2 {
         writer.write_bits(value - 2, 4).unwrap();
+    }
+}
+
+fn chromaticity(writer: &mut BitWriter, xy: ChromaticityInventory) {
+    for coordinate in [xy.x, xy.y] {
+        let packed = u64::from(((coordinate as u32) << 1) ^ ((coordinate >> 31) as u32));
+        let (selector, (base, bits)) = [(0, 19), (524288, 19), (1048576, 20), (2097152, 21)]
+            .into_iter()
+            .enumerate()
+            .find(|(_, (base, bits))| (*base..base + (1u64 << bits)).contains(&packed))
+            .unwrap();
+        writer.write_bits(selector as u64, 2).unwrap();
+        writer.write_bits(packed - base, bits).unwrap();
     }
 }
 
@@ -63,26 +77,53 @@ fn with_profile(data: &[u8], case: &corpus::Case) -> Vec<u8> {
     writer.write_bits(0, 1).unwrap(); // Original RGB.
     writer.write_bits(0, 2).unwrap(); // Explicit color, no ICC.
     enumeration(&mut writer, 0); // RGB.
-    enumeration(&mut writer, 1); // D65.
+    enumeration(
+        &mut writer,
+        match case.profile.white {
+            WhitePointInventory::D65 => 1,
+            WhitePointInventory::Custom(_) => 2,
+            WhitePointInventory::E => 10,
+            WhitePointInventory::Dci => 11,
+        },
+    );
+    if let WhitePointInventory::Custom(xy) = case.profile.white {
+        chromaticity(&mut writer, xy);
+    }
     enumeration(
         &mut writer,
         match case.profile.primaries {
-            jxl_gpu_bitstream::PrimariesInventory::Srgb => 1,
-            jxl_gpu_bitstream::PrimariesInventory::Bt2100 => 9,
-            jxl_gpu_bitstream::PrimariesInventory::P3 => 11,
-            _ => unreachable!(),
+            PrimariesInventory::Srgb => 1,
+            PrimariesInventory::Custom { .. } => 2,
+            PrimariesInventory::Bt2100 => 9,
+            PrimariesInventory::P3 => 11,
         },
     );
-    writer.write_bits(0, 1).unwrap(); // Enumerated transfer.
-    enumeration(
-        &mut writer,
-        match case.transfer.transfer {
-            jxl_gpu_bitstream::TransferFunctionInventory::Linear => 8,
-            jxl_gpu_bitstream::TransferFunctionInventory::Srgb => 13,
-            jxl_gpu_bitstream::TransferFunctionInventory::Bt709 => 1,
-            _ => unreachable!(),
-        },
-    );
+    if let PrimariesInventory::Custom { red, green, blue } = case.profile.primaries {
+        for xy in [red, green, blue] {
+            chromaticity(&mut writer, xy);
+        }
+    }
+    if let TransferFunctionInventory::Gamma {
+        scaled_gamma,
+        inverted,
+    } = case.transfer.transfer
+    {
+        assert!(inverted);
+        writer.write_bits(1, 1).unwrap();
+        writer.write_bits(u64::from(scaled_gamma), 24).unwrap();
+    } else {
+        writer.write_bits(0, 1).unwrap(); // Enumerated transfer.
+        enumeration(
+            &mut writer,
+            match case.transfer.transfer {
+                TransferFunctionInventory::Linear => 8,
+                TransferFunctionInventory::Srgb => 13,
+                TransferFunctionInventory::Bt709 => 1,
+                TransferFunctionInventory::Dci => 17,
+                _ => unreachable!(),
+            },
+        );
+    }
     enumeration(&mut writer, 1); // Relative intent.
     writer.write_bits(0, 2).unwrap(); // No extensions.
     writer.write_bits(1, 1).unwrap(); // Default transform data.
@@ -96,8 +137,9 @@ fn with_profile(data: &[u8], case: &corpus::Case) -> Vec<u8> {
         .unwrap();
     let mut header = changed.image_header;
     assert!(
-        matches!(header.colour_encoding, ColourEncodingInventory::Enumerated {primaries, transfer_function, ..}
-        if primaries == case.profile.primaries && transfer_function == case.transfer.transfer)
+        matches!(header.colour_encoding, ColourEncodingInventory::Enumerated {white_point, primaries, transfer_function, ..}
+        if white_point == case.profile.white && primaries == case.profile.primaries
+            && transfer_function == case.transfer.transfer)
     );
     header.bit_range = image.bit_range;
     header.colour_encoding = image.colour_encoding;
@@ -134,9 +176,16 @@ fn sdr_metadata_preserves_native_modular_integer_samples() {
             .split_whitespace()
             .map(|v| u32::from_str_radix(v, 16).unwrap())
             .collect();
-        for case in corpus::cases().into_iter().filter(|c| {
-            c.mode == corpus::Mode::ModularRgb && !c.profile.grayscale && !c.sequence && !c.floating
-        }) {
+        for case in corpus::cases()
+            .into_iter()
+            .chain(corpus::analytic_cases())
+            .filter(|c| {
+                c.mode == corpus::Mode::ModularRgb
+                    && !c.profile.grayscale
+                    && !c.sequence
+                    && !c.floating
+            })
+        {
             let data = with_profile(&data, &case);
             let image = jxl_gpu_bitstream::parse(&data, Default::default())
                 .unwrap()

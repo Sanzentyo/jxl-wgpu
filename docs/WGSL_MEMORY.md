@@ -96,16 +96,16 @@ name shown in parentheses.
 | `jxl_wgpu/premultiply_alpha.wgsl` | `PremultiplyUniform` / `Params` | `width, height, color_stride, alpha_stride, output_stride, _pad0, _pad1, _pad2` | 32 | 4 | uniform |
 | `jxl_wgpu/extend.wgsl` | `ExtendUniform` / `Params` | image/frame dimensions, 3 strides, signed origin, `has_reference`, 2 pads | 48 | 4 | uniform |
 | `jxl_wgpu/save.wgsl` | `SaveUniform` / `Params` | `width, height, source_stride, channels, channel, layout (output_layout), orientation, _pad0` | 32 | 4 | uniform |
-| `jxl_wgpu/image_output.wgsl` | `ImageOutputParams` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer, identity_color_transform`, three padded primary-matrix rows, alpha conversion and three pads | 192 | 4 | uniform |
+| `jxl_wgpu/image_output.wgsl` | `ImageOutputParams` / `Params` | dimensions/3 source strides, format fields, 4 plane offset/stride pairs, `logical_size, dispatch_width, orientation, source_transfer, target_transfer, identity_color_transform`, three padded primary-matrix rows, alpha conversion and three pads; gamma exponents, optional linear black threshold and one pad | 208 | 4 | uniform |
 | `jxl_wgpu/display_rgb.wgsl` | `DisplayRgbParams` / `DisplayRgbParams` | `width, height, channels, sample_type, layout (storage_layout), logical_samples, _padding0, _padding1` | 32 | 4 | uniform |
 | `jxl_wgpu/display_numeric.wgsl` | `DisplayNumericParams` / `NumericParams` | dimensions/type/depth/components, plane offset/stride, visualization/non-finite/transfer/clamp, reserved word, `scale, bias`, 2 pads | 64 | 4 | uniform |
-| `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer`, three padded source-linear-to-BT.709 matrix rows | 144 | 4 | uniform |
+| `jxl_wgpu/display_image.wgsl` | `DisplayImageParams` / `Params` | dimensions/format fields, 4 plane offset/stride pairs, `chroma_width, chroma_height, transfer`, three padded source-linear-to-BT.709 matrix rows; gamma exponent and three pads | 160 | 4 | uniform |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuTask` / `Task` | `coefficient_offset, destination_x, destination_y, quant_index, matrix_index, correlation_index, lf_index` | 28 | 4 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `GpuResourceVector` / `vec4<f32>` | four `f32` lanes | 16 | 16 | storage element |
 | `jxl_wgpu/vardct_dct8.wgsl` | `Dct8Uniform` / `Params` | `task_count`, output dimensions/3 strides, 4 resource offsets, 2 pads, `quant_biases[4]`/`vec4<f32>` | 64 | 16 | uniform |
 | `jxl_wgpu/vardct_general.wgsl`, `vardct_special.wgsl` | `ResidentVarDctParams` / `Params` | task range, transform/LF dimensions, resource offsets, 3 output dimension/stride tuples, transform/correlation geometry, artifact task/bucket offsets, X LF stride, 3 pads, `quant_biases[4]`, then Y/B LF bases and strides | 144 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_resource.wgsl` | `VarDctResourceParams` / `Params` | geometry, three source channel extents/bases, three destination stride/origin/base records, X/Y/B LF scales plus extra-precision multiplier, final LF X/B chroma-correlation slopes and 2 pads | 144 | 16 | uniform |
-| `jxl_wgpu_decode/color_output.wgsl` | `ColorSourceParams` | 3 component stride/extent/shift records; alpha offset/stride/maximum/enabled; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 160 | 16 | uniform binding 5; shared 192-byte output parameters occupy binding 4 |
+| `jxl_wgpu_decode/color_output.wgsl` | `ColorSourceParams` | 3 component stride/extent/shift records; alpha offset/stride/maximum/enabled; 3 padded inverse-matrix rows; padded cube-root/scaled biases; intensity scale, transform mode, 2 pads | 160 | 16 | uniform binding 5; shared 208-byte output parameters occupy binding 4 |
 | `jxl_wgpu_decode/vardct_artifact.wgsl` | `HfMetadataLoweringParams` / `Params` | six `vec4<u32>` records for dimensions/capacities/image/artifact/metadata/source offsets, three channel shift/LF-base/stride records, seven `vec4<u32>` records containing all 27 strategy matrix offsets, X/Y/B dequantization scale multipliers, then base X/B correlation and reciprocal colour factor | 288 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctPacketControl` / `PacketControl` | eight `vec4<u32>` records for section ranges, geometry, physical metadata offsets/capacities, expectations, quantization, streams, and scratch | 128 | 16 | uniform |
 | `jxl_wgpu_decode/vardct_packet.wgsl` | `VarDctModularParams` / `Params` | 12-byte entropy prefix; logical/upload window starts, stream/yield ends, flags, state offset, stream base; 49 consumer words; one pad | 240 | Rust 16 / WGSL 4 | read-only storage |
@@ -261,7 +261,7 @@ The table below states the default workgroup configuration for each entry point:
 | resident `vardct_special` (decoder) | coefficients/artifact/resources RO, X/Y/B output RW, U | 8x8 | Tier B (fixed) | one indirect dispatch per populated special strategy bucket; 2,304-byte workgroup storage and raster coefficient/matrix layout are fixed by the transform contract |
 | `vardct_large_encoder::quantize_blocks` | source/params RO, artifact RW | 64x1 | Tier C (`KernelVariant` linear) | one 2-D workgroup per 8x8 block; checked block-grid axes and source/artifact ranges; 1,024 bytes workgroup storage |
 | `vardct_large_encoder::serialize_control` | params RO, artifact RW | 1x1 | Tier B (fixed) | one bounded scalar dispatch serializes LF groups row-major, resets prediction at each 256x256-block boundary, and writes checked contiguous fragment descriptors |
-| `color_output` (decoder) | X/Y/B, Cb/Y/Cr or R/G/B planes and opacity RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 192-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
+| `color_output` (decoder) | X/Y/B, Cb/Y/Cr or R/G/B planes and opacity RO, output RW, 2 U | 256x1 | Tier A (`KernelVariant` 1-D) | shared 208-byte output uniform plus 160-byte codec-source uniform; checked word count is linearized across 2-D workgroups; each invocation writes one packed u32 after full-precision inverse opsin or encoded BT.601 reconstruction, requested color conversion and packing; normative JPEG 2× component interpolation is fused when restoration did not already expand the planes |
 | `vardct_chroma_upsample` (decoder, `chroma_upsample`/`chroma_2d`) | compact component RO, distinct full-resolution component RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | one-axis or fused two-axis quarter/three-quarter interpolation before restoration; checked logical extents, padded strides, storage usage/alignment/binding limits, dispatch counts, and replicated odd borders; the decoder allocates distinct destinations |
 | `vardct_gaborish` (decoder, `gaborish_rgb`) | resident X/Y/B RO, distinct resident X/Y/B RW, U | 16x16 | Tier A (`KernelVariant` 2-D) | checked actual image extent, padded per-plane stride/range, storage usage/alignment/binding limits, finite normalized weights and dispatch counts |
 | `vardct_epf_sigma` (decoder) | LF-group raw metadata/artifact RO, full-image inverse-sigma atlas RW, U | 64x1 | Tier A (`KernelVariant` 1-D) | one invocation per validated transform task; artifact status/task count gate writes, while local block extent, global destination rectangle, and sharpness are bounded before addressing |
@@ -392,7 +392,7 @@ against device limits prior to pipeline compilation and dispatch recording.
 | Lossless Modular encoder | `LosslessModularMemoryPlan` reports source binding ranges (full and peak), 256-byte-aligned parameter storage, peak artifact storage, mapped readback, diagnostic total artifact bytes, batch count, exact GPU submission count, streaming mode, valid bits, component storage bytes, channel count, format, group grid, owned bytes/job and addressed bytes/job. `EncoderBufferPoolStats` separately reports exact idle bytes, three-buffer set counts, hits, misses and evictions. | Every submit non-blockingly reserves `owned_bytes_per_job` from the context's shared `MemoryBudget`. The exclusive buffer lease and permit survive until mapped artifacts are consumed. If the future is abandoned, its callback-owned lifetime unmaps and returns the set only after mapping resolves; the mapped artifact buffer is parsed in place instead of being duplicated into a host `Vec`. A bounded poll slot is reserved before `Queue::submit`, so poll saturation returns both memory and buffers without orphaning GPU work. The idle pool uses exact artifact-size matching and has an independent 32 MiB default hard limit, configurable down to zero, plus a 256-set object-count cap for tiny workloads. | Caller-owned source bindings are sampled directly: they are reported as addressed, are neither copied nor pooled, and are not charged as encoder-owned. Queue/driver-private command metadata excluded. Physical caller-visible allocation is bounded by live admitted bytes plus the separately reported idle-pool bytes. |
 | Gray8 decoder | `WgpuDecodeMemoryStats` splits complete `per_frame_bytes` into `output_lease_bytes + transient_bytes`, then reports `modular_metadata_bytes`, local-stream and unique-config counts, LF-group stream count, `max_frame_slots`, `max_frame_window_bytes`, the actual stream peak, submissions, lane stride, Prefix/ANS/Mixed representation, and the selected 32/48/112-byte execution-state tail per lane. `WgpuDecodeBufferPoolStats` separately reports exact idle/leased bytes and objects, hits, misses, recycling, evictions, limits, and clear generation. | Output and transient portions use the backend-wide transient `MemoryBudget` by default, shared with encode and generic readback; an explicit cloneable budget can define another intentional sharing group. Prefetch keeps each permit from queue submission through the ordered pending frame and then the returned frame lease. Rebased global/deduplicated-local entropy metadata, reconstruction/state scratch sized for the maximum stream contract, status, mapped status staging, 256-byte POD parameter records, and the 16-byte dispatch uniform (plus a native-F64 dummy when used) have exclusive exact-size/usage/alignment leases. One stream allocation is reused in queue order across every LF/pass subimage/segment batch. The map callback owns those leases through completion; abandonment still unmaps staging before return. Output leases retain their reservation beyond session drop. Memory and bounded-poller saturation are explicit prefetch backpressure, with poll capacity reserved before source consumption and queue submission; the count limiter remains independent. | Explicit stream caps below 40 bytes are rejected. Every accepted stock Modular global/local MA profile can span bounded windows; VarDCT AC and combined/global-tree plus staged local-tree LF/HF packets do so through the separate engine. Requested Modular window exposure above 64 MiB is rejected. Idle decoder retention is bounded independently at 32 MiB, 256 buffers total, and 32 per exact key by default; all limits can be reduced to zero. Clear invalidates outstanding generations without disrupting submitted work. Raw codestream and caller-owned output buffers are never pooled. Active logical bytes and idle physical bytes are reported separately rather than double-counted. Driver-private allocations excluded. |
 | Generic image readback | `ImageReadbackStats` reports frame/output counts, logical bytes, exact aggregate staging bytes, and padding bytes. One `submit_frames` call uses one staging allocation, command buffer, queue submission, map callback, and completion future/wait across all supplied frames; `ImageReadbackLimits::max_transient_bytes` and device `max_buffer_size` are enforced on that aggregate. | `max_in_flight_bytes` is a hard byte-weighted budget shared by pipeline clones (or backend clones when created from a backend). The complete staging allocation is admitted atomically. A permit and every source lease remain attached through mapping/consumption; an abandoned future leaves them owned by the callback until GPU completion, and exhaustion is a typed non-blocking error. | Codec dispatches are not coalesced by this transport API. Driver-private mapping/command metadata excluded. |
-| Display textures | Pitch-linear source buffers are fully range/usage bounded. RGB, numeric, and color-image dispatches use exact 32, 64, and 144-byte Pod uniforms respectively. Color images produce RGBA8 SDR or RGBA16F wide-gamut/HDR linear BT.709 textures. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing, short-lived uniform allocation internals, command metadata, and display-pipeline objects are intentionally excluded. |
+| Display textures | Pitch-linear source buffers are fully range/usage bounded. RGB, numeric, and color-image dispatches use exact 32, 64, and 160-byte Pod uniforms respectively. Color images produce RGBA8 SDR or RGBA16F wide-gamut/HDR linear BT.709 textures. | No texture-memory reservation API. | Portable `wgpu` cannot report driver-selected texture tiling/compression size; texture backing, short-lived uniform allocation internals, command metadata, and display-pipeline objects are intentionally excluded. |
 | Video readback | Each frame pads and bounds its own staging copy. | Animation/session in-flight limits bound decode work. | It does not expose a separate aggregate staging-byte statistic. |
 
 Ordinary VarDCT 2×/4×/8× frame resampling uses the scheduler's existing `upsample.wgsl` through
@@ -409,17 +409,18 @@ adaptive frame budget before allocation. Single-entry TOCs always use LF and HF-
 and retain conservative HF storage; image dimensions no longer imply a transform strategy.
 
 VarDCT and the render graph share `ImageOutputParams` and the `image_output.wgsl` fragment.
-Its 192-byte uniform at binding 4 retains output/input dimensions at offsets 0/8, source strides
+Its 208-byte uniform at binding 4 retains output/input dimensions at offsets 0/8, source strides
 at 16, target layout fields from 28, logical bytes at 104, dispatch width at 108, zero-based
 orientation at 112, source/target transfer at 116/120, identity-color flag at 124, and padded
-primary-matrix rows at 128/144/160. Alpha conversion is at byte 176, followed by three reserved
+primary-matrix rows at 128/144/160. Transfer parameters at byte 192 carry source/target gamma, a disabled (-1) or nonnegative
+linear black threshold, and one reserved F32. Alpha conversion is at byte 176, followed by three reserved
 words. The identity flag bypasses a redundant EOTF/OETF round trip when both transfer and primaries
 match.
 The codec source fragment adds a 160-byte, 16-byte-aligned `ColorSourceParams` at binding 5:
 component geometry starts at 0, alpha offset/stride/maximum/enabled at 48, inverse matrix rows at
 64/80/96, cube-root/scaled biases at 112/128, intensity scale at 144, and transform mode at 148.
 The two uniform bindings are individually limit-checked; `output_uniform_bytes` and transient
-admission charge their full 352 bytes. Read-only storage binding 6 supplies optional signed i32
+admission charge their full 368 bytes. Read-only storage binding 6 supplies optional signed i32
 alpha. Planning and pipeline creation require five storage bindings. Opaque output reuses the first
 read-only color binding with the alpha flag disabled, adding no allocation. Source geometry,
 offsets, depth and last addressed word are checked before encoding.
@@ -744,12 +745,12 @@ Multiply clamps only foreground. Absent alpha declarations make color Blend repl
 Add add, with virtual opaque alpha at presentation. References keep the image-header association;
 the physical producer requests Preserve, and only final output may change association.
 
-Final packing uses either the shared 192-byte `ImageOutputParams` with planar source overrides or
+Final packing uses either the shared 208-byte `ImageOutputParams` with planar source overrides or
 the 80-byte, 16-byte-aligned `NativeParams`: output/source extents, channel/depth/row format,
-byte-size/dispatch/orientation/alpha-conversion, original transfer and three reserved words at byte
-48, then source plane stride, first-alpha plane, selected scalar plane and flags at byte 64
+byte-size/dispatch/orientation/alpha-conversion, original transfer selector and gamma exponent bits
+plus two reserved words at byte 48, then source plane stride, first-alpha plane, selected scalar plane and flags at byte 64
 (bit 0: F32 output; bit 1: convert linear-original RGB to original transfer).
-The common packer selects one 192-byte parameter set for the actual original or linear-original
+The common packer selects one 208-byte parameter set for the actual original or linear-original
 domain. Native packing applies the original OETF before association/quantization, leaving extras
 unchanged. `image_transfer.wgsl` shares unbounded transfer functions with color output and display;
 BT.709 extends the linear toe below zero. Original Linear never receives an extra OETF.
@@ -987,7 +988,7 @@ legacy 8/16-bit direct packers cannot truncate them. Converted wide color output
 accounted all-channel F32 presentation surface, shared with floating sources and composition.
 That surface's allocation and lifetime continue to follow the common frame byte budget.
 
-The shared `ImageOutputParams` is 192 bytes: `alpha[0]` at byte 176 selects Preserve (0),
+The shared `ImageOutputParams` is 208 bytes: `alpha[0]` at byte 176 selects Preserve (0),
 Unpremultiply (1) or Premultiply (2), followed by three zero padding words. Existing field offsets
 are unchanged. `AlphaConversion` is a typed host enum and `ALPHA_OUTPUT_SHADER` is shared by the
 render graph, VarDCT, Modular and composition native packers. Conversion follows the target RGB
@@ -1015,9 +1016,9 @@ working-word addition precedes conversion to F32; source precision metadata does
 Color normalization owns three coded-resolution planes. Gaborish/EPF add one reusable three-plane
 ping-pong set; color resampling adds three presentation-resolution planes only when needed. Extras
 reuse one separately sized normalization scratch buffer. The common `color_output` packer writes
-into the existing aligned all-channel render arena; its 192/160-byte uniforms and each 80-byte
+into the existing aligned all-channel render arena; its 208/160-byte uniforms and each 80-byte
 Gaborish/EPF or 48-byte upsampling uniform are included exactly once. A 37×17, factor-2 color plan
-with Gaborish and two EPF passes accounts 11,652 working-plane bytes and 816 uniform bytes,
+with Gaborish and two EPF passes accounts 11,652 working-plane bytes and 832 uniform bytes,
 separately from the final render arena and shared weights.
 
 `ResidentEpfSigma::Constant` stores the negative inverse sigma in byte 72 of the existing 80-byte
@@ -1062,8 +1063,8 @@ their existing callback-owned job lifetime. The noise integration test observes 
 the public executor, including Modular's composition producer: nonzero versus zero models add
 exactly 52,524 bytes for 257×17 XYB. Unfiltered original-sRGB RGB/gray additionally needs three
 normalized F32 planes, three render destinations aligned to the device's storage-offset alignment,
-an 80-byte normalization uniform and 352 bytes for packing. The tested 256-byte alignment makes
-that total increase 158,376 bytes. One byte below the required capacity leaves no partial permit,
+an 80-byte normalization uniform and 368 bytes for packing. The tested 256-byte alignment makes
+that total increase 158,392 bytes. One byte below the required capacity leaves no partial permit,
 retry succeeds after release, and abandoning a submitted fragmented session releases all permits
 after completion callbacks run. All-zero models consume their 80 metadata bits but allocate no
 noise resources.
@@ -1115,7 +1116,7 @@ Final-only consumers drive the same continuation without returning intermediate 
 An LF update is packed from validated, independently tracked XYB dependency planes. Publication
 does not transfer or mutate the four LF slot versions. A level-L render allocates three F32 planes
 at each exact grid `ceil(canvas / 8^k)`, for k=L-1 through zero, a shared 6,400-byte Up8 kernel,
-three 48-byte interpolation uniforms per level, and the color packer's 352-byte uniforms. The
+three 48-byte interpolation uniforms per level, and the color packer's 368-byte uniforms. The
 packed output is separately leased. A single atomic reservation covers this complete render cost;
 one-byte-short admission rolls back without creating GPU buffers or consuming LF ownership.
 Composed LF rendering reuses immutable kernels and pipelines while retargeting the terminal
@@ -1268,3 +1269,33 @@ orientation. Direct color-only LF rendering keeps its existing path. Refinement 
 specific compositor they need, so a native final producer can use canonical LF intermediate packing
 without changing its final output path. Callbacks retain input leases and scratch until validation;
 only immutable output allocations survive completion. No new WGSL ABI or CPU image path is added.
+
+## Analytic RGB profiles and original reconstruction
+
+`RgbColorSpace::Custom(RgbChromaticities)` retains finite CIE xy primaries and the white point.
+The shared host matrix validates source and target even for identity conversion, derives RGB/XYZ
+and Bradford matrices in F64, and lowers once to three padded F32 rows. `WhitePointAdaptation::None`
+preserves absolute XYZ. No image sample is processed on the CPU. Parameterized gamma values have
+finite positive exponents and inverses; the parameter travels with its transfer variant.
+Primary columns use homogeneous XYZ coordinates, so a zero-y primary is valid when the complete
+matrix is nonsingular. White normalization still requires a finite Y=1 representation. CPU matrix
+and actual-GPU tests cover the XYZ basis and signed/extended output against independent coefficients.
+
+`ImageOutputParams` is 208 bytes; `transfer_parameters` begins at byte 192. Shared image selectors
+are Linear=0, sRGB=1, BT.709=2, PQ=3, HLG=4, BT.2020=5, Gamma=6, DCI=7. Display uses the same curves
+and a 160-byte uniform, with its gamma vector at byte 144. The render graph retains its own checked
+selector ABI (Gamma=5, BT.2020=6, DCI=7) and existing scalar gamma lane.
+
+General CMS Gamma clamps negative values; general DCI retains a unit-slope negative branch.
+JPEG XL original Gamma/DCI reconstruction additionally zeros target-linear values at or below
+`1e-5` before the OETF, matching native libjxl's `OpGamma`. The same boundary is used for reference
+storage, composition, LF presentation, native/scalar packing and original color output. It does
+not modify existing encoded reference samples. Unreferenced linear presentation retains pre-OETF
+values. The optional threshold occupies the shared record's third transfer lane; no new GPU buffer
+or CPU image conversion is introduced. `NativeParams` remains 80 bytes, with the original transfer
+selector and gamma exponent bits in `color.x/y`.
+
+`InverseOpsin::rgb_space` identifies the inverse matrix's linear RGB. Original non-sRGB RGB output
+uses libjxl's ICC-calibrated sRGB primary coordinates; its direct sRGB and Gray paths preserve their
+existing inverse-matrix interpretation. This precision distinction is explicit producer metadata,
+while the generic BT.709 color space retains the standard CIE coordinates.

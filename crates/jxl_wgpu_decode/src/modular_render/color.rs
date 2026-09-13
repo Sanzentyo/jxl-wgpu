@@ -57,6 +57,7 @@ impl ModularColorTransform {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
     encoded_output: bool,
+    original_encoding: RgbColorEncoding,
     noise: Option<jxl_wgpu::ResidentNoiseParameters>,
     transform: ModularColorTransform,
     gaborish: Option<ResidentGaborishWeights>,
@@ -112,6 +113,7 @@ impl ModularColorConfig {
                 || noise.is_some())
             .then(|| Self {
                 encoded_output: false,
+                original_encoding: original,
                 noise,
                 transform,
                 gaborish,
@@ -182,6 +184,14 @@ impl ColorPlan {
             return invalid("Modular color reconstruction requires equal color grids");
         }
         let output_config = ColorOutputConfig {
+            linear_black_threshold: if !config.encoded_output
+                && matches!(config.transform, ModularColorTransform::Xyb { .. })
+            {
+                crate::image_color::reconstruction_black_threshold(config.original_encoding, target)
+            } else {
+                None
+            },
+            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             extent,
             orientation: OutputOrientation::Identity,
             transform: if config.encoded_output {
@@ -824,6 +834,7 @@ mod tests {
             for gaborish in [false, true] {
                 for iterations in 0..=3 {
                     let config = ModularColorConfig {
+                        original_encoding: RgbColorEncoding::SRGB_BT709,
                         encoded_output: false,
                         noise: None,
                         transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
@@ -909,6 +920,7 @@ mod tests {
             })
             .collect();
         let config = ModularColorConfig {
+            original_encoding: RgbColorEncoding::SRGB_BT709,
             encoded_output: false,
             noise: None,
             transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
@@ -933,7 +945,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.storage_bytes, 6 * 19 * 9 * 4 + 3 * 37 * 17 * 4);
-        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 48 + 352);
+        assert_eq!(plan.uniform_bytes, 80 + 80 + 2 * 80 + 3 * 48 + 208 + 160);
         assert_eq!(
             plan.layout
                 .planes

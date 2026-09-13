@@ -32,6 +32,7 @@ pub struct ImageOutputRequest {
     /// same source samples with different color metadata.
     pub source_encoding: RgbColorEncoding,
     pub format: PixelFormat,
+    pub white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
 }
 
 impl ImageOutputRequest {
@@ -39,7 +40,17 @@ impl ImageOutputRequest {
         Self {
             source_encoding,
             format,
+            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
         }
+    }
+
+    #[must_use]
+    pub const fn with_white_point_adaptation(
+        mut self,
+        adaptation: jxl_gpu_protocol::WhitePointAdaptation,
+    ) -> Self {
+        self.white_point_adaptation = adaptation;
+        self
     }
 }
 
