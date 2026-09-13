@@ -51,107 +51,133 @@ fn require_samples(name: &str, actual: &[u32], expected: impl Iterator<Item = f3
     }
 }
 
+fn local_wide_samples(case: &modular_ycbcr::Case) -> bool {
+    case.has_local_transforms()
+        && match case.bit_depth {
+            jxl_gpu_bitstream::SampleBitDepth::Integer { bits_per_sample } => bits_per_sample > 16,
+            jxl_gpu_bitstream::SampleBitDepth::Float { .. } => true,
+        }
+}
+
 #[test]
 fn all_component_selectors_match_native_color_and_numeric_output() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
-    for case in modular_ycbcr::cases() {
-        let (bytes, expected) = reference(&case.name);
-        let info = jxl_gpu_bitstream::parse(&bytes, Default::default())
-            .unwrap()
-            .codestream_inventory(Default::default())
-            .unwrap();
-        case.validate(&info);
-        let pixels = (case.size[0] * case.size[1]) as usize;
-        let rgba = &expected[..pixels * 4];
-        let request = color_request();
-        let mut prior = None;
-        for limit in [None, NonZeroU64::new(40)] {
-            let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-            if let Some(limit) = limit {
-                engine = engine.with_stream_window_limit(limit);
-            }
-            let decoder = GpuDecoder::new(engine);
-            let mut session = if limit.is_some() {
-                planes::open_fragmented(&decoder, &bytes, request.clone())
-            } else {
-                decoder.open(&bytes, request.clone()).unwrap()
-            };
-            let frame = pollster::block_on(session.next_frame_async())
-                .unwrap()
-                .unwrap();
-            let actual = planes::read(&backend, &frame.output().outputs[0]);
-            require_samples(&case.name, &actual, rgba.iter().copied());
-            if let Some(prior) = &prior {
-                assert_eq!(&actual, prior, "{} fragmented", case.name);
-            }
-            prior = Some(actual);
-            drop((frame, session));
-            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-        }
-        let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-        for channel in 0..if case.grayscale { 1 } else { 3 } {
-            let request = GpuOutputRequest::numeric(
-                PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
-                mapping(case.bit_depth),
-            )
-            .unwrap()
-            .with_color_channel(channel)
-            .unwrap()
-            .with_orientation_policy(OrientationPolicy::Keep);
-            let mut session = decoder.open(&bytes, request).unwrap();
-            let frame = session.next_frame().unwrap().unwrap();
-            require_samples(
-                &case.name,
-                &planes::read(&backend, &frame.output().outputs[0]),
-                rgba.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|pixel| pixel[channel as usize]),
-            );
-            drop((frame, session));
-            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-        }
-        for (channel, extra) in info.image_header.extra_channels.iter().enumerate() {
-            let request = GpuOutputRequest::numeric(
-                PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
-                mapping(extra.bit_depth),
-            )
-            .unwrap()
-            .with_extra_channel(channel as u32)
-            .unwrap()
-            .with_orientation_policy(OrientationPolicy::Keep);
-            let mut session = planes::open_fragmented(&decoder, &bytes, request);
-            let frame = session.next_frame().unwrap().unwrap();
-            require_samples(
-                &case.name,
-                &planes::read(&backend, &frame.output().outputs[0]),
-                expected[(4 + channel) * pixels..][..pixels].iter().copied(),
-            );
-            drop((frame, session));
-            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-        }
-        if case.orientation != 1 {
-            let oriented = samples(&format!("{}.oriented", case.name));
-            let mut session = decoder
-                .open(
-                    &bytes,
-                    request.with_orientation_policy(OrientationPolicy::Apply),
-                )
-                .unwrap();
-            let frame = session.next_frame().unwrap().unwrap();
-            require_samples(
-                &case.name,
-                &planes::read(&backend, &frame.output().outputs[0]),
-                oriented[..pixels * 4].iter().copied(),
-            );
-            drop((frame, session));
-            assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
-        }
-        eprintln!(
-            "{}: color, numeric components and 40-byte windows",
-            case.name
-        );
+    for case in modular_ycbcr::cases()
+        .into_iter()
+        .filter(|case| !local_wide_samples(case))
+    {
+        require_case(&backend, &case);
     }
+}
+
+#[test]
+fn local_wide_sample_transforms_match_independent_color_and_numeric_references() {
+    let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
+    for case in modular_ycbcr::cases()
+        .into_iter()
+        .filter(local_wide_samples)
+    {
+        require_case(&backend, &case);
+    }
+}
+
+fn require_case(backend: &WgpuBackend, case: &modular_ycbcr::Case) {
+    let (bytes, expected) = reference(&case.name);
+    let info = jxl_gpu_bitstream::parse(&bytes, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    case.validate(&info);
+    let pixels = (case.size[0] * case.size[1]) as usize;
+    let rgba = &expected[..pixels * 4];
+    let request = color_request();
+    let mut prior = None;
+    for limit in [None, NonZeroU64::new(40)] {
+        let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
+        if let Some(limit) = limit {
+            engine = engine.with_stream_window_limit(limit);
+        }
+        let decoder = GpuDecoder::new(engine);
+        let mut session = if limit.is_some() {
+            planes::open_fragmented(&decoder, &bytes, request.clone())
+        } else {
+            decoder.open(&bytes, request.clone()).unwrap()
+        };
+        let frame = pollster::block_on(session.next_frame_async())
+            .unwrap()
+            .unwrap();
+        let actual = planes::read(backend, &frame.output().outputs[0]);
+        require_samples(&case.name, &actual, rgba.iter().copied());
+        if let Some(prior) = &prior {
+            assert_eq!(&actual, prior, "{} fragmented", case.name);
+        }
+        prior = Some(actual);
+        drop((frame, session));
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+    let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
+    for channel in 0..if case.grayscale { 1 } else { 3 } {
+        let request = GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+            mapping(case.bit_depth),
+        )
+        .unwrap()
+        .with_color_channel(channel)
+        .unwrap()
+        .with_orientation_policy(OrientationPolicy::Keep);
+        let mut session = decoder.open(&bytes, request).unwrap();
+        let frame = session.next_frame().unwrap().unwrap();
+        require_samples(
+            &case.name,
+            &planes::read(backend, &frame.output().outputs[0]),
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[channel as usize]),
+        );
+        drop((frame, session));
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+    for (channel, extra) in info.image_header.extra_channels.iter().enumerate() {
+        let request = GpuOutputRequest::numeric(
+            PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]),
+            mapping(extra.bit_depth),
+        )
+        .unwrap()
+        .with_extra_channel(channel as u32)
+        .unwrap()
+        .with_orientation_policy(OrientationPolicy::Keep);
+        let mut session = planes::open_fragmented(&decoder, &bytes, request);
+        let frame = session.next_frame().unwrap().unwrap();
+        require_samples(
+            &case.name,
+            &planes::read(backend, &frame.output().outputs[0]),
+            expected[(4 + channel) * pixels..][..pixels].iter().copied(),
+        );
+        drop((frame, session));
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+    if case.orientation != 1 {
+        let oriented = samples(&format!("{}.oriented", case.name));
+        let mut session = decoder
+            .open(
+                &bytes,
+                request.with_orientation_policy(OrientationPolicy::Apply),
+            )
+            .unwrap();
+        let frame = session.next_frame().unwrap().unwrap();
+        require_samples(
+            &case.name,
+            &planes::read(backend, &frame.output().outputs[0]),
+            oriented[..pixels * 4].iter().copied(),
+        );
+        drop((frame, session));
+        assert_eq!(decoder.engine().in_flight_memory_stats().reserved_bytes, 0);
+    }
+    eprintln!(
+        "{}: color, numeric components and 40-byte windows",
+        case.name
+    );
 }
 
 fn mapping(depth: jxl_gpu_bitstream::SampleBitDepth) -> NumericSampleMapping {

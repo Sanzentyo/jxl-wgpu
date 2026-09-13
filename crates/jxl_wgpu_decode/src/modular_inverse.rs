@@ -135,10 +135,6 @@ impl ModularInversePlan {
         })
     }
 
-    pub(crate) fn final_planes(&self) -> &[ModularArenaPlane] {
-        &self.final_planes
-    }
-
     pub(crate) fn final_gpu_layouts(&self) -> Vec<GpuModularChannelLayout> {
         self.final_planes
             .iter()
@@ -413,6 +409,11 @@ fn lower_rct(
         }
         .into());
     };
+    // Equal empty residual channels are a valid RCT input. Their validated topology
+    // remains live, but there are no samples to dispatch or uniforms to allocate.
+    if first.geometry.width == 0 || first.geometry.height == 0 {
+        return Ok(());
+    }
     jobs.push(ModularInverseJob::Rct {
         params: ModularRctParams::new(
             rct.rct_type,
@@ -662,6 +663,51 @@ mod tests {
     }
 
     #[test]
+    fn empty_residual_rct_preserves_the_squeeze_plan_without_gpu_work() {
+        let limits = ModularTransformLimits::default();
+        for (width, height, horizontal) in
+            [(1, 1, true), (1, 1, false), (1, 19, true), (37, 1, false)]
+        {
+            let source =
+                ModularChannelTopology::full_resolution(width, height, 16, 3, limits).unwrap();
+            let squeeze = ModularTransformIr::Squeeze {
+                used_default_parameters: false,
+                parameters: vec![ModularSqueezeParameter {
+                    horizontal,
+                    in_place: false,
+                    begin_channel: 0,
+                    channel_count: 3,
+                }],
+            };
+            let base = ModularTransformPlan::from_ir(source.clone(), vec![squeeze.clone()], limits)
+                .unwrap();
+            let expected = plan_modular_inverse(&base).unwrap();
+            assert_eq!(expected.jobs().len(), 3);
+            for rct_type in 0..42 {
+                let plan = ModularTransformPlan::from_ir(
+                    source.clone(),
+                    vec![
+                        squeeze.clone(),
+                        ModularTransformIr::Rct(ModularRct {
+                            begin_channel: 3,
+                            rct_type,
+                        }),
+                    ],
+                    limits,
+                )
+                .unwrap();
+                assert_eq!(plan.transforms.len(), 2);
+                assert_eq!(plan.topology, base.topology);
+                assert_eq!(
+                    plan_modular_inverse(&plan).unwrap(),
+                    expected,
+                    "{width}x{height}, horizontal {horizontal}, RCT {rct_type}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn best_fit_allocator_merges_both_neighbors_and_rejects_overlap() {
         let mut allocator = WordAllocator::new(100);
         allocator
@@ -725,10 +771,10 @@ mod tests {
                 ModularSqueezeDirection::Horizontal,
             ]
         );
-        assert_eq!(plan.final_planes().len(), 1);
-        assert_eq!(plan.final_planes()[0].offset_words, 0);
-        assert_eq!(plan.final_planes()[0].geometry.width, 9);
-        assert_eq!(plan.final_planes()[0].geometry.height, 5);
+        assert_eq!(plan.final_planes.len(), 1);
+        assert_eq!(plan.final_planes[0].offset_words, 0);
+        assert_eq!(plan.final_planes[0].geometry.width, 9);
+        assert_eq!(plan.final_planes[0].geometry.height, 5);
     }
 
     #[test]
@@ -746,11 +792,11 @@ mod tests {
         );
         assert_eq!(out_of_place.entropy_words(), 30);
         assert_eq!(out_of_place.arena_words(), 45);
-        assert_eq!(out_of_place.final_planes().len(), 2);
-        assert_eq!(out_of_place.final_planes()[0].geometry.width, 5);
-        assert_eq!(out_of_place.final_planes()[0].offset_words, 30);
-        assert_eq!(out_of_place.final_planes()[1].geometry.width, 5);
-        assert_eq!(out_of_place.final_planes()[1].offset_words, 9);
+        assert_eq!(out_of_place.final_planes.len(), 2);
+        assert_eq!(out_of_place.final_planes[0].geometry.width, 5);
+        assert_eq!(out_of_place.final_planes[0].offset_words, 30);
+        assert_eq!(out_of_place.final_planes[1].geometry.width, 5);
+        assert_eq!(out_of_place.final_planes[1].offset_words, 9);
 
         let single_column = one_squeeze_plan(
             1,
@@ -769,8 +815,8 @@ mod tests {
             panic!("single Squeeze plan contains RCT");
         };
         assert_eq!(params.residual_plane().width, 0);
-        assert_eq!(single_column.final_planes()[0].geometry.width, 1);
-        assert_eq!(single_column.final_planes()[0].geometry.height, 7);
+        assert_eq!(single_column.final_planes[0].geometry.width, 1);
+        assert_eq!(single_column.final_planes[0].geometry.height, 7);
     }
 
     #[test]
@@ -788,8 +834,8 @@ mod tests {
                 ModularInverseJob::Rct { params: last },
             ] if first.rct_type() == 41 && last.rct_type() == 5
         ));
-        assert_eq!(plan.final_planes().len(), 3);
-        assert!(plan.final_planes().iter().all(|plane| {
+        assert_eq!(plan.final_planes.len(), 3);
+        assert!(plan.final_planes.iter().all(|plane| {
             plane.geometry.width == 9 && plane.geometry.height == 5 && plane.geometry.bit_depth == 8
         }));
     }
@@ -809,10 +855,10 @@ mod tests {
                 ModularInverseJob::Rct { params },
             ] if params.rct_type() == 5
         ));
-        assert_eq!(simple.final_planes().len(), 3);
+        assert_eq!(simple.final_planes.len(), 3);
         assert!(
             simple
-                .final_planes()
+                .final_planes
                 .iter()
                 .all(|plane| { plane.geometry.width == 9 && plane.geometry.height == 5 })
         );
@@ -1048,7 +1094,7 @@ mod tests {
             execute_scalar_job(&mut expected, job);
         }
         let final_spans = plan
-            .final_planes()
+            .final_planes
             .iter()
             .copied()
             .map(ModularArenaPlane::span)

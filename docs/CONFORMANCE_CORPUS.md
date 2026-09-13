@@ -3684,3 +3684,42 @@ agree before its reference is used. Fifteen native prefix snapshots cover five t
 with immutable GPU updates and exact convergence to final-only output. No production pixel
 codec fallback, module path override or unused-code suppression is introduced. Broader
 per-group transforms, frame features and mixed-frame conformance remain part of the active goal.
+
+## Modular YCbCr local transforms and empty RCT (2026-09-13)
+
+The corpus now contains 464 original streams: the preceding 244 plus 84 empty-residual RCT
+cases and 136 local-transform cases. Every RCT identifier is applied to empty horizontal and
+vertical residual triplets. Local LF/pass headers exercise all RCT types and sampling triples,
+component/RGB Palette, default and explicit append/in-place Squeeze, ordered stacks, every group
+dimension, thin edge groups, independent extras, three LF groups, progressive passes, high
+integer/floating precision, restoration and 2×/4×/8× resampling.
+
+All 232 global topology sidecars and 652 nonempty local substreams have native source/target
+geometry evidence. The local test compares channel dimensions and shifts, native stream order,
+transform declarations, entropy cursor, MA/predictor configuration, packed descriptors and the
+actual resident inverse plan. Native case declarations and serialization are separate C++ units;
+Rust uses normal `transforms`, `substreams` and `topology` modules with explicit global/LF/pass lists.
+
+Legal RCT on equal empty residuals now preserves topology without emitting dispatches or uniforms.
+The former admission gate incorrectly required one GPU job per RCT header, independently
+recounted inverse jobs and retained an unreachable unsupported-transform branch. Job selection,
+live ranges and final-plane validation now belong to the resident inverse planner; profile
+admission validates portable addresses for each intermediate topology. The unused accessor and
+obsolete public unsupported-transform error variants are removed rather than suppressed.
+
+The local 31-bit integer case exposed native SIMD inverse-Squeeze overflow. Its scalar libjxl
+build changes 42 output samples beyond 2e-6 (maxAE 0.440161824) and agrees with the GPU for color
+and all selected components. The explicit fixture oracle choice, full scalar build and unchanged
+codestream are documented in the corpus README. No GPU samples generate references, and the
+2e-6 comparison bound remains unchanged. The eighth independently expanded restoration stream
+still requires agreement between native libjxl and pinned jxl-oxide before reference publication.
+Explicit identity/no-op headers and singleton edge palettes are emitted through native metadata
+and entropy APIs even when native forward selection would omit them.
+
+Twenty-nine admission cases request exactly one frame slot, verify identical per-frame cost at
+the exact budget, reject a one-byte shortfall and check retry, held output and cancellation.
+Empty RCT adds neither a fourth job nor another 64-byte uniform to a three-channel Squeeze plan.
+Nine two-pass cases compare 27 native prefix snapshots, immutable GPU updates and exact final-only
+convergence. Color and numeric output compare whole input with 40-byte GPU windows and 43-byte
+transport fragments. Broader mixed MA/transform combinations, frame features and mixed-frame
+conformance remain part of the active full JPEG XL goal.

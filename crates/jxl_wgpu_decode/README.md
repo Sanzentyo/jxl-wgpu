@@ -310,7 +310,7 @@ presentation rounds that F32 value against the exact requested integer maximum u
 significand arithmetic, including 31-bit endpoints and half-code boundaries. This avoids an
 additional rounding loss from F32 multiplication; it does not recover precision lost in earlier
 filtering, blending or VarDCT reconstruction. Wide-source RGB8 and other converted color formats
-use the common accounted F32 presentation surface. Non-XYB YCbCr remains an 8-bit source profile.
+use the common accounted F32 presentation surface. The VarDCT JPEG reconstruction profile retains its 8-bit source limit; Modular YCbCr uses independently declared integer/floating precision.
 
 `tests/integer_samples/main.rs` checks 42 exact-source fixtures and 40 libjxl rendering cases, including
 all source precisions, large predictor residuals, real RCT/Squeeze, independently coded alpha,
@@ -667,7 +667,12 @@ same expansion is shared with restoration when enabled. A separate 276-image cor
 sources with resampling and extras, LF root changes, RGB/YCbCr crossings and all four overwritten
 reference slots. Whole/fragmented progression, final-only equality and exact reservation/release
 are checked. The corpus records native fast-renderer and extended-range CMS limitations with
-explicit independent references. Modular YCbCr and broader original color domains remain open.
+explicit independent references. Modular YCbCr now has a separate 464-stream corpus for independent
+component grids, global/LF/pass RCT/Palette/Squeeze and bounded progressive output. Its 232 global
+topologies and 652 local substreams are compared with native geometry before GPU execution. Empty
+RCT inputs retain their channel positions without dispatch or uniform allocation. A documented
+scalar libjxl oracle covers wide inverse-Squeeze overflow in the native SIMD renderer. Broader
+Modular YCbCr patch/spline/noise, mixed-frame and original-color combinations remain open.
 
 Spline programs share the bounded Prefix/ANS/hybrid/LZ77 executor with patch dictionaries. Their
 six-context entropy prefix decodes to resident quantized coefficients and absolute control points;

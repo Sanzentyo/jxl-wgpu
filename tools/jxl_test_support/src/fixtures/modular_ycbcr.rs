@@ -5,8 +5,11 @@ use jxl_gpu_bitstream::{
     GaborishInventory, RestorationFilterInventory, SampleBitDepth,
 };
 
+mod substreams;
+mod topology;
 mod transforms;
-pub use transforms::{NativeTopology, Squeeze, Transform};
+pub use topology::{NativeSubstream, NativeTopology};
+pub use transforms::{Squeeze, Transform};
 
 #[derive(Clone, Debug)]
 pub struct Case {
@@ -25,10 +28,18 @@ pub struct Case {
     pub passes: u32,
     /// First published boundary when progressive output is requested; empty leading passes vanish.
     pub first_output_pass: u32,
-    pub transforms: Vec<Transform>,
+    pub global_transforms: Vec<Transform>,
+    pub lf_transforms: Vec<Transform>,
+    pub pass_transforms: Vec<Transform>,
+    /// Native SIMD inverse Squeeze overflows on this fixture's wide working words.
+    pub scalar_inverse_reference: bool,
 }
 
 impl Case {
+    pub fn has_local_transforms(&self) -> bool {
+        !self.lf_transforms.is_empty() || !self.pass_transforms.is_empty()
+    }
+
     fn new(name: String) -> Self {
         Self {
             name,
@@ -47,7 +58,10 @@ impl Case {
             group_size_shift: 1,
             passes: 1,
             first_output_pass: 0,
-            transforms: Vec::new(),
+            global_transforms: Vec::new(),
+            lf_transforms: Vec::new(),
+            pass_transforms: Vec::new(),
+            scalar_inverse_reference: false,
         }
     }
 
@@ -226,5 +240,6 @@ pub fn cases() -> Vec<Case> {
     lf.extra_factors = vec![8, 8];
     cases.push(lf);
     transforms::extend(&mut cases);
+    substreams::extend(&mut cases);
     cases
 }

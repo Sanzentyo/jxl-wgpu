@@ -22,253 +22,10 @@
 #include "lib/jxl/modular/transform/enc_transform.h"
 #include "lib/jxl/modular/transform/squeeze.h"
 
+#include "cases.h"
+
 namespace {
-struct Case {
-  std::string name;
-  std::array<int, 3> selectors = {0, 1, 0};
-  size_t width = 37, height = 19;
-  uint32_t bits = 16, exponent_bits = 0;
-  bool gray = false, gaborish = false, associated = false;
-  uint32_t epf = 0, upsampling = 1, orientation = 1;
-  uint32_t group_size_shift = 1, passes = 1;
-  std::vector<uint32_t> extra_factors;
-  std::vector<jxl::Transform> transforms;
-  bool positive_samples = false;
-};
-
-jxl::Transform Rct(uint32_t type, uint32_t begin = 0) {
-  jxl::Transform transform(jxl::TransformId::kRCT);
-  transform.rct_type = type;
-  transform.begin_c = begin;
-  return transform;
-}
-
-jxl::Transform Palette(uint32_t begin, uint32_t count) {
-  jxl::Transform transform(jxl::TransformId::kPalette);
-  transform.begin_c = begin;
-  transform.num_c = count;
-  transform.nb_colors = 65535;
-  transform.nb_deltas = 0;
-  transform.predictor = jxl::Predictor::Zero;
-  return transform;
-}
-
-jxl::SqueezeParams Split(bool horizontal, bool in_place, uint32_t begin, uint32_t count) {
-  jxl::SqueezeParams parameters;
-  parameters.horizontal = horizontal;
-  parameters.in_place = in_place;
-  parameters.begin_c = begin;
-  parameters.num_c = count;
-  return parameters;
-}
-
-jxl::Transform Squeeze(std::vector<jxl::SqueezeParams> parameters = {}) {
-  jxl::Transform transform(jxl::TransformId::kSqueeze);
-  transform.squeezes = std::move(parameters);
-  return transform;
-}
-
-void TransformCases(std::vector<Case>& cases) {
-  for (uint32_t type = 0; type < 42; ++type) {
-    Case test;
-    test.name = "rct_" + std::to_string(type);
-    test.selectors = {0, 0, 0};
-    test.transforms = {Rct(type)};
-    cases.push_back(test);
-  }
-  for (int cb = 0; cb < 4; ++cb) for (int y = 0; y < 4; ++y) for (int cr = 0; cr < 4; ++cr) {
-    Case test;
-    test.name = "squeeze_sampling_" + std::to_string(cb) + std::to_string(y) + std::to_string(cr);
-    test.selectors = {cb, y, cr};
-    test.transforms = {Squeeze()};
-    cases.push_back(test);
-  }
-  for (auto selectors : {std::array<int, 3>{0, 0, 0}, {0, 1, 0}, {1, 2, 3}}) {
-    for (auto size : {std::array<size_t, 2>{1, 1}, {1, 19}, {37, 1}}) {
-      Case test;
-      test.name = "squeeze_thin_" + std::to_string(selectors[0]) + std::to_string(selectors[1]) + std::to_string(selectors[2])
-          + "_" + std::to_string(size[0]) + "x" + std::to_string(size[1]);
-      test.selectors = selectors;
-      test.width = size[0]; test.height = size[1];
-      test.transforms = {Squeeze()};
-      cases.push_back(test);
-    }
-  }
-  for (uint32_t shift = 0; shift <= 3; ++shift) for (bool vertical : {false, true}) {
-    Case test;
-    test.name = "squeeze_groups_" + std::to_string(128u << shift) + (vertical ? "_vertical" : "_horizontal");
-    test.group_size_shift = shift;
-    if (vertical) test.height = (256u << shift) + 3; else test.width = (256u << shift) + 3;
-    test.transforms = {Squeeze()};
-    cases.push_back(test);
-  }
-  for (bool in_place : {false, true}) {
-    Case test;
-    test.name = in_place ? "squeeze_in_place" : "squeeze_append";
-    test.selectors = {1, 2, 3};
-    test.width = 259; test.height = 129; test.group_size_shift = 0;
-    test.transforms = {Squeeze({Split(true, in_place, 0, 3), Split(false, in_place, 0, 3)})};
-    cases.push_back(test);
-  }
-  Case lf;
-  lf.name = "squeeze_lf"; lf.width = 2051; lf.group_size_shift = 0; lf.passes = 2;
-  std::vector<jxl::SqueezeParams> splits;
-  for (size_t level = 0; level < 3; ++level) {
-    splits.push_back(Split(true, true, 0, 3));
-    splits.push_back(Split(false, true, 0, 3));
-  }
-  lf.transforms = {Squeeze(splits)};
-  cases.push_back(lf);
-  Case passes;
-  passes.name = "squeeze_passes"; passes.width = 259; passes.height = 37;
-  passes.group_size_shift = 0; passes.passes = 2; passes.transforms = {Squeeze()};
-  cases.push_back(passes);
-  for (uint32_t bits : {8, 31}) {
-    Case test;
-    test.name = "squeeze_integer_" + std::to_string(bits); test.bits = bits;
-    test.transforms = {Squeeze()}; cases.push_back(test);
-  }
-  for (uint32_t bits : {16, 24, 32}) {
-    Case test;
-    test.name = "squeeze_float_" + std::to_string(bits); test.bits = bits;
-    test.exponent_bits = bits == 16 ? 5 : bits == 24 ? 7 : 8;
-    test.positive_samples = bits == 32;
-    test.transforms = {Squeeze()}; cases.push_back(test);
-  }
-  for (uint32_t channel = 0; channel < 3; ++channel) for (bool grouped : {false, true}) {
-    Case test;
-    test.name = std::string(grouped ? "palette_groups_" : "palette_") + std::to_string(channel);
-    test.selectors = {1, 2, 3};
-    if (grouped) { test.width = 259; test.height = 37; test.group_size_shift = 0; }
-    test.transforms = {Palette(channel, 1)}; cases.push_back(test);
-  }
-  Case palette;
-  palette.name = "palette_rgb"; palette.selectors = {0, 0, 0};
-  palette.transforms = {Palette(0, 3)}; cases.push_back(palette);
-  palette.name = "rct_palette_squeeze";
-  palette.transforms = {Rct(6), Palette(0, 3), Squeeze()}; cases.push_back(palette);
-  palette.name = "palette_squeeze"; palette.selectors = {1, 2, 3};
-  palette.transforms = {Palette(0, 1), Squeeze()}; cases.push_back(palette);
-  Case residual;
-  residual.name = "squeeze_residual_rct"; residual.selectors = {0, 0, 0};
-  residual.transforms = {Squeeze({Split(true, false, 0, 3)}), Rct(41, 3)};
-  cases.push_back(residual);
-  Case extras;
-  extras.name = "squeeze_extras"; extras.width = 259; extras.height = 37; extras.group_size_shift = 0;
-  extras.extra_factors = {2, 8};
-  extras.transforms = {Squeeze({Split(true, false, 0, 3), Split(false, false, 0, 3), Split(true, false, 3, 1)})};
-  cases.push_back(extras);
-  Case restored;
-  restored.name = "restored_palette_squeeze"; restored.selectors = {1, 2, 3};
-  restored.gaborish = true; restored.epf = 3;
-  restored.transforms = {Palette(0, 1), Squeeze()}; cases.push_back(restored);
-}
-
-std::vector<Case> Cases() {
-  std::vector<Case> cases;
-  for (int cb = 0; cb < 4; ++cb) {
-    for (int y = 0; y < 4; ++y) {
-      for (int cr = 0; cr < 4; ++cr) {
-        Case test;
-        test.name = "sampling_" + std::to_string(cb) + std::to_string(y) + std::to_string(cr);
-        test.selectors = {cb, y, cr};
-        cases.push_back(test);
-      }
-    }
-  }
-  for (uint32_t bits : {8, 12, 31}) {
-    Case test;
-    test.name = "integer_" + std::to_string(bits);
-    test.bits = bits;
-    cases.push_back(test);
-  }
-  for (uint32_t bits : {16, 24, 32}) {
-    Case test;
-    test.name = "float_" + std::to_string(bits);
-    test.bits = bits;
-    test.exponent_bits = bits == 16 ? 5 : bits == 24 ? 7 : 8;
-    cases.push_back(test);
-  }
-  for (bool vertical : {false, true}) {
-    Case test;
-    test.name = vertical ? "thin_vertical" : "thin_horizontal";
-    if (vertical) test.width = 1; else test.height = 1;
-    cases.push_back(test);
-  }
-  Case gray;
-  gray.name = "gray";
-  gray.gray = true;
-  cases.push_back(gray);
-  for (uint32_t epf : {1, 2, 3}) {
-    Case test;
-    test.name = "restoration_" + std::to_string(epf);
-    test.selectors = {1, 2, 3};
-    test.gaborish = true;
-    test.epf = epf;
-    cases.push_back(test);
-  }
-  for (uint32_t factor : {2, 4, 8}) {
-    Case test;
-    test.name = "resampling_" + std::to_string(factor);
-    test.width = 53;
-    test.height = 35;
-    test.bits = 32;
-    test.exponent_bits = 8;
-    test.upsampling = factor;
-    test.extra_factors = {factor, 8};
-    test.gaborish = true;
-    test.epf = 2;
-    cases.push_back(test);
-  }
-  Case associated;
-  associated.name = "associated";
-  associated.bits = 32;
-  associated.exponent_bits = 8;
-  associated.associated = true;
-  associated.extra_factors = {1, 1};
-  cases.push_back(associated);
-  for (uint32_t orientation = 2; orientation <= 8; ++orientation) {
-    Case test = associated;
-    test.name = "orientation_" + std::to_string(orientation);
-    test.orientation = orientation;
-    cases.push_back(test);
-  }
-  for (uint32_t shift = 0; shift <= 3; ++shift) {
-    for (bool vertical : {false, true}) {
-      Case test;
-      test.name = "groups_" + std::to_string(128u << shift) + (vertical ? "_vertical" : "_horizontal");
-      test.group_size_shift = shift;
-      if (vertical) test.height = (256u << shift) + 3; else test.width = (256u << shift) + 3;
-      cases.push_back(test);
-    }
-  }
-  Case prefix;
-  prefix.name = "global_prefix";
-  prefix.width = 257;
-  cases.push_back(prefix);
-  prefix.name = "passes_global_prefix";
-  prefix.passes = 2;
-  cases.push_back(prefix);
-  for (bool directional : {false, true}) {
-    Case test;
-    test.name = directional ? "passes_directional" : "passes_420";
-    test.width = 259;
-    test.group_size_shift = 0;
-    test.passes = 2;
-    if (directional) test.selectors = {1, 2, 3};
-    cases.push_back(test);
-  }
-  Case lf;
-  lf.name = "lf_extras";
-  lf.width = 2051;
-  lf.group_size_shift = 0;
-  lf.bits = 32;
-  lf.exponent_bits = 8;
-  lf.extra_factors = {8, 8};
-  cases.push_back(lf);
-  TransformCases(cases);
-  return cases;
-}
+using fixtures::Case;
 
 int32_t EncodeSample(float value, const jxl::BitDepth& depth) {
   if (!depth.floating_point_sample) {
@@ -289,9 +46,63 @@ int32_t EncodeSample(float value, const jxl::BitDepth& depth) {
   return sign | (static_cast<uint32_t>(exponent) << mantissa_bits) | ((word & 0x7fffff) >> (23 - mantissa_bits));
 }
 
+jxl::Status ApplyTransforms(jxl::Image& image, const std::vector<jxl::Transform>& transforms,
+                            size_t& squeeze_channels) {
+  squeeze_channels = 0;
+  for (auto transform : transforms) {
+    bool topology_only = transform.id == jxl::TransformId::kRCT && transform.rct_type == 0;
+    bool singleton_palette = false;
+    if (transform.id == jxl::TransformId::kPalette) {
+      JXL_RETURN_IF_ERROR(jxl::CheckEqualChannels(image, transform.begin_c,
+                                                 transform.begin_c + transform.num_c - 1));
+      const auto& first = image.channel[transform.begin_c];
+      singleton_palette = first.w == 1 && first.h == 1;
+    }
+    if (transform.id == jxl::TransformId::kSqueeze) {
+      auto parameters = transform.squeezes;
+      if (parameters.empty()) jxl::DefaultSqueezeParameters(&parameters, image);
+      topology_only = parameters.empty();
+      for (const auto& split : parameters) squeeze_channels += split.num_c;
+    }
+    if (singleton_palette) {
+      // Native forward selection elides a one-color palette. Keep the legal explicit
+      // transform with its one original color and zero index, using native meta-application.
+      std::vector<jxl::pixel_type> color;
+      for (size_t c = 0; c < transform.num_c; ++c) {
+        color.push_back(image.channel[transform.begin_c + c].Row(0)[0]);
+      }
+      transform.nb_colors = 1;
+      transform.nb_deltas = 0;
+      JXL_RETURN_IF_ERROR(transform.MetaApply(image));
+      for (size_t c = 0; c < color.size(); ++c) image.channel[0].Row(c)[0] = color[c];
+      image.channel[transform.begin_c + 1].Row(0)[0] = 0;
+    } else if (topology_only) {
+      // Preserve explicit identity RCT and default Squeeze with no applicable steps.
+      JXL_RETURN_IF_ERROR(transform.MetaApply(image));
+    } else {
+      JXL_RETURN_IF_ERROR(jxl::TransformForward(transform, image, jxl::weighted::Header(), nullptr));
+    }
+    image.transform.push_back(std::move(transform));
+  }
+  return true;
+}
+
+void WriteChannels(std::ostream& output, const jxl::Image& image) {
+  for (const auto& channel : image.channel) {
+    output << channel.w << ' ' << channel.h << ' ' << channel.hshift << ' ' << channel.vshift << '\n';
+  }
+}
+
+void WriteTopology(std::ostream& output, const jxl::Image& image, size_t squeeze_channels) {
+  output << image.nb_meta_channels << ' ' << image.channel.size() << ' '
+         << image.transform.size() << ' ' << squeeze_channels << '\n';
+  WriteChannels(output, image);
+}
+
 jxl::Status EncodeGroup(const jxl::Image& image, size_t first, size_t tile, size_t gx, size_t gy,
                         int minimum_shift, int maximum_shift, const jxl::ModularOptions& options,
-                        size_t stream_id, jxl::BitWriter& writer) {
+                        size_t stream_id, jxl::BitWriter& writer,
+                        const std::vector<jxl::Transform>& transforms, std::ostream* topology) {
   JXL_ASSIGN_OR_RETURN(auto group, jxl::Image::Create(image.memory_manager(), tile, tile, image.bitdepth, 0));
   for (size_t c = first; c < image.channel.size(); ++c) {
     const auto& source = image.channel[c];
@@ -304,6 +115,18 @@ jxl::Status EncodeGroup(const jxl::Image& image, size_t first, size_t tile, size
         std::min(width, source.w - x0), std::min(height, source.h - y0), source.hshift, source.vshift));
     for (size_t y = 0; y < channel.h; ++y) std::copy_n(source.Row(y0 + y) + x0, channel.w, channel.Row(y));
     group.channel.push_back(std::move(channel));
+  }
+  if (!group.channel.empty()) {
+    if (topology) {
+      *topology << "stream " << stream_id << "\nsource " << group.channel.size() << '\n';
+      WriteChannels(*topology, group);
+    }
+    size_t squeeze_channels;
+    JXL_RETURN_IF_ERROR(ApplyTransforms(group, transforms, squeeze_channels));
+    if (topology) {
+      *topology << "transformed ";
+      WriteTopology(*topology, group, squeeze_channels);
+    }
   }
   return jxl::ModularGenericCompress(group, options, writer, nullptr, jxl::LayerType::ModularGlobal, stream_id);
 }
@@ -423,30 +246,22 @@ jxl::Status Generate(const std::filesystem::path& output, const Case& test, bool
     const uint8_t equal[3] = {1, 1, 1};
     JXL_RETURN_IF_ERROR(frame.chroma_subsampling.Set(equal, equal));
   }
-  if (!expanded_reference && !test.transforms.empty()) {
-    size_t squeeze_channels = 0;
-    for (auto transform : test.transforms) {
-      if (transform.id == jxl::TransformId::kSqueeze) {
-        auto parameters = transform.squeezes;
-        if (parameters.empty()) jxl::DefaultSqueezeParameters(&parameters, image);
-        for (const auto& split : parameters) squeeze_channels += split.num_c;
-      }
-      if (transform.id == jxl::TransformId::kRCT && transform.rct_type == 0) {
-        // Native forward selection elides identity RCT; serialize its valid explicit header.
-        JXL_RETURN_IF_ERROR(transform.MetaApply(image));
-      } else {
-        JXL_RETURN_IF_ERROR(jxl::TransformForward(transform, image, jxl::weighted::Header(), nullptr));
-      }
-      image.transform.push_back(std::move(transform));
-    }
+  if (!expanded_reference && !test.global_transforms.empty()) {
+    size_t squeeze_channels;
+    JXL_RETURN_IF_ERROR(ApplyTransforms(image, test.global_transforms, squeeze_channels));
     std::ofstream topology(output / (test.name + ".topology"));
-    topology << image.nb_meta_channels << ' ' << image.channel.size() << ' '
-             << image.transform.size() << ' ' << squeeze_channels << '\n';
-    for (const auto& channel : image.channel) {
-      topology << channel.w << ' ' << channel.h << ' ' << channel.hshift << ' ' << channel.vshift << '\n';
-    }
+    WriteTopology(topology, image, squeeze_channels);
     if (!topology) return JXL_FAILURE("Cannot write native topology");
   }
+  std::ofstream local_topology;
+  if (!expanded_reference && (!test.lf_transforms.empty() || !test.pass_transforms.empty())) {
+    local_topology.open(output / (test.name + ".local"));
+    if (!local_topology) return JXL_FAILURE("Cannot write local topology");
+  }
+  auto* topology = local_topology.is_open() ? &local_topology : nullptr;
+  const std::vector<jxl::Transform> no_transforms;
+  const auto& lf_transforms = expanded_reference ? no_transforms : test.lf_transforms;
+  const auto& pass_transforms = expanded_reference ? no_transforms : test.pass_transforms;
   jxl::BitWriter writer(&memory);
   JXL_RETURN_IF_ERROR(jxl::WriteCodestreamHeaders(&metadata, &writer, nullptr));
   writer.ZeroPadToByte();
@@ -479,7 +294,7 @@ jxl::Status Generate(const std::filesystem::path& output, const Case& test, bool
     auto& section = *sections[single_section ? 0 : 1 + group];
     JXL_RETURN_IF_ERROR(EncodeGroup(image, first, dimensions.dc_group_dim,
         group % dimensions.xsize_dc_groups, group / dimensions.xsize_dc_groups, 3, 30, options,
-        jxl::ModularStreamId::ModularDC(group).ID(dimensions), section));
+        jxl::ModularStreamId::ModularDC(group).ID(dimensions), section, lf_transforms, topology));
   }
   for (size_t pass = 0; pass < test.passes; ++pass) {
     int minimum, maximum;
@@ -488,7 +303,7 @@ jxl::Status Generate(const std::filesystem::path& output, const Case& test, bool
       auto& section = *sections[single_section ? 0 : 2 + dimensions.num_dc_groups + pass * dimensions.num_groups + group];
       JXL_RETURN_IF_ERROR(EncodeGroup(image, first, dimensions.group_dim,
           group % dimensions.xsize_groups, group / dimensions.xsize_groups, minimum, maximum, options,
-          jxl::ModularStreamId::ModularAC(group, pass).ID(dimensions), section));
+          jxl::ModularStreamId::ModularAC(group, pass).ID(dimensions), section, pass_transforms, topology));
     }
   }
   std::vector<size_t> sizes;
@@ -503,6 +318,7 @@ jxl::Status Generate(const std::filesystem::path& output, const Case& test, bool
   std::ofstream file(output / (test.name + (expanded_reference ? ".expanded.jxl" : ".jxl")), std::ios::binary);
   file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   if (!file) return JXL_FAILURE("Cannot write fixture");
+  if (topology && !*topology) return JXL_FAILURE("Cannot write local topology");
   return true;
 }
 }
@@ -510,7 +326,7 @@ jxl::Status Generate(const std::filesystem::path& output, const Case& test, bool
 int main(int argc, char** argv) {
   if (argc != 2) return 2;
   std::filesystem::create_directories(argv[1]);
-  for (const auto& test : Cases()) {
+  for (const auto& test : fixtures::Cases()) {
     std::fprintf(stderr, "%s\n", test.name.c_str());
     if (!Generate(argv[1], test)) return 1;
     if ((test.gaborish || test.epf != 0) && !Generate(argv[1], test, true)) return 1;

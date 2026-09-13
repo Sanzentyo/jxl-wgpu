@@ -8,6 +8,9 @@ fn main() {
     let generator = std::env::args_os()
         .nth(1)
         .expect("native generator executable path");
+    let scalar_decoder = std::env::args_os()
+        .nth(2)
+        .expect("pinned scalar libjxl decoder executable path");
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data/modular_ycbcr");
     let temporary =
         std::env::temp_dir().join(format!("jxl-wgpu-modular-ycbcr-{}", std::process::id()));
@@ -24,7 +27,11 @@ fn main() {
                 .count()
             + cases
                 .iter()
-                .filter(|case| !case.transforms.is_empty())
+                .filter(|case| !case.global_transforms.is_empty())
+                .count()
+            + cases
+                .iter()
+                .filter(|case| case.has_local_transforms())
                 .count()
     );
     for case in cases {
@@ -34,11 +41,17 @@ fn main() {
             .codestream_inventory(Default::default())
             .unwrap();
         case.validate(&info);
-        if !case.transforms.is_empty() {
+        if !case.global_transforms.is_empty() {
             let name = format!("{}.topology", case.name);
             let native = std::fs::read_to_string(temporary.join(&name)).unwrap();
             let topology = modular_ycbcr::NativeTopology::parse(&native);
-            assert_eq!(topology.transform_count, case.transforms.len());
+            assert_eq!(topology.transform_count, case.global_transforms.len());
+            std::fs::write(output.join(name), native).unwrap();
+        }
+        if case.has_local_transforms() {
+            let name = format!("{}.local", case.name);
+            let native = std::fs::read_to_string(temporary.join(&name)).unwrap();
+            modular_ycbcr::NativeSubstream::parse_all(&native);
             std::fs::write(output.join(name), native).unwrap();
         }
         if case.passes > 1 {
@@ -76,7 +89,37 @@ fn main() {
         let fast =
             extra_channels::libjxl_output(&bytes, &["--preserve-alpha", "--keep-orientation"])
                 .expect("native libjxl decoder is required");
-        let reference = if case.gaborish || case.epf_iterations != 0 {
+        let reference = if case.scalar_inverse_reference {
+            // This oracle exception currently covers a final, unfiltered still. Prefixes and
+            // oriented references below use separate native entry points.
+            assert_eq!(
+                (case.passes, case.orientation, case.epf_iterations),
+                (1, 1, 0)
+            );
+            assert!(!case.gaborish);
+            let decoded = Command::new(&scalar_decoder)
+                .arg(temporary.join(format!("{}.jxl", case.name)))
+                .args(["--preserve-alpha", "--keep-orientation"])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}: scalar native decoder",
+                case.name
+            );
+            let scalar = extra_channels::floats(&decoded.stdout);
+            assert_eq!(scalar.len(), fast.len());
+            let difference = fast
+                .iter()
+                .zip(&scalar)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "{}: native SIMD/scalar inverse maxAE {difference}",
+                case.name
+            );
+            scalar
+        } else if case.gaborish || case.epf_iterations != 0 {
             // A scalar expansion produces equivalent 4:4:4 input, isolating restoration from
             // libjxl's vertical-sampling filter defect. Both independent decoders must agree.
             assert_eq!(case.orientation, 1);

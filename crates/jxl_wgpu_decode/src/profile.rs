@@ -22,13 +22,10 @@ use crate::modular_transform::{
     parse_modular_transforms,
 };
 use crate::modular_tree::BitInput;
+use crate::modular_tree::{MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config};
 use crate::{
     Error, GpuCodestream, ModularChannelCounts, ModularChannels, Result,
     UnsupportedCodestreamFeature, UnsupportedProfile,
-};
-use crate::{
-    ModularTransformFeature,
-    modular_tree::{MaConfigIr, MaTreeLimits, WpHeaderIr, parse_ma_config},
 };
 
 const MIN_GROUP_DIMENSION: u32 = 128;
@@ -428,6 +425,7 @@ fn parse_modular_profile(
     if reader.bit_offset() > dc_end {
         return unsupported("Modular DC-global metadata exceeds its TOC section");
     }
+    validate_modular_transform_layout(&transform_plan)?;
 
     let (
         groups,
@@ -436,13 +434,6 @@ fn parse_modular_profile(
         concrete_transform_plans,
         frame_plan_seed,
     ) = if single_entry {
-        validate_stock_modular_transform_plan(
-            channels,
-            frame_width,
-            frame_height,
-            u32::from(bits_per_sample),
-            &transform_plan,
-        )?;
         let groups = vec![ModularGroup {
             token_bit_offset: reader.bit_offset(),
             token_bit_end: dc_end,
@@ -460,13 +451,6 @@ fn parse_modular_profile(
             None,
         )
     } else {
-        validate_stock_modular_transform_plan(
-            channels,
-            frame_width,
-            frame_height,
-            u32::from(bits_per_sample),
-            &transform_plan,
-        )?;
         validate_modular_section_structure(codestream, frame)?;
         let limits = ModularTransformLimits::default();
         let pass_ranges = build_modular_pass_shift_ranges(
@@ -671,15 +655,7 @@ fn parse_modular_profile(
                     transforms.extend(local_transform.transforms);
                     ModularTransformPlan::from_ir(source_topology, transforms, limits)?
                 };
-                if !requires_frame_arena {
-                    validate_stock_modular_transform_plan(
-                        channels,
-                        group_width,
-                        group_height,
-                        u32::from(bits_per_sample),
-                        &concrete_transform,
-                    )?;
-                }
+                validate_modular_transform_layout(&concrete_transform)?;
                 let group_ma_config = if use_global_tree {
                     if !has_global_ma_config {
                         return unsupported(
@@ -1182,132 +1158,15 @@ fn parse_dc_global_ir(
     }
 }
 
-fn validate_stock_modular_transform_plan(
-    channels: ModularChannelCounts,
-    width: u32,
-    height: u32,
-    bit_depth: u32,
-    transform_plan: &ModularTransformPlan,
-) -> Result<()> {
-    let expected_sample_count = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|samples| samples.checked_mul(u64::from(channels.count())))
-        .ok_or_else(|| unsupported_error("Modular source sample count overflows"))?;
-    let topology_is_direct = transform_plan.topology.meta_channel_count() == 0
-        && transform_plan.topology == *transform_plan.source_topology()
-        && transform_plan.topology.sample_count() == Some(expected_sample_count)
-        && transform_plan.topology.channels().len() == channels.count() as usize
-        && transform_plan.topology.channels().iter().all(|channel| {
-            channel.width == width
-                && channel.height == height
-                && channel.hshift == 0
-                && channel.vshift == 0
-                && channel.bit_depth == bit_depth
-        });
-    // This proves that every entropy-visible channel has a portable u32 WGSL address before any
-    // backend allocation. The generalized transformed-channel executor will retain this table.
-    let _gpu_channel_layout = transform_plan.topology.gpu_layout()?;
-    match (
-        channels.conventional(),
-        transform_plan.transforms.as_slice(),
-    ) {
-        (_, []) if topology_is_direct => {
-            let inverse = plan_modular_inverse(transform_plan)?;
-            if u64::from(inverse.entropy_words()) != expected_sample_count
-                || inverse.arena_words() != inverse.entropy_words()
-                || !inverse.jobs().is_empty()
-                || inverse.final_planes().len() != channels.count() as usize
-            {
-                return Err(crate::ModularInversePlanError::TopologyState {
-                    reason: "direct topology produced a non-direct inverse schedule",
-                }
-                .into());
-            }
-        }
-        (
-            Some(ModularChannels::Rgb | ModularChannels::Rgba),
-            [
-                ModularTransformIr::Rct(ModularRct {
-                    begin_channel: 0,
-                    rct_type: 6,
-                }),
-            ],
-        ) if topology_is_direct => {}
-        (_, transforms) => {
-            let gpu_resident = transforms.iter().all(|transform| {
-                matches!(
-                    transform,
-                    ModularTransformIr::Rct(_)
-                        | ModularTransformIr::Palette(_)
-                        | ModularTransformIr::Squeeze { .. }
-                )
-            });
-            if gpu_resident {
-                let inverse = plan_modular_inverse(transform_plan)?;
-                let expected_jobs =
-                    transforms
-                        .iter()
-                        .try_fold(0usize, |total, transform| match transform {
-                            ModularTransformIr::Rct(_) => total.checked_add(1),
-                            ModularTransformIr::Squeeze { parameters, .. } => {
-                                parameters.iter().try_fold(total, |total, parameter| {
-                                    total.checked_add(parameter.channel_count as usize)
-                                })
-                            }
-                            ModularTransformIr::Palette(palette) => {
-                                total.checked_add(palette.channel_count as usize)
-                            }
-                        });
-                if inverse.arena_words() < inverse.entropy_words()
-                    || inverse.arena_bytes() != u64::from(inverse.arena_words()) * 4
-                    || Some(inverse.jobs().len()) != expected_jobs
-                    || inverse.final_planes().len()
-                        != transform_plan.source_topology().channels().len()
-                {
-                    return Err(crate::ModularInversePlanError::TopologyState {
-                        reason: "Modular transform produced inconsistent resident requirements",
-                    }
-                    .into());
-                }
-            } else {
-                let feature = transforms
-                    .iter()
-                    .find_map(|transform| match transform {
-                        ModularTransformIr::Rct(rct)
-                            if rct.begin_channel == 0 && rct.rct_type == 6 =>
-                        {
-                            None
-                        }
-                        ModularTransformIr::Rct(rct) => {
-                            Some(ModularTransformFeature::ReversibleColor {
-                                begin_channel: rct.begin_channel,
-                                rct_type: rct.rct_type,
-                            })
-                        }
-                        ModularTransformIr::Palette(_) => Some(ModularTransformFeature::Palette),
-                        ModularTransformIr::Squeeze { .. } => {
-                            Some(ModularTransformFeature::Squeeze)
-                        }
-                    })
-                    .unwrap_or(ModularTransformFeature::Invalid);
-                return unsupported_transform(feature);
-            }
-        }
-    }
+fn validate_modular_transform_layout(transform_plan: &ModularTransformPlan) -> Result<()> {
+    // Every intermediate topology must have portable WGSL addresses before allocation.
+    // The resident inverse planner owns job selection, live ranges and final-plane validation.
+    transform_plan.topology.gpu_layout()?;
     transform_plan.visit_inverse(|_, source, destination| {
         source.gpu_layout()?;
         destination.gpu_layout()?;
         Ok(())
-    })?;
-    Ok(())
-}
-
-fn unsupported_transform<T>(feature: ModularTransformFeature) -> Result<T> {
-    Err(UnsupportedProfile::new(
-        UnsupportedCodestreamFeature::ModularTransform(feature),
-        "the Modular transform is parsed but has not been lowered to a GPU kernel",
-    )
-    .into())
+    })
 }
 
 fn validate_modular_section_structure(
@@ -1859,12 +1718,11 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Gray.into(), 9, 5, 8, &squeeze)
-            .unwrap();
+        validate_modular_transform_layout(&squeeze).unwrap();
         let squeeze_inverse = plan_modular_inverse(&squeeze).unwrap();
         assert_eq!(squeeze_inverse.entropy_words(), 45);
         assert_eq!(squeeze_inverse.jobs().len(), 1);
-        assert_eq!(squeeze_inverse.final_planes().len(), 1);
+        assert_eq!(squeeze_inverse.final_gpu_layouts().len(), 1);
 
         let rgb_source = ModularChannelTopology::full_resolution(7, 3, 8, 3, limits).unwrap();
         let rct = ModularTransformPlan::from_transforms_for_test(
@@ -1876,11 +1734,11 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Rgb.into(), 7, 3, 8, &rct).unwrap();
+        validate_modular_transform_layout(&rct).unwrap();
         let rct_inverse = plan_modular_inverse(&rct).unwrap();
         assert_eq!(rct_inverse.entropy_words(), 63);
         assert_eq!(rct_inverse.jobs().len(), 1);
-        assert_eq!(rct_inverse.final_planes().len(), 3);
+        assert_eq!(rct_inverse.final_gpu_layouts().len(), 3);
 
         let palette_source = ModularChannelTopology::full_resolution(11, 7, 8, 3, limits).unwrap();
         let palette = ModularTransformPlan::from_transforms_for_test(
@@ -1897,11 +1755,10 @@ mod tests {
             limits,
         )
         .unwrap();
-        validate_stock_modular_transform_plan(ModularChannels::Rgb.into(), 11, 7, 8, &palette)
-            .unwrap();
+        validate_modular_transform_layout(&palette).unwrap();
         let palette_inverse = plan_modular_inverse(&palette).unwrap();
         assert_eq!(palette_inverse.jobs().len(), 3);
-        assert_eq!(palette_inverse.final_planes().len(), 3);
+        assert_eq!(palette_inverse.final_gpu_layouts().len(), 3);
         assert!(palette_inverse.arena_words() > palette_inverse.entropy_words());
     }
 
@@ -1974,7 +1831,7 @@ mod tests {
             panic!("progressive-DC root did not produce one resident entropy plan");
         };
         let inverse = &resident.inverse_plan;
-        assert_eq!(inverse.final_planes().len(), 3);
+        assert_eq!(inverse.final_gpu_layouts().len(), 3);
         assert_eq!(
             u64::from(inverse.entropy_words()),
             u64::from(profile.width) * u64::from(profile.height) * 3
@@ -1982,9 +1839,9 @@ mod tests {
         assert!(inverse.arena_words() >= inverse.entropy_words());
         assert_eq!(
             inverse
-                .final_planes()
+                .final_gpu_layouts()
                 .iter()
-                .map(|plane| (plane.geometry.width, plane.geometry.height))
+                .map(|plane| (plane.width, plane.height))
                 .collect::<Vec<_>>(),
             vec![(profile.width, profile.height); 3]
         );

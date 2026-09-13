@@ -22,18 +22,8 @@ pub enum UnsupportedCodestreamFeature {
     Patches,
     Splines,
     Noise,
-    ModularTransform(ModularTransformFeature),
     AnimationReferences,
     Other(String),
-}
-
-/// Standard Modular transform that has not yet been lowered to the GPU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ModularTransformFeature {
-    ReversibleColor { begin_channel: u32, rct_type: u32 },
-    Palette,
-    Squeeze,
-    Invalid,
 }
 
 /// Invalid or resource-exhausting standard Modular metadata.
@@ -119,11 +109,9 @@ pub enum ModularTransformError {
     InverseTopologyMismatch,
 }
 
-/// Invalid or unsupported lowering from Modular transform topology to resident GPU jobs.
+/// Invalid lowering from Modular transform topology to resident GPU jobs.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ModularInversePlanError {
-    #[error("resident Modular inverse planning does not yet implement {feature:?}")]
-    UnsupportedTransform { feature: ModularTransformFeature },
     #[error("resident Modular inverse topology and live plane state disagree: {reason}")]
     TopologyState { reason: &'static str },
     #[error("resident Modular inverse arena exceeds portable WGSL u32 word addressing")]

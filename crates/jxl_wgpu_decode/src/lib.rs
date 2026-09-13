@@ -85,8 +85,7 @@ pub use codec_engine::{
 pub use codestream_data::GpuCodestream;
 pub use error::{
     Error, FrontendIncomplete, FrontendStage, ModularInversePlanError, ModularTransformError,
-    ModularTransformFeature, ModularTreeError, Result, SplineResource,
-    UnsupportedCodestreamFeature, UnsupportedProfile,
+    ModularTreeError, Result, SplineResource, UnsupportedCodestreamFeature, UnsupportedProfile,
 };
 pub use frame_plan::{
     FrameExecutionNode, FrameExecutionPlan, FramePlanError, FramePresentation, FrameReference,

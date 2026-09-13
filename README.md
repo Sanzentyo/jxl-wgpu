@@ -221,9 +221,10 @@ extras and immutable progressive updates have dedicated coverage. The official 6
 and bounded fragmented input. Independent plane extents now support unequal color/extra factors:
 extras use one complete interpolation filter before splines while color is expanded afterward.
 Modular YCbCr now uses independently sized JPEG component grids for integer and floating samples,
-then GPU component expansion, restoration, frame resampling and color conversion. One hundred
-independently encoded cases cover all 64 sampling selector triples, every group dimension,
-global/LF/pass streams, gray, mixed-depth extras, orientation and bounded progressive output.
+then GPU component expansion, restoration, frame resampling and color conversion. The 464 native
+streams cover all 64 sampling triples, every group dimension, global/LF/pass RCT/Palette/Squeeze,
+empty residuals, gray, independent extras, orientation and bounded progressive output. Native
+sidecars verify the transformed geometry of 232 global cases and 652 local substreams.
 Its broader patch/spline/noise and mixed-frame combinations, and broader original color domains,
 still need conformance coverage.
 
