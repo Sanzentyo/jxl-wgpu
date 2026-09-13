@@ -389,6 +389,16 @@ Embedded preview/main selection is covered by the checkpoint above.
 
 ### K. API, scheduling, and resource safety
 
+ICC matrix/TRC checkpoint (`COLOR-01`, `IO-01`, `API-05/06`, `QA-03/06`): bounded original-byte
+profile metadata and a reusable resident RGB/Gray F32 conversion primitive now preserve exact
+colorants and independent identity/gamma/sampled/parametric curves. GPU execution covers relative
+XYZ matrix/TRC semantics, inverse plateaus/gaps, checked plane bindings and explicit program/80-byte
+dispatch allocation. The 100-pair corpus checks 176,120 components against independent f64
+equations and retains native Little CMS references with documented precision/boundary differences.
+See [the contract and evidence](ICC_MATRIX_TRC.md). All affected feature rows remain **Partial**:
+embedded-ICC decoder admission, original/XYB/reference integration, requested ICC outputs, exact
+numeric bypass, LUT/MPE/Lab/CMYK, other intents and HDR/unbounded policies are not completed here.
+
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `API-01` | P1 | **Partial** | One capability query must report exact decode, encode, color, output, precision, memory, workgroup, and platform limits. No versioned aliases or compatibility shims are required; breaking APIs should model current semantics directly. | all feature rows |

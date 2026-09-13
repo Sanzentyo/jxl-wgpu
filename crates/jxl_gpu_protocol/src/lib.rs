@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 mod color;
 pub use color::{Chromaticity, GammaExponent, RgbChromaticities, WhitePointAdaptation};
+pub mod icc;
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

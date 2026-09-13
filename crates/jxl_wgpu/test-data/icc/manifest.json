@@ -1,0 +1,16 @@
+{
+  "oracle": "Little CMS 2.19, relative, NOOPTIMIZE | NOCACHE, unit output",
+  "width": 37, "height": 17,
+  "profiles": [
+    {"name": "srgb", "channels": 3},
+    {"name": "gamma_v2", "channels": 3},
+    {"name": "gamma_v4", "channels": 3},
+    {"name": "threshold", "channels": 3},
+    {"name": "offset", "channels": 3},
+    {"name": "piecewise", "channels": 3},
+    {"name": "affine", "channels": 3},
+    {"name": "sampled", "channels": 3},
+    {"name": "gray", "channels": 1},
+    {"name": "wide", "channels": 3}
+  ]
+}

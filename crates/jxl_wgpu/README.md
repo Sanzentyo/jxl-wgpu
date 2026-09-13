@@ -15,6 +15,12 @@ pixel, coefficient, restoration, color, packing, and display work executes in WG
 operations, layouts, precision contracts, and device limits return typed errors before an output
 is authoritative.
 
+`ResidentIccProgram` and `ResidentIccPipeline` execute relative colorimetric RGB/Gray ICC
+matrix/TRC conversion on resident planar F32 channels. A checked profile retains exact colorants,
+independent curves and original ICC bytes; LUT precedence is never silently bypassed. The
+[ICC execution contract](../../docs/ICC_MATRIX_TRC.md) documents unit-domain semantics, memory
+ownership, native/scalar evidence and remaining decoder integration.
+
 ## Backend creation
 
 Request a device owned by the backend:

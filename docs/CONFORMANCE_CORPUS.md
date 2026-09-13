@@ -3852,3 +3852,23 @@ explain native ICC-calibrated XYB RGB primaries, the original Gamma/DCI black fl
 negative extensions, and independent pre-OETF references for non-invertible original curves.
 ICC/LUT/CMYK, complete original rendering intents, HDR luminance mapping and wide-gamut feature/LF
 cross-products remain incomplete.
+
+## Resident ICC matrix/TRC corpus
+
+`crates/jxl_wgpu/test-data/icc` contains ten exact Little CMS 2.19 profiles and all 100 ordered
+transforms over a 37×17 input. The 176,120 output components retain native values plus independent
+C++ f64 equation references and propagated precision intervals in explicit 28-byte records.
+The corpus covers independent RGB curves, all five parametric functions, sampled u16 curves,
+v2/v4, RGB/Gray and alternate matrices. Guarded actual-GPU buffers verify binding prefixes,
+row/inter-plane padding and tails. Separate semantic tests cover monotone directions, plateau
+endpoints, clipped/gapped parametric inverses, program reuse/cancellation and invalid bindings.
+Irregular 1,001/1,000,003-entry tables additionally verify exact input-coordinate interpolation
+against an independent f64 product, including near-zero and endpoint samples.
+
+175,851 native components also meet their independently propagated native precision bounds.
+56 zero-base offset and 213 negative-inverse components retain documented Little CMS boundary
+differences; every component still passes the narrower independent GPU assertion. No native
+reference is altered to match GPU output. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) and the
+[generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for equations and reproduction.
+This corpus validates the resident converter, not embedded-ICC JPEG XL decoder admission,
+original-domain composition, LUT/MPE/Lab/CMYK or full intent/HDR behaviour.

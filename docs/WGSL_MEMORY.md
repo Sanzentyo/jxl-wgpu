@@ -1299,3 +1299,20 @@ selector and gamma exponent bits in `color.x/y`.
 uses libjxl's ICC-calibrated sRGB primary coordinates; its direct sRGB and Gray paths preserve their
 existing inverse-matrix interpretation. This precision distinction is explicit producer metadata,
 while the generic BT.709 color space retains the standard CIE coordinates.
+
+## Resident ICC matrix/TRC records
+
+The reusable ICC metadata buffer contains an 80-byte header (three F32 matrix rows, source and
+target curve offsets) and one 48-byte record per distinct curve. Each sampled curve appends its
+exact u16 entries as u32 words; offsets are checked u32 word indices. Sample coordinates use an
+exact u32 significand product split into two words before fractional-weight conversion, so large
+tables do not lose their interpolation position to an F32 multiplication. Parametric records preserve
+all seven declared parameters on lowering. The 80-byte dispatch uniform contains extent/channel
+counts, relative input offsets/strides and output offsets/strides at 16-byte intervals.
+
+`ResidentIccMemoryPlan` reports exact program bytes and per-dispatch uniform bytes before upload;
+the caller owns admission and completion lifetime. Three storage bindings and one uniform are
+checked against device limits. Color input/output use distinct buffers and checked planar ranges;
+row/inter-plane padding and non-color channels are outside the dispatched writes. No image-sized
+temporary or host pixel conversion is used. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the
+bounded unit-domain contract and incomplete decoder/session integration.

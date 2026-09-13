@@ -70,6 +70,11 @@ See the [original color corpus](crates/jxl_wgpu_decode/test-data/original_color_
 for the original OETF and XYB calibration contracts. ICC, complete rendering intents and HDR
 luminance mapping remain incomplete.
 
+The common backend now has a bounded [resident ICC matrix/TRC converter](docs/ICC_MATRIX_TRC.md)
+with exact profile metadata, channel-specific curves and RGB/Gray conversion. Its independent
+176,120-component corpus validates GPU execution. Embedded-ICC decoder admission, reference
+composition, LUT/CMYK and full intent/HDR policies remain separate incomplete integration gates.
+
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.
 

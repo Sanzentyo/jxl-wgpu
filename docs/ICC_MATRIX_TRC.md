@@ -1,0 +1,113 @@
+# Resident ICC matrix/TRC conversion
+
+The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gray profiles.
+JPEG XL decoder admission still rejects embedded ICC: integration with original frame domains,
+reference composition, requested output and exact numeric bypass remains the next stage.
+This checkpoint does not change the full JPEG XL support claim.
+
+## Model and supported scope
+
+`jxl_gpu_protocol::icc::IccProfile` owns the original profile bytes in an `Arc<[u8]>` and a checked
+tag directory. Parsing accepts v2 and v4 through 4.4. It checks declared size, header signature,
+version/intent/PCS illuminant fields, reserved bytes, tag count, element ranges, alignment,
+duplicate signatures, partial overlaps and padding. Complete shared tag elements are allowed.
+V4.4 tag elements must be contiguous. Unknown tags remain available without interpretation.
+This validates the structures used for execution; it is not a validator for every private or
+descriptive tag's internal semantics.
+
+Default bounds are 16 MiB per profile, 4,096 tags and 1,048,576 samples per selected curve.
+`IccError` distinguishes malformed structures, resource limits, unsupported methods and undefined
+curve inverses. No source pixels are passed to this crate. A fixed number of metadata endpoint
+evaluations checks the mathematical domain of parametric curves and monotonicity for inversion.
+
+`IccProfile::matrix_trc` selects a direction and explicit intent. Higher-priority DToB/BToD or
+AToB/BToA tags produce a typed unsupported error, including the perceptual-LUT fallback when the
+requested LUT is absent. They are never silently discarded in favour of colorants/TRCs.
+Only media-relative colorimetric intent is executed at this checkpoint. RGB input/display and
+monochrome input/display/output classes with XYZ PCS are supported. Lab, CMYK, other profile
+classes, LUTs, absolute/perceptual/saturation policies and black-point compensation remain open.
+
+Matrix columns retain the exact signed fixed-point values, represented losslessly in host f64.
+Media white and chromatic adaptation retain their original signed integer records. ICC colorants
+are already relative to PCS D50; the resident transform does not apply `chad` a second time or
+approximate the colorants by recognised RGB primaries. Gray scales its one curve by PCS D50 on
+input and uses PCS Y on output. Identical matrices cancel exactly while both curves still run.
+A singular matrix can be used in the forward direction; an inverse request rejects it.
+
+Independent channel curves support identity, u8Fixed8 gamma, sampled u16 curves with linear
+interpolation, and all five ICC parametric functions. Forward evaluation permits sampled curves
+that cannot be inverted; target curves must have a defined monotone inverse. Increasing and
+decreasing sampled curves, interior/final plateaus, parametric branch gaps and clipping are
+explicitly handled. Parametric inversion solves the equation directly; it does not search a
+rounded forward function and invent a numerical plateau near black.
+Parametric target inverses currently require increasing branches, or a single decreasing linear
+branch. Other decreasing parametric combinations return a typed unsupported inverse error.
+
+Sampled interpolation computes the exact product of the input F32 significand and the integer
+interval count with portable u32 arithmetic, then rounds only the fractional weight. This avoids
+losing the interpolation coordinate in large or sharply varying tables. GPU tests include 1,001
+and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpoint guards.
+
+## GPU contract
+
+`ResidentIccMemoryPlan::new` checks capability and program bounds before allocation.
+`ResidentIccProgram::new` uploads immutable, deduplicated curve metadata once.
+`ResidentIccPipeline::encode` records conversion between one or three planar F32 color channels
+in distinct resident storage buffers. Offsets are scalar indices relative to their binding;
+each plane has its own row stride. Alignment, usage, extents, channel counts, storage capacity,
+non-overlapping output ranges, u32 addressing and workgroup counts are checked before dispatch.
+Padding, alpha and extra planes remain outside the color views and are not written.
+
+The caller admits the reported program and dispatch allocations and retains their handles through
+GPU completion, as with the other resident codec primitives. This layer neither submits nor maps
+image buffers. Recorded work can be abandoned; the same program can be reused across frame extents,
+pitches and later submissions. Queue/session integration must keep the existing memory permits
+until the last submitted consumer completes.
+
+Inputs must be finite. ICC device-domain and curve-range values are clamped to [0,1]; matrix
+intermediates preserve signed XYZ-derived values before inverse-curve domain clipping. This is an
+explicit bounded ICC contract, separate from the existing unbounded enumerated SDR conversion.
+No HDR or unbounded ICC behaviour is claimed. Matrix lowering and pixel arithmetic use F32.
+A legal parametric power that exceeds finite F32 evaluation returns `ResidentIccError::Precision`.
+
+## Evidence and precision
+
+The [offline generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) creates ten profiles
+and every ordered source/target pair: 100 transforms, each with 629 pixels, or 176,120 output
+components. It includes v2/v4, independent RGB gammas/tables, all five parametric functions,
+gray, alternate colorants/white, and inputs around transfer boundaries. Every oracle reopens the
+exact serialized profile, including its fixed-point rounding. GPU readback also verifies binding
+prefixes, tails and per-row/inter-plane guards.
+
+Little CMS 2.19 supplies native references. A separate C++ f64 implementation uses Little CMS's
+tag decoder, pivoted matrix elimination and analytical roots/exhaustive sample-segment inversion
+to apply ICC.1:2022. It shares no parser, matrix inversion or GPU binary-search implementation
+with the production code. Every component is checked against this independent reference.
+
+Before the inverse curve, the F32 uncertainty is `4e-7 * (1 + magnitude + coefficient_sum)`, where
+`magnitude = sum(abs(matrix[c] * linear[c]))` and `coefficient_sum = sum(abs(matrix[c]))`.
+The independently evaluated inverse at both ends of this interval, plus `2e-7` output rounding,
+forms the acceptance interval. This expresses steep/flat curve conditioning without pretending
+that a fixed output-code error is meaningful everywhere. In the current corpus the largest
+absolute error is 0.0001 for offset→offset near black, where F32 cannot retain a tiny power added
+to the offset. Other pairwise maxima are below 1.8e-6. These are F32 results, not exact encoded-word
+preservation; original numeric decoder output must retain its existing exact bypass.
+
+175,851 native components also satisfy an independently propagated native precision interval.
+The additional native allowance is `3/65535 * coefficient_sum` in the intermediate domain,
+plus `2/4095` at output for sampled inverse tables (otherwise `2e-7`). It accounts for Little CMS's
+16-bit sampled curves and 4,096-entry reverse approximation. The GPU uses the narrower F32
+interval above. Native values for the other 269 components are retained and marked by cause:
+56 lose the nonzero offset at a zero power base; 213 clamp a negative value before an offset
+inverse to device zero. The scalar/GPU result still has to meet ICC's boundary rules. No marked
+component is excluded from the primary GPU assertion.
+
+Additional GPU tests cover both monotone directions, exact plateau endpoint rules, all parametric
+inverse branches, clipped plateaus/gaps, metadata reuse after abandoned commands, Scalar/Lanes32/
+Tile16x16 dispatches, multiple extents/pitches, exact program limits and invalid bindings.
+The shader is Naga-validated without optional capabilities and its 80-byte uniform is checked
+against the parsed WGSL layout.
+
+The normative references are [ICC.1:2022](https://www.color.org/specification/ICC.1-2022-05.pdf),
+sections 7, 8.10, 10.6, 10.18 and Annex F. The observed native boundaries follow Little CMS 2.19
+[`cmsgamma.c`](https://github.com/mm2/Little-CMS/blob/lcms2.19/src/cmsgamma.c), cases 3 and -2.
