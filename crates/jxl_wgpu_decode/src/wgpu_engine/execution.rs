@@ -604,7 +604,11 @@ pub(super) fn select_parallel_group_layout(
             lanes -= 1;
             continue;
         };
-        let effective_stream_limit = limits.stream_limit.min(stream_budget);
+        // The minimum window limit provides token overlap for segmented streams. A whole
+        // short stream can occupy fewer bytes, so admit its actual plan below that limit.
+        let effective_stream_limit = limits
+            .stream_limit
+            .min(stream_budget.max(MIN_STREAM_WINDOW_BYTES));
         if effective_stream_limit < MIN_STREAM_WINDOW_BYTES {
             lanes -= 1;
             continue;

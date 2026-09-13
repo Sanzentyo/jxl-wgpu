@@ -784,9 +784,9 @@ fn validate_non_overlapping_planes(
                     .ok_or(ModularSqueezeError::ArithmeticOverflow {
                         field: "plane overlap range",
                     })?;
-            if u64::from(first.offset_words) < second_end
-                && u64::from(second.offset_words) < first_end
-            {
+            // Half-open ranges overlap only when their intersection contains a word.
+            // An empty residual may point inside a live allocation without aliasing it.
+            if u64::from(first.offset_words.max(second.offset_words)) < first_end.min(second_end) {
                 return Err(ModularSqueezeError::PlaneOverlap {
                     first: first_name,
                     second: second_name,
@@ -1161,6 +1161,43 @@ mod tests {
                 second: "residual",
             }
         );
+    }
+
+    #[test]
+    fn empty_residual_offsets_do_not_alias_live_average_or_output_words() {
+        for direction in [
+            ModularSqueezeDirection::Horizontal,
+            ModularSqueezeDirection::Vertical,
+        ] {
+            let (width, height, residual_width, residual_height) = match direction {
+                ModularSqueezeDirection::Horizontal => (1, 7, 0, 7),
+                ModularSqueezeDirection::Vertical => (7, 1, 7, 0),
+            };
+            for offset in [0, 1, 6, 7, 9, 13, 14] {
+                let mut params = ModularSqueezeParams::new(
+                    direction,
+                    ModularSqueezePlane::tight(width, height),
+                    ModularSqueezePlane {
+                        offset_words: offset,
+                        ..ModularSqueezePlane::tight(residual_width, residual_height)
+                    },
+                    ModularSqueezePlane {
+                        offset_words: 7,
+                        ..ModularSqueezePlane::tight(width, height)
+                    },
+                );
+                validate_params(params).unwrap();
+                validate_non_overlapping_planes(params).unwrap();
+                params.output[3] = 6;
+                assert_eq!(
+                    validate_non_overlapping_planes(params).unwrap_err(),
+                    ModularSqueezeError::PlaneOverlap {
+                        first: "average",
+                        second: "output"
+                    }
+                );
+            }
+        }
     }
 
     #[test]

@@ -35,6 +35,14 @@ fn component_expansion_is_fully_admitted_and_survives_retry_and_cancellation() {
         "resampling_8",
         "global_prefix",
         "lf_extras",
+        "rct_41",
+        "squeeze_thin_000_1x1",
+        "squeeze_thin_000_1x19",
+        "squeeze_sampling_123",
+        "palette_groups_0",
+        "squeeze_lf",
+        "squeeze_extras",
+        "restored_palette_squeeze",
     ] {
         let (bytes, expected) = reference(name);
         let decoder = GpuDecoder::new(
@@ -46,7 +54,7 @@ fn component_expansion_is_fully_admitted_and_survives_retry_and_cancellation() {
         if name == "global_prefix" {
             assert_eq!(stats.global_reconstruction_sample_words, 129 * 10);
         }
-        if name == "lf_extras" {
+        if matches!(name, "lf_extras" | "squeeze_lf") {
             assert_eq!(stats.global_reconstruction_sample_words, 0);
             // A 128-pixel group has a 1024-pixel LF span; width 2051 crosses two boundaries.
             assert_eq!(stats.low_frequency_group_stream_count, 3);
@@ -72,7 +80,9 @@ fn component_expansion_is_fully_admitted_and_survives_retry_and_cancellation() {
             WgpuSubmissionEngine::with_memory_budget(backend.clone(), budget.clone())
                 .with_stream_window_limit(NonZeroU64::new(40).unwrap()),
         );
-        let mut session = decoder.open(&bytes, color_request()).unwrap();
+        let mut session = decoder
+            .open(&bytes, color_request())
+            .unwrap_or_else(|error| panic!("{name}: {error:?}; memory: {stats:?}"));
         let blocker = budget.try_reserve(1).unwrap();
         let pressure = session.prefetch(NonZeroUsize::new(1).unwrap()).unwrap();
         assert_eq!(pressure.submitted, 0);

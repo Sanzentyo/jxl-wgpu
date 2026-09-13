@@ -3652,3 +3652,35 @@ Production Rust/WGSL, integration tests and fixture data match the fully tested 
 The audit of 330 Rust files found no ad hoc module paths or unjustified unused-code suppression;
 the five existing, documented Wasm-only dead-code expectations remain unchanged. Dependency
 manifests and the lockfile are unchanged.
+
+## Modular YCbCr transform combinations (2026-09-13)
+
+The Modular YCbCr corpus now contains 244 original streams: the preceding 100 plus 144 native
+RCT/Palette/Squeeze cases. All 42 RCT identifiers and all 64 selector triples with default
+Squeeze are represented. Explicit append/in-place Squeeze, component and three-channel palettes,
+ordered transform stacks, transformed residuals, independent extras, all group dimensions,
+three LF groups, progressive passes and restoration cover the frame-level transform boundary.
+Each new stream carries an independently generated channel-topology sidecar; Rust compares the
+complete ordered geometry and shifts, meta-channel count, transform declarations and inverse
+Squeeze count before accepting the full decode profile. The corpus README documents the
+positive-only native binary32 Squeeze fixture and the remaining per-group transform coverage.
+
+This exposed two empty-residual bugs. Default Squeeze now retains both chroma residual stages
+on one-pixel axes, preserving their channel positions and shifts. GPU plane validation accepts
+empty half-open ranges inside a live allocation while continuing to reject actual overlap.
+Separate kernel checks exercise both axes and offsets within and at the ends of live planes.
+
+Nineteen direct-render admission cases now include transforms and empty residuals. A 1×1 stream
+also exposed an admission mismatch: its 12-byte whole-stream allocation was rejected because
+the planner treated the 40-byte segmented-stream limit as a minimum allocation. Selection now
+checks actual planned bytes. Empty, short, unaligned and segmented stream tests admit the exact
+budget and reject a one-byte shortfall. GPU retry, retained-output ownership and cancellation
+exercise the same accounting, including transformed LF groups and filtered components.
+
+All 244 original streams decode natively, and GPU color and selected numeric/extra output agree
+within maxAE 2e-6. Whole and bounded fragmented execution remain bit-identical. The seventh
+independently expanded restoration equivalent adds Palette/Squeeze; native libjxl and jxl-oxide
+agree before its reference is used. Fifteen native prefix snapshots cover five two-pass cases,
+with immutable GPU updates and exact convergence to final-only output. No production pixel
+codec fallback, module path override or unused-code suppression is introduced. Broader
+per-group transforms, frame features and mixed-frame conformance remain part of the active goal.

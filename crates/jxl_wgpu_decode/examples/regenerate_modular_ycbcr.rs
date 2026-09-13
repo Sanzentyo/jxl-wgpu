@@ -22,6 +22,10 @@ fn main() {
                 .iter()
                 .filter(|case| case.gaborish || case.epf_iterations != 0)
                 .count()
+            + cases
+                .iter()
+                .filter(|case| !case.transforms.is_empty())
+                .count()
     );
     for case in cases {
         let bytes = std::fs::read(temporary.join(format!("{}.jxl", case.name))).unwrap();
@@ -30,6 +34,13 @@ fn main() {
             .codestream_inventory(Default::default())
             .unwrap();
         case.validate(&info);
+        if !case.transforms.is_empty() {
+            let name = format!("{}.topology", case.name);
+            let native = std::fs::read_to_string(temporary.join(&name)).unwrap();
+            let topology = modular_ycbcr::NativeTopology::parse(&native);
+            assert_eq!(topology.transform_count, case.transforms.len());
+            std::fs::write(output.join(name), native).unwrap();
+        }
         if case.passes > 1 {
             let mut snapshots = Vec::new();
             for completed in 0..=case.passes {

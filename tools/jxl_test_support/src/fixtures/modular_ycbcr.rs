@@ -5,6 +5,9 @@ use jxl_gpu_bitstream::{
     GaborishInventory, RestorationFilterInventory, SampleBitDepth,
 };
 
+mod transforms;
+pub use transforms::{NativeTopology, Squeeze, Transform};
+
 #[derive(Clone, Debug)]
 pub struct Case {
     pub name: String,
@@ -22,6 +25,7 @@ pub struct Case {
     pub passes: u32,
     /// First published boundary when progressive output is requested; empty leading passes vanish.
     pub first_output_pass: u32,
+    pub transforms: Vec<Transform>,
 }
 
 impl Case {
@@ -43,6 +47,7 @@ impl Case {
             group_size_shift: 1,
             passes: 1,
             first_output_pass: 0,
+            transforms: Vec::new(),
         }
     }
 
@@ -220,5 +225,6 @@ pub fn cases() -> Vec<Case> {
     };
     lf.extra_factors = vec![8, 8];
     cases.push(lf);
+    transforms::extend(&mut cases);
     cases
 }

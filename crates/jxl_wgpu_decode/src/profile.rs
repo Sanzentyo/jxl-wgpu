@@ -33,6 +33,9 @@ use crate::{
 
 const MIN_GROUP_DIMENSION: u32 = 128;
 
+#[cfg(test)]
+mod ycbcr_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModularGroup {
     pub token_bit_offset: u64,

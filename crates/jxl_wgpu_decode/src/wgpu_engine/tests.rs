@@ -300,6 +300,54 @@ fn adaptive_stream_layout_coalesces_or_trades_lanes_for_the_byte_budget() {
 }
 
 #[test]
+fn adaptive_stream_layout_admits_actual_short_stream_bytes_at_the_exact_budget() {
+    for start in 0..8 {
+        for bits in [0, 1, 8, 31, 32, 33, 56, 64, 65, 287, 288, 289, 8000] {
+            let groups = [ModularGroup {
+                token_bit_offset: start,
+                token_bit_end: start + bits,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                stream_index: 0,
+            }];
+            let codestream_bytes = (start + bits).div_ceil(8);
+            let stream_bytes =
+                plan_group_streams(codestream_bytes, &groups, MIN_STREAM_WINDOW_BYTES, 1)
+                    .unwrap()
+                    .stream_bytes();
+            let limits = ParallelGroupLimits {
+                stream_limit: MIN_STREAM_WINDOW_BYTES,
+                lane_cap: 1,
+                lane_stride: 160,
+                fixed_bytes: 1024,
+                per_frame_target: 1024 + 160 + stream_bytes,
+            };
+            let selected = select_parallel_group_layout(codestream_bytes, &groups, limits)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("start {start}, bits {bits}, stream bytes {stream_bytes}")
+                });
+            assert_eq!(selected.lanes, 1);
+            assert_eq!(selected.streams.stream_bytes(), stream_bytes);
+            assert!(
+                select_parallel_group_layout(
+                    codestream_bytes,
+                    &groups,
+                    ParallelGroupLimits {
+                        per_frame_target: limits.per_frame_target - 1,
+                        ..limits
+                    },
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn aligned_output_requires_word_isolated_plane_rows_and_internal_group_edges() {
     let extent = Extent2d::new(516, 3);
     let groups = [

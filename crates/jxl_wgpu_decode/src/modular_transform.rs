@@ -1124,15 +1124,13 @@ fn default_squeeze_parameters(
                 .map_err(|_| ModularTransformError::GpuAddressSpaceOverflow)?,
             channel_count: 2,
         };
-        if width > 1 {
-            parameters.push(chroma);
-        }
-        if height > 1 {
-            parameters.push(ModularSqueezeParameter {
-                horizontal: false,
-                ..chroma
-            });
-        }
+        // One-pixel axes still create empty residuals and advance the component shifts.
+        // Their channel positions remain part of entropy references and pass ownership.
+        parameters.push(chroma);
+        parameters.push(ModularSqueezeParameter {
+            horizontal: false,
+            ..chroma
+        });
     }
 
     let all_data = ModularSqueezeParameter {
