@@ -468,7 +468,7 @@ encodings and HDR luminance mapping remain separate roadmap gates.
 Image admission uses the validated inventory's color, depth, and alpha semantics rather than
 reparsing a fixed header bit pattern. Enumerated D65 SDR Gray/RGB, integer extras,
 all orientations, intrinsic-size hints, and named channel declarations can use the supported
-reconstruction path. Unsupported ICC/color and Modular restoration remain
+reconstruction path. Unsupported ICC color conversion and Modular restoration remain
 rejected. Unknown image,
 frame, and restoration extension selectors are typed inventory errors before any GPU work.
 Twenty-three checked-in libjxl fixtures compare exact native samples with their deterministic
@@ -604,7 +604,7 @@ streams in pass/group order, all use the same bounded-window executor and aggreg
 one global inverse/finalizer runs after assembly. One through eleven passes produce a complete final
 image; optional intermediate images run the same inverse/finalizer on independent arena copies.
 The low-level Modular producer requires patches and splines to be handled by the common frame
-executor. ICC and HDR original profiles remain typed unsupported profiles.
+executor. Color reconstruction for ICC and HDR original profiles remains typed unsupported.
 The public `GpuDecoder::wgpu` constructs `WgpuDecodeEngine`, inventories
 the standard stream once, and selects a producer for each physical frame from
 `FrameEncoding`. Callers do not choose or probe a coding mode. Both child engines retain their
@@ -614,7 +614,7 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 Both decoders accept standard or custom RGB chromaticities with D65/E/DCI/custom white points,
 Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. Non-D65 white points currently
-require relative rendering intent; ICC and HDR remain typed unsupported profiles. XYB inverse
+require relative rendering intent; ICC and HDR color reconstruction remain typed unsupported. XYB inverse
 matrices carry their linear RGB chromaticities explicitly. Original RGB/YCbCr and post-transform
 references preserve the original transfer; unreferenced XYB can retain linear original RGB.
 `GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
@@ -627,6 +627,14 @@ encoding; explicit sRGB output converts to sRGB. Native depth conversion and non
 VarDCT bit packings use the common surface and final quantizer.
 Color metadata alone does not introduce F32 conversion for native or numeric Modular output;
 unfiltered samples retain exact source words, including integer precision above 24 bits.
+
+Embedded ICC inputs support unfiltered original Modular scalar color samples and independently
+selected Modular/VarDCT extra channels in the supported single-frame paths. Numeric outputs keep
+`ColorSpecification::Undefined`; no ICC transform is needed to return their original sample domain.
+The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB/Gray and
+original/XYB input, both common and standalone engines, complete/fragmented transport, exact
+17/31-bit integers and widened IEEE-754 words. ICC color reconstruction, reference composition
+and requested ICC output remain typed unsupported.
 
 `tests/original_color` covers 228 streams with independent native references: integer/F32, gray/RGBA,
 RGB/XYB/YCbCr, cropped/hidden frames, all five blend modes and overwritten references. Whole and
@@ -899,9 +907,9 @@ single aggregate LF status map. Separate `decode_vardct_lf` and `decode_vardct_h
 preserve resident LF reconstruction across that boundary. The stock runtime-neutral pending-frame
 state machine owns every LF submission, both aggregate status maps, and the initial plus dynamically
 admitted metadata reservations. It is actual-GPU tested with ordinary multi-LF-group `cjxl` output
-through blocking and async completion. The image header
-must declare the standard sRGB/D65
-RGB or grayscale presentation encoding, with supported extra channels and no ICC profile.
+through blocking and async completion. The image header must provide consistent color-channel
+metadata and supported extra channels. Selected extras do not require ICC execution; color output
+requires the supported enumerated profiles described above.
 It receives one selected image inventory. Cropped/blended animations and layered stills enter through the frame
 executor above; the low-level standalone VarDCT entry point remains an uncropped still API.
 

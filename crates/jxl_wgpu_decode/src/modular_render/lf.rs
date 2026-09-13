@@ -7,8 +7,8 @@ use jxl_wgpu::{
 };
 
 use super::color::{
-    ModularColorConfig, ReconstructionBuffers, ReconstructionInputs, ReconstructionPipeline,
-    ReconstructionPlan,
+    ModularReconstructionConfig, ReconstructionBuffers, ReconstructionInputs,
+    ReconstructionPipeline, ReconstructionPlan,
 };
 use super::{ModularOutputPlane, Result, invalid, require, upsample_kernel};
 use crate::progressive_dc::ProgressiveDcXybPlanes;
@@ -27,7 +27,7 @@ pub(crate) struct ModularLfPlan {
 
 impl ModularLfPlan {
     pub(crate) fn new(
-        config: ModularColorConfig,
+        config: ModularReconstructionConfig,
         sources: &[ModularOutputPlane],
         resampling: &[crate::frame_resampling::ChannelResampling],
         weights: &UpsamplingWeightsInventory,

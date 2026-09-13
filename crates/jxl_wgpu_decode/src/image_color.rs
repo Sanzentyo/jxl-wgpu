@@ -9,6 +9,26 @@ use jxl_gpu_protocol::{
     TransferFunction, WhitePointAdaptation,
 };
 
+/// Check the declaration's channel meaning independently of the requested color conversion.
+/// Numeric original samples do not require a supported transfer function, matrix, or ICC LUT.
+pub(crate) fn validate_declaration(
+    image: &ImageHeaderInventory,
+) -> Result<(), crate::UnsupportedProfile> {
+    let (colour_space, has_icc) = match image.colour_encoding {
+        ColourEncodingInventory::Enumerated { colour_space, .. } => (colour_space, false),
+        ColourEncodingInventory::IccProfile { colour_space } => (colour_space, true),
+    };
+    if has_icc != image.embedded_icc.is_some()
+        || image.grayscale != (colour_space == ColourSpaceInventory::Grey)
+    {
+        return Err(crate::UnsupportedProfile::new(
+            crate::UnsupportedCodestreamFeature::ColorEncoding,
+            "image color declaration disagrees with its channels or embedded ICC metadata",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn original_encoding(image: &ImageHeaderInventory) -> Option<RgbColorEncoding> {
     if image.embedded_icc.is_some() {
         return None;

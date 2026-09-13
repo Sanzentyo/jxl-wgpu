@@ -16,8 +16,8 @@ use crate::modular_transform::GpuModularChannelLayout;
 
 mod color;
 mod lf;
-pub(crate) use color::ModularColorConfig;
 pub(crate) use color::ReconstructionPipeline as ModularReconstructionPipeline;
+pub(crate) use color::{ModularColorConfig, ModularReconstructionConfig};
 pub(crate) use lf::{ModularLfBuffers, ModularLfPipelines, ModularLfPlan};
 
 /// Interpretation of resident Modular output words after inverse transforms or resampling.

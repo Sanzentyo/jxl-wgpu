@@ -1,8 +1,11 @@
 # Resident ICC matrix/TRC conversion
 
 The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gray profiles.
-JPEG XL decoder admission still rejects embedded ICC: integration with original frame domains,
-reference composition, requested output and exact numeric bypass remains the next stage.
+JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
+independent extra-channel output in the supported single-frame paths through both codecs. Codec
+reconstruction and LF configuration are independent of color conversion. Integration with original
+color surfaces, reference composition and requested color output remains open; these paths continue
+to reject embedded ICC before submission.
 This checkpoint does not change the full JPEG XL support claim.
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
@@ -13,6 +16,13 @@ reconstruction. `ColorModel::Gray` describes gray X with optional alpha W, with 
 planar/interleaved classification. ICC RGB/Gray/XYZ signatures must match their pixel color model;
 an ICC profile cannot relabel numeric or YCbCr storage. Enumerated packers/display currently reject
 unexecuted ICC targets and gray color outputs. These descriptors do not claim decoder integration.
+
+The [embedded numeric corpus](../crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
+adds eight native RGB/Gray original/XYB streams and metadata-only substitutions into existing wide
+integer and IEEE-754 fixtures. It checks exact sample storage, complete/fragmented input, both
+standalone producers and the common decoder, and byte-budget release. It does not use an ICC
+profile-to-itself conversion for passthrough: such a conversion would evaluate curves and lose
+out-of-range values or original bit patterns.
 
 ## Model and supported scope
 

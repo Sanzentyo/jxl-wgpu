@@ -3814,7 +3814,7 @@ and independently decoded by libjxl before reference storage. There are 332 fixt
 | Requested output | Linear BT.709 F32, sRGB8, original RGBA12, selected original color F32 and independent alpha F32 for every case |
 | Exact native samples | 27 color-metadata variants of existing integer fixtures preserve byte-identical physical frames and exact 17/31-bit RGB and 5/24/31-bit alpha through native RGB and scalar selection, with whole and bounded fragmented input |
 | Colorimetry | Independent f64 primary matrices from CIE xy and a common D65; fixed source-error intervals propagated through signed matrices and piecewise transfer functions |
-| Metadata rejection | ICC, PQ/HLG/unknown transfers, singular RGB/white geometry, invalid gamma, non-relative non-D65 profiles and inconsistent Gray/RGB inventories are rejected by shared admission |
+| Color-output rejection | ICC, PQ/HLG/unknown transfers, singular RGB/white geometry, invalid gamma, non-relative non-D65 profiles and inconsistent Gray/RGB inventories are rejected by shared color-output admission |
 
 Source reconstruction uses normalized error `1e-5` for original Modular and `1/1024` for
 XYB/VarDCT; alpha is checked separately at `2e-6`. Conversion adds `5e-6*(1+abs(reference))` and one
@@ -3892,7 +3892,37 @@ are untouched. Metadata tests cover directional tag precedence, intent/geometry 
 shared profile bytes/tag directories, explicit Gray/alpha classification, and incompatible
 ICC device-space rejection before layout creation. Enumerated packers reject unexecuted ICC targets.
 
-This stage prepares decoder integration. Embedded ICC admission, original/XYB/reference execution,
+This stage prepares decoder integration. Embedded ICC color admission, original/XYB/reference execution,
 requested ICC packing/display, and per-image program/budget ownership are still incomplete.
 See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the execution contract and
 [the generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for reproducibility.
+
+## Embedded ICC numeric samples and independent extra channels
+
+`crates/jxl_wgpu_decode/test-data/embedded_icc` adds eight native 17×9 containers, two exact ICC
+profiles and two binary32 input references. libjxl 0.12.0 and Little CMS 2.19 generate RGB with
+independent gamma exponents and Gray with a sampled curve, each through Modular/VarDCT and
+original/XYB encoding. Every stream retains its exact embedded ICC declaration and independent
+binary32 alpha. All 12 files reproduce byte-for-byte; the existing corpus files are unchanged.
+The [generator notes](../crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
+give the native build, deterministic profile metadata and reference limitations.
+
+`tests/embedded_icc` checks scalar alpha for all eight streams through the common decoder and
+both standalone codec engines. Unfiltered original Modular RGB/Gray scalar color planes also
+match every input bit. Complete input and 43-byte transport fragments with 256-byte entropy
+windows return identical bytes, retain undefined numeric color metadata, and release all shared
+budget reservations.
+
+A further seven cases replace only the color declaration of established 17/31-bit RGB and
+5/16/24/32-bit floating Gray fixtures with native ICC metadata. Tests unwrap containers before
+using codestream bit offsets, compare all remaining image metadata and require byte-identical
+physical-frame entropy. Native integer color and independent alpha depths, plus widened
+IEEE-754 words including signed zero, subnormals and nonfinite values, remain exact. No existing
+fixture or expected word is changed.
+
+All eight native color-output requests still return typed `UnsupportedProfile(ColorEncoding)`
+without leaking reservations. This checkpoint separates codec reconstruction from color conversion;
+it does not establish ICC color reconstruction, composition, requested ICC packing, or full
+JPEG XL conformance. Native default output is a verified raw-word oracle only for the original
+lossless Modular cases. Explicit native ICC requests and profile labels alone are insufficient
+as color-conversion references, as documented by the generator.

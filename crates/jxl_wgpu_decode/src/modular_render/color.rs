@@ -22,56 +22,41 @@ use crate::color_output::{
 use crate::jpeg_sampling::{JpegComponentShift, component_shifts};
 
 #[derive(Clone, Debug, PartialEq)]
-enum ModularColorTransform {
-    Rgb(RgbColorEncoding),
-    Xyb {
-        lf: [f32; 3],
-        inverse: InverseOpsin,
-    },
-    Ycbcr {
-        shifts: [JpegComponentShift; 3],
-        encoding: RgbColorEncoding,
-    },
+enum ModularComponents {
+    Original,
+    Xyb { lf: [f32; 3] },
+    Ycbcr { shifts: [JpegComponentShift; 3] },
 }
 
-impl ModularColorTransform {
+impl ModularComponents {
     fn shifts(&self) -> [JpegComponentShift; 3] {
         match self {
             Self::Ycbcr { shifts, .. } => *shifts,
-            Self::Rgb(_) | Self::Xyb { .. } => [JpegComponentShift::default(); 3],
-        }
-    }
-
-    fn output(&self) -> ColorOutputTransform {
-        match self {
-            Self::Rgb(encoding) => ColorOutputTransform::Rgb(*encoding),
-            Self::Xyb { inverse, .. } => ColorOutputTransform::Xyb(*inverse),
-            Self::Ycbcr { encoding, .. } => ColorOutputTransform::Ycbcr {
-                channel_shifts: [JpegComponentShift::default(); 3],
-                encoding: *encoding,
-            },
+            Self::Original | Self::Xyb { .. } => [JpegComponentShift::default(); 3],
         }
     }
 }
 
+/// Codec reconstruction is independent of the interpretation or convertibility of its samples.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ModularColorConfig {
-    encoded_output: bool,
-    original_encoding: RgbColorEncoding,
+pub(crate) struct ModularReconstructionConfig {
     noise: Option<jxl_wgpu::ResidentNoiseParameters>,
-    transform: ModularColorTransform,
+    components: ModularComponents,
     gaborish: Option<ResidentGaborishWeights>,
     epf: Vec<ResidentEpfParameters>,
     inverse_sigma: f32,
 }
 
-impl ModularColorConfig {
+impl ModularReconstructionConfig {
     pub(crate) fn new(
         image: &ImageHeaderInventory,
         frame: &FrameInventory,
         lf: [f32; 3],
         noise: Option<crate::NoiseModel>,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Self> {
+        if image.xyb_encoded && image.opsin_inverse_matrix.is_none() {
+            return invalid("XYB inverse opsin metadata is missing");
+        }
         let (gaborish, epf) = crate::restoration::restoration_config(frame.restoration_filter)?;
         let sigma = match frame.restoration_filter {
             RestorationFilterInventory::Custom {
@@ -86,50 +71,29 @@ impl ModularColorConfig {
         if epf.is_some() && sigma < 1e-8 {
             return Err(crate::RestorationError::InvalidModularSigma { value: sigma }.into());
         }
-        let original =
-            crate::image_color::original_encoding(image).ok_or(ModularRenderError::Invalid {
-                reason: "unsupported original image color encoding",
-            })?;
-        let transform = if image.xyb_encoded {
-            ModularColorTransform::Xyb {
+        let components = if image.xyb_encoded {
+            ModularComponents::Xyb {
                 lf: lf.map(|value| value / 128.0),
-                inverse: InverseOpsin::from_image(image).ok_or(ModularRenderError::Invalid {
-                    reason: "XYB inverse opsin metadata is missing",
-                })?,
             }
         } else if frame.do_ycbcr {
-            ModularColorTransform::Ycbcr {
+            ModularComponents::Ycbcr {
                 shifts: component_shifts(frame.jpeg_upsampling),
-                encoding: original,
             }
         } else {
-            ModularColorTransform::Rgb(original)
+            ModularComponents::Original
         };
         let noise = noise.and_then(|noise| noise.parameters(frame, [0.0, 1.0]));
-        Ok(
-            (transform != ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709)
-                || gaborish.is_some()
-                || epf.is_some()
-                || noise.is_some())
-            .then(|| Self {
-                encoded_output: false,
-                original_encoding: original,
-                noise,
-                transform,
-                gaborish,
-                epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
-                inverse_sigma: -1.171_572_9 / sigma,
-            }),
-        )
+        Ok(Self {
+            noise,
+            components,
+            gaborish,
+            epf: epf.map_or_else(Vec::new, |epf| epf.passes()),
+            inverse_sigma: -1.171_572_9 / sigma,
+        })
     }
 
-    pub(crate) fn for_encoded_output(mut self) -> Self {
-        self.encoded_output = true;
-        self
-    }
-
-    pub(crate) fn is_plain_rgb(&self) -> bool {
-        matches!(self.transform, ModularColorTransform::Rgb(_))
+    pub(crate) fn is_original_passthrough(&self) -> bool {
+        matches!(self.components, ModularComponents::Original)
             && self.gaborish.is_none()
             && self.epf.is_empty()
             && self.noise.is_none()
@@ -143,6 +107,58 @@ impl ModularColorConfig {
         self.noise = None;
         self
     }
+
+    /// Resolve color conversion only after the request has selected a color-bearing output.
+    pub(crate) fn color_output(
+        self,
+        image: &ImageHeaderInventory,
+        request: &crate::GpuOutputRequest,
+    ) -> crate::Result<ModularColorConfig> {
+        let encoded = request.retains_frame_surface()
+            && request.frame_surface_encoding()
+                == crate::frame_surface::FrameSurfaceEncoding::Encoded;
+        let (transform, linear_black_threshold) = if encoded {
+            (
+                ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709),
+                None,
+            )
+        } else {
+            let original = crate::image_color::require_original_encoding(image)?;
+            let transform = match self.components {
+                ModularComponents::Original => ColorOutputTransform::Rgb(original),
+                ModularComponents::Xyb { .. } => ColorOutputTransform::Xyb(
+                    InverseOpsin::from_image(image).ok_or(ModularRenderError::Invalid {
+                        reason: "XYB inverse opsin metadata is missing",
+                    })?,
+                ),
+                ModularComponents::Ycbcr { .. } => ColorOutputTransform::Ycbcr {
+                    channel_shifts: [JpegComponentShift::default(); 3],
+                    encoding: original,
+                },
+            };
+            let threshold = matches!(self.components, ModularComponents::Xyb { .. })
+                .then(|| {
+                    crate::image_color::reconstruction_black_threshold(
+                        original,
+                        &request.format().color_spec,
+                    )
+                })
+                .flatten();
+            (transform, threshold)
+        };
+        Ok(ModularColorConfig {
+            reconstruction: self,
+            transform,
+            linear_black_threshold,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModularColorConfig {
+    reconstruction: ModularReconstructionConfig,
+    transform: ColorOutputTransform,
+    linear_black_threshold: Option<f32>,
 }
 
 #[repr(C, align(16))]
@@ -184,27 +200,15 @@ impl ColorPlan {
             return invalid("Modular color reconstruction requires equal color grids");
         }
         let output_config = ColorOutputConfig {
-            linear_black_threshold: if !config.encoded_output
-                && matches!(config.transform, ModularColorTransform::Xyb { .. })
-            {
-                crate::image_color::reconstruction_black_threshold(
-                    config.original_encoding,
-                    &target,
-                )
-            } else {
-                None
-            },
+            linear_black_threshold: config.linear_black_threshold,
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             extent,
             orientation: OutputOrientation::Identity,
-            transform: if config.encoded_output {
-                ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709)
-            } else {
-                config.transform.output()
-            },
+            transform: config.transform,
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
         };
-        let reconstruction = ReconstructionPlan::new(config, extent, sources, factors[0], limits)?;
+        let reconstruction =
+            ReconstructionPlan::new(config.reconstruction, extent, sources, factors[0], limits)?;
         let format = PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, target);
         let packed = ImageLayout::packed(extent, format.clone())?;
         let layouts = packed
@@ -238,7 +242,7 @@ impl ColorPlan {
 #[derive(Debug)]
 pub(crate) struct ReconstructionPlan {
     noise: Option<jxl_wgpu::ResidentNoisePlan>,
-    config: ModularColorConfig,
+    config: ModularReconstructionConfig,
     coded_extent: Extent2d,
     source_extents: [Extent2d; 3],
     pub(super) output_extent: Extent2d,
@@ -252,7 +256,7 @@ pub(crate) struct ReconstructionPlan {
 
 impl ReconstructionPlan {
     pub(super) fn new(
-        config: ModularColorConfig,
+        config: ModularReconstructionConfig,
         extent: Extent2d,
         sources: &[ModularOutputPlane],
         factor: u32,
@@ -271,7 +275,7 @@ impl ReconstructionPlan {
             extent.width.div_ceil(factor),
             extent.height.div_ceil(factor),
         );
-        let shifts = config.transform.shifts();
+        let shifts = config.components.shifts();
         if shifts
             .iter()
             .any(|shift| shift.horizontal > 1 || shift.vertical > 1)
@@ -415,7 +419,7 @@ impl ReconstructionPlan {
             normalized: self
                 .normalized_bytes
                 .map(|bytes| create_plane("jxl-wgpu Modular decoded color", bytes)),
-            expanded: self.config.transform.shifts().map(|shift| {
+            expanded: self.config.components.shifts().map(|shift| {
                 shift.is_subsampled().then(|| {
                     create_plane(
                         "jxl-wgpu Modular expanded JPEG component",
@@ -617,12 +621,12 @@ impl ReconstructionPipeline {
                 sources[1].encoding.packed(),
                 sources[2].encoding.packed(),
                 u32::from(matches!(
-                    plan.config.transform,
-                    ModularColorTransform::Xyb { .. }
+                    plan.config.components,
+                    ModularComponents::Xyb { .. }
                 )),
             ],
-            multipliers: match plan.config.transform {
-                ModularColorTransform::Xyb { lf, .. } => [lf[0], lf[1], lf[2], 0.0],
+            multipliers: match plan.config.components {
+                ModularComponents::Xyb { lf } => [lf[0], lf[1], lf[2], 0.0],
                 _ => [0.0; 4],
             },
         };
@@ -662,7 +666,7 @@ impl ReconstructionPipeline {
             );
         }
         let mut uniforms = vec![uniform];
-        for (index, shift) in plan.config.transform.shifts().into_iter().enumerate() {
+        for (index, shift) in plan.config.components.shifts().into_iter().enumerate() {
             if !shift.is_subsampled() {
                 continue;
             }
@@ -836,11 +840,9 @@ mod tests {
             );
             for gaborish in [false, true] {
                 for iterations in 0..=3 {
-                    let config = ModularColorConfig {
-                        original_encoding: RgbColorEncoding::SRGB_BT709,
-                        encoded_output: false,
+                    let config = ModularReconstructionConfig {
                         noise: None,
-                        transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+                        components: ModularComponents::Original,
                         gaborish: gaborish.then_some(ResidentGaborishWeights::DEFAULT),
                         epf: if iterations == 0 {
                             Vec::new()
@@ -922,11 +924,9 @@ mod tests {
                 )
             })
             .collect();
-        let config = ModularColorConfig {
-            original_encoding: RgbColorEncoding::SRGB_BT709,
-            encoded_output: false,
+        let reconstruction = ModularReconstructionConfig {
             noise: None,
-            transform: ModularColorTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+            components: ModularComponents::Original,
             gaborish: Some(ResidentGaborishWeights::DEFAULT),
             epf: crate::restoration::restoration_config(RestorationFilterInventory::Default)
                 .unwrap()
@@ -934,6 +934,11 @@ mod tests {
                 .unwrap()
                 .passes(),
             inverse_sigma: -1.171_572_9,
+        };
+        let config = ModularColorConfig {
+            reconstruction,
+            transform: ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+            linear_black_threshold: None,
         };
         let limits = wgpu::Limits::default();
         let target = crate::vardct_rgb8_format().color_spec;

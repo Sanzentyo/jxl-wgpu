@@ -276,7 +276,7 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_standard_modular_profile(&codestream, inventory)?;
-        self.open_profile(codestream, request, profile)
+        self.open_profile(codestream, request, profile, &inventory.image_header)
     }
 
     pub(crate) fn open_progressive_dc_with_inventory_data(
@@ -303,7 +303,12 @@ impl WgpuSubmissionEngine {
         } else {
             internal_request
         };
-        self.open_profile(codestream, &internal_request, profile)
+        self.open_profile(
+            codestream,
+            &internal_request,
+            profile,
+            &inventory.image_header,
+        )
     }
 
     pub(crate) fn open_frame_with_inventory_data(
@@ -313,7 +318,7 @@ impl WgpuSubmissionEngine {
         inventory: &CodestreamInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
         let profile = parse_modular_frame_profile(&codestream, inventory)?;
-        self.open_profile(codestream, request, profile)
+        self.open_profile(codestream, request, profile, &inventory.image_header)
     }
 
     fn open_profile(
@@ -321,7 +326,11 @@ impl WgpuSubmissionEngine {
         codestream: Arc<GpuCodestream>,
         request: &GpuOutputRequest,
         mut profile: StandardModularProfile,
+        image: &jxl_gpu_bitstream::ImageHeaderInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
+        if profile.progressive_dc.is_none() && request.mapping() == crate::GpuOutputMapping::Color {
+            crate::image_color::require_original_encoding(image)?;
+        }
         if !request.progressive_output() {
             profile.intermediate_passes.clear();
         }
@@ -480,25 +489,21 @@ impl WgpuSubmissionEngine {
                 }
             })
             .collect();
-        let color_render = request
-            .extra_channel()
-            .is_none()
-            .then_some(profile.color_render.clone())
-            .flatten()
-            .filter(|config| !request.uses_original_sample_domain() || !config.is_plain_rgb());
-        let color_render = if request.retains_frame_surface()
+        let reconstruct_color = request.extra_channel().is_none()
+            && (!profile.reconstruction.is_original_passthrough()
+                || (!request.uses_original_sample_domain()
+                    && crate::image_color::original_encoding(image)
+                        != Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709)));
+        if request.retains_frame_surface()
             && request.frame_surface_encoding()
                 == crate::frame_surface::FrameSurfaceEncoding::Encoded
         {
             output.transfer = 0;
-            color_render.map(crate::modular_render::ModularColorConfig::for_encoded_output)
+        }
+        let reconstruction = if request.defers_frame_features() {
+            profile.reconstruction.clone().before_frame_features()
         } else {
-            color_render
-        };
-        let color_render = if request.defers_frame_features() {
-            color_render.map(crate::modular_render::ModularColorConfig::before_frame_features)
-        } else {
-            color_render
+            profile.reconstruction.clone()
         };
         if profile.progressive_dc.is_some() {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
@@ -513,9 +518,7 @@ impl WgpuSubmissionEngine {
                     .inverse_plan
             };
             output.lf_render = Some(crate::modular_render::ModularLfPlan::new(
-                color_render.ok_or(Error::EngineContract(
-                    "LF reconstruction configuration is missing",
-                ))?,
+                reconstruction,
                 &output
                     .source_channels
                     .select(&inverse.final_gpu_layouts())?,
@@ -523,7 +526,7 @@ impl WgpuSubmissionEngine {
                 &profile.upsampling_weights,
                 &self.backend.device().limits(),
             )?);
-        } else if channels.iter().any(|channel| channel.factor != 1) || color_render.is_some() {
+        } else if channels.iter().any(|channel| channel.factor != 1) || reconstruct_color {
             let inverse = if let Some(frame) = &profile.resident_frame_plan {
                 &frame.inverse_plan
             } else {
@@ -532,11 +535,11 @@ impl WgpuSubmissionEngine {
             let sources = output
                 .source_channels
                 .select(&inverse.final_gpu_layouts())?;
-            output.render = Some(if let Some(config) = color_render {
+            output.render = Some(if reconstruct_color {
                 crate::modular_render::ModularRenderPlan::for_color(
                     sources,
                     channels,
-                    config,
+                    reconstruction.color_output(image, request)?,
                     output.layout.format.color_spec.clone(),
                     &profile.upsampling_weights,
                     &self.backend.device().limits(),

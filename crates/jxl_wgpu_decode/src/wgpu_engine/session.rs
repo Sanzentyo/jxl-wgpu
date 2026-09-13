@@ -91,8 +91,7 @@ impl WgpuDecodeSession {
         self.source
             .as_ref()?
             .profile
-            .color_render
-            .as_ref()?
+            .reconstruction
             .noise_parameters()
     }
 

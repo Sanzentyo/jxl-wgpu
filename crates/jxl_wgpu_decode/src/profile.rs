@@ -60,7 +60,7 @@ impl ModularGroup {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StandardModularProfile {
-    pub color_render: Option<crate::modular_render::ModularColorConfig>,
+    pub reconstruction: crate::modular_render::ModularReconstructionConfig,
     pub output_width: u32,
     pub output_height: u32,
     pub channel_upsampling: Vec<u32>,
@@ -168,7 +168,7 @@ fn validate_image_header(
             value: image.orientation,
         },
     )?;
-    crate::image_color::require_original_encoding(image)?;
+    crate::image_color::validate_declaration(image)?;
     validate_extra_channels(image, channels)?;
     Ok(orientation)
 }
@@ -388,12 +388,17 @@ fn parse_modular_profile(
         None
     };
     let lf_dequantization = parse_lf_channel_dequantization(&mut reader)?;
-    let color_render = crate::modular_render::ModularColorConfig::new(
+    let reconstruction = crate::modular_render::ModularReconstructionConfig::new(
         image,
         frame,
         lf_dequantization.map(FiniteF16::to_f32),
         noise,
     )?;
+    // Reserve a frame arena whenever a later color request may need one. This describes storage,
+    // not permission to execute a color conversion; numeric outputs retain the original words.
+    let frame_wide_output = !reconstruction.is_original_passthrough()
+        || crate::image_color::original_encoding(image)
+            != Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709);
     let (ma_config, has_global_ma_config, dc_ma_config, wp_header, transform_plan) =
         parse_dc_global_ir(
             &mut reader,
@@ -444,7 +449,7 @@ fn parse_modular_profile(
         // A multi-entry frame may keep every sample in DC-global even without transforms.
         // Those channels have no pass-group arena and must survive in the frame allocation.
         let requires_frame_arena = global_channel_count != 0
-            || color_render.is_some()
+            || frame_wide_output
             || resampling
             || transform_plan
                 .transforms
@@ -834,7 +839,7 @@ fn parse_modular_profile(
             )
             && image.extra_channels[0].bit_depth == image.bit_depth);
     let generalized_channels = sample_encoding.is_float()
-        || color_render.is_some()
+        || frame_wide_output
         || sample_encoding.bits() > 16
         || resampling
         || !conventional_alpha
@@ -942,7 +947,7 @@ fn parse_modular_profile(
     }
 
     Ok(StandardModularProfile {
-        color_render,
+        reconstruction,
         frame_name: String::from_utf8(frame.name_bytes.clone()).map_err(|_| {
             Error::FramePlan(crate::FramePlanError::InvalidFrame {
                 frame_index: frame.frame_index,
@@ -1246,7 +1251,7 @@ mod tests {
                 let mut single = inventory.clone();
                 single.frames = vec![frame.clone()];
                 let profile = parse_modular_frame_profile(&source, &single).unwrap();
-                assert!(profile.color_render.is_some(), "{name}");
+                assert!(!profile.reconstruction.is_original_passthrough(), "{name}");
                 assert!(profile.generalized_channels, "{name}");
                 if profile.groups.len() > 1 {
                     assert!(profile.resident_frame_plan.is_some(), "{name}");
@@ -1514,10 +1519,10 @@ mod tests {
         inventory.frames[0].extra_channel_upsampling = vec![1];
         inventory.frames[0].restoration_filter = RestorationFilterInventory::Default;
         assert!(
-            parse_standard_modular_profile(&source, &inventory)
+            !parse_standard_modular_profile(&source, &inventory)
                 .unwrap()
-                .color_render
-                .is_some()
+                .reconstruction
+                .is_original_passthrough()
         );
     }
 

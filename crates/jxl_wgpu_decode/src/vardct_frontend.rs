@@ -6,8 +6,8 @@
 //! fallback.
 
 use jxl_gpu_bitstream::{
-    BitRange, BitReader, CodestreamInventory, ColourEncodingInventory, ColourSpaceInventory,
-    FrameBlendMode, FrameEncoding, FrameInventory, FrameSectionKind, FrameType, SampleBitDepth,
+    BitRange, BitReader, CodestreamInventory, FrameBlendMode, FrameEncoding, FrameInventory,
+    FrameSectionKind, FrameType, SampleBitDepth,
 };
 use thiserror::Error;
 
@@ -43,7 +43,7 @@ pub enum UnsupportedVarDctFeature {
     CodestreamSize,
     ImageDimensions,
     SamplePrecision,
-    EmbeddedIcc,
+    ColorDeclaration,
     ExtraChannels,
     Preview,
     Animation,
@@ -1251,18 +1251,11 @@ fn validate_image(
     {
         return unsupported(UnsupportedVarDctFeature::ImageDimensions);
     }
-    if !matches!(
-        image.colour_encoding,
-        ColourEncodingInventory::Enumerated {
-            colour_space: ColourSpaceInventory::Rgb | ColourSpaceInventory::Grey,
-            ..
+    crate::image_color::validate_declaration(image).map_err(|_| {
+        VarDctFrontendError::Unsupported {
+            feature: UnsupportedVarDctFeature::ColorDeclaration,
         }
-    ) {
-        return unsupported(UnsupportedVarDctFeature::EmbeddedIcc);
-    }
-    if image.embedded_icc.is_some() {
-        return unsupported(UnsupportedVarDctFeature::EmbeddedIcc);
-    }
+    })?;
     if image.extra_channel_count as usize != image.extra_channels.len()
         || image.extra_channels.iter().any(|extra| {
             crate::modular_sample::ModularSampleEncoding::new(extra.bit_depth).is_none()

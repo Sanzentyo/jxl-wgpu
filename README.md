@@ -74,8 +74,12 @@ The common backend now has a bounded [resident ICC matrix/TRC converter](docs/IC
 with exact profile metadata, channel-specific curves and RGB/Gray conversion. Its independent
 358,530-component corpus includes 100 profile pairs and 100 connections to unbounded linear RGB.
 Pixel formats retain owned ICC profiles, and inventories share the reconstructed profile bytes.
-Embedded-ICC decoder admission, reference
-composition, LUT/CMYK and full intent/HDR policies remain separate incomplete integration gates.
+Embedded ICC inputs now support unfiltered original Modular scalar samples and independently
+selected extra channels through Modular and VarDCT in the supported single-frame paths. The
+[eight-stream native corpus](crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
+checks exact numeric words through complete and fragmented input. ICC color reconstruction,
+reference composition, requested ICC output, LUT/CMYK and full intent/HDR policies remain
+incomplete integration gates.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

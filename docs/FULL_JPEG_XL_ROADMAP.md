@@ -409,6 +409,16 @@ validation prevent numeric or YCbCr relabeling. This prepares original/XYB/refer
 stock decoder admission, profile output packing, display and per-image program/budget integration
 remain open. All affected rows remain **Partial**.
 
+Embedded ICC numeric checkpoint: Modular reconstruction/restoration/LF settings now describe codec
+components independently of color output. Unfiltered original Modular numeric samples and independent
+extras from supported single-frame paths in both codecs admit embedded ICC without interpreting
+profile curves or inventing RGB metadata.
+Eight native RGB/Gray original/XYB streams cover exact alpha and original color samples; metadata-only
+ICC substitution additionally covers 17/31-bit integer codes and 5/16/24/32-bit floating representations.
+Complete/fragmented input and common/standalone engines retain the existing byte-budget contract.
+Color reconstruction into ICC device surfaces, reference composition, requested ICC conversion and
+per-image program ownership remain open. All affected rows remain **Partial**.
+
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `API-01` | P1 | **Partial** | One capability query must report exact decode, encode, color, output, precision, memory, workgroup, and platform limits. No versioned aliases or compatibility shims are required; breaking APIs should model current semantics directly. | all feature rows |
