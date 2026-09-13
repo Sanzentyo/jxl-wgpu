@@ -4,10 +4,18 @@ The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gr
 JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
 reconstruction and LF configuration are independent of color conversion. The common decoder now
-also handles original (non-XYB, non-YCbCr) ICC RGB/Gray color surfaces, original-domain references
-and composition, relative matrix/TRC conversion and U8/F32 requested output. ICC XYB/YCbCr,
+also handles original (non-XYB) ICC RGB/Gray color surfaces, including YCbCr reconstruction,
+original-domain references and composition, relative matrix/TRC conversion and U8/F32 requested output. ICC XYB,
 enumerated-source-to-ICC conversion, spot rendering, full intents and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
+
+YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
+it does not select an ICC transform or introduce an enumerated RGB carrier. The resulting surface
+has one Gray or three RGB planes before reference storage and composition. Same-profile requests
+therefore work independently of the requested CMS intent. A 146-source corpus checks both codecs,
+sampling, precision, filtering, resampling and retained compositions. Five sources also check
+linear/sRGB and other-profile conversion with independent error propagation from each existing
+codec bound. [Generator and interval derivation](../crates/jxl_wgpu_decode/test-data/embedded_icc_ycbcr_generator/README.md).
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
 and layouts. The color specification is `Clone`, not `Copy`; clones share the original bytes and

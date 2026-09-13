@@ -1350,6 +1350,14 @@ The source buffers include `COPY_SRC`, and retained destinations include `COPY_D
 returns a complete `Surface` with its new layout; retagging a buffer cannot keep an obsolete
 three-plane layout for a Gray result.
 
+YCbCr surfaces also begin as three codec components. Their inverse color matrix retains the actual
+original RGB or ICC device encoding in `ColorOutputTransform::Ycbcr`. ICC device packing uses
+`ImageOutputParams::for_icc_device`, writing the real one/three-plane layout and copying extras
+to offsets following that color count. Reconstruction selects no CMS program, even when the
+eventual requested output needs conversion. The common compositor retains its parsed original
+profile for both physical-frame and LF-producer conversion. Color configurations are borrowed
+instead of copied; ICC ownership adds no compatibility alias or uniform ABI change.
+
 LF component previews use the same checked copy after recursive upsampling. Their output plan
 reserves no color-packing uniforms; color previews retain the 368-byte conversion plan. Both
 paths retain all recursive stage buffers through completion and copy extras independently.

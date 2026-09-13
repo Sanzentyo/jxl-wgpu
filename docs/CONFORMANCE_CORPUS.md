@@ -3969,6 +3969,32 @@ infinities, and signaling/quiet NaNs with independent payloads. Original Modular
 and unchanged F32 packing use integer words throughout, avoiding WGSL floating reinterpretation.
 The native scalar packer independently checks 64 oriented Gray/RGB color, alpha and depth-plane
 selections against literal IEEE words, including signaling NaNs and poisoned alignment gaps.
-ICC color reconstruction from XYB/YCbCr, enumerated-source ICC targets, spot rendering, standalone
+ICC color reconstruction from XYB, enumerated-source ICC targets, spot rendering, standalone
 color entry points, LUT/MPE/Lab/CMYK, full intent/HDR/display integration and browser execution
 conformance remain open. The full JPEG XL goal and affected roadmap rows remain **Partial**.
+
+## ICC YCbCr reconstruction and presentation
+
+The common embedded-ICC tests replace only color metadata in 102 existing Modular YCbCr sources
+and 44 existing original-color YCbCr sources from both codecs. The helper preserves every physical
+frame byte and non-color declaration. Same-profile requests use Perceptual/None deliberately:
+codec reconstruction must not invoke the currently relative/Bradford-only CMS.
+
+The Modular cases retain their absolute 2e-6 color/alpha bounds across all 64 sampling selectors,
+integer/floating precision, odd and one-pixel axes, restoration, resampling, alpha association,
+distributed groups/passes and independent extras. Filtered references keep the established
+independently expanded 4:4:4 oracle; unstable native right-edge restoration output is not imported.
+The original-color cases retain their normalized 1e-5 Modular and 1/1024 VarDCT color bounds and
+normalized 2e-6 alpha bound. Every whole/fragmented result is word-identical. The tests reserve
+five frame slots to retain all four completed presentation leases while discovering end-of-stream,
+then verify the retained buffers after releasing the session and check that the budget returns to zero.
+
+The 60 additional files in `embedded_icc_ycbcr` cover five representative sources, three targets
+(linear BT.709, sRGB and the opposite RGB/Gray profile), and scalar/native/lower/upper references.
+The [generator](../crates/jxl_wgpu_decode/test-data/embedded_icc_ycbcr_generator/README.md)
+checks Little CMS 2.19 against independent native precision intervals. GPU bounds instead propagate
+the existing source error through the independent ICC equations; inverse-curve steepness is included
+before final output rounding. The native floating interface receives the same explicit unit-domain
+clamp as the ICC primitive, and all samples are retained. Tests first verify reconstructed device
+values against those source bounds, then check planar/interleaved converted output, fragmented
+equality, and unchanged reconstructed alpha words. No production CPU pixel conversion is used.

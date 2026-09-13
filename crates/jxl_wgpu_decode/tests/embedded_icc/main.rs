@@ -12,6 +12,7 @@ use std::num::NonZeroU64;
 mod color;
 mod numeric;
 mod profile;
+mod ycbcr;
 
 fn inventory(data: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
     jxl_gpu_bitstream::parse(data, Default::default())

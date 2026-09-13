@@ -10,8 +10,8 @@ use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 use super::gpu::Surface;
 use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
 use crate::color_output::{
-    ColorOutputConfig, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan, ColorOutputPlane,
-    ColorOutputTransform, InverseOpsin,
+    ColorOutputConfig, ColorOutputEncoding, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan,
+    ColorOutputPlane, ColorOutputTransform, InverseOpsin,
 };
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, Result};
@@ -21,6 +21,7 @@ pub(super) fn convert(
     source: &Surface,
     image: &ImageHeaderInventory,
     frame: &FrameInventory,
+    original: &FrameSurfaceEncoding,
     encoding: FrameSurfaceEncoding,
 ) -> Result<GpuWork<Surface>> {
     if source.encoding != FrameSurfaceEncoding::Encoded {
@@ -34,13 +35,20 @@ pub(super) fn convert(
             "inverse color transform extra channel count",
         ));
     }
-    if matches!(encoding, FrameSurfaceEncoding::Icc(_)) {
-        if image.xyb_encoded || frame.do_ycbcr {
+    if matches!(original, FrameSurfaceEncoding::Icc(_)) {
+        if image.xyb_encoded {
             return Err(Error::EngineContract(
-                "ICC device copy requires original codec components",
+                "ICC XYB reconstruction is not connected",
             ));
         }
-        return copy_device(backend, source, encoding);
+        if encoding != *original {
+            return Err(Error::EngineContract(
+                "ICC component reconstruction requires the original device profile",
+            ));
+        }
+        if !frame.do_ycbcr {
+            return copy_device(backend, source, encoding);
+        }
     }
     let device = backend.device();
     let layout = FrameSurfaceLayout::with_encoding(
@@ -96,13 +104,28 @@ pub(super) fn convert(
                 InverseOpsin::from_image(image)
                     .ok_or(Error::EngineContract("encoded XYB lacks inverse opsin"))?,
             )
-        } else if frame.do_ycbcr {
-            ColorOutputTransform::Ycbcr {
-                channel_shifts: Default::default(),
-                encoding: crate::image_color::require_original_encoding(image)?,
-            }
         } else {
-            ColorOutputTransform::Rgb(crate::image_color::require_original_encoding(image)?)
+            let encoding = match original {
+                FrameSurfaceEncoding::Rgb(encoding) => ColorOutputEncoding::Rgb(*encoding),
+                FrameSurfaceEncoding::Icc(profile) => ColorOutputEncoding::Icc(profile.clone()),
+                FrameSurfaceEncoding::Encoded => {
+                    return Err(Error::EngineContract(
+                        "original color interpretation cannot be codec components",
+                    ));
+                }
+            };
+            if frame.do_ycbcr {
+                ColorOutputTransform::Ycbcr {
+                    channel_shifts: Default::default(),
+                    encoding,
+                }
+            } else if let ColorOutputEncoding::Rgb(encoding) = encoding {
+                ColorOutputTransform::Rgb(encoding)
+            } else {
+                return Err(Error::EngineContract(
+                    "original ICC components must use the device copy path",
+                ));
+            }
         },
         alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
     };
@@ -118,7 +141,7 @@ pub(super) fn convert(
                 size: NonZeroU64::new(layout.storage_bytes).expect("nonempty surface"),
             },
             layout: &layout.color,
-            config,
+            config: &config,
         },
     )?;
     source.copy_extras(

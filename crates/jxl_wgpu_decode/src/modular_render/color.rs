@@ -130,7 +130,7 @@ impl ModularReconstructionConfig {
                 ),
                 ModularComponents::Ycbcr { .. } => ColorOutputTransform::Ycbcr {
                     channel_shifts: [JpegComponentShift::default(); 3],
-                    encoding: original,
+                    encoding: original.into(),
                 },
             };
             let threshold = matches!(self.components, ModularComponents::Xyb { .. })
@@ -227,7 +227,7 @@ impl ColorPlan {
             })
             .collect();
         let layout = ImageLayout::from_planes(extent, format, layouts)?;
-        let packing_bytes = if let Some(config) = output_config {
+        let packing_bytes = if let Some(config) = &output_config {
             config.validate_layout(&layout)?;
             ColorOutputPlan::for_limits(&layout, limits)?
                 .memory
@@ -509,7 +509,7 @@ impl ColorPipeline {
                 weights,
             },
         )?;
-        let Some(config) = plan.output_config else {
+        let Some(config) = &plan.output_config else {
             crate::frame_surface::copy::planes(
                 encoder,
                 &resident_planes(

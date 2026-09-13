@@ -49,19 +49,47 @@ impl ColorOutputPlane<'_> {
     }
 }
 
+/// Actual color interpretation after codec reconstruction, before output conversion.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColorOutputEncoding {
+    /// An enumerated RGB encoding with explicit primaries and transfer.
+    Rgb(RgbColorEncoding),
+    /// Original RGB or Gray device values owned by this exact profile.
+    Icc(jxl_gpu_protocol::icc::IccProfile),
+}
+
+impl From<RgbColorEncoding> for ColorOutputEncoding {
+    fn from(encoding: RgbColorEncoding) -> Self {
+        Self::Rgb(encoding)
+    }
+}
+
 /// Color transform fused into the final packed color kernel.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ColorOutputTransform {
-    /// Reconstructed original color with an explicit transfer and primary contract.
+    /// Reconstructed RGB with explicit primaries and transfer.
     Rgb(RgbColorEncoding),
     /// JPEG XL XYB inverse into linear BT.709; the shared output applies the requested transfer.
     Xyb(InverseOpsin),
     /// JPEG reconstruction's encoded YCbCr, including component upsampling.
     Ycbcr {
         channel_shifts: [JpegComponentShift; 3],
-        /// RGB encoding after the JPEG component matrix, before requested output conversion.
-        encoding: RgbColorEncoding,
+        /// Device encoding after the JPEG component matrix, before output conversion.
+        encoding: ColorOutputEncoding,
     },
+}
+
+impl ColorOutputTransform {
+    fn encoding(&self) -> ColorOutputEncoding {
+        match self {
+            Self::Rgb(encoding) => ColorOutputEncoding::Rgb(*encoding),
+            Self::Ycbcr { encoding, .. } => encoding.clone(),
+            Self::Xyb(opsin) => ColorOutputEncoding::Rgb(RgbColorEncoding {
+                space: opsin.rgb_space,
+                transfer: jxl_gpu_protocol::TransferFunction::Linear,
+            }),
+        }
+    }
 }
 
 /// JPEG XL inverse-opsin fields used by the fused output kernel.
@@ -132,7 +160,7 @@ impl InverseOpsin {
 }
 
 /// Host-known geometry and source color transform for one packed output.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ColorOutputConfig {
     /// Logical image extent after resampling, before orientation.
     pub extent: Extent2d,
@@ -149,18 +177,18 @@ pub struct ColorOutputConfig {
 
 impl ColorOutputConfig {
     /// Extent of the packed output, including transposition for orientations 5–8.
-    pub const fn output_extent(self) -> Extent2d {
+    pub const fn output_extent(&self) -> Extent2d {
         self.orientation.map_extent(self.extent)
     }
 
     /// Validates target color, geometry, and packing before allocation or submission.
-    pub fn validate_layout(self, layout: &ImageLayout) -> Result<(), ColorOutputError> {
+    pub fn validate_layout(&self, layout: &ImageLayout) -> Result<(), ColorOutputError> {
         self.image_params(layout, [self.extent.width; 3], 1)
             .map(|_| ())
     }
 
     fn image_params(
-        self,
+        &self,
         layout: &ImageLayout,
         strides: [u32; 3],
         dispatch_width: u32,
@@ -169,24 +197,29 @@ impl ColorOutputConfig {
         {
             return Err(ColorOutputError::HdrLuminanceMappingRequired);
         }
-        let params = ImageOutputParams::new(
-            layout,
-            ImageOutputSource {
-                extent: self.extent,
-                orientation: self.orientation,
-                strides,
-                encoding: match self.transform {
-                    ColorOutputTransform::Rgb(encoding) => encoding,
-                    ColorOutputTransform::Xyb(opsin) => RgbColorEncoding {
-                        space: opsin.rgb_space,
-                        transfer: jxl_gpu_protocol::TransferFunction::Linear,
-                    },
-                    ColorOutputTransform::Ycbcr { encoding, .. } => encoding,
+        let params = match self.transform.encoding() {
+            ColorOutputEncoding::Rgb(encoding) => ImageOutputParams::new(
+                layout,
+                ImageOutputSource {
+                    extent: self.extent,
+                    orientation: self.orientation,
+                    strides,
+                    encoding,
                 },
-            },
-            dispatch_width,
-            self.white_point_adaptation,
-        )?
+                dispatch_width,
+                self.white_point_adaptation,
+            )?,
+            ColorOutputEncoding::Icc(profile) => ImageOutputParams::for_icc_device(
+                layout,
+                jxl_wgpu::ImageOutputGeometry {
+                    extent: self.extent,
+                    orientation: self.orientation,
+                    strides,
+                },
+                &profile,
+                dispatch_width,
+            )?,
+        }
         .with_alpha_conversion(self.alpha_conversion);
         Ok(if let Some(threshold) = self.linear_black_threshold {
             params.with_linear_black_threshold(threshold)?
@@ -209,7 +242,7 @@ pub struct ColorOutputInputs<'a> {
     /// Exact target layout, including oriented extent, plane offsets, and row pitches.
     pub layout: &'a ImageLayout,
     /// Output geometry and source color transform.
-    pub config: ColorOutputConfig,
+    pub config: &'a ColorOutputConfig,
 }
 
 /// An opacity plane in an encoded Modular or decoded F32 arena, one word per sample.
@@ -592,7 +625,7 @@ impl ColorOutputPacker {
         encoder: &mut wgpu::CommandEncoder,
         inputs: ColorOutputInputs<'_>,
     ) -> Result<ColorOutputScratch, ColorOutputError> {
-        let (source_params, params, plan) = validate_inputs(device, inputs, self.variant)?;
+        let (source_params, params, plan) = validate_inputs(device, &inputs, self.variant)?;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jxl-wgpu decode reconstructed packed color params"),
             contents: bytemuck::bytes_of(&params),
@@ -660,11 +693,11 @@ struct ColorSourceParams {
 
 fn validate_inputs(
     device: &wgpu::Device,
-    inputs: ColorOutputInputs<'_>,
+    inputs: &ColorOutputInputs<'_>,
     variant: KernelVariant,
 ) -> Result<(ColorSourceParams, ImageOutputParams, ColorOutputPlan), ColorOutputError> {
-    if let ColorOutputTransform::Xyb(inverse) = inputs.config.transform {
-        validate_inverse_opsin(inverse)?;
+    if let ColorOutputTransform::Xyb(inverse) = &inputs.config.transform {
+        validate_inverse_opsin(*inverse)?;
     }
     if inputs.config.alpha_conversion != jxl_wgpu::AlphaConversion::Preserve
         && inputs.alpha.is_none()
@@ -678,13 +711,13 @@ fn validate_inputs(
         plan.dispatch_width,
     )?;
 
-    let required_extents = match inputs.config.transform {
+    let required_extents = match &inputs.config.transform {
         ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
             [[inputs.config.extent.width, inputs.config.extent.height]; 3]
         }
         ColorOutputTransform::Ycbcr { channel_shifts, .. } => {
             let mut extents = [[0; 2]; 3];
-            for (channel, shift) in channel_shifts.into_iter().enumerate() {
+            for (channel, shift) in channel_shifts.iter().enumerate() {
                 if shift.horizontal > 1 || shift.vertical > 1 {
                     return Err(ColorOutputError::InvalidJpegShift {
                         channel,
@@ -745,7 +778,7 @@ fn validate_inputs(
             _ => "B input",
         };
         validate_binding(device, role, input.storage, required_bytes)?;
-        let shift = match inputs.config.transform {
+        let shift = match &inputs.config.transform {
             ColorOutputTransform::Xyb(_) | ColorOutputTransform::Rgb(_) => {
                 JpegComponentShift::default()
             }
@@ -811,7 +844,7 @@ fn validate_inputs(
         [0; 4]
     };
 
-    let (mode, matrix, bias_cbrt, scaled_bias, intensity_scale) = match inputs.config.transform {
+    let (mode, matrix, bias_cbrt, scaled_bias, intensity_scale) = match &inputs.config.transform {
         ColorOutputTransform::Xyb(inverse) => {
             let intensity_scale = 255.0 / inverse.intensity_target;
             (
@@ -1342,7 +1375,7 @@ mod tests {
                         ],
                         output: binding(&output),
                         layout: &layout,
-                        config: ColorOutputConfig {
+                        config: &ColorOutputConfig {
                             linear_black_threshold: None,
                             white_point_adaptation:
                                 jxl_gpu_protocol::WhitePointAdaptation::Bradford,
@@ -1357,8 +1390,14 @@ mod tests {
                             jxl_wgpu::AlphaConversion::Unpremultiply,
                             jxl_wgpu::AlphaConversion::Premultiply,
                         ] {
-                            let mut converted = inputs;
-                            converted.config.alpha_conversion = conversion;
+                            let config = ColorOutputConfig {
+                                alpha_conversion: conversion,
+                                ..inputs.config.clone()
+                            };
+                            let converted = ColorOutputInputs {
+                                config: &config,
+                                ..inputs
+                            };
                             assert!(matches!(
                                 packer.encode(&device, &mut encoder, converted),
                                 Err(ColorOutputError::MissingAlphaPlane)

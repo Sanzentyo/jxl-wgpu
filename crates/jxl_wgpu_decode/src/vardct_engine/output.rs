@@ -9,7 +9,7 @@ use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{KernelVariant, WgpuBackend};
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum VarDctFrameOutput {
     Image(VarDctImageOutput),
     Extra {
@@ -18,7 +18,7 @@ pub(super) enum VarDctFrameOutput {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum VarDctImageOutput {
     Color {
         config: ColorOutputConfig,
@@ -31,10 +31,10 @@ pub(super) enum VarDctImageOutput {
 }
 
 impl VarDctImageOutput {
-    pub(super) fn extent(self) -> Extent2d {
+    pub(super) fn extent(&self) -> Extent2d {
         match self {
             Self::Color { config, .. } => config.extent,
-            Self::Components { extent, .. } => extent,
+            Self::Components { extent, .. } => *extent,
         }
     }
 }
@@ -47,13 +47,13 @@ pub(super) struct FrameOutputMemory {
 }
 
 impl VarDctFrameOutput {
-    pub(super) fn requires_reconstruction(self) -> bool {
+    pub(super) fn requires_reconstruction(&self) -> bool {
         matches!(self, Self::Image(_))
     }
-    pub(super) fn retains_components(self) -> bool {
+    pub(super) fn retains_components(&self) -> bool {
         matches!(self, Self::Image(VarDctImageOutput::Components { .. }))
     }
-    pub(super) fn memory(self) -> FrameOutputMemory {
+    pub(super) fn memory(&self) -> FrameOutputMemory {
         match self {
             Self::Image(VarDctImageOutput::Color { plan, .. }) => FrameOutputMemory {
                 storage_bytes: plan.memory.output_storage_bytes,
@@ -61,7 +61,7 @@ impl VarDctFrameOutput {
                 status_bytes: 0,
             },
             Self::Image(VarDctImageOutput::Components { storage_bytes, .. }) => FrameOutputMemory {
-                storage_bytes,
+                storage_bytes: *storage_bytes,
                 uniform_bytes: 0,
                 status_bytes: 0,
             },
@@ -207,7 +207,7 @@ pub(super) fn prepare_presentation(
             VarDctColorTransform::Rgb => ColorOutputTransform::Rgb(original),
             VarDctColorTransform::Ycbcr => ColorOutputTransform::Ycbcr {
                 channel_shifts: profile.channel_shifts,
-                encoding: original,
+                encoding: original.into(),
             },
         };
         let config = ColorOutputConfig {

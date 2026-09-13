@@ -433,6 +433,18 @@ targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK, full inte
 integration still require implementation and conformance. This is progress toward the original
 full JPEG XL objective; no feature row or completion gate is marked complete by this checkpoint.
 
+ICC YCbCr checkpoint: inverse codec reconstruction now carries either the actual enumerated RGB
+encoding or the image-owned ICC device profile. It writes one Gray or three RGB color planes
+before reference storage and composition, without selecting a CMS method for reconstruction.
+102 Modular sources cover independent JPEG grids, sample precision, filters, resampling and
+extras; 44 both-codec original-color sources cover stills and composed sequences. Complete input
+and bounded fragmented input are word-identical, and retained outputs survive session release.
+Five source cases additionally check linear/sRGB and opposite RGB/Gray ICC targets against
+independent scalar intervals propagated from unchanged codec bounds and checked with Little CMS.
+ICC XYB, enumerated-source ICC targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK,
+full intents and HDR/display integration remain open. All affected rows and completion gates
+remain **Partial**.
+
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `API-01` | P1 | **Partial** | One capability query must report exact decode, encode, color, output, precision, memory, workgroup, and platform limits. No versioned aliases or compatibility shims are required; breaking APIs should model current semantics directly. | all feature rows |

@@ -150,7 +150,7 @@ impl LfPreview {
             backend,
         };
         if canonical {
-            preview.for_surface(config.extent, working.frame_surface_encoding())
+            preview.for_surface(preview.extent, working.frame_surface_encoding())
         } else {
             Ok(preview)
         }
@@ -373,7 +373,7 @@ impl LfPreview {
                     alpha: None,
                     output: binding(output.as_wgpu_buffer()),
                     layout: &self.layout,
-                    config: color.config,
+                    config: &color.config,
                 },
             )?),
             PreviewOutput::Components => {

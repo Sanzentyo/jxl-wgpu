@@ -635,11 +635,13 @@ The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB
 original/XYB input, both common and standalone engines, complete/fragmented transport, exact
 17/31-bit integers and widened IEEE-754 words.
 
-The common `WgpuDecodeEngine` additionally accepts original (non-XYB, non-YCbCr) ICC color through
+The common `WgpuDecodeEngine` additionally accepts original (non-XYB) ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB
 color planes; additional channels follow the actual color-plane count. Reconstruction returns
-codec components without a fictitious RGB encoding. Checked GPU copies preserve their words when
-entering the original ICC domain. References and frame blends stay in that domain, including
+codec components without a fictitious RGB encoding. RGB components enter the original ICC domain
+through checked word-preserving GPU copies. YCbCr components instead apply the inverse JPEG
+color matrix after component upsampling, using their actual RGB/Gray device profile.
+References and frame blends stay in that domain, including
 extended values; conversion returns its actual layout along with its buffer.
 
 For these inputs, requested enumerated SDR output and other RGB/Gray matrix/TRC profiles execute
@@ -648,10 +650,19 @@ GPU program uploads lazily once, with exact budget admission, retry and completi
 `with_icc_rendering_intent` defaults to relative colorimetric; other intents and non-Bradford
 conversion currently return typed errors. Same-profile U8/F32 planar/interleaved Gray/RGB output
 performs only packing, orientation and requested alpha association, with no CMS curve evaluation.
-F32 with preserved association retains the existing Modular IEEE words, including nonfinite values.
+F32 with preserved association retains the existing Modular IEEE words, including nonfinite values,
+when no inverse YCbCr arithmetic is required.
 U8 packing supports Gray/Gray-alpha and RGB/BGR/RGBA/BGRA, with quantization after association.
 
-ICC XYB/YCbCr reconstruction, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
+YCbCr tests cover 102 Modular sources with all JPEG sampling selectors, integer/floating precision,
+restoration, resampling, independent extras and alpha, plus 44 both-codec stills and composed
+sequences. Whole and fragmented input produce identical output words, including after retaining
+all completed frame leases and dropping the session. Five sources additionally check planar and
+interleaved linear/sRGB and other-profile output against independently propagated ICC intervals;
+conversion preserves the actual reconstructed alpha words. See the
+[reference recipe](test-data/embedded_icc_ycbcr_generator/README.md).
+
+ICC XYB reconstruction, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
 CMYK, full intents, HDR luminance mapping and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

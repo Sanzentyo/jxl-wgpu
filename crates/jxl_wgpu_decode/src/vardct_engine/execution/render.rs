@@ -59,7 +59,7 @@ pub(super) fn encode_frame_render(
         })?;
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
     let mut dc_reconstruction = None;
-    let (output_scratch, post_transform_buffers, lf_output) = match source.output {
+    let (output_scratch, post_transform_buffers, lf_output) = match source.output.clone() {
         VarDctFrameOutput::Image(mut image_output) => {
             let resident_planes =
                 resident_planes.ok_or(VarDctDecodeError::EntropyWindowContract {
@@ -386,7 +386,7 @@ pub(super) fn encode_frame_render(
                             ],
                             output: resident_binding(output)?,
                             layout: &source.layout,
-                            config,
+                            config: &config,
                         },
                     )?;
                     debug_assert_eq!(scratch.plan, plan);

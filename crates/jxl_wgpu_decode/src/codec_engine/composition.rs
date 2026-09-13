@@ -600,12 +600,10 @@ fn presentation_encoding(
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
     let image = &inventory.image_header;
     crate::image_color::validate_declaration(image)?;
-    if image.embedded_icc.is_some()
-        && (image.xyb_encoded || inventory.frames.iter().any(|frame| frame.do_ycbcr))
-    {
+    if image.embedded_icc.is_some() && image.xyb_encoded {
         return Err(crate::UnsupportedProfile::new(
             crate::UnsupportedCodestreamFeature::ColorEncoding,
-            "ICC XYB and YCbCr color reconstruction is not yet connected",
+            "ICC XYB color reconstruction is not yet connected",
         )
         .into());
     }
@@ -1191,6 +1189,7 @@ impl DependentPending {
             &surface,
             &carry.source.inventory.image_header,
             frame,
+            &self.output.compositor()?.original,
             encoding,
         )?;
         self.stage = Some(Stage::ColorTransform(work));
@@ -1845,6 +1844,7 @@ impl DependentPending {
                     &surface,
                     &carry.source.inventory.image_header,
                     frame,
+                    &compositor.original,
                     encoding,
                 )?,
                 index,
