@@ -1,7 +1,7 @@
 # Modular YCbCr conformance corpus
 
 The offline generator in `../modular_ycbcr_generator` uses libjxl to serialize the image/frame/
-TOC and Modular headers and entropy of 464 original streams. The outer two-bit LF-global prefix
+TOC and Modular headers and entropy of 474 original streams. The outer two-bit LF-global prefix
 selects default LF quantization and local MA trees. The shared Rust case manifest verifies actual
 metadata. The production GPU codec supplies neither fixture bytes nor reference pixels.
 
@@ -12,7 +12,7 @@ resampled 12-bit alpha and binary32 depth; associated alpha; orientations 1–8;
 and vertical groups at every 128/256/512/1024-pixel group dimension; a global color prefix;
 two-pass channel ownership with empty leading passes; and three LF groups carrying extras.
 
-The 364 streams with transforms include 232 global-transform cases and 136 cases with local
+The 372 streams with transforms include 236 global-transform cases and 140 cases with local
 LF/pass transforms (four use both). They cover all 42 RCT types; default Squeeze with every
 selector triple; append/in-place horizontal and vertical Squeeze; one-pixel axes with empty
 residuals; all group dimensions; integer and floating working words; component and three-channel
@@ -24,7 +24,7 @@ progressive residual passes. The manifests explicitly separate global, LF and pa
 Each global-transform case has a native `*.topology` sidecar. Its header contains the meta-channel
 count, total channel count, transform count and number of inverse Squeeze channel operations.
 Each following row contains width, height, horizontal shift and vertical shift for one channel,
-including empty residuals. Local cases have `*.local` sidecars with 652 nonempty substream records:
+including empty residuals. Local cases have `*.local` sidecars with 664 nonempty substream records:
 `stream ID`, `source COUNT` and its channel rows, then `transformed` and the same topology format.
 Rust compares source/target geometry and shifts, transform headers, stream order, entropy cursor,
 MA/predictor configuration, packed descriptors and the actual resident inverse plan. Sidecars are
@@ -74,6 +74,12 @@ other progressive and oriented references use their existing native entry points
 The generator explicitly emits global, LF and pass streams with their native Modular stream IDs.
 Scalar input patterns and equivalent-stream expansion belong solely to offline fixture generation.
 
+Ten feature sources extend this corpus: `feature_global_up*` and `feature_local_up*` pair global
+and local Squeeze at equal color/extra factors 1/2/4/8, with binary32 color, 12-bit alpha and
+binary32 depth. `feature_mixed_010` and `feature_mixed_123` use 8-bit 257×17 metadata compatible
+with the existing original-RGB and VarDCT reference inputs. The patch manifest reuses these
+native streams without changing precision declarations or entropy.
+
 Reproduce with CMake, a C++17 compiler, pkg-config and system Highway, Brotli, LCMS2 and libjxl.
 Use a libjxl checkout at `a7a9c787341cf703dede03c2009fa460cae5e5df` (v0.12.0); the CMake project
 rejects a different commit. From the workspace root:
@@ -99,5 +105,7 @@ The GPU tests require an actual adapter and compare native color, selected RGB/e
 tests check 29 exact-budget admission cases with one requested frame slot, a one-byte budget shortfall, retry and cancellation.
 Short whole-stream uploads are admitted by actual allocation size, including those below the
 40-byte limit needed for segmented entropy streams. The nine two-pass cases also compare 27 native
-prefix snapshots and immutable GPU updates. Broader mixed MA/transform combinations, patch/spline/
-noise dictionaries and mixed frame composition remain part of the active full JPEG XL goal.
+prefix snapshots and immutable GPU updates. The separate patch-reference corpus now covers
+Modular YCbCr patches/noise, mixed component references and filtered sequences. Broader mixed
+MA/transform combinations, spline interactions, physical LF-producer features and post-transform
+frame composition remain part of the active full JPEG XL goal.

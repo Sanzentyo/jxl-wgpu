@@ -225,6 +225,25 @@ void LocalCases(std::vector<Case>& cases) {
     cases.push_back(test);
   }
 }
+void FeatureSources(std::vector<Case>& cases) {
+  for (uint32_t factor : {1, 2, 4, 8}) for (bool local : {false, true}) {
+    Case test = Grouped(std::string(local ? "feature_local_up" : "feature_global_up") + std::to_string(factor));
+    test.width = 256 * factor + 3;
+    test.bits = 32; test.exponent_bits = 8; test.positive_samples = true;
+    test.upsampling = factor; test.extra_factors = {factor, factor};
+    test.selectors = local ? std::array<int, 3>{1, 2, 3} : std::array<int, 3>{0, 1, 0};
+    auto& transforms = local ? test.pass_transforms : test.global_transforms;
+    transforms = {Squeeze({Split(true, false, 0, 3), Split(false, false, 0, 3)})};
+    cases.push_back(test);
+  }
+  for (auto selectors : {std::array<int, 3>{0, 1, 0}, {1, 2, 3}}) {
+    Case test;
+    test.name = "feature_mixed_" + std::to_string(selectors[0]) + std::to_string(selectors[1]) + std::to_string(selectors[2]);
+    test.width = 257; test.height = 17; test.bits = 8;
+    test.selectors = selectors;
+    cases.push_back(test);
+  }
+}
 }  // namespace
 
 std::vector<Case> Cases() {
@@ -331,6 +350,7 @@ std::vector<Case> Cases() {
   cases.push_back(lf);
   TransformCases(cases);
   LocalCases(cases);
+  FeatureSources(cases);
   return cases;
 }
 

@@ -5,6 +5,7 @@ use jxl_gpu_bitstream::{
     GaborishInventory, RestorationFilterInventory, SampleBitDepth,
 };
 
+mod feature_sources;
 mod substreams;
 mod topology;
 mod transforms;
@@ -241,5 +242,6 @@ pub fn cases() -> Vec<Case> {
     cases.push(lf);
     transforms::extend(&mut cases);
     substreams::extend(&mut cases);
+    feature_sources::extend(&mut cases);
     cases
 }

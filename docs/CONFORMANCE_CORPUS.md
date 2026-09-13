@@ -3389,7 +3389,7 @@ goal remains active.
 ### Subsampled and mixed component patch references (2026-09-13)
 
 `examples/regenerate_patch_references.rs` and the explicit
-`jxl_test_support::fixtures::patch_references` manifest generate 276 streams in
+`jxl_test_support::fixtures::patch_references` manifest originally generated 276 streams in
 `test-data/patches/references/`, with one packed linear RGBA plus scalar-extra F32 reference each.
 The 552 files reuse checked-in native image entropy. One frame recipe carries its codestream,
 reference slot/domain and optional dictionary; the shared assembler requires identical decoded
@@ -3723,3 +3723,76 @@ Nine two-pass cases compare 27 native prefix snapshots, immutable GPU updates an
 convergence. Color and numeric output compare whole input with 40-byte GPU windows and 43-byte
 transport fragments. Broader mixed MA/transform combinations, frame features and mixed-frame
 conformance remain part of the active full JPEG XL goal.
+
+## Modular YCbCr patch and frame references (2026-09-13)
+
+The component-reference manifest now contains 494 streams: all 276 preceding cases and 218
+additions. Every original codestream must decode with native libjxl. Each new case freezes both
+preserved sRGB and independently computed linear RGBA, followed by unchanged scalar-extra planes.
+The existing 552 reference files remain byte-identical. Ordinary `jpeg`, `mixed` and
+`modular_ycbcr` modules declare families, source noise operations, reference decoders, control
+cases and error metrics; filenames no longer decide test behavior or oracle selection.
+
+| New cases | Coverage |
+|---:|---|
+| 128 | All 64 Modular YCbCr sampling triples at 37×19, rotated between producer and consumer, with all eight patch modes and paired nonzero/zero noise |
+| 24 | Empty/nonempty dictionaries and six-frame four-slot overwrites across RCT, Palette/Squeeze, empty residuals, local transforms, multiple passes and LF-group transform ownership |
+| 12 | Global/local binary32 Squeeze producers with 12-bit alpha and binary32 depth, equal color/extra factors 1/2/4/8, empty dictionaries and reference overwrites |
+| 18 | Gaborish/EPF, global/local Palette/Squeeze, empty/nonempty dictionaries, nonzero/zero noise and four-slot overwrites, using independently expanded equivalents |
+| 36 | Both reference directions between two Modular YCbCr sampling layouts and Modular RGB, VarDCT RGB or VarDCT YCbCr, including empty dictionaries and all-slot overwrites |
+
+Ten independently encoded sources extend the Modular YCbCr corpus to 474 original streams,
+236 global topology sidecars, 140 local-transform cases and 664 nonempty local substreams.
+Eight sources use equal color/extra factors and global/local Squeeze. Two 8-bit 257×17 sources
+match the existing RGB/VarDCT image metadata. Source precision and image declarations are never
+rewritten over incompatible entropy. The shared frame assembler checks every decoded image
+parameter before joining frames.
+
+New sRGB references come directly from native decoding. The generator applies the specified
+signed f64 sRGB EOTF only to RGB, leaving alpha and each extra unchanged; native CMS is not used
+as the extended-range linear oracle. The 18 filtered sequences run their complete patch/noise/
+reference chain with independent scalar-expanded 4:4:4 sources. Native libjxl first proves that
+implicit-alpha arithmetic substitutions preserve every F32 word; pinned jxl-oxide then checks
+those equivalents within normalized error 2e-6. The GPU input retains the original subsampling
+and all eight patch modes. The maximum independent-decoder error was 2.407e-7.
+
+The preceding cases keep their original metrics and bounds. New Modular-only and Modular-RGB
+references use normalized linear error 1e-5 and sRGB error 2e-6. Mixed VarDCT cases retain the
+established independent-IDCT bound of 1/1024 in both directly compared domains. Twelve explicitly
+listed wide-F32-extra cases normalize RGB by `1 + max(abs(reference RGB))` **per pixel**; alpha
+and selected extra planes retain separate per-component error bounds of 2e-6. Other cases use
+`1 + abs(reference component)`.
+
+The vector metric accounts for cancellation after unclamped extra-channel alpha and YCbCr
+conversion. For example, an overwrite pixel has red about -1517.886, blue about -2038.155 and
+green about 8.95438. Native SIMD/scalar green outputs are 8.954337/8.954346, while the GPU returns
+8.954416. A separate f64 evaluation gives 8.954381. Native green matrix constants include
+intermediate F32 rounding; WGSL constants are rounded after constant evaluation. Both source
+rounding and these coefficient differences are amplified by opposing large components. A
+per-component 2e-6 test also fails between native SIMD/scalar implementations in a resampled
+case. The explicit vector metric measures color-vector precision without treating the cancelled
+component as the scale of its operands. Tolerance coefficients and reference pixels are unchanged;
+no GPU output supplies a new reference or selects an oracle.
+
+The targeted Apple M5/Metal run passes all 494 cases, with 988 linear comparisons, 988 sRGB
+comparisons and 60 independent-extra comparisons. Of those, the additions account for 436, 436
+and 24 comparisons. Their maximum normalized errors are 3.063e-5 (mixed VarDCT linear),
+2.054e-5 (mixed VarDCT sRGB) and 1.348e-6 (extra planes). The twelve vector-scaled cases remain
+below 1.144e-6 in linear and 1.330e-6 in sRGB. Numeric extra requests select normalized integer
+or native floating mapping from the channel's declared precision.
+
+Whole input and 43-byte transport fragments through 256-byte GPU windows must produce identical
+words for every update. Final-only output equals the last update, held images remain immutable,
+controls prove that patches and noise affect pixels, and input/GPU reservations fully drain.
+The two existing negative tests still reject references saved after color conversion and patches
+outside the JPEG-padded component surface. This corpus does not claim independent native prefix
+snapshots for every composed pass, physical LF-producer features, Modular YCbCr spline interactions,
+post-transform composition across every profile, or ISO precision certification. Those remain
+part of the active full JPEG XL goal.
+
+Regenerate and validate the component references after regenerating the native sources:
+
+```sh
+cargo run -p jxl_wgpu_decode --example regenerate_patch_references
+cargo test -p jxl_wgpu_decode --test patches references:: -- --test-threads=1
+```

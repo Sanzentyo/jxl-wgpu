@@ -12,22 +12,46 @@ fn main() {
             &["--linear", "--preserve-alpha", "--keep-orientation"],
         )
         .expect("native libjxl must accept every component reference fixture");
-        let samples = match case.reference_source() {
+        let inventory = jxl_gpu_bitstream::parse(&encoded, Default::default())
+            .unwrap()
+            .codestream_inventory(Default::default())
+            .unwrap();
+        let pixels = inventory.image_header.width as usize * inventory.image_header.height as usize;
+        assert_eq!(
+            native.len(),
+            pixels * (4 + inventory.image_header.extra_channels.len())
+        );
+        let samples = match &case.reference_source {
             patch_references::ReferenceSource::NativeLinear => native,
-            patch_references::ReferenceSource::NativeSrgb => {
-                let inventory = jxl_gpu_bitstream::parse(&encoded, Default::default())
-                    .unwrap()
-                    .codestream_inventory(Default::default())
-                    .unwrap();
-                assert!(inventory.image_header.extra_channels.is_empty());
-                let srgb =
+            patch_references::ReferenceSource::NativeSrgb
+            | patch_references::ReferenceSource::ExpandedSrgb { .. } => {
+                let srgb = if matches!(
+                    &case.reference_source,
+                    patch_references::ReferenceSource::ExpandedSrgb { .. }
+                ) {
+                    expanded_srgb(&case)
+                } else {
                     native::libjxl_output(&encoded, &["--preserve-alpha", "--keep-orientation"])
-                        .unwrap();
+                        .unwrap()
+                };
                 assert_eq!(srgb.len(), native.len());
+                assert!(srgb.iter().all(|value| value.is_finite()));
+                if case.encoded_tolerance.is_some() {
+                    std::fs::write(
+                        output.join(format!("{}.srgb.f32.hex", case.name)),
+                        offline::float_hex(
+                            &srgb
+                                .iter()
+                                .flat_map(|value| value.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                    .unwrap();
+                }
                 srgb.into_iter()
                     .enumerate()
                     .map(|(i, value)| {
-                        if i % 4 == 3 {
+                        if i >= pixels * 4 || i % 4 == 3 {
                             return value;
                         }
                         let value = f64::from(value);
@@ -98,4 +122,57 @@ fn main() {
         )
         .unwrap();
     }
+}
+
+fn expanded_srgb(case: &patch_references::Case) -> Vec<f32> {
+    let expanded = case.encode_expanded_reference();
+    let inventory = jxl_gpu_bitstream::parse(&expanded, Default::default())
+        .unwrap()
+        .codestream_inventory(Default::default())
+        .unwrap();
+    assert!(inventory.image_header.extra_channels.is_empty());
+    assert!(
+        inventory
+            .frames
+            .iter()
+            .all(|frame| frame.jpeg_upsampling == [0; 3])
+    );
+    let samples =
+        native::libjxl_output(&expanded, &["--preserve-alpha", "--keep-orientation"]).unwrap();
+    let arithmetic = case.encode_expanded_arithmetic_reference();
+    let equivalent =
+        native::libjxl_output(&arithmetic, &["--preserve-alpha", "--keep-orientation"]).unwrap();
+    assert!(
+        samples
+            .iter()
+            .map(|v| v.to_bits())
+            .eq(equivalent.iter().map(|v| v.to_bits())),
+        "{}: expanded implicit-alpha arithmetic changed pixels",
+        case.name
+    );
+    let image = jxl_oxide::JxlImage::read_with_defaults(arithmetic.as_slice()).unwrap();
+    let render = image.render_frame(0).unwrap();
+    let planar = render.image_planar();
+    assert_eq!(planar.len(), 3);
+    let pixels = inventory.image_header.width as usize * inventory.image_header.height as usize;
+    assert_eq!(samples.len(), pixels * 4);
+    let mut maximum = 0f32;
+    for i in 0..pixels {
+        for c in 0..3 {
+            let a = samples[i * 4 + c];
+            let b = planar[c].buf()[i];
+            assert!(a.is_finite() && b.is_finite());
+            maximum = maximum.max((a - b).abs() / (1.0 + a.abs()));
+        }
+    }
+    assert!(
+        maximum <= 2e-6,
+        "{}: expanded native/jxl-oxide max normalized error {maximum}",
+        case.name
+    );
+    eprintln!(
+        "{}: expanded native/jxl-oxide max normalized error {maximum}",
+        case.name
+    );
+    samples
 }

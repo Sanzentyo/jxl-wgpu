@@ -210,8 +210,10 @@ executor applies patches before 2×/4×/8× frame upsampling and noise, then pub
 or pre-transform references before color conversion. Both coding modes, equal-rate and early
 extra resampling, LF previews, custom weights and reference overwrites have 140 native-reference
 fixtures. VarDCT also expands subsampled JPEG components before retaining patch references or
-applying patches. Another 276-image corpus covers all 64 sampling selector triples at odd extents,
+applying patches. Another 494-image corpus covers all 64 sampling selector triples at odd extents,
 mixed Modular/VarDCT sources, RGB/YCbCr component references and reference-slot overwrites.
+This includes 218 Modular YCbCr patch/noise and mixed-frame combinations, with global/local
+transforms, independent floating extras, resampling and independently verified restoration.
 Independent reference selection and precision limits are documented in
 [the conformance corpus](docs/CONFORMANCE_CORPUS.md#subsampled-and-mixed-component-patch-references-2026-09-13).
 GPU spline entropy decoding, bounded Catmull–Rom geometry and ordered tile rendering now execute
@@ -221,12 +223,12 @@ extras and immutable progressive updates have dedicated coverage. The official 6
 and bounded fragmented input. Independent plane extents now support unequal color/extra factors:
 extras use one complete interpolation filter before splines while color is expanded afterward.
 Modular YCbCr now uses independently sized JPEG component grids for integer and floating samples,
-then GPU component expansion, restoration, frame resampling and color conversion. The 464 native
+then GPU component expansion, restoration, frame resampling and color conversion. The 474 native
 streams cover all 64 sampling triples, every group dimension, global/LF/pass RCT/Palette/Squeeze,
 empty residuals, gray, independent extras, orientation and bounded progressive output. Native
-sidecars verify the transformed geometry of 232 global cases and 652 local substreams.
-Its broader patch/spline/noise and mixed-frame combinations, and broader original color domains,
-still need conformance coverage.
+sidecars verify the transformed geometry of 236 global cases and 664 local substreams.
+Spline interactions, physical LF-producer feature combinations, post-transform composition and
+broader original color domains still need conformance coverage.
 
 Integer decoding covers all 1–31-bit declarations. `native_modular_pixel_format` constructs
 Gray/RGB/RGBA layouts with 8-, 16-, or 32-bit storage and zero high padding. Unfiltered Modular

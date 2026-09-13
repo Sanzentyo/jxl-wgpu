@@ -662,17 +662,22 @@ physical seeds survive producer projection. Native comparisons cover 140 images,
 2×/4×/8× factors, custom weights, both LF root modes, noisy LF consumers and reference overwrites.
 VarDCT retains full-resolution JPEG component surfaces even when restoration, frame upsampling
 and noise need no expansion. Only shifted components allocate new planes, before patches; the
-same expansion is shared with restoration when enabled. A separate 276-image corpus covers all
+same expansion is shared with restoration when enabled. A separate 494-image corpus covers all
 64 JPEG selector triples at odd extents, filtered and noisy JPEG references, mixed Modular/VarDCT
 sources with resampling and extras, LF root changes, RGB/YCbCr crossings and all four overwritten
 reference slots. Whole/fragmented progression, final-only equality and exact reservation/release
 are checked. The corpus records native fast-renderer and extended-range CMS limitations with
-explicit independent references. Modular YCbCr now has a separate 464-stream corpus for independent
-component grids, global/LF/pass RCT/Palette/Squeeze and bounded progressive output. Its 232 global
-topologies and 652 local substreams are compared with native geometry before GPU execution. Empty
+explicit independent references. Its 218 new cases cover Modular YCbCr patches/noise, ordered
+transforms, independent extras, resampling, restoration and both directions of RGB/YCbCr and
+Modular/VarDCT references. New sRGB requests compare directly with preserved native samples;
+filtered equivalents also require agreement from jxl-oxide. Case families, source noise operations,
+oracle choices, controls and precision metrics are explicit metadata. Modular YCbCr also has a
+474-stream corpus for independent component grids, global/LF/pass RCT/Palette/Squeeze and bounded
+progressive output. Its 236 global topologies and 664 local substreams are compared with native geometry before GPU execution. Empty
 RCT inputs retain their channel positions without dispatch or uniform allocation. A documented
 scalar libjxl oracle covers wide inverse-Squeeze overflow in the native SIMD renderer. Broader
-Modular YCbCr patch/spline/noise, mixed-frame and original-color combinations remain open.
+Modular YCbCr spline interactions, physical LF-producer features, post-transform composition and
+original-color combinations remain open.
 
 Spline programs share the bounded Prefix/ANS/hybrid/LZ77 executor with patch dictionaries. Their
 six-context entropy prefix decodes to resident quantized coefficients and absolute control points;

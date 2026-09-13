@@ -1,6 +1,17 @@
-//! Component-domain patch references across coding modes and JPEG sampling layouts.
+//! Component-domain patch references with explicit source, oracle and control metadata.
 use super::{frame_features, noise, patches};
 use jxl_gpu_bitstream::CodestreamInventory;
+
+mod jpeg;
+mod mixed;
+mod modular_ycbcr;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    Jpeg,
+    Mixed,
+    ModularYcbcr,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pattern {
@@ -11,190 +22,133 @@ pub enum Pattern {
     JpegPadding,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceSource {
     NativeLinear,
     NativeSrgb,
     JxlOxideLinear,
+    /// Independently expanded 4:4:4 sources traverse the complete feature sequence and
+    /// isolate libjxl's vertically subsampled restoration defect.
+    ExpandedSrgb {
+        sources: [Source; 2],
+    },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Noise {
+    Preserve,
+    Zero,
+    Inject,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorErrorScale {
+    Component,
+    /// Unclamped alpha can produce large, opposing YCbCr components. Bound the RGB vector
+    /// instead of dividing by a single component which may cancel to almost zero.
+    PixelRgb,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    pub noise: Noise,
+}
+
+impl Source {
+    fn encode(&self) -> Vec<u8> {
+        let data = crate::offline::unhex(
+            &std::fs::read_to_string(
+                crate::decoder_directory().join(format!("test-data/{}.jxl.hex", self.name)),
+            )
+            .unwrap(),
+        );
+        match self.noise {
+            Noise::Preserve => data,
+            Noise::Inject => frame_features::with_noise(&data, false),
+            Noise::Zero => {
+                let info = inventory(&data);
+                let data = if info.frames.iter().any(|frame| frame.flags & 1 != 0) {
+                    data
+                } else {
+                    frame_features::with_noise(&data, false)
+                };
+                noise::zero_noise(&data, &inventory(&data), None)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Case {
     pub name: String,
-    pub sources: [String; 2],
-    pub zero_noise: bool,
+    pub sources: [Source; 2],
+    pub family: Family,
     pub pattern: Pattern,
+    pub reference_source: ReferenceSource,
+    pub linear_tolerance: f32,
+    /// Also freeze and directly compare native sRGB, without deriving it from GPU output.
+    pub encoded_tolerance: Option<f32>,
+    pub color_error_scale: ColorErrorScale,
+    /// Cases whose final reference must differ, such as an empty dictionary or zero noise.
+    pub controls: Vec<String>,
 }
 
 pub fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
-    for cb in 0..4 {
-        for y in 0..4 {
-            for cr in 0..4 {
-                for zero_noise in [false, true] {
-                    cases.push(Case {
-                        name: format!("jpeg_{cb}{y}{cr}{}", if zero_noise { "_zero" } else { "" }),
-                        // Different producer and consumer layouts prevent a matching stride
-                        // mistake in both frames from hiding behind a same-source patch.
-                        sources: [
-                            format!("jpeg_sampling/odd_{cr}{cb}{y}"),
-                            format!("jpeg_sampling/odd_{cb}{y}{cr}"),
-                        ],
-                        zero_noise,
-                        pattern: Pattern::AllModes,
-                    });
-                }
-                cases.push(Case {
-                    name: format!("jpeg_{cb}{y}{cr}_padding"),
-                    sources: [
-                        format!("jpeg_sampling/odd_{cr}{cb}{y}"),
-                        format!("jpeg_sampling/odd_{cb}{y}{cr}"),
-                    ],
-                    zero_noise: true,
-                    pattern: Pattern::JpegPadding,
-                });
-            }
-        }
-    }
-    for sampling in ["422", "440", "420"] {
-        for filter in ["gab", "epf1", "gab_epf2", "gab_epf3"] {
-            cases.push(Case {
-                name: format!("jpeg_{sampling}_{filter}"),
-                sources: [
-                    format!("noise/jpeg_{sampling}"),
-                    format!("noise/jpeg_{sampling}_{filter}"),
-                ],
-                zero_noise: false,
-                pattern: Pattern::AllModes,
-            });
-        }
-        for (suffix, pattern) in [("empty", Pattern::Empty), ("edge", Pattern::PaddedEdge)] {
-            cases.push(Case {
-                name: format!("jpeg_{sampling}_{suffix}"),
-                sources: std::array::from_fn(|_| format!("noise/jpeg_{sampling}")),
-                zero_noise: true,
-                pattern,
-            });
-        }
-    }
-    for (name, sources) in [
-        ("xyb", ["noise/modular_257x17", "noise/vardct_257x17"]),
-        ("xyb_up2", ["noise/modular_up2", "noise/vardct_up2"]),
-        ("xyb_up4", ["noise/modular_up4", "noise/vardct_up4"]),
-        ("xyb_up8", ["noise/modular_up8", "noise/vardct_up8"]),
-        (
-            "rgb",
-            ["noise/modular_rgb_group256", "noise/vardct_rgb_257x17"],
-        ),
-        ("rgb_up2", ["noise/modular_rgb_up2", "noise/vardct_rgb_up2"]),
-        ("rgb_up4", ["noise/modular_rgb_up4", "noise/vardct_rgb_up4"]),
-        ("rgb_up8", ["noise/modular_rgb_up8", "noise/vardct_rgb_up8"]),
-        (
-            "extras_up2",
-            [
-                "lf_patch_features/equal_up2_modular.lf1",
-                "lf_patch_features/equal_up2_vardct.lf1",
-            ],
-        ),
-        (
-            "extras_up4",
-            [
-                "lf_patch_features/equal_up4_modular.lf1",
-                "lf_patch_features/equal_up4_vardct.lf1",
-            ],
-        ),
-        (
-            "extras_up8",
-            [
-                "lf_patch_features/equal_up8_modular.lf1",
-                "lf_patch_features/equal_up8_vardct.lf1",
-            ],
-        ),
-        (
-            "lf_up8",
-            [
-                "lf_patch_features/equal_up8_modular",
-                "lf_patch_features/equal_up8_vardct",
-            ],
-        ),
-        (
-            "jpeg_modular",
-            ["noise/modular_rgb_group256", "noise/jpeg_420"],
-        ),
-        ("jpeg_rgb", ["noise/vardct_rgb_257x17", "noise/jpeg_422"]),
-    ] {
-        for reverse in [false, true] {
-            let sources = if reverse {
-                [sources[1], sources[0]]
-            } else {
-                sources
-            };
-            for (suffix, pattern) in [("empty", Pattern::Empty), ("patches", Pattern::AllModes)] {
-                cases.push(Case {
-                    name: format!("mixed_{name}_{}_{suffix}", u32::from(reverse)),
-                    sources: sources.map(str::to_owned),
-                    zero_noise: false,
-                    pattern,
-                });
-            }
-            if matches!(
-                name,
-                "xyb" | "rgb" | "extras_up8" | "jpeg_modular" | "jpeg_rgb"
-            ) {
-                cases.push(Case {
-                    name: format!("mixed_{name}_{}_overwrite", u32::from(reverse)),
-                    sources: sources.map(str::to_owned),
-                    zero_noise: false,
-                    pattern: Pattern::Overwrite,
-                });
-            }
-        }
-    }
+    jpeg::extend(&mut cases);
+    mixed::extend(&mut cases);
+    modular_ycbcr::extend(&mut cases);
     cases
 }
 
 impl Case {
-    pub fn reference_source(&self) -> ReferenceSource {
-        match self.name.as_str() {
-            // These component-domain crossings can produce sRGB values above two. libjxl's
-            // CMS approximates the extended-range curve; freeze its unconverted RGB and
-            // evaluate the specified transfer in f64 instead of relaxing precision bounds.
-            name if name.starts_with("mixed_jpeg_") => ReferenceSource::NativeSrgb,
-            // libjxl 0.12's fast renderer has a vertical-subsampling restoration defect.
-            // The existing noise_combinations test audits this exception with scalar f64
-            // Gaborish and jxl-oxide. Keep the same explicit selection for patched frames.
-            "jpeg_440_gab" | "jpeg_420_gab" | "jpeg_440_gab_epf3" | "jpeg_420_gab_epf3" => {
-                ReferenceSource::JxlOxideLinear
-            }
-            _ => ReferenceSource::NativeLinear,
+    fn new(name: String, sources: [String; 2], family: Family, pattern: Pattern) -> Self {
+        Self {
+            name,
+            sources: sources.map(|name| Source {
+                name,
+                noise: Noise::Preserve,
+            }),
+            family,
+            pattern,
+            reference_source: ReferenceSource::NativeLinear,
+            linear_tolerance: 1.0 / 1024.0,
+            encoded_tolerance: None,
+            color_error_scale: ColorErrorScale::Component,
+            controls: Vec::new(),
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_with_arithmetic(false)
+        self.encode_sources(&self.sources, false)
     }
 
     /// jxl-oxide 0.12.6 rejects implicit alpha in patch modes 4–7. The reference generator
     /// proves this arithmetic equivalent matches the original stream bit-for-bit in libjxl.
     pub fn encode_arithmetic_reference(&self) -> Vec<u8> {
-        assert_eq!(self.reference_source(), ReferenceSource::JxlOxideLinear);
+        assert_eq!(self.reference_source, ReferenceSource::JxlOxideLinear);
         assert_eq!(self.pattern, Pattern::AllModes);
-        self.encode_with_arithmetic(true)
+        self.encode_sources(&self.sources, true)
     }
 
-    fn encode_with_arithmetic(&self, arithmetic: bool) -> Vec<u8> {
-        let sources = self.sources.each_ref().map(|name| {
-            let data = crate::offline::unhex(
-                &std::fs::read_to_string(
-                    crate::decoder_directory().join(format!("test-data/{name}.jxl.hex")),
-                )
-                .unwrap(),
-            );
-            if self.zero_noise {
-                noise::zero_noise(&data, &inventory(&data), None)
-            } else {
-                data
-            }
-        });
+    pub fn encode_expanded_reference(&self) -> Vec<u8> {
+        self.encode_sources(self.expanded_sources(), false)
+    }
+
+    pub fn encode_expanded_arithmetic_reference(&self) -> Vec<u8> {
+        self.encode_sources(self.expanded_sources(), true)
+    }
+
+    fn expanded_sources(&self) -> &[Source; 2] {
+        let ReferenceSource::ExpandedSrgb { sources } = &self.reference_source else {
+            panic!("case does not declare expanded reference sources");
+        };
+        sources
+    }
+
+    fn encode_sources(&self, sources: &[Source; 2], arithmetic: bool) -> Vec<u8> {
+        let sources = sources.each_ref().map(Source::encode);
         let dictionaries = sources.each_ref().map(|data| {
             let inventory = inventory(data);
             let frame = inventory.frames.last().unwrap();
@@ -239,7 +193,7 @@ impl Case {
                     coded.height.div_ceil(v) * v - 2,
                     1,
                 ]
-            } else if arithmetic {
+            } else if arithmetic && self.pattern != Pattern::Empty {
                 assert!(inventory.image_header.extra_channels.is_empty());
                 patches::arithmetic_values(&coded, 16)
             } else {

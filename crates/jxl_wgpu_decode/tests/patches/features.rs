@@ -3,6 +3,7 @@ use super::*;
 use jxl_wgpu_decode::{FrameProgression, OrientationPolicy};
 
 use jxl_test_support::fixtures::patch_features as corpus;
+use jxl_test_support::fixtures::patch_references::ColorErrorScale;
 
 #[test]
 fn patch_features_match_native_and_preserve_progressive_images() {
@@ -54,41 +55,115 @@ fn check_features(lf: bool) {
                     .any(|frame| frame.flags & 2 != 0 && frame.lf_level != 0),
                 family.lf
             );
-            check_image(&backend, &name, &data, &reference(&name), 1.0 / 1024.0);
+            check_image(
+                &backend,
+                &name,
+                &data,
+                ImageReferences {
+                    linear: ImageReference {
+                        samples: &reference(&name),
+                        tolerance: 1.0 / 1024.0,
+                    },
+                    srgb: None,
+                    scale: ColorErrorScale::Component,
+                },
+            );
         }
     }
+}
+
+pub(super) struct ImageReference<'a> {
+    pub samples: &'a [f32],
+    pub tolerance: f32,
+}
+
+pub(super) struct ImageReferences<'a> {
+    pub linear: ImageReference<'a>,
+    pub srgb: Option<ImageReference<'a>>,
+    pub scale: ColorErrorScale,
+}
+
+fn compare_color(
+    actual: &[u32],
+    expected: &[f32],
+    tolerance: f32,
+    scale: ColorErrorScale,
+    label: &str,
+) {
+    if scale == ColorErrorScale::Component {
+        return compare(actual, expected, tolerance, label);
+    }
+    assert_eq!(actual.len(), expected.len(), "{label}");
+    assert!(actual.len().is_multiple_of(4));
+    let mut maximum = 0f32;
+    for (pixel, (actual, expected)) in actual
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let rgb_scale = 1.0 + expected[..3].iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for channel in 0..4 {
+            let value = f32::from_bits(actual[channel]);
+            let error = (value - expected[channel]).abs()
+                / if channel == 3 {
+                    1.0 + expected[channel].abs()
+                } else {
+                    rgb_scale
+                };
+            let bound = if channel == 3 { 2e-6 } else { tolerance };
+            assert!(
+                value.is_finite() && expected[channel].is_finite() && error <= bound,
+                "{label}/pixel{pixel}/channel{channel}: {value} vs {}, error {error}",
+                expected[channel]
+            );
+            maximum = maximum.max(error);
+        }
+    }
+    eprintln!("{label}: max RGB-vector/independent-alpha normalized error {maximum}");
 }
 
 pub(super) fn check_image(
     backend: &WgpuBackend,
     name: &str,
     data: &[u8],
-    reference_samples: &[f32],
-    linear_tolerance: f32,
+    references: ImageReferences<'_>,
 ) {
     let info = inventory(data);
     eprintln!("patch feature {name}");
     let pixels = info.image_header.width as usize * info.image_header.height as usize;
     assert_eq!(
-        reference_samples.len(),
+        references.linear.samples.len(),
         pixels * (4 + info.image_header.extra_channels.len())
     );
+    if let Some(srgb) = &references.srgb {
+        assert_eq!(srgb.samples.len(), references.linear.samples.len());
+        assert_eq!(
+            &srgb.samples[pixels * 4..],
+            &references.linear.samples[pixels * 4..]
+        );
+    }
     let mut linear_words: Option<Vec<u32>> = None;
     for linear in [true, false] {
-        let mut expected = reference_samples[..pixels * 4].to_vec();
+        let mut expected = references.linear.samples[..pixels * 4].to_vec();
         if !linear {
-            // Reference IDCT rounding is amplified near black by the nonlinear transfer.
-            // Check accuracy against the reference in linear light, then independently check
-            // that the sRGB request applies the analytic OETF to those validated values.
-            expected = linear_words
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|&word| f32::from_bits(word))
-                .collect();
-            for (index, value) in expected.iter_mut().enumerate() {
-                if index % 4 != 3 {
-                    *value = srgb(*value);
+            if let Some(srgb) = &references.srgb {
+                expected.copy_from_slice(&srgb.samples[..pixels * 4]);
+            } else {
+                // Reference IDCT rounding is amplified near black by the nonlinear transfer.
+                // Check accuracy against the reference in linear light, then independently check
+                // that the sRGB request applies the analytic OETF to those validated values.
+                expected = linear_words
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|&word| f32::from_bits(word))
+                    .collect();
+                for (index, value) in expected.iter_mut().enumerate() {
+                    if index % 4 != 3 {
+                        *value = srgb(*value);
+                    }
                 }
             }
         }
@@ -134,11 +209,19 @@ pub(super) fn check_image(
                 images.push(update);
             }
             assert!(snapshots.last().unwrap().0.is_none());
-            let tolerance = if linear { linear_tolerance } else { 2e-6 };
-            compare(
+            let tolerance = if linear {
+                references.linear.tolerance
+            } else {
+                references
+                    .srgb
+                    .as_ref()
+                    .map_or(2e-6, |reference| reference.tolerance)
+            };
+            compare_color(
                 &snapshots.last().unwrap().1,
                 &expected,
                 tolerance,
+                references.scale,
                 &format!("{name}/linear{linear}/{limit:?}"),
             );
             if linear && linear_words.is_none() {
@@ -173,10 +256,16 @@ pub(super) fn check_image(
             .unwrap()
             .with_stream_window_limit(NonZeroU64::new(256).unwrap()),
     );
-    for channel in 0..info.image_header.extra_channels.len() {
+    for (channel, extra) in info.image_header.extra_channels.iter().enumerate() {
+        let mapping = match extra.bit_depth {
+            jxl_gpu_bitstream::SampleBitDepth::Integer { .. } => {
+                NumericSampleMapping::NormalizedUnsigned
+            }
+            jxl_gpu_bitstream::SampleBitDepth::Float { .. } => NumericSampleMapping::NativeFloat,
+        };
         let request = GpuOutputRequest::numeric(
             jxl_gpu_formats::vpi::VpiPitchLinearFormat::F32.pixel_format(),
-            NumericSampleMapping::NormalizedUnsigned,
+            mapping,
         )
         .unwrap()
         .with_extra_channel(channel as u32)
@@ -189,7 +278,7 @@ pub(super) fn check_image(
         let offset = (4 + channel) * pixels;
         compare(
             &planes::read(backend, &image.output().outputs[0]),
-            &reference_samples[offset..offset + pixels],
+            &references.linear.samples[offset..offset + pixels],
             2e-6,
             &format!("{name}/extra{channel}"),
         );

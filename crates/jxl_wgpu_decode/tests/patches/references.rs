@@ -1,27 +1,33 @@
 use super::*;
-use jxl_test_support::fixtures::patch_references::{self as corpus, Pattern};
+use jxl_gpu_bitstream::FrameEncoding;
+use jxl_test_support::fixtures::patch_references::{self as corpus, Family};
 
 #[test]
 fn subsampled_component_references_match_independent_decoders_with_bounded_progression() {
-    check_references(false);
+    check_references(Family::Jpeg);
 }
 
 #[test]
 fn mixed_component_references_match_native_with_bounded_progression() {
-    check_references(true);
+    check_references(Family::Mixed);
 }
 
-fn check_references(mixed: bool) {
+#[test]
+fn modular_ycbcr_component_references_match_native_with_bounded_progression() {
+    check_references(Family::ModularYcbcr);
+}
+
+fn check_references(family: Family) {
     let backend = backend();
     for case in corpus::cases()
         .into_iter()
-        .filter(|case| case.name.starts_with("mixed_") == mixed)
+        .filter(|case| case.family == family)
     {
         let name = format!("references/{}", case.name);
         let data = encoded(&name);
         assert_eq!(data, case.encode(), "fixture recipe drift: {name}");
         let info = inventory(&data);
-        if mixed {
+        if family == Family::Mixed {
             let first = info.frames.first().unwrap();
             assert!(
                 info.frames
@@ -30,26 +36,45 @@ fn check_references(mixed: bool) {
                         || frame.do_ycbcr != first.do_ycbcr)
             );
         } else {
-            assert!(info.frames.iter().all(|frame| frame.do_ycbcr));
+            let encoding = match family {
+                Family::Jpeg => FrameEncoding::VarDct,
+                Family::ModularYcbcr => FrameEncoding::Modular,
+                Family::Mixed => unreachable!(),
+            };
+            assert!(
+                info.frames
+                    .iter()
+                    .all(|frame| frame.do_ycbcr && frame.encoding == encoding)
+            );
         }
         let expected = reference(&name);
-        eprintln!("{name}: {:?} linear reference", case.reference_source());
-        if case.pattern == Pattern::AllModes && mixed {
-            let control = name.strip_suffix("_patches").unwrap().to_owned() + "_empty";
-            assert_ne!(expected, reference(&control), "patches must affect {name}");
+        eprintln!("{name}: {:?} linear reference", case.reference_source);
+        for control in &case.controls {
+            assert_ne!(
+                expected,
+                reference(&format!("references/{control}")),
+                "control {control} must differ from {name}"
+            );
         }
-        if case.zero_noise
-            && let Some(nonzero) = name.strip_suffix("_zero")
-        {
-            assert_ne!(expected, reference(nonzero), "noise must affect {name}");
-        }
-        let tolerance = match case.reference_source() {
-            corpus::ReferenceSource::NativeLinear | corpus::ReferenceSource::NativeSrgb => {
-                1.0 / 1024.0
-            }
-            corpus::ReferenceSource::JxlOxideLinear => 1e-5,
-        };
-        features::check_image(&backend, &name, &data, &expected, tolerance);
+        let srgb = case
+            .encoded_tolerance
+            .map(|_| reference(&format!("{name}.srgb")));
+        features::check_image(
+            &backend,
+            &name,
+            &data,
+            features::ImageReferences {
+                linear: features::ImageReference {
+                    samples: &expected,
+                    tolerance: case.linear_tolerance,
+                },
+                srgb: srgb.as_deref().map(|samples| features::ImageReference {
+                    samples,
+                    tolerance: case.encoded_tolerance.unwrap(),
+                }),
+                scale: case.color_error_scale,
+            },
+        );
     }
 }
 

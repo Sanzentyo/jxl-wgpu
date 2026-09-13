@@ -16,6 +16,9 @@ The module tree follows the source tree:
 writing. `fixtures::patches` and `fixtures::splines` define their respective scenarios using that
 shared contract. A frame explicitly declares its patch and spline programs; assembly preserves
 their codestream order without reaching into another test target or example's private files.
+`fixtures::patch_references` has ordinary `jpeg`, `mixed` and `modular_ycbcr` submodules. Each
+case declares its family, source noise operation, oracle, comparison controls and precision metric.
+Filename prefixes and suffixes do not select test behavior or oracle exceptions.
 
 Each decoder integration target has a `tests/<target>/main.rs` entry point. Its private modules
 live below that directory and use ordinary `mod` declarations. Examples with private helpers
