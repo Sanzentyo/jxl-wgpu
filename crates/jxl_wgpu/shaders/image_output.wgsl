@@ -53,6 +53,14 @@ fn source_coordinate(destination: vec2<u32>) -> vec2<u32> {
     );
 }
 
+fn source_rgb_at(x: u32, y: u32) -> vec3<f32> {
+    return bitcast<vec3<f32>>(source_rgb_words_at(x, y));
+}
+
+fn source_alpha_at(x: u32, y: u32) -> f32 {
+    return bitcast<f32>(source_alpha_word_at(x, y));
+}
+
 fn target_linear_rgb_at(x: u32, y: u32) -> vec3<f32> {
     let source = source_rgb_at(x, y);
     let source_linear = vec3<f32>(
@@ -236,14 +244,24 @@ fn rgb_component_at(x: u32, y: u32, component: u32) -> f32 {
 }
 
 fn rgb_byte_at(x: u32, y: u32, component: u32, byte: u32) -> u32 {
-    let value = rgb_component_at(x, y, component);
     if params.bits == 32u {
-        return (bitcast<u32>(value) >> (byte * 8u)) & 0xffu;
+        var word: u32;
+        if component == 3u {
+            word = source_alpha_word_at(x, y);
+        } else if params.identity_color_transform != 0u && params.alpha.x == 0u {
+            // A float round trip may flush subnormals or change NaN/zero representations.
+            // Preserve an unchanged F32 component as an integer word through packing.
+            word = source_rgb_words_at(x, y)[component];
+        } else {
+            word = bitcast<u32>(rgb_component_at(x, y, component));
+        }
+        return (word >> (byte * 8u)) & 0xffu;
     }
-    return quantize8(value, 0u);
+    return quantize8(rgb_component_at(x, y, component), 0u);
 }
 
 fn stored_rgb_component(position: u32) -> u32 {
+    if params.order == 4u { return select(0u, 3u, position == 1u); }
     if (params.order == 1u || params.order == 3u) && position < 3u {
         return 2u - position;
     }
@@ -273,9 +291,9 @@ fn byte_at(index: u32) -> u32 {
         let row_bytes = params.width * rgb_sample_bytes;
         if plane_contains(index, params.plane0_offset, params.plane0_stride, row_bytes, params.height) {
             plane = 0u; local = plane_local(index, params.plane0_offset, params.plane0_stride);
-        } else if plane_contains(index, params.plane1_offset, params.plane1_stride, row_bytes, params.height) {
+        } else if params.channels > 1u && plane_contains(index, params.plane1_offset, params.plane1_stride, row_bytes, params.height) {
             plane = 1u; local = plane_local(index, params.plane1_offset, params.plane1_stride);
-        } else if plane_contains(index, params.plane2_offset, params.plane2_stride, row_bytes, params.height) {
+        } else if params.channels > 2u && plane_contains(index, params.plane2_offset, params.plane2_stride, row_bytes, params.height) {
             plane = 2u; local = plane_local(index, params.plane2_offset, params.plane2_stride);
         } else if params.channels == 4u && plane_contains(index, params.plane3_offset, params.plane3_stride, row_bytes, params.height) {
             plane = 3u; local = plane_local(index, params.plane3_offset, params.plane3_stride);

@@ -5,7 +5,7 @@ use jxl_gpu_bitstream::{
     EdgePreservingFilterInventory, FrameInventory, ImageHeaderInventory, RestorationFilterInventory,
 };
 use jxl_gpu_formats::{ColorSpecification, ImageLayout, PixelFormat, RgbChannelOrder};
-use jxl_gpu_protocol::{Extent2d, OutputOrientation, RgbColorEncoding};
+use jxl_gpu_protocol::{Extent2d, OutputOrientation};
 use jxl_wgpu::{
     ResidentEpfInputs, ResidentEpfParameters, ResidentEpfPipeline, ResidentEpfSigma,
     ResidentF32Plane, ResidentGaborishInputs, ResidentGaborishPipeline, ResidentGaborishWeights,
@@ -118,10 +118,7 @@ impl ModularReconstructionConfig {
             && request.frame_surface_encoding()
                 == crate::frame_surface::FrameSurfaceEncoding::Encoded;
         let (transform, linear_black_threshold) = if encoded {
-            (
-                ColorOutputTransform::Rgb(RgbColorEncoding::LINEAR_BT709),
-                None,
-            )
+            (None, None)
         } else {
             let original = crate::image_color::require_original_encoding(image)?;
             let transform = match self.components {
@@ -144,7 +141,7 @@ impl ModularReconstructionConfig {
                     )
                 })
                 .flatten();
-            (transform, threshold)
+            (Some(transform), threshold)
         };
         Ok(ModularColorConfig {
             reconstruction: self,
@@ -157,7 +154,8 @@ impl ModularReconstructionConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModularColorConfig {
     reconstruction: ModularReconstructionConfig,
-    transform: ColorOutputTransform,
+    /// Absent when reconstruction ends at codec components with no color interpretation.
+    transform: Option<ColorOutputTransform>,
     linear_black_threshold: Option<f32>,
 }
 
@@ -174,7 +172,7 @@ const _: () = assert!(std::mem::size_of::<NormalizeColorParams>() == 80);
 pub(super) struct ColorPlan {
     reconstruction: ReconstructionPlan,
     layout: ImageLayout,
-    output_config: ColorOutputConfig,
+    output_config: Option<ColorOutputConfig>,
     pub storage_bytes: u64,
     pub uniform_bytes: u64,
 }
@@ -199,17 +197,24 @@ impl ColorPlan {
         {
             return invalid("Modular color reconstruction requires equal color grids");
         }
-        let output_config = ColorOutputConfig {
+        let output_config = config.transform.map(|transform| ColorOutputConfig {
             linear_black_threshold: config.linear_black_threshold,
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
             extent,
             orientation: OutputOrientation::Identity,
-            transform: config.transform,
+            transform,
             alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
-        };
+        });
         let reconstruction =
             ReconstructionPlan::new(config.reconstruction, extent, sources, factors[0], limits)?;
-        let format = PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, target);
+        let format = if output_config.is_some() {
+            PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, target)
+        } else {
+            if target != ColorSpecification::Undefined {
+                return invalid("codec components cannot declare a color output encoding");
+            }
+            crate::frame_surface::FrameSurfaceEncoding::Encoded.format()
+        };
         let packed = ImageLayout::packed(extent, format.clone())?;
         let layouts = packed
             .planes
@@ -222,11 +227,17 @@ impl ColorPlan {
             })
             .collect();
         let layout = ImageLayout::from_planes(extent, format, layouts)?;
-        output_config.validate_layout(&layout)?;
-        let packing = ColorOutputPlan::for_limits(&layout, limits)?;
+        let packing_bytes = if let Some(config) = output_config {
+            config.validate_layout(&layout)?;
+            ColorOutputPlan::for_limits(&layout, limits)?
+                .memory
+                .uniform_bytes
+        } else {
+            0
+        };
         Ok(Self {
             storage_bytes: reconstruction.storage_bytes,
-            uniform_bytes: reconstruction.uniform_bytes + packing.memory.uniform_bytes,
+            uniform_bytes: reconstruction.uniform_bytes + packing_bytes,
             reconstruction,
             layout,
             output_config,
@@ -498,6 +509,18 @@ impl ColorPipeline {
                 weights,
             },
         )?;
+        let Some(config) = plan.output_config else {
+            crate::frame_surface::copy::planes(
+                encoder,
+                &resident_planes(
+                    plan.reconstruction.output_buffers(buffers),
+                    plan.reconstruction.output_extent,
+                )?,
+                output,
+                &plan.layout,
+            )?;
+            return Ok(uniforms);
+        };
         let packed = self.output.encode(
             device,
             encoder,
@@ -515,7 +538,7 @@ impl ColorPipeline {
                 alpha: None,
                 output,
                 layout: &plan.layout,
-                config: plan.output_config,
+                config,
             },
         )?;
         uniforms.extend([packed.uniform, packed.source_uniform]);
@@ -805,6 +828,7 @@ mod tests {
     use super::*;
     use crate::modular_sample::ModularSampleEncoding;
     use crate::modular_transform::GpuModularChannelLayout;
+    use jxl_gpu_protocol::RgbColorEncoding;
 
     #[test]
     fn lf_reconstruction_retains_only_final_plane_reservations() {
@@ -937,7 +961,7 @@ mod tests {
         };
         let config = ModularColorConfig {
             reconstruction,
-            transform: ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709),
+            transform: Some(ColorOutputTransform::Rgb(RgbColorEncoding::SRGB_BT709)),
             linear_black_threshold: None,
         };
         let limits = wgpu::Limits::default();

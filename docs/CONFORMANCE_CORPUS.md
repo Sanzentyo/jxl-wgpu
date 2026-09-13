@@ -3920,9 +3920,55 @@ physical-frame entropy. Native integer color and independent alpha depths, plus 
 IEEE-754 words including signed zero, subnormals and nonfinite values, remain exact. No existing
 fixture or expected word is changed.
 
-All eight native color-output requests still return typed `UnsupportedProfile(ColorEncoding)`
-without leaking reservations. This checkpoint separates codec reconstruction from color conversion;
-it does not establish ICC color reconstruction, composition, requested ICC packing, or full
-JPEG XL conformance. Native default output is a verified raw-word oracle only for the original
-lossless Modular cases. Explicit native ICC requests and profile labels alone are insufficient
-as color-conversion references, as documented by the generator.
+At this numeric checkpoint all eight color-output requests were rejected. Original ICC color
+execution is covered by the following checkpoint; XYB color remains rejected without leaking
+reservations. Native default output preserves exact input words only for lossless Modular;
+VarDCT needs its independently decoded native pixels. Explicit native ICC requests and profile
+labels alone are insufficient as color-conversion references, as documented by the generator.
+
+## Original ICC color execution and device packing
+
+The original 12 embedded files remain unchanged. Another 28 references bring this corpus to
+40 files: each of the four original-color streams has native device F32, native linear/sRGB/other
+ICC results, and independent f64-derived results for those three conversions. Native original
+VarDCT output verifies both original/data ICC bytes before returning pixels. Conversion uses
+Little CMS 2.19 with relative intent, `NOOPTIMIZE | NOCACHE`. The linear endpoint uses the XYZ
+double interface and independent CIE/Bradford geometry; no surrogate linear ICC changes its basis.
+Shared offline headers live under `tools/jxl_test_support/native/icc`, separately from all
+production Rust/WGSL code. Their relocation reproduces all 223 resident-ICC files unchanged using
+the original generator command and compiler contraction policy.
+
+The generator checks every native converted component against the independently propagated
+native precision interval. The decoder's primary color comparisons use independent scalar
+results; native bytes remain in the corpus. In one Gray VarDCT→RGB case, native sampled-curve
+precision differs from the scalar result by about 0.000388 near black. The GPU's maximum error
+for that conversion is below 0.0000023. This difference is retained and explained, rather than
+replacing native data or expanding the GPU test's tolerance to fit it. Decoder color comparisons
+include the separately checked VarDCT reconstruction error; the fixed end-to-end F32 limit is
+2e-4, while original device VarDCT samples must stay within 2e-5. Lossless Modular device output
+and every alpha word remain exact.
+
+Whole input and 43-byte fragments with 256-byte entropy windows cover RGB/Gray and both codecs,
+planar/interleaved F32, same-profile output and requested enumerated/other ICC conversion. U8
+tests cover Gray/Gray-alpha and RGB/BGR/RGBA/BGRA, including plane padding and alpha association
+before quantization. Metadata-only substitutions into four floating fixtures preserve all IEEE
+words under same-profile F32 output; this bypass does not select a CMS intent or evaluate curves.
+A six-presentation Gray fixture changes only its color declaration, then checks original-domain
+Add/Multiply algebra above one and Exif-six orientation against the established native case.
+
+Private GPU tests verify failed output, transient and first-program admissions independently,
+exact repeated retry, reuse without a second program reservation, and cancellation while a caller
+holds the output. Completion releases the source, intermediate, uniforms and program exactly once.
+The existing recursive LF oracle also covers non-color component surfaces with standard/custom
+Up8 weights, levels one through four, odd and one-pixel axes, poisoned input padding and exact
+admission. Component previews omit both color conversion and its 368-byte uniform reservation.
+The shared image-output source interface carries binary32 words. A separate actual-GPU test
+checks 64 combinations of all eight orientations, RGB/BGR/RGBA/BGRA and planar/interleaved
+packing against integer references containing signed zeros, both signs of subnormals and
+infinities, and signaling/quiet NaNs with independent payloads. Original Modular normalization
+and unchanged F32 packing use integer words throughout, avoiding WGSL floating reinterpretation.
+The native scalar packer independently checks 64 oriented Gray/RGB color, alpha and depth-plane
+selections against literal IEEE words, including signaling NaNs and poisoned alignment gaps.
+ICC color reconstruction from XYB/YCbCr, enumerated-source ICC targets, spot rendering, standalone
+color entry points, LUT/MPE/Lab/CMYK, full intent/HDR/display integration and browser execution
+conformance remain open. The full JPEG XL goal and affected roadmap rows remain **Partial**.

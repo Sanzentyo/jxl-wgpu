@@ -25,7 +25,8 @@ mod tests;
 #[derive(Clone)]
 pub(super) struct LfPreview {
     backend: WgpuBackend,
-    config: ColorOutputConfig,
+    extent: Extent2d,
+    output: PreviewOutput,
     inverse_opsin: InverseOpsin,
     original_encoding: jxl_gpu_protocol::RgbColorEncoding,
     pub(super) layout: ImageLayout,
@@ -33,11 +34,31 @@ pub(super) struct LfPreview {
     pub(super) surface_encoding: Option<crate::frame_surface::FrameSurfaceEncoding>,
     pub(super) compositor: Option<Arc<super::gpu::Compositor>>,
     extra_count: usize,
-    output_plan: ColorOutputPlan,
     output_storage_bytes: u64,
     kernel: Arc<ResidentUpsampleKernel>,
     upsample: Arc<ResidentUpsamplePipeline>,
     packer: Arc<ColorOutputPacker>,
+}
+
+#[derive(Clone)]
+struct ColorPreview {
+    config: ColorOutputConfig,
+    plan: ColorOutputPlan,
+}
+
+#[derive(Clone)]
+enum PreviewOutput {
+    Color(Box<ColorPreview>),
+    Components,
+}
+
+impl PreviewOutput {
+    fn transient_bytes(&self) -> u64 {
+        match self {
+            Self::Color(color) => color.plan.memory.transient_bytes,
+            Self::Components => 0,
+        }
+    }
 }
 
 impl std::fmt::Debug for LfPreview {
@@ -114,11 +135,14 @@ impl LfPreview {
             surface_encoding: None,
             compositor,
             extra_count: image.extra_channels.len(),
-            config,
+            extent: config.extent,
+            output: PreviewOutput::Color(Box::new(ColorPreview {
+                config,
+                plan: output_plan,
+            })),
             inverse_opsin,
             original_encoding: crate::image_color::require_original_encoding(image)?,
             layout,
-            output_plan,
             output_storage_bytes: output_plan.memory.output_storage_bytes,
             kernel: Arc::new(kernel),
             upsample: Arc::new(ResidentUpsamplePipeline::new(device)?),
@@ -141,39 +165,35 @@ impl LfPreview {
         let surface = crate::frame_surface::FrameSurfaceLayout::with_encoding(
             extent,
             self.extra_count,
-            encoding,
+            encoding.clone(),
             &self.backend.device().limits(),
         )?;
-        let config = ColorOutputConfig {
-            linear_black_threshold: if encoding
-                == crate::frame_surface::FrameSurfaceEncoding::Encoded
-            {
-                None
-            } else {
-                crate::image_color::reconstruction_black_threshold(
+        let output = if encoding == crate::frame_surface::FrameSurfaceEncoding::Encoded {
+            PreviewOutput::Components
+        } else {
+            let config = ColorOutputConfig {
+                linear_black_threshold: crate::image_color::reconstruction_black_threshold(
                     self.original_encoding,
                     &surface.color.format.color_spec,
-                )
-            },
-            white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
-            extent,
-            orientation: OutputOrientation::Identity,
-            alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
-            transform: if encoding == crate::frame_surface::FrameSurfaceEncoding::Encoded {
-                ColorOutputTransform::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
-            } else {
-                ColorOutputTransform::Xyb(self.inverse_opsin)
-            },
+                ),
+                white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
+                extent,
+                orientation: OutputOrientation::Identity,
+                alpha_conversion: jxl_wgpu::AlphaConversion::Preserve,
+                transform: ColorOutputTransform::Xyb(self.inverse_opsin),
+            };
+            config.validate_layout(&surface.color)?;
+            PreviewOutput::Color(Box::new(ColorPreview {
+                config,
+                plan: ColorOutputPlan::for_limits(&surface.color, &self.backend.device().limits())?,
+            }))
         };
-        config.validate_layout(&surface.color)?;
-        let output_plan =
-            ColorOutputPlan::for_limits(&surface.color, &self.backend.device().limits())?;
         Ok(Self {
-            config,
+            extent,
+            output,
             layout: surface.color.clone(),
             surface: Some(surface.clone()),
             surface_encoding: Some(encoding),
-            output_plan,
             output_storage_bytes: surface.storage_bytes,
             ..self.clone()
         })
@@ -198,8 +218,8 @@ impl LfPreview {
         let extent_at = |level| {
             let divisor = 1_u32 << (3 * level);
             Extent2d::new(
-                self.config.extent.width.div_ceil(divisor),
-                self.config.extent.height.div_ceil(divisor),
+                self.extent.width.div_ceil(divisor),
+                self.extent.height.div_ceil(divisor),
             )
         };
         let input_extent = extent_at(level);
@@ -238,7 +258,7 @@ impl LfPreview {
         let transient_bytes = sizes.iter().sum::<u64>() * channels as u64
             + u64::from(level) * channels as u64 * ResidentUpsamplePipeline::UNIFORM_BYTES
             + self.kernel.weight_bytes()
-            + self.output_plan.memory.transient_bytes
+            + self.output.transient_bytes()
             + completion_fence_bytes();
         let poll = self.backend.submission_poller().try_reserve()?;
         let mut permit = self
@@ -333,22 +353,39 @@ impl LfPreview {
                 )?);
             }
         }
-        let scratch = self.packer.encode(
-            device,
-            &mut encoder,
-            ColorOutputInputs {
-                planes: std::array::from_fn(|channel| ColorOutputPlane {
-                    storage: binding(&stages.last().expect("nonzero LF level")[channel]),
-                    width: self.config.extent.width,
-                    height: self.config.extent.height,
-                    stride: self.config.extent.width,
-                }),
-                alpha: None,
-                output: binding(output.as_wgpu_buffer()),
-                layout: &self.layout,
-                config: self.config,
-            },
-        )?;
+        let final_planes: [_; 3] = std::array::from_fn(|channel| ResidentF32Plane {
+            storage: binding(&stages.last().expect("nonzero LF level")[channel]),
+            width: self.extent.width,
+            height: self.extent.height,
+            stride: self.extent.width,
+        });
+        let scratch = match &self.output {
+            PreviewOutput::Color(color) => Some(self.packer.encode(
+                device,
+                &mut encoder,
+                ColorOutputInputs {
+                    planes: final_planes.map(|plane| ColorOutputPlane {
+                        storage: plane.storage,
+                        width: plane.width,
+                        height: plane.height,
+                        stride: plane.stride,
+                    }),
+                    alpha: None,
+                    output: binding(output.as_wgpu_buffer()),
+                    layout: &self.layout,
+                    config: color.config,
+                },
+            )?),
+            PreviewOutput::Components => {
+                crate::frame_surface::copy::planes(
+                    &mut encoder,
+                    &final_planes,
+                    binding(output.as_wgpu_buffer()),
+                    &self.layout,
+                )?;
+                None
+            }
+        };
         if let Some(surface) = &self.surface {
             for (channel, layout) in surface.extras.iter().enumerate() {
                 encoder.copy_buffer_to_buffer(
@@ -356,7 +393,7 @@ impl LfPreview {
                     0,
                     output.as_wgpu_buffer(),
                     layout.planes[0].offset,
-                    u64::from(self.config.extent.width) * u64::from(self.config.extent.height) * 4,
+                    u64::from(self.extent.width) * u64::from(self.extent.height) * 4,
                 );
             }
         }

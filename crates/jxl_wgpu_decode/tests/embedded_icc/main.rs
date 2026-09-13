@@ -9,6 +9,7 @@ use jxl_wgpu_decode::{
 };
 use std::num::NonZeroU64;
 
+mod color;
 mod numeric;
 mod profile;
 
@@ -123,7 +124,7 @@ fn native_icc_declarations_and_scalar_alpha_survive_both_codecs() {
 fn icc_color_conversion_requires_execution_and_cannot_be_enabled_by_metadata() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-    for case in corpus::cases() {
+    for case in corpus::cases().filter(|case| case.xyb) {
         let data = case.bytes();
         let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format()).unwrap();
         assert!(matches!(decoder.open(&data, request),

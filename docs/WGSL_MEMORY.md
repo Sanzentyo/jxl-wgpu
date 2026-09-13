@@ -432,7 +432,8 @@ Target chroma subsampling averages only valid oriented pixels, then packing quan
 8/10/12/16-bit codes, or writes IEEE 754 F32 RGB components without quantization. RGB storage kinds
 0/1 use `bits = storage_bits = 32` for F32 and 8 for U8. Every invocation still owns one output word;
 byte extraction supports unaligned float plane starts and row pitches. A source fragment supplies
-`source_rgb_at` and linear `source_alpha_at` in output coordinates: unclipped linear BT.709 for XYB
+`source_rgb_words_at` and `source_alpha_word_at` as binary32 words in output coordinates:
+unclipped linear BT.709 for XYB
 or the validated original RGB encoding after JPEG component conversion; no intermediate RGB
 allocation or queue submission is added. The requested `ImageLayout`
 defines output lease bytes, plane gaps, row pitches, and four-byte final storage rounding. Range
@@ -701,15 +702,17 @@ observable in-flight total before the shader is advertised as supported.
 ## Decoder crop/blend composition ABI and lifetime
 
 `jxl_wgpu_decode::codec_engine::composition` retains an explicitly tagged sample domain followed
-by every extra plane in one F32 allocation. Domains are sRGB, linear RGB, and codec components
+by every extra plane in one F32 allocation. Domains are enumerated RGB, original ICC RGB/Gray,
+linear RGB, and codec components
 before inverse color conversion. The last domain is carried by the private producer request and
 import contract; it cannot be inferred from a pixel format and cannot be passed to final packing.
-Blending and post-transform references require sRGB; unreferenced XYB presentations can keep
+Blending and post-transform references require the original domain; unreferenced enumerated XYB presentations can keep
 linear RGB until final packing.
 A plane has `width * height` samples and its starting byte
 offset is aligned to `max(4, min_storage_buffer_offset_alignment)`. The complete allocation is
-`(3 + extra_count) * aligned_plane_bytes`. `FrameSurfaceLayout` validates this total against
-buffer/binding/u32 limits before allocating extra views. Output 0 describes only the three color
+`(color_count + extra_count) * aligned_plane_bytes`, with one ICC Gray plane or three RGB/codec
+planes. `FrameSurfaceLayout` validates this total against
+buffer/binding/u32 limits before allocating extra views. Output 0 describes only the color
 planes; outputs 1 onward describe independently normalized scalar extras with their real global
 offsets and logical ends. Every output aliases the same tracked `GpuBufferLease`, so one allocation
 is charged once. Import validates layout, extent, output IDs and buffer identity. Only the private
@@ -764,7 +767,10 @@ Linear/sRGB/BT.709 are admitted from the image inventory, including original RGB
 Composition and reference storage use original encoding; standalone XYB can retain linear-original
 primaries. Primary matrices share one exact D65 chromaticity, are multiplied in host F64 and lowered
 once to F32 uniforms, including display conversion. Component surfaces retain a separate explicit
-tag. Their identity carrier layout never claims that codec components are public linear RGB.
+tag and three planar non-color F32 fields. Checked GPU copies preserve component words without
+an enumerated RGB carrier or color-packing uniforms. RGB and ICC device domains are explicit;
+an inverse color operation returns its new layout with its buffer, including relocated extras
+when three codec components become one Gray plane.
 
 When Render applies to color with spot declarations, either packer also binds a readonly ink table
 at binding 7. Each 32-byte, 16-byte-aligned `SpotColor` stores the absolute plane word offset at
@@ -878,7 +884,8 @@ extra factor differs from color, all extras expand before features; color alone 
 Otherwise the extras share the color factor after features. Two successive quotient/color filters
 are never substituted for a single extra filter. `FrameSurfaceLayout` records each plane's extent,
 stride and aligned byte offset in one checked allocation. `color_plane_bytes` applies only to the
-three equal-sized color components; extra offsets are cumulative aligned plane sizes. Imported
+equal-sized color planes (three codec/RGB planes or one ICC Gray plane); extra offsets are
+cumulative aligned plane sizes. Imported
 component surfaces preserve these layouts, while patch/blend/output operations explicitly require
 uniform extents. Modular normalization and LF-extra reconstruction allocate distinct target grids;
 their finalizers use each extra's actual extent. Feature completion copies already-expanded extras
@@ -1293,7 +1300,10 @@ storage, composition, LF presentation, native/scalar packing and original color 
 not modify existing encoded reference samples. Unreferenced linear presentation retains pre-OETF
 values. The optional threshold occupies the shared record's third transfer lane; no new GPU buffer
 or CPU image conversion is introduced. `NativeParams` remains 80 bytes, with the original transfer
-selector and gamma exponent bits in `color.x/y`.
+selector and gamma exponent bits in `color.x/y`. `color.z` carries the actual one or three
+color planes, keeping Gray ICC extras outside color evaluation. Native/scalar packing reads
+integer words and only evaluates floating values for an actual transfer, ink, association or
+integer quantization; unchanged F32 colors and extras preserve every bit.
 
 `InverseOpsin::rgb_space` identifies the inverse matrix's linear RGB. Original non-sRGB RGB output
 uses libjxl's ICC-calibrated sRGB primary coordinates; its direct sRGB and Gray paths preserve their
@@ -1322,3 +1332,41 @@ checked against device limits. Color input/output use distinct buffers and check
 row/inter-plane padding and non-color channels are outside the dispatched writes. No image-sized
 temporary or host pixel conversion is used. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the
 bounded unit-domain contract and incomplete decoder/session integration.
+
+## Original ICC frame and presentation ownership
+
+ICC original-device surfaces carry an owned profile with one Gray or three RGB F32 planes.
+All normalized extra planes retain their independent views and follow the actual color count.
+A codec-component surface has three explicitly tagged non-color planes. GPU buffer copies check
+all source/destination ranges, usages, offsets, scalar formats and row strides before recording;
+they preserve IEEE words and plane guards without color evaluation, uniforms or CPU readback.
+Original Modular normalization also writes `modular_sample_f32_bits` directly to integer storage;
+XYB normalization alone evaluates the required floating reconstruction. The shared output source
+interface returns RGB/alpha words. Unchanged F32 RGB and every packed F32 alpha avoid bitcasting
+through a floating value: WGSL permits bit reinterpretation to flush subnormals and does not
+guarantee nonfinite/zero representations. Actual color/association operations still evaluate F32.
+This changes no uniform size, binding index, allocation size or buffer access mode.
+The source buffers include `COPY_SRC`, and retained destinations include `COPY_DST`. Conversion
+returns a complete `Surface` with its new layout; retagging a buffer cannot keep an obsolete
+three-plane layout for a Gray result.
+
+LF component previews use the same checked copy after recursive upsampling. Their output plan
+reserves no color-packing uniforms; color previews retain the 368-byte conversion plan. Both
+paths retain all recursive stage buffers through completion and copy extras independently.
+
+The common compositor parses the original profile once per selected image. When requested output
+needs a profile transform, it selects one host program and uploads it on its first admitted use.
+The program buffer has its own exact `MemoryPermit`, shared by an image-owned cache and each
+submitted dispatch. Failed initial admission leaves the cache empty; later frames reuse the same
+program reservation. A conversion reserves a separate full target-color/extra intermediate,
+the 80-byte ICC dispatch uniform, the 208-byte output-packing uniform and the browser completion
+fence. Packed output has its own lease. Completion owns all input/intermediate/uniform/program
+handles, even if pending work and the image session are dropped.
+
+Same-profile device output allocates no ICC program or conversion intermediate. The 208-byte
+output ABI is unchanged: stored-channel order 4 identifies Gray/Gray-alpha; absent planar channels
+are excluded before accessing their zero stride fields. `surface_color_channels` specializes the
+source to one or three planes, and the alpha index follows that count. Each invocation owns one
+complete output word, including plane gaps and the final padded word. Gray alpha is the independent
+alpha component, not a second color channel. Alpha association precedes U8 quantization; preserved
+F32 words bypass both curve evaluation and association arithmetic.

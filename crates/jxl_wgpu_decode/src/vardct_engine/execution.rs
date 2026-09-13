@@ -426,6 +426,7 @@ struct PostTransformJobBuffers {
 }
 
 enum FrameOutputScratch {
+    Components,
     Color {
         _scratch: ColorOutputScratch,
     },
@@ -437,7 +438,7 @@ enum FrameOutputScratch {
 impl FrameOutputScratch {
     fn status_bytes(&self) -> u64 {
         match self {
-            Self::Color { .. } => 0,
+            Self::Color { .. } | Self::Components => 0,
             Self::Extra { .. } => {
                 crate::modular_scalar_output::ModularScalarOutputPlan::STATUS_BYTES
             }
@@ -2189,12 +2190,13 @@ fn submit_vardct(
         "jxl-wgpu VarDCT B plane",
     ];
     // Feature rendering can copy a retained LF image into its common component surface.
-    let retained_usage = if source.packet.profile.lf_level != 0 {
-        wgpu::BufferUsages::COPY_SRC
-    } else {
-        wgpu::BufferUsages::empty()
-    };
-    let resident_planes = source.output.is_color().then(|| {
+    let retained_usage =
+        if source.packet.profile.lf_level != 0 || source.output.retains_components() {
+            wgpu::BufferUsages::COPY_SRC
+        } else {
+            wgpu::BufferUsages::empty()
+        };
+    let resident_planes = source.output.requires_reconstruction().then(|| {
         std::array::from_fn(|channel| {
             storage(
                 image_labels[channel],

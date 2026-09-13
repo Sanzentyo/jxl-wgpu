@@ -55,6 +55,8 @@ pub enum ModularRenderError {
     #[error(transparent)]
     ColorOutput(std::sync::Arc<crate::color_output::ColorOutputError>),
     #[error(transparent)]
+    FrameSurface(#[from] crate::FrameSurfaceError),
+    #[error(transparent)]
     Layout(#[from] jxl_gpu_formats::LayoutError),
 }
 
@@ -284,7 +286,9 @@ impl ModularRenderPlan {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };

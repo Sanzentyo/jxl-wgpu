@@ -374,6 +374,7 @@ pub struct GpuOutputRequest {
     spot_colors: SpotColorPolicy,
     alpha: AlphaOutputPolicy,
     white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation,
+    icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent,
     frame_surface: Option<crate::frame_surface::FrameSurfaceEncoding>,
     frame_stage: crate::frame_surface::FrameRenderStage,
     lf_extras: bool,
@@ -519,6 +520,7 @@ impl GpuOutputRequest {
             spot_colors: SpotColorPolicy::Render,
             alpha: AlphaOutputPolicy::default(),
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
+            icc_rendering_intent: jxl_gpu_protocol::icc::IccRenderingIntent::Relative,
             frame_surface: None,
             frame_stage: crate::frame_surface::FrameRenderStage::Complete,
             lf_extras: false,
@@ -599,12 +601,29 @@ impl GpuOutputRequest {
         }
     }
 
+    /// Select the intent for requested ICC color conversion. The default is relative
+    /// colorimetric with Bradford adaptation. Unsupported profile methods or intents return
+    /// typed errors. Exact same-profile device output does not evaluate a color transform.
+    #[must_use]
+    pub const fn with_icc_rendering_intent(
+        mut self,
+        intent: jxl_gpu_protocol::icc::IccRenderingIntent,
+    ) -> Self {
+        self.icc_rendering_intent = intent;
+        self
+    }
+
+    #[must_use]
+    pub const fn icc_rendering_intent(&self) -> jxl_gpu_protocol::icc::IccRenderingIntent {
+        self.icc_rendering_intent
+    }
+
     pub(crate) fn for_frame_surface(
         mut self,
         encoding: crate::frame_surface::FrameSurfaceEncoding,
     ) -> Self {
-        self.frame_surface = Some(encoding);
         self.format = encoding.format();
+        self.frame_surface = Some(encoding);
         self.alpha = AlphaOutputPolicy::Preserve;
         self.spot_colors = SpotColorPolicy::Preserve;
         self.orientation = OrientationPolicy::Keep;
@@ -643,7 +662,9 @@ impl GpuOutputRequest {
     }
 
     pub(crate) fn frame_surface_encoding(&self) -> crate::frame_surface::FrameSurfaceEncoding {
-        self.frame_surface.expect("private frame surface request")
+        self.frame_surface
+            .clone()
+            .expect("private frame surface request")
     }
 
     pub(crate) fn renders_spot_colors(

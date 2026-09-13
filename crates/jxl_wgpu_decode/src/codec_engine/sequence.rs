@@ -110,7 +110,11 @@ impl SequenceSource {
             .as_ref()
             .map_or_else(
                 || self.request.clone(),
-                |encodings| self.request.clone().for_frame_surface(encodings[index]),
+                |encodings| {
+                    self.request
+                        .clone()
+                        .for_frame_surface(encodings[index].clone())
+                },
             )
             .with_progressive_output(progressive && self.request.progressive_output())
             .with_lf_extras(

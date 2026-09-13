@@ -4,6 +4,8 @@ use jxl_gpu_protocol::{ChangedRegions, OutputId, SubmissionToken};
 use jxl_wgpu::{GpuImageFrame, GpuImageOutput, ImageReadbackPipeline};
 use wgpu::util::DeviceExt;
 
+use crate::frame_surface::FrameSurfaceEncoding;
+
 fn image() -> ImageHeaderInventory {
     let hex = include_str!("../../../../test-data/testsrc_vardct_progressive_dc_ac.jxl.hex");
     let compact = hex.split_whitespace().collect::<String>();
@@ -71,205 +73,216 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
         Err(error) => panic!("{error:?}"),
     };
     let memory = backend.transient_memory_budget();
-    for (custom, surface) in [(false, false), (true, false), (false, true), (true, true)] {
-        for (level, width, height) in [
-            (1, 17, 9),
-            (1, 1, 33),
-            (2, 257, 17),
-            (3, 1025, 9),
-            (4, 8193, 1),
+    for custom in [false, true] {
+        for encoding in [
+            None,
+            Some(FrameSurfaceEncoding::Rgb(
+                jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+            )),
+            Some(FrameSurfaceEncoding::Encoded),
         ] {
-            let mut image = image();
-            image.width = width;
-            image.height = height;
-            if custom {
-                image
-                    .upsampling_weights
-                    .up8
-                    .fill(jxl_gpu_bitstream::FiniteF32::from_f32(1.0 / 32.0).unwrap());
-            }
-            let mut format = PixelFormat::rgb_f32(
-                RgbChannelOrder::Rgb,
-                false,
-                crate::vardct_rgb8_format().color_spec,
-            );
-            let ColorSpecification::Defined(ref mut color) = format.color_spec else {
-                unreachable!()
-            };
-            color.transfer = TransferFunction::Linear;
-            let mut render_image = image.clone();
-            if surface {
-                render_image.width += 8;
-                render_image.height += 8;
-                render_image.orientation = 6;
-            }
-            let mut renderer = LfPreview::new(
-                backend.clone(),
-                &render_image,
-                &GpuOutputRequest::color(format).unwrap(),
-            )
-            .unwrap();
-            if surface {
-                renderer = renderer
-                    .for_surface(
-                        Extent2d::new(width, height),
-                        crate::frame_surface::FrameSurfaceEncoding::Rgb(
-                            jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
-                        ),
-                    )
-                    .unwrap();
-            }
-            let source = Extent2d::new(
-                width.div_ceil(1 << (3 * level)),
-                height.div_ceil(1 << (3 * level)),
-            );
-            let stride = source.width + 3;
-            let producer = if surface {
-                Extent2d::new(source.width + 2, source.height + 1)
-            } else {
-                source
-            };
-            let mut cpu = std::array::from_fn::<_, 3, _>(|channel| {
-                (0..source.width * source.height)
-                    .map(|i| {
-                        let value = match channel {
-                            0 => (i % 5) as f32 * 0.005 - 0.01,
-                            1 => 0.3 + (i % 7) as f32 * 0.03,
-                            _ => 0.2 + (i % 3) as f32 * 0.03,
-                        };
-                        f64::from(value)
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let leases = std::array::from_fn(|channel| {
-                let mut padded = vec![f32::NAN; (stride * producer.height) as usize];
-                for y in 0..source.height {
-                    for x in 0..source.width {
-                        padded[(y * stride + x) as usize] =
-                            cpu[channel][(y * source.width + x) as usize] as f32;
-                    }
-                }
-                let buffer =
-                    backend
-                        .device()
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("LF scalar oracle input with poisoned padding"),
-                            contents: bytemuck::cast_slice(&padded),
-                            usage: wgpu::BufferUsages::STORAGE,
-                        });
-                let permit = memory.try_reserve(buffer.size()).unwrap();
-                GpuBufferLease::from_tracked(buffer, permit)
-            });
-            let planes = ProgressiveDcXybPlanes::from_leases(
-                leases,
-                producer.width,
-                producer.height,
-                stride,
-            )
-            .unwrap();
-            for extent in [
-                [0, source.height],
-                [source.width, 0],
-                [producer.width + 1, source.height],
-                [source.width, producer.height + 1],
+            let surface = encoding.is_some();
+            let components = encoding == Some(FrameSurfaceEncoding::Encoded);
+            for (level, width, height) in [
+                (1, 17, 9),
+                (1, 1, 33),
+                (2, 257, 17),
+                (3, 1025, 9),
+                (4, 8193, 1),
             ] {
-                assert!(planes.clone().into_extent(extent).is_err());
-            }
-            let bytes = |w: u32, h: u32| u64::from(w) * u64::from(h) * 4;
-            let total = renderer.output_storage_bytes
-                + renderer.output_plan.memory.transient_bytes
-                + renderer.kernel.weight_bytes()
-                + u64::from(level) * 3 * ResidentUpsamplePipeline::UNIFORM_BYTES
-                + (0..level)
-                    .map(|i| bytes(width.div_ceil(1 << (3 * i)), height.div_ceil(1 << (3 * i))) * 3)
-                    .sum::<u64>();
-            let blocker = memory
-                .try_reserve(memory.snapshot().available_bytes - total + 1)
-                .unwrap();
-            let before = memory.snapshot().reserved_bytes;
-            assert!(
-                matches!(renderer.submit(&planes, level), Err(Error::MemoryBackpressure(jxl_wgpu::MemoryBudgetError::Exhausted { requested_bytes, .. })) if requested_bytes == total)
-            );
-            assert_eq!(memory.snapshot().reserved_bytes, before);
-            drop(blocker);
-            for invalid in [0, 5] {
-                assert!(matches!(
-                    renderer.submit(&planes, invalid),
-                    Err(Error::EngineContract(_))
-                ));
-            }
-            let output = renderer.submit(&planes, level).unwrap().wait().unwrap();
-            let mut size = source;
-            for next in (0..level).rev() {
-                let extent = Extent2d::new(
-                    width.div_ceil(1 << (3 * next)),
-                    height.div_ceil(1 << (3 * next)),
+                let mut image = image();
+                image.width = width;
+                image.height = height;
+                if custom {
+                    image
+                        .upsampling_weights
+                        .up8
+                        .fill(jxl_gpu_bitstream::FiniteF32::from_f32(1.0 / 32.0).unwrap());
+                }
+                let mut format = PixelFormat::rgb_f32(
+                    RgbChannelOrder::Rgb,
+                    false,
+                    crate::vardct_rgb8_format().color_spec,
                 );
-                cpu = cpu.map(|input| up8(&input, size, extent, &image.upsampling_weights.up8));
-                size = extent;
-            }
-            let inverse = InverseOpsin::from_image(&image).unwrap();
-            let expected = (0..cpu[0].len())
-                .flat_map(|i| {
-                    let mixed = [cpu[1][i] + cpu[0][i], cpu[1][i] - cpu[0][i], cpu[2][i]];
-                    let lms = std::array::from_fn::<_, 3, _>(|c| {
-                        ((mixed[c] - f64::from(inverse.opsin_bias[c]).cbrt()).powi(3)
-                            + f64::from(inverse.opsin_bias[c]))
-                            * 255.0
-                            / f64::from(inverse.intensity_target)
-                    });
-                    inverse.inverse_opsin_matrix.map(|row| {
-                        row.into_iter()
-                            .zip(lms)
-                            .map(|(a, b)| f64::from(a) * b)
-                            .sum::<f64>()
+                let ColorSpecification::Defined(ref mut color) = format.color_spec else {
+                    unreachable!()
+                };
+                color.transfer = TransferFunction::Linear;
+                let mut render_image = image.clone();
+                if surface {
+                    render_image.width += 8;
+                    render_image.height += 8;
+                    render_image.orientation = 6;
+                }
+                let mut renderer = LfPreview::new(
+                    backend.clone(),
+                    &render_image,
+                    &GpuOutputRequest::color(format).unwrap(),
+                )
+                .unwrap();
+                if let Some(encoding) = &encoding {
+                    renderer = renderer
+                        .for_surface(Extent2d::new(width, height), encoding.clone())
+                        .unwrap();
+                }
+                let source = Extent2d::new(
+                    width.div_ceil(1 << (3 * level)),
+                    height.div_ceil(1 << (3 * level)),
+                );
+                let stride = source.width + 3;
+                let producer = if surface {
+                    Extent2d::new(source.width + 2, source.height + 1)
+                } else {
+                    source
+                };
+                let mut cpu = std::array::from_fn::<_, 3, _>(|channel| {
+                    (0..source.width * source.height)
+                        .map(|i| {
+                            let value = match channel {
+                                0 => (i % 5) as f32 * 0.005 - 0.01,
+                                1 => 0.3 + (i % 7) as f32 * 0.03,
+                                _ => 0.2 + (i % 3) as f32 * 0.03,
+                            };
+                            f64::from(value)
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let leases = std::array::from_fn(|channel| {
+                    let mut padded = vec![f32::NAN; (stride * producer.height) as usize];
+                    for y in 0..source.height {
+                        for x in 0..source.width {
+                            padded[(y * stride + x) as usize] =
+                                cpu[channel][(y * source.width + x) as usize] as f32;
+                        }
+                    }
+                    let buffer =
+                        backend
+                            .device()
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("LF scalar oracle input with poisoned padding"),
+                                contents: bytemuck::cast_slice(&padded),
+                                usage: wgpu::BufferUsages::STORAGE,
+                            });
+                    let permit = memory.try_reserve(buffer.size()).unwrap();
+                    GpuBufferLease::from_tracked(buffer, permit)
+                });
+                let planes = ProgressiveDcXybPlanes::from_leases(
+                    leases,
+                    producer.width,
+                    producer.height,
+                    stride,
+                )
+                .unwrap();
+                for extent in [
+                    [0, source.height],
+                    [source.width, 0],
+                    [producer.width + 1, source.height],
+                    [source.width, producer.height + 1],
+                ] {
+                    assert!(planes.clone().into_extent(extent).is_err());
+                }
+                let bytes = |w: u32, h: u32| u64::from(w) * u64::from(h) * 4;
+                let total = renderer.output_storage_bytes
+                    + if components { 0 } else { 368 }
+                    + renderer.kernel.weight_bytes()
+                    + u64::from(level) * 3 * ResidentUpsamplePipeline::UNIFORM_BYTES
+                    + (0..level)
+                        .map(|i| {
+                            bytes(width.div_ceil(1 << (3 * i)), height.div_ceil(1 << (3 * i))) * 3
+                        })
+                        .sum::<u64>();
+                let blocker = memory
+                    .try_reserve(memory.snapshot().available_bytes - total + 1)
+                    .unwrap();
+                let before = memory.snapshot().reserved_bytes;
+                assert!(
+                    matches!(renderer.submit(&planes, level), Err(Error::MemoryBackpressure(jxl_wgpu::MemoryBudgetError::Exhausted { requested_bytes, .. })) if requested_bytes == total)
+                );
+                assert_eq!(memory.snapshot().reserved_bytes, before);
+                drop(blocker);
+                for invalid in [0, 5] {
+                    assert!(matches!(
+                        renderer.submit(&planes, invalid),
+                        Err(Error::EngineContract(_))
+                    ));
+                }
+                let output = renderer.submit(&planes, level).unwrap().wait().unwrap();
+                let mut size = source;
+                for next in (0..level).rev() {
+                    let extent = Extent2d::new(
+                        width.div_ceil(1 << (3 * next)),
+                        height.div_ceil(1 << (3 * next)),
+                    );
+                    cpu = cpu.map(|input| up8(&input, size, extent, &image.upsampling_weights.up8));
+                    size = extent;
+                }
+                let inverse = InverseOpsin::from_image(&image).unwrap();
+                let expected = (0..cpu[0].len())
+                    .flat_map(|i| {
+                        if components {
+                            return std::array::from_fn(|channel| cpu[channel][i]);
+                        }
+                        let mixed = [cpu[1][i] + cpu[0][i], cpu[1][i] - cpu[0][i], cpu[2][i]];
+                        let lms = std::array::from_fn::<_, 3, _>(|c| {
+                            ((mixed[c] - f64::from(inverse.opsin_bias[c]).cbrt()).powi(3)
+                                + f64::from(inverse.opsin_bias[c]))
+                                * 255.0
+                                / f64::from(inverse.intensity_target)
+                        });
+                        inverse.inverse_opsin_matrix.map(|row| {
+                            row.into_iter()
+                                .zip(lms)
+                                .map(|(a, b)| f64::from(a) * b)
+                                .sum::<f64>()
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            let frame = GpuImageFrame {
-                token: SubmissionToken(1),
-                outputs: vec![GpuImageOutput {
-                    id: OutputId(0),
-                    layout: renderer.layout.clone(),
-                    buffer: output,
-                }],
-                changed: ChangedRegions::default(),
-            };
-            let actual = ImageReadbackPipeline::new(&backend)
-                .submit(&frame)
-                .unwrap()
-                .wait()
-                .unwrap()
-                .frame
-                .outputs[0]
-                .bytes
-                .clone();
-            let layout = &frame.outputs[0].layout;
-            assert_eq!(actual.len() as u64, layout.logical_size);
-            let error = expected
-                .iter()
-                .enumerate()
-                .map(|(index, expected)| {
-                    let pixel = index / 3;
-                    let channel = index % 3;
-                    let plane = &layout.planes[if surface { channel } else { 0 }];
-                    let offset = plane.offset as usize
-                        + pixel / width as usize * plane.row_stride as usize
-                        + pixel % width as usize * if surface { 4 } else { 12 }
-                        + if surface { 0 } else { channel * 4 };
-                    let actual = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
-                    assert!(actual.is_finite());
-                    (f64::from(actual) - expected).abs()
-                })
-                .fold(0_f64, f64::max);
-            assert!(
-                error < 1e-5,
-                "level {level} custom {custom} surface {surface}: {error}"
-            );
-            drop(frame);
-            drop(planes);
-            drop(renderer);
-            assert_eq!(memory.snapshot().reserved_bytes, 0);
+                    .collect::<Vec<_>>();
+                let frame = GpuImageFrame {
+                    token: SubmissionToken(1),
+                    outputs: vec![GpuImageOutput {
+                        id: OutputId(0),
+                        layout: renderer.layout.clone(),
+                        buffer: output,
+                    }],
+                    changed: ChangedRegions::default(),
+                };
+                let actual = ImageReadbackPipeline::new(&backend)
+                    .submit(&frame)
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .frame
+                    .outputs[0]
+                    .bytes
+                    .clone();
+                let layout = &frame.outputs[0].layout;
+                assert_eq!(actual.len() as u64, layout.logical_size);
+                let error = expected
+                    .iter()
+                    .enumerate()
+                    .map(|(index, expected)| {
+                        let pixel = index / 3;
+                        let channel = index % 3;
+                        let plane = &layout.planes[if surface { channel } else { 0 }];
+                        let offset = plane.offset as usize
+                            + pixel / width as usize * plane.row_stride as usize
+                            + pixel % width as usize * if surface { 4 } else { 12 }
+                            + if surface { 0 } else { channel * 4 };
+                        let actual =
+                            f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
+                        assert!(actual.is_finite());
+                        (f64::from(actual) - expected).abs()
+                    })
+                    .fold(0_f64, f64::max);
+                assert!(
+                    error < 1e-5,
+                    "level {level} custom {custom} encoding {encoding:?}: {error}"
+                );
+                drop(frame);
+                drop(planes);
+                drop(renderer);
+                assert_eq!(memory.snapshot().reserved_bytes, 0);
+            }
         }
     }
 }

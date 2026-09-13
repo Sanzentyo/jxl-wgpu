@@ -5,7 +5,7 @@ timestamp and clears their optional profile ID, reopens the exact bytes, and con
 ordered pairs with relative colorimetric intent, `NOOPTIMIZE | NOCACHE`, and no black-point
 compensation. Float native output is clipped to the declared unit output range.
 
-`scalar.hpp` independently evaluates the ICC.1:2022 matrix/TRC equations in f64, using Little CMS
+`tools/jxl_test_support/native/icc/scalar.hpp` independently evaluates the ICC.1:2022 matrix/TRC equations in f64, using Little CMS
 only to read the profile's exact colorant/curve metadata. It uses pivoted elimination and
 analytical roots or exhaustive sampled-segment search. Production Rust/WGSL code is not called.
 See [the execution contract](../../../../docs/ICC_MATRIX_TRC.md) for scope, precision intervals
@@ -31,6 +31,7 @@ From the workspace root, build with a C++17 compiler and the pinned `lcms2` deve
 ```sh
 mkdir -p .git/icc-regenerate
 c++ -std=c++17 -Wall -Wextra -Werror \
+  -Itools/jxl_test_support/native \
   crates/jxl_wgpu/test-data/icc_generator/main.cpp \
   $(pkg-config --cflags --libs lcms2) -o .git/icc-regenerate/generator
 .git/icc-regenerate/generator .git/icc-regenerate/corpus
@@ -40,7 +41,7 @@ cargo test -p jxl_wgpu --test icc -- --test-threads=1
 
 Generation is offline. `cargo test` consumes the checked-in bytes and does not spawn an oracle.
 
-`linear.hpp` adds the `linear` subdirectory with 100 bidirectional connections between these ten
+The shared `icc/linear.hpp` adds the `linear` subdirectory with 100 bidirectional connections between these ten
 profiles and five linear RGB spaces. Its CIE/Bradford calculation uses normalized primaries and
 pivoted elimination, independently of production's homogeneous geometry. Native ICC execution
 uses `TYPE_XYZ_DBL` on the PCS side plus the independent matrix on the linear side, without

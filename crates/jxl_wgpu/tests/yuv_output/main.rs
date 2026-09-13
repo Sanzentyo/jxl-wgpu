@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 mod analytic;
+mod words;
 
 use jxl_gpu_formats::convert_rgb_f32;
 use jxl_gpu_protocol::{

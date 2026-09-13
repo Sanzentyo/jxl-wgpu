@@ -17,11 +17,15 @@ struct ColorSourceParams {
 @group(0) @binding(5) var<uniform> source_params: ColorSourceParams;
 @group(0) @binding(6) var<storage, read> source_alpha: array<u32>;
 
-fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
+fn plane_word(channel: u32, x: u32, y: u32) -> u32 {
     let index = y * source_params.plane_geometry[channel].x + x;
-    if (channel == 0u) { return bitcast<f32>(source_r[index]); }
-    if (channel == 1u) { return bitcast<f32>(source_g[index]); }
-    return bitcast<f32>(source_b[index]);
+    if (channel == 0u) { return source_r[index]; }
+    if (channel == 1u) { return source_g[index]; }
+    return source_b[index];
+}
+
+fn plane_value(channel: u32, x: u32, y: u32) -> f32 {
+    return bitcast<f32>(plane_word(channel, x, y));
 }
 
 fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
@@ -63,16 +67,16 @@ fn jpeg_sample(channel: u32, x: u32, y: u32) -> f32 {
     return mix(top, bottom, y_weight);
 }
 
-fn source_alpha_at(x: u32, y: u32) -> f32 {
+fn source_alpha_word_at(x: u32, y: u32) -> u32 {
     let alpha = source_params.alpha_geometry;
-    if alpha.w == 0u { return 1.0; }
+    if alpha.w == 0u { return 0x3f800000u; }
     let coordinate = source_coordinate(vec2<u32>(x, y));
     let word = source_alpha[alpha.x + coordinate.y * alpha.y + coordinate.x];
-    if alpha.w == 2u { return bitcast<f32>(word); }
-    return bitcast<f32>(modular_sample_f32_bits(word, alpha.z));
+    if alpha.w == 2u { return word; }
+    return modular_sample_f32_bits(word, alpha.z);
 }
 
-fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
+fn reconstruct_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
     let coordinate = source_coordinate(vec2<u32>(min(output_x, params.width - 1u), min(output_y, params.height - 1u)));
     let column = coordinate.x;
     let row = coordinate.y;
@@ -89,7 +93,6 @@ fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
     let x = plane_value(0u, column, row);
     let y = plane_value(1u, column, row);
     let b = plane_value(2u, column, row);
-    if source_params.mode == 2u { return vec3<f32>(x, y, b); }
 
     // This is deliberately identical to jxl_wgpu's XYB inverse contract:
     // reconstruct biased LMS, apply the sign-preserving cube, then the
@@ -107,4 +110,11 @@ fn source_rgb_at(output_x: u32, output_y: u32) -> vec3<f32> {
         dot(source_params.matrix_b.xyz, lms),
     );
     return linear_rgb;
+}
+
+fn source_rgb_words_at(x: u32, y: u32) -> vec3<u32> {
+    if source_params.mode != 2u { return bitcast<vec3<u32>>(reconstruct_rgb_at(x, y)); }
+    let coordinate = source_coordinate(vec2<u32>(min(x, params.width - 1u), min(y, params.height - 1u)));
+    return vec3<u32>(plane_word(0u, coordinate.x, coordinate.y),
+        plane_word(1u, coordinate.x, coordinate.y), plane_word(2u, coordinate.x, coordinate.y));
 }

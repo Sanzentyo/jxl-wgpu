@@ -3,9 +3,10 @@
 The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gray profiles.
 JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
-reconstruction and LF configuration are independent of color conversion. Integration with original
-color surfaces, reference composition and requested color output remains open; these paths continue
-to reject embedded ICC before submission.
+reconstruction and LF configuration are independent of color conversion. The common decoder now
+also handles original (non-XYB, non-YCbCr) ICC RGB/Gray color surfaces, original-domain references
+and composition, relative matrix/TRC conversion and U8/F32 requested output. ICC XYB/YCbCr,
+enumerated-source-to-ICC conversion, spot rendering, full intents and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
@@ -15,7 +16,9 @@ preview and physical-frame inventories. Profile interpretation remains separate 
 reconstruction. `ColorModel::Gray` describes gray X with optional alpha W, with explicit U8/F32
 planar/interleaved classification. ICC RGB/Gray/XYZ signatures must match their pixel color model;
 an ICC profile cannot relabel numeric or YCbCr storage. Enumerated packers/display currently reject
-unexecuted ICC targets and gray color outputs. These descriptors do not claim decoder integration.
+unexecuted ICC targets and gray color outputs. `ImageOutputParams::for_icc_device` is a separate
+packing entry point: it verifies the exact source/target profile and packs already converted
+device values without assigning an enumerated RGB meaning or evaluating any curves.
 
 The [embedded numeric corpus](../crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
 adds eight native RGB/Gray original/XYB streams and metadata-only substitutions into existing wide
@@ -23,6 +26,23 @@ integer and IEEE-754 fixtures. It checks exact sample storage, complete/fragment
 standalone producers and the common decoder, and byte-budget release. It does not use an ICC
 profile-to-itself conversion for passthrough: such a conversion would evaluate curves and lose
 out-of-range values or original bit patterns.
+
+The common decoder resolves the original profile once per selected image. Its component producer
+contract uses three non-color F32 planes with explicit private tagging, followed by checked GPU
+copies into the original profile's one Gray or three RGB planes. References keep that profile;
+blending derives alpha/extra offsets from the actual color count. Original-device F32 packing with
+preserved alpha association retains Modular IEEE words, including nonfinite values. ICC conversion
+uses the finite device-value contract described below; its unit-domain curve rules apply only
+when an actual profile conversion is requested.
+
+Requested color conversion uses a selected immutable program shared across physical frames. Program
+upload is lazy, budgeted and retryable; each dispatch retains its uploaded program through GPU
+completion even if the image session is dropped. Intermediate color surfaces, unchanged extra
+planes, output words, the 80-byte ICC uniform and 208-byte packing uniform are all accounted.
+No frame readback or CPU pixel CMS is involved. `GpuOutputRequest::with_icc_rendering_intent`
+defaults to relative colorimetric; non-Bradford conversion and unimplemented intents return errors.
+Exact same-profile packing does not select a CMS method and therefore does not require an
+executable matrix/TRC or inverse curve.
 
 ## Model and supported scope
 

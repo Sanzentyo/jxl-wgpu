@@ -1,12 +1,15 @@
-//! Private frame storage with an explicit codec-component or RGB domain. All planes share one
+//! Private frame storage with an explicit codec-component or color domain. All planes share one
 //! accounted allocation; each view carries its own extent and offset, including extra channels
 //! that have already been upsampled while color components still await frame features.
 
 use jxl_gpu_formats::{Channel, ImageLayout, PixelFormat, RgbChannelOrder, SampleKind};
+use jxl_gpu_protocol::icc::{IccProfile, IccSignature};
 use jxl_gpu_protocol::{
     ChangedRegions, Extent2d, OutputId, Region, RgbColorEncoding, RgbColorSpace,
 };
 use jxl_wgpu::{GpuBufferLease, GpuImageOutput, UnvalidatedGpuImageOutput};
+
+pub(crate) mod copy;
 
 /// A component surface can leave the producer before or after frame features. This is
 /// independent of its sample domain: saved encoded references have completed all features.
@@ -19,9 +22,11 @@ pub(crate) enum FrameRenderStage {
 /// The sample domain at the post-reconstruction boundary. Patch references retain codec
 /// components, frame blending uses the original encoding, and an unreferenced XYB presentation
 /// can retain linear RGB until output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FrameSurfaceEncoding {
     Rgb(RgbColorEncoding),
+    /// Original device values with their exact profile, with one gray or three RGB planes.
+    Icc(IccProfile),
     /// Codec components before the inverse color transform. The private producer contract
     /// carries this tag explicitly; a pixel format alone can never identify this domain.
     Encoded,
@@ -30,13 +35,36 @@ pub(crate) enum FrameSurfaceEncoding {
 impl FrameSurfaceEncoding {
     pub(crate) const SRGB: Self = Self::Rgb(RgbColorEncoding::SRGB_BT709);
 
-    pub(crate) fn format(self) -> PixelFormat {
+    pub(crate) fn format(&self) -> PixelFormat {
+        if let Self::Icc(profile) = self {
+            let color = jxl_gpu_formats::ColorSpecification::Icc(profile.clone());
+            return if profile.header().device_space == IccSignature(*b"GRAY") {
+                PixelFormat::gray_f32(false, true, color)
+            } else {
+                PixelFormat::rgb_f32(RgbChannelOrder::Rgb, true, color)
+            };
+        }
+        if *self == Self::Encoded {
+            let mut format = PixelFormat::non_color(
+                SampleKind::Float,
+                32,
+                &[Channel::X, Channel::Y, Channel::Z],
+            );
+            format.planes = [Channel::X, Channel::Y, Channel::Z]
+                .into_iter()
+                .map(|channel| {
+                    jxl_gpu_formats::PlaneFormat::separate_words(
+                        jxl_gpu_formats::PlaneSampling::FULL,
+                        1,
+                        &[channel],
+                        32,
+                    )
+                })
+                .collect();
+            return format;
+        }
         let mut color = crate::vardct_rgb8_format().color_spec;
-        // The component tag remains authoritative for Encoded storage. Its carrier layout
-        // supplies an identity transfer to private packers and is never a public RGB output.
-        let encoding = self
-            .rgb_encoding()
-            .unwrap_or(RgbColorEncoding::LINEAR_BT709);
+        let encoding = self.rgb_encoding().expect("RGB surface encoding");
         if let jxl_gpu_formats::ColorSpecification::Defined(ref mut color) = color {
             color.space = match encoding.space {
                 RgbColorSpace::Bt709 => jxl_gpu_formats::ColorSpace::Bt709,
@@ -68,6 +96,11 @@ impl FrameSurfaceEncoding {
     }
 
     pub(crate) fn from_format(format: &PixelFormat) -> Option<Self> {
+        format.validate().ok()?;
+        if let jxl_gpu_formats::ColorSpecification::Icc(profile) = &format.color_spec {
+            let encoding = Self::Icc(profile.clone());
+            return (*format == encoding.format()).then_some(encoding);
+        }
         let jxl_gpu_formats::ColorSpecification::Defined(color) = format.color_spec else {
             return None;
         };
@@ -78,15 +111,15 @@ impl FrameSurfaceEncoding {
         (*format == encoding.format()).then_some(encoding)
     }
 
-    pub(crate) const fn rgb_encoding(self) -> Option<RgbColorEncoding> {
+    pub(crate) const fn rgb_encoding(&self) -> Option<RgbColorEncoding> {
         match self {
-            Self::Rgb(encoding) => Some(encoding),
-            Self::Encoded => None,
+            Self::Rgb(encoding) => Some(*encoding),
+            Self::Icc(_) | Self::Encoded => None,
         }
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum FrameSurfaceError {
     #[error(transparent)]
     Layout(#[from] jxl_gpu_formats::LayoutError),
@@ -95,6 +128,12 @@ pub enum FrameSurfaceError {
         resource: &'static str,
         required: u64,
         available: u64,
+    },
+    #[error("frame plane copy {role} {plane}: {reason}")]
+    Copy {
+        role: &'static str,
+        plane: usize,
+        reason: &'static str,
     },
 }
 
@@ -129,6 +168,7 @@ impl FrameSurfaceLayout {
     ) -> Result<Self, FrameSurfaceError> {
         let format = encoding.format();
         let color = ImageLayout::packed(extent, format)?;
+        let color_count = color.planes.len() as u64;
         let alignment = u64::from(limits.min_storage_buffer_offset_alignment).max(4);
         let available = limits
             .max_buffer_size
@@ -148,7 +188,7 @@ impl FrameSurfaceLayout {
         let color_plane_bytes = aligned_bytes(color.planes[0].end_offset()?)?;
         // Reject an impossible channel count before walking the iterator or allocating views.
         let minimum_bytes = (extra_extents.len() as u64)
-            .checked_add(3)
+            .checked_add(color_count)
             .and_then(|count| count.checked_mul(alignment))
             .ok_or_else(overflow)?;
         if minimum_bytes > available {
@@ -159,7 +199,9 @@ impl FrameSurfaceLayout {
             });
         }
         let scalar_format = PixelFormat::non_color(SampleKind::Float, 32, &[Channel::X]);
-        let mut storage_bytes = color_plane_bytes.checked_mul(3).ok_or_else(overflow)?;
+        let mut storage_bytes = color_plane_bytes
+            .checked_mul(color_count)
+            .ok_or_else(overflow)?;
         for extra_extent in extra_extents.clone() {
             let scalar = ImageLayout::packed(extra_extent, scalar_format.clone())?;
             storage_bytes = storage_bytes
@@ -190,7 +232,7 @@ impl FrameSurfaceLayout {
             })
             .collect();
         let color = ImageLayout::from_planes(extent, color.format, planes)?;
-        let mut offset = 3 * color_plane_bytes;
+        let mut offset = color_count * color_plane_bytes;
         let extras = extra_extents
             .map(|extra_extent| {
                 let mut scalar = ImageLayout::packed(extra_extent, scalar_format.clone())?;
@@ -219,10 +261,6 @@ impl FrameSurfaceLayout {
         self.extras
             .iter()
             .all(|extra| extra.extent == self.color.extent)
-    }
-
-    pub(crate) fn set_encoding(&mut self, encoding: FrameSurfaceEncoding) {
-        self.color.format = encoding.format();
     }
 }
 
@@ -305,7 +343,7 @@ mod tests {
                 });
                 assert_eq!(
                     FrameSurfaceEncoding::from_format(&encoding.format()),
-                    Some(encoding)
+                    Some(encoding.clone())
                 );
                 let interleaved =
                     PixelFormat::rgb_f32(RgbChannelOrder::Rgb, false, encoding.format().color_spec);
@@ -315,7 +353,11 @@ mod tests {
         assert_eq!(FrameSurfaceEncoding::Encoded.rgb_encoding(), None);
         assert_eq!(
             FrameSurfaceEncoding::from_format(&FrameSurfaceEncoding::Encoded.format()),
-            Some(FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709))
+            None
+        );
+        assert_eq!(
+            FrameSurfaceEncoding::Encoded.format().color_spec,
+            jxl_gpu_formats::ColorSpecification::Undefined
         );
     }
 

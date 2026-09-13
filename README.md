@@ -77,9 +77,12 @@ Pixel formats retain owned ICC profiles, and inventories share the reconstructed
 Embedded ICC inputs now support unfiltered original Modular scalar samples and independently
 selected extra channels through Modular and VarDCT in the supported single-frame paths. The
 [eight-stream native corpus](crates/jxl_wgpu_decode/test-data/embedded_icc_generator/README.md)
-checks exact numeric words through complete and fragmented input. ICC color reconstruction,
-reference composition, requested ICC output, LUT/CMYK and full intent/HDR policies remain
-incomplete integration gates.
+checks exact numeric words through complete and fragmented input. The common decoder also handles
+original (non-XYB, non-YCbCr) ICC RGB/Gray color surfaces, original-domain reference composition,
+relative matrix/TRC conversion to enumerated SDR or another ICC profile, and U8/F32 device packing.
+Same-profile output preserves device values without evaluating curves. Programs are shared per
+selected image and accounted through GPU completion. ICC XYB/YCbCr reconstruction, enumerated
+sources targeting ICC, spot rendering, LUT/CMYK and full intent/HDR policies remain incomplete.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream
 features or device limits return typed errors before a partial output becomes authoritative.

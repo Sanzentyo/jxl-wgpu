@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-#include "scalar.hpp"
-#include "linear.hpp"
+#include <icc/scalar.hpp>
+#include <icc/linear.hpp>
 
 namespace {
 using Profile = std::unique_ptr<void, decltype(&cmsCloseProfile)>;

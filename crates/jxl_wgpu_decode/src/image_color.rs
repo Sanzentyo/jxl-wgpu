@@ -118,6 +118,31 @@ pub(crate) fn require_original_encoding(
     })
 }
 
+/// Resolve owned ICC metadata once for the selected image. Raw numeric requests can avoid this
+/// entirely; retaining device values only requires a structurally valid profile, not a CMS method.
+pub(crate) fn original_domain(
+    image: &ImageHeaderInventory,
+) -> crate::Result<crate::frame_surface::FrameSurfaceEncoding> {
+    validate_declaration(image)?;
+    if let Some(icc) = &image.embedded_icc {
+        use jxl_gpu_protocol::icc::{IccLimits, IccProfile, IccSignature};
+        let profile = IccProfile::parse(icc.profile.clone(), IccLimits::default())?;
+        let expected = IccSignature(if image.grayscale { *b"GRAY" } else { *b"RGB " });
+        if profile.header().device_space != expected {
+            return Err(crate::UnsupportedProfile::new(
+                crate::UnsupportedCodestreamFeature::ColorEncoding,
+                "embedded ICC device channels disagree with the JPEG XL image declaration",
+            )
+            .into());
+        }
+        Ok(crate::frame_surface::FrameSurfaceEncoding::Icc(profile))
+    } else {
+        Ok(crate::frame_surface::FrameSurfaceEncoding::Rgb(
+            require_original_encoding(image)?,
+        ))
+    }
+}
+
 pub(crate) const fn linear_encoding(original: RgbColorEncoding) -> RgbColorEncoding {
     RgbColorEncoding {
         space: original.space,

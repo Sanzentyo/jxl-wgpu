@@ -24,6 +24,12 @@ formats and Gray/alpha storage describe these domains independently of execution
 [ICC execution contract](../../docs/ICC_MATRIX_TRC.md) documents unit-domain semantics, memory
 ownership, native/scalar evidence and remaining decoder integration.
 
+`ImageOutputParams::for_icc_device` packs values already in the exact target ICC profile. It
+supports U8/F32 Gray/Gray-alpha and RGB/BGR/RGBA/BGRA, planar or interleaved, with orientation and
+alpha association. This entry point verifies profile identity and performs no curve or matrix
+evaluation. Enumerated conversion remains a separate constructor; neither path relabels an
+unexecuted ICC transform as linear RGB.
+
 ## Backend creation
 
 Request a device owned by the backend:
@@ -166,11 +172,13 @@ color conversion, and WGSL addressing. The appended 16-byte record carries both 
 and an optional target-linear black threshold for codec reconstruction. `with_alpha_conversion` selects an explicit
 association adjustment after color conversion and before quantization or chroma subsampling.
 The common `ALPHA_OUTPUT_SHADER` uses the JPEG XL finite `2^-26` alpha floor; it never transforms
-the alpha component through an RGB transfer. Producers supply `source_rgb_at` and linear `source_alpha_at`
-shader functions in oriented coordinates, so
+the alpha component through an RGB transfer. Producers supply `source_rgb_words_at` and
+`source_alpha_word_at` shader functions containing binary32 RGB/linear-alpha words in oriented coordinates, so
 VarDCT can fuse XYB/JPEG reconstruction directly into the same word-owned packing entry point.
 Its extra source uniform is separately budgeted; no intermediate RGB image is required. Every
 producer still owns validation of its input bindings and source-specific plane strides.
+Unchanged F32 color and all F32 alpha packing retain integer words throughout; floating-point
+evaluation is used only when reconstruction, color conversion or association requires it.
 Plane range checks end at the last row's payload, allowing a following plane inside unused row-tail
 capacity without suppressing its writes. Output words beyond the logical payload are rejected
 before byte-address multiplication, and final partial-word padding is zero.

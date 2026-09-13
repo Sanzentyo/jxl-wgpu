@@ -1,6 +1,7 @@
 //! The inverse codec color transform consumes an explicitly tagged component surface.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use jxl_gpu_bitstream::{FrameInventory, ImageHeaderInventory};
 use jxl_gpu_protocol::OutputOrientation;
@@ -21,7 +22,7 @@ pub(super) fn convert(
     image: &ImageHeaderInventory,
     frame: &FrameInventory,
     encoding: FrameSurfaceEncoding,
-) -> Result<GpuWork> {
+) -> Result<GpuWork<Surface>> {
     if source.encoding != FrameSurfaceEncoding::Encoded {
         return Err(Error::EngineContract(
             "inverse color transform requires codec components",
@@ -33,11 +34,19 @@ pub(super) fn convert(
             "inverse color transform extra channel count",
         ));
     }
+    if matches!(encoding, FrameSurfaceEncoding::Icc(_)) {
+        if image.xyb_encoded || frame.do_ycbcr {
+            return Err(Error::EngineContract(
+                "ICC device copy requires original codec components",
+            ));
+        }
+        return copy_device(backend, source, encoding);
+    }
     let device = backend.device();
     let layout = FrameSurfaceLayout::with_encoding(
         source.extent(),
         image.extra_channels.len(),
-        encoding,
+        encoding.clone(),
         &device.limits(),
     )?;
     let plan = ColorOutputPlan::for_limits(&layout.color, &device.limits())?;
@@ -112,22 +121,98 @@ pub(super) fn convert(
             config,
         },
     )?;
-    for extra in &layout.extras {
-        let plane = &extra.planes[0];
-        encoder.copy_buffer_to_buffer(
-            source.buffer.as_wgpu_buffer(),
-            plane.offset,
-            output.as_wgpu_buffer(),
-            plane.offset,
-            u64::from(source.extent().width) * u64::from(source.extent().height) * 4,
-        );
-    }
+    source.copy_extras(
+        &mut encoder,
+        ResidentStorageBinding {
+            buffer: output.as_wgpu_buffer(),
+            offset: 0,
+            size: NonZeroU64::new(layout.storage_bytes).expect("nonempty surface"),
+        },
+        &layout,
+    )?;
     submit_recorded(
         backend,
         encoder,
-        output,
+        Surface {
+            buffer: output,
+            layout: Arc::new(layout),
+            encoding,
+        },
         vec![source.buffer.clone()],
         scratch,
+        permit,
+        poll,
+    )
+}
+
+fn copy_device(
+    backend: &WgpuBackend,
+    source: &Surface,
+    encoding: FrameSurfaceEncoding,
+) -> Result<GpuWork<Surface>> {
+    let device = backend.device();
+    let layout = FrameSurfaceLayout::with_encoding(
+        source.extent(),
+        source.layout.extras.len(),
+        encoding.clone(),
+        &device.limits(),
+    )?;
+    let poll = backend.submission_poller().try_reserve()?;
+    let output_permit = backend
+        .transient_memory_budget()
+        .try_reserve(layout.storage_bytes)?;
+    let permit = backend
+        .transient_memory_budget()
+        .try_reserve(completion_fence_bytes())?;
+    let buffer = GpuBufferLease::from_tracked(
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JPEG XL original ICC device surface"),
+            size: layout.storage_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
+        output_permit,
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    let output = ResidentStorageBinding {
+        buffer: buffer.as_wgpu_buffer(),
+        offset: 0,
+        size: NonZeroU64::new(layout.storage_bytes).expect("nonempty device surface"),
+    };
+    let planes = source
+        .layout
+        .color
+        .planes
+        .iter()
+        .take(layout.color.planes.len())
+        .map(|plane| {
+            Ok(jxl_wgpu::ResidentF32Plane {
+                storage: ResidentStorageBinding {
+                    buffer: source.buffer.as_wgpu_buffer(),
+                    offset: plane.offset,
+                    size: NonZeroU64::new(plane.end_offset()? - plane.offset)
+                        .expect("nonempty component"),
+                },
+                width: source.extent().width,
+                height: source.extent().height,
+                stride: (plane.row_stride / 4) as u32,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, jxl_gpu_formats::LayoutError>>()?;
+    crate::frame_surface::copy::planes(&mut encoder, &planes, output, &layout.color)?;
+    source.copy_extras(&mut encoder, output, &layout)?;
+    submit_recorded(
+        backend,
+        encoder,
+        Surface {
+            buffer,
+            layout: Arc::new(layout),
+            encoding,
+        },
+        vec![source.buffer.clone()],
+        (),
         permit,
         poll,
     )

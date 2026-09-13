@@ -614,7 +614,7 @@ mode-specific bindings and pipeline caches while sharing the backend byte budget
 
 Both decoders accept standard or custom RGB chromaticities with D65/E/DCI/custom white points,
 Linear/sRGB/BT.709 or parameterized Gamma/DCI transfer, and gray. Non-D65 white points currently
-require relative rendering intent; ICC and HDR color reconstruction remain typed unsupported. XYB inverse
+require relative rendering intent; full ICC and HDR reconstruction remain incomplete. XYB inverse
 matrices carry their linear RGB chromaticities explicitly. Original RGB/YCbCr and post-transform
 references preserve the original transfer; unreferenced XYB can retain linear original RGB.
 `GpuOutputRequest::with_white_point_adaptation` selects Bradford or absolute XYZ for requested
@@ -633,8 +633,27 @@ selected Modular/VarDCT extra channels in the supported single-frame paths. Nume
 `ColorSpecification::Undefined`; no ICC transform is needed to return their original sample domain.
 The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB/Gray and
 original/XYB input, both common and standalone engines, complete/fragmented transport, exact
-17/31-bit integers and widened IEEE-754 words. ICC color reconstruction, reference composition
-and requested ICC output remain typed unsupported.
+17/31-bit integers and widened IEEE-754 words.
+
+The common `WgpuDecodeEngine` additionally accepts original (non-XYB, non-YCbCr) ICC color through
+both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB
+color planes; additional channels follow the actual color-plane count. Reconstruction returns
+codec components without a fictitious RGB encoding. Checked GPU copies preserve their words when
+entering the original ICC domain. References and frame blends stay in that domain, including
+extended values; conversion returns its actual layout along with its buffer.
+
+For these inputs, requested enumerated SDR output and other RGB/Gray matrix/TRC profiles execute
+the resident ICC pipeline. The original profile is parsed once per selected image and its selected
+GPU program uploads lazily once, with exact budget admission, retry and completion ownership.
+`with_icc_rendering_intent` defaults to relative colorimetric; other intents and non-Bradford
+conversion currently return typed errors. Same-profile U8/F32 planar/interleaved Gray/RGB output
+performs only packing, orientation and requested alpha association, with no CMS curve evaluation.
+F32 with preserved association retains the existing Modular IEEE words, including nonfinite values.
+U8 packing supports Gray/Gray-alpha and RGB/BGR/RGBA/BGRA, with quantization after association.
+
+ICC XYB/YCbCr reconstruction, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
+CMYK, full intents, HDR luminance mapping and standalone codec color admission remain open.
+Numeric and extra-channel bypasses keep their existing independent contracts.
 
 `tests/original_color` covers 228 streams with independent native references: integer/F32, gray/RGBA,
 RGB/XYB/YCbCr, cropped/hidden frames, all five blend modes and overwritten references. Whole and

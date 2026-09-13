@@ -12,6 +12,11 @@ The module tree follows the source tree:
 - `gpu` drives whole or fragmented test input and reads explicitly requested test output.
 - `offline` writes fixture files and manages native generator processes and hexadecimal formats.
 
+`native/icc` owns the shared C++ f64 ICC curve and CIE/Bradford reference equations used by the
+resident-ICC and embedded-JPEG-XL generators. Both compile with `-Itools/jxl_test_support/native`
+and include the named `icc` headers. Cargo and production decoding never compile or link this
+offline oracle; its pinned native dependency and reproduction commands belong to each corpus.
+
 `fixtures::frame_features` owns common frame headers, bounded prefix assembly and feature entropy
 writing. `fixtures::patches` and `fixtures::splines` define their respective scenarios using that
 shared contract. A frame explicitly declares its patch and spline programs; assembly preserves

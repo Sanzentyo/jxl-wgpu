@@ -5,9 +5,9 @@ struct Params {
     multipliers: vec4<f32>,
 };
 @group(0) @binding(0) var<storage, read> source: array<u32>;
-@group(0) @binding(1) var<storage, read_write> output_x: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output_y: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output_b: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_x: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output_y: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_b: array<u32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
 fn source_at(channel: u32, coordinate: vec2<u32>) -> u32 {
@@ -23,22 +23,22 @@ fn normalize_color(@builtin(global_invocation_id) id: vec3<u32>) {
         let color = vec3<f32>(f32(bitcast<i32>(words.y)), f32(bitcast<i32>(words.x)),
             f32(bitcast<i32>(words.z + words.x))) * params.multipliers.xyz;
         let index = id.y * params.sources[0].x + id.x;
-        output_x[index] = color.x;
-        output_y[index] = color.y;
-        output_b[index] = color.z;
+        output_x[index] = bitcast<u32>(color.x);
+        output_y[index] = bitcast<u32>(color.y);
+        output_b[index] = bitcast<u32>(color.z);
         return;
     }
     // RGB and YCbCr retain component order. Each YCbCr plane may have its own grid.
     if id.x < params.sources[0].x && id.y < params.sources[0].y {
         output_x[id.y * params.sources[0].x + id.x] =
-            bitcast<f32>(modular_sample_f32_bits(source_at(0u, id.xy), params.encodings.x));
+            modular_sample_f32_bits(source_at(0u, id.xy), params.encodings.x);
     }
     if id.x < params.sources[1].x && id.y < params.sources[1].y {
         output_y[id.y * params.sources[1].x + id.x] =
-            bitcast<f32>(modular_sample_f32_bits(source_at(1u, id.xy), params.encodings.y));
+            modular_sample_f32_bits(source_at(1u, id.xy), params.encodings.y);
     }
     if id.x < params.sources[2].x && id.y < params.sources[2].y {
         output_b[id.y * params.sources[2].x + id.x] =
-            bitcast<f32>(modular_sample_f32_bits(source_at(2u, id.xy), params.encodings.z));
+            modular_sample_f32_bits(source_at(2u, id.xy), params.encodings.z);
     }
 }

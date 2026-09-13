@@ -183,7 +183,7 @@ pub(super) fn prepare_packet_source(
         &packet.profile,
         options.output_variant,
     )?;
-    let render_color = output.is_color();
+    let render_color = output.requires_reconstruction();
     let base_color_correlation = packet.lf_correlation.base;
     let noise_parameters = packet
         .noise
@@ -444,7 +444,7 @@ pub(super) fn prepare_packet_source(
         .map(|group| ResidentVarDctMemoryPlan::new(group.coefficient_words()))
         .collect::<Result<Vec<_>, _>>()?;
     let intermediate_outputs = if request.progressive_output()
-        && output.is_color()
+        && output.requires_reconstruction()
         && frame.frame_type == jxl_gpu_bitstream::FrameType::Regular
     {
         let progression = |completed| {

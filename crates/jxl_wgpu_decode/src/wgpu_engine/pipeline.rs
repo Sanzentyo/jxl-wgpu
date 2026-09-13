@@ -328,7 +328,12 @@ impl WgpuSubmissionEngine {
         mut profile: StandardModularProfile,
         image: &jxl_gpu_bitstream::ImageHeaderInventory,
     ) -> Result<PreparedGpuSession<WgpuDecodeSession>> {
-        if profile.progressive_dc.is_none() && request.mapping() == crate::GpuOutputMapping::Color {
+        if profile.progressive_dc.is_none()
+            && request.mapping() == crate::GpuOutputMapping::Color
+            && !(request.retains_frame_surface()
+                && request.frame_surface_encoding()
+                    == crate::frame_surface::FrameSurfaceEncoding::Encoded)
+        {
             crate::image_color::require_original_encoding(image)?;
         }
         if !request.progressive_output() {

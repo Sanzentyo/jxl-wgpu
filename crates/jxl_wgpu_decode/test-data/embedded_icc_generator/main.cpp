@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <icc/scalar.hpp>
+#include <icc/linear.hpp>
 
 using Bytes = std::vector<unsigned char>;
 void Check(bool ok, const char* message) {
@@ -97,14 +99,13 @@ void WriteHex(const std::string& path, const Bytes& bytes) {
 // No profile request: non-XYB data stays in its original device sample domain. The public
 // native API rejects an explicit request for these per-channel / sampled profiles even when
 // they match the embedded original. Verify the actual default profile and every sample bit.
-void CheckOriginal(const Bytes& bytes, const Bytes& profile, bool gray,
-                   const std::vector<float>& input) {
+std::vector<float> DecodeOriginal(const Bytes& bytes, const Bytes& profile, bool gray) {
   auto* dec = JxlDecoderCreate(nullptr);
   Check(JxlDecoderSubscribeEvents(dec, JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE) == JXL_DEC_SUCCESS, "events");
   Check(JxlDecoderSetInput(dec, bytes.data(), bytes.size()) == JXL_DEC_SUCCESS, "input");
   JxlDecoderCloseInput(dec);
   const JxlPixelFormat format = {gray ? 2u : 4u, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
-  std::vector<float> pixels(input.size());
+  std::vector<float> pixels(17 * 9 * (gray ? 2 : 4));
   size_t images = 0;
   for (;;) {
     const auto status = JxlDecoderProcessInput(dec);
@@ -119,13 +120,94 @@ void CheckOriginal(const Bytes& bytes, const Bytes& profile, bool gray,
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
       Check(JxlDecoderSetImageOutBuffer(dec, &format, pixels.data(), pixels.size() * 4) == JXL_DEC_SUCCESS, "output");
     } else if (status == JXL_DEC_FULL_IMAGE) {
-      Check(std::memcmp(pixels.data(), input.data(), input.size() * 4) == 0, "original sample bits changed");
       ++images;
     } else if (status == JXL_DEC_SUCCESS) break;
     else Check(false, "decode failed");
   }
   Check(images == 1, "image count");
   JxlDecoderDestroy(dec);
+  return pixels;
+}
+
+void WriteFloats(const std::string& path, const std::vector<float>& pixels) {
+  Bytes words;
+  for (const float sample : pixels) {
+    uint32_t word;
+    static_assert(sizeof(word) == sizeof(sample));
+    std::memcpy(&word, &sample, sizeof(word));
+    for (unsigned shift = 0; shift < 32; shift += 8) words.push_back(word >> shift);
+  }
+  WriteHex(path, words);
+}
+
+// The codec first produces original device samples. Little CMS independently evaluates those
+// samples; it never supplies a requested-profile decoder label as a substitute for a transform.
+double Srgb(double value) {
+  const double magnitude = std::abs(value);
+  return std::copysign(magnitude <= 0.0031308 ? 12.92 * magnitude : 1.055 * std::pow(magnitude, 1.0 / 2.4) - 0.055, value);
+}
+
+std::vector<float> Convert(const Bytes& profile, bool gray, const std::vector<float>& input,
+                           cmsHPROFILE target, bool target_gray, const std::string& kind) {
+  auto source = cmsOpenProfileFromMem(profile.data(), profile.size());
+  Check(source != nullptr && target != nullptr, "open conversion profile");
+  if (kind != "other") {
+    const size_t channels = gray ? 2 : 4;
+    std::vector<float> colors;
+    for (size_t i = 0; i < input.size(); ++i) if (i % channels + 1 != channels) colors.push_back(input[i]);
+    const auto rgb = connection::Native(source, connection::kSpaces[0], colors, true);
+    std::vector<float> output;
+    for (size_t i = 0; i < rgb.size(); ++i) {
+      output.push_back(kind == "srgb" ? static_cast<float>(Srgb(rgb[i])) : rgb[i]);
+      if (i % 3 == 2) output.push_back(input[(i / 3) * channels + channels - 1]);
+    }
+    cmsCloseProfile(source);
+    return output;
+  }
+  auto transform = cmsCreateTransform(source, gray ? TYPE_GRAY_FLT : TYPE_RGB_FLT,
+      target, target_gray ? TYPE_GRAY_DBL : TYPE_RGB_DBL,
+      INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOOPTIMIZE | cmsFLAGS_NOCACHE);
+  Check(transform != nullptr, "native ICC transform");
+  const size_t source_channels = gray ? 2 : 4;
+  const size_t target_channels = target_gray ? 1 : 3;
+  std::vector<float> output;
+  for (size_t i = 0; i < input.size(); i += source_channels) {
+    std::array<double, 3> converted{};
+    cmsDoTransform(transform, input.data() + i, converted.data(), 1);
+    for (size_t c = 0; c < target_channels; ++c) output.push_back(static_cast<float>(converted[c]));
+    output.push_back(input[i + source_channels - 1]);
+  }
+  cmsDeleteTransform(transform);
+  cmsCloseProfile(source);
+  return output;
+}
+
+std::vector<float> Scalar(const Bytes& profile, bool gray, const std::vector<float>& input,
+                          cmsHPROFILE target, const std::string& kind, const std::vector<float>& native) {
+  auto source = cmsOpenProfileFromMem(profile.data(), profile.size());
+  Check(source != nullptr, "scalar source profile");
+  const size_t channels = gray ? 2 : 4;
+  std::vector<float> colors;
+  for (size_t i = 0; i < input.size(); ++i) if (i % channels + 1 != channels) colors.push_back(input[i]);
+  auto reference = kind == "other" ? scalar::Convert(scalar::Profile(source), scalar::Profile(target), colors)
+      : connection::Reference(scalar::Profile(source), connection::kSpaces[0], colors, true);
+  const size_t target_channels = kind == "other" && !gray ? 1 : 3;
+  std::vector<float> output;
+  for (size_t pixel = 0; pixel < input.size() / channels; ++pixel) {
+    for (size_t c = 0; c < target_channels; ++c) {
+      double value = reference.exact[pixel * target_channels + c];
+      double lower = reference.native_lower[pixel * target_channels + c];
+      double upper = reference.native_upper[pixel * target_channels + c];
+      if (kind == "srgb") { value = Srgb(value); lower = Srgb(lower); upper = Srgb(upper); }
+      const double observed = native[pixel * (target_channels + 1) + c];
+      Check(reference.native_semantics[pixel * target_channels + c] == 0, "unexpected native boundary semantics");
+      Check(observed >= lower && observed <= upper, "native precision interval");
+      output.push_back(static_cast<float>(value));
+    }
+    output.push_back(input[pixel * channels + channels - 1]);
+  }
+  cmsCloseProfile(source);
+  return output;
 }
 
 int main(int argc, char** argv) {
@@ -140,18 +222,24 @@ int main(int argc, char** argv) {
     Write(prefix + ".icc", profile);
     std::vector<float> input(17 * 9 * (gray ? 2 : 4));
     for (size_t i = 0; i < input.size(); ++i) input[i] = (8 + ((i * 37) % 101)) / 128.0f;
-    Bytes words;
-    for (const float sample : input) {
-      uint32_t word;
-      static_assert(sizeof(word) == sizeof(sample));
-      std::memcpy(&word, &sample, sizeof(word));
-      for (unsigned shift = 0; shift < 32; shift += 8) words.push_back(word >> shift);
-    }
-    WriteHex(prefix + ".input.f32.hex", words);
+    WriteFloats(prefix + ".input.f32.hex", input);
     for (const bool modular : {true, false}) for (const bool original : {true, false}) {
       const auto name = prefix + (modular ? "_modular" : "_vardct") + (original ? "_original" : "_xyb");
       const auto bytes = Encode(profile, gray, modular, original, input);
-      if (modular && original) CheckOriginal(bytes, profile, gray, input);
+      if (original) {
+        const auto decoded = DecodeOriginal(bytes, profile, gray);
+        if (modular) Check(std::memcmp(decoded.data(), input.data(), input.size() * 4) == 0, "original sample bits changed");
+        WriteFloats(name + ".native.f32.hex", decoded);
+        const auto target_bytes = gray ? Read(std::string(argv[1]) + "/gamma_v4.icc")
+                                       : Gray(Read(std::string(argv[1]) + "/sampled.icc"));
+        auto target = cmsOpenProfileFromMem(target_bytes.data(), target_bytes.size());
+        for (const std::string kind : {"linear", "srgb", "other"}) {
+          const auto native = Convert(profile, gray, decoded, target, !gray, kind);
+          WriteFloats(name + "." + kind + ".f32.hex", native);
+          WriteFloats(name + "." + kind + ".scalar.f32.hex", Scalar(profile, gray, decoded, target, kind, native));
+        }
+        cmsCloseProfile(target);
+      }
       WriteHex(name + ".jxl.hex", bytes);
       std::printf("%s: %zu bytes\n", name.c_str(), bytes.size());
     }

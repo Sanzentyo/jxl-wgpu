@@ -31,6 +31,7 @@ pub(super) struct BlendChannel {
 
 pub(super) fn blend_channels(
     frame: &FrameInventory,
+    color_count: usize,
     extras: &[ExtraChannelInventory],
 ) -> Result<Vec<BlendChannel>> {
     if frame.extra_channel_blends.len() != extras.len() {
@@ -53,37 +54,39 @@ pub(super) fn blend_channels(
         .iter()
         .any(|extra| matches!(extra.channel_type, ExtraChannelTypeInventory::Alpha { .. }));
     let color_alpha = frame.color_blend.alpha_channel.unwrap_or(0);
-    (0..3 + extras.len())
+    (0..color_count + extras.len())
         .map(|channel| {
-            let blend = if channel < 3 {
+            let blend = if channel < color_count {
                 &frame.color_blend
             } else {
-                &frame.extra_channel_blends[channel - 3]
+                &frame.extra_channel_blends[channel - color_count]
             };
             let selector = blend.alpha_channel.unwrap_or(0) as usize;
             let mut mode = blend.mode as u32;
             let mut clamp = blend.clamp;
-            let mut alpha_channel = 3 + selector as u32;
-            if channel < 3 && !has_alpha {
+            let mut alpha_channel = color_count as u32 + selector as u32;
+            if channel < color_count && !has_alpha {
                 mode = match mode {
                     2 => 0,
                     3 => 1,
                     mode => mode,
                 };
-            } else if channel >= 3 && channel == 3 + selector {
+            } else if channel >= color_count && channel == color_count + selector {
                 mode = match mode {
                     2 => 5,
                     3 => 6,
                     mode => mode,
                 };
             }
-            if has_alpha && frame.color_blend.mode as u32 == 2 && channel as u32 == 3 + color_alpha
+            if has_alpha
+                && frame.color_blend.mode as u32 == 2
+                && channel as u32 == color_count as u32 + color_alpha
             {
                 mode = 5;
-                alpha_channel = 3 + color_alpha;
+                alpha_channel = color_count as u32 + color_alpha;
                 clamp = frame.color_blend.clamp;
             }
-            let selected = alpha_channel.saturating_sub(3) as usize;
+            let selected = alpha_channel.saturating_sub(color_count as u32) as usize;
             if matches!(mode, 2 | 3 | 5) && selected >= extras.len() {
                 return Err(Error::EngineContract(
                     "blend alpha channel is outside the frame surface",

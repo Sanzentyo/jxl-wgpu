@@ -65,10 +65,7 @@ fn step(pending: &mut DependentPending) {
             pending.reconstructed(source).unwrap();
         }
         Stage::Features(work) => pending.feature_complete(work.wait().unwrap()).unwrap(),
-        Stage::ColorTransform { work, mut source } => {
-            source.buffer = work.wait().unwrap();
-            pending.transformed(source).unwrap();
-        }
+        Stage::ColorTransform(work) => pending.transformed(work.wait().unwrap()).unwrap(),
         Stage::Advance => pending.advance().unwrap(),
         stage => panic!("unexpected spline boundary: {stage:?}"),
     }

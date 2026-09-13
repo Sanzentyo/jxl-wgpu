@@ -18,10 +18,11 @@ use super::submission::{GpuWork, Submission, submit, validate_size};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, GpuOutputRequest, Result};
 
+mod icc;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
-/// Unrounded RGB in an explicit domain, followed by independently normalized extra planes.
+/// Unrounded color in an explicit domain, followed by independently normalized extra planes.
 #[derive(Clone, Debug)]
 pub(super) struct Surface {
     pub(super) buffer: GpuBufferLease,
@@ -44,10 +45,37 @@ impl Surface {
         Ok((self.layout.color_plane_bytes / 4) as u32)
     }
 
-    pub(super) fn with_encoding(mut self, encoding: FrameSurfaceEncoding) -> Self {
-        Arc::make_mut(&mut self.layout).set_encoding(encoding);
-        self.encoding = encoding;
-        self
+    pub(super) fn copy_extras(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: jxl_wgpu::ResidentStorageBinding<'_>,
+        layout: &FrameSurfaceLayout,
+    ) -> Result<()> {
+        if self.layout.extras.len() != layout.extras.len() {
+            return Err(Error::EngineContract(
+                "color conversion must preserve all extra channels",
+            ));
+        }
+        for (input, destination) in self.layout.extras.iter().zip(&layout.extras) {
+            let plane = &input.planes[0];
+            crate::frame_surface::copy::planes(
+                encoder,
+                &[jxl_wgpu::ResidentF32Plane {
+                    storage: jxl_wgpu::ResidentStorageBinding {
+                        buffer: self.buffer.as_wgpu_buffer(),
+                        offset: plane.offset,
+                        size: std::num::NonZeroU64::new(plane.end_offset()? - plane.offset)
+                            .expect("nonempty extra"),
+                    },
+                    width: input.extent.width,
+                    height: input.extent.height,
+                    stride: (plane.row_stride / 4) as u32,
+                }],
+                output,
+                destination,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -67,7 +95,7 @@ const _: () = assert!(std::mem::offset_of!(NativeParams, color) == 48);
 const _: () = assert!(std::mem::offset_of!(NativeParams, source) == 64);
 
 #[derive(Debug)]
-enum Packing {
+enum RasterPacking {
     Color {
         original: Box<ImageOutputParams>,
         linear: Box<ImageOutputParams>,
@@ -76,14 +104,22 @@ enum Packing {
 }
 
 #[derive(Debug)]
+enum Packing {
+    Raster {
+        pipeline: wgpu::ComputePipeline,
+        params: RasterPacking,
+    },
+    Icc(Box<icc::Presentation>),
+}
+
+#[derive(Debug)]
 pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
-    original: jxl_gpu_protocol::RgbColorEncoding,
+    pub(super) original: FrameSurfaceEncoding,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
-    pack: wgpu::ComputePipeline,
     packing: Packing,
     spots: Vec<SpotColor>,
     pub(super) layout: ImageLayout,
@@ -101,7 +137,7 @@ impl Compositor {
         let extras = &image.extra_channels;
         let grayscale = image.grayscale;
         let sample_bit_depth = image.bit_depth;
-        let original = crate::image_color::require_original_encoding(image)?;
+        let original = crate::image_color::original_domain(image)?;
         let orientation = OutputOrientation::from_exif_value(image.orientation).ok_or(
             Error::InvalidImageOrientation {
                 value: image.orientation,
@@ -114,9 +150,10 @@ impl Compositor {
         let surface = FrameSurfaceLayout::with_encoding(
             canvas,
             extras.len(),
-            FrameSurfaceEncoding::Rgb(original),
+            original.clone(),
             &device.limits(),
         )?;
+        let color_count = surface.color.planes.len() as u32;
         let output_size = aligned(layout.logical_size)?;
         validate_size(device, output_size)?;
         let bindings = device.limits().max_storage_buffers_per_shader_stage;
@@ -159,7 +196,9 @@ impl Compositor {
         }
         let blend_dispatch = dispatch(
             device,
-            u64::from(canvas.width) * u64::from(canvas.height) * (3 + extras.len() as u64),
+            u64::from(canvas.width)
+                * u64::from(canvas.height)
+                * (u64::from(color_count) + extras.len() as u64),
         )?;
         let output_dispatch = dispatch(device, output_size / 4)?;
         let first_alpha = extras.iter().enumerate().find_map(|(index, extra)| {
@@ -169,7 +208,7 @@ impl Compositor {
                 None
             }
         });
-        let alpha_channel = first_alpha.map_or(u32::MAX, |(index, _)| 3 + index as u32);
+        let alpha_channel = first_alpha.map_or(u32::MAX, |(index, _)| color_count + index as u32);
         let alpha_conversion = request.alpha_conversion(extras);
         let color_channel = request.numeric_color_channel(grayscale)?;
         let selected = request
@@ -181,7 +220,7 @@ impl Compositor {
                         index,
                         count: extras.len() as u32,
                     })
-                    .map(|extra| (3 + index, extra))
+                    .map(|extra| (color_count + index, extra))
             })
             .transpose()?;
         if request.mapping() == crate::GpuOutputMapping::Color
@@ -206,7 +245,7 @@ impl Compositor {
         let spot_source = spot_shader(!spots.is_empty());
         let native = crate::model::native_modular_format(request.format()).filter(|_| {
             request.uses_original_sample_domain()
-                || original == jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709
+                || original.rgb_encoding() == Some(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709)
         });
         let source_depth = selected.map_or(sample_bit_depth, |(_, extra)| extra.bit_depth);
         let source_float = matches!(source_depth, SampleBitDepth::Float { .. });
@@ -245,125 +284,169 @@ impl Compositor {
                     | crate::NumericSampleMapping::NativeFloat
             )
         ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
-        let (packing, source) = if native.is_some() || scalar_float {
-            if let (Some(native), Some((_, extra))) = (native, selected)
-                && (native.channels != crate::ModularChannels::Gray
-                    || extra.bit_depth
-                        != (SampleBitDepth::Integer {
-                            bits_per_sample: u32::from(native.bits_per_sample),
-                        }))
-            {
-                return Err(Error::UnsupportedOutputFormat(
-                    "native composed extra output must match its declared unsigned depth".into(),
-                ));
+        let packing = if let FrameSurfaceEncoding::Icc(profile) = &original
+            && request.mapping() == crate::GpuOutputMapping::Color
+        {
+            if !spots.is_empty() {
+                return Err(Error::UnsupportedOutputFormat("ICC spot-ink rendering is not yet connected; preserve spot channels to return the base color".into()));
             }
-            let (channels, bits, sample_bytes) = native.map_or((1, 32, 4), |native| {
-                (
-                    native.channels.count(),
-                    u32::from(native.bits_per_sample),
-                    u32::from(native.storage_bits) / 8,
-                )
-            });
-            (
-                Packing::Native(NativeParams {
-                    extent: [
-                        layout.extent.width,
-                        layout.extent.height,
-                        canvas.width,
-                        canvas.height,
-                    ],
-                    format: [
-                        channels,
-                        bits,
-                        sample_bytes,
-                        u32::try_from(layout.planes[0].row_stride).map_err(|_| address_error())?,
-                    ],
-                    output: [
-                        u32::try_from(layout.logical_size).map_err(|_| address_error())?,
-                        output_dispatch[0] * 64,
-                        orientation.to_exif_value() - 1,
-                        alpha_conversion as u32,
-                    ],
-                    color: [
-                        match original.transfer {
-                            jxl_gpu_protocol::TransferFunction::Linear => 0,
-                            jxl_gpu_protocol::TransferFunction::Srgb => 1,
-                            jxl_gpu_protocol::TransferFunction::Bt709 => 2,
-                            jxl_gpu_protocol::TransferFunction::Gamma(_) => 6,
-                            jxl_gpu_protocol::TransferFunction::Dci => 7,
-                            _ => unreachable!("validated original transfer"),
-                        },
-                        match original.transfer {
-                            jxl_gpu_protocol::TransferFunction::Gamma(exponent) => {
-                                exponent.value().to_bits()
-                            }
-                            _ => 1.0f32.to_bits(),
-                        },
-                        0,
-                        0,
-                    ],
-                    source: [
-                        (surface.color_plane_bytes / 4) as u32,
-                        alpha_channel,
-                        selected.map_or(color_channel.unwrap_or(0), |(index, _)| index),
-                        u32::from(scalar_float),
-                    ],
-                }),
-                format!(
-                    "{IMAGE_ORIENTATION_SHADER}\n{}\n{}\n{spot_source}\n{}",
-                    jxl_wgpu::ALPHA_OUTPUT_SHADER,
-                    jxl_wgpu::IMAGE_TRANSFER_SHADER,
-                    crate::modular_sample::shader(include_str!("native.wgsl"))
-                ),
-            )
+            Packing::Icc(Box::new(icc::Presentation::new(
+                &backend,
+                &surface,
+                profile,
+                request,
+                orientation,
+                alpha_conversion,
+                alpha_channel,
+            )?))
         } else {
-            if request.mapping() != crate::GpuOutputMapping::Color {
-                return Err(Error::UnsupportedOutputFormat("composed numeric samples require matching native unsigned or scalar normalized F32 output".into()));
-            }
-            let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
-                let params = ImageOutputParams::new(
-                    &layout,
-                    ImageOutputSource {
-                        extent: canvas,
-                        orientation,
-                        strides: [canvas.width; 3],
-                        encoding: encoding
-                            .rgb_encoding()
-                            .ok_or(Error::EngineContract("packing requires RGB"))?,
-                    },
-                    output_dispatch[0] * 64,
-                    request.white_point_adaptation(),
-                )?
-                .with_alpha_conversion(alpha_conversion);
-                Ok(
-                    if encoding
-                        == FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(original))
-                    {
-                        if let Some(threshold) = crate::image_color::reconstruction_black_threshold(
-                            original,
-                            &layout.format.color_spec,
-                        ) {
-                            params.with_linear_black_threshold(threshold)?
+            let (packing, source) = if native.is_some() || scalar_float {
+                if let (Some(native), Some((_, extra))) = (native, selected)
+                    && (native.channels != crate::ModularChannels::Gray
+                        || extra.bit_depth
+                            != (SampleBitDepth::Integer {
+                                bits_per_sample: u32::from(native.bits_per_sample),
+                            }))
+                {
+                    return Err(Error::UnsupportedOutputFormat(
+                        "native composed extra output must match its declared unsigned depth"
+                            .into(),
+                    ));
+                }
+                let (channels, bits, sample_bytes) = native.map_or((1, 32, 4), |native| {
+                    (
+                        native.channels.count(),
+                        u32::from(native.bits_per_sample),
+                        u32::from(native.storage_bits) / 8,
+                    )
+                });
+                (
+                    RasterPacking::Native(NativeParams {
+                        extent: [
+                            layout.extent.width,
+                            layout.extent.height,
+                            canvas.width,
+                            canvas.height,
+                        ],
+                        format: [
+                            channels,
+                            bits,
+                            sample_bytes,
+                            u32::try_from(layout.planes[0].row_stride)
+                                .map_err(|_| address_error())?,
+                        ],
+                        output: [
+                            u32::try_from(layout.logical_size).map_err(|_| address_error())?,
+                            output_dispatch[0] * 64,
+                            orientation.to_exif_value() - 1,
+                            alpha_conversion as u32,
+                        ],
+                        color: [
+                            match original.rgb_encoding().map(|encoding| encoding.transfer) {
+                                None | Some(jxl_gpu_protocol::TransferFunction::Linear) => 0,
+                                Some(jxl_gpu_protocol::TransferFunction::Srgb) => 1,
+                                Some(jxl_gpu_protocol::TransferFunction::Bt709) => 2,
+                                Some(jxl_gpu_protocol::TransferFunction::Gamma(_)) => 6,
+                                Some(jxl_gpu_protocol::TransferFunction::Dci) => 7,
+                                _ => unreachable!("validated original transfer"),
+                            },
+                            match original.rgb_encoding().map(|encoding| encoding.transfer) {
+                                Some(jxl_gpu_protocol::TransferFunction::Gamma(exponent)) => {
+                                    exponent.value().to_bits()
+                                }
+                                _ => 1.0f32.to_bits(),
+                            },
+                            color_count,
+                            0,
+                        ],
+                        source: [
+                            (surface.color_plane_bytes / 4) as u32,
+                            alpha_channel,
+                            selected.map_or(color_channel.unwrap_or(0), |(index, _)| index),
+                            u32::from(scalar_float),
+                        ],
+                    }),
+                    format!(
+                        "{IMAGE_ORIENTATION_SHADER}\n{}\n{}\n{spot_source}\n{}",
+                        jxl_wgpu::ALPHA_OUTPUT_SHADER,
+                        jxl_wgpu::IMAGE_TRANSFER_SHADER,
+                        crate::modular_sample::shader(include_str!("native.wgsl"))
+                    ),
+                )
+            } else {
+                if request.mapping() != crate::GpuOutputMapping::Color {
+                    return Err(Error::UnsupportedOutputFormat("composed numeric samples require matching native unsigned or scalar normalized F32 output".into()));
+                }
+                let original = original
+                    .rgb_encoding()
+                    .ok_or(Error::EngineContract("enumerated packing requires RGB"))?;
+                let params = |encoding: FrameSurfaceEncoding| -> Result<ImageOutputParams> {
+                    let params = ImageOutputParams::new(
+                        &layout,
+                        ImageOutputSource {
+                            extent: canvas,
+                            orientation,
+                            strides: [canvas.width; 3],
+                            encoding: encoding
+                                .rgb_encoding()
+                                .ok_or(Error::EngineContract("packing requires RGB"))?,
+                        },
+                        output_dispatch[0] * 64,
+                        request.white_point_adaptation(),
+                    )?
+                    .with_alpha_conversion(alpha_conversion);
+                    Ok(
+                        if encoding
+                            == FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(
+                                original,
+                            ))
+                        {
+                            if let Some(threshold) =
+                                crate::image_color::reconstruction_black_threshold(
+                                    original,
+                                    &layout.format.color_spec,
+                                )
+                            {
+                                params.with_linear_black_threshold(threshold)?
+                            } else {
+                                params
+                            }
                         } else {
                             params
-                        }
-                    } else {
-                        params
+                        },
+                    )
+                };
+                (
+                    RasterPacking::Color {
+                        original: Box::new(params(FrameSurfaceEncoding::Rgb(original))?),
+                        linear: Box::new(params(FrameSurfaceEncoding::Rgb(
+                            crate::image_color::linear_encoding(original),
+                        ))?),
                     },
+                    format!(
+                        "{IMAGE_OUTPUT_SHADER}\n{spot_source}\n{}",
+                        include_str!("output.wgsl")
+                    ),
                 )
             };
-            (
-                Packing::Color {
-                    original: Box::new(params(FrameSurfaceEncoding::Rgb(original))?),
-                    linear: Box::new(params(FrameSurfaceEncoding::Rgb(
-                        crate::image_color::linear_encoding(original),
-                    ))?),
-                },
-                format!(
-                    "{IMAGE_OUTPUT_SHADER}\n{spot_source}\n{}",
-                    include_str!("output.wgsl")
-                ),
-            )
+            let constants = if matches!(packing, RasterPacking::Color { .. }) {
+                vec![
+                    ("wg_x", 64.0),
+                    ("wg_y", 1.0),
+                    (
+                        "surface_plane_words",
+                        (surface.color_plane_bytes / 4) as f64,
+                    ),
+                    ("surface_alpha_channel", f64::from(alpha_channel)),
+                ]
+            } else {
+                Vec::new()
+            };
+            let pipeline = pipeline(device, "JPEG XL composed frame output", &source, &constants);
+            Packing::Raster {
+                pipeline,
+                params: packing,
+            }
         };
         let blend = pipeline(
             device,
@@ -371,20 +454,6 @@ impl Compositor {
             include_str!("blend.wgsl"),
             &[],
         );
-        let constants = if matches!(packing, Packing::Color { .. }) {
-            vec![
-                ("wg_x", 64.0),
-                ("wg_y", 1.0),
-                (
-                    "surface_plane_words",
-                    (surface.color_plane_bytes / 4) as f64,
-                ),
-                ("surface_alpha_channel", f64::from(alpha_channel)),
-            ]
-        } else {
-            Vec::new()
-        };
-        let pack = pipeline(device, "JPEG XL composed frame output", &source, &constants);
         Ok(Self {
             backend,
             canvas,
@@ -392,7 +461,6 @@ impl Compositor {
             extras: extras.to_vec(),
             surface,
             blend,
-            pack,
             packing,
             spots,
             layout,
@@ -418,12 +486,12 @@ impl Compositor {
         let encoding = domain
             .or_else(|| FrameSurfaceEncoding::from_format(&first.layout.format))
             .ok_or(Error::EngineContract(
-                "physical producer returned an unknown RGB surface encoding",
+                "physical producer returned an unknown surface color encoding",
             ))?;
         let expected = FrameSurfaceLayout::with_extra_extents(
             extent,
             outputs.iter().skip(1).map(|output| output.layout.extent),
-            encoding,
+            encoding.clone(),
             &self.backend.device().limits(),
         )?;
         if outputs.len() != 1 + self.extras.len()
@@ -448,11 +516,23 @@ impl Compositor {
         })
     }
 
+    pub(super) fn linear_encoding(&self) -> FrameSurfaceEncoding {
+        match &self.original {
+            FrameSurfaceEncoding::Rgb(original) => {
+                FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(*original))
+            }
+            FrameSurfaceEncoding::Icc(_) => {
+                FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709)
+            }
+            FrameSurfaceEncoding::Encoded => unreachable!("original image color domain"),
+        }
+    }
+
     pub(super) fn completed_surface(&self, buffer: GpuBufferLease) -> Surface {
         Surface {
             buffer,
             layout: Arc::new(self.surface.clone()),
-            encoding: FrameSurfaceEncoding::Rgb(self.original),
+            encoding: self.original.clone(),
         }
     }
 
@@ -469,14 +549,14 @@ impl Compositor {
                 .then(|| references[index].clone())
                 .flatten()
         });
-        if foreground.encoding != FrameSurfaceEncoding::Rgb(self.original)
+        if foreground.encoding != self.original
             || references
                 .iter()
                 .flatten()
-                .any(|base| base.encoding != FrameSurfaceEncoding::Rgb(self.original))
+                .any(|base| base.encoding != self.original)
         {
             return Err(Error::EngineContract(
-                "blending requires original-encoding RGB surfaces",
+                "blending requires original-color surfaces",
             ));
         }
         if foreground.extent() != Extent2d::new(frame.width, frame.height)
@@ -500,14 +580,14 @@ impl Compositor {
                 ];
             }
         }
-        let channels = blend_channels(frame, &self.extras)?;
+        let channels = blend_channels(frame, self.surface.color.planes.len(), &self.extras)?;
         let (intersection, origin) = intersection(self.canvas, frame);
         let params = BlendParams {
             canvas: [
                 self.canvas.width,
                 self.canvas.height,
                 (self.surface.color_plane_bytes / 4) as u32,
-                3 + self.extras.len() as u32,
+                self.surface.color.planes.len() as u32 + self.extras.len() as u32,
             ],
             intersection,
             source: [
@@ -543,12 +623,9 @@ impl Compositor {
     }
 
     pub(super) fn pack(&self, source: &Surface) -> Result<GpuWork> {
-        if source.encoding != FrameSurfaceEncoding::Rgb(self.original)
-            && source.encoding
-                != FrameSurfaceEncoding::Rgb(crate::image_color::linear_encoding(self.original))
-        {
+        if source.encoding != self.original && source.encoding != self.linear_encoding() {
             return Err(Error::EngineContract(
-                "presentation source is outside its original RGB encoding",
+                "presentation source is outside its original color domain",
             ));
         }
         if source.extent() != self.canvas
@@ -558,30 +635,37 @@ impl Compositor {
                 "presentation canvas has the wrong extent or plane stride",
             ));
         }
+        let Packing::Raster {
+            pipeline,
+            params: packing,
+        } = &self.packing
+        else {
+            let Packing::Icc(icc) = &self.packing else {
+                unreachable!()
+            };
+            return icc.pack(&self.backend, source);
+        };
         let mut native;
-        let (params, output_binding, uniform_binding): (&[u8], _, _) = match &self.packing {
-            Packing::Color { original, linear } => (
-                bytemuck::bytes_of(
-                    if source.encoding == FrameSurfaceEncoding::Rgb(self.original) {
-                        original.as_ref()
-                    } else {
-                        linear.as_ref()
-                    },
-                ),
+        let (params, output_binding, uniform_binding): (&[u8], _, _) = match packing {
+            RasterPacking::Color { original, linear } => (
+                bytemuck::bytes_of(if source.encoding == self.original {
+                    original.as_ref()
+                } else {
+                    linear.as_ref()
+                }),
                 3,
                 4,
             ),
-            Packing::Native(params) => {
+            RasterPacking::Native(params) => {
                 native = *params;
-                native.source[3] |=
-                    u32::from(source.encoding != FrameSurfaceEncoding::Rgb(self.original)) << 1;
+                native.source[3] |= u32::from(source.encoding != self.original) << 1;
                 (bytemuck::bytes_of(&native), 1, 2)
             }
         };
         submit(
             &self.backend,
             Submission {
-                pipeline: &self.pack,
+                pipeline,
                 params,
                 inputs: &[(0, &source.buffer)],
                 metadata: (!self.spots.is_empty()).then(|| (7, bytemuck::cast_slice(&self.spots))),

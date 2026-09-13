@@ -1,8 +1,8 @@
 //! Shared color conversion, orientation, and pitch-linear packing for GPU image producers.
 //!
-//! The shader fragment owns the output words. A producer supplies `source_rgb_at(x, y)` in
-//! oriented coordinates, returning unclipped RGB in the configured source encoding. This allows
-//! codec reconstruction to fuse with the same output conversion used by the render graph.
+//! The shader fragment owns the output words. A producer supplies RGB and alpha as binary32
+//! words in oriented coordinates. Unchanged F32 output preserves those words; color conversion
+//! evaluates them as floats. Codec reconstruction can fuse with the render graph's output path.
 
 use crate::{Error, Result};
 use bytemuck::{Pod, Zeroable};
@@ -18,8 +18,11 @@ use jxl_gpu_protocol::{
 };
 
 /// Shared WGSL declarations, color conversion, and word-owned output entry point `main`.
-/// Append a source fragment defining `source_rgb_at(x: u32, y: u32) -> vec3<f32>`
-/// and linear `source_alpha_at(x: u32, y: u32) -> f32`, both in oriented coordinates.
+/// Append a source fragment defining `source_rgb_words_at(x: u32, y: u32) -> vec3<u32>`
+/// and `source_alpha_word_at(x: u32, y: u32) -> u32`, both in oriented coordinates. These are
+/// binary32 representations of unclipped source RGB and linear alpha. A source that needs no
+/// reconstruction must return its stored words directly, preserving nonfinite and subnormal
+/// representations without a float round trip.
 pub const IMAGE_OUTPUT_SHADER: &str = concat!(
     include_str!("../shaders/image_orientation.wgsl"),
     include_str!("../shaders/alpha_output.wgsl"),
@@ -51,6 +54,15 @@ pub struct ImageOutputSource {
     /// Producer-specific scalar strides. The source fragment owns plane-bound validation.
     pub strides: [u32; 3],
     pub encoding: RgbColorEncoding,
+}
+
+/// Coordinates for packing values whose color transform has already completed.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageOutputGeometry {
+    pub extent: Extent2d,
+    pub orientation: OutputOrientation,
+    /// Producer-specific scalar strides. The source fragment validates its own plane bounds.
+    pub strides: [u32; 3],
 }
 
 /// Shared output association helper. Conversion follows the requested color transfer and
@@ -132,6 +144,63 @@ impl ImageOutputParams {
         adaptation: WhitePointAdaptation,
     ) -> Result<Self> {
         let prepared = prepare_image_output(layout)?;
+        let color = image_color_transform(source.encoding, &layout.format, adaptation)?;
+        Self::lower(
+            layout,
+            ImageOutputGeometry {
+                extent: source.extent,
+                orientation: source.orientation,
+                strides: source.strides,
+            },
+            dispatch_width,
+            prepared,
+            color,
+        )
+    }
+
+    /// Pack RGB or gray device values already in the exact target ICC profile. This performs
+    /// no curve or matrix evaluation, preserving F32 device samples when alpha is preserved.
+    /// A gray source supplies its one color word in `source_rgb_words_at(...).x`; alpha is separate.
+    pub fn for_icc_device(
+        layout: &ImageLayout,
+        source: ImageOutputGeometry,
+        profile: &jxl_gpu_protocol::icc::IccProfile,
+        dispatch_width: u32,
+    ) -> Result<Self> {
+        if !matches!(&layout.format.color_spec, ColorSpecification::Icc(target) if target == profile)
+        {
+            return Err(Error::InvalidPayload(
+                "device packing requires the exact source ICC profile".into(),
+            ));
+        }
+        let prepared = prepare_output(layout, true)?;
+        if prepared.kind > 1 {
+            return Err(Error::Unsupported(
+                "ICC device packing requires RGB or gray storage".into(),
+            ));
+        }
+        Self::lower(
+            layout,
+            source,
+            dispatch_width,
+            prepared,
+            ImageColorTransform {
+                source_transfer: 0,
+                target_transfer: 0,
+                source_gamma: 1.0,
+                target_gamma: 1.0,
+                primaries: IDENTITY_3.map(|row| [row[0] as f32, row[1] as f32, row[2] as f32, 0.0]),
+            },
+        )
+    }
+
+    fn lower(
+        layout: &ImageLayout,
+        source: ImageOutputGeometry,
+        dispatch_width: u32,
+        prepared: PreparedImageOutput,
+        color: ImageColorTransform,
+    ) -> Result<Self> {
         if source.extent.is_empty()
             || source.orientation.map_extent(source.extent) != layout.extent
             || dispatch_width == 0
@@ -140,7 +209,6 @@ impl ImageOutputParams {
                 "image output source geometry or dispatch is invalid".into(),
             ));
         }
-        let color = image_color_transform(source.encoding, &layout.format, adaptation)?;
         Ok(Self {
             width: layout.extent.width,
             height: layout.extent.height,
@@ -188,7 +256,7 @@ impl ImageOutputParams {
     }
 
     /// Adjusts RGB association after color conversion, including when the output omits alpha.
-    /// The producer must supply the matching alpha plane through `source_alpha_at`.
+    /// The producer must supply the matching alpha plane through `source_alpha_word_at`.
     #[must_use]
     pub const fn with_alpha_conversion(mut self, conversion: AlphaConversion) -> Self {
         self.alpha[0] = conversion as u32;
@@ -214,6 +282,10 @@ pub(crate) struct PreparedImageOutput {
 }
 
 pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImageOutput> {
+    prepare_output(layout, false)
+}
+
+fn prepare_output(layout: &ImageLayout, gray_device: bool) -> Result<PreparedImageOutput> {
     if layout.planes.len() != layout.format.planes.len() || layout.planes.len() > 4 {
         return Err(Error::Unsupported(format!(
             "generic GPU output supports 1..=4 planes, layout has {}",
@@ -237,6 +309,30 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
 
     let class = classify_image_output_format(&layout.format)?;
     match class {
+        ColorFormatClass::Gray {
+            sample,
+            storage,
+            alpha,
+        } if gray_device => {
+            Ok(PreparedImageOutput {
+                kind: match storage {
+                    ColorStorage::Interleaved => 0,
+                    ColorStorage::Planar => 1,
+                },
+                channels: if alpha { 2 } else { 1 },
+                order: 4, // Device gray, with optional alpha in position one.
+                matrix: 1,
+                range: 0,
+                siting_x: 1,
+                siting_y: 1,
+                subsample_x: 1,
+                subsample_y: 1,
+                bits: u32::from(sample.bits()),
+                storage_bits: u32::from(sample.bits()),
+                plane_offsets,
+                plane_strides,
+            })
+        }
         ColorFormatClass::Gray { .. } => Err(Error::Unsupported(
             "gray output requires an explicit gray color conversion and packing stage".into(),
         )),

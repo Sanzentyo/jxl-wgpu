@@ -1144,6 +1144,34 @@ impl OutputPlan {
         let orientation = request.orientation_policy().resolve(orientation);
         let extent = orientation.map_extent(source_extent);
         let format = request.format().clone();
+        if request.retains_frame_surface()
+            && request.frame_surface_encoding()
+                == crate::frame_surface::FrameSurfaceEncoding::Encoded
+        {
+            let output = Self {
+                surface: None,
+                render: None,
+                lf_render: None,
+                source_channels: super::channels::OutputChannels::identity(
+                    source_channels,
+                    source_encoding,
+                ),
+                layout: ImageLayout::packed(extent, format)?,
+                source_extent,
+                orientation,
+                kind: OutputKind::RgbPlanar,
+                transfer: 0,
+                limited_range: false,
+                channels: 3,
+                order: 0,
+                bits: 32,
+                storage_bits: 32,
+                numeric_mapping: 0,
+                f64_output_path: None,
+            };
+            output.validate_shader_layout()?;
+            return Ok(output);
+        }
         if let Some(native) = native_modular_format(&format) {
             let native_mapping = matches!(
                 (native.channels, request.mapping()),

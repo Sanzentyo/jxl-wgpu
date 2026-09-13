@@ -416,8 +416,22 @@ profile curves or inventing RGB metadata.
 Eight native RGB/Gray original/XYB streams cover exact alpha and original color samples; metadata-only
 ICC substitution additionally covers 17/31-bit integer codes and 5/16/24/32-bit floating representations.
 Complete/fragmented input and common/standalone engines retain the existing byte-budget contract.
-Color reconstruction into ICC device surfaces, reference composition, requested ICC conversion and
-per-image program ownership remain open. All affected rows remain **Partial**.
+This numeric checkpoint did not establish ICC color surfaces or conversion. All affected rows
+remain **Partial**.
+
+Original ICC execution checkpoint: common decoding of original (non-XYB, non-YCbCr) ICC RGB/Gray
+now uses explicitly tagged non-color codec components and copies them into their real device
+domain. Gray has one color plane; reference blending and extra offsets follow that count. Color
+conversion returns both the actual layout and its buffer. Relative matrix/TRC execution supports
+enumerated SDR and other RGB/Gray ICC targets, with exact-profile U8/F32 packing, orientation and
+alpha association. Same-profile F32 output preserves Modular IEEE words without curve evaluation.
+Image-owned programs upload once with retryable exact admission and completion-owned resources.
+The eight-stream corpus retains all previous bytes and adds native original VarDCT pixels,
+Little CMS references and independent f64 color results; a metadata-only Gray composition case
+retains values above one across blending and orientation. ICC XYB/YCbCr, enumerated-source ICC
+targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK, full intents and HDR/display
+integration still require implementation and conformance. This is progress toward the original
+full JPEG XL objective; no feature row or completion gate is marked complete by this checkpoint.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|

@@ -68,10 +68,7 @@ fn step(pending: &mut DependentPending, emit: bool) {
             .complete_lf_features(Some(work.wait().unwrap()), emit)
             .unwrap(),
         Stage::LfFeatures(work) => pending.record_lf(Some(work.wait().unwrap()), emit).unwrap(),
-        Stage::ColorTransform { work, mut source } => {
-            source.buffer = work.wait().unwrap();
-            pending.transformed(source).unwrap();
-        }
+        Stage::ColorTransform(work) => pending.transformed(work.wait().unwrap()).unwrap(),
         Stage::Blend(work) => pending
             .record(
                 pending
@@ -295,7 +292,7 @@ fn begin_feature_refinement(pending: &mut DependentPending) {
                         preview.surface.as_ref(),
                         &buffer,
                     ),
-                    preview.surface_encoding,
+                    preview.surface_encoding.clone(),
                 )
                 .unwrap();
             pending

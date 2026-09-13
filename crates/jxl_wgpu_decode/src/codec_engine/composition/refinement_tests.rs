@@ -395,20 +395,18 @@ pub(super) fn step_component_refinement(
     else {
         panic!("expected component refinement");
     };
-    let (RefinementRender::Patches {
-        work,
-        mut source,
-        index,
-    }
-    | RefinementRender::Transform {
-        work,
-        mut source,
-        index,
-    }) = render
-    else {
-        panic!("expected patch or transform work");
+    let (source, index) = match render {
+        RefinementRender::Patches {
+            work,
+            mut source,
+            index,
+        } => {
+            source.buffer = work.wait().unwrap();
+            (source, index)
+        }
+        RefinementRender::Transform { work, index } => (work.wait().unwrap(), index),
+        _ => panic!("expected patch or transform work"),
     };
-    source.buffer = work.wait().unwrap();
     let next = || pending.render_refinement(compositor, source, index, resume, progression);
     if fail {
         require_allocation_failure(backend, next);

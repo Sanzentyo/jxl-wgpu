@@ -229,6 +229,10 @@ pub enum Error {
     #[error(transparent)]
     FrameSurface(#[from] crate::FrameSurfaceError),
     #[error(transparent)]
+    Icc(#[from] jxl_gpu_protocol::icc::IccError),
+    #[error(transparent)]
+    ResidentIcc(#[from] jxl_wgpu::ResidentIccError),
+    #[error(transparent)]
     ModularPalette(#[from] crate::modular_palette::ModularPaletteError),
     #[error(transparent)]
     VarDct(#[from] crate::vardct_engine::VarDctDecodeError),

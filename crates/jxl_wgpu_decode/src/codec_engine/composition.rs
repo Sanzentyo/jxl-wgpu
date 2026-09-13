@@ -478,7 +478,9 @@ impl DependentSession {
                     } else {
                         Extent2d::new(frame.width, frame.height)
                     };
-                    preview.for_surface(extent, encodings[last]).map(Arc::new)
+                    preview
+                        .for_surface(extent, encodings[last].clone())
+                        .map(Arc::new)
                 } else {
                     Ok(Arc::clone(preview))
                 }
@@ -540,17 +542,17 @@ fn composed_source(
         )
         .into());
     }
-    let original = FrameSurfaceEncoding::Rgb(crate::image_color::require_original_encoding(image)?);
-    let working = GpuOutputRequest::color(original.format())?
-        .for_frame_surface(original)
-        .with_progressive_output(request.progressive_output())
-        .with_max_frame_slots(request.max_frame_slots());
     let compositor = Arc::new(Compositor::new(
         engine.backend().clone(),
         Extent2d::new(image.width, image.height),
         image,
         request,
     )?);
+    let original = compositor.original.clone();
+    let working = GpuOutputRequest::color(original.format())?
+        .for_frame_surface(original)
+        .with_progressive_output(request.progressive_output())
+        .with_max_frame_slots(request.max_frame_slots());
     let source = SequenceSource {
         engine,
         codestream,
@@ -561,12 +563,13 @@ fn composed_source(
                 .iter()
                 .zip(&inventory.frames)
                 .map(|(node, frame)| {
-                    if frame.flags & 0x12 != 0
+                    if matches!(compositor.original, FrameSurfaceEncoding::Icc(_))
+                        || frame.flags & 0x12 != 0
                         || (node.save_reference.is_some() && frame.save_before_color_transform)
                     {
                         Ok(FrameSurfaceEncoding::Encoded)
                     } else {
-                        presentation_encoding(image, node, frame)
+                        presentation_encoding(&compositor, image, node, frame)
                     }
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -577,27 +580,35 @@ fn composed_source(
 }
 
 fn presentation_encoding(
+    compositor: &Compositor,
     image: &jxl_gpu_bitstream::ImageHeaderInventory,
     node: &crate::FrameExecutionNode,
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<FrameSurfaceEncoding> {
-    let original = crate::image_color::require_original_encoding(image)?;
+    let original = compositor.original.clone();
     if image.xyb_encoded
         && !frame.do_ycbcr
         && !node.needs_composition
         && (node.save_reference.is_none() || frame.save_before_color_transform)
     {
-        Ok(FrameSurfaceEncoding::Rgb(
-            crate::image_color::linear_encoding(original),
-        ))
+        Ok(compositor.linear_encoding())
     } else {
-        Ok(FrameSurfaceEncoding::Rgb(original))
+        Ok(original)
     }
 }
 
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
     let image = &inventory.image_header;
-    crate::image_color::require_original_encoding(image)?;
+    crate::image_color::validate_declaration(image)?;
+    if image.embedded_icc.is_some()
+        && (image.xyb_encoded || inventory.frames.iter().any(|frame| frame.do_ycbcr))
+    {
+        return Err(crate::UnsupportedProfile::new(
+            crate::UnsupportedCodestreamFeature::ColorEncoding,
+            "ICC XYB and YCbCr color reconstruction is not yet connected",
+        )
+        .into());
+    }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
         if frame.flags & 2 != 0 && frame.upsampling != 1 {
             for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
@@ -679,8 +690,7 @@ enum RefinementRender {
         index: usize,
     },
     Transform {
-        work: GpuWork,
-        source: Surface,
+        work: GpuWork<Surface>,
         index: usize,
     },
     Blend(GpuWork),
@@ -725,10 +735,7 @@ enum Stage {
         work: GpuWork,
         source: Surface,
     },
-    ColorTransform {
-        work: GpuWork,
-        source: Surface,
-    },
+    ColorTransform(GpuWork<Surface>),
     Decode(PhysicalPending),
     Blend(GpuWork),
     Pack(GpuWork),
@@ -855,7 +862,7 @@ impl DependentPending {
                     .source
                     .surface_encodings
                     .as_ref()
-                    .map(|domains| domains[self.physical]);
+                    .map(|domains| domains[self.physical].clone());
                 let surface = compositor.import_with_encoding(frame.output.outputs, domain)?;
                 if let Some(dictionary) = self
                     .patches
@@ -1173,7 +1180,12 @@ impl DependentPending {
         if self.physical + 1 != self.end && frame.save_before_color_transform {
             return self.advance();
         }
-        let encoding = presentation_encoding(&carry.source.inventory.image_header, node, frame)?;
+        let encoding = presentation_encoding(
+            self.output.compositor()?,
+            &carry.source.inventory.image_header,
+            node,
+            frame,
+        )?;
         let work = transform::convert(
             carry.source.engine.backend(),
             &surface,
@@ -1181,10 +1193,7 @@ impl DependentPending {
             frame,
             encoding,
         )?;
-        self.stage = Some(Stage::ColorTransform {
-            work,
-            source: surface.with_encoding(encoding),
-        });
+        self.stage = Some(Stage::ColorTransform(work));
         self.count_submission();
         Ok(())
     }
@@ -1351,13 +1360,11 @@ impl DependentPending {
                     self.stage = None;
                     self.reconstructed(surface)?;
                 }
-                Stage::ColorTransform { work, source } => {
-                    let buffer = match work.poll(context) {
+                Stage::ColorTransform(work) => {
+                    let surface = match work.poll(context) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result?,
                     };
-                    let mut surface = source.clone();
-                    surface.buffer = buffer;
                     self.stage = None;
                     self.transformed(surface)?;
                 }
@@ -1468,11 +1475,6 @@ impl DependentPending {
                             work,
                             source,
                             index,
-                        }
-                        | RefinementRender::Transform {
-                            work,
-                            source,
-                            index,
                         },
                     ..
                 } => {
@@ -1483,6 +1485,30 @@ impl DependentPending {
                     let surface = Surface {
                         buffer,
                         ..source.clone()
+                    };
+                    let index = *index;
+                    let Some(Stage::Refinement {
+                        compositor,
+                        resume,
+                        progression,
+                        ..
+                    }) = self.stage.take()
+                    else {
+                        unreachable!()
+                    };
+                    if emit_intermediates {
+                        self.render_refinement(compositor, surface, index, resume, progression)?;
+                    } else {
+                        self.stage = Some(resume.stage());
+                    }
+                }
+                Stage::Refinement {
+                    render: RefinementRender::Transform { work, index },
+                    ..
+                } => {
+                    let surface = match work.poll(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result?,
                     };
                     let index = *index;
                     let Some(Stage::Refinement {
@@ -1599,7 +1625,7 @@ impl DependentPending {
                                     Some(surface_layout),
                                     &buffer,
                                 ),
-                                preview.surface_encoding,
+                                preview.surface_encoding.clone(),
                             )?;
                             self.begin_refinement(
                                 compositor,
@@ -1656,10 +1682,7 @@ impl DependentPending {
                     source.buffer = work.wait()?;
                     self.reconstructed(source)?;
                 }
-                Stage::ColorTransform { work, mut source } => {
-                    source.buffer = work.wait()?;
-                    self.transformed(source)?;
-                }
+                Stage::ColorTransform(work) => self.transformed(work.wait()?)?,
                 Stage::Decode(PhysicalPending {
                     mut pending,
                     count,
@@ -1685,9 +1708,9 @@ impl DependentPending {
                     // Final-only completion drains the render, then resumes physical execution.
                     // A blend which has not yet been packed needs no additional presentation work.
                     match render {
-                        RefinementRender::Features { work, .. } => drop(work.wait()?),
+                        RefinementRender::Features { work, .. }
+                        | RefinementRender::Transform { work, .. } => drop(work.wait()?),
                         RefinementRender::Patches { work, .. }
-                        | RefinementRender::Transform { work, .. }
                         | RefinementRender::Blend(work)
                         | RefinementRender::Pack(work) => drop(work.wait()?),
                     }
@@ -1710,7 +1733,7 @@ impl DependentPending {
             .carry
             .as_ref()
             .and_then(|carry| carry.source.surface_encodings.as_ref())
-            .map(|encodings| encodings[self.physical]);
+            .map(|encodings| encodings[self.physical].clone());
         let surface = compositor.import_with_encoding(frame.outputs, domain)?;
         let Some(Stage::Decode(decode)) = self.stage.take() else {
             return Err(Error::EngineContract(
@@ -1810,8 +1833,12 @@ impl DependentPending {
         let node = &self.nodes[index - self.first];
         let frame = &carry.source.inventory.frames[index];
         let render = if surface.encoding == FrameSurfaceEncoding::Encoded {
-            let encoding =
-                presentation_encoding(&carry.source.inventory.image_header, node, frame)?;
+            let encoding = presentation_encoding(
+                &compositor,
+                &carry.source.inventory.image_header,
+                node,
+                frame,
+            )?;
             RefinementRender::Transform {
                 work: transform::convert(
                     carry.source.engine.backend(),
@@ -1820,7 +1847,6 @@ impl DependentPending {
                     frame,
                     encoding,
                 )?,
-                source: surface.with_encoding(encoding),
                 index,
             }
         } else if node.needs_composition {

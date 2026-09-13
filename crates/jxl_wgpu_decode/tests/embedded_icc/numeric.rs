@@ -7,7 +7,7 @@ use jxl_wgpu_decode::{
 };
 use std::num::NonZeroU64;
 
-fn source(directory: &str, name: &str) -> (Vec<u8>, Vec<u32>) {
+pub(super) fn sample_fixture(directory: &str, name: &str) -> (Vec<u8>, Vec<u32>) {
     let root = corpus::directory().parent().unwrap().join(directory);
     let bytes = unhex(&std::fs::read_to_string(root.join(format!("{name}.jxl.hex"))).unwrap());
     let suffix = if directory == "integer" { "u32" } else { "f32" };
@@ -43,7 +43,7 @@ fn embedded_icc_does_not_change_wide_integer_codes_or_ieee754_words() {
         ("31-3-5-33x5-p0-r0", 31, 5),
         ("31-3-24-33x5-p0-r0", 31, 24),
     ] {
-        let (bytes, words) = source("integer", name);
+        let (bytes, words) = sample_fixture("integer", name);
         let bytes = profile::replace(&bytes, &rgb);
         for channel in 0..4 {
             let bits = if channel == 3 { alpha_bits } else { color_bits };
@@ -75,7 +75,7 @@ fn embedded_icc_does_not_change_wide_integer_codes_or_ieee754_words() {
         }
     }
     for name in ["5-2", "16-5", "24-7", "32-8"] {
-        let (bytes, words) = source("floating", name);
+        let (bytes, words) = sample_fixture("floating", name);
         let bytes = profile::replace(&bytes, &gray);
         let expected: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         for (index, decoder) in decoders.iter().enumerate() {

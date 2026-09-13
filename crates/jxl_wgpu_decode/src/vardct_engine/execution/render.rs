@@ -1,5 +1,6 @@
 //! Reconstruct and present one immutable coefficient state. Entropy accumulation is separate.
 
+use super::super::output::VarDctImageOutput;
 use super::*;
 
 pub(super) struct FrameRenderInputs<'a> {
@@ -59,7 +60,7 @@ pub(super) fn encode_frame_render(
     let mut resident_scratch = Vec::with_capacity(source.groups.len());
     let mut dc_reconstruction = None;
     let (output_scratch, post_transform_buffers, lf_output) = match source.output {
-        VarDctFrameOutput::Color { mut config, plan } => {
+        VarDctFrameOutput::Image(mut image_output) => {
             let resident_planes =
                 resident_planes.ok_or(VarDctDecodeError::EntropyWindowContract {
                     detail: "color output lacks its resident planes",
@@ -279,15 +280,16 @@ pub(super) fn encode_frame_render(
             } else {
                 source.packet.profile.channel_shifts
             };
-            if let crate::color_output::ColorOutputTransform::Ycbcr { channel_shifts, .. } =
-                &mut config.transform
+            if let VarDctImageOutput::Color { config, .. } = &mut image_output
+                && let crate::color_output::ColorOutputTransform::Ycbcr { channel_shifts, .. } =
+                    &mut config.transform
             {
                 // Plane geometry and color conversion must agree, including when noise alone
                 // requires expanded components or a zero noise model elides that expansion.
                 *channel_shifts = presentation_shifts;
             }
-            let output_width = config.extent.width;
-            let output_height = config.extent.height;
+            let output_width = image_output.extent().width;
+            let output_height = image_output.extent().height;
             let presentation_stride = if frame_upsample_planes.is_some() {
                 output_width
             } else {
@@ -335,57 +337,80 @@ pub(super) fn encode_frame_render(
             } else {
                 None
             };
-            let output_scratch = pipelines.output.encode(
-                device,
-                commands,
-                ColorOutputInputs {
-                    alpha: if source.surface.is_some() {
-                        None
-                    } else if let (Some(plan), Some(buffers)) =
-                        (&source.extra_render, &rendered_extra)
-                    {
-                        let plane = plan.planes()[0];
-                        Some(crate::color_output::ColorOutputAlpha {
-                            domain: crate::ModularSampleDomain::DecodedF32,
-                            storage: resident_binding(&buffers.output)?,
-                            width: plane.layout.width,
-                            height: plane.layout.height,
-                            stride: plane.layout.row_stride_words,
-                            word_offset: plane.layout.word_offset,
-                            sample_bit_depth: plane.encoding.depth(),
+            let output_scratch = match image_output {
+                VarDctImageOutput::Color { config, plan } => {
+                    let scratch = pipelines.output.encode(
+                        device,
+                        commands,
+                        ColorOutputInputs {
+                            alpha: if source.surface.is_some() {
+                                None
+                            } else if let (Some(plan), Some(buffers)) =
+                                (&source.extra_render, &rendered_extra)
+                            {
+                                let plane = plan.planes()[0];
+                                Some(crate::color_output::ColorOutputAlpha {
+                                    domain: crate::ModularSampleDomain::DecodedF32,
+                                    storage: resident_binding(&buffers.output)?,
+                                    width: plane.layout.width,
+                                    height: plane.layout.height,
+                                    stride: plane.layout.row_stride_words,
+                                    word_offset: plane.layout.word_offset,
+                                    sample_bit_depth: plane.encoding.depth(),
+                                })
+                            } else {
+                                extra_planes
+                                    .first()
+                                    .map(super::super::staging::ResidentModularPlane::alpha_binding)
+                                    .transpose()?
+                            },
+                            planes: [
+                                ColorOutputPlane {
+                                    storage: resident_binding(&presentation_planes[0])?,
+                                    width: presentation_geometry[0][0],
+                                    height: presentation_geometry[0][1],
+                                    stride: presentation_strides[0],
+                                },
+                                ColorOutputPlane {
+                                    storage: resident_binding(&presentation_planes[1])?,
+                                    width: presentation_geometry[1][0],
+                                    height: presentation_geometry[1][1],
+                                    stride: presentation_strides[1],
+                                },
+                                ColorOutputPlane {
+                                    storage: resident_binding(&presentation_planes[2])?,
+                                    width: presentation_geometry[2][0],
+                                    height: presentation_geometry[2][1],
+                                    stride: presentation_strides[2],
+                                },
+                            ],
+                            output: resident_binding(output)?,
+                            layout: &source.layout,
+                            config,
+                        },
+                    )?;
+                    debug_assert_eq!(scratch.plan, plan);
+                    FrameOutputScratch::Color { _scratch: scratch }
+                }
+                VarDctImageOutput::Components { .. } => {
+                    let planes = [0, 1, 2].map(|index| {
+                        Ok::<_, VarDctDecodeError>(ResidentF32Plane {
+                            storage: resident_binding(&presentation_planes[index])?,
+                            width: presentation_geometry[index][0],
+                            height: presentation_geometry[index][1],
+                            stride: presentation_strides[index],
                         })
-                    } else {
-                        extra_planes
-                            .first()
-                            .map(super::super::staging::ResidentModularPlane::alpha_binding)
-                            .transpose()?
-                    },
-                    planes: [
-                        ColorOutputPlane {
-                            storage: resident_binding(&presentation_planes[0])?,
-                            width: presentation_geometry[0][0],
-                            height: presentation_geometry[0][1],
-                            stride: presentation_strides[0],
-                        },
-                        ColorOutputPlane {
-                            storage: resident_binding(&presentation_planes[1])?,
-                            width: presentation_geometry[1][0],
-                            height: presentation_geometry[1][1],
-                            stride: presentation_strides[1],
-                        },
-                        ColorOutputPlane {
-                            storage: resident_binding(&presentation_planes[2])?,
-                            width: presentation_geometry[2][0],
-                            height: presentation_geometry[2][1],
-                            stride: presentation_strides[2],
-                        },
-                    ],
-                    output: resident_binding(output)?,
-                    layout: &source.layout,
-                    config,
-                },
-            )?;
-            debug_assert_eq!(output_scratch.plan, plan);
+                    });
+                    let [first, second, third] = planes;
+                    crate::frame_surface::copy::planes(
+                        commands,
+                        &[first?, second?, third?],
+                        resident_binding(output)?,
+                        &source.layout,
+                    )?;
+                    FrameOutputScratch::Components
+                }
+            };
             // The frame executor completes deferred features before publishing an LF slot.
             // Retain only the allocations at the requested reconstruction boundary.
             let lf_output = if source.packet.profile.lf_level != 0 {
@@ -435,13 +460,7 @@ pub(super) fn encode_frame_render(
                 _frame_upsample_weights: frame_upsample_weights,
                 _frame_upsample_uniforms: frame_upsample_uniforms,
             };
-            (
-                FrameOutputScratch::Color {
-                    _scratch: output_scratch,
-                },
-                post_transform_buffers,
-                lf_output,
-            )
+            (output_scratch, post_transform_buffers, lf_output)
         }
         VarDctFrameOutput::Extra { index, plan } => {
             let extra = extra_planes

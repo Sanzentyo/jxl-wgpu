@@ -45,6 +45,6 @@ pub(super) fn shader(enabled: bool) -> &'static str {
     if enabled {
         include_str!("spot.wgsl")
     } else {
-        "fn present_rgb(rgb: vec3<f32>, position: u32) -> vec3<f32> { return rgb; }"
+        "fn present_rgb_words(rgb: vec3<u32>, position: u32) -> vec3<u32> { return rgb; }"
     }
 }

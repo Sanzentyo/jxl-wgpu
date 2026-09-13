@@ -76,6 +76,7 @@ impl ResidentIccMemoryPlan {
 }
 
 /// Immutable uploaded metadata. Callers retain this handle for every recorded dispatch.
+#[derive(Debug)]
 pub struct ResidentIccProgram {
     buffer: wgpu::Buffer,
     input_channels: usize,
@@ -146,6 +147,7 @@ pub enum ResidentIccError {
     OutputOverlap,
 }
 
+#[derive(Debug)]
 pub struct ResidentIccPipeline {
     pipeline: wgpu::ComputePipeline,
     variant: KernelVariant,

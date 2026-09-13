@@ -602,7 +602,7 @@ fn lf_patch_queued_body_and_each_gpu_stage_preserve_leases_on_cancel_drain_and_a
                 let buffer = work.wait().unwrap();
                 let preview = pending.lf_preview.as_ref().unwrap();
                 assert_eq!(
-                    preview.surface_encoding,
+                    preview.surface_encoding.clone(),
                     Some(FrameSurfaceEncoding::Encoded)
                 );
                 let compositor = Arc::clone(pending.output.compositor().unwrap());
@@ -613,7 +613,7 @@ fn lf_patch_queued_body_and_each_gpu_stage_preserve_leases_on_cancel_drain_and_a
                             preview.surface.as_ref(),
                             &buffer,
                         ),
-                        preview.surface_encoding,
+                        preview.surface_encoding.clone(),
                     )
                     .unwrap();
                 let next = || {
