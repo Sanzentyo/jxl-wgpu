@@ -623,6 +623,8 @@ impl GpuOutputRequest {
         encoding: crate::frame_surface::FrameSurfaceEncoding,
     ) -> Self {
         self.format = encoding.format();
+        self.mapping = GpuOutputMapping::Color;
+        self.numeric_channel = None;
         self.frame_surface = Some(encoding);
         self.alpha = AlphaOutputPolicy::Preserve;
         self.spot_colors = SpotColorPolicy::Preserve;

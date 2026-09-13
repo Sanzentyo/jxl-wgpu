@@ -169,9 +169,16 @@ pub(super) fn prepare_presentation(
                 profile.upsampling,
                 &frame.extra_channel_upsampling,
             );
+            // LF prediction can retain only XYB. Match the normalized-extra selection;
+            // optional previews and producer features request their extra planes explicitly.
+            let extra_factors: &[u32] = if profile.lf_level == 0 || request.retains_lf_extras() {
+                &frame.extra_channel_upsampling
+            } else {
+                &[]
+            };
             crate::frame_surface::FrameSurfaceLayout::with_extra_extents(
                 orientation.map_extent(extent),
-                frame.extra_channel_upsampling.iter().map(|&factor| {
+                extra_factors.iter().map(|&factor| {
                     resampling
                         .extra(factor, request.frame_render_stage())
                         .extent

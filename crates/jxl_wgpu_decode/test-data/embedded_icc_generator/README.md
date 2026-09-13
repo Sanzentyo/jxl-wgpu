@@ -65,10 +65,14 @@ still reports the original ICC. This generator therefore decodes original device
 and performs independently checked conversion afterward.
 
 Common original ICC RGB/Gray color execution is a partial capability in the full JPEG XL goal.
-ICC XYB reconstruction, enumerated-source ICC targets, spot rendering, standalone codec
+Broader ICC XYB conformance, enumerated-source ICC targets, spot rendering, standalone codec
 color admission, LUT/MPE/Lab/CMYK, full rendering intents and HDR/display integration remain open.
 Neither native reference executable nor CPU pixel conversion is a production dependency.
 
 YCbCr reconstruction and converted presentation use the existing device corpus plus the separate
 [ICC YCbCr generator](../embedded_icc_ycbcr_generator/README.md). Its 146 source substitutions and
 five independently bounded conversion cases extend the same common execution path.
+
+XYB reconstruction and original-device reference addition have a separate
+[generator and precision contract](../embedded_icc_xyb_generator/README.md). Direct linear
+output and RGB/Gray requested profiles reuse these four XYB inputs without changing their bytes.

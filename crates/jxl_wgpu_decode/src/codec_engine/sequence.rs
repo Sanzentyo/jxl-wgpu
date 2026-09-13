@@ -188,14 +188,11 @@ impl SequenceSource {
             }
             FrameEncoding::VarDct => {
                 let request = if projected.frames[0].frame_type == FrameType::LowFrequency {
-                    let lf_request = GpuOutputRequest::color(crate::vardct_rgb8_format())?
-                        .with_max_frame_slots(request.max_frame_slots())
-                        .with_lf_extras(request.retains_lf_extras());
-                    if request.defers_frame_features() {
-                        lf_request.before_frame_features()
-                    } else {
-                        lf_request
-                    }
+                    // LF prediction and features consume codec components. Its visible
+                    // preview is reconstructed by the image's common color boundary.
+                    request
+                        .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Encoded)
+                        .with_progressive_output(false)
                 } else {
                     request
                 };

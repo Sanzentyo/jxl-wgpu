@@ -11,7 +11,9 @@ use std::num::NonZeroU64;
 
 mod color;
 mod numeric;
+mod output;
 mod profile;
+mod xyb;
 mod ycbcr;
 
 fn inventory(data: &[u8]) -> jxl_gpu_bitstream::CodestreamInventory {
@@ -125,12 +127,19 @@ fn native_icc_declarations_and_scalar_alpha_survive_both_codecs() {
 fn icc_color_conversion_requires_execution_and_cannot_be_enabled_by_metadata() {
     let backend = pollster::block_on(WgpuBackend::request_default(Default::default())).unwrap();
     let decoder = GpuDecoder::wgpu(backend.clone()).unwrap();
-    for case in corpus::cases().filter(|case| case.xyb) {
+    for case in corpus::cases().filter(|case| !case.xyb) {
         let data = case.bytes();
-        let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format()).unwrap();
-        assert!(matches!(decoder.open(&data, request),
-            Err(jxl_wgpu_decode::Error::UnsupportedProfile(error))
-                if error.feature == jxl_wgpu_decode::UnsupportedCodestreamFeature::ColorEncoding));
+        // Original ICC conversion requires a real CMS method. Successful direct linear
+        // XYB output is covered separately and must not select this unused method.
+        let request = GpuOutputRequest::color(jxl_wgpu_decode::vardct_rgb8_format())
+            .unwrap()
+            .with_icc_rendering_intent(jxl_gpu_protocol::icc::IccRenderingIntent::Perceptual);
+        assert!(matches!(
+            decoder.open(&data, request),
+            Err(jxl_wgpu_decode::Error::Icc(
+                jxl_gpu_protocol::icc::IccError::RenderingIntent { .. }
+            ))
+        ));
         assert_eq!(
             backend.transient_memory_budget().snapshot().reserved_bytes,
             0

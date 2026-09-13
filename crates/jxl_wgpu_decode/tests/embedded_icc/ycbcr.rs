@@ -1,13 +1,12 @@
+use super::output::frames;
 use super::{corpus, inventory, numeric, profile};
 use jxl_gpu_bitstream::FrameEncoding;
 use jxl_gpu_formats::{ColorSpecification, PixelFormat, RgbChannelOrder};
 use jxl_gpu_protocol::WhitePointAdaptation;
 use jxl_gpu_protocol::icc::{IccLimits, IccProfile, IccRenderingIntent};
-use jxl_test_support::{fixtures::modular_ycbcr, fixtures::original_color, gpu::planes};
+use jxl_test_support::{fixtures::modular_ycbcr, fixtures::original_color};
 use jxl_wgpu::WgpuBackend;
-use jxl_wgpu_decode::{
-    AlphaOutputPolicy, GpuDecoder, GpuOutputRequest, OrientationPolicy, WgpuDecodeEngine,
-};
+use jxl_wgpu_decode::{AlphaOutputPolicy, GpuOutputRequest, OrientationPolicy};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 mod converted;
@@ -37,48 +36,8 @@ fn device_request(format: PixelFormat) -> GpuOutputRequest {
         .with_orientation_policy(OrientationPolicy::Keep)
         .with_icc_rendering_intent(IccRenderingIntent::Perceptual)
         .with_white_point_adaptation(WhitePointAdaptation::None)
-}
-
-fn frames(
-    backend: &WgpuBackend,
-    data: &[u8],
-    request: GpuOutputRequest,
-    limit: Option<NonZeroU64>,
-) -> Vec<Vec<u32>> {
-    let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();
-    if let Some(limit) = limit {
-        engine = engine.with_stream_window_limit(limit);
-    }
-    let decoder = GpuDecoder::new(engine);
-    // These fixtures publish at most four frames. Keep one more admission slot so
-    // end-of-stream can be discovered while every completed frame lease is retained.
-    let request = request.with_max_frame_slots(NonZeroUsize::new(5).unwrap());
-    let format = request.format().clone();
-    let mut session = if limit.is_some() {
-        planes::open_fragmented(&decoder, data, request)
-    } else {
-        decoder.open(data, request).unwrap()
-    };
-    let mut held = Vec::new();
-    while let Some(frame) = pollster::block_on(session.next_frame_async()).unwrap() {
-        let output = &frame.output().outputs[0];
-        assert_eq!(output.layout.format, format);
-        let pixels = planes::read(backend, output);
-        held.push((frame, pixels));
-    }
-    drop(session);
-    let frames = held
-        .into_iter()
-        .map(|(frame, pixels)| {
-            assert_eq!(planes::read(backend, &frame.output().outputs[0]), pixels);
-            pixels
-        })
-        .collect();
-    assert_eq!(
-        backend.transient_memory_budget().snapshot().reserved_bytes,
-        0
-    );
-    frames
+        // Retain all four sequence frames while reserving one slot for end-of-stream.
+        .with_max_frame_slots(NonZeroUsize::new(5).unwrap())
 }
 
 fn compare(

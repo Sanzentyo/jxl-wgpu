@@ -137,8 +137,10 @@ impl InverseOpsin {
         Some(Self {
             // libjxl's original-profile XYB conversion derives its RGB matrix from these
             // ICC-calibrated sRGB chromaticities. Its direct sRGB and Gray paths use the
-            // inverse matrix without that calibration. Keep this producer distinction explicit.
+            // inverse matrix without that calibration. Embedded ICC XYB also reconstructs
+            // directly into linear D65 BT.709, independently of its original device profile.
             rgb_space: if !image.grayscale
+                && image.embedded_icc.is_none()
                 && crate::image_color::original_encoding(image)?.space
                     != jxl_gpu_protocol::RgbColorSpace::Bt709
             {

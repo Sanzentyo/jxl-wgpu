@@ -118,6 +118,7 @@ fn recursive_lf_rendering_clips_odd_grids_and_accounts_levels_one_through_four()
                     backend.clone(),
                     &render_image,
                     &GpuOutputRequest::color(format).unwrap(),
+                    None,
                 )
                 .unwrap();
                 if let Some(encoding) = &encoding {

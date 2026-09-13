@@ -23,7 +23,7 @@ pub(super) fn replace(data: &[u8], donor: &[u8]) -> Vec<u8> {
     let original = super::inventory(data);
     let source = super::inventory(donor);
     let image = &original.image_header;
-    assert!(image.embedded_icc.is_none() && !image.xyb_encoded);
+    assert!(image.embedded_icc.is_none());
     assert_eq!(image.grayscale, source.image_header.grayscale);
     let icc = source.image_header.embedded_icc.as_ref().unwrap();
     let mut reader = Bitstream::new(data);
@@ -49,7 +49,7 @@ pub(super) fn replace(data: &[u8], donor: &[u8]) -> Vec<u8> {
     for _ in 0..extras {
         ExtraChannelInfo::parse(&mut reader, ()).unwrap();
     }
-    assert!(!reader.read_bool().unwrap()); // Original device samples.
+    assert_eq!(reader.read_bool().unwrap(), image.xyb_encoded);
     let color_start = reader.num_read_bits() as u64;
     ColourEncoding::parse(&mut reader, ()).unwrap();
     let color_end = reader.num_read_bits() as u64;

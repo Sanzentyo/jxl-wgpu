@@ -109,7 +109,31 @@ enum Packing {
         pipeline: wgpu::ComputePipeline,
         params: RasterPacking,
     },
-    Icc(Box<icc::Presentation>),
+    Icc {
+        original: Option<Box<icc::Presentation>>,
+        linear: Option<Box<icc::Presentation>>,
+    },
+}
+
+/// Color domains actually consumed by this image's presentation and reference plan.
+#[derive(Clone, Copy)]
+pub(super) struct ColorUsage {
+    pub(super) original: bool,
+    pub(super) linear: bool,
+    pub(super) reconstruct_original: bool,
+}
+
+impl ColorUsage {
+    pub(super) const ORIGINAL: Self = Self {
+        original: true,
+        linear: false,
+        reconstruct_original: true,
+    };
+    pub(super) const LINEAR: Self = Self {
+        original: false,
+        linear: true,
+        reconstruct_original: false,
+    };
 }
 
 #[derive(Debug)]
@@ -117,6 +141,8 @@ pub(super) struct Compositor {
     backend: WgpuBackend,
     canvas: Extent2d,
     pub(super) original: FrameSurfaceEncoding,
+    pub(super) original_samples: bool,
+    pub(super) reconstruction: Option<super::icc_transform::Transform>,
     extras: Vec<ExtraChannelInventory>,
     surface: FrameSurfaceLayout,
     blend: wgpu::ComputePipeline,
@@ -133,6 +159,7 @@ impl Compositor {
         canvas: Extent2d,
         image: &jxl_gpu_bitstream::ImageHeaderInventory,
         request: &GpuOutputRequest,
+        usage: ColorUsage,
     ) -> Result<Self> {
         let extras = &image.extra_channels;
         let grayscale = image.grayscale;
@@ -284,21 +311,58 @@ impl Compositor {
                     | crate::NumericSampleMapping::NativeFloat
             )
         ) && matches!(jxl_gpu_formats::classify_pixel_format(request.format()), Ok(jxl_gpu_formats::PixelFormatClass::Numeric(n)) if n.components == 1 && n.sample_kind == jxl_gpu_formats::SampleKind::Float && n.bits_per_component == 32);
-        let packing = if let FrameSurfaceEncoding::Icc(profile) = &original
+        let reconstruction = if image.xyb_encoded
+            && usage.reconstruct_original
+            && let FrameSurfaceEncoding::Icc(profile) = &original
+        {
+            Some(super::icc_transform::Transform::new(
+                &backend,
+                jxl_gpu_protocol::icc::IccTransform::from_linear_rgb(
+                    jxl_gpu_protocol::RgbColorSpace::Bt709,
+                    profile,
+                    profile.header().rendering_intent,
+                )?,
+            )?)
+        } else {
+            None
+        };
+        let packing = if matches!(&original, FrameSurfaceEncoding::Icc(_))
             && request.mapping() == crate::GpuOutputMapping::Color
         {
             if !spots.is_empty() {
                 return Err(Error::UnsupportedOutputFormat("ICC spot-ink rendering is not yet connected; preserve spot channels to return the base color".into()));
             }
-            Packing::Icc(Box::new(icc::Presentation::new(
-                &backend,
-                &surface,
-                profile,
-                request,
-                orientation,
-                alpha_conversion,
-                alpha_channel,
-            )?))
+            let presentation = |encoding: FrameSurfaceEncoding| -> Result<_> {
+                let source = FrameSurfaceLayout::with_encoding(
+                    canvas,
+                    extras.len(),
+                    encoding.clone(),
+                    &device.limits(),
+                )?;
+                Ok(Box::new(icc::Presentation::new(
+                    &backend,
+                    &source,
+                    &encoding,
+                    request,
+                    orientation,
+                    alpha_conversion,
+                    first_alpha.map(|(index, _)| index),
+                )?))
+            };
+            Packing::Icc {
+                original: usage
+                    .original
+                    .then(|| presentation(original.clone()))
+                    .transpose()?,
+                linear: usage
+                    .linear
+                    .then(|| {
+                        presentation(FrameSurfaceEncoding::Rgb(
+                            jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                        ))
+                    })
+                    .transpose()?,
+            }
         } else {
             let (packing, source) = if native.is_some() || scalar_float {
                 if let (Some(native), Some((_, extra))) = (native, selected)
@@ -458,6 +522,8 @@ impl Compositor {
             backend,
             canvas,
             original,
+            original_samples: request.uses_original_sample_domain(),
+            reconstruction,
             extras: extras.to_vec(),
             surface,
             blend,
@@ -640,9 +706,16 @@ impl Compositor {
             params: packing,
         } = &self.packing
         else {
-            let Packing::Icc(icc) = &self.packing else {
+            let Packing::Icc { original, linear } = &self.packing else {
                 unreachable!()
             };
+            let icc = if source.encoding == self.original {
+                original
+            } else {
+                linear
+            }
+            .as_ref()
+            .ok_or(Error::EngineContract("unplanned presentation color domain"))?;
             return icc.pack(&self.backend, source);
         };
         let mut native;
@@ -658,6 +731,25 @@ impl Compositor {
             ),
             RasterPacking::Native(params) => {
                 native = *params;
+                let original_colors = native.color[2];
+                let source_colors = source.layout.color.planes.len() as u32;
+                if source.encoding != self.original
+                    && matches!(self.original, FrameSurfaceEncoding::Icc(_))
+                    && native.source[2] < original_colors
+                {
+                    return Err(Error::EngineContract(
+                        "original ICC color samples require device reconstruction",
+                    ));
+                }
+                // LF previews can carry linear RGB even when the original ICC is Gray.
+                // Extra selections and the first alpha follow the actual color planes.
+                if native.source[1] != u32::MAX {
+                    native.source[1] = native.source[1] - original_colors + source_colors;
+                }
+                if native.source[2] >= original_colors {
+                    native.source[2] = native.source[2] - original_colors + source_colors;
+                }
+                native.color[2] = source_colors;
                 native.source[3] |= u32::from(source.encoding != self.original) << 1;
                 (bytemuck::bytes_of(&native), 1, 2)
             }

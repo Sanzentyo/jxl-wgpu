@@ -28,7 +28,7 @@ pub(super) struct LfPreview {
     extent: Extent2d,
     output: PreviewOutput,
     inverse_opsin: InverseOpsin,
-    original_encoding: jxl_gpu_protocol::RgbColorEncoding,
+    original_encoding: Option<jxl_gpu_protocol::RgbColorEncoding>,
     pub(super) layout: ImageLayout,
     pub(super) surface: Option<crate::frame_surface::FrameSurfaceLayout>,
     pub(super) surface_encoding: Option<crate::frame_surface::FrameSurfaceEncoding>,
@@ -74,26 +74,36 @@ impl LfPreview {
         backend: WgpuBackend,
         image: &ImageHeaderInventory,
         request: &GpuOutputRequest,
+        compositor: Option<Arc<super::gpu::Compositor>>,
     ) -> Result<Self> {
-        let canonical =
-            !image.extra_channels.is_empty() || request.mapping() != crate::GpuOutputMapping::Color;
-        let compositor = canonical
-            .then(|| {
-                super::gpu::Compositor::new(
-                    backend.clone(),
-                    Extent2d::new(image.width, image.height),
-                    image,
-                    request,
-                )
-            })
-            .transpose()?
-            .map(Arc::new);
+        let compositor = if let Some(compositor) = compositor {
+            Some(compositor)
+        } else if image.embedded_icc.is_some()
+            || !image.extra_channels.is_empty()
+            || request.mapping() != crate::GpuOutputMapping::Color
+        {
+            Some(Arc::new(super::gpu::Compositor::new(
+                backend.clone(),
+                Extent2d::new(image.width, image.height),
+                image,
+                request,
+                super::gpu::ColorUsage::LINEAR,
+            )?))
+        } else {
+            None
+        };
+        let original_encoding = match &compositor {
+            Some(compositor) => compositor.original.rgb_encoding(),
+            None => Some(crate::image_color::require_original_encoding(image)?),
+        };
+        let canonical = compositor.is_some();
         let working =
             request
                 .clone()
                 .for_frame_surface(crate::frame_surface::FrameSurfaceEncoding::Rgb(
-                    crate::image_color::linear_encoding(
-                        crate::image_color::require_original_encoding(image)?,
+                    original_encoding.map_or(
+                        jxl_gpu_protocol::RgbColorEncoding::LINEAR_BT709,
+                        crate::image_color::linear_encoding,
                     ),
                 ));
         let render_request = if canonical { &working } else { request };
@@ -101,10 +111,12 @@ impl LfPreview {
             "LF presentation has no inverse opsin metadata",
         ))?;
         let config = ColorOutputConfig {
-            linear_black_threshold: crate::image_color::reconstruction_black_threshold(
-                crate::image_color::require_original_encoding(image)?,
-                &render_request.format().color_spec,
-            ),
+            linear_black_threshold: original_encoding.and_then(|original| {
+                crate::image_color::reconstruction_black_threshold(
+                    original,
+                    &render_request.format().color_spec,
+                )
+            }),
             white_point_adaptation: render_request.white_point_adaptation(),
             extent: Extent2d::new(image.width, image.height),
             orientation: render_request.orientation_policy().resolve(
@@ -141,7 +153,7 @@ impl LfPreview {
                 plan: output_plan,
             })),
             inverse_opsin,
-            original_encoding: crate::image_color::require_original_encoding(image)?,
+            original_encoding,
             layout,
             output_storage_bytes: output_plan.memory.output_storage_bytes,
             kernel: Arc::new(kernel),
@@ -172,10 +184,12 @@ impl LfPreview {
             PreviewOutput::Components
         } else {
             let config = ColorOutputConfig {
-                linear_black_threshold: crate::image_color::reconstruction_black_threshold(
-                    self.original_encoding,
-                    &surface.color.format.color_spec,
-                ),
+                linear_black_threshold: self.original_encoding.and_then(|original| {
+                    crate::image_color::reconstruction_black_threshold(
+                        original,
+                        &surface.color.format.color_spec,
+                    )
+                }),
                 white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,
                 extent,
                 orientation: OutputOrientation::Identity,

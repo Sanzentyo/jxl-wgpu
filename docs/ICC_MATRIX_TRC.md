@@ -4,9 +4,10 @@ The metadata and resident GPU execution layers support RGB matrix/TRC and XYZ gr
 JPEG XL decoding now admits embedded ICC for unfiltered original Modular numeric samples and
 independent extra-channel output in the supported single-frame paths through both codecs. Codec
 reconstruction and LF configuration are independent of color conversion. The common decoder now
-also handles original (non-XYB) ICC RGB/Gray color surfaces, including YCbCr reconstruction,
-original-domain references and composition, relative matrix/TRC conversion and U8/F32 requested output. ICC XYB,
-enumerated-source-to-ICC conversion, spot rendering, full intents and HDR mapping remain open.
+also handles original and XYB ICC RGB/Gray color surfaces, including YCbCr reconstruction,
+original-domain references and composition, relative matrix/TRC conversion and U8/F32 requested output.
+Broader ICC XYB conformance, enumerated-source-to-ICC conversion, spot rendering, full intents
+and HDR mapping remain open.
 This checkpoint does not change the full JPEG XL support claim.
 
 YCbCr reconstruction carries the actual original device profile through the inverse codec matrix;
@@ -16,6 +17,15 @@ therefore work independently of the requested CMS intent. A 146-source corpus ch
 sampling, precision, filtering, resampling and retained compositions. Five sources also check
 linear/sRGB and other-profile conversion with independent error propagation from each existing
 codec bound. [Generator and interval derivation](../crates/jxl_wgpu_decode/test-data/embedded_icc_ycbcr_generator/README.md).
+
+XYB reconstruction keeps direct presentations in unbounded linear D65 BT.709. References saved
+after the color transform and frame blends first enter the original ICC device domain. The
+original profile's header intent selects reconstruction; the requested intent selects presentation.
+Only required connections are selected and uploaded. Both stages use the same image-owned,
+budgeted ICC program abstraction, including intermediate storage retained through GPU completion.
+Gray reconstruction changes three linear planes into one device plane and keeps extra-channel
+offsets consistent. Four stills, four additive sequences and seven LF/patch substitutions cover
+this boundary. [XYB generator and precision](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
 
 `ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
 and layouts. The color specification is `Clone`, not `Copy`; clones share the original bytes and

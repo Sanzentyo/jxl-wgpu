@@ -109,8 +109,14 @@ fn native_scalar_packing_preserves_gray_rgb_and_extra_ieee_words() {
                     request.with_extra_channel((channel - color_count) as u32)
                 }
                 .unwrap();
-                let compositor =
-                    Compositor::new(backend.clone(), extent, &image, &request).unwrap();
+                let compositor = Compositor::new(
+                    backend.clone(),
+                    extent,
+                    &image,
+                    &request,
+                    ColorUsage::ORIGINAL,
+                )
+                .unwrap();
                 let frame = jxl_wgpu::GpuImageFrame {
                     token: jxl_gpu_protocol::SubmissionToken(1),
                     outputs: vec![GpuImageOutput {
@@ -166,14 +172,17 @@ fn spot_metadata_admission_is_exact_retryable_and_completion_owned() {
         crate::SpotColorPolicy::Render,
         crate::SpotColorPolicy::Preserve,
     ] {
-        let request = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format())
-            .unwrap()
-            .with_spot_color_policy(policy);
+        let request = GpuOutputRequest::color(
+            FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709).format(),
+        )
+        .unwrap()
+        .with_spot_color_policy(policy);
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
             image,
             &request,
+            ColorUsage::ORIGINAL,
         )
         .unwrap();
         let size = compositor.surface.storage_bytes;

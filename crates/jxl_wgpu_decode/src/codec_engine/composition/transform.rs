@@ -7,7 +7,8 @@ use jxl_gpu_bitstream::{FrameInventory, ImageHeaderInventory};
 use jxl_gpu_protocol::OutputOrientation;
 use jxl_wgpu::{GpuBufferLease, ResidentStorageBinding, WgpuBackend};
 
-use super::gpu::Surface;
+use super::gpu::{Compositor, Surface};
+use super::icc_transform::ColorBinding;
 use super::submission::{GpuWork, completion_fence_bytes, submit_recorded};
 use crate::color_output::{
     ColorOutputConfig, ColorOutputEncoding, ColorOutputInputs, ColorOutputPacker, ColorOutputPlan,
@@ -16,14 +17,18 @@ use crate::color_output::{
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
 use crate::{Error, Result};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests;
+
 pub(super) fn convert(
     backend: &WgpuBackend,
     source: &Surface,
     image: &ImageHeaderInventory,
     frame: &FrameInventory,
-    original: &FrameSurfaceEncoding,
+    compositor: &Compositor,
     encoding: FrameSurfaceEncoding,
 ) -> Result<GpuWork<Surface>> {
+    let original = &compositor.original;
     if source.encoding != FrameSurfaceEncoding::Encoded {
         return Err(Error::EngineContract(
             "inverse color transform requires codec components",
@@ -35,12 +40,7 @@ pub(super) fn convert(
             "inverse color transform extra channel count",
         ));
     }
-    if matches!(original, FrameSurfaceEncoding::Icc(_)) {
-        if image.xyb_encoded {
-            return Err(Error::EngineContract(
-                "ICC XYB reconstruction is not connected",
-            ));
-        }
+    if matches!(original, FrameSurfaceEncoding::Icc(_)) && !image.xyb_encoded {
         if encoding != *original {
             return Err(Error::EngineContract(
                 "ICC component reconstruction requires the original device profile",
@@ -57,14 +57,50 @@ pub(super) fn convert(
         encoding.clone(),
         &device.limits(),
     )?;
-    let plan = ColorOutputPlan::for_limits(&layout.color, &device.limits())?;
+    let connection = if image.xyb_encoded && matches!(encoding, FrameSurfaceEncoding::Icc(_)) {
+        if encoding != *original {
+            return Err(Error::EngineContract(
+                "XYB reconstruction target is not its original profile",
+            ));
+        }
+        Some(
+            compositor
+                .reconstruction
+                .as_ref()
+                .ok_or(Error::EngineContract(
+                    "unplanned original ICC reconstruction",
+                ))?,
+        )
+    } else {
+        None
+    };
+    let linear_layout = connection
+        .map(|_| {
+            FrameSurfaceLayout::with_encoding(
+                source.extent(),
+                0,
+                compositor.linear_encoding(),
+                &device.limits(),
+            )
+        })
+        .transpose()?;
+    let rendered = linear_layout.as_ref().unwrap_or(&layout);
+    let plan = ColorOutputPlan::for_limits(&rendered.color, &device.limits())?;
     let poll = backend.submission_poller().try_reserve()?;
     let output_permit = backend
         .transient_memory_budget()
         .try_reserve(layout.storage_bytes)?;
-    let permit = backend
-        .transient_memory_budget()
-        .try_reserve(plan.memory.uniform_bytes + completion_fence_bytes())?;
+    let permit = backend.transient_memory_budget().try_reserve(
+        plan.memory.uniform_bytes
+            + completion_fence_bytes()
+            + linear_layout
+                .as_ref()
+                .map_or(0, |layout| layout.storage_bytes)
+            + connection.map_or(0, |connection| connection.memory.dispatch_uniform_bytes),
+    )?;
+    let program = connection
+        .map(|connection| connection.resident(backend))
+        .transpose()?;
     let output = GpuBufferLease::from_tracked(
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JPEG XL color-transformed frame"),
@@ -76,6 +112,14 @@ pub(super) fn convert(
         }),
         output_permit,
     );
+    let linear = linear_layout.as_ref().map(|layout| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JPEG XL linear XYB reconstruction before original ICC"),
+            size: layout.storage_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        })
+    });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     let planes = [0u64, 1, 2].map(|channel| ColorOutputPlane {
         storage: ResidentStorageBinding {
@@ -89,10 +133,12 @@ pub(super) fn convert(
     });
     let config = ColorOutputConfig {
         linear_black_threshold: if image.xyb_encoded {
-            crate::image_color::reconstruction_black_threshold(
-                crate::image_color::require_original_encoding(image)?,
-                &layout.color.format.color_spec,
-            )
+            original.rgb_encoding().and_then(|original| {
+                crate::image_color::reconstruction_black_threshold(
+                    original,
+                    &rendered.color.format.color_spec,
+                )
+            })
         } else {
             None
         },
@@ -136,14 +182,41 @@ pub(super) fn convert(
             planes,
             alpha: None,
             output: ResidentStorageBinding {
-                buffer: output.as_wgpu_buffer(),
+                buffer: linear.as_ref().unwrap_or(output.as_wgpu_buffer()),
                 offset: 0,
-                size: NonZeroU64::new(layout.storage_bytes).expect("nonempty surface"),
+                size: NonZeroU64::new(rendered.storage_bytes).expect("nonempty surface"),
             },
-            layout: &layout.color,
+            layout: &rendered.color,
             config: &config,
         },
     )?;
+    let icc_uniform = if let (Some(connection), Some(program), Some(linear)) =
+        (connection, &program, &linear)
+    {
+        Some(connection.encode(
+            backend,
+            &mut encoder,
+            program,
+            ColorBinding {
+                storage: ResidentStorageBinding {
+                    buffer: linear,
+                    offset: 0,
+                    size: NonZeroU64::new(rendered.storage_bytes).expect("nonempty linear surface"),
+                },
+                layout: &rendered.color,
+            },
+            ColorBinding {
+                storage: ResidentStorageBinding {
+                    buffer: output.as_wgpu_buffer(),
+                    offset: 0,
+                    size: NonZeroU64::new(layout.storage_bytes).expect("nonempty original surface"),
+                },
+                layout: &layout.color,
+            },
+        )?)
+    } else {
+        None
+    };
     source.copy_extras(
         &mut encoder,
         ResidentStorageBinding {
@@ -162,7 +235,7 @@ pub(super) fn convert(
             encoding,
         },
         vec![source.buffer.clone()],
-        scratch,
+        (scratch, linear, icc_uniform, program),
         permit,
         poll,
     )

@@ -1,18 +1,17 @@
 //! Image-owned ICC selection and completion-owned GPU presentation resources.
 
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
 
 use jxl_gpu_formats::{ColorSpecification, ImageLayout};
-use jxl_gpu_protocol::icc::{IccProfile, IccTransform};
+use jxl_gpu_protocol::icc::IccTransform;
 use jxl_gpu_protocol::{OutputOrientation, RgbColorEncoding, RgbColorSpace, WhitePointAdaptation};
 use jxl_wgpu::{
     AlphaConversion, GpuBufferLease, ImageOutputGeometry, ImageOutputParams, ImageOutputSource,
-    MemoryPermit, ResidentIccInputs, ResidentIccMemoryPlan, ResidentIccPipeline, ResidentIccPlane,
-    ResidentIccProgram, ResidentStorageBinding, WgpuBackend,
+    ResidentStorageBinding, WgpuBackend,
 };
 use wgpu::util::DeviceExt;
 
+use super::super::icc_transform::{ColorBinding, Transform};
 use super::super::submission::{GpuWork, completion_fence_bytes, submit_recorded, validate_size};
 use super::{Surface, aligned, dispatch, pipeline};
 use crate::frame_surface::{FrameSurfaceEncoding, FrameSurfaceLayout};
@@ -22,42 +21,8 @@ use crate::{Error, GpuOutputRequest, Result};
 mod tests;
 
 #[derive(Debug)]
-struct Transform {
-    selected: IccTransform,
-    memory: ResidentIccMemoryPlan,
-    pipeline: ResidentIccPipeline,
-    // Failed admissions do not populate the cache. A selected image shares one immutable
-    // program across its frames; each submitted use retains its own Arc until completion.
-    uploaded: Mutex<Option<Arc<Program>>>,
-}
-
-#[derive(Debug)]
-struct Program {
-    resident: ResidentIccProgram,
-    _permit: MemoryPermit,
-}
-
-impl Transform {
-    fn resident(&self, backend: &WgpuBackend) -> Result<Arc<Program>> {
-        let mut cached = super::super::lock(&self.uploaded);
-        if let Some(program) = &*cached {
-            return Ok(Arc::clone(program));
-        }
-        let permit = backend
-            .transient_memory_budget()
-            .try_reserve(self.memory.program_bytes)?;
-        let program = Arc::new(Program {
-            resident: ResidentIccProgram::new(backend.device(), &self.selected)?,
-            _permit: permit,
-        });
-        *cached = Some(Arc::clone(&program));
-        Ok(program)
-    }
-}
-
-#[derive(Debug)]
 pub(super) struct Presentation {
-    original: IccProfile,
+    source_encoding: FrameSurfaceEncoding,
     transform: Option<Transform>,
     working: FrameSurfaceLayout,
     output: ImageLayout,
@@ -70,13 +35,22 @@ impl Presentation {
     pub(super) fn new(
         backend: &WgpuBackend,
         source: &FrameSurfaceLayout,
-        profile: &IccProfile,
+        source_encoding: &FrameSurfaceEncoding,
         request: &GpuOutputRequest,
         orientation: OutputOrientation,
         alpha: AlphaConversion,
-        alpha_channel: u32,
+        alpha_extra: Option<usize>,
     ) -> Result<Self> {
         let device = backend.device();
+        if FrameSurfaceEncoding::from_format(&source.color.format).as_ref() != Some(source_encoding)
+        {
+            return Err(Error::EngineContract(
+                "color presentation source layout mismatch",
+            ));
+        }
+        if alpha_extra.is_some_and(|index| index >= source.extras.len()) {
+            return Err(Error::EngineContract("color presentation alpha index"));
+        }
         let output = ImageLayout::packed(
             orientation.map_extent(source.color.extent),
             request.format().clone(),
@@ -87,8 +61,8 @@ impl Presentation {
             return Err(crate::color_output::ColorOutputError::HdrLuminanceMappingRequired.into());
         }
         let (encoding, selected) =
-            match &output.format.color_spec {
-                ColorSpecification::Icc(target) => (
+            match (source_encoding, &output.format.color_spec) {
+                (FrameSurfaceEncoding::Icc(profile), ColorSpecification::Icc(target)) => (
                     FrameSurfaceEncoding::Icc(target.clone()),
                     if target == profile {
                         None
@@ -100,7 +74,7 @@ impl Presentation {
                         )?)
                     },
                 ),
-                ColorSpecification::Defined(_) => (
+                (FrameSurfaceEncoding::Icc(profile), ColorSpecification::Defined(_)) => (
                     FrameSurfaceEncoding::Rgb(RgbColorEncoding::LINEAR_BT709),
                     Some(IccTransform::to_linear_rgb(
                         profile,
@@ -108,6 +82,24 @@ impl Presentation {
                         request.icc_rendering_intent(),
                     )?),
                 ),
+                (FrameSurfaceEncoding::Rgb(encoding), ColorSpecification::Icc(target)) => {
+                    if encoding.transfer != jxl_gpu_protocol::TransferFunction::Linear {
+                        return Err(Error::EngineContract(
+                            "ICC connection requires linear RGB input",
+                        ));
+                    }
+                    (
+                        FrameSurfaceEncoding::Icc(target.clone()),
+                        Some(IccTransform::from_linear_rgb(
+                            encoding.space,
+                            target,
+                            request.icc_rendering_intent(),
+                        )?),
+                    )
+                }
+                (FrameSurfaceEncoding::Rgb(_), ColorSpecification::Defined(_)) => {
+                    (source_encoding.clone(), None)
+                }
                 _ => return Err(Error::UnsupportedOutputFormat(
                     "ICC color output requires an explicit target profile or enumerated encoding"
                         .into(),
@@ -152,11 +144,7 @@ impl Presentation {
         }
         .with_alpha_conversion(alpha);
         let color_count = working.color.planes.len() as u32;
-        let alpha_channel = if alpha_channel == u32::MAX {
-            u32::MAX
-        } else {
-            color_count + alpha_channel - source.color.planes.len() as u32
-        };
+        let alpha_channel = alpha_extra.map_or(u32::MAX, |index| color_count + index as u32);
         let shader = format!(
             "{}\n{}\n{}",
             jxl_wgpu::IMAGE_OUTPUT_SHADER,
@@ -179,17 +167,10 @@ impl Presentation {
             ],
         );
         let transform = selected
-            .map(|selected| -> Result<_> {
-                Ok(Transform {
-                    memory: ResidentIccMemoryPlan::new(&selected, &device.limits())?,
-                    pipeline: ResidentIccPipeline::new(device)?,
-                    selected,
-                    uploaded: Mutex::new(None),
-                })
-            })
+            .map(|selected| Transform::new(backend, selected))
             .transpose()?;
         Ok(Self {
-            original: profile.clone(),
+            source_encoding: source_encoding.clone(),
             transform,
             working,
             output,
@@ -200,9 +181,9 @@ impl Presentation {
     }
 
     pub(super) fn pack(&self, backend: &WgpuBackend, source: &Surface) -> Result<GpuWork> {
-        if source.encoding != FrameSurfaceEncoding::Icc(self.original.clone()) {
+        if source.encoding != self.source_encoding {
             return Err(Error::EngineContract(
-                "ICC presentation requires its original device surface",
+                "color presentation received an unplanned source encoding",
             ));
         }
         let device = backend.device();
@@ -250,26 +231,17 @@ impl Presentation {
                     size: NonZeroU64::new(size).expect("nonempty ICC storage"),
                 }
             }
-            let planes = |layout: &ImageLayout| {
-                layout
-                    .planes
-                    .iter()
-                    .map(|plane| ResidentIccPlane {
-                        offset: (plane.offset / 4) as u32,
-                        stride: (plane.row_stride / 4) as u32,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            icc_uniform = Some(transform.pipeline.encode(
-                device,
+            icc_uniform = Some(transform.encode(
+                backend,
                 &mut encoder,
-                &program.resident,
-                ResidentIccInputs {
-                    input: binding(source.buffer.as_wgpu_buffer(), source.layout.storage_bytes),
-                    output: binding(&buffer, self.working.storage_bytes),
-                    extent: source.extent(),
-                    input_planes: &planes(&source.layout.color),
-                    output_planes: &planes(&self.working.color),
+                program,
+                ColorBinding {
+                    storage: binding(source.buffer.as_wgpu_buffer(), source.layout.storage_bytes),
+                    layout: &source.layout.color,
+                },
+                ColorBinding {
+                    storage: binding(&buffer, self.working.storage_bytes),
+                    layout: &self.working.color,
                 },
             )?);
             source.copy_extras(

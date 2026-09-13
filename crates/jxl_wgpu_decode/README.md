@@ -635,7 +635,7 @@ The [embedded ICC corpus](test-data/embedded_icc_generator/README.md) covers RGB
 original/XYB input, both common and standalone engines, complete/fragmented transport, exact
 17/31-bit integers and widened IEEE-754 words.
 
-The common `WgpuDecodeEngine` additionally accepts original (non-XYB) ICC color through
+The common `WgpuDecodeEngine` additionally accepts original and XYB ICC color through
 both physical codecs. Private surfaces carry the exact owned profile and one Gray or three RGB
 color planes; additional channels follow the actual color-plane count. Reconstruction returns
 codec components without a fictitious RGB encoding. RGB components enter the original ICC domain
@@ -662,7 +662,17 @@ interleaved linear/sRGB and other-profile output against independently propagate
 conversion preserves the actual reconstructed alpha words. See the
 [reference recipe](test-data/embedded_icc_ycbcr_generator/README.md).
 
-ICC XYB reconstruction, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
+XYB reconstructs into linear D65 BT.709. Direct presentations keep that unbounded domain;
+post-transform references and composition first execute the original ICC's linear-to-device
+program. Its header intent is independent of the requested presentation intent. Source domains
+are selected from the frame plan, so an unused original CMS method does not block direct output.
+Reconstruction and presentation share exact program admission and completion ownership.
+LF prediction and features retain explicit codec components through their common color boundary.
+Four native stills, four additive reference sequences and seven LF/patch substitutions cover
+these paths; [reference generation and bounds](test-data/embedded_icc_xyb_generator/README.md)
+keep native reconstruction precision separate from ICC curve conditioning.
+
+Broader ICC XYB alpha/crop/reference conformance, enumerated-source-to-ICC conversion, spot-ink rendering, LUT/MPE,
 CMYK, full intents, HDR luminance mapping and standalone codec color admission remain open.
 Numeric and extra-channel bypasses keep their existing independent contracts.
 

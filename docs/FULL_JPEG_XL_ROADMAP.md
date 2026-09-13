@@ -428,7 +428,7 @@ alpha association. Same-profile F32 output preserves Modular IEEE words without 
 Image-owned programs upload once with retryable exact admission and completion-owned resources.
 The eight-stream corpus retains all previous bytes and adds native original VarDCT pixels,
 Little CMS references and independent f64 color results; a metadata-only Gray composition case
-retains values above one across blending and orientation. ICC XYB/YCbCr, enumerated-source ICC
+retains values above one across blending and orientation. Broader ICC XYB/YCbCr conformance, enumerated-source ICC
 targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK, full intents and HDR/display
 integration still require implementation and conformance. This is progress toward the original
 full JPEG XL objective; no feature row or completion gate is marked complete by this checkpoint.
@@ -441,9 +441,27 @@ extras; 44 both-codec original-color sources cover stills and composed sequences
 and bounded fragmented input are word-identical, and retained outputs survive session release.
 Five source cases additionally check linear/sRGB and opposite RGB/Gray ICC targets against
 independent scalar intervals propagated from unchanged codec bounds and checked with Little CMS.
-ICC XYB, enumerated-source ICC targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK,
+Broader ICC XYB conformance, enumerated-source ICC targets, spot rendering, standalone color admission, LUT/MPE/Lab/CMYK,
 full intents and HDR/display integration remain open. All affected rows and completion gates
 remain **Partial**.
+
+ICC XYB checkpoint: inverse opsin reconstructs into linear D65 BT.709 independently of the
+original device profile. Direct presentations retain unbounded linear values. Post-transform
+references and frame composition execute a selected linear-to-original-ICC program first;
+Gray uses one real device plane and extras follow the actual color count. Reconstruction uses
+the source header intent, while requested presentation intent remains independent. The image
+plan selects only required domains, and both conversion stages share lazy, exactly admitted
+programs and completion-owned intermediate storage. LF prediction and patch producers retain
+explicit codec components instead of requiring an enumerated RGB carrier.
+Four native stills cover both codecs and RGB/Gray targets; four additive sequences verify
+original-domain blending and above-one values. Seven metadata substitutions cover LF/coefficient
+updates, custom weights and patched/nested LF producers in both codecs. 68 native/scalar/interval
+files are reproducible from the [published generator](../crates/jxl_wgpu_decode/test-data/embedded_icc_xyb_generator/README.md).
+Native XYB reconstruction precision is propagated through independent ICC inverse curves and
+composition, separately from native CMS precision. Wider alpha/blend/crop/reference combinations,
+ICC conversion after composition, numeric sequence bypasses, all ICC methods/intents and HDR
+policies still require conformance. This checkpoint leaves the full JPEG XL objective and every
+affected completion gate **Partial**.
 
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|

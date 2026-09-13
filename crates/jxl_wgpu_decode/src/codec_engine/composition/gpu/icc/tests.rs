@@ -1,4 +1,4 @@
-use super::super::Compositor;
+use super::super::{ColorUsage, Compositor};
 use super::*;
 use jxl_gpu_protocol::Extent2d;
 
@@ -15,17 +15,24 @@ fn icc_program_admission_is_exact_reusable_retryable_and_completion_owned() {
             .codestream_inventory(Default::default())
             .unwrap()
             .image_header;
-        let request = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format())
-            .unwrap()
-            .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve);
+        let request = GpuOutputRequest::color(
+            FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709).format(),
+        )
+        .unwrap()
+        .with_alpha_output_policy(crate::AlphaOutputPolicy::Preserve);
         let compositor = Compositor::new(
             backend.clone(),
             Extent2d::new(image.width, image.height),
             &image,
             &request,
+            ColorUsage::ORIGINAL,
         )
         .unwrap();
-        let super::super::Packing::Icc(presentation) = &compositor.packing else {
+        let super::super::Packing::Icc {
+            original: Some(presentation),
+            ..
+        } = &compositor.packing
+        else {
             panic!("ICC presentation plan")
         };
         let transform = presentation.transform.as_ref().unwrap();

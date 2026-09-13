@@ -28,6 +28,7 @@ mod blend;
 mod entropy_program;
 mod features;
 mod gpu;
+mod icc_transform;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod lf_tests;
 mod patches;
@@ -389,18 +390,15 @@ impl DependentSession {
                 .iter()
                 .any(|frame| frame.frame_type == FrameType::LowFrequency)
         {
-            let working;
-            let request = if matches!(output, Output::Composed(_)) {
-                working = GpuOutputRequest::color(FrameSurfaceEncoding::SRGB.format())?
-                    .with_orientation_policy(crate::OrientationPolicy::Keep);
-                &working
-            } else {
-                request
+            let compositor = match &output {
+                Output::Composed(compositor) => Some(Arc::clone(compositor)),
+                Output::Native => None,
             };
             Some(Arc::new(LfPreview::new(
                 source.engine.backend().clone(),
                 &inventory.image_header,
                 request,
+                compositor,
             )?))
         } else {
             None
@@ -542,11 +540,37 @@ fn composed_source(
         )
         .into());
     }
+    let usage = if !image.xyb_encoded {
+        gpu::ColorUsage::ORIGINAL
+    } else {
+        let linear: Vec<_> = plan
+            .nodes
+            .iter()
+            .zip(&inventory.frames)
+            .map(|(node, frame)| {
+                uses_linear(image, node, frame, request.uses_original_sample_domain())
+            })
+            .collect();
+        let mut usage = gpu::ColorUsage {
+            original: false,
+            linear: false,
+            reconstruct_original: linear.iter().any(|linear| !linear),
+        };
+        for presentation in &plan.presentations {
+            let linear = linear
+                .get(presentation.physical_frames.end.saturating_sub(1))
+                .ok_or(Error::EngineContract("presentation color plan index"))?;
+            usage.linear |= *linear;
+            usage.original |= !linear;
+        }
+        usage
+    };
     let compositor = Arc::new(Compositor::new(
         engine.backend().clone(),
         Extent2d::new(image.width, image.height),
         image,
         request,
+        usage,
     )?);
     let original = compositor.original.clone();
     let working = GpuOutputRequest::color(original.format())?
@@ -586,27 +610,29 @@ fn presentation_encoding(
     frame: &jxl_gpu_bitstream::FrameInventory,
 ) -> Result<FrameSurfaceEncoding> {
     let original = compositor.original.clone();
-    if image.xyb_encoded
-        && !frame.do_ycbcr
-        && !node.needs_composition
-        && (node.save_reference.is_none() || frame.save_before_color_transform)
-    {
+    if uses_linear(image, node, frame, compositor.original_samples) {
         Ok(compositor.linear_encoding())
     } else {
         Ok(original)
     }
 }
 
+fn uses_linear(
+    image: &jxl_gpu_bitstream::ImageHeaderInventory,
+    node: &crate::FrameExecutionNode,
+    frame: &jxl_gpu_bitstream::FrameInventory,
+    original_samples: bool,
+) -> bool {
+    image.xyb_encoded
+        && !frame.do_ycbcr
+        && !node.needs_composition
+        && (node.save_reference.is_none() || frame.save_before_color_transform)
+        && !(image.embedded_icc.is_some() && original_samples)
+}
+
 fn validate(inventory: &CodestreamInventory, plan: &FrameExecutionPlan) -> Result<()> {
     let image = &inventory.image_header;
     crate::image_color::validate_declaration(image)?;
-    if image.embedded_icc.is_some() && image.xyb_encoded {
-        return Err(crate::UnsupportedProfile::new(
-            crate::UnsupportedCodestreamFeature::ColorEncoding,
-            "ICC XYB color reconstruction is not yet connected",
-        )
-        .into());
-    }
     for (node, frame) in plan.nodes.iter().zip(&inventory.frames) {
         if frame.flags & 2 != 0 && frame.upsampling != 1 {
             for (channel, &factor) in frame.extra_channel_upsampling.iter().enumerate() {
@@ -1189,7 +1215,7 @@ impl DependentPending {
             &surface,
             &carry.source.inventory.image_header,
             frame,
-            &self.output.compositor()?.original,
+            self.output.compositor()?,
             encoding,
         )?;
         self.stage = Some(Stage::ColorTransform(work));
@@ -1844,7 +1870,7 @@ impl DependentPending {
                     &surface,
                     &carry.source.inventory.image_header,
                     frame,
-                    &compositor.original,
+                    &compositor,
                     encoding,
                 )?,
                 index,

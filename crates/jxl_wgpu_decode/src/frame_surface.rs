@@ -33,8 +33,6 @@ pub(crate) enum FrameSurfaceEncoding {
 }
 
 impl FrameSurfaceEncoding {
-    pub(crate) const SRGB: Self = Self::Rgb(RgbColorEncoding::SRGB_BT709);
-
     pub(crate) fn format(&self) -> PixelFormat {
         if let Self::Icc(profile) = self {
             let color = jxl_gpu_formats::ColorSpecification::Icc(profile.clone());
@@ -369,11 +367,21 @@ mod tests {
             ..Default::default()
         };
         let extent = Extent2d::new(513, 5);
-        let rgb = FrameSurfaceLayout::with_encoding(extent, 0, FrameSurfaceEncoding::SRGB, &limits)
-            .unwrap();
+        let rgb = FrameSurfaceLayout::with_encoding(
+            extent,
+            0,
+            FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709),
+            &limits,
+        )
+        .unwrap();
         assert!(rgb.storage_bytes < 65536);
         assert!(matches!(
-            FrameSurfaceLayout::with_encoding(extent, 9, FrameSurfaceEncoding::SRGB, &limits),
+            FrameSurfaceLayout::with_encoding(
+                extent,
+                9,
+                FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709),
+                &limits
+            ),
             Err(FrameSurfaceError::Limit {
                 resource: "storage",
                 ..
@@ -383,7 +391,7 @@ mod tests {
             FrameSurfaceLayout::with_encoding(
                 Extent2d::new(1, 1),
                 usize::MAX,
-                FrameSurfaceEncoding::SRGB,
+                FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709),
                 &limits
             )
             .is_err()
@@ -392,7 +400,7 @@ mod tests {
             FrameSurfaceLayout::with_encoding(
                 Extent2d::new(u32::MAX, u32::MAX),
                 1,
-                FrameSurfaceEncoding::SRGB,
+                FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709),
                 &limits
             )
             .is_err()
@@ -405,7 +413,7 @@ mod tests {
         let surface = FrameSurfaceLayout::with_encoding(
             Extent2d::new(3, 5),
             9,
-            FrameSurfaceEncoding::SRGB,
+            FrameSurfaceEncoding::Rgb(jxl_gpu_protocol::RgbColorEncoding::SRGB_BT709),
             &limits,
         )
         .unwrap();
