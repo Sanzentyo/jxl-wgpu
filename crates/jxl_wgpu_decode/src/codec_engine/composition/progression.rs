@@ -82,7 +82,7 @@ impl LfPreview {
         let config = ColorOutputConfig {
             linear_black_threshold: crate::image_color::reconstruction_black_threshold(
                 crate::image_color::require_original_encoding(image)?,
-                render_request.format().color_spec,
+                &render_request.format().color_spec,
             ),
             white_point_adaptation: render_request.white_point_adaptation(),
             extent: Extent2d::new(image.width, image.height),
@@ -152,7 +152,7 @@ impl LfPreview {
             } else {
                 crate::image_color::reconstruction_black_threshold(
                     self.original_encoding,
-                    surface.color.format.color_spec,
+                    &surface.color.format.color_spec,
                 )
             },
             white_point_adaptation: jxl_gpu_protocol::WhitePointAdaptation::Bradford,

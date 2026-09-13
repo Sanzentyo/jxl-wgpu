@@ -1,7 +1,7 @@
 use super::*;
 use jxl_gpu_formats::{
-    ChromaLocation2d, ColorFormatClass, ColorRange, ColorSpace, ColorSpec, ColorSpecification,
-    PixelFormatClass, RgbChannelOrder, RgbSample, TransferFunction, classify_pixel_format,
+    ChromaLocation2d, ColorFormatClass, ColorRange, ColorSample, ColorSpace, ColorSpec,
+    ColorSpecification, PixelFormatClass, RgbChannelOrder, TransferFunction, classify_pixel_format,
     convert_rgb_f32, vpi::VpiPitchLinearFormat,
 };
 
@@ -58,7 +58,7 @@ fn assert_color_codes(
     if matches!(
         class,
         PixelFormatClass::Color(ColorFormatClass::Rgb {
-            sample: RgbSample::F32,
+            sample: ColorSample::F32,
             ..
         })
     ) {
@@ -182,14 +182,14 @@ fn output_cases() -> Vec<(String, PixelFormat)> {
     });
     cases.extend(
         [
-            ("I444", PixelFormat::i444(8, 8, color).unwrap()),
-            ("I422", PixelFormat::i422(8, 8, color).unwrap()),
-            ("I420", PixelFormat::i420(8, 8, color).unwrap()),
-            ("NV21", PixelFormat::nv21(color)),
-            ("NV42", PixelFormat::nv42(color)),
-            ("P010", PixelFormat::p010(color)),
-            ("P012", PixelFormat::p012(color)),
-            ("P016", PixelFormat::p016(color)),
+            ("I444", PixelFormat::i444(8, 8, color.clone()).unwrap()),
+            ("I422", PixelFormat::i422(8, 8, color.clone()).unwrap()),
+            ("I420", PixelFormat::i420(8, 8, color.clone()).unwrap()),
+            ("NV21", PixelFormat::nv21(color.clone())),
+            ("NV42", PixelFormat::nv42(color.clone())),
+            ("P010", PixelFormat::p010(color.clone())),
+            ("P012", PixelFormat::p012(color.clone())),
+            ("P016", PixelFormat::p016(color.clone())),
             ("I420-12", PixelFormat::i420(12, 16, color).unwrap()),
         ]
         .map(|(name, format)| (name.to_owned(), format)),
@@ -200,7 +200,7 @@ fn output_cases() -> Vec<(String, PixelFormat)> {
     });
     cases.push((
         "linear-BGRA".to_owned(),
-        PixelFormat::rgb8(RgbChannelOrder::Bgra, false, linear),
+        PixelFormat::rgb8(RgbChannelOrder::Bgra, false, linear.clone()),
     ));
     cases.push((
         "linear-BGRA-F32".to_owned(),
@@ -219,7 +219,7 @@ fn output_cases() -> Vec<(String, PixelFormat)> {
         for planar in [false, true] {
             cases.push((
                 format!("{order:?}-F32-planar{planar}"),
-                PixelFormat::rgb_f32(order, planar, srgb),
+                PixelFormat::rgb_f32(order, planar, srgb.clone()),
             ));
         }
     }

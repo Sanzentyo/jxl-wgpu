@@ -268,10 +268,21 @@ fn gray_uses_pcs_y_and_chad_is_preserved_without_double_adaptation() {
         transform.matrix()[0],
         [10000.0 / 65536.0, 50000.0 / 65536.0, 5536.0 / 65536.0]
     );
-    assert_eq!(transform.source().chromatic_adaptation().unwrap()[1], 4096);
+    assert_eq!(
+        transform
+            .source()
+            .profile()
+            .unwrap()
+            .chromatic_adaptation()
+            .unwrap()[1],
+        4096
+    );
     assert_eq!(transform.target().curves().len(), 1);
     let reverse = IccTransform::new(&gray, &rgb, IccRenderingIntent::Relative).unwrap();
-    assert_eq!(reverse.source().matrix()[0][0], f64::from(0xf6d6) / 65536.0);
+    assert_eq!(
+        reverse.source().profile().unwrap().matrix()[0][0],
+        f64::from(0xf6d6) / 65536.0
+    );
 }
 
 #[test]
@@ -285,5 +296,91 @@ fn a_singular_input_matrix_is_usable_forward_but_has_no_inverse() {
     assert_eq!(
         IccTransform::new(&target, &source, IccRenderingIntent::Relative),
         Err(IccError::Matrix)
+    );
+    assert!(
+        IccTransform::to_linear_rgb(
+            &source,
+            crate::RgbColorSpace::Bt709,
+            IccRenderingIntent::Relative
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        IccTransform::from_linear_rgb(
+            crate::RgbColorSpace::Bt709,
+            &source,
+            IccRenderingIntent::Relative
+        ),
+        Err(IccError::Matrix)
+    );
+}
+
+#[test]
+fn linear_connections_honor_directional_tag_priority_intent_and_geometry() {
+    use crate::RgbColorSpace;
+    for (tag, forward) in [
+        (*b"A2B0", true),
+        (*b"A2B1", true),
+        (*b"D2B1", true),
+        (*b"B2A0", false),
+        (*b"B2A1", false),
+        (*b"B2D1", false),
+    ] {
+        let mut tags = rgb_tags();
+        tags.push((tag, element(b"mAB ", &[])));
+        let profile = parse(profile_bytes(&tags)).unwrap();
+        let to = IccTransform::to_linear_rgb(
+            &profile,
+            RgbColorSpace::Bt709,
+            IccRenderingIntent::Relative,
+        );
+        let from = IccTransform::from_linear_rgb(
+            RgbColorSpace::Bt709,
+            &profile,
+            IccRenderingIntent::Relative,
+        );
+        let (rejected, accepted) = if forward { (to, from) } else { (from, to) };
+        assert_eq!(
+            rejected,
+            Err(IccError::TransformTag {
+                tag: IccSignature(tag)
+            })
+        );
+        assert!(accepted.is_ok());
+    }
+    let profile = parse(profile_bytes(&rgb_tags())).unwrap();
+    for intent in [
+        IccRenderingIntent::Perceptual,
+        IccRenderingIntent::Absolute,
+        IccRenderingIntent::Saturation,
+    ] {
+        assert_eq!(
+            IccTransform::to_linear_rgb(&profile, RgbColorSpace::Bt709, intent),
+            Err(IccError::RenderingIntent { intent })
+        );
+        assert_eq!(
+            IccTransform::from_linear_rgb(RgbColorSpace::Bt709, &profile, intent),
+            Err(IccError::RenderingIntent { intent })
+        );
+    }
+    assert_eq!(
+        IccTransform::to_linear_rgb(
+            &profile,
+            RgbColorSpace::Undefined,
+            IccRenderingIntent::Relative
+        ),
+        Err(IccError::LinearRgb(
+            crate::ColorMatrixError::UndefinedTarget
+        ))
+    );
+    assert_eq!(
+        IccTransform::from_linear_rgb(
+            RgbColorSpace::Undefined,
+            &profile,
+            IccRenderingIntent::Relative
+        ),
+        Err(IccError::LinearRgb(
+            crate::ColorMatrixError::UndefinedSource
+        ))
     );
 }

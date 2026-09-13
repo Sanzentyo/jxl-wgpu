@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
-    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
-    SampleKind, TransferFunction, WgslNumericCapability, YcbcrEncoding, classify_pixel_format,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ColorStorage,
+    ImageLayout, NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass,
+    RgbChannelOrder, SampleKind, TransferFunction, WgslNumericCapability, YcbcrEncoding,
+    classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputLayout, SampleType};
 use wgpu::util::DeviceExt;
@@ -1308,6 +1309,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
     let class = classify_display_format(&layout.format)?;
     let color = match layout.format.color_spec {
         ColorSpecification::Defined(color) => color,
+        ColorSpecification::Icc(_) => return Err(Error::Unsupported("ICC color must be converted by the resident ICC pipeline before enumerated RGB packing or display".into())),
         ColorSpecification::Default | ColorSpecification::Undefined => {
             return Err(Error::Unsupported(
                 "display conversion requires an explicit color specification".into(),
@@ -1335,7 +1337,7 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
         || matches!(
             class,
             ColorFormatClass::Rgb {
-                sample: jxl_gpu_formats::RgbSample::F32,
+                sample: jxl_gpu_formats::ColorSample::F32,
                 ..
             }
         );
@@ -1355,6 +1357,11 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
     );
     let (kind, channels, order, bits, storage_bits, matrix, range, siting_x, siting_y) = match class
     {
+        ColorFormatClass::Gray { .. } => {
+            return Err(Error::Unsupported(
+                "gray display requires an explicit gray color conversion stage".into(),
+            ));
+        }
         ColorFormatClass::Rgb {
             sample,
             storage,
@@ -1366,8 +1373,8 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                 ));
             }
             let kind = match storage {
-                RgbStorage::Interleaved => 0,
-                RgbStorage::Planar => 1,
+                ColorStorage::Interleaved => 0,
+                ColorStorage::Planar => 1,
             };
             let (channels, order) = match order {
                 RgbChannelOrder::Rgb => (3, 0),
@@ -1457,8 +1464,8 @@ fn validate_image(layout: &ImageLayout, buffer_size: u64) -> Result<ValidatedIma
                     siting_x,
                     siting_y,
                 ),
-                ColorFormatClass::Rgb { .. } => {
-                    unreachable!("RGB color classes were handled before YCbCr lowering")
+                ColorFormatClass::Rgb { .. } | ColorFormatClass::Gray { .. } => {
+                    unreachable!("RGB and gray color classes were handled before YCbCr lowering")
                 }
             }
         }

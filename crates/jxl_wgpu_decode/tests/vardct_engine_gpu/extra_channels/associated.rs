@@ -444,10 +444,10 @@ fn alpha_conversion_precedes_yuv_subsampling_and_quantization() {
     ] {
         let data = encoded(hex);
         for format in [
-            PixelFormat::nv12(srgb),
-            PixelFormat::p010(cl),
-            PixelFormat::packed_yuv4228(jxl_gpu_formats::Packed422Order::Yuyv, srgb),
-            PixelFormat::packed_yuv4228(jxl_gpu_formats::Packed422Order::Uyvy, srgb),
+            PixelFormat::nv12(srgb.clone()),
+            PixelFormat::p010(cl.clone()),
+            PixelFormat::packed_yuv4228(jxl_gpu_formats::Packed422Order::Yuyv, srgb.clone()),
+            PixelFormat::packed_yuv4228(jxl_gpu_formats::Packed422Order::Uyvy, srgb.clone()),
         ] {
             for policy in [
                 AlphaOutputPolicy::Preserve,

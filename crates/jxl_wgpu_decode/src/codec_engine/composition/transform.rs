@@ -74,7 +74,7 @@ pub(super) fn convert(
         linear_black_threshold: if image.xyb_encoded {
             crate::image_color::reconstruction_black_threshold(
                 crate::image_color::require_original_encoding(image)?,
-                layout.color.format.color_spec,
+                &layout.color.format.color_spec,
             )
         } else {
             None

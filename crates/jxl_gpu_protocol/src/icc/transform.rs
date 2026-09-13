@@ -1,3 +1,6 @@
+use crate::color::matrix::{IDENTITY, multiply};
+use crate::{Chromaticity, ColorMatrix, RgbColorSpace, WhitePointAdaptation};
+
 use super::{IccCurve, IccDirection, IccError, IccProfile, IccRenderingIntent, IccSignature};
 
 /// Exact profile matrix and independent curves selected for one direction. Colorants are
@@ -150,12 +153,48 @@ impl IccProfile {
     }
 }
 
-/// Device-to-device colorimetric program. Input/output channel counts follow their profiles;
-/// alpha and extra channels are deliberately outside this pixel color transform.
+/// A selected ICC profile endpoint or an unbounded linear RGB connection. Linear RGB has
+/// three channels and no ICC device-domain clipping or fixed-point profile approximation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IccTransformEndpoint {
+    Profile(IccMatrixTrc),
+    LinearRgb(RgbColorSpace),
+}
+
+impl IccTransformEndpoint {
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        match self {
+            Self::Profile(profile) => profile.curves.len(),
+            Self::LinearRgb(_) => 3,
+        }
+    }
+
+    /// Selected device curves; a linear RGB connection has no curve descriptors.
+    #[must_use]
+    pub fn curves(&self) -> &[IccCurve] {
+        match self {
+            Self::Profile(profile) => &profile.curves,
+            Self::LinearRgb(_) => &[],
+        }
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> Option<&IccMatrixTrc> {
+        match self {
+            Self::Profile(profile) => Some(profile),
+            Self::LinearRgb(_) => None,
+        }
+    }
+}
+
+/// ICC colorimetric program. Device endpoints follow their profile's bounded curve rules;
+/// linear RGB endpoints preserve signed values and values above one. Alpha and extra channels
+/// are outside this transform. Relative intent connects PCS D50 and RGB whites using Bradford.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IccTransform {
-    source: IccMatrixTrc,
-    target: IccMatrixTrc,
+    source: IccTransformEndpoint,
+    target: IccTransformEndpoint,
     matrix: [[f64; 3]; 3],
 }
 
@@ -165,27 +204,72 @@ impl IccTransform {
         target: &IccProfile,
         intent: IccRenderingIntent,
     ) -> Result<Self, IccError> {
-        let source = source.matrix_trc(IccDirection::DeviceToPcs, intent)?;
-        let target = target.matrix_trc(IccDirection::PcsToDevice, intent)?;
-        let target_inverse = if target.curves.len() == 1 {
-            // Gray uses PCS Y; no chromatic or black-point adaptation is implicit here.
-            [[0.0, 1.0, 0.0], [0.0; 3], [0.0; 3]]
-        } else {
-            inverse(target.matrix)?
+        Self::connect(
+            IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
+            IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+        )
+    }
+
+    /// Convert a profile's device channels to unbounded linear RGB. Source colorants and
+    /// independent curves retain their exact ICC values; no synthetic profile is serialized.
+    pub fn to_linear_rgb(
+        source: &IccProfile,
+        target: RgbColorSpace,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::Profile(source.matrix_trc(IccDirection::DeviceToPcs, intent)?),
+            IccTransformEndpoint::LinearRgb(target),
+        )
+    }
+
+    /// Convert unbounded linear RGB to a profile's device channels. Inputs are not clamped
+    /// before the PCS matrix; only the selected ICC inverse curve applies device bounds.
+    pub fn from_linear_rgb(
+        source: RgbColorSpace,
+        target: &IccProfile,
+        intent: IccRenderingIntent,
+    ) -> Result<Self, IccError> {
+        Self::connect(
+            IccTransformEndpoint::LinearRgb(source),
+            IccTransformEndpoint::Profile(target.matrix_trc(IccDirection::PcsToDevice, intent)?),
+        )
+    }
+
+    fn connect(
+        source: IccTransformEndpoint,
+        target: IccTransformEndpoint,
+    ) -> Result<Self, IccError> {
+        let source_matrix = match &source {
+            IccTransformEndpoint::Profile(profile) => profile.matrix,
+            IccTransformEndpoint::LinearRgb(space) => *ColorMatrix::rgb_to_xyz(
+                *space,
+                Chromaticity::ICC_D50,
+                WhitePointAdaptation::Bradford,
+            )?
+            .rows(),
         };
-        let matrix = if source.matrix == target.matrix && source.curves.len() == target.curves.len()
+        let target_inverse = match &target {
+            IccTransformEndpoint::Profile(profile) if profile.curves.len() == 1 => {
+                // Gray uses PCS Y; no implicit black-point adaptation.
+                [[0.0, 1.0, 0.0], [0.0; 3], [0.0; 3]]
+            }
+            IccTransformEndpoint::Profile(profile) => inverse(profile.matrix)?,
+            IccTransformEndpoint::LinearRgb(space) => *ColorMatrix::xyz_to_rgb(
+                Chromaticity::ICC_D50,
+                *space,
+                WhitePointAdaptation::Bradford,
+            )?
+            .rows(),
+        };
+        let matrix = if matches!((&source, &target),
+            (IccTransformEndpoint::Profile(s), IccTransformEndpoint::Profile(t))
+                if s.matrix == t.matrix && s.curves.len() == t.curves.len())
         {
-            // Preserve exact cancellation. A tiny residual can select a different end of a
-            // sampled plateau even though the mathematical matrix product is identity.
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            // Exact cancellation also retains the specified endpoint of sampled plateaus.
+            IDENTITY
         } else {
-            std::array::from_fn(|r| {
-                std::array::from_fn(|c| {
-                    (0..3)
-                        .map(|k| target_inverse[r][k] * source.matrix[k][c])
-                        .sum::<f64>()
-                })
-            })
+            multiply(target_inverse, source_matrix)
         };
         if matrix.iter().flatten().any(|v| !v.is_finite()) {
             return Err(IccError::Matrix);
@@ -198,11 +282,11 @@ impl IccTransform {
     }
 
     #[must_use]
-    pub const fn source(&self) -> &IccMatrixTrc {
+    pub const fn source(&self) -> &IccTransformEndpoint {
         &self.source
     }
     #[must_use]
-    pub const fn target(&self) -> &IccMatrixTrc {
+    pub const fn target(&self) -> &IccTransformEndpoint {
         &self.target
     }
     #[must_use]
@@ -227,20 +311,6 @@ fn xyz_tag(profile: &IccProfile, signature: [u8; 4]) -> Result<[i32; 3], IccErro
     Ok([data.i32(8)?, data.i32(12)?, data.i32(16)?])
 }
 
-fn inverse(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], IccError> {
-    let [[a, b, c], [d, e, f], [g, h, i]] = m;
-    let adj = [
-        [e * i - f * h, c * h - b * i, b * f - c * e],
-        [f * g - d * i, a * i - c * g, c * d - a * f],
-        [d * h - e * g, b * g - a * h, a * e - b * d],
-    ];
-    let det = a * adj[0][0] + b * adj[1][0] + c * adj[2][0];
-    if !det.is_finite() || det == 0.0 {
-        return Err(IccError::Matrix);
-    }
-    let result = adj.map(|row| row.map(|v| v / det));
-    if result.iter().flatten().any(|v| !v.is_finite()) {
-        return Err(IccError::Matrix);
-    }
-    Ok(result)
+fn inverse(matrix: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], IccError> {
+    crate::color::matrix::inverse(matrix).map_err(|_| IccError::Matrix)
 }

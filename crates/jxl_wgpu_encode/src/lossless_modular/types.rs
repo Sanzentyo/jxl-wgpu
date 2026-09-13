@@ -174,7 +174,7 @@ pub(super) fn lossless_modular_source_spec(
     {
         return Err(UnsupportedFeature::InputFormat.into());
     }
-    let logical_format = match (format.model, format.swizzle, format.color_spec) {
+    let logical_format = match (format.model, format.swizzle, &format.color_spec) {
         (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
             LosslessModularFormat::Gray
         }

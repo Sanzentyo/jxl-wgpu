@@ -627,7 +627,7 @@ fn bt2020_constant_luminance_displays_through_its_normative_inverse() {
         range: ColorRange::Full,
         chroma_location: ChromaLocation2d::BOTH,
     });
-    let format = PixelFormat::i444(8, 8, color).expect("valid BT.2020 CL I444");
+    let format = PixelFormat::i444(8, 8, color.clone()).expect("valid BT.2020 CL I444");
     let layout = jxl_wgpu::ImageLayout::packed(extent, format).expect("valid I444 layout");
     let mut bytes = vec![0; usize::try_from(layout.logical_size).unwrap()];
     for (plane, code) in codes.into_iter().enumerate() {
@@ -761,10 +761,10 @@ fn generic_image_display_supports_high_depth_packed_and_rgb_layouts() {
         chroma_location: ChromaLocation2d::CENTER,
     });
     let formats = [
-        PixelFormat::luma(16, color),
-        PixelFormat::p010(color),
-        PixelFormat::i420(12, 16, color).unwrap(),
-        PixelFormat::nv42(color),
+        PixelFormat::luma(16, color.clone()),
+        PixelFormat::p010(color.clone()),
+        PixelFormat::i420(12, 16, color.clone()).unwrap(),
+        PixelFormat::nv42(color.clone()),
         PixelFormat::packed_yuv4228(Packed422Order::Uyvy, color),
         PixelFormat::rgb8(
             RgbChannelOrder::Bgra,
@@ -841,7 +841,7 @@ fn odd_width_packed_422_preserves_color_and_tail_luma_order() {
         .into_iter()
         .enumerate()
     {
-        let format = PixelFormat::packed_yuv4228(order, color);
+        let format = PixelFormat::packed_yuv4228(order, color.clone());
         let converted = jxl_gpu_formats::convert_rgb_f32([&red, &green, &blue], extent, &format)
             .expect("convert packed 4:2:2 display input");
         let mut bytes = converted.bytes;

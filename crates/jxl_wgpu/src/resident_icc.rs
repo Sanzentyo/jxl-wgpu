@@ -9,7 +9,7 @@
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_protocol::{
     Extent2d,
-    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccTransform},
+    icc::{IccCurve, IccCurveKind, IccInverseDirection, IccTransform, IccTransformEndpoint},
 };
 use wgpu::util::DeviceExt;
 
@@ -94,8 +94,8 @@ impl ResidentIccProgram {
         });
         Ok(Self {
             buffer,
-            input_channels: transform.source().curves().len(),
-            output_channels: transform.target().curves().len(),
+            input_channels: transform.source().channels(),
+            output_channels: transform.target().channels(),
             memory,
         })
     }

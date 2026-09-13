@@ -7,10 +7,10 @@
 use crate::{Error, Result};
 use bytemuck::{Pod, Zeroable};
 use jxl_gpu_formats::{
-    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ImageLayout,
-    NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbStorage,
-    TransferFunction as ImageTransferFunction, WgslNumericCapability, YcbcrEncoding,
-    classify_pixel_format,
+    ChromaLocation, ChromaOrder, ColorFormatClass, ColorRange, ColorSpecification, ColorStorage,
+    ImageLayout, NumericFormatClass, Packed422Order, PixelFormat, PixelFormatClass,
+    RgbChannelOrder, TransferFunction as ImageTransferFunction, WgslNumericCapability,
+    YcbcrEncoding, classify_pixel_format,
 };
 use jxl_gpu_protocol::{
     Extent2d, OutputOrientation, RgbColorEncoding, TransferFunction as SourceTransferFunction,
@@ -237,6 +237,9 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
 
     let class = classify_image_output_format(&layout.format)?;
     match class {
+        ColorFormatClass::Gray { .. } => Err(Error::Unsupported(
+            "gray output requires an explicit gray color conversion and packing stage".into(),
+        )),
         ColorFormatClass::Rgb {
             sample,
             storage,
@@ -249,8 +252,8 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
                 ));
             }
             let kind = match storage {
-                RgbStorage::Interleaved => 0,
-                RgbStorage::Planar => 1,
+                ColorStorage::Interleaved => 0,
+                ColorStorage::Planar => 1,
             };
             let (channels, order) = match order {
                 RgbChannelOrder::Rgb => (3, 0),
@@ -303,8 +306,8 @@ pub(crate) fn prepare_image_output(layout: &ImageLayout) -> Result<PreparedImage
                 ColorFormatClass::Yuv422Packed { order } => {
                     (6, 3, u32::from(order == Packed422Order::Uyvy), 8, 8)
                 }
-                ColorFormatClass::Rgb { .. } => {
-                    unreachable!("RGB color classes were handled before YCbCr lowering")
+                ColorFormatClass::Rgb { .. } | ColorFormatClass::Gray { .. } => {
+                    unreachable!("RGB and gray color classes were handled before YCbCr lowering")
                 }
             };
             Ok(PreparedImageOutput {
@@ -351,6 +354,7 @@ fn numeric_image_output_error(numeric: NumericFormatClass) -> Error {
 fn image_color_params(layout: &ImageLayout) -> Result<(u32, u32, u8, u8)> {
     let color = match layout.format.color_spec {
         ColorSpecification::Defined(color) => color,
+        ColorSpecification::Icc(_) => return Err(Error::Unsupported("ICC color must be converted by the resident ICC pipeline before enumerated RGB packing or display".into())),
         ColorSpecification::Default | ColorSpecification::Undefined => {
             return Err(Error::Unsupported(
                 "YCbCr GPU output requires an explicit matrix, range, and chroma location".into(),
@@ -424,6 +428,7 @@ pub(crate) fn image_color_transform(
     };
     let target_color = match target.color_spec {
         ColorSpecification::Defined(color) => color,
+        ColorSpecification::Icc(_) => return Err(Error::Unsupported("ICC color must be converted by the resident ICC pipeline before enumerated RGB packing or display".into())),
         ColorSpecification::Default | ColorSpecification::Undefined => {
             return Err(Error::Unsupported(
                 "generic GPU output requires an explicit target color specification".into(),

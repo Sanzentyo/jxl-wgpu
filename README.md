@@ -72,7 +72,9 @@ luminance mapping remain incomplete.
 
 The common backend now has a bounded [resident ICC matrix/TRC converter](docs/ICC_MATRIX_TRC.md)
 with exact profile metadata, channel-specific curves and RGB/Gray conversion. Its independent
-176,120-component corpus validates GPU execution. Embedded-ICC decoder admission, reference
+358,530-component corpus includes 100 profile pairs and 100 connections to unbounded linear RGB.
+Pixel formats retain owned ICC profiles, and inventories share the reconstructed profile bytes.
+Embedded-ICC decoder admission, reference
 composition, LUT/CMYK and full intent/HDR policies remain separate incomplete integration gates.
 
 Creating an encoder or decoder requires a compatible `wgpu` backend. Unsupported codestream

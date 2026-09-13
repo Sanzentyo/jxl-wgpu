@@ -60,11 +60,12 @@ pub(super) fn lower_program(
             }
         }
     }
-    for (target, source) in [
-        (&mut header.source_curves, transform.source().curves()),
-        (&mut header.target_curves, transform.target().curves()),
+    for (target, endpoint) in [
+        (&mut header.source_curves, transform.source()),
+        (&mut header.target_curves, transform.target()),
     ] {
-        for (i, curve) in source.iter().enumerate() {
+        target[3] = u32::from(matches!(endpoint, IccTransformEndpoint::LinearRgb(_)));
+        for (i, curve) in endpoint.curves().iter().enumerate() {
             target[i] = offsets[curves
                 .iter()
                 .position(|v| *v == curve)

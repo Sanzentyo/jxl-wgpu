@@ -893,7 +893,7 @@ pub(crate) fn native_modular_format(format: &PixelFormat) -> Option<NativeModula
                 && spec.encoding == jxl_gpu_formats::YcbcrEncoding::Undefined
                 && spec.transfer == jxl_gpu_formats::TransferFunction::Srgb
                 && spec.range == jxl_gpu_formats::ColorRange::Full);
-    let channels = match (format.model, format.swizzle, format.color_spec) {
+    let channels = match (format.model, format.swizzle, &format.color_spec) {
         (ColorModel::NonColor, Swizzle::X000, ColorSpecification::Undefined) => {
             ModularChannels::Gray
         }

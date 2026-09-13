@@ -83,10 +83,10 @@ fn spot_presentation_precedes_native_quantization_and_target_chroma_subsampling(
                 }
             }
             for format in [
-                PixelFormat::nv12(srgb),
-                PixelFormat::p010(cl),
-                PixelFormat::packed_yuv4228(Packed422Order::Yuyv, srgb),
-                PixelFormat::packed_yuv4228(Packed422Order::Uyvy, srgb),
+                PixelFormat::nv12(srgb.clone()),
+                PixelFormat::p010(cl.clone()),
+                PixelFormat::packed_yuv4228(Packed422Order::Yuyv, srgb.clone()),
+                PixelFormat::packed_yuv4228(Packed422Order::Uyvy, srgb.clone()),
             ] {
                 let ColorSpecification::Defined(mut color) = format.color_spec else {
                     unreachable!()

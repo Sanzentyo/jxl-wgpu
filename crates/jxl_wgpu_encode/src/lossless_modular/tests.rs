@@ -252,16 +252,22 @@ mod native_tests {
         }
         assert!(LosslessModularFormat::Gray.pixel_format(0).is_err());
         assert!(LosslessModularFormat::Gray.pixel_format(17).is_err());
-        let undefined = ColorSpecification::Undefined;
         assert!(
-            lossless_modular_source_spec(
-                &PixelFormat::rgb8(RgbChannelOrder::Rgb, true, undefined,)
-            )
+            lossless_modular_source_spec(&PixelFormat::rgb8(
+                RgbChannelOrder::Rgb,
+                true,
+                ColorSpecification::Undefined,
+            ))
             .is_err()
         );
         for order in [RgbChannelOrder::Bgr, RgbChannelOrder::Bgra] {
             assert!(
-                lossless_modular_source_spec(&PixelFormat::rgb8(order, false, undefined)).is_err()
+                lossless_modular_source_spec(&PixelFormat::rgb8(
+                    order,
+                    false,
+                    ColorSpecification::Undefined
+                ))
+                .is_err()
             );
         }
         let defined = ColorSpecification::Defined(jxl_gpu_formats::ColorSpec::bt709(

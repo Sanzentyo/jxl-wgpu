@@ -6,6 +6,8 @@ pub enum ColorModel {
     NonColor,
     Ycbcr,
     Rgb,
+    /// One color-bearing gray component X, with optional alpha W.
+    Gray,
     Raw(RawPattern),
     Xyz,
 }
@@ -181,13 +183,17 @@ impl ColorSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ColorSpecification {
     /// An external API may infer its default interpretation.
     Default,
     /// Color interpretation is absent or irrelevant.
     Undefined,
     Defined(ColorSpec),
+    /// Exact owned ICC metadata, including independent channel curves and unrecognized tags.
+    /// Cloning shares the original bytes and checked directory. A storage classifier does not
+    /// imply that a consumer implements the profile's selected transform.
+    Icc(jxl_gpu_protocol::icc::IccProfile),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +259,18 @@ pub enum SwizzleComponent {
 pub struct Swizzle(pub [SwizzleComponent; 4]);
 
 impl Swizzle {
+    pub const X001: Self = Self([
+        SwizzleComponent::X,
+        SwizzleComponent::Zero,
+        SwizzleComponent::Zero,
+        SwizzleComponent::One,
+    ]);
+    pub const X00W: Self = Self([
+        SwizzleComponent::X,
+        SwizzleComponent::Zero,
+        SwizzleComponent::Zero,
+        SwizzleComponent::W,
+    ]);
     pub const X000: Self = Self([
         SwizzleComponent::X,
         SwizzleComponent::Zero,
@@ -416,7 +434,9 @@ impl PlaneFormat {
 }
 
 /// A storage-complete logical pixel format independent of concrete offsets and
-/// row pitches.
+/// row pitches. Convenience constructors describe storage and retain the supplied color
+/// metadata. Call [`Self::validate`], a classifier or an image-layout constructor to check
+/// color-model compatibility; an incompatible ICC specification never causes a builder panic.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PixelFormat {
     pub model: ColorModel,
@@ -454,6 +474,20 @@ impl PixelFormat {
     }
 
     pub fn validate(&self) -> Result<(), PixelFormatError> {
+        if let ColorSpecification::Icc(profile) = &self.color_spec {
+            let signature = profile.header().device_space;
+            if !matches!(
+                (self.model, &signature.0),
+                (ColorModel::Rgb, b"RGB ")
+                    | (ColorModel::Gray, b"GRAY")
+                    | (ColorModel::Xyz, b"XYZ ")
+            ) {
+                return Err(PixelFormatError::IccDeviceSpace {
+                    model: self.model,
+                    signature,
+                });
+            }
+        }
         if self.planes.is_empty() || self.planes.len() > Self::MAX_PLANES {
             return Err(PixelFormatError::PlaneCount(self.planes.len()));
         }
@@ -521,7 +555,8 @@ impl PixelFormat {
         }
     }
 
-    /// Constructs planar Y/Cb/Cr with samples MSB-aligned in their storage words.
+    /// Constructs planar Y/Cb/Cr, checking sample widths and subsampling. Color metadata
+    /// compatibility is checked by [`Self::validate`] and image-layout construction.
     pub fn yuv_planar(
         subsampling: ChromaSubsampling,
         bits: u8,
@@ -535,14 +570,14 @@ impl PixelFormat {
                 .expect("validated sample and storage widths")
         };
         let chroma_sampling = PlaneSampling::new(horizontal, vertical);
-        Self::new(
-            ColorModel::Ycbcr,
+        Ok(Self {
+            model: ColorModel::Ycbcr,
             color_spec,
-            subsampling,
-            SampleKind::Unsigned,
-            ByteOrder::Native,
-            Swizzle::XYZ0,
-            vec![
+            chroma_subsampling: subsampling,
+            sample_kind: SampleKind::Unsigned,
+            byte_order: ByteOrder::Native,
+            swizzle: Swizzle::XYZ0,
+            planes: vec![
                 PlaneFormat {
                     sampling: PlaneSampling::FULL,
                     pixels_per_element: 1,
@@ -559,7 +594,7 @@ impl PixelFormat {
                     words: vec![word(Channel::Z)],
                 },
             ],
-        )
+        })
     }
 
     /// Constructs semi-planar Y plus interleaved chroma with samples
@@ -582,14 +617,14 @@ impl PixelFormat {
             PackingWord::msb_aligned(channel, bits, storage_bits)
                 .expect("validated sample and storage widths")
         };
-        Self::new(
-            ColorModel::Ycbcr,
+        Ok(Self {
+            model: ColorModel::Ycbcr,
             color_spec,
-            subsampling,
-            SampleKind::Unsigned,
-            ByteOrder::Native,
-            Swizzle::XYZ0,
-            vec![
+            chroma_subsampling: subsampling,
+            sample_kind: SampleKind::Unsigned,
+            byte_order: ByteOrder::Native,
+            swizzle: Swizzle::XYZ0,
+            planes: vec![
                 PlaneFormat {
                     sampling: PlaneSampling::FULL,
                     pixels_per_element: 1,
@@ -601,7 +636,7 @@ impl PixelFormat {
                     words: channels.into_iter().map(word).collect(),
                 },
             ],
-        )
+        })
     }
 
     #[must_use]
@@ -636,6 +671,55 @@ impl PixelFormat {
     #[must_use]
     pub fn rgb_f32(order: RgbChannelOrder, planar: bool, color_spec: ColorSpecification) -> Self {
         Self::rgb_format(order, planar, color_spec, SampleKind::Float, 32)
+    }
+
+    /// Color-bearing gray X and optional alpha W, independently of numeric scalar storage.
+    #[must_use]
+    pub fn gray8(alpha: bool, planar: bool, color_spec: ColorSpecification) -> Self {
+        Self::gray_format(alpha, planar, color_spec, SampleKind::Unsigned, 8)
+    }
+
+    /// F32 gray with optional linear alpha. ICC metadata describes the gray device component.
+    #[must_use]
+    pub fn gray_f32(alpha: bool, planar: bool, color_spec: ColorSpecification) -> Self {
+        Self::gray_format(alpha, planar, color_spec, SampleKind::Float, 32)
+    }
+
+    fn gray_format(
+        alpha: bool,
+        planar: bool,
+        color_spec: ColorSpecification,
+        sample_kind: SampleKind,
+        bits: u8,
+    ) -> Self {
+        let channels: &[Channel] = if alpha {
+            &[Channel::X, Channel::W]
+        } else {
+            &[Channel::X]
+        };
+        Self {
+            model: ColorModel::Gray,
+            color_spec,
+            chroma_subsampling: ChromaSubsampling::None,
+            sample_kind,
+            byte_order: ByteOrder::Native,
+            swizzle: if alpha { Swizzle::X00W } else { Swizzle::X001 },
+            planes: if planar {
+                channels
+                    .iter()
+                    .map(|&channel| {
+                        PlaneFormat::separate_words(PlaneSampling::FULL, 1, &[channel], bits)
+                    })
+                    .collect()
+            } else {
+                vec![PlaneFormat::separate_words(
+                    PlaneSampling::FULL,
+                    1,
+                    channels,
+                    bits,
+                )]
+            },
+        }
     }
 
     fn rgb_format(
@@ -865,6 +949,11 @@ pub enum RgbChannelOrder {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum PixelFormatError {
+    #[error("ICC device space {signature} is incompatible with pixel color model {model:?}")]
+    IccDeviceSpace {
+        model: ColorModel,
+        signature: jxl_gpu_protocol::icc::IccSignature,
+    },
     #[error("pixel format has {0} planes; expected 1..=6")]
     PlaneCount(usize),
     #[error("plane {plane} has a zero sampling divisor")]

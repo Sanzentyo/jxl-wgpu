@@ -399,6 +399,16 @@ See [the contract and evidence](ICC_MATRIX_TRC.md). All affected feature rows re
 embedded-ICC decoder admission, original/XYB/reference integration, requested ICC outputs, exact
 numeric bypass, LUT/MPE/Lab/CMYK, other intents and HDR/unbounded policies are not completed here.
 
+ICC connection/ownership checkpoint: profile↔linear RGB programs now combine exact ICC colorants
+and shared f64 CIE/Bradford geometry before GPU lowering. The linear endpoint preserves signed
+and above-one components; ICC device curves retain their bounded contract. 100 additional native
+and independent connections validate 182,410 components, while the original 121 reference files
+remain unchanged. `ColorSpecification::Icc` owns shared original profile bytes/tag metadata;
+inventory clones share reconstructed ICC bytes. Explicit Gray color/alpha storage and device-space
+validation prevent numeric or YCbCr relabeling. This prepares original/XYB/reference integration;
+stock decoder admission, profile output packing, display and per-image program/budget integration
+remain open. All affected rows remain **Partial**.
+
 | ID | Pri | State | Requirement and acceptance gate | Depends on |
 |---|---:|---|---|---|
 | `API-01` | P1 | **Partial** | One capability query must report exact decode, encode, color, output, precision, memory, workgroup, and platform limits. No versioned aliases or compatibility shims are required; breaking APIs should model current semantics directly. | all feature rows |

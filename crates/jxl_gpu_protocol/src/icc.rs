@@ -14,7 +14,7 @@ mod transform;
 
 pub use curve::{IccCurve, IccCurveKind, IccInverseDirection};
 pub use profile::{IccHeader, IccProfile, IccTag};
-pub use transform::{IccMatrixTrc, IccTransform};
+pub use transform::{IccMatrixTrc, IccTransform, IccTransformEndpoint};
 
 /// An ICC four-byte signature, preserved even for unknown tags and profile classes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,6 +70,8 @@ impl Default for IccLimits {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IccError {
+    #[error("ICC linear RGB connection: {0}")]
+    LinearRgb(#[from] crate::ColorMatrixError),
     #[error("ICC {field} needs bytes through {required}, available {available}")]
     Truncated {
         field: &'static str,

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jxl_gpu_formats::{
-    ChromaOrder, ColorFormatClass, ColorRange, ColorSpace, ColorSpecification, ImageLayout,
-    Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder, RgbSample, RgbStorage,
+    ChromaOrder, ColorFormatClass, ColorRange, ColorSample, ColorSpace, ColorSpecification,
+    ColorStorage, ImageLayout, Packed422Order, PixelFormat, PixelFormatClass, RgbChannelOrder,
     SampleKind, TransferFunction, classify_pixel_format,
 };
 use jxl_gpu_protocol::{Extent2d, OutputOrientation, SubmissionToken};
@@ -1195,7 +1195,7 @@ impl OutputPlan {
         let float_rgb = matches!(
             class,
             PixelFormatClass::Color(ColorFormatClass::Rgb {
-                sample: RgbSample::F32,
+                sample: ColorSample::F32,
                 ..
             })
         );
@@ -1350,8 +1350,8 @@ impl OutputPlan {
                         }
                         let (channels, order) = rgb_output_shape(order);
                         let kind = match storage {
-                            RgbStorage::Interleaved => OutputKind::RgbInterleaved,
-                            RgbStorage::Planar => OutputKind::RgbPlanar,
+                            ColorStorage::Interleaved => OutputKind::RgbInterleaved,
+                            ColorStorage::Planar => OutputKind::RgbPlanar,
                         };
                         (
                             kind,

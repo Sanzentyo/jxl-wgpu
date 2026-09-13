@@ -39,3 +39,20 @@ cargo test -p jxl_wgpu --test icc -- --test-threads=1
 ```
 
 Generation is offline. `cargo test` consumes the checked-in bytes and does not spawn an oracle.
+
+`linear.hpp` adds the `linear` subdirectory with 100 bidirectional connections between these ten
+profiles and five linear RGB spaces. Its CIE/Bradford calculation uses normalized primaries and
+pivoted elimination, independently of production's homogeneous geometry. Native ICC execution
+uses `TYPE_XYZ_DBL` on the PCS side plus the independent matrix on the linear side, without
+serializing a surrogate linear RGB profile. Linear input/output is unbounded; only ICC device
+curves use the unit-domain contract.
+
+- `linear/manifest.json` records all five exact white/primary declarations.
+- `linear/input.f32le` contains 629 three-channel inputs including signed/above-one values.
+- `linear/<profile>_to_<space>.reference` and the reverse name use the same 28-byte records.
+  Forward inputs reuse the original `<profile>_input.f32le` files.
+
+All 182,410 additional components have primary scalar intervals and native references with the
+same precision and semantics-mask policy. The generator still reproduces every original file
+byte for byte; the complete corpus contains 223 files. The build/regeneration command above
+reproduces both parts together.

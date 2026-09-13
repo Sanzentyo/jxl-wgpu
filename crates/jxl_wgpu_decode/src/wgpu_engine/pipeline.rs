@@ -537,7 +537,7 @@ impl WgpuSubmissionEngine {
                     sources,
                     channels,
                     config,
-                    output.layout.format.color_spec,
+                    output.layout.format.color_spec.clone(),
                     &profile.upsampling_weights,
                     &self.backend.device().limits(),
                 )?

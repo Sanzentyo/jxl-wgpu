@@ -1310,6 +1310,12 @@ tables do not lose their interpolation position to an F32 multiplication. Parame
 all seven declared parameters on lowering. The 80-byte dispatch uniform contains extent/channel
 counts, relative input offsets/strides and output offsets/strides at 16-byte intervals.
 
+The fourth word of each source/target curve-offset vector (byte offsets 60 and 76) selects the
+endpoint: zero uses ICC curve offsets, one uses unbounded linear RGB without curve descriptors or
+unit clipping. Channel counts remain in the dispatch uniform; a linear endpoint always has three.
+The 80-byte header/dispatch and 48-byte curve ABI sizes are unchanged. Exact ICC/PCS/RGB matrices
+are combined in host f64 metadata before F32 program lowering; no image buffer is read on the host.
+
 `ResidentIccMemoryPlan` reports exact program bytes and per-dispatch uniform bytes before upload;
 the caller owns admission and completion lifetime. Three storage bindings and one uniform are
 checked against device limits. Color input/output use distinct buffers and checked planar ranges;

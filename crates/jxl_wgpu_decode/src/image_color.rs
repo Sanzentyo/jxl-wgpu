@@ -110,7 +110,7 @@ pub(crate) const fn linear_encoding(original: RgbColorEncoding) -> RgbColorEncod
 /// General RGB color conversion continues to use the profile curve itself.
 pub(crate) fn reconstruction_black_threshold(
     original: RgbColorEncoding,
-    target: jxl_gpu_formats::ColorSpecification,
+    target: &jxl_gpu_formats::ColorSpecification,
 ) -> Option<f32> {
     let jxl_gpu_formats::ColorSpecification::Defined(target) = target else {
         return None;
@@ -250,7 +250,7 @@ mod tests {
         image.embedded_icc = Some(EmbeddedIccInventory {
             bit_range: image.bit_range,
             encoded_byte_count: 0,
-            profile: vec![],
+            profile: [].into(),
         });
         unsupported.push(image);
         for image in unsupported {

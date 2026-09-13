@@ -1,5 +1,8 @@
 //! Color parameters shared by render plans, pixel layouts and codec frontends.
 
+pub(crate) mod matrix;
+pub use matrix::{ColorMatrix, ColorMatrixError};
+
 /// Finite CIE xy coordinates. Equality and hashing preserve the exact declared values.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chromaticity {
@@ -9,6 +12,11 @@ pub struct Chromaticity {
 
 impl Chromaticity {
     pub const D65: Self = Self::constant(0.3127, 0.3290);
+    /// D50 from ICC's exact s15Fixed16 PCS illuminant (0xf6d6, 0x10000, 0xd32d).
+    pub const ICC_D50: Self = Self::constant(
+        0xf6d6 as f64 / (0xf6d6 + 0x10000 + 0xd32d) as f64,
+        0x10000 as f64 / (0xf6d6 + 0x10000 + 0xd32d) as f64,
+    );
     pub const E: Self = Self::constant(1.0 / 3.0, 1.0 / 3.0);
     pub const DCI: Self = Self::constant(0.314, 0.351);
 

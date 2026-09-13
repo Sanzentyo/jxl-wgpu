@@ -3872,3 +3872,27 @@ reference is altered to match GPU output. See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC
 [generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for equations and reproduction.
 This corpus validates the resident converter, not embedded-ICC JPEG XL decoder admission,
 original-domain composition, LUT/MPE/Lab/CMYK or full intent/HDR behaviour.
+
+## ICC linear RGB connections and owned color metadata
+
+The resident ICC corpus now adds 100 forward/reverse connections between the ten exact original
+profiles and BT.709, BT.2020, Display P3, equal-white BT.709 and native JPEG XL calibrated RGB.
+All 182,410 new components are checked against independent f64 CIE/Bradford geometry and ICC
+curve equations. Little CMS 2.19 supplies native ICC evaluation through its XYZ double interface;
+the linear endpoint is not approximated by a serialized fixed-point profile. Linear inputs include
+negative and above-one values. On Metal, maximum absolute error is below 8.6e-7, with 1,228 negative
+and 294 above-one outputs outside a 1e-4 boundary margin. All values satisfy the established
+pre-inverse uncertainty and output rounding bounds.
+
+The new native semantics counts are `[180494, 30, 1886, 0]`: documented zero-base offsets and
+negative offset inverses remain marked and retained, while every component still passes its primary
+scalar/GPU assertion. The original 121 files remain unchanged; 223 files now cover 358,530
+components. Guarded bindings verify that row padding, alpha/extra storage and neighboring planes
+are untouched. Metadata tests cover directional tag precedence, intent/geometry rejection,
+shared profile bytes/tag directories, explicit Gray/alpha classification, and incompatible
+ICC device-space rejection before layout creation. Enumerated packers reject unexecuted ICC targets.
+
+This stage prepares decoder integration. Embedded ICC admission, original/XYB/reference execution,
+requested ICC packing/display, and per-image program/budget ownership are still incomplete.
+See [ICC_MATRIX_TRC.md](ICC_MATRIX_TRC.md) for the execution contract and
+[the generator](../crates/jxl_wgpu/test-data/icc_generator/README.md) for reproducibility.

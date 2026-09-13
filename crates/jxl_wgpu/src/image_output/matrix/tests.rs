@@ -1,4 +1,5 @@
 use super::*;
+use jxl_gpu_protocol::{Chromaticity, RgbChromaticities};
 
 #[test]
 fn white_adaptation_and_absolute_xyz_have_distinct_colorimetric_meanings() {
@@ -38,7 +39,17 @@ fn zero_y_primaries_define_a_valid_xyz_basis() {
         blue: Chromaticity::new(0.0, 0.0).unwrap(),
         white: Chromaticity::E,
     };
-    for (row, expected) in to_xyz(color).unwrap().into_iter().zip(IDENTITY) {
+    for (row, expected) in ColorMatrix::rgb_to_xyz(
+        RgbColorSpace::Custom(color),
+        Chromaticity::E,
+        WhitePointAdaptation::None,
+    )
+    .unwrap()
+    .rows()
+    .iter()
+    .copied()
+    .zip(IDENTITY)
+    {
         for (actual, expected) in row.into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-14);
         }

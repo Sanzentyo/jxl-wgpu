@@ -13,9 +13,14 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorFormatClass {
     Rgb {
-        sample: RgbSample,
-        storage: RgbStorage,
+        sample: ColorSample,
+        storage: ColorStorage,
         order: RgbChannelOrder,
+    },
+    Gray {
+        sample: ColorSample,
+        storage: ColorStorage,
+        alpha: bool,
     },
     Luma {
         bits: u8,
@@ -38,20 +43,20 @@ pub enum ColorFormatClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RgbStorage {
+pub enum ColorStorage {
     Interleaved,
     Planar,
 }
 
-/// Component representation of a color-bearing RGB image.
+/// Component representation of a color-bearing RGB or gray image.
 /// Floating-point color preserves values outside the nominal `0..=1` range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RgbSample {
+pub enum ColorSample {
     U8,
     F32,
 }
 
-impl RgbSample {
+impl ColorSample {
     #[must_use]
     pub const fn bits(self) -> u8 {
         match self {
@@ -130,6 +135,7 @@ pub fn classify_pixel_format(
     match format.model {
         ColorModel::NonColor => classify_numeric(format).map(PixelFormatClass::Numeric),
         ColorModel::Rgb => classify_rgb(format).map(PixelFormatClass::Color),
+        ColorModel::Gray => classify_gray(format).map(PixelFormatClass::Color),
         ColorModel::Ycbcr => classify_ycbcr(format).map(PixelFormatClass::Color),
         unsupported => Err(PixelFormatClassificationError::UnsupportedColorModel(
             unsupported,
@@ -182,8 +188,8 @@ fn classify_numeric(
 
 fn classify_rgb(format: &PixelFormat) -> Result<ColorFormatClass, PixelFormatClassificationError> {
     let sample = match format.sample_kind {
-        SampleKind::Unsigned => RgbSample::U8,
-        SampleKind::Float => RgbSample::F32,
+        SampleKind::Unsigned => ColorSample::U8,
+        SampleKind::Float => ColorSample::F32,
         other => {
             return Err(PixelFormatClassificationError::UnsupportedColorSampleKind(
                 other,
@@ -208,7 +214,7 @@ fn classify_rgb(format: &PixelFormat) -> Result<ColorFormatClass, PixelFormatCla
                 && plane.bits == bits
                 && plane.storage_bits == bits =>
         {
-            RgbStorage::Interleaved
+            ColorStorage::Interleaved
         }
         planes
             if matches!(planes.len(), 3 | 4)
@@ -223,7 +229,7 @@ fn classify_rgb(format: &PixelFormat) -> Result<ColorFormatClass, PixelFormatCla
                         .collect::<Vec<_>>(),
                 ) =>
         {
-            RgbStorage::Planar
+            ColorStorage::Planar
         }
         _ => return Err(PixelFormatClassificationError::UnsupportedColorPacking),
     };
@@ -242,6 +248,56 @@ fn classify_rgb(format: &PixelFormat) -> Result<ColorFormatClass, PixelFormatCla
         sample,
         storage,
         order,
+    })
+}
+
+fn classify_gray(format: &PixelFormat) -> Result<ColorFormatClass, PixelFormatClassificationError> {
+    let sample = match format.sample_kind {
+        SampleKind::Unsigned => ColorSample::U8,
+        SampleKind::Float => ColorSample::F32,
+        other => {
+            return Err(PixelFormatClassificationError::UnsupportedColorSampleKind(
+                other,
+            ));
+        }
+    };
+    if format.chroma_subsampling != ChromaSubsampling::None
+        || !format.planes.iter().all(is_full_sample_plane)
+    {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    }
+    let stored = format
+        .planes
+        .iter()
+        .map(stored_plane)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(PixelFormatClassificationError::UnsupportedColorPacking)?;
+    if stored
+        .iter()
+        .any(|plane| plane.bits != sample.bits() || plane.storage_bits != sample.bits())
+    {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    }
+    let channels = stored
+        .iter()
+        .flat_map(|plane| plane.channels.iter().copied())
+        .collect::<Vec<_>>();
+    let alpha = match (channels.as_slice(), format.swizzle) {
+        ([Channel::X], Swizzle::X001) => false,
+        ([Channel::X, Channel::W], Swizzle::X00W) => true,
+        _ => return Err(PixelFormatClassificationError::UnsupportedColorPacking),
+    };
+    let storage = if stored.len() == 1 {
+        ColorStorage::Interleaved
+    } else if stored.iter().all(|plane| plane.channels.len() == 1) {
+        ColorStorage::Planar
+    } else {
+        return Err(PixelFormatClassificationError::UnsupportedColorPacking);
+    };
+    Ok(ColorFormatClass::Gray {
+        sample,
+        storage,
+        alpha,
     })
 }
 
@@ -569,64 +625,64 @@ mod tests {
             (
                 Vpi::Rgb8,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Interleaved,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Interleaved,
                     order: RgbChannelOrder::Rgb,
                 }),
             ),
             (
                 Vpi::Bgr8,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Interleaved,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Interleaved,
                     order: RgbChannelOrder::Bgr,
                 }),
             ),
             (
                 Vpi::Rgba8,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Interleaved,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Interleaved,
                     order: RgbChannelOrder::Rgba,
                 }),
             ),
             (
                 Vpi::Bgra8,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Interleaved,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Interleaved,
                     order: RgbChannelOrder::Bgra,
                 }),
             ),
             (
                 Vpi::Rgb8Planar,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Planar,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Planar,
                     order: RgbChannelOrder::Rgb,
                 }),
             ),
             (
                 Vpi::Bgr8Planar,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Planar,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Planar,
                     order: RgbChannelOrder::Bgr,
                 }),
             ),
             (
                 Vpi::Rgba8Planar,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Planar,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Planar,
                     order: RgbChannelOrder::Rgba,
                 }),
             ),
             (
                 Vpi::Bgra8Planar,
                 color(ColorFormatClass::Rgb {
-                    sample: RgbSample::U8,
-                    storage: RgbStorage::Planar,
+                    sample: ColorSample::U8,
+                    storage: ColorStorage::Planar,
                     order: RgbChannelOrder::Bgra,
                 }),
             ),
@@ -674,7 +730,7 @@ mod tests {
             ChromaLocation2d::CENTER,
         ));
         assert_eq!(
-            classify_pixel_format(&PixelFormat::p010(spec)).unwrap(),
+            classify_pixel_format(&PixelFormat::p010(spec.clone())).unwrap(),
             color(ColorFormatClass::YuvSemiplanar {
                 subsampling: ChromaSubsampling::Cs420,
                 bits: 10,
@@ -683,7 +739,7 @@ mod tests {
             })
         );
         assert_eq!(
-            classify_pixel_format(&PixelFormat::nv21(spec)).unwrap(),
+            classify_pixel_format(&PixelFormat::nv21(spec.clone())).unwrap(),
             color(ColorFormatClass::YuvSemiplanar {
                 subsampling: ChromaSubsampling::Cs420,
                 bits: 8,
@@ -728,11 +784,11 @@ mod tests {
                 assert_eq!(
                     classify_pixel_format(&format).unwrap(),
                     color(ColorFormatClass::Rgb {
-                        sample: RgbSample::F32,
+                        sample: ColorSample::F32,
                         storage: if planar {
-                            RgbStorage::Planar
+                            ColorStorage::Planar
                         } else {
-                            RgbStorage::Interleaved
+                            ColorStorage::Interleaved
                         },
                         order,
                     })
@@ -748,6 +804,45 @@ mod tests {
                     classify_pixel_format(&format),
                     Err(PixelFormatClassificationError::UnsupportedColorPacking)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn gray_color_and_alpha_have_explicit_storage_without_numeric_relabeling() {
+        for sample in [ColorSample::U8, ColorSample::F32] {
+            for alpha in [false, true] {
+                for planar in [false, true] {
+                    let spec = ColorSpecification::Defined(ColorSpec::bt709(
+                        ColorRange::Full,
+                        ChromaLocation2d::CENTER,
+                    ));
+                    let format = match sample {
+                        ColorSample::U8 => PixelFormat::gray8(alpha, planar, spec),
+                        ColorSample::F32 => PixelFormat::gray_f32(alpha, planar, spec),
+                    };
+                    assert_eq!(
+                        classify_pixel_format(&format).unwrap(),
+                        color(ColorFormatClass::Gray {
+                            sample,
+                            storage: if planar && alpha {
+                                ColorStorage::Planar
+                            } else {
+                                ColorStorage::Interleaved
+                            },
+                            alpha,
+                        })
+                    );
+                    let mut invalid = format.clone();
+                    invalid.swizzle = Swizzle::X000;
+                    assert!(classify_pixel_format(&invalid).is_err());
+                    let mut invalid = format.clone();
+                    invalid.chroma_subsampling = ChromaSubsampling::Cs420;
+                    assert!(classify_pixel_format(&invalid).is_err());
+                    let mut invalid = format;
+                    invalid.planes[0].words[0].fields[0].bits = 16;
+                    assert!(classify_pixel_format(&invalid).is_err());
+                }
             }
         }
     }

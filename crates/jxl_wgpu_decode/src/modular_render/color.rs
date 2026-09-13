@@ -187,7 +187,10 @@ impl ColorPlan {
             linear_black_threshold: if !config.encoded_output
                 && matches!(config.transform, ModularColorTransform::Xyb { .. })
             {
-                crate::image_color::reconstruction_black_threshold(config.original_encoding, target)
+                crate::image_color::reconstruction_black_threshold(
+                    config.original_encoding,
+                    &target,
+                )
             } else {
                 None
             },
@@ -940,7 +943,7 @@ mod tests {
             &[source; 3],
             &[2; 3],
             &planes,
-            target,
+            target.clone(),
             &limits,
         )
         .unwrap();
@@ -961,7 +964,7 @@ mod tests {
                 &[source; 3],
                 &[2, 4, 2],
                 &planes,
-                target,
+                target.clone(),
                 &limits
             ),
             Err(ModularRenderError::Invalid { .. })

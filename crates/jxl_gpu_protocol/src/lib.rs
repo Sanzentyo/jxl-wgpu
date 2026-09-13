@@ -16,7 +16,10 @@ use std::fmt;
 use std::sync::Arc;
 
 mod color;
-pub use color::{Chromaticity, GammaExponent, RgbChromaticities, WhitePointAdaptation};
+pub use color::{
+    Chromaticity, ColorMatrix, ColorMatrixError, GammaExponent, RgbChromaticities,
+    WhitePointAdaptation,
+};
 pub mod icc;
 
 /// Stable identifier for a logical image plane in a [`RenderPlan`].

@@ -341,7 +341,7 @@ impl Compositor {
                     {
                         if let Some(threshold) = crate::image_color::reconstruction_black_threshold(
                             original,
-                            layout.format.color_spec,
+                            &layout.format.color_spec,
                         ) {
                             params.with_linear_black_threshold(threshold)?
                         } else {

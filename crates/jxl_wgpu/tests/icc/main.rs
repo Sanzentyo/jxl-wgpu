@@ -17,6 +17,8 @@ use serde::Deserialize;
 use wgpu::util::DeviceExt;
 
 mod analytic;
+mod connection;
+mod metadata;
 
 #[derive(Deserialize)]
 struct Manifest {

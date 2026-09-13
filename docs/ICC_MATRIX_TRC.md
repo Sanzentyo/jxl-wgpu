@@ -5,6 +5,15 @@ JPEG XL decoder admission still rejects embedded ICC: integration with original 
 reference composition, requested output and exact numeric bypass remains the next stage.
 This checkpoint does not change the full JPEG XL support claim.
 
+`ColorSpecification::Icc(IccProfile)` now carries the exact profile through owned pixel formats
+and layouts. The color specification is `Clone`, not `Copy`; clones share the original bytes and
+tag directory. `EmbeddedIccInventory::profile` likewise shares reconstructed bytes across image,
+preview and physical-frame inventories. Profile interpretation remains separate from inventory
+reconstruction. `ColorModel::Gray` describes gray X with optional alpha W, with explicit U8/F32
+planar/interleaved classification. ICC RGB/Gray/XYZ signatures must match their pixel color model;
+an ICC profile cannot relabel numeric or YCbCr storage. Enumerated packers/display currently reject
+unexecuted ICC targets and gray color outputs. These descriptors do not claim decoder integration.
+
 ## Model and supported scope
 
 `jxl_gpu_protocol::icc::IccProfile` owns the original profile bytes in an `Arc<[u8]>` and a checked
@@ -47,6 +56,24 @@ Sampled interpolation computes the exact product of the input F32 significand an
 interval count with portable u32 arithmetic, then rounds only the fractional weight. This avoids
 losing the interpolation coordinate in large or sharply varying tables. GPU tests include 1,001
 and 1,000,003 irregular samples, subnormal/near-zero coordinates and exact endpoint guards.
+
+## Linear RGB connections
+
+`IccTransform::to_linear_rgb` and `from_linear_rgb` connect the selected profile to a declared
+`RgbColorSpace`. The endpoint model distinguishes a profile's one/three device channels and
+curves from three unbounded linear RGB components. Relative colorimetric intent uses Bradford
+between the RGB reference white and ICC's exact encoded PCS D50. Colorants are connected directly
+in f64; no synthetic quantized profile or approximation by recognized primaries is introduced.
+
+`ColorMatrix` in the backend-neutral protocol owns the shared CIE geometry and white adaptation
+calculation. Existing RGB output/display lower this same implementation to F32. ICC connections
+combine the profile colorants and RGB/PCS matrix in f64 before a single F32 lowering. The host
+calculates metadata matrices only. The shader evaluates all pixel curves and matrix products.
+
+The linear endpoint has no ICC curve descriptor and applies no unit clipping. A negative input
+or input above one reaches the PCS matrix unchanged. A linear output can remain negative or
+above one after conversion from a wider gamut. The profile endpoint still follows the bounded
+ICC curve contract. This does not extend arbitrary ICC device curves to unbounded/HDR domains.
 
 ## GPU contract
 
@@ -107,6 +134,21 @@ inverse branches, clipped plateaus/gaps, metadata reuse after abandoned commands
 Tile16x16 dispatches, multiple extents/pitches, exact program limits and invalid bindings.
 The shader is Naga-validated without optional capabilities and its 80-byte uniform is checked
 against the parsed WGSL layout.
+
+The `linear` subcorpus adds 100 connections between the ten original profiles and five linear
+spaces (BT.709, BT.2020, Display P3, equal-white BT.709 and the native JPEG XL calibrated RGB
+coordinates). It checks all 182,410 output components using independent f64 CIE/Bradford geometry,
+with primary normalization and pivoted elimination distinct from production. Native ICC execution
+uses Little CMS's XYZ double interface, with the independent matrix on the linear side, so no
+fixed-point surrogate profile changes the requested endpoint. Inputs include mixed signed and
+above-one RGB values. Primary uncertainty remains `4e-7 * (1 + magnitude + coefficient_sum)`
+before the target inverse (or linear identity), plus `2e-7` at output.
+
+On Metal the linear corpus has maximum absolute error below 8.6e-7. It retains 1,228 negative
+and 294 above-one output components outside a 1e-4 boundary margin. Native semantics agree for
+180,494 components; 30 zero-base offsets and 1,886 negative offset inverses carry the previously
+documented masks and still pass every primary scalar/GPU assertion. The original 121 corpus
+files remain byte-identical. The complete corpus now has 223 files and 358,530 checked components.
 
 The normative references are [ICC.1:2022](https://www.color.org/specification/ICC.1-2022-05.pdf),
 sections 7, 8.10, 10.6, 10.18 and Annex F. The observed native boundaries follow Little CMS 2.19

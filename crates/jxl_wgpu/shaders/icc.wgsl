@@ -167,11 +167,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var linear = vec3<f32>(0.0);
     for (var channel = 0u; channel < params.extent_channels.z; channel++) {
         let value = input[params.input_offsets[channel] + id.y * params.input_strides[channel] + id.x];
-        linear[channel] = forward_curve(program[12u + channel], value);
+        if program[15u] != 0u { linear[channel] = value; }
+        else { linear[channel] = forward_curve(program[12u + channel], value); }
     }
     for (var channel = 0u; channel < params.extent_channels.w; channel++) {
         let base = channel * 4u;
         let row = vec3<f32>(bitcast<f32>(program[base]), bitcast<f32>(program[base + 1u]), bitcast<f32>(program[base + 2u]));
-        output[params.output_offsets[channel] + id.y * params.output_strides[channel] + id.x] = inverse_curve(program[16u + channel], dot(row, linear));
+        var value = dot(row, linear);
+        if program[19u] == 0u { value = inverse_curve(program[16u + channel], value); }
+        output[params.output_offsets[channel] + id.y * params.output_strides[channel] + id.x] = value;
     }
 }

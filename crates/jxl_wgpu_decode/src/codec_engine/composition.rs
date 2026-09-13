@@ -53,13 +53,13 @@ pub(super) fn needs_surface(
     plan: &FrameExecutionPlan,
 ) -> bool {
     use jxl_gpu_formats::{
-        ColorFormatClass, ColorRange, ColorSpace, ColorSpecification, PixelFormatClass, RgbSample,
-        TransferFunction, classify_pixel_format,
+        ColorFormatClass, ColorRange, ColorSample, ColorSpace, ColorSpecification,
+        PixelFormatClass, TransferFunction, classify_pixel_format,
     };
     let direct_float = matches!(
         classify_pixel_format(request.format()),
         Ok(PixelFormatClass::Color(ColorFormatClass::Rgb {
-            sample: RgbSample::F32,
+            sample: ColorSample::F32,
             ..
         }))
     ) && matches!(request.format().color_spec, ColorSpecification::Defined(spec)

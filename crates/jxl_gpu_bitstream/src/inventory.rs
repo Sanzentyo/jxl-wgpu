@@ -300,8 +300,9 @@ pub struct EmbeddedIccInventory {
     pub bit_range: BitRange,
     /// Size of the intermediate transformed ICC byte stream.
     pub encoded_byte_count: u64,
-    /// Original ICC profile bytes reconstructed from the transformed stream.
-    pub profile: Vec<u8>,
+    /// Original ICC bytes shared by image/preview/frame inventories without re-copying.
+    /// Interpretation and transform admission are separate from codestream reconstruction.
+    pub profile: std::sync::Arc<[u8]>,
 }
 
 /// Bounded, owned subset of the standard JPEG XL image header.
@@ -1438,7 +1439,7 @@ fn parse_embedded_icc(
     Ok(EmbeddedIccInventory {
         bit_range: BitRange::between(header_bits, icc_end)?,
         encoded_byte_count,
-        profile,
+        profile: profile.into(),
     })
 }
 
@@ -2816,6 +2817,11 @@ mod tests {
         assert!(icc.bit_range.length > 0);
         assert!(icc.encoded_byte_count > 0);
         assert_eq!(icc.profile.len(), 544);
+        let copy = inventory.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &icc.profile,
+            &copy.image_header.embedded_icc.as_ref().unwrap().profile
+        ));
         assert_eq!(&icc.profile[36..40], b"acsp");
         let profile_hash = Sha256::digest(&icc.profile);
         assert_eq!(

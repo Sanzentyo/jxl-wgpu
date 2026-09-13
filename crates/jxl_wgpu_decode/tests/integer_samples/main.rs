@@ -351,12 +351,20 @@ fn wide_integer_color_quantizes_at_presentation_without_setting_padding_bits() {
         let bits = depth(image.bit_depth);
         for (format, output_bits, channels) in [
             (
-                PixelFormat::rgb8(RgbChannelOrder::Rgb, false, color().format().color_spec),
+                PixelFormat::rgb8(
+                    RgbChannelOrder::Rgb,
+                    false,
+                    color().format().color_spec.clone(),
+                ),
                 8,
                 3,
             ),
             (
-                PixelFormat::rgb8(RgbChannelOrder::Rgba, false, color().format().color_spec),
+                PixelFormat::rgb8(
+                    RgbChannelOrder::Rgba,
+                    false,
+                    color().format().color_spec.clone(),
+                ),
                 8,
                 4,
             ),

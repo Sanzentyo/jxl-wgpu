@@ -453,7 +453,7 @@ mod tests {
         let nv12 = convert_rgb_f32(
             [&red, &zero, &zero],
             Extent2d::new(2, 2),
-            &PixelFormat::nv12(color_spec),
+            &PixelFormat::nv12(color_spec.clone()),
         )
         .unwrap();
         let nv21 = convert_rgb_f32(

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "scalar.hpp"
+#include "linear.hpp"
 
 namespace {
 using Profile = std::unique_ptr<void, decltype(&cmsCloseProfile)>;
@@ -174,7 +175,32 @@ int main(int argc, char** argv) {
         WriteReferences(directory / (prefix + ".reference"), output, reference);
       }
     }
-    std::cout << "10 exact profiles, 100 transforms, 629 samples per transform\n";
+    const auto linear_directory = directory / "linear";
+    std::filesystem::create_directories(linear_directory);
+    auto linear_input = Input(3);
+    for (auto& value : linear_input) value = value * 1.5f - 0.25f;
+    const std::array<float, 9> probes{0, 1, -0.25f, 1.25f, -0.1f, 0.2f, 0.0001f, -0.0001f, 0.5f};
+    std::copy(probes.begin(), probes.end(), linear_input.begin());
+    WriteFloats(linear_directory / "input.f32le", linear_input);
+    std::ofstream linear_manifest(linear_directory / "manifest.json");
+    linear_manifest.precision(17);
+    linear_manifest << "{\"spaces\": [\n";
+    for (size_t s = 0; s < connection::kSpaces.size(); ++s) {
+      const auto& space = connection::kSpaces[s];
+      linear_manifest << "{\"name\":\"" << space.name << "\",\"white\":[" << space.white[0] << ',' << space.white[1] << "],\"primaries\":[";
+      for (size_t c = 0; c < 3; ++c) linear_manifest << '[' << space.primaries[c][0] << ',' << space.primaries[c][1] << ']' << (c == 2 ? "" : ",");
+      linear_manifest << "]}" << (s + 1 == connection::kSpaces.size() ? "\n" : ",\n");
+      for (size_t p = 0; p < profiles.size(); ++p) for (bool to_linear : {true, false}) {
+        const auto input = to_linear ? Input(p == 8 ? 1 : 3) : linear_input;
+        const auto reference = connection::Reference(scalar::Profile(profiles[p].get()), space, input, to_linear);
+        const auto native = connection::Native(profiles[p].get(), space, input, to_linear);
+        const std::string name = to_linear ? names[p] + "_to_" + space.name : space.name + "_to_" + names[p];
+        WriteReferences(linear_directory / (name + ".reference"), native, reference);
+      }
+    }
+    linear_manifest << "]}\n";
+    Require(linear_manifest.good(), "write linear manifest");
+    std::cout << "10 exact profiles, 100 profile pairs and 100 linear RGB connections, 629 samples per transform\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

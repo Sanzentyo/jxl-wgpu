@@ -13,11 +13,27 @@ buffers. The crate separates:
 There is no CUDA or NVIDIA dependency.
 
 `PixelFormat::rgb_f32(order, planar, color_spec)` describes RGB/BGR/RGBA/BGRA with IEEE 754
-binary32 components. `ColorFormatClass::Rgb { sample, storage, order }` uses `RgbSample::U8`
-or `RgbSample::F32`; floating-point color remains distinct from non-color numeric F32.
+binary32 components. `ColorFormatClass::Rgb { sample, storage, order }` uses `ColorSample::U8`
+or `ColorSample::F32`; floating-point color remains distinct from non-color numeric F32.
 The color specification defines RGB's transfer function and primaries, while alpha is linear.
 Floating-point output preserves finite negative and greater-than-one values. The scalar oracle
 packs these values without quantization, using the same channel swizzle and checked plane layout.
+
+`ColorSpecification::Icc(IccProfile)` owns the exact profile; cloned formats/layouts share the
+original bytes and checked tag directory. `ColorSpecification` is therefore `Clone`, not `Copy`.
+ICC device-space signatures must match the RGB, Gray or XYZ pixel model. Numeric and YCbCr
+descriptors cannot acquire ICC semantics by attaching a profile.
+Convenience constructors retain the supplied color metadata while describing storage;
+`PixelFormat::validate`, classification and image-layout construction reject incompatible ICC
+color models with `IccDeviceSpace`. Fixed NV/P-family constructors never panic on such metadata.
+
+`PixelFormat::gray8(alpha, planar, color_spec)` and `gray_f32` describe gray X with optional alpha W.
+`ColorFormatClass::Gray { sample, storage, alpha }` shares `ColorSample` and `ColorStorage` with
+RGB. A single-channel layout is classified as interleaved; with alpha, both interleaved and planar
+storage are distinct. Gray is color-bearing and never enters the numeric classifier. Storage
+classification is separate from execution capability: stock decoder admission and enumerated
+packing/display still require the remaining ICC/gray integration described in
+[ICC_MATRIX_TRC.md](../../docs/ICC_MATRIX_TRC.md).
 
 ## Portable storage boundary
 

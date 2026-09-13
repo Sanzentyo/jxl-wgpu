@@ -40,12 +40,15 @@ fn splines_compose_with_patches_noise_upsampling_and_lf_in_both_coding_modes() {
             .codestream_inventory(Default::default())
             .unwrap();
         let pixels = inventory.image_header.width as usize * inventory.image_header.height as usize;
-        let request =
-            GpuOutputRequest::color(PixelFormat::rgb_f32(RgbChannelOrder::Rgba, false, color))
-                .unwrap()
-                .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
-                .with_spot_color_policy(SpotColorPolicy::Preserve)
-                .with_orientation_policy(OrientationPolicy::Keep);
+        let request = GpuOutputRequest::color(PixelFormat::rgb_f32(
+            RgbChannelOrder::Rgba,
+            false,
+            color.clone(),
+        ))
+        .unwrap()
+        .with_alpha_output_policy(AlphaOutputPolicy::Preserve)
+        .with_spot_color_policy(SpotColorPolicy::Preserve)
+        .with_orientation_policy(OrientationPolicy::Keep);
         let mut prior = None;
         for limit in [None, NonZeroU64::new(256)] {
             let mut engine = WgpuDecodeEngine::new(backend.clone()).unwrap();

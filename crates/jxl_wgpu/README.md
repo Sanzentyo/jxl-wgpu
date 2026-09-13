@@ -18,6 +18,9 @@ is authoritative.
 `ResidentIccProgram` and `ResidentIccPipeline` execute relative colorimetric RGB/Gray ICC
 matrix/TRC conversion on resident planar F32 channels. A checked profile retains exact colorants,
 independent curves and original ICC bytes; LUT precedence is never silently bypassed. The
+same program connects profiles to unbounded linear RGB using shared f64 CIE/Bradford metadata
+before one F32 lowering; signed and above-one linear values remain intact. Owned ICC pixel
+formats and Gray/alpha storage describe these domains independently of execution admission. The
 [ICC execution contract](../../docs/ICC_MATRIX_TRC.md) documents unit-domain semantics, memory
 ownership, native/scalar evidence and remaining decoder integration.
 
